@@ -165,8 +165,32 @@ mod standing_browser_grants {
             read_floors(&scratch.floor())
                 .unwrap()
                 .get("browser-standing-grants"),
-            Some(&STANDING_GRANT_STORE_FORMAT.version)
+            Some(&1)
         );
+        let storage = FilesystemStandingGrantStorage::new(&path)
+            .with_format_floor(FormatFloor::at(scratch.floor()));
+        let grants = cerebellum::browser_standing_grants::StandingBrowserGrants::open(
+            std::sync::Arc::new(storage),
+            Some("machine".into()),
+        );
+        grants
+            .record(
+                "agent",
+                cerebellum::browser_standing_grants::StandingSubject::Domain("example.com".into()),
+                2,
+                vec![],
+                None,
+                "card",
+            )
+            .unwrap();
+        assert_eq!(
+            read_floors(&scratch.floor())
+                .unwrap()
+                .get("browser-standing-grants"),
+            Some(&2)
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 2);
     }
 
     #[test]

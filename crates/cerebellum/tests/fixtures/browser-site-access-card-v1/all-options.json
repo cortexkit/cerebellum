@@ -3,6 +3,10 @@
   "expires_in_ms": 1800000,
   "facts": [
     {
+      "label": "Standing access",
+      "value": "news.example and its subdomains"
+    },
+    {
       "label": "Can",
       "value": "It can open and read pages there and click ordinary buttons and links"
     },
@@ -26,7 +30,7 @@
       "detail": "Up to clicking ordinary links and buttons.",
       "effect": "grant",
       "id": "allow_origin_always",
-      "label": "Always allow on news.example"
+      "label": "Always allow on news.example and its subdomains"
     },
     {
       "detail": "Up to clicking ordinary links and buttons. Covers every public website, including ones where you're signed in. To withdraw it, ask the agent to remove its browser access.",

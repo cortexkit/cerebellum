@@ -3,6 +3,10 @@
   "expires_in_ms": 1800000,
   "facts": [
     {
+      "label": "Standing access",
+      "value": "news.example and its subdomains"
+    },
+    {
       "label": "Can",
       "value": "It can open and read pages there and click ordinary buttons and links"
     },
@@ -34,7 +38,7 @@
       "detail": "Up to making lasting changes.",
       "effect": "grant",
       "id": "allow_origin_always",
-      "label": "Always allow on news.example"
+      "label": "Always allow on news.example and its subdomains"
     },
     {
       "effect": "decline",

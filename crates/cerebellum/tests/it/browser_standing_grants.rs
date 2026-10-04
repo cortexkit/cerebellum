@@ -621,7 +621,7 @@ async fn each_answered_option_mints_exactly_its_row() {
                 assert_eq!(row.granted_at_ms, now);
                 assert_eq!(row.revoked_at_ms, None);
                 let (subject, expires) = match id {
-                    "allow_origin_always" => (StandingSubject::Origin(PUBLIC.into()), None),
+                    "allow_origin_always" => (StandingSubject::Domain("news.example".into()), None),
                     "allow_all_sites_10m" => (
                         StandingSubject::AllSites,
                         Some(now + ALL_SITES_SHORT_GRANT_MS),
@@ -1285,7 +1285,7 @@ async fn a_row_bound_to_another_machine_grants_nothing() {
 async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() {
     let scratch = Scratch::new("unreadable");
     let path = scratch.0.join("browser_standing_grants.json");
-    std::fs::write(&path, br#"{"version": 2, "grants": []}"#).unwrap();
+    std::fs::write(&path, br#"{"version": 3, "grants": []}"#).unwrap();
     let clock = ManualWallClock::at(1_700_000_000_000);
     let mut fixture = Fixture::with_store(store_over(scratch.storage(), &clock), clock);
     assert!(fixture.store.store_error().is_some());
@@ -1309,6 +1309,149 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
     assert_eq!(revoke["outcome"], "store_unavailable", "{revoke}");
     assert_eq!(
         std::fs::read(&path).unwrap(),
-        br#"{"version": 2, "grants": []}"#
+        br#"{"version": 3, "grants": []}"#
     );
+}
+
+#[tokio::test]
+async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-domain", AGENT).asking())
+        .await;
+    let reply = fixture
+        .call_answering(
+            &route,
+            "browser.navigate",
+            navigation("https://manager.eu.ovhcloud.com/", 2),
+            json!({"decision": "allow_origin_always", "elicitation_id":"el_domain"}),
+            |question| {
+                assert!(question
+                    .to_string()
+                    .contains("Always allow on ovhcloud.com and its subdomains"));
+            },
+        )
+        .await;
+    assert_authorized(&reply, "domain answer");
+    assert_eq!(
+        fixture.store.live_rows(AGENT)[0].subject.to_value(),
+        json!({"domain":"ovhcloud.com"})
+    );
+    let reply = fixture
+        .call(
+            &route,
+            "browser.navigate",
+            navigation("https://auth.eu.ovhcloud.com/", 2),
+        )
+        .await;
+    assert_authorized(&reply, "sibling");
+}
+
+#[tokio::test]
+async fn suffix_localhost_and_ip_cards_remain_host_only() {
+    for (origin, host) in [
+        ("https://github.io", "github.io"),
+        ("http://localhost:8080", "localhost"),
+        ("https://93.184.216.34", "93.184.216.34"),
+    ] {
+        let mut fixture = Fixture::new();
+        let route = fixture
+            .route(Session::primary("c-host", AGENT).asking())
+            .await;
+        fixture
+            .call_answering(
+                &route,
+                "browser.navigate",
+                navigation(&format!("{origin}/"), 2),
+                json!({"decision":"deny"}),
+                |question| {
+                    let text = question.to_string();
+                    assert!(text.contains(&format!("Always allow on {host}")), "{text}");
+                    assert!(!text.contains("and its subdomains"), "{text}");
+                },
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn domain_rows_never_cover_http() {
+    let mut fixture = Fixture::new();
+    fixture.seed(
+        AGENT,
+        StandingSubject::Domain("ovhcloud.com".into()),
+        2,
+        &[],
+    );
+    let route = fixture.route(Session::primary("c-http", AGENT)).await;
+    let reply = fixture
+        .call(
+            &route,
+            "browser.navigate",
+            navigation("http://auth.ovhcloud.com/", 2),
+        )
+        .await;
+    assert_refused(&reply, "http");
+}
+
+#[tokio::test]
+async fn domain_rows_never_cover_sibling_domains() {
+    let mut fixture = Fixture::new();
+    fixture.seed(
+        AGENT,
+        StandingSubject::Domain("ovhcloud.com".into()),
+        2,
+        &[],
+    );
+    let route = fixture.route(Session::primary("c-sibling", AGENT)).await;
+    let reply = fixture
+        .call(
+            &route,
+            "browser.navigate",
+            navigation("https://notovhcloud.com/", 2),
+        )
+        .await;
+    assert_refused(&reply, "sibling domain");
+}
+
+#[tokio::test]
+async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
+    let mut fixture = Fixture::new();
+    fixture.seed(
+        AGENT,
+        StandingSubject::Domain("ovhcloud.com".into()),
+        4,
+        &[HazardClass::CredentialFormSubmit],
+    );
+    let desk = fixture.management_route().await;
+    let listed = fixture
+        .operate(&desk, "grants.list", json!({"agent_id":AGENT}))
+        .await;
+    assert_eq!(
+        listed["browser"]["grants"][0]["subject"],
+        json!({"domain":"ovhcloud.com"})
+    );
+    let revoked = fixture
+        .operate(
+            &desk,
+            "browser.revoke_grant",
+            json!({"agent_id":AGENT,"domain":"ovhcloud.com"}),
+        )
+        .await;
+    assert_eq!(revoked["revoked"], 1);
+    fixture.seed(
+        AGENT,
+        StandingSubject::Domain("ovhcloud.com".into()),
+        2,
+        &[],
+    );
+    let route = fixture.route(Session::primary("c-withdraw", AGENT)).await;
+    let revoked = fixture
+        .call(
+            &route,
+            "browser_use",
+            json!({"action":"revoke_access","domain":"ovhcloud.com"}),
+        )
+        .await;
+    assert_eq!(revoked["revoked"], 1, "{revoked}");
 }

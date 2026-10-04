@@ -4,7 +4,8 @@
 //! conversation it was given in (see [`crate::authorization`]). The same card
 //! can also offer three standing answers, kept here:
 //!
-//! * "Always allow on <origin>": one origin, at the ceiling the request needed,
+//! * "Always allow": one registrable domain on default-port HTTPS, or an
+//!   exact origin when domain scope is unavailable, at the requested ceiling,
 //!   with the hazards the card disclosed.
 //! * "Allow on all sites for 10 minutes" and "Always allow on all sites": every
 //!   public origin, at a ceiling of at most [`MAX_ALL_SITES_LEVEL`], with no
@@ -39,8 +40,9 @@ use crate::classification::canonical_grant_origin;
 /// home beside the always-allow app store.
 pub const STANDING_GRANT_STORE_FILE: &str = "browser_standing_grants.json";
 
-/// The only store format this build reads or writes.
-pub const STANDING_GRANT_STORE_VERSION: u64 = 1;
+/// The highest store format this build reads. Until a domain row is recorded,
+/// writes stay in version 1 so an older binary can still read the store.
+pub const STANDING_GRANT_STORE_VERSION: u64 = 2;
 
 /// The store's format, as the format floor and staging name it.
 pub const STANDING_GRANT_STORE_FORMAT: cerebellum_core::format_floor::DurableFormat =
@@ -56,13 +58,15 @@ pub const ALL_SITES_SHORT_GRANT_MS: u64 = 10 * 60 * 1000;
 /// Lasting changes are only ever granted for a named origin.
 pub const MAX_ALL_SITES_LEVEL: u8 = MUTATE_REVERSIBLE;
 
-/// What a standing row covers: one origin, or every public origin.
+/// What a standing row covers: an origin, a registrable domain, or all public sites.
 ///
-/// On the wire `{"origin": "https://example.com"}` or `{"all_sites": true}`.
+/// On the wire `{"origin": "https://example.com"}`, `{"domain": "example.com"}`,
+/// or `{"all_sites": true}`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "SubjectWire", into = "SubjectWire")]
 pub enum StandingSubject {
     Origin(String),
+    Domain(String),
     AllSites,
 }
 
@@ -78,6 +82,8 @@ struct SubjectWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     all_sites: Option<bool>,
 }
 
@@ -85,8 +91,8 @@ impl TryFrom<SubjectWire> for StandingSubject {
     type Error = String;
 
     fn try_from(wire: SubjectWire) -> Result<Self, Self::Error> {
-        match (wire.origin, wire.all_sites) {
-            (Some(origin), None) => {
+        match (wire.origin, wire.domain, wire.all_sites) {
+            (Some(origin), None, None) => {
                 if canonical_grant_origin(&origin).as_deref() != Some(origin.as_str()) {
                     return Err(format!(
                         "subject origin `{origin}` is not a canonical origin"
@@ -94,7 +100,13 @@ impl TryFrom<SubjectWire> for StandingSubject {
                 }
                 Ok(Self::Origin(origin))
             }
-            (None, Some(true)) => Ok(Self::AllSites),
+            (None, Some(domain), None)
+                if domain_scope(&format!("https://{domain}")).as_deref()
+                    == Some(domain.as_str()) =>
+            {
+                Ok(Self::Domain(domain))
+            }
+            (None, None, Some(true)) => Ok(Self::AllSites),
             _ => Err("a subject names exactly one origin, or all_sites: true".to_string()),
         }
     }
@@ -105,10 +117,17 @@ impl From<StandingSubject> for SubjectWire {
         match subject {
             StandingSubject::Origin(origin) => Self {
                 origin: Some(origin),
+                domain: None,
+                all_sites: None,
+            },
+            StandingSubject::Domain(domain) => Self {
+                origin: None,
+                domain: Some(domain),
                 all_sites: None,
             },
             StandingSubject::AllSites => Self {
                 origin: None,
+                domain: None,
                 all_sites: Some(true),
             },
         }
@@ -164,6 +183,7 @@ impl StandingBrowserGrant {
     pub fn key(&self) -> String {
         let subject = match &self.subject {
             StandingSubject::Origin(origin) => origin.as_str(),
+            StandingSubject::Domain(domain) => domain.as_str(),
             StandingSubject::AllSites => "*",
         };
         format!("{}|{}|{}", self.consent_ref, subject, self.granted_at_ms)
@@ -180,6 +200,11 @@ impl StandingBrowserGrant {
                 "max_level {} is not a grantable tier",
                 self.max_level
             ));
+        }
+        if let StandingSubject::Domain(domain) = &self.subject {
+            if domain_scope(&format!("https://{domain}")).as_deref() != Some(domain.as_str()) {
+                return Err("invalid registrable domain subject".into());
+            }
         }
         let unique: BTreeSet<_> = self.hazards.iter().collect();
         if unique.len() != self.hazards.len() {
@@ -219,7 +244,7 @@ pub struct StandingGrantStoreState {
 impl Default for StandingGrantStoreState {
     fn default() -> Self {
         Self {
-            version: STANDING_GRANT_STORE_VERSION,
+            version: 1,
             grants: Vec::new(),
         }
     }
@@ -392,7 +417,7 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
                 detail: "version is missing or is not an unsigned integer".to_string(),
             });
         };
-        if version != STANDING_GRANT_STORE_FORMAT.version {
+        if !(1..=STANDING_GRANT_STORE_VERSION).contains(&version) {
             return Err(StandingGrantStoreError::UnknownVersion { found: version });
         }
         serde_json::from_value(value).map_err(|error| StandingGrantStoreError::Corrupt {
@@ -407,7 +432,10 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
         // Before anything is written: a store in this format on disk with no
         // floor naming it would let staging pass a build that cannot read it.
         self.floor
-            .raise(STANDING_GRANT_STORE_FORMAT)
+            .raise(cerebellum_core::format_floor::DurableFormat::new(
+                STANDING_GRANT_STORE_FORMAT.name,
+                state.version,
+            ))
             .map_err(|error| StandingGrantStoreError::WriteFailed {
                 detail: error.to_string(),
             })?;
@@ -505,6 +533,8 @@ pub enum RevokeTarget {
     Everything,
     /// The agent's row for one origin.
     Origin(String),
+    /// The agent's row for one registrable domain.
+    Domain(String),
     /// The agent's all-sites rows: both the ten-minute row and the one that
     /// lasts until revoked.
     AllSites,
@@ -515,6 +545,7 @@ pub struct StandingBrowserGrants {
     storage: Arc<dyn StandingGrantStorage>,
     machine_uuid: Option<String>,
     rows: Mutex<Result<Vec<StandingBrowserGrant>, StandingGrantStoreError>>,
+    version: AtomicU64,
     /// Held across a read-modify-write of the store, so two concurrent writes
     /// cannot each save a copy missing the other's row.
     writes: Mutex<()>,
@@ -544,10 +575,22 @@ impl StandingBrowserGrants {
     /// [`StandingBrowserGrant::check`], withholds every standing grant for the
     /// life of this module and is never saved over.
     pub fn open(storage: Arc<dyn StandingGrantStorage>, machine_uuid: Option<String>) -> Self {
+        let mut version = 1;
         let rows = storage.load().and_then(|state| {
-            if state.version != STANDING_GRANT_STORE_VERSION {
+            version = state.version;
+            if !(1..=STANDING_GRANT_STORE_VERSION).contains(&state.version) {
                 return Err(StandingGrantStoreError::UnknownVersion {
                     found: state.version,
+                });
+            }
+            if state.version == 1
+                && state
+                    .grants
+                    .iter()
+                    .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+            {
+                return Err(StandingGrantStoreError::Corrupt {
+                    detail: "domain rows require version 2".into(),
                 });
             }
             for row in &state.grants {
@@ -560,6 +603,7 @@ impl StandingBrowserGrants {
             storage,
             machine_uuid,
             rows: Mutex::new(rows),
+            version: AtomicU64::new(version),
             writes: Mutex::new(()),
             clock: Arc::new(SystemWallClock),
         }
@@ -638,6 +682,7 @@ impl StandingBrowserGrants {
             })
             .find(|row| match &row.subject {
                 StandingSubject::Origin(granted) => *granted == origin,
+                StandingSubject::Domain(domain) => domain_covers(domain, &origin),
                 StandingSubject::AllSites => {
                     required_hazards.is_empty()
                         && row.max_level <= MAX_ALL_SITES_LEVEL
@@ -703,9 +748,23 @@ impl StandingBrowserGrants {
         });
         rows.push(row.clone());
         self.storage.save(&StandingGrantStoreState {
-            version: STANDING_GRANT_STORE_VERSION,
+            version: if self.version.load(Ordering::SeqCst) == 2
+                || rows
+                    .iter()
+                    .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+            {
+                2
+            } else {
+                1
+            },
             grants: rows.clone(),
         })?;
+        if rows
+            .iter()
+            .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+        {
+            self.version.store(2, Ordering::SeqCst);
+        }
         *lock(&self.rows) = Ok(rows);
         Ok(row)
     }
@@ -735,6 +794,9 @@ impl StandingBrowserGrants {
                     RevokeTarget::Origin(origin) => {
                         row.subject == StandingSubject::Origin(origin.clone())
                     }
+                    RevokeTarget::Domain(domain) => {
+                        row.subject == StandingSubject::Domain(domain.clone())
+                    }
                     RevokeTarget::AllSites => row.subject == StandingSubject::AllSites,
                 };
             if named && row.is_live(now) {
@@ -746,7 +808,15 @@ impl StandingBrowserGrants {
             return json!({"outcome": "nothing_to_revoke", "revoked": 0});
         }
         if let Err(error) = self.storage.save(&StandingGrantStoreState {
-            version: STANDING_GRANT_STORE_VERSION,
+            version: if self.version.load(Ordering::SeqCst) == 2
+                || rows
+                    .iter()
+                    .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+            {
+                2
+            } else {
+                1
+            },
             grants: rows.clone(),
         }) {
             return json!({
@@ -755,6 +825,12 @@ impl StandingBrowserGrants {
                 "reason": error.reason_code(),
                 "remedy": "the access is still in force; check the data directory is writable and retry",
             });
+        }
+        if rows
+            .iter()
+            .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+        {
+            self.version.store(2, Ordering::SeqCst);
         }
         *lock(&self.rows) = Ok(rows);
         json!({"outcome": "revoked", "revoked": revoked})
@@ -817,6 +893,32 @@ pub fn standing_browser_grant_covers(
         .is_some()
 }
 
+/// The registrable domain offered by a standing answer, only for public DNS
+/// names on HTTPS's default port. Conversation answers do not use this scope.
+pub fn domain_scope(origin: &str) -> Option<String> {
+    let canonical = canonical_grant_origin(origin)?;
+    let host = canonical.strip_prefix("https://")?;
+    if host.contains(':') || host.parse::<IpAddr>().is_ok() || !origin_is_public(&canonical) {
+        return None;
+    }
+    crate::public_suffix::registrable_domain(host)
+}
+
+pub fn always_subject(origin: String) -> StandingSubject {
+    domain_scope(&origin).map_or(StandingSubject::Origin(origin), StandingSubject::Domain)
+}
+
+fn domain_covers(domain: &str, origin: &str) -> bool {
+    let Some(host) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    !host.contains(':')
+        && (host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.')))
+}
+
 /// Whether `origin` is a public website an all-sites grant may cover.
 ///
 /// Refused: anything that is not a canonical http(s) origin (which includes
@@ -866,6 +968,56 @@ pub fn origin_is_public(origin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psl_not_last_two_labels() {
+        assert_eq!(
+            domain_scope("https://manager.example.co.uk"),
+            Some("example.co.uk".into())
+        );
+    }
+
+    #[test]
+    fn private_suffix_tenants_do_not_share_domains() {
+        assert_eq!(
+            domain_scope("https://a.github.io"),
+            Some("a.github.io".into())
+        );
+        assert_eq!(
+            domain_scope("https://b.github.io"),
+            Some("b.github.io".into())
+        );
+    }
+
+    #[test]
+    fn host_only_writes_keep_version_one_until_a_domain_is_recorded() {
+        let storage = Arc::new(InMemoryStandingGrantStorage::new());
+        let grants = StandingBrowserGrants::open(storage.clone(), Some("machine".into()));
+        grants
+            .record(
+                "agent",
+                StandingSubject::Origin("https://example.com".into()),
+                2,
+                vec![],
+                None,
+                "card",
+            )
+            .unwrap();
+        assert_eq!(storage.load().unwrap().version, 1);
+        grants
+            .record(
+                "agent",
+                StandingSubject::Domain("example.com".into()),
+                2,
+                vec![],
+                None,
+                "domain-card",
+            )
+            .unwrap();
+        assert_eq!(storage.load().unwrap().version, 2);
+        grants.revoke("agent", &RevokeTarget::Domain("example.com".into()));
+        assert_eq!(storage.load().unwrap().version, 2);
+    }
 
     #[test]
     fn public_origins_are_told_apart_from_local_and_private_ones() {
