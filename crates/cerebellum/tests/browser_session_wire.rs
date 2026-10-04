@@ -4357,11 +4357,25 @@ async fn an_action_after_a_same_document_fragment_change_still_dispatches() {
 }
 
 async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
+    blocking_grant_fixture_with_standing(false).await
+}
+
+async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<RecordingLauncher>) {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
+        standing.then(|| {
+            Arc::new(
+                cerebellum::browser_standing_grants::StandingBrowserGrants::open(
+                    Arc::new(
+                        cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new(),
+                    ),
+                    Some("test-machine".into()),
+                ),
+            )
+        }),
     );
     planes.launch_service = Some(launcher.clone());
     launch_at(&planes, &launcher.page, "https://page.example").await;
@@ -4599,6 +4613,92 @@ async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
     }
 }
 
+async fn late_in_call_answer(decision: &str, linkable: bool) {
+    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
+    let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
+    assert!(facts.agent_project_id_attested && facts.acts_as_agent && facts.session_kind_attested);
+    assert_eq!(
+        facts.identity.session_kind,
+        cerebellum_core::identity::SessionKind::Primary
+    );
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_browser_consent_deadline_for_test(
+        keyed_navigation(9, 801, "pf:late"),
+        &tx,
+        &planes,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    let pending = consent_frame(&mut rx).await;
+    assert_eq!(body(&pending)["outcome"], "consent_pending");
+    let mut answer = json!({"decision": decision});
+    if linkable {
+        answer["elicitation_id"] = json!("el_test_late");
+    }
+    let response = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        question.header.channel,
+        question.header.epoch,
+        question.header.corr,
+        serde_json::to_vec(&answer).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(response, &tx, &planes)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while planes.management.browser_grant_pending_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let rows = planes
+        .management
+        .standing_browser_grants()
+        .live_rows(&facts.identity.agent_project_id);
+    if decision == "allow_origin_always" && linkable {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].consent_ref, "el_test_late");
+        assert_eq!(
+            rows[0].subject,
+            cerebellum::browser_standing_grants::StandingSubject::Origin(
+                "https://requested.example".into()
+            )
+        );
+    } else {
+        assert!(rows.is_empty());
+        assert_eq!(
+            planes.management.browser_grant_count().await,
+            usize::from(decision == "allow_conversation")
+        );
+    }
+    assert!(
+        launcher.effects.lock().unwrap().is_empty(),
+        "a late answer must not navigate"
+    );
+}
+
+#[tokio::test]
+async fn late_in_call_always_answer_records_standing_origin() {
+    late_in_call_answer("allow_origin_always", true).await;
+}
+
+#[tokio::test]
+async fn late_in_call_conversation_answer_records_conversation_grant() {
+    late_in_call_answer("allow_conversation", true).await;
+}
+
+#[tokio::test]
+async fn late_in_call_always_without_elicitation_id_records_nothing() {
+    late_in_call_answer("allow_origin_always", false).await;
+}
+
 #[tokio::test]
 async fn blocking_browser_grant_timeout_keeps_late_answer() {
     let (planes, launcher) = blocking_grant_fixture().await;
@@ -4657,9 +4757,31 @@ async fn blocking_browser_grant_cancel_releases_registry() {
     cerebellum::handle_frame_for_test(cancel, &tx, &planes)
         .await
         .unwrap();
-    let reply = consent_frame(&mut rx).await;
+    let mut reply = None;
+    let mut cancellation = None;
+    for _ in 0..2 {
+        let frame = consent_frame(&mut rx).await;
+        if frame.header.ty == FrameType::Cancel {
+            cancellation = Some(frame);
+        } else {
+            reply = Some(frame);
+        }
+    }
+    let cancel = cancellation.expect("cancellation ends the browser card at the carrier");
     assert_eq!(
-        serde_json::from_slice::<Value>(&reply.body).unwrap()["detail"]["decision"],
+        (
+            cancel.header.channel,
+            cancel.header.epoch,
+            cancel.header.corr
+        ),
+        (
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.unwrap().body).unwrap()["detail"]["decision"],
         "cancelled"
     );
     assert_eq!(planes.elicitor.outstanding(), baseline);
@@ -5103,8 +5225,8 @@ async fn withdrawing_a_denied_call_is_refused_denied() {
 }
 
 #[tokio::test]
-async fn withdrawing_a_consent_pending_call_closes_its_question_and_repeats_identically() {
-    let (planes, launcher) = blocking_grant_fixture().await;
+async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_navigation() {
+    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
     let (tx, mut rx) = mpsc::channel(8);
     cerebellum::handle_browser_consent_deadline_for_test(
         keyed_navigation(9, 801, "pf:pending"),
@@ -5129,10 +5251,34 @@ async fn withdrawing_a_consent_pending_call_closes_its_question_and_repeats_iden
     let repeat = withdraw(&planes, &tx, &mut rx, 9, 816, "pf:pending").await;
     assert_eq!(repeat.body, first.body, "a repeat answered differently");
 
-    // The question closed: a late allow writes no grant, and nothing ran.
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    // Withdrawing the navigation leaves its site-access question open, so the
+    // later permission response can still record a grant without navigating.
+    let mut response = question.clone();
+    response.header.ty = FrameType::Response;
+    response.body = serde_json::to_vec(
+        &json!({"decision":"allow_origin_always", "elicitation_id":"el_withdrawn"}),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(response, &tx, &planes)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while planes.management.browser_grant_pending_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let rows = planes
+        .management
+        .standing_browser_grants()
+        .live_rows("pj-browser-session-wire");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].consent_ref, "el_withdrawn");
+    assert!(
+        rx.try_recv().is_err(),
+        "withdraw must not end the card or resume the call"
+    );
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
@@ -6060,6 +6206,69 @@ async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
     );
 }
 
+#[tokio::test]
+async fn scope_epoch_replacement_cancels_late_in_call_card() {
+    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
+    bind_route(
+        &planes,
+        12,
+        reserved("prefrontal-core"),
+        Some(scope_stamp(1, true)),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_browser_consent_deadline_for_test(
+        keyed_navigation(9, 801, "pf:replaced"),
+        &tx,
+        &planes,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let question = consent_frame(&mut rx).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    assert_eq!(
+        body(&consent_frame(&mut rx).await)["outcome"],
+        "consent_pending"
+    );
+    assert_eq!(
+        bind_reply(&planes, 15, scope_stamp(2, true))
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let cancel = consent_frame(&mut rx).await;
+    assert_eq!(cancel.header.ty, FrameType::Cancel);
+    assert_eq!(
+        (
+            cancel.header.channel,
+            cancel.header.epoch,
+            cancel.header.corr
+        ),
+        (
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr
+        )
+    );
+    let mut answer = question;
+    answer.header.ty = FrameType::Response;
+    answer.body = serde_json::to_vec(
+        &json!({"decision":"allow_origin_always", "elicitation_id":"el_replaced"}),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(answer, &tx, &planes)
+        .await
+        .unwrap();
+    assert!(planes
+        .management
+        .standing_browser_grants()
+        .live_rows("pj-browser-session-wire")
+        .is_empty());
+    assert!(!launcher.effects.lock().unwrap().contains(&"navigate"));
+}
+
 /// A question the epoch-1 session left open grants nothing when answered
 /// after the epoch-2 bind.
 #[tokio::test]
@@ -6697,7 +6906,30 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
     cerebellum::handle_frame_for_test(cancel, &tx, &planes)
         .await
         .unwrap();
-    let reply = consent_frame(&mut rx).await;
+    let mut reply = None;
+    let mut cancellation = None;
+    for _ in 0..2 {
+        let frame = consent_frame(&mut rx).await;
+        if frame.header.ty == FrameType::Cancel {
+            cancellation = Some(frame);
+        } else {
+            reply = Some(frame);
+        }
+    }
+    let cancel = cancellation.expect("the relayed call's card is ended at the carrier");
+    assert_eq!(
+        (
+            cancel.header.channel,
+            cancel.header.epoch,
+            cancel.header.corr
+        ),
+        (
+            question.header.channel,
+            question.header.epoch,
+            question.header.corr
+        )
+    );
+    let reply = reply.unwrap();
     assert_eq!(
         body(&reply)["detail"]["decision"],
         "cancelled",
