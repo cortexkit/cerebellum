@@ -7251,6 +7251,8 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
         body["outcome"], "authorization_denied",
         "standing rows must not authorize: {body}"
     );
+    assert_eq!(body["context"]["profile_disposition"], "none", "{body}");
+    assert!(body["context"]["profile_name"].is_null(), "{body}");
 }
 
 #[tokio::test]
