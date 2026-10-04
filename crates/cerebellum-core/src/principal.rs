@@ -91,6 +91,7 @@ pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
     "prefrontal-routing",
     "aft",
     "broca",
+    "basal",
 ];
 
 /// Whether a daemon-spawned module id is a trusted first-party consumer of

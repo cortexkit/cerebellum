@@ -13,7 +13,7 @@ mod holder_lock;
 mod lease_timing;
 pub(crate) use lease_timing::{
     acquired as lease_acquired, deadline as lease_deadline, refusal as lease_refusal,
-    released as lease_released,
+    released as lease_released, with_holder as with_lease_holder,
 };
 
 #[cfg(all(target_os = "linux", test))]

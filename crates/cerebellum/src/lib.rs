@@ -1214,6 +1214,12 @@ impl RouteBindings {
             .and_then(|routes| routes.get(&(channel, epoch)).cloned())
     }
 
+    /// Observe the facts retained by the real bind handler without replacing them.
+    #[doc(hidden)]
+    pub fn accepted_bind_for_test(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
+        self.get(channel, epoch)
+    }
+
     fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
         let facts = self
             .inner
@@ -1515,7 +1521,7 @@ fn consent_context(
                 epoch,
             }) as Arc<dyn computer_grants::QuestionCarrier>
         });
-    computer_grants::ConsentContext::new(
+    let mut context = computer_grants::ConsentContext::new(
         computer_grants::GrantCaller {
             conversation_key: facts.identity.conversation_key.clone(),
             agent_project_id: facts.identity.agent_project_id.clone(),
@@ -1532,7 +1538,12 @@ fn consent_context(
         }),
         planes.drain_signal.subscribe(),
         elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
-    )
+    );
+    context.unattended = facts.flow_id.is_some();
+    if context.unattended {
+        context.caller.conversation_key.clear();
+    }
+    context
 }
 
 /// The binary entry point: read config from env, load the health config
@@ -3025,7 +3036,14 @@ async fn handle_frame(
         }
         FrameType::Request if frame.header.channel == 0 => {
             if scope_epoch_admits_bind(&frame, writer, planes).await? {
-                handle_control_request(frame, writer, &planes.health, &planes.routes).await?;
+                handle_control_request(
+                    frame,
+                    writer,
+                    &planes.health,
+                    &planes.routes,
+                    &planes.elicitor,
+                )
+                .await?;
             }
             Ok(true)
         }
@@ -3219,7 +3237,9 @@ async fn handle_management_request(
         )
         .await;
     }
-    if method == management::WOULD_ASK && !facts.admits_session_calls() {
+    if method == management::WOULD_ASK
+        && !cerebellum_core::principal::admits_session_calls(&facts.principal)
+    {
         return send_route_error(
             writer,
             ver,
@@ -3250,6 +3270,27 @@ async fn handle_management_request(
     };
     if let Some(refusal) = session_flow_refusal(facts) {
         return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+    }
+    if facts.flow_id.is_some()
+        && matches!(
+            method,
+            management::OPEN_GRANT
+                | management::IMPORT_LOGIN
+                | management::CAPTURE_LOGIN
+                | management::PRESENT
+                | management::CLEAR_LAUNCH_RECOVERY
+                | management::REBIND_PROFILE_ROOT
+        )
+    {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            flow_consent_refusal("unattended_flow"),
+        )
+        .await;
     }
     let params = object
         .get("params")
@@ -4503,6 +4544,7 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
+    elicitor: &elicit::Elicitor,
 ) -> Result<(), ModuleError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
@@ -4599,6 +4641,14 @@ async fn handle_control_request(
             // delegation. Retaining it also lets call records name the scope
             // and lets its owner withdraw calls when the scope is revoked.
             .with_scope(scope);
+            elicitor.set_unattended(
+                route_channel,
+                epoch,
+                accepted_facts
+                    .scope
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.attributes.flow_id.is_some()),
+            );
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
@@ -5010,7 +5060,12 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
                 body["outcome"].as_str(),
                 Some("invalid_request" | "resource_busy")
             ) || (body["outcome"] == "consent_unavailable"
-                && body["detail"]["reason"] == "flow_scopes_unsupported")
+                && matches!(
+                    body["detail"]["reason"].as_str(),
+                    Some(
+                        "flow_carrier_not_admitted" | "unattended_flow" | "takeover_not_for_flows"
+                    )
+                ))
         }
         FrameType::Error => body["code"].as_str().is_some_and(|code| {
             [
@@ -5548,6 +5603,33 @@ async fn handle_tool_request(
         None => (name, arguments),
     };
 
+    if accepted_facts.flow_id.is_some() && !accepted_facts.acts_as_agent {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            flow_consent_refusal("unattended_flow"),
+        )
+        .await;
+    }
+    if accepted_facts.flow_id.is_some()
+        && matches!(
+            name,
+            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+        )
+    {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            flow_consent_refusal("takeover_not_for_flows"),
+        )
+        .await;
+    }
     if browser_session::CONTROL_TOOLS.contains(&name) {
         // The admission refusal is a reply of this capability like any other,
         // so it goes through the same boundary. A refusal returned from above
@@ -5826,14 +5908,24 @@ async fn serve_browser_with_consent(
     arguments: &Value,
     park_limit: Duration,
 ) -> Result<Value, cerebellum_computer::platform::vocabulary::CapabilityResultValidationError> {
-    let mut reply = authorization::with_standing_caller(
-        standing_caller(facts),
-        planes.browser.serve(&facts.identity, capability, arguments),
+    let mut reply = authorization::with_flow(
+        facts.flow_id.is_some(),
+        authorization::with_standing_caller(
+            standing_caller(facts),
+            planes.browser.serve(&facts.identity, capability, arguments),
+        ),
     )
     .await?;
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
+    if facts.flow_id.is_some() {
+        reply["outcome"] = json!("consent_unavailable");
+        reply["detail"] = json!({"reason": "unattended_flow"});
+        reply["remedy"] =
+            json!("an unattended flow cannot ask a person; configure its owner's standing grant");
+        return planes.browser.finish_reply(capability.name(), reply);
+    }
     if !facts.declares_elicitation() {
         return Ok(reply);
     }
@@ -5957,7 +6049,8 @@ fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingC
 /// a primary session acting for its daemon-attested agent and session kind.
 /// Worker and ephemeral sessions are offered this conversation only.
 fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
-    (facts.agent_project_id_attested
+    (facts.flow_id.is_none()
+        && facts.agent_project_id_attested
         && facts.acts_as_agent
         && facts.session_kind_attested
         && facts.identity.session_kind == cerebellum_core::identity::SessionKind::Primary)
@@ -6058,7 +6151,17 @@ async fn handle_browser_control(
             let launch = if let Some(service) = planes.launch_service.clone() {
                 let accepted = accepted.clone();
                 let id = browser_session_id.clone();
-                match tokio::task::spawn_blocking(move || service.launch(&accepted, &id)).await {
+                match tokio::task::spawn_blocking(move || {
+                    let holder = accepted
+                        .flow_id
+                        .as_ref()
+                        .map_or_else(cortexkit_resource_busy::Holder::head, |flow_id| {
+                            cortexkit_resource_busy::Holder::flow(flow_id.clone())
+                        });
+                    profile_custody::with_lease_holder(holder, || service.launch(&accepted, &id))
+                })
+                .await
+                {
                     Ok(result) => result,
                     Err(_) => Err(json!({"outcome": "internal_failure"})),
                 }
@@ -6158,19 +6261,24 @@ async fn handle_browser_control(
     }
 }
 
-/// Route-admission refusal beside the prefrontal-only caller guard. Unattended
-/// flow scopes cannot request consent here yet, so this runs before capability
-/// dispatch: no consent card, browser launch or computer read may happen first.
+fn flow_consent_refusal(reason: &str) -> Value {
+    json!({"outcome": "consent_unavailable", "detail": {"reason": reason},
+        "remedy": "an unattended flow cannot ask a person; configure its owner's standing grants"})
+}
+
+/// A daemon stamp with `flow_id` identifies an unattended workflow. Only a
+/// route from reserved:basal with an authorized prefrontal-core owner may use
+/// that authority; every other carrier is refused before capability dispatch.
 fn session_flow_refusal(facts: &AcceptedBindFacts) -> Option<Value> {
     facts
         .scope
         .as_ref()
-        .filter(|stamp| stamp.attributes.flow_id.is_some())
+        .filter(|stamp| stamp.attributes.flow_id.is_some() && facts.flow_id.is_none())
         .map(|_| {
             json!({
                 "outcome": "consent_unavailable",
-                "detail": {"reason": "flow_scopes_unsupported"},
-                "remedy": "flows can't use cerebellum yet",
+                "detail": {"reason": "flow_carrier_not_admitted"},
+                "remedy": "open the flow route through authorized reserved:basal",
             })
         })
 }
@@ -6399,7 +6507,14 @@ pub async fn handle_control_request_for_test(
     health_state: &Arc<HealthState>,
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
-    handle_control_request(frame, writer, health_state, &route_bindings).await
+    handle_control_request(
+        frame,
+        writer,
+        health_state,
+        &route_bindings,
+        &elicit::Elicitor::new(),
+    )
+    .await
 }
 
 pub async fn handle_control_request_for_test_with_bindings(
@@ -6408,7 +6523,14 @@ pub async fn handle_control_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    handle_control_request(frame, writer, health_state, route_bindings).await
+    handle_control_request(
+        frame,
+        writer,
+        health_state,
+        route_bindings,
+        &elicit::Elicitor::new(),
+    )
+    .await
 }
 
 /// The principal a test bind carries when it stands for a session's calls:
@@ -11306,6 +11428,271 @@ mod relayed_computer_call_tests {
             .collect()
     }
 
+    async fn bind_basal_flow(
+        planes: &Planes,
+        tx: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+    ) {
+        let stamp = subc_protocol::scope::ScopeStamp {
+            owner: session_caller_principal_for_test().unwrap(),
+            scope_ref: "flow-head".into(),
+            scope_epoch: 1,
+            kind: subc_protocol::scope::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            attributes: subc_protocol::scope::ScopeAttributes {
+                agent_id: Some("test-project".into()),
+                delegates: true,
+                flow_id: Some("flow-computer".into()),
+            },
+            owner_authorized: true,
+        };
+        let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
+            role_versions: None,
+            route_channel: CHANNEL,
+            epoch: EPOCH,
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+            identity: subc_protocol::BindIdentity::new("/test/project", "test", "test-session"),
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            }),
+            consumer_capabilities: Some(vec!["elicitation".into()]),
+            admission_facts: None,
+            scope: Some(stamp),
+        };
+        handle_frame(
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                40,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+            tx,
+            planes,
+        )
+        .await
+        .unwrap();
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_persistent_app_grant_reads_and_missing_grant_never_reads() {
+        use computer_grants::{
+            AlwaysGrantRecord, ComputerGrants, GrantStorage, GrantStoreState, InMemoryGrantStorage,
+            GRANT_STORE_VERSION,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountReads(Arc<AtomicUsize>);
+        impl AppStateSource for CountReads {
+            fn read_app_state(
+                &self,
+                _: &ProcessGrant,
+                _: ReadBounds,
+            ) -> Result<RawAppState, AppStateReadError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(AppStateReadError::Unreadable)
+            }
+        }
+        for granted in [false, true] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let mut planes = planes_with_source(
+                &InMemoryJournalStorage::new(),
+                Arc::new(CountReads(reads.clone())),
+            );
+            let storage = Arc::new(InMemoryGrantStorage::new());
+            storage
+                .save(&GrantStoreState {
+                    version: GRANT_STORE_VERSION,
+                    records: if granted {
+                        vec![AlwaysGrantRecord {
+                            agent_project_id: "test-project".into(),
+                            bundle_identity: APP.into(),
+                            team_id: Some("FIXTURE001".into()),
+                            designated_requirement: Some(
+                                "certificate leaf[subject.OU] = \"FIXTURE001\"".into(),
+                            ),
+                            machine_uuid: "machine".into(),
+                            created_at_ms: 1,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                })
+                .unwrap();
+            planes.management = Arc::new(ManagementPlane::with_computer_grants(
+                Arc::new(Running),
+                Arc::new(ComputerGrants::open(storage, Some("machine".into()))),
+            ));
+            // Permission granted for this conversation must not authorize an
+            // unattended workflow; only the owner's persistent app grant may.
+            planes
+                .management
+                .computer_grants()
+                .seed_conversation_app_for_test("test-session", APP);
+            planes.computer_admitted =
+                Arc::new(["computer.read_state".into(), "computer.keys".into()].into());
+            let (tx, mut rx) = mpsc::channel(8);
+            bind_basal_flow(&planes, &tx, &mut rx).await;
+            let request =
+                json!({"name":"computer_use","arguments":{"action":"read_state","target":APP}});
+            handle_frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    CHANNEL,
+                    EPOCH,
+                    42,
+                    serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap(),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            if granted {
+                assert_eq!(reads.load(Ordering::SeqCst), 1, "{body}");
+            } else {
+                assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+                assert_eq!(body["reason"], "unattended_flow");
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert!(rx.try_recv().is_err());
+            if granted {
+                planes
+                    .management
+                    .computer_grants()
+                    .seed_takeover_for_test("test-session");
+                let keys = json!({"name":"computer_use","arguments":{"action":"keys","target":APP,"keys":["command","s"]}});
+                handle_frame(
+                    Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        CHANNEL,
+                        EPOCH,
+                        43,
+                        serde_json::to_vec(&keys).unwrap(),
+                    )
+                    .unwrap(),
+                    &tx,
+                    &planes,
+                )
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply.header.ty, FrameType::Response);
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+                assert_eq!(body["reason"], "takeover_not_for_flows", "{body}");
+                assert_eq!(
+                    reads.load(Ordering::SeqCst),
+                    1,
+                    "fronting keys must refuse before another app read"
+                );
+                assert_eq!(planes.elicitor.outstanding(), 0);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_takeover_refuses_even_with_existing_takeover_grant() {
+        let mut planes = planes(&InMemoryJournalStorage::new());
+        planes.computer_admitted = Arc::new(
+            [
+                "computer.takeover_move".into(),
+                "computer.takeover_drag".into(),
+                "computer.takeover_scroll".into(),
+            ]
+            .into(),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        bind_basal_flow(&planes, &tx, &mut rx).await;
+        planes
+            .management
+            .computer_grants()
+            .seed_takeover_for_test("test-session");
+        let image_id = planes.management.app_state_sessions().register_image(
+            "test-session",
+            cerebellum_computer::app_state::session::RegisteredImage {
+                bundle_identity: APP.into(),
+                pid: 4242,
+                process_generation: "1700000000000000".into(),
+                width_px: 100,
+                height_px: 100,
+                mapping: cerebellum_computer::app_state::image::ImageMapping::for_window(
+                    (0.0, 0.0),
+                    (100.0, 100.0),
+                    (100, 100),
+                    (100, 100),
+                )
+                .unwrap(),
+            },
+        );
+        for (corr, action) in [
+            (
+                44,
+                json!({"action":"takeover_scroll", "target":APP,"axis":"vertical","amount_lines":1}),
+            ),
+            (
+                42,
+                json!({"action":"takeover_move", "image_id":image_id, "to":{"x":1,"y":1}}),
+            ),
+            (
+                43,
+                json!({"action":"takeover_drag", "image_id":image_id, "from":{"x":1,"y":1},"to":{"x":2,"y":2}}),
+            ),
+        ] {
+            let request = json!({"name":"computer_use","arguments":action});
+            handle_frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    CHANNEL,
+                    EPOCH,
+                    corr,
+                    serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap(),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+            assert_eq!(body["detail"]["reason"], "takeover_not_for_flows", "{body}");
+            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn flow_scope_admission_blocks_computer_reads_before_consent() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11396,7 +11783,7 @@ mod relayed_computer_call_tests {
                 assert_eq!(
                     serde_json::from_slice::<Value>(&reply.body).unwrap(),
                     json!({
-                        "outcome":"consent_unavailable", "detail":{"reason":"flow_scopes_unsupported"}, "remedy":"flows can't use cerebellum yet"
+                        "outcome":"consent_unavailable", "detail":{"reason":"flow_carrier_not_admitted"}, "remedy":"open the flow route through authorized reserved:basal"
                     })
                 );
                 assert_eq!(reads.load(Ordering::SeqCst), 0);

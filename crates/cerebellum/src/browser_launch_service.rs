@@ -549,9 +549,16 @@ impl ProductionLaunchService {
         let mut locks_guard = map_poisoned_mutex(locks.lock(), "custody_locks_lock")?;
         let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
             .with_launch_timeout(self.config.launch_handshake_deadline_ms);
-        let prepared = bound
-            .acquire_and_prepare(key, &invocation, &reservation, &context)
-            .map_err(|outcome| self.recovery.name_recovery_hold(outcome).as_json())?;
+        let holder = accepted
+            .flow_id
+            .as_ref()
+            .map_or_else(cortexkit_resource_busy::Holder::head, |flow_id| {
+                cortexkit_resource_busy::Holder::flow(flow_id.clone())
+            });
+        let prepared = crate::profile_custody::with_lease_holder(holder, || {
+            bound.acquire_and_prepare(key, &invocation, &reservation, &context)
+        })
+        .map_err(|outcome| self.recovery.name_recovery_hold(outcome).as_json())?;
         let opened = bound
             .launch_prepared(prepared, &commitment)
             .map_err(|outcome| outcome.as_json())?;
@@ -2903,6 +2910,59 @@ mod executable_identity_launch_tests {
         }
     }
 
+    #[test]
+    fn flow_profile_holder_names_flow_and_head_in_both_directions() {
+        let vector: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/flow-browser-profile.json")).unwrap();
+        vector.validate().unwrap();
+        for flow_holds in [true, false] {
+            let service = ProductionLaunchService::open(
+                crate::Planes::short_test_browser_config(),
+                crate::JournalPersistence::Isolated,
+            );
+            let mut head = accepted_facts(Path::new("/test/project"));
+            head.identity.conversation_key = "head-holder".into();
+            head.principal = Some(subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            });
+            let mut flow = head.clone();
+            flow.flow_id = Some("flow-7".into());
+            flow.principal = Some(subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            });
+            flow.identity.conversation_key = "flow:flow-7".into();
+            let (holder, contender) = if flow_holds {
+                (&flow, &head)
+            } else {
+                (&head, &flow)
+            };
+            let held = service
+                .take_launch_profile(holder, "holder-session")
+                .unwrap_or_else(|reply| panic!("{reply}"));
+            crate::profile_custody::lease_deadline(
+                &held.holder_id,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
+            let refusal = service
+                .take_launch_profile(contender, "contender-session")
+                .err()
+                .expect("same agent profile is held");
+            assert_eq!(refusal["outcome"], "resource_busy", "{refusal}");
+            let detail: cortexkit_resource_busy::ResourceBusy =
+                serde_json::from_value(refusal["detail"].clone()).unwrap();
+            detail.validate().unwrap();
+            assert_eq!(
+                detail.holder,
+                if flow_holds {
+                    vector.holder.clone()
+                } else {
+                    cortexkit_resource_busy::Holder::head()
+                }
+            );
+            let mut rollback = held.rollback;
+            rollback.after_reap().unwrap();
+        }
+    }
+
     fn accepted_facts(project_root: &Path) -> AcceptedBindFacts {
         AcceptedBindFacts {
             identity: RouteIdentity {
@@ -2923,6 +2983,7 @@ mod executable_identity_launch_tests {
             consumer_capabilities: Vec::new(),
             surface: RouteSurface::Tools,
             scope: None,
+            flow_id: None,
         }
     }
 
@@ -4321,6 +4382,7 @@ mod orphan_recovery_tests {
                 consumer_capabilities: Vec::new(),
                 surface: RouteSurface::Tools,
                 scope: None,
+                flow_id: None,
             }
         }
 

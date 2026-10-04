@@ -299,7 +299,7 @@ pub struct AcceptedBindFacts {
     pub identity: RouteIdentity,
     pub principal: Option<Principal>,
     /// True only when the project id came from daemon admission facts or an
-    /// authorized non-flow prefrontal-core scope, never the project-root fallback.
+    /// authorized prefrontal-core scope, never the project-root fallback.
     pub agent_project_id_attested: bool,
     /// Permits durable browser profiles and reading or offering standing browser
     /// and persistent application grants for the attested agent.
@@ -335,6 +335,9 @@ pub struct AcceptedBindFacts {
     /// a request body. `None` for a route opened without a scope, which is
     /// served exactly as routes were before scopes existed.
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// The unattended workflow's id, retained only for reserved:basal routes
+    /// carrying an authorized prefrontal-core stamp and fixed at bind time.
+    pub flow_id: Option<String>,
 }
 
 impl AcceptedBindFacts {
@@ -367,6 +370,7 @@ impl AcceptedBindFacts {
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
             scope: None,
+            flow_id: None,
         }
     }
 
@@ -375,9 +379,28 @@ impl AcceptedBindFacts {
     pub fn with_scope(mut self, scope: Option<subc_protocol::scope::ScopeStamp>) -> Self {
         if let Some(stamp) = scope
             .as_ref()
+            .filter(|stamp| flow_carrier_admitted(stamp, &self.principal))
+        {
+            self.flow_id = stamp.attributes.flow_id.clone();
+            // Bind admission facts describe the carrier, not the workflow's owner.
+            // Only the authorized scope may identify the agent a flow acts for.
+            self.identity.agent_project_id.clear();
+            self.identity.profile_disposition = ProfileDisposition::None;
+            self.agent_project_id_attested = false;
+            self.session_kind_attested = false;
+            self.acts_as_agent = false;
+            self.control_operations.clear();
+        }
+        if let Some(stamp) = scope
+            .as_ref()
             .filter(|stamp| scope_admission_eligible(stamp, &self.principal))
         {
-            if let Some(agent) = &stamp.attributes.agent_id {
+            if let Some(agent) = stamp
+                .attributes
+                .agent_id
+                .as_ref()
+                .filter(|_| self.flow_id.is_none() || stamp.attributes.delegates)
+            {
                 self.identity.agent_project_id = agent.clone();
                 self.identity.session_kind = session_kind_from_scope(stamp.kind);
                 self.identity.profile_disposition = if !stamp.attributes.delegates
@@ -444,9 +467,11 @@ impl AcceptedBindFacts {
     ///
     /// True means asking is worth attempting, never that an answer will arrive.
     pub fn declares_elicitation(&self) -> bool {
-        self.consumer_capabilities
-            .iter()
-            .any(|family| family == ELICITATION_CAPABILITY)
+        self.flow_id.is_none()
+            && self
+                .consumer_capabilities
+                .iter()
+                .any(|family| family == ELICITATION_CAPABILITY)
     }
 
     /// Whether daemon-attested bind facts admit this control operation. Caller
@@ -496,7 +521,7 @@ impl AcceptedBindFacts {
     /// admission facts on the bind say which conversation a call would act in,
     /// never whether this caller may act in one.
     pub fn admits_session_calls(&self) -> bool {
-        crate::principal::admits_session_calls(&self.principal)
+        self.flow_id.is_some() || crate::principal::admits_session_calls(&self.principal)
     }
 
     /// These facts as an operator's call outside any conversation sees them.
@@ -532,6 +557,7 @@ impl AcceptedBindFacts {
             // A scope is session identity, like the conversation above, so an
             // operator's view outside any session carries none.
             scope: None,
+            flow_id: None,
         }
     }
 
@@ -556,10 +582,27 @@ fn scope_admission_eligible(
     let core = Principal::Reserved {
         module_id: "prefrontal-core".to_string(),
     };
-    stamp.owner_authorized
-        && stamp.owner == core
-        && principal.as_ref() == Some(&core)
-        && stamp.attributes.flow_id.is_none()
+    flow_carrier_admitted(stamp, principal)
+        || (stamp.owner_authorized
+            && stamp.owner == core
+            && principal.as_ref() == Some(&core)
+            && stamp.attributes.flow_id.is_none())
+}
+
+fn flow_carrier_admitted(
+    stamp: &subc_protocol::scope::ScopeStamp,
+    principal: &Option<Principal>,
+) -> bool {
+    stamp.attributes.flow_id.is_some()
+        && stamp.owner_authorized
+        && stamp.owner
+            == Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            }
+        && principal.as_ref()
+            == Some(&Principal::Reserved {
+                module_id: "basal".into(),
+            })
 }
 
 /// Map daemon scope kinds explicitly to the older session-kind vocabulary.

@@ -41,6 +41,7 @@ tokio::task_local! {
     /// served outside such a scope, or on a task spawned from it, sees no
     /// caller and is authorized by conversation grants alone.
     static STANDING_CALLER: Option<StandingCaller>;
+    static FLOW: bool;
 }
 
 /// Run `future` with `caller` as the agent whose standing browser rows may
@@ -50,6 +51,12 @@ pub async fn with_standing_caller<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     STANDING_CALLER.scope(caller, future).await
+}
+
+/// Unattended workflows use their owner's persistent browser permissions,
+/// never permission granted just for a conversation with a person.
+pub(crate) async fn with_flow<F: std::future::Future>(flow: bool, future: F) -> F::Output {
+    FLOW.scope(flow, future).await
 }
 
 fn current_standing_caller() -> Option<StandingCaller> {
@@ -704,7 +711,11 @@ impl GrantStore {
         let mut conversation_grants = self
             .current
             .values()
-            .filter(|grant| grant.validate().is_ok() && grant.conversation_key == conversation_key)
+            .filter(|grant| {
+                !FLOW.try_with(|flow| *flow).unwrap_or(false)
+                    && grant.validate().is_ok()
+                    && grant.conversation_key == conversation_key
+            })
             .collect::<Vec<_>>();
         conversation_grants.sort_by(compare_grants);
         let candidates = conversation_grants

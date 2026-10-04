@@ -9,6 +9,7 @@ use cortexkit_resource_busy::{Holder, ResourceBusy};
 struct Timing {
     since_ms: u64,
     deadline: Option<Instant>,
+    holder: Holder,
 }
 static TIMINGS: OnceLock<Mutex<HashMap<String, Timing>>> = OnceLock::new();
 
@@ -26,6 +27,7 @@ pub(crate) fn acquired(holder_id: &str) {
                     .as_millis()
                     .min(u64::MAX as u128) as u64,
                 deadline: None,
+                holder: ACQUIRING_HOLDER.with(|holder| holder.borrow().clone()),
             },
         );
 }
@@ -49,11 +51,22 @@ pub(crate) fn released(holder_id: &str) {
         .remove(holder_id);
 }
 
-/// Every holder is the agent's head session today, because cerebellum serves no
-/// flows yet. Once it does, a holder whose route carries a `flow_id` maps to
-/// `Holder::flow(flow_id)` here.
-fn browser_profile_holder() -> Holder {
-    Holder::head()
+thread_local! {
+    static ACQUIRING_HOLDER: std::cell::RefCell<Holder> = std::cell::RefCell::new(Holder::head());
+}
+
+/// Carry the route's head-or-flow identity while acquiring the browser profile
+/// lock, without changing its on-disk record. Restore the previous identity even
+/// when acquisition unwinds.
+pub(crate) fn with_holder<T>(holder: Holder, acquire: impl FnOnce() -> T) -> T {
+    struct Restore(Holder);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACQUIRING_HOLDER.with(|holder| *holder.borrow_mut() = self.0.clone());
+        }
+    }
+    let _restore = Restore(ACQUIRING_HOLDER.with(|current| current.replace(holder)));
+    acquire()
 }
 
 pub(crate) fn refusal(holder_id: &str) -> Option<ResourceBusy> {
@@ -69,7 +82,7 @@ pub(crate) fn refusal(holder_id: &str) -> Option<ResourceBusy> {
         .min(u64::MAX as u128) as u64;
     let detail = ResourceBusy::new(
         "browser_profile",
-        browser_profile_holder(),
+        timing.holder.clone(),
         timing.since_ms,
         remaining,
     );
