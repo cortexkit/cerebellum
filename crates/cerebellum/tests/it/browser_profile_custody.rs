@@ -1499,3 +1499,51 @@ fn the_supervisor_generation_carries_a_boot_id_exactly_on_linux() {
     let own = current_supervisor_generation().expect("this platform records a supervisor");
     assert_eq!(own.boot_id.is_some(), cfg!(target_os = "linux"));
 }
+
+#[test]
+fn cross_process_holder_without_lease_timing_keeps_profile_busy_wire_shape() {
+    let root = TestRoot::new("remote-busy-holder");
+    let remote = generation(901, 901000);
+    let mut locks =
+        ProfileCustodyLocks::open(root.path(), remote, RecordingJournal::default(), AlwaysLive)
+            .unwrap();
+    let holder = locks.mint_holder().unwrap();
+    let claim = match locks
+        .acquire(ProfileCustodyKey::durable("project-1"), holder.clone())
+        .unwrap()
+    {
+        ProfileCustodyAcquisition::Acquired(claim) => claim,
+        other => panic!("unexpected acquisition: {other:?}"),
+    };
+    let lock_path = profile_lock_path(root.path());
+    let remote_record = fs::read(&lock_path).unwrap();
+    locks.release_exact(&claim).unwrap();
+    // Install the evidence another supervisor leaves, with no local timing entry.
+    fs::write(&lock_path, remote_record).unwrap();
+    let mut contender = ProfileCustodyLocks::open(
+        root.path(),
+        generation(902, 902000),
+        RecordingJournal::default(),
+        AlwaysLive,
+    )
+    .unwrap();
+    let mut lifecycle = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
+    let (invocation, reservation, _) = tokens("remote-contender");
+    let refusal = ProfileBoundLaunch::new(&mut lifecycle, &mut contender)
+        .with_launch_timeout(100)
+        .acquire_and_prepare(
+            ProfileCustodyKey::durable("project-1"),
+            &invocation,
+            &reservation,
+            &context("primary", "durable", "remote-contender"),
+        )
+        .unwrap_err()
+        .as_json();
+    assert_eq!(
+        refusal,
+        json!({
+            "outcome":"profile_busy", "holder_id":holder.as_str(),
+            "remedy":"another session holds this project's browser profile; close that session's browser or retry once it releases"
+        })
+    );
+}

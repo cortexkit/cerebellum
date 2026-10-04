@@ -540,7 +540,8 @@ impl ProductionLaunchService {
 
         let mut lifecycle_guard = map_poisoned_mutex(lifecycle.lock(), "profile_registry_lock")?;
         let mut locks_guard = map_poisoned_mutex(locks.lock(), "custody_locks_lock")?;
-        let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard);
+        let mut bound = ProfileBoundLaunch::new(&mut lifecycle_guard, &mut locks_guard)
+            .with_launch_timeout(self.config.launch_handshake_deadline_ms);
         let prepared = bound
             .acquire_and_prepare(key, &invocation, &reservation, &context)
             .map_err(|outcome| self.recovery.name_recovery_hold(outcome).as_json())?;
@@ -579,13 +580,14 @@ impl ProductionLaunchService {
             }));
         }
 
-        let rollback = SharedRollback::new(
+        let mut rollback = SharedRollback::new(
             Arc::clone(&lifecycle),
             Arc::clone(&locks),
             Box::new(move |lifecycle, locks| {
                 ProfileBoundLaunch::new(lifecycle, locks).rollback_opened(opened)
             }),
         );
+        rollback.holder_id = Some(holder_id.clone());
         drop(locks_guard);
         drop(lifecycle_guard);
         Ok(HeldLaunchProfile {
@@ -2264,6 +2266,7 @@ impl BrowserExitProbe for ProductionExitProbe {
 
 #[derive(Clone)]
 struct SharedRollback {
+    holder_id: Option<String>,
     state: Arc<Mutex<Option<SharedRollbackState>>>,
 }
 
@@ -2291,6 +2294,7 @@ impl SharedRollback {
         rollback: ErasedRollback,
     ) -> Self {
         Self {
+            holder_id: None,
             state: Arc::new(Mutex::new(Some(SharedRollbackState {
                 lifecycle,
                 locks,
@@ -2470,6 +2474,10 @@ impl ProductionSessionCleanup {
 }
 
 impl SessionCleanup for ProductionSessionCleanup {
+    fn custody_holder_id(&self) -> Option<&str> {
+        self.profile.holder_id.as_deref()
+    }
+
     fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
         self.terminal_outcome = Some(outcome);
     }
@@ -3056,6 +3064,7 @@ mod cleanup_ordering_tests {
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&released);
         let rollback = SharedRollback {
+            holder_id: None,
             state: Arc::new(Mutex::new(Some(SharedRollbackState {
                 lifecycle,
                 locks,
@@ -3229,6 +3238,7 @@ mod crash_reports_teardown_tests {
             },
             // No profile custody to give back.
             profile: SharedRollback {
+                holder_id: None,
                 state: Arc::new(Mutex::new(None)),
             },
             crash_reports: Some(crash_reports),

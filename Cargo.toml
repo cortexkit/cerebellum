@@ -47,6 +47,7 @@ subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # than carrying a copy that drifts. Pinned by subtree in commons-source.txt
 # the same way the subconscious crates are.
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
+cortexkit-resource-busy = { path = "../commons/crates/cortexkit-resource-busy" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -76,3 +77,4 @@ subc-os = { path = "../subconscious/crates/subc-os" }
 # The published tool-provider contract depends on cortexkit-store-types by
 # version; one copy, the sibling the module itself links and pins.
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
+cortexkit-resource-busy = { path = "../commons/crates/cortexkit-resource-busy" }

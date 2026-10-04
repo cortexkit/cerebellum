@@ -789,6 +789,7 @@ where
         }
         match install_record(&self.root, &lock_path, &record) {
             Ok(()) => {
+                super::lease_acquired(holder_id.as_str());
                 drop(coordination);
                 Ok(ProfileCustodyAcquisition::Acquired(ProfileCustodyClaim {
                     key,
@@ -907,6 +908,7 @@ where
             .map_err(ProfileCustodyLockError::Journal)?;
         fs::remove_file(path)?;
         sync_directory(&self.root)?;
+        super::lease_released(claim.holder_id.as_str());
         Ok(ProfileCustodyRelease::Released)
     }
 

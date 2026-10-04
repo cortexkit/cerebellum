@@ -104,12 +104,14 @@ impl BrowserSessionTerminalOutcome {
 pub struct BrowserLease {
     idle_timeout_ms: u64,
     monotonic_deadline: MonoInstant,
+    custody_holder_id: Option<String>,
 }
 
 impl BrowserLease {
     pub fn established<C: MonotonicClock>(idle_timeout_ms: u64, clock: &C) -> Self {
         Self {
             idle_timeout_ms,
+            custody_holder_id: None,
             monotonic_deadline: clock
                 .now()
                 .saturating_add(Duration::from_millis(idle_timeout_ms)),
@@ -120,6 +122,24 @@ impl BrowserLease {
         self.monotonic_deadline = clock
             .now()
             .saturating_add(Duration::from_millis(self.idle_timeout_ms));
+        self.sync_custody_deadline(clock);
+    }
+
+    fn sync_custody_deadline<C: MonotonicClock>(&self, clock: &C) {
+        if let Some(holder_id) = &self.custody_holder_id {
+            // Convert the session's monotonic deadline to a standard Instant.
+            // Sample Instant before the monotonic clock so the retry hint cannot
+            // exceed the idle reaper's remaining time.
+            let now = std::time::Instant::now();
+            let remaining_ns = self
+                .monotonic_deadline
+                .as_nanos()
+                .saturating_sub(clock.now().as_nanos());
+            crate::profile_custody::lease_deadline(
+                holder_id,
+                now + Duration::from_nanos(remaining_ns),
+            );
+        }
     }
 
     pub fn deadline(&self) -> MonoInstant {
@@ -793,6 +813,10 @@ struct RouteKillSwitch {
 }
 
 pub trait SessionCleanup: Send {
+    fn custody_holder_id(&self) -> Option<&str> {
+        None
+    }
+
     fn set_terminal_outcome(&mut self, outcome: BrowserSessionTerminalOutcome) {
         let _ = outcome;
     }
@@ -1170,6 +1194,7 @@ impl SessionCell {
                 lease: BrowserLease {
                     idle_timeout_ms: 1,
                     monotonic_deadline: MonoInstant::from_nanos(0),
+                    custody_holder_id: None,
                 },
                 pending_operations: 0,
                 terminal: None,
@@ -1697,6 +1722,8 @@ impl BrowserSessions {
         }
         meta.disposition = disposition;
         meta.lease = BrowserLease::established(config.browser_idle_timeout_ms, clock);
+        meta.lease.custody_holder_id = cleanup.custody_holder_id().map(str::to_owned);
+        meta.lease.sync_custody_deadline(clock);
         meta.cleanup = Some(cleanup);
         meta.lifecycle = Lifecycle::Ready;
         let result = (
