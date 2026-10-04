@@ -102,6 +102,7 @@ enum Reply {
 /// The questions this module has outstanding.
 pub struct Elicitor {
     lane: AskLane<oneshot::Sender<Reply>>,
+    unattended: std::sync::Mutex<std::collections::HashSet<(u16, u32)>>,
 }
 
 impl Default for Elicitor {
@@ -114,6 +115,17 @@ impl Elicitor {
     pub fn new() -> Self {
         Self {
             lane: AskLane::new(),
+            unattended: Default::default(),
+        }
+    }
+
+    /// Record whether a bound route has no person to ask. Epochs keep a reused
+    /// channel from inheriting the preceding route's consent policy.
+    pub(crate) fn set_unattended(&self, channel: u16, epoch: u32, unattended: bool) {
+        let mut routes = self.unattended.lock().unwrap_or_else(|e| e.into_inner());
+        routes.remove(&(channel, epoch));
+        if unattended {
+            routes.insert((channel, epoch));
         }
     }
 
@@ -131,6 +143,16 @@ impl Elicitor {
         mut body: Value,
         deadline: Duration,
     ) -> AskOutcome {
+        // Enforce the no-person boundary before registering or sending any card,
+        // including cards raised on detached settlement tasks.
+        if self
+            .unattended
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(channel, epoch))
+        {
+            return AskOutcome::Undeliverable;
+        }
         let guard = ROUTE_GUARD.try_with(Arc::clone).ok();
         let _parked = guard.as_ref().map(|guard| guard.park_on_consent());
         let correlation = self.lane.next_correlation();

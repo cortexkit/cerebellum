@@ -672,6 +672,8 @@ impl RouteLiveness for AlwaysOpenRoute {
 /// Everything a call needs to ask for a grant and wait for the answer.
 pub struct ConsentContext {
     pub caller: GrantCaller,
+    /// An unattended flow can use persistent app grants but can never ask.
+    pub unattended: bool,
     /// How to reach a person, or `None` when the route declared it cannot
     /// relay a question.
     pub carrier: Option<Arc<dyn QuestionCarrier>>,
@@ -700,6 +702,7 @@ impl ConsentContext {
             drain,
             park_guard,
             park_limit: CONSENT_PARK_LIMIT,
+            unattended: false,
         }
     }
 
@@ -1197,10 +1200,14 @@ impl ComputerGrants {
                 let key = (caller.conversation_key.clone(), bundle_identity.clone());
                 // A deny given in this conversation holds even over an older
                 // standing answer: the person said no to this conversation.
-                if state.conversation_app_denies.contains(&key) {
+                if !caller.conversation_key.is_empty()
+                    && state.conversation_app_denies.contains(&key)
+                {
                     return Standing::Denied;
                 }
-                let conversation = state.conversation_apps.get(&key).cloned();
+                let conversation = (!caller.conversation_key.is_empty())
+                    .then(|| state.conversation_apps.get(&key).cloned())
+                    .flatten();
                 // Released before the signature checks, which read the
                 // process and must not hold every other call up meanwhile.
                 drop(state);
@@ -1260,6 +1267,11 @@ impl ComputerGrants {
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_takeover_for_test(&self, conversation: &str) {
+        lock(&self.state).takeovers.insert(conversation.to_owned());
+    }
+
     /// Whether the caller holds the grant now, without asking anyone.
     pub fn holds(&self, caller: &GrantCaller, need: &GrantNeed) -> bool {
         matches!(self.standing(caller, need), Standing::Granted)
@@ -1273,6 +1285,12 @@ impl ComputerGrants {
         context: &ConsentContext,
         cancel: &CancelHandle,
     ) -> Result<GrantAdmission, ConsentRefusal> {
+        if context.unattended && matches!(need, GrantNeed::Takeover) {
+            return Err(ConsentRefusal::Unavailable {
+                reason: "takeover_not_for_flows",
+                remedy: "takeover requires an attended session",
+            });
+        }
         let caller = &context.caller;
         let mut signature_changed = false;
         match self.standing(caller, need) {
@@ -1295,6 +1313,9 @@ impl ComputerGrants {
                     self.drop_conversation_grant(caller, need, &stale);
                 }
             }
+        }
+        if context.unattended {
+            return Err(ConsentRefusal::Unavailable { reason: "unattended_flow", remedy: "an unattended flow cannot ask a person; configure its owner's persistent app grant" });
         }
         // The identity a grant made by this question is bound to. Read before
         // asking, so nobody is asked about a process no grant could be bound

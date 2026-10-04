@@ -1247,6 +1247,21 @@ where
             return unposted(refusal);
         }
 
+        if consent.unattended
+            && keystrokes::key_delivery(
+                &parsed.action,
+                self.app_state_source.frontmost_pid() == Some(grant.pid),
+                true,
+            ) == keystrokes::KeyDelivery::BringForward
+        {
+            return unposted(
+                ConsentRefusal::Unavailable {
+                    reason: "takeover_not_for_flows",
+                    remedy: "fronting keys requires an attended session",
+                }
+                .reply(None),
+            );
+        }
         // Before anything is posted or fronted: the target's own focused
         // element must be readable and must not be a secure field. Asked of
         // the target rather than of the frontmost application, because the
@@ -1280,6 +1295,17 @@ where
                 &crate::computer_grants::GrantNeed::Takeover,
             ),
         );
+        // Focus may have moved while the focused element was read. Recheck
+        // before choosing a delivery path that would require takeover.
+        if consent.unattended && delivery != keystrokes::KeyDelivery::PerProcess {
+            return unposted(
+                ConsentRefusal::Unavailable {
+                    reason: "takeover_not_for_flows",
+                    remedy: "fronting keys requires an attended session",
+                }
+                .reply(None),
+            );
+        }
         if delivery == keystrokes::KeyDelivery::Refuse {
             let mut reply = keystrokes::modifier_chord_refusal();
             admission.decorate(&mut reply);

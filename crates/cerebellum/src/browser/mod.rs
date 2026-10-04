@@ -4337,6 +4337,7 @@ fn browser_result_outcome_schema() -> Value {
         "image_too_large",
         "authorization_denied",
         "consent_pending",
+        "consent_unavailable",
         "hazard_not_disclosed",
         "navigation_policy_rejected",
         "navigation_failed",
@@ -4513,6 +4514,7 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
     // than to whichever of them first happened to be exercised.
     let mut outcomes = outcomes.to_vec();
     outcomes.push("authorization_denied");
+    outcomes.push("consent_unavailable");
     properties.insert("outcome".into(), enum_schema(&outcomes));
     let detail = match properties.remove("detail") {
         Some(detail) => json!({"anyOf": [invalid_request_detail_result_schema(), detail]}),

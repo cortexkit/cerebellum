@@ -429,7 +429,10 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         // This module-level declaration lets route openers discover scoped
         // admission support independently of the tool and management roles.
         .capabilities(Some(CapabilityDeclarations {
-            provides: vec![SCOPE_ADMISSION_CAPABILITY.to_string()],
+            provides: vec![
+                SCOPE_ADMISSION_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))

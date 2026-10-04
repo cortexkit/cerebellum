@@ -2399,6 +2399,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
         session_kind_attested: true,
         control_operations: Vec::new(),
         effective_capability_scope: None,
+        flow_id: None,
         consumer_capabilities: Vec::new(),
         surface: RouteSurface::Tools,
         scope: None,
@@ -6846,6 +6847,16 @@ mod resource_busy_wire {
     }
     #[tokio::test]
     async fn resource_busy_same_agent_launch_reaches_withhold_boundary_with_real_lease_timing() {
+        resource_busy_pair(None).await;
+    }
+
+    #[tokio::test]
+    async fn flow_resource_busy_wire_names_real_holder_in_both_directions() {
+        resource_busy_pair(Some(true)).await;
+        resource_busy_pair(Some(false)).await;
+    }
+
+    async fn resource_busy_pair(flow_holds: Option<bool>) {
         let since = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -6889,6 +6900,45 @@ mod resource_busy_wire {
         planes.launch_service = Some(launcher.clone());
         bind(&planes, 9, "holder-conversation").await;
         bind(&planes, 10, "contender-conversation").await;
+        if let Some(flow_holds) = flow_holds {
+            let mut stamp = flow_stamp();
+            stamp.attributes.agent_id = Some("same-agent".into());
+            let (channel, conversation) = if flow_holds {
+                (9, "holder-conversation")
+            } else {
+                (10, "contender-conversation")
+            };
+            let bind = ModuleControlRequest::RouteBind {
+                role_versions: None,
+                route_channel: channel,
+                epoch: 3,
+                target: RouteTarget::ToolProvider {
+                    module_id: "cerebellum".into(),
+                },
+                identity: BindIdentity::new("/same/project", "test", conversation),
+                principal: Some(reserved("basal")),
+                consumer_capabilities: Some(vec!["elicitation".into()]),
+                admission_facts: None,
+                scope: Some(stamp),
+            };
+            let (tx, mut rx) = mpsc::channel(2);
+            cerebellum::handle_frame_for_test(
+                Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Passive, false),
+                    0,
+                    0,
+                    2,
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap(),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+        }
         let launched = launch(&planes, 9).await;
         assert_eq!(launched["outcome"], "launched", "{launched}");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -6898,8 +6948,19 @@ mod resource_busy_wire {
             serde_json::from_value(reply["detail"].clone()).unwrap();
         detail.validate().unwrap();
         assert_eq!(detail.resource, "browser_profile");
-        assert_eq!(detail.holder, cortexkit_resource_busy::Holder::head());
-        assert!(reply["detail"]["holder"].get("flow_id").is_none());
+        let vector: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/flow-browser-profile.json")).unwrap();
+        vector.validate().unwrap();
+        assert_eq!(
+            detail.holder,
+            if flow_holds == Some(true) {
+                vector.holder
+            } else {
+                cortexkit_resource_busy::Holder::head()
+            }
+        );
+        if flow_holds != Some(true) {
+            assert!(reply["detail"]["holder"].get("flow_id").is_none());
+        }
         assert!(detail.since_ms >= since && detail.since_ms <= since + 3000);
         assert!(
             detail.retry_after_ms <= config().browser_idle_timeout_ms - 50,
@@ -7023,7 +7084,7 @@ async fn assert_scope_unattested(stamp: subc_protocol::scope::ScopeStamp, princi
         body["reason"] == "admission_facts_absent"
             || body["code"] == "session_caller_not_admitted"
             || (body["outcome"] == "consent_unavailable"
-                && body["detail"]["reason"] == "flow_scopes_unsupported"),
+                && body["detail"]["reason"] == "flow_carrier_not_admitted"),
         "{body}"
     );
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
@@ -7308,7 +7369,7 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
         .ty,
         FrameType::Response
     );
-    let expected = json!({"outcome":"consent_unavailable", "detail":{"reason":"flow_scopes_unsupported"}, "remedy":"flows can't use cerebellum yet"});
+    let expected = json!({"outcome":"consent_unavailable", "detail":{"reason":"flow_carrier_not_admitted"}, "remedy":"open the flow route through authorized reserved:basal"});
     let (tx, mut rx) = mpsc::channel(8);
     for (corr, name, args) in [
         (801, "browser_use", json!({"action":"launch"})),
@@ -7368,4 +7429,473 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
         body, expected,
         "without a flow the call must reach ordinary computer admission: {body}"
     );
+}
+
+fn flow_stamp() -> subc_protocol::scope::ScopeStamp {
+    let mut stamp = admission_stamp();
+    stamp.attributes.flow_id = Some("flow-7".into());
+    stamp
+}
+
+async fn bind_flow_wire(
+    planes: &Planes,
+    stamp: Option<subc_protocol::scope::ScopeStamp>,
+    principal: Principal,
+) {
+    bind_flow_wire_target(
+        planes,
+        stamp,
+        principal,
+        RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .await;
+}
+
+async fn bind_flow_wire_target(
+    planes: &Planes,
+    stamp: Option<subc_protocol::scope::ScopeStamp>,
+    principal: Principal,
+    target: RouteTarget,
+) {
+    let reply = bind_flow_wire_reply(planes, stamp, principal, target).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+async fn bind_flow_wire_reply(
+    planes: &Planes,
+    stamp: Option<subc_protocol::scope::ScopeStamp>,
+    principal: Principal,
+    target: RouteTarget,
+) -> Frame {
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        route_channel: 9,
+        epoch: 3,
+        target,
+        identity: BindIdentity::new("/caller/project", "test", "test-session"),
+        principal: Some(principal),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: None,
+        scope: stamp,
+    };
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap(),
+        &tx,
+        planes,
+    )
+    .await
+    .unwrap();
+    rx.recv().await.unwrap()
+}
+
+async fn flow_wire_call(planes: &Planes, corr: u64, action: Value) -> Value {
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(request(corr, "browser_use", action), &tx, planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "no flow may elicit: {reply:?}"
+    );
+    assert_eq!(planes.elicitor.outstanding(), 0);
+    assert!(rx.try_recv().is_err(), "unexpected elicitation frame");
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+fn flow_planes() -> (Planes, Arc<RecordingLauncher>) {
+    let (mut planes, launcher) = scope_admission_planes();
+    planes.browser = Arc::new(
+        Arc::try_unwrap(planes.browser)
+            .unwrap_or_else(|_| panic!("fresh browser plane is uniquely owned"))
+            .with_result_schema_enforcement(
+                cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+            ),
+    );
+    (planes, launcher)
+}
+
+#[tokio::test]
+async fn flow_owner_standing_grant_navigates_without_elicitation() {
+    let (planes, launcher) = flow_planes();
+    seed_scope_standing_grant(&planes).await;
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let launch = flow_wire_call(&planes, 2, json!({"action":"launch"})).await;
+    assert_eq!(launch["outcome"], "launched", "{launch}");
+    let accepted = launcher.accepted_launches.lock().unwrap()[0].clone();
+    assert_eq!(
+        accepted.identity.logical_profile_key(),
+        Some(("pj-scope-agent".into(), "default".into()))
+    );
+    assert_eq!(accepted.flow_id.as_deref(), Some("flow-7"));
+    let reply = flow_wire_call(&planes, 3, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(*launcher.launches.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn flow_missing_browser_grant_refuses_before_launch_or_navigation() {
+    let (planes, launcher) = flow_planes();
+    grant_browser(&planes, "https://page.example", vec![]).await;
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "unattended_flow");
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    assert!(launcher.accepted_launches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
+    for no_agent in [true, false] {
+        let (planes, launcher) = flow_planes();
+        seed_scope_standing_grant(&planes).await;
+        let mut stamp = flow_stamp();
+        if no_agent {
+            stamp.attributes.agent_id = None;
+        } else {
+            stamp.attributes.delegates = false;
+        }
+        bind_flow_wire(&planes, Some(stamp.clone()), reserved("basal")).await;
+        let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
+        assert!(!facts.acts_as_agent);
+        assert!(!facts.agent_project_id_attested);
+        assert!(!facts.session_kind_attested);
+        assert_eq!(facts.identity.logical_profile_key(), None);
+        for (corr, action) in [
+            (2, json!({"action":"launch"})),
+            (
+                3,
+                json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
+            ),
+        ] {
+            assert_eq!(
+                flow_wire_call(&planes, corr, action).await["outcome"],
+                "consent_unavailable"
+            );
+        }
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
+    for (principal, owner, authorized) in [
+        ("prefrontal-core", "prefrontal-core", true),
+        ("broca", "prefrontal-core", true),
+    ] {
+        let (planes, launcher) = flow_planes();
+        let mut stamp = flow_stamp();
+        stamp.owner = reserved(owner);
+        stamp.owner_authorized = authorized;
+        bind_flow_wire(&planes, Some(stamp), reserved(principal)).await;
+        for (corr, action) in [
+            (2, json!({"action":"launch"})),
+            (
+                3,
+                json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
+            ),
+        ] {
+            let reply = flow_wire_call(&planes, corr, action).await;
+            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+            assert_eq!(
+                reply["detail"]["reason"], "flow_carrier_not_admitted",
+                "{reply}"
+            );
+        }
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
+    let (planes, launcher) = flow_planes();
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    for (corr, action) in [
+        (
+            2,
+            json!({"action":"import_login","origin":"https://page.example"}),
+        ),
+        (
+            3,
+            json!({"action":"capture_login","credential_domain":"page.example","account":"me","fetch_url":"https://page.example/api","login_url":"https://page.example/login"}),
+        ),
+        (
+            4,
+            json!({"action":"open_grant","origins":["https://page.example"],"hazards":[]}),
+        ),
+        (
+            5,
+            json!({"action":"present","origin":"https://page.example"}),
+        ),
+    ] {
+        let reply = flow_wire_call(&planes, corr, action).await;
+        assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+        assert_eq!(reply["detail"]["reason"], "unattended_flow", "{reply}");
+    }
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flow_elicitation_chokepoint_refuses_future_cards() {
+    let (planes, _) = flow_planes();
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let ending = planes
+        .elicitor
+        .ask(
+            &tx,
+            9,
+            3,
+            json!({"method":"elicitation/create","params":{}}),
+            Duration::from_millis(10),
+        )
+        .await;
+    assert_eq!(ending, cerebellum::elicit::AskOutcome::Undeliverable);
+    assert_eq!(planes.elicitor.outstanding(), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn flow_recovery_and_profile_rebind_consent_sites_never_open_cards() {
+    let (planes, launcher) = flow_planes();
+    bind_flow_wire_target(
+        &planes,
+        Some(flow_stamp()),
+        reserved("basal"),
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .await;
+    for (corr, method, params) in [
+        (
+            2,
+            cerebellum::management::CLEAR_LAUNCH_RECOVERY,
+            json!({"agent_project_id":"pj-scope-agent"}),
+        ),
+        (3, cerebellum::management::REBIND_PROFILE_ROOT, json!({})),
+    ] {
+        let mut frame = request(corr, "unused", json!({}));
+        frame.body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        cerebellum::handle_frame_for_test(frame, &tx, &planes)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+        assert_eq!(body["detail"]["reason"], "unattended_flow");
+        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flow_basal_bind_requires_admitted_carrier() {
+    let mut no_flow_id = flow_stamp();
+    no_flow_id.attributes.flow_id = None;
+    let mut unauthorized = flow_stamp();
+    unauthorized.owner_authorized = false;
+    let mut wrong_owner = flow_stamp();
+    wrong_owner.owner = reserved("broca");
+    for stamp in [
+        None,
+        Some(no_flow_id),
+        Some(unauthorized),
+        Some(wrong_owner),
+    ] {
+        let (planes, launcher) = flow_planes();
+        let reply = bind_flow_wire_reply(
+            &planes,
+            stamp,
+            reserved("basal"),
+            RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "principal_denied", "{body}");
+        assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+        assert_eq!(planes.elicitor.outstanding(), 0);
+    }
+}
+
+#[tokio::test]
+async fn flow_operator_operations_cannot_list_or_revoke_app_grants() {
+    use cerebellum::computer_grants::{
+        AlwaysGrantRecord, ComputerGrants, GrantStorage, GrantStoreState, InMemoryGrantStorage,
+        GRANT_STORE_VERSION,
+    };
+    let (mut planes, launcher) = flow_planes();
+    let storage = Arc::new(InMemoryGrantStorage::new());
+    let state = GrantStoreState {
+        version: GRANT_STORE_VERSION,
+        records: vec![AlwaysGrantRecord {
+            agent_project_id: "pj-scope-agent".into(),
+            bundle_identity: "com.example.Editor".into(),
+            team_id: Some("TEAM".into()),
+            designated_requirement: Some("test requirement".into()),
+            machine_uuid: "machine".into(),
+            created_at_ms: 1,
+        }],
+    };
+    storage.save(&state).unwrap();
+    planes.management = Arc::new(
+        cerebellum::management::ManagementPlane::with_computer_grants(
+            Arc::new(cerebellum::management::PlatformResolver::new()),
+            Arc::new(ComputerGrants::open(
+                storage.clone(),
+                Some("machine".into()),
+            )),
+        ),
+    );
+    assert_eq!(
+        planes.management.computer_grants().list()["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    bind_flow_wire_target(
+        &planes,
+        Some(flow_stamp()),
+        reserved("basal"),
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .await;
+    for (corr, method, params) in [
+        (2, cerebellum::management::LIST_APP_GRANTS, json!({})),
+        (
+            3,
+            cerebellum::management::REVOKE_APP_GRANT,
+            json!({"grantee":"pj-scope-agent","bundle_identity":"com.example.Editor"}),
+        ),
+        (
+            4,
+            cerebellum::management::CLEAR_LAUNCH_RECOVERY,
+            json!({"agent_project_id":"pj-scope-agent"}),
+        ),
+        (5, cerebellum::management::REBIND_PROFILE_ROOT, json!({})),
+        (6, cerebellum::management::REVOKE_GRANT, json!({})),
+        (
+            7,
+            cerebellum::management::LIST_GRANTS,
+            json!({"agent_id":"pj-scope-agent"}),
+        ),
+    ] {
+        let mut frame = request(corr, "unused", json!({}));
+        frame.body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        cerebellum::handle_frame_for_test(frame, &tx, &planes)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "consent_unavailable", "{method}: {body}");
+        assert_eq!(body["detail"]["reason"], "unattended_flow");
+        assert!(
+            body.get("grants").is_none(),
+            "operator records must not be disclosed"
+        );
+        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            planes.management.computer_grants().list()["grants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(storage.load().unwrap(), state);
+    }
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flow_goodbye_clears_unattended_elicitation_state() {
+    let (planes, _) = flow_planes();
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = json!({"method":"elicitation/create","params":{}});
+    assert_eq!(
+        planes
+            .elicitor
+            .ask(&tx, 9, 3, question.clone(), Duration::from_millis(10))
+            .await,
+        cerebellum::elicit::AskOutcome::Undeliverable
+    );
+    assert!(rx.try_recv().is_err());
+    cerebellum::handle_frame_for_test(
+        Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            9,
+            3,
+            0,
+            vec![],
+        )
+        .unwrap(),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
+    // A direct sender probe observes removal without rebinding, which would
+    // otherwise clear the policy itself and conceal a missing Goodbye cleanup.
+    assert_eq!(
+        planes
+            .elicitor
+            .ask(&tx, 9, 3, question, Duration::from_millis(10))
+            .await,
+        cerebellum::elicit::AskOutcome::NoAnswer
+    );
+    let mut saw_question = false;
+    while let Ok(frame) = rx.try_recv() {
+        if frame.header.channel == 9 && frame.header.ty == FrameType::Request {
+            saw_question = true;
+        }
+    }
+    assert!(saw_question, "the route's unattended entry was not cleared");
+    assert_eq!(planes.elicitor.outstanding(), 0);
 }
