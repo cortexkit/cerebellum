@@ -45,6 +45,9 @@ use subc_protocol::manifest::{
 /// The single application capability this module advertises.
 pub const BROWSER_STATUS: &str = "browser.status";
 
+/// Declares daemon-stamped scope admission support so route openers can discover it.
+pub const SCOPE_ADMISSION_CAPABILITY: &str = "cerebellum-scope-admission/v1";
+
 pub fn browser_wire_tools() -> Vec<Tool> {
     crate::browser::tool_definitions()
         .into_iter()
@@ -423,12 +426,10 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         // every other operation is refused there. This module holds no grant
         // that reads a credential, so it still cannot pull a secret.
         //
-        // `provides` stays empty because it is capability-grammar naming, a
-        // different axis from the provider roles above, and this module's
-        // capabilities have no grammar names cut yet. Empty claims nothing; it
-        // does not claim we provide nothing.
+        // This module-level declaration lets route openers discover scoped
+        // admission support independently of the tool and management roles.
         .capabilities(Some(CapabilityDeclarations {
-            provides: Vec::new(),
+            provides: vec![SCOPE_ADMISSION_CAPABILITY.to_string()],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))

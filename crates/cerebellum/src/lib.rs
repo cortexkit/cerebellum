@@ -1520,7 +1520,8 @@ fn consent_context(
             conversation_key: facts.identity.conversation_key.clone(),
             agent_project_id: facts.identity.agent_project_id.clone(),
             durable_identity_attested: facts.agent_project_id_attested
-                && facts.session_kind_attested,
+                && facts.session_kind_attested
+                && facts.acts_as_agent,
         },
         carrier,
         Arc::new(BoundRoute {
@@ -3242,8 +3243,14 @@ async fn handle_management_request(
         operator_facts = facts.outside_session_scope();
         &operator_facts
     } else {
+        if let Some(refusal) = session_flow_refusal(facts) {
+            return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+        }
         return send_session_caller_not_admitted(writer, ver, channel, epoch, corr, facts).await;
     };
+    if let Some(refusal) = session_flow_refusal(facts) {
+        return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+    }
     let params = object
         .get("params")
         .cloned()
@@ -3987,7 +3994,7 @@ fn standing_grant_operation(
             standing_grant_params::only(params, &["origin"])
                 .map_err(StandingGrantOperationRefusal::UnknownField)?;
             let origin = standing_grant_params::origin(params)?;
-            if !facts.agent_project_id_attested {
+            if !facts.agent_project_id_attested || !facts.acts_as_agent {
                 return Ok(json!({
                     "outcome": "agent_not_attested",
                     "revoked": 0,
@@ -4552,7 +4559,13 @@ async fn handle_control_request(
             // ignored, leave the route with the permissive default scope. Refuse
             // the bind and bind nothing, so the route serves no request at all.
             if let Some(refusal) =
-                AcceptedBindFacts::admission_facts_refusal(admission_facts.as_ref())
+                AcceptedBindFacts::admission_facts_refusal(admission_facts.as_ref()).or_else(|| {
+                    AcceptedBindFacts::scope_facts_refusal(
+                        &principal,
+                        scope.as_ref(),
+                        admission_facts.as_ref(),
+                    )
+                })
             {
                 let body = serde_json::to_vec(&subc_protocol::ErrorBody {
                     code: refusal.reason_code().to_string(),
@@ -4582,10 +4595,9 @@ async fn handle_control_request(
                 consumer_capabilities.as_deref(),
                 &target,
             )
-            // The scope stamp is kept exactly as the daemon sent it. It names
-            // the session a call is recorded under, lets that session's owner
-            // withdraw a call, and decides what a revoked session takes with
-            // it; admission is still by principal, as before scopes.
+            // An authorized prefrontal-core scope stamp supplies identity and
+            // delegation. Retaining it also lets call records name the scope
+            // and lets its owner withdraw calls when the scope is revoked.
             .with_scope(scope);
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
@@ -4818,6 +4830,13 @@ async fn handle_keyed_tool_request(
             )))
         })
     };
+    // A previous call result must not bypass current route admission. Preserve
+    // that historical record, but do not expose its reply through a flow route.
+    if !matches!(&begun, Begin::Execute(_)) {
+        if let Some(refusal) = session_flow_refusal(&facts) {
+            return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+        }
+    }
     let ticket = match begun {
         Begin::Execute(ticket) => ticket,
         Begin::Replay(reply) => {
@@ -4986,10 +5005,13 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
     let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
     match reply.header.ty {
         // The envelope and argument checks answer in the reply body.
-        FrameType::Response => matches!(
-            body["outcome"].as_str(),
-            Some("invalid_request" | "resource_busy")
-        ),
+        FrameType::Response => {
+            matches!(
+                body["outcome"].as_str(),
+                Some("invalid_request" | "resource_busy")
+            ) || (body["outcome"] == "consent_unavailable"
+                && body["detail"]["reason"] == "flow_scopes_unsupported")
+        }
         FrameType::Error => body["code"].as_str().is_some_and(|code| {
             [
                 "invalid_request",
@@ -5429,6 +5451,9 @@ async fn handle_tool_request(
     // below reads a grant, asks a person or reserves a journal entry; see
     // `send_session_caller_not_admitted`. Every tool call acts in the route's
     // conversation, so no tool is served outside one.
+    if let Some(refusal) = session_flow_refusal(&accepted_facts) {
+        return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+    }
     if !accepted_facts.admits_session_calls() {
         return send_session_caller_not_admitted(
             writer,
@@ -5532,7 +5557,7 @@ async fn handle_tool_request(
             Some(refusal) => json!({
                 "outcome": "authorization_denied",
                 "reason": refusal.reason_code(),
-                "remedy": refusal.remedy(),
+                "remedy": accepted_facts.control_refusal_remedy(refusal),
             }),
             None => handle_browser_control(name, arguments, &accepted_facts, planes).await,
         };
@@ -5917,22 +5942,23 @@ async fn serve_browser_with_consent(
     }
 }
 
-/// The agent whose standing browser rows may authorize a request on this
-/// route: only an `agentProjectId` the daemon attested, never one taken from
-/// the caller-controlled project-root fallback.
+/// Standing browser rows may authorize this route only when its agent is
+/// daemon-attested and the route may act for that agent, never for an identity
+/// taken from the caller-controlled project-root fallback.
 fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingCaller> {
-    facts
-        .agent_project_id_attested
-        .then(|| authorization::StandingCaller {
+    (facts.agent_project_id_attested && facts.acts_as_agent).then(|| {
+        authorization::StandingCaller {
             agent_id: facts.identity.agent_project_id.clone(),
-        })
+        }
+    })
 }
 
 /// The agent a site-access card on this route may offer standing answers for:
-/// a primary session whose agent and session kind the daemon both attested.
+/// a primary session acting for its daemon-attested agent and session kind.
 /// Worker and ephemeral sessions are offered this conversation only.
 fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
     (facts.agent_project_id_attested
+        && facts.acts_as_agent
         && facts.session_kind_attested
         && facts.identity.session_kind == cerebellum_core::identity::SessionKind::Primary)
         .then_some(facts.identity.agent_project_id.as_str())
@@ -6130,6 +6156,23 @@ async fn handle_browser_control(
         }
         _ => json!({"outcome": "internal_failure"}),
     }
+}
+
+/// Route-admission refusal beside the prefrontal-only caller guard. Unattended
+/// flow scopes cannot request consent here yet, so this runs before capability
+/// dispatch: no consent card, browser launch or computer read may happen first.
+fn session_flow_refusal(facts: &AcceptedBindFacts) -> Option<Value> {
+    facts
+        .scope
+        .as_ref()
+        .filter(|stamp| stamp.attributes.flow_id.is_some())
+        .map(|_| {
+            json!({
+                "outcome": "consent_unavailable",
+                "detail": {"reason": "flow_scopes_unsupported"},
+                "remedy": "flows can't use cerebellum yet",
+            })
+        })
 }
 
 async fn send_invalid_request_response(
@@ -6632,6 +6675,52 @@ pub async fn handle_tool_request_for_test_with_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_admission_nondelegating_routes_do_not_read_or_offer_standing_grants() {
+        use super::*;
+        let core = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let bind = subc_protocol::BindIdentity::new("/caller/project", "test", "conversation");
+        let target = subc_protocol::RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        };
+        for delegates in [false, true] {
+            let scope = subc_protocol::scope::ScopeStamp {
+                owner: core.clone(),
+                scope_ref: "head".into(),
+                scope_epoch: 1,
+                kind: subc_protocol::scope::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+                attributes: subc_protocol::scope::ScopeAttributes {
+                    agent_id: Some("pj-agent".into()),
+                    delegates,
+                    flow_id: None,
+                },
+                owner_authorized: true,
+            };
+            let facts =
+                AcceptedBindFacts::from_bind(&bind, Some(core.clone()), None, None, &target)
+                    .with_scope(Some(scope));
+            assert_eq!(standing_caller(&facts).is_some(), delegates);
+            assert_eq!(
+                standing_offer_agent(&facts),
+                if delegates { Some("pj-agent") } else { None }
+            );
+            let planes = Planes::with_browser_config_journaling(
+                Arc::new(HealthState::new()),
+                None,
+                JournalPersistence::Isolated,
+            );
+            let (tx, _) = mpsc::channel(2);
+            let consent = consent_context(&planes, &facts, &tx, 9, 3);
+            assert_eq!(
+                consent.caller.durable_identity_attested, delegates,
+                "persistent app grants and Always allow use this same attestation"
+            );
+        }
+    }
 
     /// The build script names exactly the attestations the compiler reads.
     ///
@@ -11082,6 +11171,13 @@ mod relayed_computer_call_tests {
     /// Planes whose computer journal is held in `storage`, in memory, with one
     /// tool route for the session caller that can relay a question.
     fn planes(storage: &InMemoryJournalStorage) -> Planes {
+        planes_with_source(storage, Arc::new(Unreadable))
+    }
+
+    fn planes_with_source(
+        storage: &InMemoryJournalStorage,
+        source: Arc<dyn AppStateSource>,
+    ) -> Planes {
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
@@ -11119,7 +11215,7 @@ mod relayed_computer_call_tests {
                     .without_expected_post_condition()
             })
             .with_session_lock_for_test(Some(false))
-            .with_app_state_source(Arc::new(Unreadable)),
+            .with_app_state_source(source),
         ));
         planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
         planes.routes.insert(
@@ -11208,6 +11304,130 @@ mod relayed_computer_call_tests {
                 serde_json::from_slice(&bytes).unwrap()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn flow_scope_admission_blocks_computer_reads_before_consent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountReads(Arc<AtomicUsize>);
+        impl AppStateSource for CountReads {
+            fn read_app_state(
+                &self,
+                _: &ProcessGrant,
+                _: ReadBounds,
+            ) -> Result<RawAppState, AppStateReadError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(AppStateReadError::Unreadable)
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage = InMemoryJournalStorage::new();
+        let planes = planes_with_source(&storage, Arc::new(CountReads(reads.clone())));
+        let (tx, mut rx) = mpsc::channel(8);
+        for flow_id in [Some("flow-1".to_string()), None] {
+            let stamp = subc_protocol::scope::ScopeStamp {
+                owner: session_caller_principal_for_test().unwrap(),
+                scope_ref: "head".into(),
+                scope_epoch: 1,
+                kind: subc_protocol::scope::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+                attributes: subc_protocol::scope::ScopeAttributes {
+                    agent_id: Some("test-project".into()),
+                    delegates: true,
+                    flow_id: flow_id.clone(),
+                },
+                owner_authorized: true,
+            };
+            let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
+                role_versions: None,
+                route_channel: CHANNEL,
+                epoch: EPOCH,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "cerebellum".into(),
+                },
+                identity: subc_protocol::BindIdentity::new("/test/project", "test", "test-session"),
+                principal: session_caller_principal_for_test(),
+                consumer_capabilities: Some(vec!["elicitation".into()]),
+                admission_facts: Some(
+                    json!({"agentProjectId":"test-project", "sessionKind":"primary"}),
+                ),
+                scope: Some(stamp),
+            };
+            handle_frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    40,
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap(),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+            let request =
+                json!({"name":"computer_use", "arguments":{"action":"read_state", "target":APP}});
+            handle_frame(
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    CHANNEL,
+                    EPOCH,
+                    42,
+                    serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap(),
+                &tx,
+                &planes,
+            )
+            .await
+            .unwrap();
+            let mut reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if flow_id.is_some() {
+                assert_eq!(reply.header.ty, FrameType::Response);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&reply.body).unwrap(),
+                    json!({
+                        "outcome":"consent_unavailable", "detail":{"reason":"flow_scopes_unsupported"}, "remedy":"flows can't use cerebellum yet"
+                    })
+                );
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+                assert_eq!(planes.elicitor.outstanding(), 0);
+                assert!(
+                    rx.try_recv().is_err(),
+                    "a flow must not send an elicitation"
+                );
+            } else {
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Request,
+                    "the attended route may ask for app consent"
+                );
+                assert!(planes.elicitor.deliver(
+                    reply.header.channel,
+                    reply.header.corr,
+                    json!({"decision":"allow_conversation"})
+                ));
+                reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply.header.ty, FrameType::Response);
+                assert_eq!(
+                    reads.load(Ordering::SeqCst),
+                    1,
+                    "the non-flow route actually reads synthetic app state"
+                );
+            }
+        }
     }
 
     #[tokio::test]
