@@ -4665,10 +4665,12 @@ async fn late_in_call_answer(decision: &str, linkable: bool) {
     if decision == "allow_origin_always" && linkable {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].consent_ref, "el_test_late");
+        // An "always" answer covers the registrable domain of an https origin
+        // on the default port.
         assert_eq!(
             rows[0].subject,
-            cerebellum::browser_standing_grants::StandingSubject::Origin(
-                "https://requested.example".into()
+            cerebellum::browser_standing_grants::StandingSubject::Domain(
+                "requested.example".into()
             )
         );
     } else {
