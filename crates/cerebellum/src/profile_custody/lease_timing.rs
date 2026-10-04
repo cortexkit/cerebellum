@@ -49,7 +49,9 @@ pub(crate) fn released(holder_id: &str) {
         .remove(holder_id);
 }
 
-/// When browser flows are supported, map their route's flow_id to a Holder here.
+/// Every holder is the agent's head session today, because cerebellum serves no
+/// flows yet. Once it does, a holder whose route carries a `flow_id` maps to
+/// `Holder::flow(flow_id)` here.
 fn browser_profile_holder() -> Holder {
     Holder::head()
 }

@@ -1518,7 +1518,8 @@ fn cross_process_holder_without_lease_timing_keeps_profile_busy_wire_shape() {
     let lock_path = profile_lock_path(root.path());
     let remote_record = fs::read(&lock_path).unwrap();
     locks.release_exact(&claim).unwrap();
-    // Install the evidence another supervisor leaves, with no local timing entry.
+    // Put the released lock record back, so the profile looks held by another
+    // supervisor: the lock is on disk but this process has no timing for it.
     fs::write(&lock_path, remote_record).unwrap();
     let mut contender = ProfileCustodyLocks::open(
         root.path(),
