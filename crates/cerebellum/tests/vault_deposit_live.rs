@@ -213,6 +213,7 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
     // Before the daemon starts: it resolves its homes from these.
     std::env::set_var("HOME", &home);
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
 
     // The daemon, with cerebellum configured as a shell that hands the test
@@ -232,6 +233,9 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
                     "args": ["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
                     "env": {
                         "HOME": home,
+                        "XDG_CONFIG_HOME": home.join(".config"),
+                        "XDG_DATA_HOME": home.join(".local/share"),
+                        "XDG_RUNTIME_DIR": home.join("run"),
                         "NONCE_OUT": nonce_file,
                     },
                     "reserved": true,
@@ -249,6 +253,8 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
+        .with_live_children_record(run.join("live-children.json"))
+        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
         .with_capture_logs_dir(run.join("logs"))
         .with_terminal_journal_path(run.join("terminals.jsonl"));
     let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));

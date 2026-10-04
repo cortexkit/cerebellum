@@ -1148,6 +1148,10 @@ async fn start_live_daemon_with_browser(
     // run after a build.  The module exits immediately without --subc, so this
     // costs nothing once the binary is already validated.
     let _ = tokio::process::Command::new(&binary)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_RUNTIME_DIR", home.join("run"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1208,6 +1212,7 @@ async fn start_live_daemon_with_browser(
                         "HOME": home,
                         "XDG_CONFIG_HOME": home.join(".config"),
                         "XDG_DATA_HOME": home.join(".local").join("share"),
+                        "XDG_RUNTIME_DIR": home.join("run"),
                     },
                     "reserved": true,
                 }
@@ -1224,6 +1229,8 @@ async fn start_live_daemon_with_browser(
         // test binary, whose HOME is the real one. Without this the module's
         // stderr lands in the operator's live run dir; SUBC found
         // `cerebellum.stderr.log` there. Point it at the isolated home.
+        .with_live_children_record(home.join(".local/share/cortexkit/run/live-children.json"))
+        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
         .with_capture_logs_dir(&capture_logs_dir)
         // Same reason, one file over: the terminal journal also defaults into
         // the daemon's own run dir, where the live daemon appends every

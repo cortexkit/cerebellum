@@ -357,6 +357,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     // own.
     std::env::set_var("HOME", &home);
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     std::env::remove_var("SUBC_LAUNCH_NONCE_FD");
@@ -378,6 +379,9 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
                     "args": ["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
                     "env": {
                         "HOME": home,
+                        "XDG_CONFIG_HOME": home.join(".config"),
+                        "XDG_DATA_HOME": home.join(".local/share"),
+                        "XDG_RUNTIME_DIR": home.join("run"),
                         "NONCE_OUT": nonce_file,
                     },
                     "reserved": true,
@@ -395,6 +399,8 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
+        .with_live_children_record(run.join("live-children.json"))
+        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
         .with_capture_logs_dir(run.join("logs"))
         .with_terminal_journal_path(run.join("terminals.jsonl"))
         .with_scope_authority_owners(vec![OWNER.to_string()]);
