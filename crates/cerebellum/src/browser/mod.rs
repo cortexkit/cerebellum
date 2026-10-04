@@ -48,7 +48,7 @@ use crate::snapshot_store::{
 use cerebellum_computer::platform::vocabulary::{
     CapabilityResultValidationError, CapabilityResultViolation,
 };
-use cerebellum_core::identity::{RouteIdentity, SessionKind};
+use cerebellum_core::identity::{ProfileDisposition, RouteIdentity, SessionKind};
 
 pub const NAVIGATE: &str = "browser.navigate";
 pub const SNAPSHOT: &str = "browser.snapshot";
@@ -724,15 +724,20 @@ pub struct BrowserContextResult {
 
 impl BrowserContextResult {
     pub fn from_identity(identity: &RouteIdentity) -> Self {
-        let (kind, disposition) = match identity.session_kind {
-            SessionKind::Primary => ("primary", "durable"),
-            SessionKind::Subagent => ("subagent", "disposable"),
-            SessionKind::Ephemeral => ("ephemeral", "none"),
+        let kind = match identity.session_kind {
+            SessionKind::Primary => "primary",
+            SessionKind::Subagent => "subagent",
+            SessionKind::Ephemeral => "ephemeral",
+        };
+        let profile = identity.resolve_profile();
+        let disposition = match profile.profile_disposition {
+            ProfileDisposition::Durable => "durable",
+            ProfileDisposition::Disposable => "disposable",
+            ProfileDisposition::None => "none",
         };
         Self {
             profile_uuid: None,
-            profile_name: (identity.session_kind != SessionKind::Ephemeral)
-                .then(|| "default".to_string()),
+            profile_name: profile.profile_name,
             session_kind_effective: kind,
             profile_disposition: disposition,
         }
@@ -1117,8 +1122,7 @@ pub fn journal_identity(identity: &RouteIdentity) -> JournalIdentity {
             SessionKind::Ephemeral => JournalSessionKind::Ephemeral,
         },
         profile_uuid: None,
-        profile_name: (identity.session_kind != SessionKind::Ephemeral)
-            .then(|| "default".to_string()),
+        profile_name: identity.resolve_profile().profile_name,
         origin: identity.origin.clone(),
         witness: identity.witness.clone(),
     }
@@ -2215,8 +2219,7 @@ impl BrowserPlane {
                         store,
                         FinalContextAssociation {
                             profile_uuid: None,
-                            profile_name: (identity.session_kind != SessionKind::Ephemeral)
-                                .then(|| "default".to_string()),
+                            profile_name: identity.resolve_profile().profile_name,
                         },
                         CompletedResult { outcome, detail },
                     )
