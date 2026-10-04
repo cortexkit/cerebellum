@@ -8024,6 +8024,7 @@ mod tests {
                 None,
                 vec![
                     crate::snapshot_store::RefRecord {
+                        frame_document: None,
                         captured: crate::snapshot_store::SnapshotRef::new(
                             "e1", "button", "Sign in", 0,
                         )
@@ -8038,6 +8039,7 @@ mod tests {
                         classification: Ok(Box::new(classification)),
                     },
                     crate::snapshot_store::RefRecord {
+                        frame_document: None,
                         captured: crate::snapshot_store::SnapshotRef::new(
                             "e2", "button", "Continue", 0,
                         )
@@ -8110,10 +8112,11 @@ mod tests {
         );
         assert!(unknown["detail"].get("required").is_none());
         assert!(unknown["detail"].get("grant_request").is_none());
-        assert!(unknown["remedy"]
-            .as_str()
-            .unwrap()
-            .contains("enclosing element"));
+        // No classification was captured, so the next step must capture it;
+        // choosing another ref cannot repair missing document facts.
+        let remedy = unknown["remedy"].as_str().unwrap();
+        assert!(remedy.contains("capture target classification"));
+        assert!(!remedy.contains("enclosing element"));
     }
 
     /// An answer arriving on a route reaches the question that asked it.

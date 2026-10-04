@@ -168,6 +168,7 @@ async fn composed_routes_omit_browser_type_and_click_uses_one_lane() {
             }],
             None,
             vec![RefRecord {
+                frame_document: None,
                 captured: reference,
                 frame_path: vec![],
                 backend_identity: None,
@@ -1285,6 +1286,7 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
         .filter_map(|record| {
             let reference = record.reference.as_ref()?;
             Some(RefRecord {
+                frame_document: None,
                 captured: SnapshotRef::new(reference, record.role.clone(), record.name.clone(), 0)
                     .unwrap(),
                 frame_path: vec!["frame-main".into()],
@@ -2864,6 +2866,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
             }],
             None,
             vec![RefRecord {
+                frame_document: None,
                 captured: reference,
                 frame_path: vec!["frame-main".into()],
                 backend_identity: Some(

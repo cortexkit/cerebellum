@@ -290,6 +290,7 @@ fn snapshot_observation(
         ],
         dom_text: None,
         refs: vec![RefRecord {
+            frame_document: None,
             captured: SnapshotRef::new("e1", "button", "Sign in", 0).unwrap(),
             frame_path: vec!["frame-main".into()],
             backend_identity: Some(BackendNodeIdentity::new("target", "frame-main", 42).unwrap()),
@@ -432,6 +433,7 @@ struct RecordingLauncher {
     /// authorization and its return. Consumed by the next capture.
     moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
+    frame_fixture: Option<Arc<Mutex<FrameFixture>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
     present_error: Option<&'static str>,
@@ -464,6 +466,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 page: self.page.clone(),
                 moves_during_capture: Arc::clone(&self.moves_during_capture),
                 clicked: false,
+                frame_fixture: self.frame_fixture.clone(),
                 hazardous_target: self.hazardous_target,
                 cross_site_link_target: self.cross_site_link_target,
                 present_error: self.present_error,
@@ -511,11 +514,20 @@ impl BrowserSessionLauncher for UndeclaredReplyLauncher {
     }
 }
 
+#[derive(Default)]
+struct FrameFixture {
+    financial: bool,
+    action_origin_override: Option<String>,
+    documents: Vec<cerebellum::snapshot_store::FrameDocument>,
+    readable: Vec<cerebellum::snapshot_store::FrameDocument>,
+}
+
 struct RecordingProcess {
     effects: Arc<Mutex<Vec<&'static str>>>,
     page: CommittedPage,
     moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     clicked: bool,
+    frame_fixture: Option<Arc<Mutex<FrameFixture>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
     present_error: Option<&'static str>,
@@ -542,6 +554,91 @@ impl RecordingProcess {
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
+    fn frame_documents(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<Vec<cerebellum::snapshot_store::FrameDocument>, NavigationDriveError> {
+        Ok(self
+            .frame_fixture
+            .as_ref()
+            .map(|f| f.lock().unwrap().documents.clone())
+            .unwrap_or_default())
+    }
+    fn set_read_frames(
+        &mut self,
+        frames: Vec<cerebellum::snapshot_store::FrameDocument>,
+    ) -> Result<(), NavigationDriveError> {
+        if let Some(fixture) = &self.frame_fixture {
+            fixture.lock().unwrap().readable = frames;
+        }
+        Ok(())
+    }
+    fn prepare_frame(
+        &mut self,
+        _: &str,
+        expected: &cerebellum::snapshot_store::FrameDocument,
+        _: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        Ok(self
+            .frame_fixture
+            .as_ref()
+            .is_some_and(|f| f.lock().unwrap().documents.contains(expected)))
+    }
+
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            cerebellum::classification::NonTypeClassificationRecord,
+            cerebellum::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        let fixture = self
+            .frame_fixture
+            .as_ref()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .lock()
+            .unwrap();
+        let frame = fixture
+            .documents
+            .iter()
+            .find(|frame| frame.parent_id.is_some())
+            .ok_or(NavigationDriveError::Unavailable)?;
+        Ok(Ok(frame_submit_record(
+            frame,
+            epoch,
+            if fixture.financial {
+                "cc-number"
+            } else if self.hazardous_target {
+                "current-password"
+            } else {
+                ""
+            },
+        )))
+    }
+    fn point_frame_document(&mut self) -> Option<cerebellum::snapshot_store::FrameDocument> {
+        self.frame_fixture.as_ref().and_then(|fixture| {
+            let fixture = fixture.lock().unwrap();
+            let mut frame = fixture
+                .documents
+                .iter()
+                .find(|frame| frame.parent_id.is_some())
+                .cloned()?;
+            if let Some(origin) = &fixture.action_origin_override {
+                frame.origin = origin.clone();
+                frame.url = format!("{origin}/frame");
+            }
+            Some(frame)
+        })
+    }
+
     fn committed_document(
         &mut self,
         _: &str,
@@ -610,13 +707,64 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.effects.lock().unwrap().push("snapshot");
-        let observation = snapshot_observation(
+        let mut observation = snapshot_observation(
             self.clicked,
             self.hazardous_target,
             self.cross_site_link_target,
             document_epoch,
             current_origin,
         );
+        if let Some(fixture) = &self.frame_fixture {
+            let fixture = fixture.lock().unwrap();
+            if let Some(frame) = fixture.documents.iter().find(|f| f.parent_id.is_some()) {
+                if fixture.readable.contains(frame) {
+                    let mut captured_frame = frame.clone();
+                    if let Some(origin) = &fixture.action_origin_override {
+                        captured_frame.origin = origin.clone();
+                        captured_frame.url = format!("{origin}/frame");
+                    }
+                    observation.refs[0].frame_document = Some(captured_frame);
+                    let backend = observation.refs[0].backend_identity.as_mut().unwrap();
+                    backend.frame_id = frame.frame_id.clone();
+                    let identity = backend.digest();
+                    let record = observation.refs[0].classification.as_mut().unwrap();
+                    record.node_identity = identity.clone();
+                    record.activation_target_identity = identity;
+                    record.current_top_level_origin = frame.origin.clone();
+                    if fixture.financial || self.hazardous_target {
+                        **record = frame_submit_record(
+                            frame,
+                            document_epoch,
+                            if fixture.financial {
+                                "cc-number"
+                            } else {
+                                "current-password"
+                            },
+                        );
+                    } else {
+                        **record = classify_click(&NonTypeClassificationInput::new(
+                            document_epoch,
+                            ElementClassificationInput::new(
+                                NodeIdentityInput::new("target", &frame.frame_id, 42),
+                                TargetKind::Button,
+                            )
+                            .input_type("button"),
+                            &frame.origin,
+                        ))
+                        .unwrap();
+                    }
+                } else {
+                    observation.refs.clear();
+                    observation.records = vec![AxRecord {
+                        depth: 0,
+                        role: "document".into(),
+                        name: format!("{} needs browser.open_grant read grant", frame.origin),
+                        value: None,
+                        reference: None,
+                    }];
+                }
+            }
+        }
         if self.apply_moves_during_capture() {
             return Err(NavigationDriveError::CdpFailure);
         }
@@ -3439,6 +3587,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
             }],
             dom_text: None,
             refs: vec![RefRecord {
+                frame_document: None,
                 captured: SnapshotRef::new("e1", "link", "Learn more", 0).unwrap(),
                 frame_path: vec![MAIN_FRAME.into()],
                 backend_identity: Some(identity),
@@ -7898,4 +8047,222 @@ async fn flow_goodbye_clears_unattended_elicitation_state() {
     }
     assert!(saw_question, "the route's unattended entry was not cleared");
     assert_eq!(planes.elicitor.outstanding(), 0);
+}
+
+fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
+    use cerebellum::snapshot_store::FrameDocument;
+    Arc::new(Mutex::new(FrameFixture {
+        financial: false,
+        action_origin_override: None,
+        readable: vec![],
+        documents: vec![
+            FrameDocument {
+                navigation_revision: 0,
+                frame_id: "frame-main".into(),
+                parent_id: None,
+                session_id: "main-session".into(),
+                loader_id: "main-loader".into(),
+                url: "https://page.example/page".into(),
+                origin: "https://page.example".into(),
+            },
+            FrameDocument {
+                navigation_revision: 0,
+                frame_id: "payment-frame".into(),
+                parent_id: Some("frame-main".into()),
+                session_id: "payment-session".into(),
+                loader_id: "payment-loader".into(),
+                url: "https://payment.example/frame".into(),
+                origin: "https://payment.example".into(),
+            },
+        ],
+    }))
+}
+
+#[tokio::test]
+async fn frame_read_grants_are_checked_before_capture() {
+    let fixture = frame_fixture();
+    let launcher = Arc::new(RecordingLauncher {
+        frame_fixture: Some(fixture.clone()),
+        ..Default::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(&planes, "https://page.example", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+    let reply = invoke(&planes, 900, "browser.snapshot", json!({})).await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(!reply.to_string().contains("Sign in"));
+    assert_eq!(fixture.lock().unwrap().readable.len(), 1);
+    assert!(reply.to_string().contains("https://payment.example"));
+    let image = invoke(&planes, 902, "browser.screenshot", json!({})).await;
+    let image: Value = serde_json::from_slice(&image.body).unwrap();
+    assert_eq!(image["outcome"], "authorization_denied", "{image}");
+    assert_eq!(
+        image["detail"]["attempted_origin"],
+        "https://payment.example"
+    );
+    assert!(!launcher.effects.lock().unwrap().contains(&"screenshot"));
+    grant_browser(&planes, "https://payment.example", vec![]).await;
+    let reply = invoke(&planes, 901, "browser.snapshot", json!({})).await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.lock().unwrap().readable.len(), 2);
+    assert!(reply.to_string().contains("Sign in"));
+}
+
+#[tokio::test]
+async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
+    let fixture = frame_fixture();
+    let launcher = Arc::new(RecordingLauncher {
+        frame_fixture: Some(fixture.clone()),
+        ..Default::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://payment.example", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+    // Inject a ref naming another origin to exercise action authorization
+    // independently of the preceding capture's read-grant filter.
+    fixture.lock().unwrap().action_origin_override = Some("https://other-frame.example".into());
+    let snapshot = invoke(&planes, 910, "browser.snapshot", json!({"mode":"ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    let reply = invoke(&planes, 911, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"exercise the frame authorization boundary","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(
+        reply["detail"]["attempted_origin"],
+        "https://other-frame.example"
+    );
+    let screenshot = invoke(&planes, 912, "browser.screenshot", json!({})).await;
+    let screenshot: Value = serde_json::from_slice(&screenshot.body).unwrap();
+    let point = invoke(&planes, 913, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":screenshot["snapshot_id"],"intent":"exercise point frame authorization","severity":{"tier":4,"credential":false,"financial":true}})).await;
+    let point: Value = serde_json::from_slice(&point.body).unwrap();
+    assert_eq!(point["outcome"], "authorization_denied", "{point}");
+    assert_eq!(
+        point["detail"]["attempted_origin"],
+        "https://other-frame.example"
+    );
+    assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
+}
+
+#[tokio::test]
+async fn navigated_frame_ref_is_stale_before_mouse_input() {
+    let fixture = frame_fixture();
+    let launcher = Arc::new(RecordingLauncher {
+        frame_fixture: Some(fixture.clone()),
+        ..Default::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://payment.example", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+    let snapshot = invoke(&planes, 920, "browser.snapshot", json!({"mode":"ax"})).await;
+    let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+    fixture.lock().unwrap().documents[1].loader_id = "navigated-loader".into();
+    let zoom = invoke(
+        &planes,
+        922,
+        "browser.snapshot",
+        json!({"zoom":first_ref(&snapshot)}),
+    )
+    .await;
+    let zoom: Value = serde_json::from_slice(&zoom.body).unwrap();
+    assert_eq!(zoom["outcome"], "stale_snapshot", "{zoom}");
+    let reply = invoke(&planes, 921, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"exercise stale frame refusal","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
+    assert!(reply["remedy"].as_str().unwrap().contains("snapshot"));
+    assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
+    let fresh = invoke(&planes, 923, "browser.snapshot", json!({"mode":"ax"})).await;
+    let fresh: Value = serde_json::from_slice(&fresh.body).unwrap();
+    let clicked = invoke(&planes, 924, "browser.click", json!({"ref":first_ref(&fresh),"snapshot_id":fresh["snapshot_id"],"intent":"fresh frame snapshot can click","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(launcher.effects.lock().unwrap().contains(&"input_press"));
+}
+
+fn frame_submit_record(
+    frame: &cerebellum::snapshot_store::FrameDocument,
+    epoch: u64,
+    token: &str,
+) -> cerebellum::classification::NonTypeClassificationRecord {
+    let dom = json!({"nodes":[
+        {"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"","nodeName":"#document"},
+        {"nodeId":7,"backendNodeId":7,"parentId":1,"nodeType":1,"localName":"form","attributes":[]},
+        {"nodeId":8,"backendNodeId":8,"parentId":7,"nodeType":1,"localName":"input","attributes":["autocomplete",token]},
+        {"nodeId":42,"backendNodeId":42,"parentId":7,"nodeType":1,"localName":"button","attributes":["type",if token.is_empty() { "button" } else { "submit" }]}
+    ]});
+    cerebellum::browser::navigation::classify_flattened_document(
+        dom.as_object().unwrap(),
+        &BackendNodeIdentity::new("target", &frame.frame_id, 42).unwrap(),
+        epoch,
+        &frame.origin,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_paths() {
+    for (financial, missing_hazard) in [
+        (true, "financial_form_submit"),
+        (false, "credential_form_submit"),
+    ] {
+        let fixture = frame_fixture();
+        fixture.lock().unwrap().financial = financial;
+        let launcher = Arc::new(RecordingLauncher {
+            frame_fixture: Some(fixture),
+            hazardous_target: !financial,
+            ..Default::default()
+        });
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        planes.launch_service = Some(launcher.clone());
+        grant_browser(&planes, "https://page.example", vec![]).await;
+        grant_browser(&planes, "https://payment.example", vec![]).await;
+        launch_at(&planes, &launcher.page, "https://page.example").await;
+        let snapshot = invoke(&planes, 930, "browser.snapshot", json!({"mode":"ax"})).await;
+        let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+        let screenshot = invoke(&planes, 931, "browser.screenshot", json!({})).await;
+        let screenshot: Value = serde_json::from_slice(&screenshot.body).unwrap();
+        assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+        let severity = json!({"tier":4,"credential":!financial,"financial":financial});
+        let ref_reply = invoke(&planes, 932, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"exercise frame submit policy","severity":severity})).await;
+        let point_reply = invoke(&planes, 933, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":screenshot["snapshot_id"],"intent":"exercise frame point submit policy","severity":severity})).await;
+        for reply in [ref_reply, point_reply] {
+            let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply["outcome"], "hazard_not_disclosed", "{reply}");
+            assert_eq!(reply["detail"]["missing_hazard"], missing_hazard);
+            assert_eq!(
+                reply["detail"]["attempted_origin"],
+                "https://payment.example"
+            );
+            assert_eq!(
+                reply["detail"]["required"]["financial"], financial,
+                "{reply}"
+            );
+            assert_eq!(
+                reply["detail"]["required"]["credential"], !financial,
+                "{reply}"
+            );
+        }
+        assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
+    }
 }

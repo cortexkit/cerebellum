@@ -1,3 +1,5 @@
+mod frames;
+
 use std::cmp;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -316,6 +318,14 @@ pub struct CdpNavigationDriver<IO> {
     /// verification closes it before opening another, so there is never more
     /// than one.
     unclosed_verification_target: Option<String>,
+    frame_revisions: HashMap<String, u64>,
+    frame_sessions: HashMap<String, String>,
+    configured_frame_sessions: HashSet<String>,
+    frame_documents: Vec<crate::snapshot_store::FrameDocument>,
+    read_frames: Option<Vec<crate::snapshot_store::FrameDocument>>,
+    active_frame: Option<crate::snapshot_store::FrameDocument>,
+    point_frame: Option<crate::snapshot_store::FrameDocument>,
+    point_target: Option<(String, BrowserClickPosition)>,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -335,6 +345,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             read_buffer: vec![0; READ_CHUNK_BYTES],
             verification: None,
             unclosed_verification_target: None,
+            frame_revisions: HashMap::new(),
+            frame_sessions: HashMap::new(),
+            configured_frame_sessions: HashSet::new(),
+            frame_documents: Vec::new(),
+            read_frames: None,
+            active_frame: None,
+            point_frame: None,
+            point_target: None,
         }
     }
 
@@ -712,16 +730,30 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let Some(frame_id) = result.get("frameId").and_then(Value::as_str) else {
             return Ok(Err(ClassificationUnavailable::DomReadFailed));
         };
-        let identity = BackendNodeIdentity {
+        let mut identity = BackendNodeIdentity {
             target_id: attachment.target_id,
             frame_id: frame_id.to_string(),
             backend_node_id,
         };
+        let mut document_url = document_url.to_string();
+        if !self.configured_frame_sessions.is_empty() {
+            let frames = self.frame_documents(
+                context_key,
+                deadline.saturating_duration_since(clock.now()).as_millis() as u64,
+            )?;
+            let (resolved, frame, local) =
+                self.resolve_frame_point(position, identity, &frames, deadline, clock)?;
+            identity = resolved;
+            document_url = frame.origin.clone();
+            self.point_target = Some((frame.session_id.clone(), local));
+            self.active_frame = Some(frame.clone());
+            self.point_frame = Some(frame);
+        }
         self.classify_click_before(
             context_key,
             &identity,
             document_epoch,
-            document_url,
+            &document_url,
             deadline,
             clock,
         )
@@ -739,6 +771,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        let expected_frame = self.point_frame.clone();
         let actual = self
             .classify_point(
                 context_key,
@@ -748,16 +781,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 deadline_ms,
             )
             .map_err(ClickDriveError::Navigation)?;
-        if actual.as_ref().ok() != Some(expected) {
+        if actual.as_ref().ok() != Some(expected) || self.point_frame != expected_frame {
             return Err(ClickDriveError::ClassificationChanged);
         }
-        self.click_point(context_key, position, deadline_ms, input_dispatched)
-            .map_err(|error| match error {
-                ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
-                ClickPointDriveError::OutsideViewport(refusal) => {
-                    ClickDriveError::OutsideViewportAfterScroll(refusal)
-                }
-            })
+        let target = self.point_target.clone();
+        self.click_point_with_clock(
+            context_key,
+            position,
+            deadline_ms,
+            input_dispatched,
+            &mut SystemNavigationClock,
+            target,
+        )
+        .map_err(|error| match error {
+            ClickPointDriveError::Navigation(error) => ClickDriveError::Navigation(error),
+            ClickPointDriveError::OutsideViewport(refusal) => {
+                ClickDriveError::OutsideViewportAfterScroll(refusal)
+            }
+        })
     }
 
     /// Dispatch a coordinate click through this driver's owned CDP session.
@@ -775,6 +816,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline_ms,
             input_dispatched,
             &mut clock,
+            None,
         )
     }
 
@@ -860,13 +902,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<Result<NonTypeClassificationRecord, ClassificationUnavailable>, NavigationDriveError>
     {
-        let attachment = self
-            .attachment
-            .clone()
-            .filter(|attachment| {
-                attachment.context_key == context_key && attachment.target_id == identity.target_id
-            })
-            .ok_or(NavigationDriveError::CdpFailure)?;
+        let attachment = self.frame_attachment(identity)?;
+        if attachment.context_key != context_key {
+            return Err(NavigationDriveError::CdpFailure);
+        }
         let current_origin = match document_origin(document_url) {
             Ok(origin) => origin,
             Err(reason) => return Ok(Err(reason)),
@@ -934,13 +973,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             ))?;
         self.ensure_attached(context_key, deadline, clock)
             .map_err(ClickDriveError::Navigation)?;
+        if let Some(expected) = self.active_frame.clone() {
+            if !self
+                .prepare_frame(context_key, &expected, deadline_ms)
+                .map_err(ClickDriveError::Navigation)?
+            {
+                return Err(ClickDriveError::ClassificationChanged);
+            }
+        }
         let attachment = self
-            .attachment
-            .clone()
-            .filter(|attachment| {
-                attachment.context_key == context_key && attachment.target_id == identity.target_id
-            })
-            .ok_or(ClickDriveError::NoPosition)?;
+            .frame_attachment(identity)
+            .map_err(ClickDriveError::Navigation)?;
+        if attachment.context_key != context_key {
+            return Err(ClickDriveError::NoPosition);
+        }
 
         // Geometry follows the activated element, not an AX text node with no box.
         let activated = if let Some(record) = revalidation
@@ -1011,35 +1057,46 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline,
             clock,
         )?;
+        let root_session = self
+            .attachment
+            .as_ref()
+            .ok_or(ClickDriveError::NoPosition)?
+            .session_id
+            .clone();
+        let hit_position = if let Some(frame) = self.active_frame.clone() {
+            let documents = self.frame_documents.clone();
+            self.frame_global_point(position, &frame, &documents, deadline, clock)
+                .map_err(ClickDriveError::Navigation)?
+        } else {
+            position
+        };
         let viewport = self
-            .read_css_visual_viewport(&attachment.session_id, deadline, clock)
+            .read_css_visual_viewport(&root_session, deadline, clock)
             .map(|visual| visual.rect)
             .map_err(ClickDriveError::Navigation)?;
-        match geometry::require_point_in_viewport(position.x_css, position.y_css, viewport) {
+        match geometry::require_point_in_viewport(hit_position.x_css, hit_position.y_css, viewport)
+        {
             Ok(()) => {}
             Err(geometry::GeometryError::OutsideViewport) => {
                 return Err(ClickDriveError::OutsideViewportAfterScroll(
-                    ViewportRefusal { position, viewport },
-                ));
+                    ViewportRefusal {
+                        position: hit_position,
+                        viewport,
+                    },
+                ))
             }
             Err(_) => {
                 return Err(ClickDriveError::Navigation(
                     NavigationDriveError::CdpFailure,
-                ));
+                ))
             }
         }
-
-        let hit_x = hit_test_coordinate(position.x_css)?;
-        let hit_y = hit_test_coordinate(position.y_css)?;
-        let mut hit_params = Map::new();
-        hit_params.insert("x".into(), Value::Number(hit_x.into()));
-        hit_params.insert("y".into(), Value::Number(hit_y.into()));
-        hit_params.insert("includeUserAgentShadowDOM".into(), Value::Bool(true));
+        let hit_params = serde_json::json!({"x":hit_test_coordinate(hit_position.x_css)?,"y":hit_test_coordinate(hit_position.y_css)?,"includeUserAgentShadowDOM":true}).as_object().unwrap().clone();
         let hit_response = self
             .command_response(
                 "DOM.getNodeForLocation",
                 Some(hit_params),
-                Some(attachment.session_id.clone()),
+                Some(root_session),
                 deadline,
                 None,
                 None,
@@ -1052,20 +1109,35 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let hit_result = hit_response.result.ok_or(ClickDriveError::Navigation(
             NavigationDriveError::CdpFailure,
         ))?;
-        let hit_backend_node_id = hit_result
+        let backend = hit_result
             .get("backendNodeId")
             .and_then(Value::as_u64)
             .filter(|value| *value > 0)
             .ok_or(ClickDriveError::Navigation(
                 NavigationDriveError::CdpFailure,
             ))?;
-        let hit_frame_id = hit_result
+        let frame_id = hit_result
             .get("frameId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or(ClickDriveError::Navigation(
                 NavigationDriveError::CdpFailure,
             ))?;
+        let observed = BackendNodeIdentity {
+            target_id: identity.target_id.clone(),
+            frame_id: frame_id.into(),
+            backend_node_id: backend,
+        };
+        let observed = if !self.configured_frame_sessions.is_empty() {
+            let documents = self.frame_documents.clone();
+            self.resolve_frame_point(hit_position, observed, &documents, deadline, clock)
+                .map_err(ClickDriveError::Navigation)?
+                .0
+        } else {
+            observed
+        };
+        let hit_frame_id = observed.frame_id;
+        let hit_backend_node_id = observed.backend_node_id;
         if hit_frame_id != identity.frame_id {
             return Err(ClickDriveError::NoPosition);
         }
@@ -1126,6 +1198,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
+        if let Some(frame) = self.active_frame.clone() {
+            if !self
+                .prepare_frame(context_key, &frame, deadline_ms)
+                .map_err(ClickDriveError::Navigation)?
+            {
+                return Err(ClickDriveError::ClassificationChanged);
+            }
+        }
         if let Some((document_epoch, current_origin, expected)) = revalidation {
             let actual = self
                 .classify_click_before(
@@ -1163,6 +1243,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
         clock: &mut C,
+        target: Option<(String, BrowserClickPosition)>,
     ) -> Result<BrowserClickOutcome, ClickPointDriveError> {
         let deadline = clock
             .now()
@@ -1197,16 +1278,35 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 ));
             }
         }
-        self.actuate_click(
-            context_key,
-            &attachment.session_id,
-            position,
-            deadline,
-            deadline_ms,
-            input_dispatched,
-            clock,
-        )
-        .map_err(ClickPointDriveError::Navigation)
+        let (session, local) = target.unwrap_or((attachment.session_id, position));
+        let outcome = self
+            .actuate_click(
+                context_key,
+                &session,
+                local,
+                deadline,
+                deadline_ms,
+                input_dispatched,
+                clock,
+            )
+            .map_err(ClickPointDriveError::Navigation)?;
+        // The public point is in the addressed screenshot's coordinate system,
+        // even when input used a child renderer's local coordinate system.
+        Ok(match outcome {
+            BrowserClickOutcome::Clicked { navigation, .. } => BrowserClickOutcome::Clicked {
+                position,
+                navigation,
+            },
+            BrowserClickOutcome::JavaScriptDialogDismissed {
+                dialogs,
+                navigation,
+                ..
+            } => BrowserClickOutcome::JavaScriptDialogDismissed {
+                position,
+                dialogs,
+                navigation,
+            },
+        })
     }
 
     fn content_quad_position<C: NavigationClock>(
@@ -1575,6 +1675,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         classification_context: Option<(u64, &str)>,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        if self.read_frames.is_some() {
+            return self.snapshot_all_frames(
+                context_key,
+                mode,
+                deadline_ms,
+                classification_context,
+                clock,
+            );
+        }
         if mode == SnapshotKind::Screenshot {
             return Err(NavigationDriveError::CdpFailure);
         }
@@ -1589,6 +1698,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .filter(|attachment| attachment.context_key == context_key)
             .ok_or(NavigationDriveError::CdpFailure)?;
 
+        let mut attachment = attachment;
+        if let Some(frame) = &self.active_frame {
+            attachment.session_id = frame.session_id.clone();
+        }
         self.command(
             "Accessibility.enable",
             None,
@@ -1599,13 +1712,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )?;
         let root_result = self.command(
             "Accessibility.getRootAXNode",
-            None,
+            self.active_frame.as_ref().map(|frame| {
+                serde_json::json!({"frameId":frame.frame_id})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            }),
             Some(attachment.session_id.clone()),
             deadline,
             None,
             clock,
         )?;
         let root = required_ax_node(&root_result, "node")?;
+        let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
         let mut observation = traverse_ax_tree(
             root,
@@ -1678,7 +1797,18 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 );
             }
         }
-        if mode == SnapshotKind::DomFull {
+        if mode == SnapshotKind::DomFull && self.active_frame.is_some() {
+            let params = serde_json::json!({"backendNodeId":root_backend_id.ok_or(NavigationDriveError::CdpFailure)?}).as_object().unwrap().clone();
+            let outer = self.command(
+                "DOM.getOuterHTML",
+                Some(params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            observation.dom_text = Some(required_result_string(&outer, "outerHTML")?);
+        } else if mode == SnapshotKind::DomFull {
             let mut params = Map::new();
             params.insert("depth".into(), Value::Number(0.into()));
             params.insert("pierce".into(), Value::Bool(true));
@@ -2403,6 +2533,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .accept_event(&frame)
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
             let _ = self.transport.pop_event();
+            self.observe_frame_session(&event);
             // Events from the session-verification tab update only that tab's
             // load record; they are never applied to the person's page or to a
             // navigation's tracker.
@@ -2416,7 +2547,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 if let (Some(attachment), Some(session_id)) =
                     (self.attachment.as_ref(), event.session_id.as_deref())
                 {
-                    if session_id == attachment.session_id {
+                    if session_id == attachment.session_id
+                        || self
+                            .frame_sessions
+                            .values()
+                            .any(|session| session == session_id)
+                    {
                         let dialog_type = event
                             .params
                             .as_ref()
@@ -2688,6 +2824,20 @@ fn parse_flattened_dom_nodes(
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or(ClassificationUnavailable::FlattenedNodesMissing)?;
+    let mut pierced_parents = HashMap::new();
+    for value in values {
+        if let Some(parent) = value.get("nodeId").and_then(Value::as_u64) {
+            for key in ["shadowRoots", "pseudoElements"] {
+                if let Some(roots) = value.get(key).and_then(Value::as_array) {
+                    for root in roots {
+                        if let Some(id) = root.get("nodeId").and_then(Value::as_u64) {
+                            pierced_parents.insert(id, parent);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut nodes = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let field_invalid = |field| ClassificationUnavailable::NodeFieldInvalid { index, field };
@@ -2698,7 +2848,7 @@ fn parse_flattened_dom_nodes(
             .get("nodeType")
             .and_then(Value::as_u64)
             .ok_or(field_invalid("nodeType"))?;
-        if !matches!(node_type, 1 | 3) {
+        if !matches!(node_type, 1 | 3 | 9 | 11) {
             continue;
         }
         let node_id = object
@@ -2714,6 +2864,7 @@ fn parse_flattened_dom_nodes(
         let local_name = object
             .get("localName")
             .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
             .or_else(|| object.get("nodeName").and_then(Value::as_str))
             .ok_or(field_invalid("localName"))?
             .to_ascii_lowercase();
@@ -2723,7 +2874,7 @@ fn parse_flattened_dom_nodes(
         // Text nodes carry backend identities in AX snapshots but have no attributes.
         // Retain them so their parent chain can identify the activated element.
         let empty_attributes = Vec::new();
-        let attribute_values = if node_type == 3 {
+        let attribute_values = if node_type != 1 {
             &empty_attributes
         } else {
             object
@@ -2761,7 +2912,8 @@ fn parse_flattened_dom_nodes(
             parent_id: object
                 .get("parentId")
                 .and_then(Value::as_u64)
-                .filter(|id| *id > 0),
+                .filter(|id| *id > 0)
+                .or_else(|| pierced_parents.get(&node_id).copied()),
             backend_node_id,
             local_name,
             attributes,
@@ -2807,6 +2959,33 @@ fn build_non_type_classification(
     document_epoch: u64,
     current_origin: &str,
 ) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
+    // Form ids and label targets are document-scoped even when CDP flattens
+    // several same-process frame documents into one response.
+    let raw_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.node_id, node)).collect();
+    let document_root = |node: &RawDomNode| {
+        let mut current = node;
+        let mut seen = HashSet::new();
+        while current.local_name != "#document" {
+            if !seen.insert(current.node_id) {
+                return 0;
+            }
+            let Some(parent) = current.parent_id.and_then(|id| raw_by_id.get(&id).copied()) else {
+                break;
+            };
+            current = parent;
+        }
+        current.node_id
+    };
+    let target_root = nodes
+        .iter()
+        .find(|n| n.backend_node_id == target_identity.backend_node_id)
+        .map(document_root);
+    let scoped: Vec<_> = nodes
+        .iter()
+        .filter(|node| Some(document_root(node)) == target_root)
+        .cloned()
+        .collect();
+    let nodes = scoped.as_slice();
     let mut by_node_id = HashMap::with_capacity(nodes.len());
     let mut by_backend_id = HashMap::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
@@ -3147,12 +3326,16 @@ fn described_node_contains(
         if node.get("backendNodeId").and_then(Value::as_u64) == Some(backend_node_id) {
             return Ok(true);
         }
-        if let Some(children) = node.get("children") {
-            let children = children
-                .as_array()
-                .ok_or(NavigationDriveError::CdpFailure)?;
-            for child in children {
-                pending.push(child.as_object().ok_or(NavigationDriveError::CdpFailure)?);
+        // Pierced DOM descriptions place shadow descendants under shadowRoots,
+        // not children. They are part of the target's composed subtree too.
+        for key in ["children", "shadowRoots"] {
+            if let Some(children) = node.get(key) {
+                let children = children
+                    .as_array()
+                    .ok_or(NavigationDriveError::CdpFailure)?;
+                for child in children {
+                    pending.push(child.as_object().ok_or(NavigationDriveError::CdpFailure)?);
+                }
             }
         }
     }
@@ -3319,6 +3502,7 @@ where
     if max_nodes == 0 || target_id.is_empty() {
         return Err(NavigationDriveError::CdpFailure);
     }
+    let root_frame = root.frame_id.clone();
     let root_id = root.node_id.clone();
     let mut scheduled = HashSet::from([root_id.clone()]);
     let mut stack = vec![PendingAxNode {
@@ -3348,6 +3532,16 @@ where
             return Err(NavigationDriveError::CdpFailure);
         }
         processed += 1;
+        // Frame-aware snapshots collect each frame's accessibility tree after
+        // checking its read grant. Ignore nodes explicitly tagged as another
+        // frame so this reply cannot disclose that other frame's content.
+        if node
+            .frame_id
+            .as_ref()
+            .is_some_and(|frame| root_frame.as_ref().is_some_and(|root| frame != root))
+        {
+            continue;
+        }
 
         let mut frame_path = pending.frame_path;
         if let Some(frame_id) = &node.frame_id {
@@ -3386,6 +3580,7 @@ where
                         BackendNodeIdentity::new(target_id, frame_id, backend_node_id)
                             .map_err(|_| NavigationDriveError::CdpFailure)?;
                     refs.push(RefRecord {
+                        frame_document: None,
                         captured,
                         frame_path: frame_path.clone(),
                         backend_identity: Some(backend_identity),
@@ -4135,7 +4330,7 @@ mod tests {
     /// `DOM.getFlattenedDocument` of a loopback page holding a same-origin
     /// link, a cross-origin link, a relative link, a plain button and a login
     /// form, captured from headless Chrome by `examples/classify_live.rs`.
-    const LOOPBACK_CAPTURE: &str = include_str!("fixtures/loopback_flattened_document.json");
+    const LOOPBACK_CAPTURE: &str = include_str!("../fixtures/loopback_flattened_document.json");
 
     /// Drive the production snapshot path over an AX tree of a root (backend
     /// 10) and one button (backend 60, ref `e2`) in `frame-main`, answering the
@@ -5026,6 +5221,90 @@ mod tests {
     }
 
     #[test]
+    fn frame_form_ids_and_card_controls_do_not_cross_document_boundaries() {
+        let document = json!({"nodes":[
+            {"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"","nodeName":"#document"},
+            {"nodeId":10,"backendNodeId":10,"parentId":1,"nodeType":1,"localName":"iframe","attributes":[]},
+            {"nodeId":20,"backendNodeId":20,"parentId":10,"nodeType":9,"localName":"","nodeName":"#document"},
+            {"nodeId":21,"backendNodeId":21,"parentId":20,"nodeType":1,"localName":"form","attributes":["id","checkout"]},
+            {"nodeId":22,"backendNodeId":22,"parentId":21,"nodeType":1,"localName":"input","attributes":["autocomplete","cc-number"]},
+            {"nodeId":5,"backendNodeId":5,"parentId":1,"nodeType":1,"localName":"form","attributes":["id","checkout"]},
+            {"nodeId":6,"backendNodeId":6,"parentId":1,"nodeType":1,"localName":"button","attributes":["type","submit","form","checkout"]}
+        ]});
+        let identity = BackendNodeIdentity::new("page", "main", 6).unwrap();
+        let record = classify_flattened_document(
+            document.as_object().unwrap(),
+            &identity,
+            7,
+            "http://127.0.0.1:9000/",
+        )
+        .unwrap();
+        assert!(!record.financial);
+        assert_eq!(
+            record.form_owner,
+            Some(
+                BackendNodeIdentity::new("page", "main", 5)
+                    .unwrap()
+                    .digest()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn classification_unavailable_without_enclosing_ref_does_not_offer_one() {
+        let references = snapshot_refs(dom_frames(json!([])), Some((7, PAGE_URL)));
+        let reply = click_reply(
+            references,
+            json!({"tier":2,"credential":false,"financial":false}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "classification_unavailable");
+        assert_eq!(
+            reply["detail"]["classification_unavailable"],
+            "target_not_in_document"
+        );
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(!remedy.contains("enclosing"), "{remedy}");
+        assert!(
+            remedy.contains("frame") && remedy.contains("grant"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn ref_click_accepts_pierced_shadow_descendant_at_the_dispatch_center() {
+        let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{"quads":quad.clone()}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":4,"sessionId":"session-own","result":layout_metrics(0.0,0.0,1280.0,713.0)}),
+            json!({"id":5,"sessionId":"session-own","result":{"backendNodeId":91,"frameId":"frame-main"}}),
+            json!({"id":6,"sessionId":"session-own","result":{"node":{"backendNodeId":42,"children":[],"shadowRoots":[{"backendNodeId":90,"children":[{"backendNodeId":91}]}]}}}),
+            json!({"id":7,"sessionId":"session-own","result":{}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":{}}),
+            json!({"id":10,"sessionId":"session-own","result":{}}),
+        ]);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let mut inputs = Vec::new();
+        driver
+            .click_for_test(
+                "route-own",
+                &identity,
+                1000,
+                &mut |event| inputs.push(event),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+        assert_eq!(inputs.len(), 2);
+        let hit = &driver.pipe.writes[4]["params"];
+        let input = &driver.pipe.writes[8]["params"];
+        assert_eq!(hit["x"].as_f64(), input["x"].as_f64());
+        assert_eq!(hit["y"].as_f64(), input["y"].as_f64());
+    }
+
+    #[test]
     fn click_dispatches_mouse_input_at_the_resolved_content_quad_center() {
         let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
         let frames = [
@@ -5234,6 +5513,7 @@ mod tests {
             1_000,
             &mut |event| input_events.push(event),
             &mut FakeClock::new(),
+            None,
         );
 
         assert_eq!(
@@ -5390,8 +5670,8 @@ mod tests {
         (observation, url)
     }
 
-    const X_LIKE: &str = include_str!("fixtures/x_like_page.json");
-    const SETTINGS_LIKE: &str = include_str!("fixtures/settings_like_page.json");
+    const X_LIKE: &str = include_str!("../fixtures/x_like_page.json");
+    const SETTINGS_LIKE: &str = include_str!("../fixtures/settings_like_page.json");
 
     fn render_fixture(
         observation: &BrowserSnapshotObservation,
@@ -5426,14 +5706,14 @@ mod tests {
     fn x_like_outline_and_zoom_match_their_golden_text() {
         let (observation, url) = fixture_observation(X_LIKE);
         let outline = render_fixture(&observation, &url, None, 65_536).text;
-        assert_eq!(outline, include_str!("fixtures/x_like_outline.txt"));
+        assert_eq!(outline, include_str!("../fixtures/x_like_outline.txt"));
         // The outline of a timeline page stays small...
         assert!(outline.len() < 3 * 1024, "{} bytes", outline.len());
         // ...and one zoom on a post (an article named in the outline) reads it.
         let article = ref_of(&observation, "article", None);
         assert!(outline.contains(&format!("{article} article Pebble Post")));
         let zoomed = render_fixture(&observation, &url, Some(&article), 65_536).text;
-        assert_eq!(zoomed, include_str!("fixtures/x_like_zoom_article.txt"));
+        assert_eq!(zoomed, include_str!("../fixtures/x_like_zoom_article.txt"));
         assert!(zoomed.contains("text A seed swap with"), "{zoomed}");
         assert!(
             zoomed.contains("@moss_example, Value: example.com/moss_example"),
@@ -5445,10 +5725,16 @@ mod tests {
     fn settings_like_outline_and_zoom_match_their_golden_text() {
         let (observation, url) = fixture_observation(SETTINGS_LIKE);
         let outline = render_fixture(&observation, &url, None, 65_536).text;
-        assert_eq!(outline, include_str!("fixtures/settings_like_outline.txt"));
+        assert_eq!(
+            outline,
+            include_str!("../fixtures/settings_like_outline.txt")
+        );
         let form = ref_of(&observation, "form", Some("Change password"));
         let zoomed = render_fixture(&observation, &url, Some(&form), 65_536).text;
-        assert_eq!(zoomed, include_str!("fixtures/settings_like_zoom_form.txt"));
+        assert_eq!(
+            zoomed,
+            include_str!("../fixtures/settings_like_zoom_form.txt")
+        );
     }
 
     #[test]

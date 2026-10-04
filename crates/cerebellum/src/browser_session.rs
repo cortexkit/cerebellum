@@ -360,6 +360,10 @@ pub enum NavigationDriveError {
     StateUnavailable,
     ConnectorFailure,
     CdpFailure,
+    FrameChanged {
+        authorized_origin: String,
+        live_origin: String,
+    },
     CommandFailed {
         error_text: String,
     },
@@ -558,6 +562,36 @@ pub trait OwnedBrowserProcess: Send {
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.snapshot(context_key, mode, deadline_ms)
+    }
+
+    /// Enumerate identities without returning frame content.
+    fn frame_documents(
+        &mut self,
+        _context: &str,
+        _deadline_ms: u64,
+    ) -> Result<Vec<crate::snapshot_store::FrameDocument>, NavigationDriveError> {
+        Ok(Vec::new())
+    }
+    fn set_read_frames(
+        &mut self,
+        frames: Vec<crate::snapshot_store::FrameDocument>,
+    ) -> Result<(), NavigationDriveError> {
+        if frames.is_empty() {
+            Ok(())
+        } else {
+            Err(NavigationDriveError::Unavailable)
+        }
+    }
+    fn prepare_frame(
+        &mut self,
+        _context: &str,
+        _expected: &crate::snapshot_store::FrameDocument,
+        _deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        Ok(false)
+    }
+    fn point_frame_document(&mut self) -> Option<crate::snapshot_store::FrameDocument> {
+        None
     }
 
     /// Capture one visual viewport through the process-owned CDP driver.
@@ -1401,6 +1435,39 @@ impl OperationGuard {
                 )
             },
         )
+    }
+
+    pub(crate) fn frame_documents(
+        &mut self,
+        context: &str,
+        deadline_ms: u64,
+    ) -> Result<Vec<crate::snapshot_store::FrameDocument>, NavigationDriveError> {
+        self.drive(
+            |e| e,
+            |process| process.frame_documents(context, deadline_ms),
+        )
+    }
+    pub(crate) fn set_read_frames(
+        &mut self,
+        frames: Vec<crate::snapshot_store::FrameDocument>,
+    ) -> Result<(), NavigationDriveError> {
+        self.drive(|e| e, |process| process.set_read_frames(frames))
+    }
+    pub(crate) fn prepare_frame(
+        &mut self,
+        context: &str,
+        frame: &crate::snapshot_store::FrameDocument,
+        deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        self.drive(
+            |e| e,
+            |process| process.prepare_frame(context, frame, deadline_ms),
+        )
+    }
+    pub(crate) fn point_frame_document(
+        &mut self,
+    ) -> Result<Option<crate::snapshot_store::FrameDocument>, NavigationDriveError> {
+        self.drive(|e| e, |process| Ok(process.point_frame_document()))
     }
 
     pub(crate) fn screenshot(
@@ -2873,6 +2940,10 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
         NavigationDriveError::StateUnavailable => "browser session state unavailable".to_string(),
         NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
         NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
+        NavigationDriveError::FrameChanged {
+            authorized_origin,
+            live_origin,
+        } => format!("frame document changed during read: {authorized_origin} -> {live_origin}"),
     }
 }
 

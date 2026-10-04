@@ -2061,6 +2061,43 @@ impl OwnedBrowserProcess for ProductionProcess {
             .snapshot(context_key, mode, deadline_ms)
     }
 
+    fn frame_documents(
+        &mut self,
+        context: &str,
+        deadline_ms: u64,
+    ) -> Result<Vec<crate::snapshot_store::FrameDocument>, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .frame_documents(context, deadline_ms)
+    }
+    fn set_read_frames(
+        &mut self,
+        frames: Vec<crate::snapshot_store::FrameDocument>,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .set_read_frames(frames);
+        Ok(())
+    }
+    fn prepare_frame(
+        &mut self,
+        context: &str,
+        frame: &crate::snapshot_store::FrameDocument,
+        deadline_ms: u64,
+    ) -> Result<bool, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .prepare_frame(context, frame, deadline_ms)
+    }
+    fn point_frame_document(&mut self) -> Option<crate::snapshot_store::FrameDocument> {
+        self.driver
+            .as_ref()
+            .and_then(|driver| driver.point_frame_document())
+    }
+
     fn snapshot_classified(
         &mut self,
         context_key: &str,
