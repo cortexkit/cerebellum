@@ -45,6 +45,7 @@ pub mod manifest;
 pub mod network;
 pub mod profile;
 pub mod profile_custody;
+pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
 pub mod wire;
@@ -865,6 +866,21 @@ mod standing_grant_params {
                 }
             }
             Some(_) => Err(("origin", "wrong_type")),
+        }
+    }
+
+    pub(super) fn domain(params: &Map<String, Value>) -> Result<Option<String>, Refusal> {
+        match params.get("domain") {
+            None => Ok(None),
+            Some(Value::String(domain))
+                if crate::browser_standing_grants::domain_scope(&format!("https://{domain}"))
+                    .as_deref()
+                    == Some(domain.as_str()) =>
+            {
+                Ok(Some(domain.clone()))
+            }
+            Some(Value::String(_)) => Err(("domain", "invalid_domain")),
+            Some(_) => Err(("domain", "wrong_type")),
         }
     }
 
@@ -4049,7 +4065,7 @@ fn standing_grant_operation(
     let standing = planes.management.standing_browser_grants();
     match method {
         management::REVOKE_ACCESS => {
-            standing_grant_params::only(params, &["origin"])
+            standing_grant_params::only(params, &["origin", "domain"])
                 .map_err(StandingGrantOperationRefusal::UnknownField)?;
             let origin = standing_grant_params::origin(params)?;
             if !facts.agent_project_id_attested || !facts.acts_as_agent {
@@ -4059,11 +4075,17 @@ fn standing_grant_operation(
                     "remedy": "this route's agent identity is not attested, so it holds no standing browser access to remove",
                 }));
             }
-            let target = origin.map_or(RevokeTarget::Everything, RevokeTarget::Origin);
+            let domain = standing_grant_params::domain(params)?;
+            let target = match (origin, domain) {
+                (Some(_), Some(_)) => return Err(("domain", "conflicting_fields").into()),
+                (Some(origin), None) => RevokeTarget::Origin(origin),
+                (None, Some(domain)) => RevokeTarget::Domain(domain),
+                (None, None) => RevokeTarget::Everything,
+            };
             Ok(standing.revoke(&facts.identity.agent_project_id, &target))
         }
         management::REVOKE_GRANT => {
-            standing_grant_params::only(params, &["agent_id", "origin", "all_sites"])
+            standing_grant_params::only(params, &["agent_id", "origin", "domain", "all_sites"])
                 .map_err(StandingGrantOperationRefusal::UnknownField)?;
             let agent_id = standing_grant_params::agent_id(params)?;
             let origin = standing_grant_params::origin(params)?;
@@ -4075,11 +4097,15 @@ fn standing_grant_operation(
                 }
                 Some(_) => return Err(("all_sites", "wrong_type").into()),
             };
+            let domain = standing_grant_params::domain(params)?;
+            if domain.is_some() && (origin.is_some() || all_sites) {
+                return Err(("domain", "conflicting_fields").into());
+            }
             let target = match (origin, all_sites) {
                 (Some(_), true) => return Err(("all_sites", "conflicting_fields").into()),
                 (Some(origin), false) => RevokeTarget::Origin(origin),
                 (None, true) => RevokeTarget::AllSites,
-                (None, false) => RevokeTarget::Everything,
+                (None, false) => domain.map_or(RevokeTarget::Everything, RevokeTarget::Domain),
             };
             Ok(standing.revoke(&agent_id, &target))
         }

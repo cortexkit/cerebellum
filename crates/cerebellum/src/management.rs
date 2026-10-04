@@ -1195,7 +1195,7 @@ impl ManagementPlane {
                     .authorized_origins
                     .iter()
                     .cloned()
-                    .map(StandingSubject::Origin)
+                    .map(crate::browser_standing_grants::always_subject)
                     .collect::<Vec<_>>(),
                 pending.disclosed_hazards.iter().copied().collect(),
                 None,
@@ -1855,7 +1855,19 @@ pub(crate) fn browser_grant_question(
         .iter()
         .map(|origin| crate::login_import::origin_host(origin).unwrap_or_else(|| origin.clone()))
         .collect();
+    let standing_scopes: Vec<String> = origins
+        .iter()
+        .map(|origin| {
+            crate::browser_standing_grants::domain_scope(origin).map_or_else(
+                || crate::login_import::origin_host(origin).unwrap_or_else(|| origin.clone()),
+                |domain| format!("{domain} and its subdomains"),
+            )
+        })
+        .collect();
     let mut facts = Vec::new();
+    if choices.contains(&BrowserGrantChoice::OriginAlways) && standing_scopes != hosts {
+        facts.push(Fact::new("Standing access", standing_scopes.join(", ")));
+    }
     let message = browser_grant_message(&hosts, hazards, severity.tier);
     // Separate the capabilities from the headline without losing the ceiling's meaning.
     if let Some((_, capabilities)) = message.split_once("? ") {
@@ -1898,7 +1910,7 @@ pub(crate) fn browser_grant_question(
         facts,
         grants: choices
             .iter()
-            .map(|choice| browser_grant_option(*choice, &hosts, severity))
+            .map(|choice| browser_grant_option(*choice, &standing_scopes, severity))
             .collect(),
         decline: ConsentOption::decline(BROWSER_GRANT_DECLINE, "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
