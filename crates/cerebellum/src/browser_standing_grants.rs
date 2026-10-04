@@ -709,9 +709,35 @@ impl StandingBrowserGrants {
         })
     }
 
+    /// Keep history bounded while retaining the newest withdrawn rows in each scope.
+    fn prune_non_live_rows(rows: &mut Vec<StandingBrowserGrant>) {
+        let mut scopes = BTreeSet::new();
+        for row in rows.iter() {
+            scopes.insert((row.agent_id.clone(), row.subject.clone()));
+        }
+        for (agent_id, subject) in scopes {
+            let mut old: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.agent_id == agent_id
+                        && row.subject == subject
+                        && row.revoked_at_ms.is_some()
+                })
+                .map(|(index, row)| (index, row.granted_at_ms))
+                .collect();
+            old.sort_by_key(|(_, granted_at)| std::cmp::Reverse(*granted_at));
+            let mut remove: Vec<_> = old.into_iter().skip(20).map(|(index, _)| index).collect();
+            remove.sort_unstable_by(|left, right| right.cmp(left));
+            for index in remove {
+                rows.remove(index);
+            }
+        }
+    }
+
     /// Record a standing answer, lasting `lifetime_ms` from now or, with
-    /// `None`, until revoked. A previous row of the same agent for the same
-    /// subject is replaced, so the newest answer is the one in force.
+    /// `None`, until revoked. A previous row of the same agent, subject, and
+    /// machine is retained as revoked history, so the newest answer is in force.
     pub fn record(
         &self,
         agent_id: &str,
@@ -741,12 +767,16 @@ impl StandingBrowserGrants {
             .map_err(|detail| StandingGrantStoreError::Corrupt { detail })?;
         let _writing = lock(&self.writes);
         let mut rows = lock(&self.rows).clone()?;
-        rows.retain(|kept| {
-            !(kept.agent_id == row.agent_id
-                && kept.subject == row.subject
-                && kept.machine_uuid == machine)
-        });
+        for previous in rows.iter_mut().filter(|previous| {
+            previous.agent_id == row.agent_id
+                && previous.subject == row.subject
+                && previous.machine_uuid == machine
+                && previous.is_live(granted_at_ms)
+        }) {
+            previous.revoked_at_ms = Some(granted_at_ms);
+        }
         rows.push(row.clone());
+        Self::prune_non_live_rows(&mut rows);
         self.storage.save(&StandingGrantStoreState {
             version: if self.version.load(Ordering::SeqCst) == 2
                 || rows

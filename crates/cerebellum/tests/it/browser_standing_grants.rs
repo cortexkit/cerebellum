@@ -1218,6 +1218,45 @@ impl Drop for Scratch {
     }
 }
 
+/// Replacing an origin answer keeps the earlier consent row as revoked history.
+#[tokio::test]
+async fn replacing_an_origin_row_keeps_the_old_consent_as_revoked_history() {
+    let scratch = Scratch::new("superseded");
+    let clock = ManualWallClock::at(1_700_000_000_000);
+    let storage = scratch.storage();
+    let store = store_over(storage, &clock);
+    let subject = StandingSubject::Origin(PUBLIC.into());
+    store
+        .record(AGENT, subject.clone(), 2, vec![], None, "el_first")
+        .unwrap();
+    clock.advance_ms(18_000);
+    store
+        .record(AGENT, subject, 3, vec![], None, "el_second")
+        .unwrap();
+
+    let file: Value = serde_json::from_slice(
+        &std::fs::read(scratch.0.join("browser_standing_grants.json")).unwrap(),
+    )
+    .unwrap();
+    let rows = file["grants"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["consent_ref"], "el_first");
+    assert_eq!(rows[0]["revoked_at_ms"], 1_700_000_018_000_u64);
+    assert_eq!(rows[1]["consent_ref"], "el_second");
+    assert_eq!(rows[1]["revoked_at_ms"], Value::Null);
+    assert_eq!(store.live_rows(AGENT).len(), 1);
+    assert_eq!(store.live_rows(AGENT)[0].consent_ref, "el_second");
+
+    let mut fixture = Fixture::with_store(store, clock);
+    let desk = fixture.management_route().await;
+    let listed = fixture
+        .operate(&desk, "grants.list", json!({"agent_id": AGENT}))
+        .await;
+    let listed_rows = listed["browser"]["grants"].as_array().unwrap();
+    assert_eq!(listed_rows.len(), 1);
+    assert_eq!(listed_rows[0]["consent_ref"], "el_second");
+}
+
 /// A row answered before a restart still authorizes after it, read back
 /// from the file the first module wrote.
 #[tokio::test]
