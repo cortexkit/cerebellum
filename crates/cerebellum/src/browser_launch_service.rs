@@ -477,6 +477,13 @@ impl ProductionLaunchService {
         accepted: &AcceptedBindFacts,
         browser_session_id: &str,
     ) -> Result<HeldLaunchProfile, Value> {
+        // A head not acting for its agent has no durable profile authority.
+        if accepted.agent_project_id_attested
+            && !accepted.acts_as_agent
+            && accepted.identity.session_kind == cerebellum_core::identity::SessionKind::Primary
+        {
+            return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}));
+        }
         let context =
             stamped_context(accepted).map_err(|_| json!({"outcome": "authorization_denied"}))?;
         if context.profile_disposition() == crate::profile::ProfileDisposition::None {
@@ -2901,6 +2908,7 @@ mod executable_identity_launch_tests {
             },
             principal: None,
             agent_project_id_attested: true,
+            acts_as_agent: true,
             session_kind_attested: true,
             control_operations: Vec::new(),
             effective_capability_scope: None,
@@ -4296,6 +4304,7 @@ mod orphan_recovery_tests {
                 },
                 principal: Some(subc_protocol::Principal::Direct),
                 agent_project_id_attested: true,
+                acts_as_agent: true,
                 session_kind_attested: true,
                 control_operations: Vec::new(),
                 effective_capability_scope: None,

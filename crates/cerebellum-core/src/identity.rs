@@ -93,18 +93,18 @@ impl ProfileResolution {
         identity: &RouteIdentity,
         logical_profile_key: Option<LogicalProfileKey>,
     ) -> Self {
-        match identity.session_kind {
-            SessionKind::Primary => Self {
+        match identity.profile_disposition {
+            ProfileDisposition::Durable => Self {
                 profile_disposition: ProfileDisposition::Durable,
                 profile_name: Some("default".to_string()),
                 logical_profile_key,
             },
-            SessionKind::Subagent => Self {
+            ProfileDisposition::Disposable => Self {
                 profile_disposition: ProfileDisposition::Disposable,
                 profile_name: Some("default".to_string()),
                 logical_profile_key,
             },
-            SessionKind::Ephemeral => Self {
+            ProfileDisposition::None => Self {
                 profile_disposition: ProfileDisposition::None,
                 profile_name: None,
                 logical_profile_key: None,
@@ -174,12 +174,14 @@ impl RouteIdentity {
 
     /// Compute the logical profile key without opening profile storage.
     pub fn logical_profile_key(&self) -> Option<LogicalProfileKey> {
-        match self.session_kind {
-            SessionKind::Primary => Some((self.agent_project_id.clone(), "default".to_string())),
-            SessionKind::Subagent => {
+        match self.profile_disposition {
+            ProfileDisposition::Durable => {
+                Some((self.agent_project_id.clone(), "default".to_string()))
+            }
+            ProfileDisposition::Disposable => {
                 Some((self.agent_project_id.clone(), self.conversation_key.clone()))
             }
-            SessionKind::Ephemeral => None,
+            ProfileDisposition::None => None,
         }
     }
 
@@ -296,10 +298,13 @@ impl ControlOperationRefusal {
 pub struct AcceptedBindFacts {
     pub identity: RouteIdentity,
     pub principal: Option<Principal>,
-    /// True only when the project id came from daemon admission facts rather
-    /// than the caller-controlled project-root compatibility fallback.
+    /// True only when the project id came from daemon admission facts or an
+    /// authorized non-flow prefrontal-core scope, never the project-root fallback.
     pub agent_project_id_attested: bool,
-    /// True only when daemon facts explicitly identify the session kind; the
+    /// Permits durable browser profiles and reading or offering standing browser
+    /// and persistent application grants for the attested agent.
+    pub acts_as_agent: bool,
+    /// True only when daemon facts or an eligible scope identify the session kind; the
     /// compatibility default to `primary` is not attested and therefore must not
     /// authorize durable storage.
     pub session_kind_attested: bool,
@@ -344,6 +349,7 @@ impl AcceptedBindFacts {
             identity: RouteIdentity::from_accepted_bind(identity, &principal, admission_facts),
             principal,
             agent_project_id_attested: admitted_agent_project_id(admission_facts).is_some(),
+            acts_as_agent: admitted_agent_project_id(admission_facts).is_some(),
             session_kind_attested: admitted_session_kind(admission_facts).is_some(),
             control_operations: control_operations_from_facts(admission_facts),
             // A bind carrying a scope under a retired name is refused before it
@@ -367,6 +373,34 @@ impl AcceptedBindFacts {
     /// Attach the scope stamp the daemon put on the bind (`None` for a route
     /// opened without a scope).
     pub fn with_scope(mut self, scope: Option<subc_protocol::scope::ScopeStamp>) -> Self {
+        if let Some(stamp) = scope
+            .as_ref()
+            .filter(|stamp| scope_admission_eligible(stamp, &self.principal))
+        {
+            if let Some(agent) = &stamp.attributes.agent_id {
+                self.identity.agent_project_id = agent.clone();
+                self.identity.session_kind = session_kind_from_scope(stamp.kind);
+                self.identity.profile_disposition = if !stamp.attributes.delegates
+                    && self.identity.session_kind == SessionKind::Primary
+                {
+                    ProfileDisposition::None
+                } else {
+                    ProfileDisposition::for_session_kind(self.identity.session_kind)
+                };
+                self.agent_project_id_attested = true;
+                self.session_kind_attested = true;
+                self.acts_as_agent = stamp.attributes.delegates;
+                self.control_operations = match stamp.kind {
+                    subc_protocol::scope::ScopeKind::Head
+                    | subc_protocol::scope::ScopeKind::Worker => {
+                        ["browser.launch", "browser.status", "browser.close"]
+                            .map(String::from)
+                            .to_vec()
+                    }
+                    subc_protocol::scope::ScopeKind::Ephemeral => Vec::new(),
+                };
+            }
+        }
         self.scope = scope;
         self
     }
@@ -382,6 +416,30 @@ impl AcceptedBindFacts {
             .map(|key| AdmissionFactsRefusal::CapabilityScopeMisspelled { key })
     }
 
+    /// Refuse a bind when its eligible scope stamp and daemon admission facts
+    /// name different agents or session kinds, rather than choosing one claim.
+    pub fn scope_facts_refusal(
+        principal: &Option<Principal>,
+        scope: Option<&subc_protocol::scope::ScopeStamp>,
+        facts: Option<&Value>,
+    ) -> Option<AdmissionFactsRefusal> {
+        let stamp = scope.filter(|stamp| scope_admission_eligible(stamp, principal))?;
+        let agent = stamp.attributes.agent_id.as_deref()?;
+        if admitted_agent_project_id(facts).is_some_and(|fact| fact != agent) {
+            return Some(AdmissionFactsRefusal::ScopeFactsConflict {
+                field: "agentProjectId",
+            });
+        }
+        if admitted_session_kind(facts)
+            .is_some_and(|kind| kind != session_kind_from_scope(stamp.kind))
+        {
+            return Some(AdmissionFactsRefusal::ScopeFactsConflict {
+                field: "sessionKind",
+            });
+        }
+        None
+    }
+
     /// Whether the consumer declared it can relay a question to a human.
     ///
     /// True means asking is worth attempting, never that an answer will arrive.
@@ -395,6 +453,16 @@ impl AcceptedBindFacts {
     /// request fields cannot substitute for missing identity or authority facts.
     pub fn allows_control_operation(&self, operation: &str) -> bool {
         self.control_operation_refusal(operation).is_none()
+    }
+
+    /// A missing scoped identity must be repaired by the scope owner, not by
+    /// adding caller-controlled request fields or enabling a legacy carrier.
+    pub fn control_refusal_remedy(&self, refusal: ControlOperationRefusal) -> &'static str {
+        if self.scope.is_some() && !self.agent_project_id_attested {
+            "this scoped route has no attested agent; ask prefrontal-core to open a non-flow scope with agent_id under its authorized owner, or use a route with daemon admission facts"
+        } else {
+            refusal.remedy()
+        }
     }
 
     /// Which attested fact fails to admit this control operation, if any.
@@ -455,6 +523,7 @@ impl AcceptedBindFacts {
             },
             principal: self.principal.clone(),
             agent_project_id_attested: false,
+            acts_as_agent: false,
             session_kind_attested: false,
             control_operations: Vec::new(),
             effective_capability_scope: Some(Vec::new()),
@@ -480,6 +549,28 @@ impl AcceptedBindFacts {
     }
 }
 
+fn scope_admission_eligible(
+    stamp: &subc_protocol::scope::ScopeStamp,
+    principal: &Option<Principal>,
+) -> bool {
+    let core = Principal::Reserved {
+        module_id: "prefrontal-core".to_string(),
+    };
+    stamp.owner_authorized
+        && stamp.owner == core
+        && principal.as_ref() == Some(&core)
+        && stamp.attributes.flow_id.is_none()
+}
+
+/// Map daemon scope kinds explicitly to the older session-kind vocabulary.
+fn session_kind_from_scope(kind: subc_protocol::scope::ScopeKind) -> SessionKind {
+    match kind {
+        subc_protocol::scope::ScopeKind::Head => SessionKind::Primary,
+        subc_protocol::scope::ScopeKind::Worker => SessionKind::Subagent,
+        subc_protocol::scope::ScopeKind::Ephemeral => SessionKind::Ephemeral,
+    }
+}
+
 /// Why a bind's admission facts are refused before the route is bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionFactsRefusal {
@@ -487,6 +578,8 @@ pub enum AdmissionFactsRefusal {
     /// longer reads. `key` is where it was found, as a dotted path from the
     /// root of the facts (for example `accepted.effectiveCapabilityScope`).
     CapabilityScopeMisspelled { key: String },
+    /// The scope stamp and daemon admission facts disagree about this identity field.
+    ScopeFactsConflict { field: &'static str },
 }
 
 impl AdmissionFactsRefusal {
@@ -494,12 +587,14 @@ impl AdmissionFactsRefusal {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::CapabilityScopeMisspelled { .. } => "admission_fact_misspelled",
+            Self::ScopeFactsConflict { .. } => "scope_admission_conflict",
         }
     }
 
     /// A human-readable account of the refusal and what to do about it.
     pub fn message(&self) -> String {
         match self {
+            Self::ScopeFactsConflict { field } => format!("scope stamp and admission facts disagree about {field}; reopen the route with consistent daemon-stamped identity"),
             Self::CapabilityScopeMisspelled { key } => format!(
                 "the admission facts carry a capability scope at '{key}', which is not read; \
                  the scope is read only from the root key 'effectiveCapabilityScope'. The bind \
@@ -512,6 +607,7 @@ impl AdmissionFactsRefusal {
     /// Structured facts about the refusal, for the error body's `detail`.
     pub fn detail(&self) -> Value {
         match self {
+            Self::ScopeFactsConflict { field } => serde_json::json!({"field": field}),
             Self::CapabilityScopeMisspelled { key } => serde_json::json!({
                 "key": key,
                 "expected_key": "effectiveCapabilityScope",
@@ -720,6 +816,75 @@ pub fn take_test_observations() -> Vec<IdentityResolutionObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_admission_ephemeral_kind_is_not_worker() {
+        let core = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let stamp = subc_protocol::scope::ScopeStamp {
+            owner: core.clone(),
+            scope_ref: "ephemeral".into(),
+            scope_epoch: 1,
+            kind: subc_protocol::scope::ScopeKind::Ephemeral,
+            parent: None,
+            parent_state: None,
+            attributes: subc_protocol::scope::ScopeAttributes {
+                agent_id: Some("pj-agent".into()),
+                delegates: true,
+                flow_id: None,
+            },
+            owner_authorized: true,
+        };
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind_identity("/caller/project", "conversation"),
+            Some(core),
+            None,
+            None,
+            &tool_route(),
+        )
+        .with_scope(Some(stamp));
+        assert_eq!(accepted.identity.session_kind, SessionKind::Ephemeral);
+        assert_eq!(
+            accepted.identity.profile_disposition,
+            ProfileDisposition::None
+        );
+        assert!(accepted.control_operations.is_empty());
+    }
+
+    #[test]
+    fn scope_admission_flow_stamp_attests_nothing() {
+        let core = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let stamp = subc_protocol::scope::ScopeStamp {
+            owner: core.clone(),
+            scope_ref: "flow-head".into(),
+            scope_epoch: 1,
+            kind: subc_protocol::scope::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            attributes: subc_protocol::scope::ScopeAttributes {
+                agent_id: Some("pj-agent".into()),
+                delegates: true,
+                flow_id: Some("flow".into()),
+            },
+            owner_authorized: true,
+        };
+        let accepted = AcceptedBindFacts::from_bind(
+            &bind_identity("/caller/project", "conversation"),
+            Some(core),
+            None,
+            None,
+            &tool_route(),
+        )
+        .with_scope(Some(stamp));
+        assert!(!accepted.agent_project_id_attested);
+        assert!(!accepted.session_kind_attested);
+        assert!(!accepted.acts_as_agent);
+        assert!(accepted.control_operations.is_empty());
+        assert_eq!(accepted.effective_capability_scope, None);
+    }
 
     fn tool_route() -> RouteTarget {
         RouteTarget::ToolProvider {

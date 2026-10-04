@@ -824,6 +824,16 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
         .iter()
         .find(|module| module.module_id == MODULE_ID)
         .expect("real subc catalog must contain cerebellum");
+    assert!(
+        entry
+            .capabilities
+            .as_ref()
+            .expect("module capability declarations survive HELLO registration")
+            .provides
+            .iter()
+            .any(|name| name == manifest::SCOPE_ADMISSION_CAPABILITY),
+        "catalog.list modules[i].capabilities.provides exposes scope admission to route openers"
+    );
     // Both roles survive registration with a real daemon and come back in its
     // catalogue. Asserted against the DAEMON's view rather than the manifest
     // builder's, which is the difference between advertising a surface and the

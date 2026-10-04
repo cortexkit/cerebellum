@@ -423,6 +423,9 @@ enum PageMove {
 #[derive(Default)]
 struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
+    accepted_launches: Mutex<Vec<cerebellum_core::identity::AcceptedBindFacts>>,
+    profile_service: Option<cerebellum::browser_launch_service::ProductionLaunchService>,
+    profile_directories: Mutex<Vec<std::path::PathBuf>>,
     page: CommittedPage,
     /// Navigations the page commits while a snapshot or screenshot is being
     /// captured, standing for ones that land between the read's
@@ -443,9 +446,17 @@ struct RecordingLauncher {
 impl BrowserSessionLauncher for RecordingLauncher {
     fn launch(
         &self,
-        _: &cerebellum_core::identity::AcceptedBindFacts,
-        _: &str,
+        accepted: &cerebellum_core::identity::AcceptedBindFacts,
+        session_id: &str,
     ) -> Result<LaunchedBrowser, Value> {
+        if let Some(service) = &self.profile_service {
+            let directory = service.take_and_return_profile_custody(accepted, session_id)?;
+            self.profile_directories.lock().unwrap().push(directory);
+        }
+        self.accepted_launches
+            .lock()
+            .unwrap()
+            .push(accepted.clone());
         *self.launches.lock().unwrap() += 1;
         Ok(LaunchedBrowser {
             process: Box::new(RecordingProcess {
@@ -2384,6 +2395,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
         // is opened.
         principal: Some(subc_protocol::Principal::Direct),
         agent_project_id_attested: true,
+        acts_as_agent: true,
         session_kind_attested: true,
         control_operations: Vec::new(),
         effective_capability_scope: None,
@@ -5369,12 +5381,13 @@ fn with_readable_call_records(
 }
 
 #[tokio::test]
-async fn flow_id_scope_stamp_decodes_and_binds_without_changing_service() {
+async fn flow_id_scope_stamp_binds_but_session_calls_are_refused() {
     let planes = Planes::with_browser_config_journaling(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
     );
+    // Reuse a call key so a recorded attended reply cannot bypass flow refusal.
     for (channel, flow_id) in [(10, None), (11, Some("flow-1".to_owned()))] {
         let mut scope = scope_stamp(1, true);
         scope.attributes.flow_id = flow_id;
@@ -5388,7 +5401,15 @@ async fn flow_id_scope_stamp_decodes_and_binds_without_changing_service() {
         )
         .await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(body["outcome"], "no_session", "{body}");
+        assert_eq!(
+            body["outcome"],
+            if channel == 11 {
+                "consent_unavailable"
+            } else {
+                "no_session"
+            },
+            "{body}"
+        );
     }
 }
 
@@ -6683,4 +6704,433 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
         body(&reply)
     );
     assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+fn admission_stamp() -> subc_protocol::scope::ScopeStamp {
+    let mut stamp = scope_stamp(1, true);
+    stamp.attributes.agent_id = Some("pj-scope-agent".into());
+    stamp.attributes.delegates = true;
+    stamp
+}
+
+fn scope_admission_planes() -> (Planes, Arc<RecordingLauncher>) {
+    let launcher = Arc::new(RecordingLauncher::default());
+    let standing = Arc::new(
+        cerebellum::browser_standing_grants::StandingBrowserGrants::open(
+            Arc::new(cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new()),
+            Some("test-machine".into()),
+        ),
+    );
+    let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+        Some(standing),
+    );
+    planes.launch_service = Some(launcher.clone());
+    (planes, launcher)
+}
+
+async fn bind_admission_stamp(
+    planes: &Planes,
+    stamp: subc_protocol::scope::ScopeStamp,
+    principal: Principal,
+    facts: Option<Value>,
+) -> Frame {
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/caller/chosen/project", "test", "test-session"),
+        principal: Some(principal),
+        consumer_capabilities: None,
+        admission_facts: facts,
+        scope: Some(stamp),
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        9,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(2);
+    cerebellum::handle_control_request_for_test_with_bindings(
+        frame,
+        &tx,
+        &planes.health,
+        &planes.routes,
+    )
+    .await
+    .unwrap();
+    rx.recv().await.unwrap()
+}
+
+async fn scoped_launch(planes: &Planes) -> Value {
+    let reply = invoke_existing(planes, 1, "browser.launch", json!({})).await;
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+async fn assert_scope_unattested(stamp: subc_protocol::scope::ScopeStamp, principal: Principal) {
+    let (planes, launcher) = scope_admission_planes();
+    assert_eq!(
+        bind_admission_stamp(&planes, stamp, principal, None)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let body = scoped_launch(&planes).await;
+    // Flow routes bind but are refused even before control-operation admission.
+    assert!(
+        body["reason"] == "admission_facts_absent"
+            || body["code"] == "session_caller_not_admitted"
+            || (body["outcome"] == "consent_unavailable"
+                && body["detail"]["reason"] == "flow_scopes_unsupported"),
+        "{body}"
+    );
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn scope_admission_requires_owner_authorized() {
+    let mut stamp = admission_stamp();
+    stamp.owner_authorized = false;
+    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+}
+#[tokio::test]
+async fn scope_admission_requires_core_owner() {
+    let mut stamp = admission_stamp();
+    stamp.owner = reserved("broca");
+    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+}
+#[tokio::test]
+async fn scope_admission_requires_core_route_principal() {
+    assert_scope_unattested(admission_stamp(), reserved("broca")).await;
+}
+#[tokio::test]
+async fn scope_admission_excludes_flow_scopes() {
+    let mut stamp = admission_stamp();
+    stamp.attributes.flow_id = Some("flow-1".into());
+    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+}
+#[tokio::test]
+async fn scope_admission_requires_agent_id() {
+    let mut stamp = admission_stamp();
+    stamp.attributes.agent_id = None;
+    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+}
+#[tokio::test]
+async fn scope_admission_current_worker_shape_attests_nothing() {
+    let mut stamp = admission_stamp();
+    stamp.kind = subc_protocol::scope::ScopeKind::Worker;
+    stamp.attributes.agent_id = None;
+    stamp.attributes.delegates = false;
+    assert_scope_unattested(stamp.clone(), reserved("prefrontal-core")).await;
+    let (planes, _) = scope_admission_planes();
+    bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    let body = scoped_launch(&planes).await;
+    assert_eq!(body["reason"], "admission_facts_absent");
+    assert!(
+        body["remedy"].as_str().unwrap().contains("agent_id"),
+        "{body}"
+    );
+}
+#[tokio::test]
+async fn scope_admission_worker_with_agent_gets_controls_and_disposable_profile() {
+    let (planes, launcher) = scope_admission_planes();
+    let mut stamp = admission_stamp();
+    stamp.kind = subc_protocol::scope::ScopeKind::Worker;
+    assert_eq!(
+        bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let body = scoped_launch(&planes).await;
+    assert_eq!(body["outcome"], "launched", "{body}");
+    assert_eq!(body["profile_disposition"], "disposable");
+    assert_eq!(*launcher.launches.lock().unwrap(), 1);
+    let facts = launcher.accepted_launches.lock().unwrap()[0].clone();
+    assert_eq!(
+        facts.identity.session_kind,
+        cerebellum_core::identity::SessionKind::Subagent
+    );
+    for op in ["browser.launch", "browser.status", "browser.close"] {
+        assert!(facts.allows_control_operation(op));
+    }
+}
+#[tokio::test]
+async fn scope_admission_ephemeral_gets_no_controls() {
+    let (planes, launcher) = scope_admission_planes();
+    let mut stamp = admission_stamp();
+    stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+    bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    let body = scoped_launch(&planes).await;
+    assert_eq!(body["reason"], "operation_not_granted", "{body}");
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    for op in ["browser.status", "browser.close"] {
+        let reply = invoke_existing(
+            &planes,
+            3,
+            op,
+            if op == "browser.close" {
+                json!({"browser_session_id":"absent"})
+            } else {
+                json!({})
+            },
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["reason"], "operation_not_granted", "{body}");
+    }
+}
+
+async fn seed_scope_standing_grant(planes: &Planes) {
+    planes
+        .management
+        .standing_browser_grants()
+        .record(
+            "pj-scope-agent",
+            cerebellum::browser_standing_grants::StandingSubject::Origin(
+                "https://page.example".into(),
+            ),
+            cerebellum::authorization::COMPOSE,
+            vec![],
+            None,
+            "scope-consent",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
+    let (mut planes, _) = scope_admission_planes();
+    // Exercise production profile selection and custody without starting Chrome.
+    let launcher = Arc::new(RecordingLauncher {
+        profile_service: Some(
+            cerebellum::browser_launch_service::ProductionLaunchService::open(
+                config(),
+                cerebellum::JournalPersistence::Isolated,
+            ),
+        ),
+        ..RecordingLauncher::default()
+    });
+    planes.launch_service = Some(launcher.clone());
+    seed_scope_standing_grant(&planes).await;
+    bind_admission_stamp(
+        &planes,
+        admission_stamp(),
+        reserved("prefrontal-core"),
+        None,
+    )
+    .await;
+    let body = scoped_launch(&planes).await;
+    assert_eq!(body["outcome"], "launched", "{body}");
+    assert_eq!(body["profile_disposition"], "durable");
+    let launched = launcher.accepted_launches.lock().unwrap()[0].clone();
+    assert_eq!(launched.identity.agent_project_id, "pj-scope-agent");
+    assert!(launched.acts_as_agent);
+    assert_eq!(launcher.profile_directories.lock().unwrap().len(), 1);
+    let service = launcher.profile_service.as_ref().unwrap();
+    let reused = service
+        .take_and_return_profile_custody(&launched, "second-session")
+        .unwrap();
+    assert_eq!(
+        reused,
+        launcher.profile_directories.lock().unwrap()[0],
+        "durable agent profile is reused across sessions"
+    );
+    let mut another_agent = launched.clone();
+    another_agent.identity.agent_project_id = "pj-other-agent".into();
+    let other = service
+        .take_and_return_profile_custody(&another_agent, "other-session")
+        .unwrap();
+    assert_ne!(
+        other, reused,
+        "profile ownership is keyed on the stamp's agent"
+    );
+    assert_eq!(
+        launched.identity.logical_profile_key(),
+        Some(("pj-scope-agent".into(), "default".into()))
+    );
+    let navigated = invoke_existing(
+        &planes,
+        2,
+        "browser.navigate",
+        json!({"url":"https://page.example/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&navigated.body).unwrap();
+    assert_eq!(
+        body["outcome"], "ok",
+        "standing row must authorize navigation: {body}"
+    );
+}
+
+#[tokio::test]
+async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_access() {
+    let (planes, launcher) = scope_admission_planes();
+    seed_scope_standing_grant(&planes).await;
+    let mut stamp = admission_stamp();
+    stamp.attributes.delegates = false;
+    bind_admission_stamp(&planes, stamp.clone(), reserved("prefrontal-core"), None).await;
+    let body = scoped_launch(&planes).await;
+    assert_eq!(body["outcome"], "no_profile", "{body}");
+    assert_eq!(body["profile_disposition"], "none", "{body}");
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    let accepted = cerebellum_core::identity::AcceptedBindFacts::from_bind(
+        &BindIdentity::new("/caller/project", "test", "test-session"),
+        Some(reserved("prefrontal-core")),
+        None,
+        None,
+        &RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .with_scope(Some(stamp));
+    assert_eq!(
+        accepted.identity.resolve_profile().logical_profile_key,
+        None
+    );
+    let service = cerebellum::browser_launch_service::ProductionLaunchService::open(
+        config(),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    let refusal = service
+        .take_and_return_profile_custody(&accepted, "no-profile-session")
+        .unwrap_err();
+    assert_eq!(refusal["outcome"], "no_profile");
+    let navigated = invoke_existing(
+        &planes,
+        2,
+        "browser.navigate",
+        json!({"url":"https://page.example/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&navigated.body).unwrap();
+    assert_eq!(
+        body["outcome"], "authorization_denied",
+        "standing rows must not authorize: {body}"
+    );
+}
+
+#[tokio::test]
+async fn scope_admission_conflicting_facts_refuse_bind_and_agreeing_facts_bind() {
+    for (field, value) in [
+        ("agentProjectId", json!("pj-other")),
+        ("sessionKind", json!("subagent")),
+    ] {
+        let (planes, _) = scope_admission_planes();
+        let mut facts = json!({"agentProjectId":"pj-scope-agent", "sessionKind":"primary"});
+        facts[field] = value;
+        let reply = bind_admission_stamp(
+            &planes,
+            admission_stamp(),
+            reserved("prefrontal-core"),
+            Some(facts),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "scope_admission_conflict");
+        assert_eq!(body["detail"]["field"], field);
+        assert_eq!(scoped_launch(&planes).await["code"], "route_not_bound");
+    }
+    let (planes, _) = scope_admission_planes();
+    let reply = bind_admission_stamp(&planes, admission_stamp(), reserved("prefrontal-core"),
+        Some(json!({"agentProjectId":"pj-scope-agent", "sessionKind":"primary", "effectiveCapabilityScope":["browser.status"]}))).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+
+    let body = scoped_launch(&planes).await;
+    assert_eq!(
+        body["code"], "capability_denied",
+        "facts remain the only capability scope source: {body}"
+    );
+}
+
+#[tokio::test]
+async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_refusal() {
+    let (mut planes, launcher) = scope_admission_planes();
+    let storage = with_readable_call_records(&mut planes);
+    let mut stamp = admission_stamp();
+    stamp.attributes.flow_id = Some("flow-1".into());
+    let facts = json!({"agentProjectId":"pj-scope-agent", "sessionKind":"primary", "browserControlOperations":["browser.launch","browser.status","browser.close"]});
+    assert_eq!(
+        bind_admission_stamp(
+            &planes,
+            stamp.clone(),
+            reserved("prefrontal-core"),
+            Some(facts.clone())
+        )
+        .await
+        .header
+        .ty,
+        FrameType::Response
+    );
+    let expected = json!({"outcome":"consent_unavailable", "detail":{"reason":"flow_scopes_unsupported"}, "remedy":"flows can't use cerebellum yet"});
+    let (tx, mut rx) = mpsc::channel(8);
+    for (corr, name, args) in [
+        (801, "browser_use", json!({"action":"launch"})),
+        (
+            802,
+            "computer_use",
+            json!({"action":"read_state", "target":"com.example.NotInstalled"}),
+        ),
+    ] {
+        let reply = exchange(
+            &planes,
+            &tx,
+            &mut rx,
+            keyed_on(9, corr, name, args, &format!("flow:{corr}")),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body, expected,
+            "{name} must use the pinned route-admission envelope"
+        );
+        let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+        let record: Value = serde_json::from_str(stored.lines().last().unwrap()).unwrap();
+        assert_eq!(record["state"], "refused", "{stored}");
+        assert_eq!(record["refusal_reason"], "consent_unavailable", "{stored}");
+        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "no elicitation or reverse request was sent"
+        );
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    }
+    stamp.attributes.flow_id = None;
+    assert_eq!(
+        bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), Some(facts))
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let reply = invoke_existing(&planes, 803, "browser_use", json!({"action":"launch"})).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "launched", "{body}");
+    assert_eq!(*launcher.launches.lock().unwrap(), 1);
+    let reply = invoke_existing(
+        &planes,
+        804,
+        "computer_use",
+        json!({"action":"read_state", "target":"com.example.NotInstalled"}),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(
+        body["code"], "capability_not_admitted",
+        "without a flow the call reaches ordinary computer capability admission: {body}"
+    );
 }
