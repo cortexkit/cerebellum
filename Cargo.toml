@@ -39,7 +39,7 @@ subc-os = { path = "../subconscious/crates/subc-os" }
 # types they speak to it. Taken from crates.io at a fixed version so the lock
 # moves on them only when this repo chooses, not whenever the sibling does.
 subc-control = "0.28.0"
-subc-daemon = "0.31.0"
+subc-daemon = "0.31.1"
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # The fleet commons, a second sibling beside subconscious, for the daemon-
 # aligned home resolvers (`resolve_data_home` / `resolve_config_home`). One
