@@ -6861,9 +6861,17 @@ mod resource_busy_wire {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let root: PathBuf =
-            std::env::temp_dir().join(format!("ck-resource-busy-{}-{since}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // A per-call directory: tests in this binary run in parallel, and two
+        // fixtures sharing a root share profile custody, so one test would see
+        // the other's browser holding the profile. The counter keeps names
+        // distinct within a millisecond, and `create_dir` refuses a reused one.
+        static ROOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = ROOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root: PathBuf = std::env::temp_dir().join(format!(
+            "ck-resource-busy-{}-{since}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
         let launcher = Arc::new(CustodyLauncher {
             lifecycle: Arc::new(Mutex::new(
                 ProfileLifecycle::open_with_config(
