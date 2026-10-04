@@ -6,7 +6,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -858,9 +858,17 @@ fn sqlite(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let mut stdout = child.stdout.take().expect("SQLite stdout is piped");
+    // Drain concurrently so a full pipe cannot stop SQLite from exiting.
+    // Dropping this thread's handle on timeout does not wait for a blocked read.
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output)?;
+        Ok::<_, io::Error>(output)
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if Instant::now() >= deadline {
             // macOS security-policy evaluation can leave a child blocked in
@@ -875,12 +883,14 @@ fn sqlite(
             ));
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    };
+    let output = reader
+        .join()
+        .map_err(|_| io::Error::other("SQLite stdout reader panicked"))??;
+    if !status.success() {
         return Err(io::Error::other("SQLite could not read the cookie store"));
     }
-    String::from_utf8(output.stdout).map_err(|_| io::Error::other("SQLite returned non-UTF-8"))
+    String::from_utf8(output).map_err(|_| io::Error::other("SQLite returned non-UTF-8"))
 }
 
 /// The URI form of a store path for `ATTACH`, which needs a URI to carry a
@@ -2512,6 +2522,26 @@ mod tests {
 #[cfg(all(test, unix))]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn sqlite_large_stdout_is_drained_before_child_exit() {
+        let program = crate::content_named_fixture::content_named_fixture(
+            "sqlite-large-stdout",
+            "sqlite",
+            b"#!/bin/sh\nexec /usr/bin/awk 'BEGIN { for (i = 0; i < 16384; i++) print \"0123456789abcdef\" }'\n",
+            0o700,
+        );
+        let start = Instant::now();
+        let output = sqlite_read_until(
+            &program,
+            Path::new("/tmp/unused-cookie-store"),
+            "PRAGMA quick_check;",
+            start + Duration::from_secs(2),
+        )
+        .expect("large SQLite output must not block behind a full stdout pipe");
+        assert_eq!(output, "0123456789abcdef\n".repeat(16384));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn sqlite_transfer_deadline_bounds_a_silent_child() {
