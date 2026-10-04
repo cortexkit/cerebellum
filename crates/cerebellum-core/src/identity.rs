@@ -298,9 +298,12 @@ impl ControlOperationRefusal {
 pub struct AcceptedBindFacts {
     pub identity: RouteIdentity,
     pub principal: Option<Principal>,
-    /// True only when the project id came from daemon admission facts or the
-    /// `agent_id` of an authorized scope stamp admitted for this route (see
-    /// [`Self::flow_id`]), never the project-root fallback.
+    /// True only when the project id is daemon-vouched: either the bind's
+    /// admission facts carried `agentProjectId` (stamped by the daemon's
+    /// configured carrier, never by the caller), or an authorized scope stamp
+    /// admitted for this route named it as `agent_id` (see [`Self::flow_id`]).
+    /// The fallback that derives a project id from the caller's project root
+    /// never counts.
     pub agent_project_id_attested: bool,
     /// Permits durable browser profiles and reading or offering standing browser
     /// and persistent application grants for the attested agent.
