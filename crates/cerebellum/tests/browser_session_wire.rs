@@ -7459,6 +7459,21 @@ async fn bind_flow_wire_target(
     principal: Principal,
     target: RouteTarget,
 ) {
+    let reply = bind_flow_wire_reply(planes, stamp, principal, target).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+async fn bind_flow_wire_reply(
+    planes: &Planes,
+    stamp: Option<subc_protocol::scope::ScopeStamp>,
+    principal: Principal,
+    target: RouteTarget,
+) -> Frame {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
         route_channel: 9,
@@ -7486,13 +7501,7 @@ async fn bind_flow_wire_target(
     )
     .await
     .unwrap();
-    let reply = rx.recv().await.unwrap();
-    assert_eq!(
-        reply.header.ty,
-        FrameType::Response,
-        "{}",
-        String::from_utf8_lossy(&reply.body)
-    );
+    rx.recv().await.unwrap()
 }
 
 async fn flow_wire_call(planes: &Planes, corr: u64, action: Value) -> Value {
@@ -7594,8 +7603,6 @@ async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
     for (principal, owner, authorized) in [
         ("prefrontal-core", "prefrontal-core", true),
         ("broca", "prefrontal-core", true),
-        ("basal", "prefrontal-core", false),
-        ("basal", "broca", true),
     ] {
         let (planes, launcher) = flow_planes();
         let mut stamp = flow_stamp();
@@ -7618,14 +7625,6 @@ async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
         }
         assert_eq!(*launcher.launches.lock().unwrap(), 0);
     }
-    let (planes, _) = flow_planes();
-    bind_flow_wire(&planes, None, reserved("basal")).await;
-    let reply = invoke_existing(&planes, 2, "browser.launch", json!({})).await;
-    assert_eq!(reply.header.ty, FrameType::Error);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&reply.body).unwrap()["code"],
-        "session_caller_not_admitted"
-    );
 }
 
 #[tokio::test]
@@ -7715,4 +7714,188 @@ async fn flow_recovery_and_profile_rebind_consent_sites_never_open_cards() {
         assert!(rx.try_recv().is_err());
     }
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flow_basal_bind_requires_admitted_carrier() {
+    let mut no_flow_id = flow_stamp();
+    no_flow_id.attributes.flow_id = None;
+    let mut unauthorized = flow_stamp();
+    unauthorized.owner_authorized = false;
+    let mut wrong_owner = flow_stamp();
+    wrong_owner.owner = reserved("broca");
+    for stamp in [
+        None,
+        Some(no_flow_id),
+        Some(unauthorized),
+        Some(wrong_owner),
+    ] {
+        let (planes, launcher) = flow_planes();
+        let reply = bind_flow_wire_reply(
+            &planes,
+            stamp,
+            reserved("basal"),
+            RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "principal_denied", "{body}");
+        assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+        assert_eq!(planes.elicitor.outstanding(), 0);
+    }
+}
+
+#[tokio::test]
+async fn flow_operator_operations_cannot_list_or_revoke_app_grants() {
+    use cerebellum::computer_grants::{
+        AlwaysGrantRecord, ComputerGrants, GrantStorage, GrantStoreState, InMemoryGrantStorage,
+        GRANT_STORE_VERSION,
+    };
+    let (mut planes, launcher) = flow_planes();
+    let storage = Arc::new(InMemoryGrantStorage::new());
+    let state = GrantStoreState {
+        version: GRANT_STORE_VERSION,
+        records: vec![AlwaysGrantRecord {
+            agent_project_id: "pj-scope-agent".into(),
+            bundle_identity: "com.example.Editor".into(),
+            team_id: Some("TEAM".into()),
+            designated_requirement: Some("test requirement".into()),
+            machine_uuid: "machine".into(),
+            created_at_ms: 1,
+        }],
+    };
+    storage.save(&state).unwrap();
+    planes.management = Arc::new(
+        cerebellum::management::ManagementPlane::with_computer_grants(
+            Arc::new(cerebellum::management::PlatformResolver::new()),
+            Arc::new(ComputerGrants::open(
+                storage.clone(),
+                Some("machine".into()),
+            )),
+        ),
+    );
+    assert_eq!(
+        planes.management.computer_grants().list()["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    bind_flow_wire_target(
+        &planes,
+        Some(flow_stamp()),
+        reserved("basal"),
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .await;
+    for (corr, method, params) in [
+        (2, cerebellum::management::LIST_APP_GRANTS, json!({})),
+        (
+            3,
+            cerebellum::management::REVOKE_APP_GRANT,
+            json!({"grantee":"pj-scope-agent","bundle_identity":"com.example.Editor"}),
+        ),
+        (
+            4,
+            cerebellum::management::CLEAR_LAUNCH_RECOVERY,
+            json!({"agent_project_id":"pj-scope-agent"}),
+        ),
+        (5, cerebellum::management::REBIND_PROFILE_ROOT, json!({})),
+        (6, cerebellum::management::REVOKE_GRANT, json!({})),
+        (
+            7,
+            cerebellum::management::LIST_GRANTS,
+            json!({"agent_id":"pj-scope-agent"}),
+        ),
+    ] {
+        let mut frame = request(corr, "unused", json!({}));
+        frame.body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        cerebellum::handle_frame_for_test(frame, &tx, &planes)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "consent_unavailable", "{method}: {body}");
+        assert_eq!(body["detail"]["reason"], "unattended_flow");
+        assert!(
+            body.get("grants").is_none(),
+            "operator records must not be disclosed"
+        );
+        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            planes.management.computer_grants().list()["grants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(storage.load().unwrap(), state);
+    }
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn flow_goodbye_clears_unattended_elicitation_state() {
+    let (planes, _) = flow_planes();
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = json!({"method":"elicitation/create","params":{}});
+    assert_eq!(
+        planes
+            .elicitor
+            .ask(&tx, 9, 3, question.clone(), Duration::from_millis(10))
+            .await,
+        cerebellum::elicit::AskOutcome::Undeliverable
+    );
+    assert!(rx.try_recv().is_err());
+    cerebellum::handle_frame_for_test(
+        Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            9,
+            3,
+            0,
+            vec![],
+        )
+        .unwrap(),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
+    // A direct sender probe observes removal without rebinding, which would
+    // otherwise clear the policy itself and conceal a missing Goodbye cleanup.
+    assert_eq!(
+        planes
+            .elicitor
+            .ask(&tx, 9, 3, question, Duration::from_millis(10))
+            .await,
+        cerebellum::elicit::AskOutcome::NoAnswer
+    );
+    let mut saw_question = false;
+    while let Ok(frame) = rx.try_recv() {
+        if frame.header.channel == 9 && frame.header.ty == FrameType::Request {
+            saw_question = true;
+        }
+    }
+    assert!(saw_question, "the route's unattended entry was not cleared");
+    assert_eq!(planes.elicitor.outstanding(), 0);
 }

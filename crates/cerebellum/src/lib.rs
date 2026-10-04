@@ -2975,6 +2975,9 @@ async fn handle_frame(
                 .routes
                 .remove(frame.header.channel, frame.header.epoch);
             planes
+                .elicitor
+                .set_unattended(frame.header.channel, frame.header.epoch, false);
+            planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
             if let Some(facts) = removed {
@@ -3234,6 +3237,19 @@ async fn handle_management_request(
             corr,
             "unknown_method",
             &format!("unknown method '{method}'"),
+        )
+        .await;
+    }
+    // A workflow's owner permissions do not include the operator's machine-wide
+    // grant administration, even when the workflow has an admitted flow route.
+    if facts.flow_id.is_some() && is_operator_operation(method) {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            flow_consent_refusal("unattended_flow"),
         )
         .await;
     }
@@ -4583,11 +4599,16 @@ async fn handle_control_request(
             // (subc-mcp) is the primary exclusion of cerebellum capabilities
             // from `mcp:*` surfaces. This check is the defense-in-depth backstop
             // that rejects a forged direct dispatch under a non-first-party
-            // principal before any capability executes. Whether a first-party
-            // principal may act in the conversation this bind names is decided
+            // principal before any capability executes. The sole exception is
+            // Basal carrying an admitted flow stamp, not Basal's other routes.
+            // Whether a first-party principal may act in this conversation is decided
             // per call, at dispatch: see `send_session_caller_not_admitted`.
             let trust = trust_for_principal(&principal);
-            if !trust.is_first_party() {
+            if !trust.is_first_party()
+                && !scope.as_ref().is_some_and(|stamp| {
+                    cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
+                })
+            {
                 return send_principal_denied(
                     writer,
                     frame.header.ver,

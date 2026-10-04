@@ -589,7 +589,9 @@ fn scope_admission_eligible(
             && stamp.attributes.flow_id.is_none())
 }
 
-fn flow_carrier_admitted(
+/// Only Basal carrying an authorized core-owned flow stamp may bypass the
+/// ordinary first-party bind restriction and act as an unattended workflow.
+pub fn flow_carrier_admitted(
     stamp: &subc_protocol::scope::ScopeStamp,
     principal: &Option<Principal>,
 ) -> bool {
