@@ -103,6 +103,7 @@ enum Reply {
 pub struct Elicitor {
     lane: AskLane<oneshot::Sender<Reply>>,
     unattended: std::sync::Mutex<std::collections::HashSet<(u16, u32)>>,
+    cards: std::sync::Mutex<std::collections::HashMap<(u16, u64), Card>>,
 }
 
 impl Default for Elicitor {
@@ -116,6 +117,7 @@ impl Elicitor {
         Self {
             lane: AskLane::new(),
             unattended: Default::default(),
+            cards: Default::default(),
         }
     }
 
@@ -189,7 +191,7 @@ impl Elicitor {
         // in the lane for the life of the module. A late answer then finds no
         // entry and is discarded as unsolicited.
         let _registration = Registration {
-            lane: &self.lane,
+            elicitor: self,
             channel,
             correlation,
         };
@@ -210,7 +212,18 @@ impl Elicitor {
         ) else {
             return AskOutcome::Undeliverable;
         };
+        self.cards.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            (channel, correlation),
+            Card {
+                epoch,
+                writer: writer.clone(),
+            },
+        );
         if writer.send(frame).await.is_err() {
+            self.cards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(channel, correlation));
             return AskOutcome::Undeliverable;
         }
 
@@ -250,6 +263,10 @@ impl Elicitor {
     }
 
     fn settle(&self, channel: u16, correlation: u64, reply: Reply) -> bool {
+        self.cards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(channel, correlation));
         let Some(waiter) = self.lane.claim(channel, correlation) else {
             return false;
         };
@@ -258,23 +275,85 @@ impl Elicitor {
         waiter.send(reply).is_ok()
     }
 
+    /// End matching cards both here and at the carrier. The writer is retained
+    /// with each card so scope revocation can also run outside the frame loop.
+    pub(crate) async fn cancel_where(&self, matches: impl Fn(u16, u32) -> bool) {
+        let cards = self.take_cards(matches);
+        for ((channel, correlation), card) in cards {
+            self.lane.forget(channel, correlation);
+            card.cancel(channel, correlation).await;
+        }
+    }
+
+    /// A closed route cannot carry a Cancel. Remove its cards before the asks
+    /// wake on route closure, without trying to send to the departed carrier.
+    pub(crate) fn forget_route(&self, channel: u16, epoch: u32) {
+        for ((channel, correlation), _) in self.take_cards(|c, e| c == channel && e == epoch) {
+            self.lane.forget(channel, correlation);
+        }
+    }
+
+    fn take_cards(&self, matches: impl Fn(u16, u32) -> bool) -> Vec<((u16, u64), Card)> {
+        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<_> = cards
+            .iter()
+            .filter(|((channel, _), card)| matches(*channel, card.epoch))
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| cards.remove(&key).map(|card| (key, card)))
+            .collect()
+    }
+
     /// How many questions are outstanding.
     pub fn outstanding(&self) -> usize {
         self.lane.outstanding()
     }
 }
 
+/// The return address of an unanswered card, retained until it is ended.
+struct Card {
+    epoch: u32,
+    writer: mpsc::Sender<Frame>,
+}
+
+impl Card {
+    async fn cancel(self, channel: u16, correlation: u64) {
+        if let Ok(frame) = Frame::build(
+            FrameType::Cancel,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            self.epoch,
+            correlation,
+            Vec::new(),
+        ) {
+            let _ = self.writer.send(frame).await;
+        }
+    }
+}
+
 /// One registered question, removed from the lane when dropped. Correlations
 /// are never reused, so removing an entry an answer already claimed is a no-op.
 struct Registration<'a> {
-    lane: &'a AskLane<oneshot::Sender<Reply>>,
+    elicitor: &'a Elicitor,
     channel: u16,
     correlation: u64,
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        self.lane.forget(self.channel, self.correlation);
+        self.elicitor.lane.forget(self.channel, self.correlation);
+        let card = self
+            .elicitor
+            .cards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(self.channel, self.correlation));
+        if let Some(card) = card {
+            // A deadline or a dropped ask ends an unanswered card too. Sending
+            // on a task avoids blocking Drop when the writer is backpressured.
+            tokio::spawn(card.cancel(self.channel, self.correlation));
+        }
     }
 }
 

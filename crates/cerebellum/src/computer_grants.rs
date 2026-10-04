@@ -1554,8 +1554,8 @@ impl ComputerGrants {
             let waited = tokio::select! {
                 result = settled.wait_for(Option::is_some) => match result {
                     Ok(value) => Some(value.clone()),
-                    // The card was withdrawn unanswered: its conversation
-                    // ended, or the call that filed it was withdrawn.
+                    // The card was withdrawn unanswered because its
+                    // conversation or session scope ended.
                     Err(_) => None,
                 },
                 () = tokio::time::sleep(park_limit) => Some(None),
@@ -1641,6 +1641,10 @@ impl ComputerGrants {
         });
         if let Some(open) = lock(&self.state).questions.get_mut(ask_id) {
             open.asking = Some(task.abort_handle());
+        } else {
+            // Revocation may remove the question between its insertion and this
+            // task's registration. Do not leave an unowned card waiting on a person.
+            task.abort();
         }
     }
 
@@ -2346,6 +2350,37 @@ enum Ending {
 #[cfg(test)]
 mod consent_card_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_question_revoked_before_carrier_registration_aborts_the_ask() {
+        struct Carrier(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl QuestionCarrier for Carrier {
+            fn put(
+                &self,
+                _: Value,
+                _: Duration,
+            ) -> Pin<Box<dyn Future<Output = AskOutcome> + Send>> {
+                let sender = lock(&self.0).take().unwrap();
+                Box::pin(async move {
+                    let _sender = sender;
+                    std::future::pending::<AskOutcome>().await
+                })
+            }
+        }
+        let grants = Arc::new(ComputerGrants::open(
+            Arc::new(InMemoryGrantStorage::new()),
+            None,
+        ));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let carrier: Arc<dyn QuestionCarrier> = Arc::new(Carrier(Mutex::new(Some(tx))));
+        // The question has already been removed by revocation when setup
+        // reaches the detached carrier-task registration.
+        grants.put_question("revoked", &carrier, json!({}), Duration::from_secs(300));
+        assert!(tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("the unowned ask is aborted")
+            .is_err());
+    }
 
     #[test]
     fn takeover_card_has_a_decline_and_conversation_duration() {

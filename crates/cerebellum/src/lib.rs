@@ -1383,6 +1383,7 @@ async fn scope_epoch_admits_bind(
                     .end_browser_conversation(conversation_key)
                     .await;
                 planes.management.end_conversation(conversation_key);
+                cancel_conversation_cards(planes, conversation_key).await;
                 if let Some(config) = planes.browser_config.as_ref() {
                     if let Some(finish) = planes.sessions.begin_teardown_route(
                         conversation_key,
@@ -1415,6 +1416,18 @@ async fn scope_epoch_admits_bind(
     }
 }
 
+async fn cancel_conversation_cards(planes: &Planes, conversation_key: &str) {
+    planes
+        .elicitor
+        .cancel_where(|channel, epoch| {
+            planes
+                .routes
+                .get(channel, epoch)
+                .is_some_and(|facts| facts.identity.conversation_key == conversation_key)
+        })
+        .await;
+}
+
 /// End what a session scope that definitively ended was allowed, for each
 /// conversation its routes carried: the browser grant questions and the
 /// computer consent questions it has open (so a late answer grants nothing),
@@ -1432,6 +1445,7 @@ async fn revoke_scope(planes: &Planes, conversations: &std::collections::BTreeSe
             .end_browser_conversation(conversation_key)
             .await;
         planes.management.end_conversation(conversation_key);
+        cancel_conversation_cards(planes, conversation_key).await;
         if let Some(config) = planes.browser_config.clone() {
             let sessions = planes.sessions.clone();
             let conversation_key = conversation_key.clone();
@@ -1516,6 +1530,11 @@ fn login_consent_request(
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST: Duration;
+}
+
 /// Everything a computer call on this route needs to ask for a grant and wait.
 ///
 /// The identity is the route's accepted bind, never the request body. The
@@ -1555,6 +1574,10 @@ fn consent_context(
         planes.drain_signal.subscribe(),
         elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
     );
+    #[cfg(test)]
+    if let Ok(limit) = COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST.try_with(|limit| *limit) {
+        context.park_limit = limit;
+    }
     context.unattended = facts.flow_id.is_some();
     if context.unattended {
         context.caller.conversation_key.clear();
@@ -2972,6 +2995,7 @@ async fn handle_frame(
                         .draining
                         .store(true, std::sync::atomic::Ordering::Release);
                     planes.drain_signal.send_replace(true);
+                    planes.elicitor.cancel_where(|_, _| true).await;
                     // Spend the drain window flushing profiles, not waiting for the
                     // deadline. It is only an upper bound, never a scheduled start.
                     if let Some(config) = planes.browser_config.clone() {
@@ -2984,6 +3008,9 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            planes
+                .elicitor
+                .forget_route(frame.header.channel, frame.header.epoch);
             // Unbound before its requests are cancelled, so a call waiting on a
             // person sees the route gone when it wakes and answers
             // `route_closed` rather than a caller-requested cancel.
@@ -5350,13 +5377,9 @@ async fn handle_tool_withdraw(
     match lookup {
         Lookup::Own(snapshot) => {
             let answer = call_records::withdraw_answer(&snapshot);
-            // Close the question the call left open, so a late answer cannot
-            // write a grant. Idempotent, and it never changes the answer.
-            if answer["answer"] == "withdrawn" {
-                if let Some(ask_id) = snapshot.ask_id.as_deref() {
-                    planes.management.withdraw_consent_question(ask_id).await;
-                }
-            }
+            // The held action has already returned without executing. Stopping
+            // the turn is not a refusal: its card may still record a late grant,
+            // but acting on that grant requires a new call.
             send_tool_response(writer, ver, channel, epoch, corr, answer).await
         }
         Lookup::Unknown => {
@@ -7839,6 +7862,68 @@ mod tests {
         handle_frame(answer, writer, planes).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn drain_ends_open_browser_card_with_correlated_cancel() {
+        let planes = open_grant_planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_, question) = open_grant_over_wire(&planes, &tx, &mut rx, 900).await;
+        let draining = Frame::build(
+            FrameType::Push,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            0,
+            serde_json::to_vec(
+                &json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        handle_frame(draining, &tx, &planes).await.unwrap();
+        let cancel = next_frame(&mut rx).await;
+        assert_eq!(cancel.header.ty, FrameType::Cancel);
+        assert_eq!(
+            (
+                cancel.header.channel,
+                cancel.header.epoch,
+                cancel.header.corr
+            ),
+            (
+                question.header.channel,
+                question.header.epoch,
+                question.header.corr
+            )
+        );
+        browser_grants_settled(&planes).await;
+        end_question(&planes, &tx, &question, "allow_conversation").await;
+        assert_eq!(planes.management.browser_grant_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn scope_revocation_ends_open_browser_card_with_correlated_cancel() {
+        let planes = open_grant_planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_, question) = open_grant_over_wire(&planes, &tx, &mut rx, 901).await;
+        let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
+        revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
+        let cancel = next_frame(&mut rx).await;
+        assert_eq!(cancel.header.ty, FrameType::Cancel);
+        assert_eq!(
+            (
+                cancel.header.channel,
+                cancel.header.epoch,
+                cancel.header.corr
+            ),
+            (
+                question.header.channel,
+                question.header.epoch,
+                question.header.corr
+            )
+        );
+        end_question(&planes, &tx, &question, "allow_conversation").await;
+        assert_eq!(planes.management.browser_grant_count().await, 0);
+    }
+
     async fn browser_grants_settled(planes: &Planes) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while planes.management.browser_grant_pending_count().await != 0 {
@@ -9036,7 +9121,7 @@ mod tests {
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
         assert!(!planes.management.computer_grants().remembers_login_answer());
-        let (_, pending) = capture_until_pending(
+        let (open_question, pending) = capture_until_pending(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -9050,6 +9135,20 @@ mod tests {
         assert_eq!(planes.elicitor.outstanding(), 1, "{pending}");
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
+        let cancel = next_frame(&mut writer_rx).await;
+        assert_eq!(cancel.header.ty, FrameType::Cancel);
+        assert_eq!(
+            (
+                cancel.header.channel,
+                cancel.header.epoch,
+                cancel.header.corr
+            ),
+            (
+                open_question.header.channel,
+                open_question.header.epoch,
+                open_question.header.corr
+            )
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while planes.elicitor.outstanding() != 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -10583,11 +10682,13 @@ mod drain_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(result["outcome"], "denied");
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        assert_eq!(result["outcome"], "no_answer");
+        let cancel = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(cancel.header.ty, FrameType::Cancel);
+        assert_eq!(cancel.header.corr, question.header.corr);
         await_count(&planes, 0).await;
     }
 
@@ -11144,10 +11245,82 @@ mod computer_consent_wire_tests {
     }
 
     #[tokio::test]
+    async fn withdrawing_an_asked_computer_call_keeps_its_late_app_grant() {
+        let planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = wait_request();
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["call_key"] = json!("pf:computer-pending");
+        request.body = serde_json::to_vec(&body).unwrap();
+        COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST
+            .scope(
+                Duration::from_millis(20),
+                handle_tool_request_for_test_with_existing_planes(request, &tx, &planes),
+            )
+            .await
+            .unwrap();
+        let question = rx.recv().await.unwrap();
+        assert_eq!(question.header.ty, FrameType::Request);
+        assert_eq!(reply(&mut rx).await["outcome"], "consent_pending");
+        handle_frame(
+            frame(
+                FrameType::Request,
+                CHANNEL,
+                CORR + 1,
+                json!({"name":"tool.withdraw", "arguments":{"call_key":"pf:computer-pending"}}),
+            ),
+            &tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let withdrawn: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(withdrawn["answer"], "withdrawn");
+        handle_frame(
+            frame(
+                FrameType::Response,
+                CHANNEL,
+                question.header.corr,
+                json!({"decision":"allow_conversation", "elicitation_id":"el_computer_late"}),
+            ),
+            &tx,
+            &planes,
+        )
+        .await
+        .unwrap();
+        let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
+        let caller = computer_grants::GrantCaller {
+            conversation_key: facts.identity.conversation_key,
+            agent_project_id: facts.identity.agent_project_id,
+            durable_identity_attested: true,
+        };
+        let need = computer_grants::GrantNeed::App {
+            bundle_identity: APP.into(),
+            display_name: APP.into(),
+            code: Arc::new(computer_grants::SignedByFixtureTeam),
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !planes.management.computer_grants().holds(&caller, &need) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the late answer records the app grant");
+        assert!(
+            rx.try_recv().is_err(),
+            "no cancelled card or resumed action"
+        );
+        settle_to(&planes, (0, 0)).await;
+    }
+
+    #[tokio::test]
     async fn a_drain_releases_a_parked_call_at_once_with_the_gauge_restored() {
         let planes = planes();
         let (tx, mut rx) = mpsc::channel(8);
-        parked_call(&planes, &tx, &mut rx).await;
+        handle_frame(wait_request(), &tx, &planes).await.unwrap();
+        let question = rx.recv().await.unwrap();
+        assert_eq!(question.header.ty, FrameType::Request);
+        settle_to(&planes, (0, 1)).await;
 
         handle_frame(
             frame(
@@ -11161,7 +11334,33 @@ mod computer_consent_wire_tests {
         )
         .await
         .unwrap();
-        let body = reply(&mut rx).await;
+        let mut answer = None;
+        let mut cancellation = None;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if frame.header.ty == FrameType::Cancel {
+                cancellation = Some(frame);
+            } else {
+                answer = Some(serde_json::from_slice::<Value>(&frame.body).unwrap());
+            }
+        }
+        let cancel = cancellation.expect("drain ends the app card at the carrier");
+        assert_eq!(
+            (
+                cancel.header.channel,
+                cancel.header.epoch,
+                cancel.header.corr
+            ),
+            (
+                question.header.channel,
+                question.header.epoch,
+                question.header.corr
+            )
+        );
+        let body = answer.unwrap();
         assert_eq!(body["outcome"], "module_draining", "{body}");
         settle_to(&planes, (0, 0)).await;
     }
