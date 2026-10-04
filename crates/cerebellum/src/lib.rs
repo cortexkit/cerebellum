@@ -1214,7 +1214,7 @@ impl RouteBindings {
             .and_then(|routes| routes.get(&(channel, epoch)).cloned())
     }
 
-    /// Observe the facts retained by the real bind handler without replacing them.
+    /// Return the facts recorded when this route was bound, unchanged.
     #[doc(hidden)]
     pub fn accepted_bind_for_test(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
         self.get(channel, epoch)
@@ -3240,8 +3240,9 @@ async fn handle_management_request(
         )
         .await;
     }
-    // A workflow's owner permissions do not include the operator's machine-wide
-    // grant administration, even when the workflow has an admitted flow route.
+    // Operator operations (list or revoke grants, profile-root rebind, and
+    // launch-recovery clear) administer machine-wide grants and browser state.
+    // A flow route never gets them, even when acting for its owner.
     if facts.flow_id.is_some() && is_operator_operation(method) {
         return send_tool_response(
             writer,
@@ -4595,14 +4596,11 @@ async fn handle_control_request(
             // Cerebellum declares no versioned roles today.
             role_versions: _,
         } => {
-            // In-module principal default-deny backstop: the gateway policy
-            // (subc-mcp) is the primary exclusion of cerebellum capabilities
-            // from `mcp:*` surfaces. This check is the defense-in-depth backstop
-            // that rejects a forged direct dispatch under a non-first-party
-            // principal before any capability executes. The sole exception is
-            // Basal carrying an admitted flow stamp, not Basal's other routes.
-            // Whether a first-party principal may act in this conversation is decided
-            // per call, at dispatch: see `send_session_caller_not_admitted`.
+            // Refuse non-first-party principals at bind; the only exception is a
+            // Basal route that passes `flow_carrier_admitted`. The subc-mcp gateway
+            // also keeps these tools off MCP surfaces. Whether a first-party caller
+            // may act in a conversation is checked per call in
+            // `send_session_caller_not_admitted`.
             let trust = trust_for_principal(&principal);
             if !trust.is_first_party()
                 && !scope.as_ref().is_some_and(|stamp| {
@@ -6287,9 +6285,9 @@ fn flow_consent_refusal(reason: &str) -> Value {
         "remedy": "an unattended flow cannot ask a person; configure its owner's standing grants"})
 }
 
-/// A daemon stamp with `flow_id` identifies an unattended workflow. Only a
-/// route from reserved:basal with an authorized prefrontal-core owner may use
-/// that authority; every other carrier is refused before capability dispatch.
+/// A scope stamp carrying `flow_id` marks a flow (see `AcceptedBindFacts::flow_id`).
+/// Only a route that passes `flow_carrier_admitted` may act for it; every other
+/// route carrying such a stamp is refused before capability dispatch.
 fn session_flow_refusal(facts: &AcceptedBindFacts) -> Option<Value> {
     facts
         .scope
@@ -11555,8 +11553,8 @@ mod relayed_computer_call_tests {
                 Arc::new(Running),
                 Arc::new(ComputerGrants::open(storage, Some("machine".into()))),
             ));
-            // Permission granted for this conversation must not authorize an
-            // unattended workflow; only the owner's persistent app grant may.
+            // A grant given in this conversation must not authorize the flow;
+            // only the owner's persistent app grant may.
             planes
                 .management
                 .computer_grants()

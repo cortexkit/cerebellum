@@ -55,9 +55,11 @@ thread_local! {
     static ACQUIRING_HOLDER: std::cell::RefCell<Holder> = std::cell::RefCell::new(Holder::head());
 }
 
-/// Carry the route's head-or-flow identity while acquiring the browser profile
-/// lock, without changing its on-disk record. Restore the previous identity even
-/// when acquisition unwinds.
+/// While acquiring the browser profile lock, record whether the acquiring route
+/// is the agent's head session or a flow (see `AcceptedBindFacts::flow_id`), and
+/// which flow, so a later busy refusal can name the holder. This is in memory
+/// only; the on-disk lock record is unchanged. Restore the previous value even
+/// if acquisition unwinds.
 pub(crate) fn with_holder<T>(holder: Holder, acquire: impl FnOnce() -> T) -> T {
     struct Restore(Holder);
     impl Drop for Restore {

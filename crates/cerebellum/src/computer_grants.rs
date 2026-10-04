@@ -672,7 +672,8 @@ impl RouteLiveness for AlwaysOpenRoute {
 /// Everything a call needs to ask for a grant and wait for the answer.
 pub struct ConsentContext {
     pub caller: GrantCaller,
-    /// An unattended flow can use persistent app grants but can never ask.
+    /// A flow (see `AcceptedBindFacts::flow_id`) has no person to ask: it may use
+    /// its owner's persistent app grants, but never raises a consent question.
     pub unattended: bool,
     /// How to reach a person, or `None` when the route declared it cannot
     /// relay a question.

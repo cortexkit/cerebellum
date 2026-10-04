@@ -119,8 +119,9 @@ impl Elicitor {
         }
     }
 
-    /// Record whether a bound route has no person to ask. Epochs keep a reused
-    /// channel from inheriting the preceding route's consent policy.
+    /// Record whether a bound route has no person to ask. Pairing the setting
+    /// with the route's epoch prevents a later route reusing the same channel
+    /// number from inheriting it.
     pub(crate) fn set_unattended(&self, channel: u16, epoch: u32, unattended: bool) {
         let mut routes = self.unattended.lock().unwrap_or_else(|e| e.into_inner());
         routes.remove(&(channel, epoch));
@@ -143,8 +144,9 @@ impl Elicitor {
         mut body: Value,
         deadline: Duration,
     ) -> AskOutcome {
-        // Enforce the no-person boundary before registering or sending any card,
-        // including cards raised on detached settlement tasks.
+        // Refuse to register or send any consent question on a flow route (see
+        // `AcceptedBindFacts::flow_id`), including questions from detached
+        // settlement tasks, because no person can answer.
         if self
             .unattended
             .lock()

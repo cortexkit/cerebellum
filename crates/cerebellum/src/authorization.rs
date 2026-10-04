@@ -53,8 +53,8 @@ pub async fn with_standing_caller<F: std::future::Future>(
     STANDING_CALLER.scope(caller, future).await
 }
 
-/// Unattended workflows use their owner's persistent browser permissions,
-/// never permission granted just for a conversation with a person.
+/// A flow (see `AcceptedBindFacts::flow_id`) uses its owner's persistent
+/// (standing) browser grants, never grants given for one conversation with a person.
 pub(crate) async fn with_flow<F: std::future::Future>(flow: bool, future: F) -> F::Output {
     FLOW.scope(flow, future).await
 }

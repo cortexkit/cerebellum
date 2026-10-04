@@ -7881,8 +7881,8 @@ async fn flow_goodbye_clears_unattended_elicitation_state() {
     .await
     .unwrap();
     assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
-    // A direct sender probe observes removal without rebinding, which would
-    // otherwise clear the policy itself and conceal a missing Goodbye cleanup.
+    // Probe the elicitor directly to check that this route's Goodbye cleared its
+    // no-person setting. Rebinding would clear it too and hide missing Goodbye cleanup.
     assert_eq!(
         planes
             .elicitor

@@ -298,8 +298,9 @@ impl ControlOperationRefusal {
 pub struct AcceptedBindFacts {
     pub identity: RouteIdentity,
     pub principal: Option<Principal>,
-    /// True only when the project id came from daemon admission facts or an
-    /// authorized prefrontal-core scope, never the project-root fallback.
+    /// True only when the project id came from daemon admission facts or the
+    /// `agent_id` of an authorized scope stamp admitted for this route (see
+    /// [`Self::flow_id`]), never the project-root fallback.
     pub agent_project_id_attested: bool,
     /// Permits durable browser profiles and reading or offering standing browser
     /// and persistent application grants for the attested agent.
@@ -335,8 +336,16 @@ pub struct AcceptedBindFacts {
     /// a request body. `None` for a route opened without a scope, which is
     /// served exactly as routes were before scopes existed.
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
-    /// The unattended workflow's id, retained only for reserved:basal routes
-    /// carrying an authorized prefrontal-core stamp and fixed at bind time.
+    /// The flow's id, fixed at bind time and retained only for an admitted carrier.
+    ///
+    /// A **flow** is an unattended workflow that the Basal module runs on an
+    /// agent's behalf, with no person available to answer a consent question.
+    /// Its **owner** is the agent it acts for, named by `agent_id` in the scope stamp.
+    /// A **scope stamp** is session identity the daemon attaches to a route's bind;
+    /// the session owner writes it, not the caller. It is **authorized** when its
+    /// stamp owner is `reserved:prefrontal-core` and the daemon reports that owner
+    /// as a configured scope authority (`owner_authorized`). The **carrier** is
+    /// the module that opened the route; for a flow it must be `reserved:basal`.
     pub flow_id: Option<String>,
 }
 
@@ -382,8 +391,8 @@ impl AcceptedBindFacts {
             .filter(|stamp| flow_carrier_admitted(stamp, &self.principal))
         {
             self.flow_id = stamp.attributes.flow_id.clone();
-            // Bind admission facts describe the carrier, not the workflow's owner.
-            // Only the authorized scope may identify the agent a flow acts for.
+            // On a flow route, bind admission facts identify the carrier (Basal),
+            // so discard them. Only the scope stamp's `agent_id` names the owner.
             self.identity.agent_project_id.clear();
             self.identity.profile_disposition = ProfileDisposition::None;
             self.agent_project_id_attested = false;
@@ -589,8 +598,10 @@ fn scope_admission_eligible(
             && stamp.attributes.flow_id.is_none())
 }
 
-/// Only Basal carrying an authorized core-owned flow stamp may bypass the
-/// ordinary first-party bind restriction and act as an unattended workflow.
+/// Check that `flow_id` is present, `owner_authorized` is true, the stamp owner
+/// is `reserved:prefrontal-core`, and the route principal is `reserved:basal`.
+/// This is the only way a module outside the first-party list may bind a route.
+/// For flow vocabulary, see [`AcceptedBindFacts::flow_id`].
 pub fn flow_carrier_admitted(
     stamp: &subc_protocol::scope::ScopeStamp,
     principal: &Option<Principal>,
