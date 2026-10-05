@@ -2615,7 +2615,11 @@ impl Planes {
     /// tests. A running module builds through `with_browser_config` with the
     /// config it loaded, `None` when the file names no browser.
     pub fn new(health: Arc<HealthState>) -> Self {
-        Self::with_browser_config(health, Some(Self::short_test_browser_config()))
+        Self::with_browser_config_journaling(
+            health,
+            Some(Self::short_test_browser_config()),
+            JournalPersistence::Isolated,
+        )
     }
 
     fn short_test_browser_config() -> BrowserConfig {
@@ -2717,6 +2721,7 @@ impl Planes {
                 Arc::new(management::PlatformResolver::new()),
                 computer_grants,
             )
+            .with_isolated_storage(journal == JournalPersistence::Isolated)
             .with_standing_browser_grants(standing),
         );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -6865,6 +6870,42 @@ pub async fn handle_tool_request_for_test_with_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn isolated_plane_without_profile_lifecycle_refuses_rebind_without_touching_data_home() {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::PathBuf;
+
+        fn snapshot(root: &std::path::Path) -> BTreeMap<PathBuf, Option<std::time::SystemTime>> {
+            let mut entries = BTreeMap::new();
+            let Ok(children) = fs::read_dir(root) else { return entries };
+            for child in children.flatten() {
+                let path = child.path();
+                let modified = child.metadata().ok().and_then(|metadata| metadata.modified().ok());
+                entries.insert(path, modified);
+            }
+            entries
+        }
+
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+        let browser_root = data_home.map(|root| root.join("cortexkit/cerebellum/browser"));
+        let before = browser_root.as_deref().map(snapshot);
+
+        let planes = Planes::new(Arc::new(HealthState::new()));
+        let (reply, question) = planes.management
+            .open_profile_root_rebind("isolated-rebind-test", true)
+            .await;
+        assert_eq!(reply["outcome"], "internal_failure");
+        assert_eq!(reply["stage"], "profile_registry_unavailable");
+        assert!(question.is_none());
+        if let (Some(root), Some(before)) = (browser_root, before) {
+            assert_eq!(snapshot(&root), before, "isolated rebind touched the operator browser data home");
+        }
+    }
+
     #[test]
     fn scope_admission_nondelegating_routes_do_not_read_or_offer_standing_grants() {
         use super::*;

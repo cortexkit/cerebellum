@@ -351,6 +351,7 @@ pub struct ManagementPlane {
     standing_browser_grants: Arc<StandingBrowserGrants>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
+    isolated_storage: bool,
     pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
     /// Where the launch service publishes what startup recovery kept.
     launch_recovery: Arc<LaunchRecoveryRegistry>,
@@ -643,6 +644,7 @@ impl ManagementPlane {
             standing_browser_grants,
             pending_browser_grants: Mutex::new(BTreeMap::new()),
             profile_lifecycle: None,
+            isolated_storage: false,
             pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
             launch_recovery: Arc::new(LaunchRecoveryRegistry::new()),
             pending_launch_recovery_clears: Mutex::new(BTreeMap::new()),
@@ -893,6 +895,11 @@ impl ManagementPlane {
         let mut plane = Self::new(resolver);
         plane.profile_lifecycle = Some(profile_lifecycle);
         plane
+    }
+
+    pub(crate) fn with_isolated_storage(mut self, isolated: bool) -> Self {
+        self.isolated_storage = isolated;
+        self
     }
 
     pub(crate) fn browser_grants(&self) -> Arc<Mutex<GrantStore>> {
@@ -1290,6 +1297,9 @@ impl ManagementPlane {
     fn profile_lifecycle_for_rebind(&self) -> Result<Arc<ProfileLifecycle>, &'static str> {
         if let Some(lifecycle) = self.profile_lifecycle.as_ref() {
             return Ok(Arc::clone(lifecycle));
+        }
+        if self.isolated_storage {
+            return Err("profile_registry_unavailable");
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {

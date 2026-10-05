@@ -192,7 +192,7 @@ mod macos_probe {
             ));
         }
 
-        let planes = Planes::new(Arc::new(HealthState::new()));
+        let planes = Planes::with_browser_config(Arc::new(HealthState::new()), None);
         bind_routes(&planes).await?;
 
         let mut findings = Vec::new();

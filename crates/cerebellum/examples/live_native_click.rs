@@ -193,7 +193,7 @@ mod macos_probe {
             button.identifier, button.role, button.title
         );
 
-        let planes = Planes::new(Arc::new(HealthState::new()));
+        let planes = Planes::with_browser_config(Arc::new(HealthState::new()), None);
         bind_routes(&planes).await?;
         let target = mint_target_lease(&planes).await?;
         println!(

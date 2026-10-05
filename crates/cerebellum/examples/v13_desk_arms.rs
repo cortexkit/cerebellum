@@ -836,7 +836,7 @@ mod desk {
     impl Probe {
         async fn new(journal: PathBuf) -> Result<Self, String> {
             let mut probe = Self {
-                planes: Planes::new(Arc::new(HealthState::new())),
+                planes: Planes::with_browser_config(Arc::new(HealthState::new()), None),
                 journal,
                 channel: 1,
                 corr: 100,
