@@ -862,9 +862,9 @@ fn prepare_spawn(
         return Err(SpawnError::Spawn(status));
     }
     if disclaim {
-        // Resolve before fork. Without a successful responsibility disclaim,
-        // Chrome would inherit the module's Screen Recording, Accessibility,
-        // and Input Monitoring grants, so an unavailable operation forbids launch.
+        // Make Chrome its own responsible process (see responsibility.rs), so it
+        // can't use this module's Screen Recording, Accessibility or Input
+        // Monitoring grants. If that can't be done, Chrome isn't launched.
         type SetDisclaim = unsafe extern "C" fn(*mut PosixSpawnAttr, c_int) -> c_int;
         let result = crate::require_responsibility_disclaim(
             || {
@@ -877,9 +877,12 @@ fn prepare_spawn(
                 if symbol.is_null() {
                     None
                 } else {
-                    // SAFETY: this exact libSystem symbol uses the private Darwin
-                    // responsibility.h signature: int (posix_spawnattr_t *, int).
-                    // PosixSpawnAttr is Darwin's opaque pointer typedef.
+                    // SAFETY: the symbol is libSystem's
+                    // `int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *, int)`
+                    // (private header responsibility.h, the declaration Chromium
+                    // uses). `PosixSpawnAttr` is the same opaque pointer type as
+                    // `posix_spawnattr_t`, so the function type matches. The
+                    // contrast test below fails if the call doesn't take effect.
                     Some(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(symbol) })
                 }
             },
@@ -1217,8 +1220,11 @@ mod tests {
             )
         };
         assert!(!symbol.is_null(), "responsibility query unavailable");
-        // SAFETY: this exact libSystem symbol uses the private Darwin
-        // responsibility.h signature: pid_t (pid_t); Darwin pid_t is c_int.
+        // SAFETY: the symbol is libSystem's
+        // `pid_t responsibility_get_pid_responsible_for_pid(pid_t)` (private
+        // header responsibility.h). Darwin's `pid_t` is `c_int`, so the
+        // function type matches. It returns the pid macOS checks privacy
+        // permissions against for the given process.
         let query = unsafe { std::mem::transmute::<*mut c_void, ResponsiblePid>(symbol) };
         let responsible = unsafe { query(std::process::id() as c_int) };
         assert!(responsible > 0);

@@ -1,13 +1,21 @@
-//! Require the runtime-resolved Darwin operation that prevents a spawned
-//! browser from inheriting the launching module's macOS privacy permissions.
+//! Keep the agent's browser from inheriting cerebellum's macOS privacy grants.
+//!
+//! macOS checks privacy permissions (Screen Recording, Accessibility, Input
+//! Monitoring) against a process's *responsible process*, which a child
+//! inherits from whoever spawned it. Spawning with the private libSystem
+//! attribute `responsibility_spawnattrs_setdisclaim` makes the child its own
+//! responsible process, so it holds none of the spawner's grants. That call
+//! is resolved at runtime because it isn't in the public SDK headers.
 
-/// The browser must not inherit the module's Screen Recording, Accessibility,
-/// or Input Monitoring permissions when responsibility cannot be disclaimed.
+/// The operation that stops the browser inheriting the module's Screen
+/// Recording, Accessibility and Input Monitoring grants is missing or failed,
+/// so the browser must not be launched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsibilityDisclaimUnavailable;
 
-/// Resolve and apply a disclaim operation before spawning. Both a missing symbol
-/// and a failed operation forbid an undisclaimed launch.
+/// Resolve the operation and apply it to the spawn attributes. A missing
+/// symbol and a non-zero result both refuse, so the browser is never
+/// launched holding the module's grants.
 pub fn require_responsibility_disclaim<T>(
     resolve: impl FnOnce() -> Option<T>,
     call: impl FnOnce(T) -> i32,
