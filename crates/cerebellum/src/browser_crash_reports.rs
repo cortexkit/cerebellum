@@ -230,13 +230,8 @@ mod macos {
             // error rather than a directory shared with whoever made it.
             // Owner-only, because a minidump holds page memory from the agent's
             // signed-in sessions.
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&path)
-                    .map_err(|_| CrashReportRefusal::DirectoryUnavailable)?;
-            }
+            cerebellum_core::private_fs::create_dir(&path)
+                .map_err(|_| CrashReportRefusal::DirectoryUnavailable)?;
             let directory = Self {
                 path,
                 removed: false,

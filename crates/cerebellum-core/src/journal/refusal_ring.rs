@@ -5,7 +5,7 @@
 //! the caller that produced them.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

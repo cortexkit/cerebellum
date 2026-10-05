@@ -5,7 +5,7 @@
 //! the binding that minted them.
 
 use crate::private_fs;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

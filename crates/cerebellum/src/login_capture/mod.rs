@@ -831,15 +831,8 @@ impl CaptureFs for HostFs {
     }
 }
 
-#[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new().create(path)
+    cerebellum_core::private_fs::create_dir(path)
 }
 
 #[cfg(unix)]

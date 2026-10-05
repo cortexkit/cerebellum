@@ -171,7 +171,6 @@ struct ScratchProfileRoot {
 
 impl ScratchProfileRoot {
     fn create() -> io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -183,7 +182,7 @@ impl ScratchProfileRoot {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         // Owner-only, as profiles and their locks are wherever they live.
-        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        cerebellum_core::private_fs::create_dir(&path)?;
         Ok(Self { path })
     }
 }
@@ -2708,7 +2707,7 @@ fn browser_data_root() -> Result<PathBuf, ()> {
     // Not created at boot: a module that never launches a browser has no reason
     // to leave a directory behind, and the failure to create is reported at the
     // moment a caller asked for something that needs it.
-    std::fs::create_dir_all(&root).map_err(|_| ())?;
+    cerebellum_core::private_fs::create_dir_all(&root).map_err(|_| ())?;
     Ok(root)
 }
 

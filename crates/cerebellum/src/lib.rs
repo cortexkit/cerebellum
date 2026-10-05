@@ -1775,6 +1775,7 @@ impl ModuleConfig {
 }
 
 async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleEnding {
+    record_private_state_tightening();
     // Listening starts before the connection is made, so a SIGTERM that
     // arrives while connecting is held until the module can act on it rather
     // than ending the process with no teardown.
@@ -6546,6 +6547,18 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
 ///
 /// All are atomics, so reading them keeps the health lane insulated, and
 /// none changes the status.
+static PRIVATE_STATE_TIGHTEN_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_private_state_tightening() {
+    if let Some(home) = cerebellum_core::platform_dirs::data_home() {
+        let root = home.join("cortexkit").join("cerebellum");
+        let failures = cerebellum_core::private_fs::tighten_data_tree(&root);
+        PRIVATE_STATE_TIGHTEN_FAILURES
+            .fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
     if let ModuleControlResponse::HealthCheck {
         metrics: Some(serde_json::Value::Object(metrics)),
@@ -6553,6 +6566,12 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
     } = &mut report
     {
         let counts = browser_crash_reports::leftover_counts();
+        metrics.insert(
+            "privateStateTightenFailures".to_string(),
+            serde_json::Value::from(
+                PRIVATE_STATE_TIGHTEN_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),
