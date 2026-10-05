@@ -2615,7 +2615,11 @@ impl Planes {
     /// tests. A running module builds through `with_browser_config` with the
     /// config it loaded, `None` when the file names no browser.
     pub fn new(health: Arc<HealthState>) -> Self {
-        Self::with_browser_config(health, Some(Self::short_test_browser_config()))
+        Self::with_browser_config_journaling(
+            health,
+            Some(Self::short_test_browser_config()),
+            JournalPersistence::Isolated,
+        )
     }
 
     fn short_test_browser_config() -> BrowserConfig {
@@ -2717,6 +2721,7 @@ impl Planes {
                 Arc::new(management::PlatformResolver::new()),
                 computer_grants,
             )
+            .with_isolated_storage(journal == JournalPersistence::Isolated)
             .with_standing_browser_grants(standing),
         );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
