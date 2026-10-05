@@ -18,7 +18,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
             .ok_or(NavigationDriveError::CdpFailure)?;
-        self.ensure_attached(context_key, deadline, &mut clock)?;
+        if self
+            .ensure_attached(context_key, deadline, &mut clock)
+            .is_err()
+        {
+            return Ok(BrowserTypeResult::NotReady {
+                reason_code: "type_attachment_not_ready".into(),
+            });
+        }
         let mut adapter = TypeAdapter {
             driver: self,
             context_key,
@@ -27,14 +34,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline,
             clock,
             selected: false,
+            runtime_enabled: false,
         };
         let snapshot = match adapter.observe_type_target() {
             Ok(snapshot) => snapshot,
-            Err(_) => {
-                return Ok(BrowserTypeResult::StaleSnapshot {
-                    reason: crate::browser_type::StaleReason::ResolvedNodeChanged,
-                })
-            }
+            Err(error) => return Ok(crate::browser_type::observation_failure(&error)),
         };
         let mut request = BrowserTypeRequest::new("ref", "snapshot", text);
         request.replace = clear_first;
@@ -60,6 +64,7 @@ struct TypeAdapter<'a, IO: CdpPipeIo> {
     deadline: Instant,
     clock: SystemNavigationClock,
     selected: bool,
+    runtime_enabled: bool,
 }
 
 impl<IO: CdpPipeIo> TypeAdapter<'_, IO> {
@@ -68,10 +73,48 @@ impl<IO: CdpPipeIo> TypeAdapter<'_, IO> {
         method: &str,
         params: Value,
     ) -> Result<Map<String, Value>, TypeDriverError> {
+        // Initialize Runtime before asking a cold renderer for a remote DOM object.
+        // Its acknowledgement establishes the execution-context domain on this session.
+        if method == "DOM.resolveNode" && !self.runtime_enabled {
+            self.command("Runtime.enable", serde_json::json!({}))?;
+            self.runtime_enabled = true;
+        }
         let attachment = self
             .driver
             .frame_attachment(&self.target.identity)
-            .map_err(|_| TypeDriverError::new("frame_unavailable"))?;
+            .map_err(|_| TypeDriverError::new("type_frame_not_ready"))?;
+        if self.clock.now() >= self.deadline {
+            return Err(TypeDriverError::new("type_deadline_expired"));
+        }
+        let not_ready = match method {
+            "DOM.focus" => "type_focus_not_ready",
+            "DOM.resolveNode" => "type_context_not_ready",
+            "Runtime.enable" => "type_runtime_not_ready",
+            "Input.dispatchKeyEvent" => "type_clear_not_ready",
+            "Input.insertText" => "type_insert_not_ready",
+            "Runtime.callFunctionOn"
+                if params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("this.select()")) =>
+            {
+                "type_selection_not_ready"
+            }
+            "Runtime.callFunctionOn"
+                if params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("length === 0")) =>
+            {
+                "type_clear_not_ready"
+            }
+            "Runtime.callFunctionOn"
+                if params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("collapse(false)")) =>
+            {
+                "type_caret_not_ready"
+            }
+            _ => "type_focus_not_ready",
+        };
         let response = self
             .driver
             .command_response(
@@ -83,9 +126,15 @@ impl<IO: CdpPipeIo> TypeAdapter<'_, IO> {
                 None,
                 &mut self.clock,
             )
-            .map_err(|_| TypeDriverError::new("cdp_failure"))?;
+            .map_err(|_| {
+                TypeDriverError::new(if self.clock.now() >= self.deadline {
+                    "type_deadline_expired"
+                } else {
+                    not_ready
+                })
+            })?;
         if response.error.is_some() {
-            return Err(TypeDriverError::new("cdp_failure"));
+            return Err(TypeDriverError::new(not_ready));
         }
         response
             .result
@@ -97,14 +146,15 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
     fn observe_type_target(&mut self) -> Result<TypeTarget, TypeDriverError> {
         let live = self
             .driver
-            .committed_document(self.context_key, self.deadline_ms);
-        super::super::typing::check_type_document(self.target.document.as_ref(), live)
+            .committed_document(self.context_key, self.deadline_ms)
+            .map_err(|_| TypeDriverError::new("type_document_not_ready"))?;
+        super::super::typing::check_type_document(self.target.document.as_ref(), Ok(live))
             .map_err(|_| TypeDriverError::new("document_changed"))?;
         if let Some(frame) = &self.target.frame {
             if !self
                 .driver
                 .prepare_frame(self.context_key, frame, self.deadline_ms)
-                .map_err(|_| TypeDriverError::new("frame_changed"))?
+                .map_err(|_| TypeDriverError::new("type_frame_not_ready"))?
             {
                 return Err(TypeDriverError::new("frame_changed"));
             }
@@ -112,7 +162,7 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
         let attachment = self
             .driver
             .frame_attachment(&self.target.identity)
-            .map_err(|_| TypeDriverError::new("frame_changed"))?;
+            .map_err(|_| TypeDriverError::new("type_frame_not_ready"))?;
         let nodes = self
             .driver
             .flattened_dom_nodes_before(&attachment, self.deadline, &mut self.clock)
@@ -184,6 +234,9 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
     }
 
     fn focus_type_target(&mut self, _: &str) -> Result<(), TypeDriverError> {
+        // DOM focus alone can leave the tab backgrounded. The first insertion
+        // would then activate it and run focus handlers after caret preparation.
+        self.command("Page.bringToFront", serde_json::json!({}))?;
         self.command(
             "DOM.focus",
             serde_json::json!({"backendNodeId":self.target.identity.backend_node_id}),
@@ -228,11 +281,33 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             .and_then(Value::as_bool)
             != Some(true)
         {
-            return Err(TypeDriverError::new("focus_changed"));
+            return Err(TypeDriverError::new("type_focus_not_ready"));
         }
         if self.selected {
             self.command("Input.dispatchKeyEvent", serde_json::json!({"type":"keyDown","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}))?;
             self.command("Input.dispatchKeyEvent", serde_json::json!({"type":"keyUp","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}))?;
+            let empty = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return (typeof this.value === 'string' ? this.value : this.textContent).length === 0; }","returnByValue":true}))?;
+            if empty
+                .get("result")
+                .and_then(|result| result.get("value"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(TypeDriverError::new("type_clear_not_ready"));
+            }
+        } else {
+            // Focus does not establish an append caret. Move it only after the
+            // executor's live-document and classification rechecks, just before insertion.
+            let moved = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { if (typeof this.setSelectionRange === 'function') { const end = this.value.length; this.setSelectionRange(end, end); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); range.collapse(false); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } return true; }","returnByValue":true}))?;
+            if moved.contains_key("exceptionDetails")
+                || moved
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+            {
+                return Err(TypeDriverError::new("type_caret_not_ready"));
+            }
         }
         self.command("Input.insertText", serde_json::json!({"text":text}))?;
         Ok(())

@@ -3387,25 +3387,86 @@ impl CdpPipeIo for ChromeLikePipe {
                         .unwrap_or_else(click_page_document),
                 ),
             ),
-            "DOM.focus" => self.reply(id, json!({})),
-            "DOM.resolveNode" => self.reply(id, json!({"object":{"objectId":"field"}})),
+            "Page.bringToFront" => {
+                *self.typing.as_ref().unwrap().fronted.lock().unwrap() = true;
+                self.reply(id, json!({}));
+            }
+            "DOM.focus" => {
+                if self.typing.as_ref().is_some_and(|page| page.fail_focus) {
+                    self.queue(json!({"id":id,"sessionId":"session-own","error":{"code":-32000,"message":"DOM node is not ready"}}));
+                } else {
+                    self.reply(id, json!({}));
+                }
+            }
+            "Runtime.enable" => {
+                *self
+                    .typing
+                    .as_ref()
+                    .unwrap()
+                    .runtime_enabled
+                    .lock()
+                    .unwrap() = true;
+                self.reply(id, json!({}));
+            }
+            "DOM.resolveNode" => {
+                let page = self.typing.as_ref().unwrap();
+                if page.cold_runtime && !*page.runtime_enabled.lock().unwrap() {
+                    self.queue(json!({"id":id,"sessionId":"session-own","error":{"code":-32000,"message":"Execution context not ready"}}));
+                } else {
+                    self.reply(id, json!({"object":{"objectId":"field"}}));
+                }
+            }
             "Runtime.callFunctionOn" => {
-                self.reply(id, json!({"result":{"type":"boolean","value":true}}))
+                let page = self.typing.as_ref().unwrap();
+                let function = command["params"]["functionDeclaration"].as_str().unwrap();
+                let value = if function.contains("this.select()") {
+                    *page.selected.lock().unwrap() = true;
+                    None
+                } else if function.contains("collapse(false)") {
+                    *page.caret.lock().unwrap() = page.value.lock().unwrap().len();
+                    *page.selected.lock().unwrap() = false;
+                    Some(true)
+                } else if function.contains("length === 0") {
+                    Some(page.value.lock().unwrap().is_empty())
+                } else {
+                    Some(true)
+                };
+                self.reply(
+                    id,
+                    value
+                        .map(|value| json!({"result":{"type":"boolean","value":value}}))
+                        .unwrap_or_else(|| json!({"result":{"type":"undefined"}})),
+                );
             }
             "Input.dispatchKeyEvent" => {
-                if command["params"]["type"] == "keyDown" {
-                    self.typing.as_ref().unwrap().value.lock().unwrap().clear();
+                let page = self.typing.as_ref().unwrap();
+                if command["params"]["type"] == "keyDown"
+                    && *page.selected.lock().unwrap()
+                    && !page.ignore_delete
+                {
+                    page.value.lock().unwrap().clear();
+                    *page.caret.lock().unwrap() = 0;
+                    *page.selected.lock().unwrap() = false;
                 }
                 self.reply(id, json!({}));
             }
             "Input.insertText" => {
-                self.typing
-                    .as_ref()
-                    .unwrap()
-                    .value
-                    .lock()
-                    .unwrap()
-                    .push_str(command["params"]["text"].as_str().unwrap());
+                let page = self.typing.as_ref().unwrap();
+                let text = command["params"]["text"].as_str().unwrap();
+                let mut value = page.value.lock().unwrap();
+                let mut caret = page.caret.lock().unwrap();
+                if page.background && !*page.fronted.lock().unwrap() {
+                    *caret = 0;
+                }
+                if *page.selected.lock().unwrap() {
+                    value.clear();
+                    *caret = 0;
+                }
+                value.insert_str(*caret, text);
+                *caret += text.len();
+                *page.selected.lock().unwrap() = false;
+                drop(caret);
+                drop(value);
                 self.reply(id, json!({}));
             }
             "Page.getNavigationHistory" => {
@@ -8660,6 +8721,14 @@ async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
 #[derive(Clone, Default)]
 struct TypePage {
     input_type: String,
+    caret: Arc<Mutex<usize>>,
+    selected: Arc<Mutex<bool>>,
+    ignore_delete: bool,
+    fail_focus: bool,
+    cold_runtime: bool,
+    background: bool,
+    fronted: Arc<Mutex<bool>>,
+    runtime_enabled: Arc<Mutex<bool>>,
     autocomplete: String,
     frame_origin: Option<String>,
     value: Arc<Mutex<String>>,
@@ -8885,4 +8954,92 @@ async fn wire_type_planted_secret_absent_from_all_records() {
     let mut planted = records.clone();
     planted[0].push_str(SECRET);
     assert!(contains_type_secret(&planted, SECRET));
+}
+
+#[tokio::test]
+async fn wire_type_append_moves_caret_to_end() {
+    let page = TypePage::default();
+    let value = page.value.clone();
+    *value.lock().unwrap() = "existing".into();
+    let (planes, _, _) = type_fixture(page).await;
+    let reply = type_wire(&planes, " suffix", false).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(*value.lock().unwrap(), "existing suffix");
+}
+
+#[tokio::test]
+async fn wire_type_clear_verifies_empty_before_insert() {
+    let page = TypePage {
+        ignore_delete: true,
+        ..Default::default()
+    };
+    let value = page.value.clone();
+    *value.lock().unwrap() = "existing".into();
+    let (planes, _, commands) = type_fixture(page).await;
+    let reply = type_wire(&planes, "replacement", true).await;
+    assert_eq!(reply["outcome"], "type_not_ready", "{reply}");
+    assert_eq!(*value.lock().unwrap(), "existing");
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|method| method == "Input.insertText"));
+}
+
+#[tokio::test]
+async fn wire_type_focus_failure_is_retryable_not_internal() {
+    let (planes, _, commands) = type_fixture(TypePage {
+        fail_focus: true,
+        ..Default::default()
+    })
+    .await;
+    let reply = type_wire(&planes, "hello", false).await;
+    assert_eq!(reply["outcome"], "type_not_ready", "{reply}");
+    assert_eq!(
+        reply["detail"]["reason_code"], "type_focus_not_ready",
+        "{reply}"
+    );
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|method| method.starts_with("Input.")));
+}
+
+#[tokio::test]
+async fn wire_type_initializes_runtime_before_resolving_cold_target() {
+    let page = TypePage {
+        cold_runtime: true,
+        ..Default::default()
+    };
+    let value = page.value.clone();
+    let (planes, _, commands) = type_fixture(page).await;
+    let reply = type_wire(&planes, "cold text", false).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(*value.lock().unwrap(), "cold text");
+    let commands = commands.lock().unwrap();
+    assert!(
+        commands
+            .iter()
+            .position(|method| method == "Runtime.enable")
+            .unwrap()
+            < commands
+                .iter()
+                .position(|method| method == "DOM.resolveNode")
+                .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn wire_type_focuses_tab_before_setting_append_caret() {
+    let page = TypePage {
+        background: true,
+        ..Default::default()
+    };
+    let value = page.value.clone();
+    *value.lock().unwrap() = "existing".into();
+    let (planes, _, _) = type_fixture(page).await;
+    let reply = type_wire(&planes, " suffix", false).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(*value.lock().unwrap(), "existing suffix");
 }

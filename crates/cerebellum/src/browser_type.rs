@@ -341,6 +341,7 @@ pub enum BrowserTypeResult {
     InvalidRequest { field: String, reason_code: String },
     StaleSnapshot { reason: StaleReason },
     AuthorizationDenied,
+    NotReady { reason_code: String },
     InternalError { reason_code: String },
 }
 
@@ -363,6 +364,9 @@ impl BrowserTypeResult {
                 "outcome": "authorization_denied",
                 "detail": { "reason": "no_grant" }
             }),
+            Self::NotReady { reason_code } => {
+                json!({"outcome":"type_not_ready","detail":{"reason_code":reason_code}})
+            }
             Self::InternalError { reason_code } => json!({
                 "outcome": "internal_error",
                 "detail": { "reason_code": reason_code }
@@ -534,24 +538,17 @@ impl BrowserTypeExecutor {
             );
         }
 
-        if driver.focus_type_target(&initial.node_identity).is_err() {
-            return finalize_dispatched(
-                journal,
-                BrowserTypeResult::InternalError {
-                    reason_code: "cdp_failure".to_string(),
-                },
-            );
+        if let Err(error) = driver.focus_type_target(&initial.node_identity) {
+            return finalize_dispatched(journal, driver_failure(&error, "type_focus_not_ready"));
         }
-        if request.replace
-            && driver
-                .select_type_target_contents(&initial.node_identity)
-                .is_err()
-        {
+        if let Err(error) = if request.replace {
+            driver.select_type_target_contents(&initial.node_identity)
+        } else {
+            Ok(())
+        } {
             return finalize_dispatched(
                 journal,
-                BrowserTypeResult::InternalError {
-                    reason_code: "cdp_failure".to_string(),
-                },
+                driver_failure(&error, "type_selection_not_ready"),
             );
         }
 
@@ -576,22 +573,14 @@ impl BrowserTypeExecutor {
             );
         }
 
-        if driver
-            .insert_type_text(&initial.node_identity, &request.text)
-            .is_err()
-        {
-            return finalize_dispatched(
-                journal,
-                BrowserTypeResult::InternalError {
-                    reason_code: "cdp_failure".to_string(),
-                },
-            );
+        if let Err(error) = driver.insert_type_text(&initial.node_identity, &request.text) {
+            return finalize_dispatched(journal, driver_failure(&error, "type_insert_not_ready"));
         }
         finalize_dispatched(journal, BrowserTypeResult::Ok)
     }
 }
 
-fn observation_failure(error: &TypeDriverError) -> BrowserTypeResult {
+pub(crate) fn observation_failure(error: &TypeDriverError) -> BrowserTypeResult {
     match error.reason.as_str() {
         "document_changed" | "frame_changed" => BrowserTypeResult::StaleSnapshot {
             reason: StaleReason::DocumentEpochChanged,
@@ -599,9 +588,26 @@ fn observation_failure(error: &TypeDriverError) -> BrowserTypeResult {
         "classification_changed" | "node_changed" => BrowserTypeResult::StaleSnapshot {
             reason: StaleReason::ResolvedNodeChanged,
         },
-        _ => BrowserTypeResult::InternalError {
-            reason_code: "cdp_failure".into(),
-        },
+        _ => driver_failure(error, "type_observation_not_ready"),
+    }
+}
+
+fn driver_failure(error: &TypeDriverError, fallback: &str) -> BrowserTypeResult {
+    let reason = match error.reason.as_str() {
+        "type_runtime_not_ready"
+        | "type_context_not_ready"
+        | "type_selection_not_ready"
+        | "type_insert_not_ready"
+        | "type_deadline_expired"
+        | "type_frame_not_ready"
+        | "type_document_not_ready"
+        | "type_clear_not_ready"
+        | "type_caret_not_ready"
+        | "type_focus_not_ready" => error.reason.as_str(),
+        _ => fallback,
+    };
+    BrowserTypeResult::NotReady {
+        reason_code: reason.into(),
     }
 }
 
