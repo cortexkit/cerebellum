@@ -465,7 +465,10 @@ pub fn build_with_browser_plane_pins(
         .into_iter()
         .filter(|(name, _, _)| crate::browser::has_wire_dispatch_route(name))
     {
-        let requires_extraction = matches!(name, crate::browser::SNAPSHOT | crate::browser::CLICK);
+        let requires_extraction = matches!(
+            name,
+            crate::browser::SNAPSHOT | crate::browser::CLICK | crate::browser::TYPE
+        );
         if requires_extraction
             && (!pins.extraction_group_eligible() || !extraction_evidence_eligible)
         {
@@ -476,7 +479,10 @@ pub fn build_with_browser_plane_pins(
             description: Some(description.to_string()),
             execution_mode: if matches!(
                 name,
-                crate::browser::NAVIGATE | crate::browser::CLICK | crate::browser::CLICK_POINT
+                crate::browser::NAVIGATE
+                    | crate::browser::CLICK
+                    | crate::browser::TYPE
+                    | crate::browser::CLICK_POINT
             ) {
                 ExecutionMode::Unfenceable
             } else {
@@ -706,38 +712,26 @@ pub fn evaluate_unfenceable_gates(inputs: &UnfenceableReleaseInputs) -> ReleaseR
     ReleaseReport { outcomes }
 }
 
-/// The evidence-gated manifest for `browser.type`, which production does not
-/// build.
-///
-/// Advertising requires BOTH that the release gates pass AND that the capability
-/// can be dispatched. The second condition is not redundant: the gates are
-/// satisfied by supplying release evidence, which is a deployment act, while
-/// being dispatchable is a property of the code. Without it, supplying evidence
-/// alone would advertise a capability that every call to it rejects as an
-/// unknown method — and this one accepts typed text, so the caller would be told
-/// it has a facility for entering text that does not exist.
-///
-/// Today `browser.type` has no dispatch route, so this advertises nothing
-/// whatever the evidence says. Adding one is what makes the gate live, which is
-/// the point at which its evidence requirements have to be met rather than
-/// merely defined.
+/// Build the manifest with optional release evidence. Production browser typing
+/// is advertised through the same dispatchable catalogue as other browser tools.
 pub fn build_with_unfenceable_evidence(inputs: &UnfenceableReleaseInputs) -> ModuleManifest {
     let mut manifest = build("cerebellum");
     if !evaluate_unfenceable_gates(inputs).passed() {
         return manifest;
     }
-    if crate::dispatchable_tool(BROWSER_TYPE_TOOL).is_none() {
+    if !crate::browser::has_wire_dispatch_route(BROWSER_TYPE_TOOL) {
         return manifest;
     }
     let ProviderRole::ToolProvider { tools, .. } = &mut manifest.provides[0] else {
         return manifest;
     };
-    tools.push(browser_type_tool());
+    if !tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL) {
+        tools.push(browser_type_tool());
+    }
     manifest
 }
 
-/// Construct the fixed `browser.type` tool definition that is added to the
-/// manifest only after the eligibility checks have passed.
+/// Construct the frame-bound browser typing tool definition.
 pub fn browser_type_tool() -> Tool {
     Tool {
         name: BROWSER_TYPE_TOOL.to_string(),
@@ -750,13 +744,10 @@ pub fn browser_type_tool() -> Tool {
             "type": "object",
             "properties": {
                 "ref": {"type": "string"},
-                "snapshot_id": {"type": "string"},
-                "text": {"type": "string"},
-                "replace": {"type": "boolean"},
-                "intent": {"type": "string"},
-                "severity": {"type": "object"},
+                "text": {"type": "string", "maxLength": 10000},
+                "clear_first": {"type": "boolean", "default": false},
             },
-            "required": ["ref", "snapshot_id", "text", "intent", "severity"],
+            "required": ["ref", "text"],
             "additionalProperties": false,
         }),
     }
@@ -1124,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_plane_routes_are_capability_relative_and_type_free() {
+    fn browser_plane_routes_require_extraction_for_type() {
         let common_only = build_with_browser_plane_pins(
             "cerebellum",
             Some(&valid_browser_pins(false)),
@@ -1159,11 +1150,11 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            9,
-            "three controls, navigate, screenshot, snapshot, click, the coordinate \
+            10,
+            "three controls, navigate, screenshot, snapshot, click, type, the coordinate \
              click, and browser_use"
         );
-        assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
+        assert!(tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
         let serialized = serialize_with_browser_plane_pins(
             "cerebellum",
             Some(&valid_browser_pins(true)),
@@ -1186,17 +1177,11 @@ mod tests {
 
     #[test]
     fn unfenceable_advertisement_requires_every_gate_to_pass() {
-        // Every gate passing ADMITS browser.type, asserted through the gate
-        // report. The manifest cannot carry the positive case: advertising also
-        // requires a dispatch route, and browser.type has none, so reading the
-        // manifest here would find it absent for that reason and hold however
-        // the gates behaved.
+        // Gate evaluation checks release evidence separately from the manifest builder.
         assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
-
-        // Suppressing any single gate withholds admission. Also asserted
-        // through the report rather than through the manifest: browser.type is
-        // absent from the manifest whatever the gates say, so a manifest
-        // assertion here would pass with the gate deleted.
+        assert!(has_browser_type(&build_with_unfenceable_evidence(
+            &valid_inputs()
+        )));
         let mut no_evidence = valid_inputs();
         no_evidence.evidence = None;
         assert!(!evaluate_unfenceable_gates(&no_evidence).passed());
@@ -1212,13 +1197,6 @@ mod tests {
         let mut no_fit = valid_inputs();
         no_fit.computed_max_entry_bytes = None;
         assert!(!evaluate_unfenceable_gates(&no_fit).passed());
-
-        // And the manifest carries none of it, on inputs that pass every gate,
-        // so this fails when a dispatch route is added rather than silently
-        // starting to advertise.
-        assert!(!has_browser_type(&build_with_unfenceable_evidence(
-            &valid_inputs()
-        )));
     }
 
     #[test]

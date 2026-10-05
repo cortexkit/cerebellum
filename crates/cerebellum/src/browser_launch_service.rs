@@ -2223,6 +2223,20 @@ impl OwnedBrowserProcess for ProductionProcess {
             )
     }
 
+    fn type_classified(
+        &mut self,
+        context_key: &str,
+        target: &crate::browser_type::TypeDispatch,
+        text: &str,
+        clear_first: bool,
+        deadline_ms: u64,
+    ) -> Result<crate::browser_type::BrowserTypeResult, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .type_classified(context_key, target, text, clear_first, deadline_ms)
+    }
+
     fn generation_matches(&self) -> bool {
         self.process.as_ref().is_some_and(|process| {
             let generation = process.generation();

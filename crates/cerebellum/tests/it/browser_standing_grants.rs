@@ -982,13 +982,9 @@ async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
     }
 }
 
-/// No standing row, however broad, reaches typing: `browser.type` is not
-/// served on the wire and the flat tool has no typing action. The refusal of
-/// typing into credential and payment fields itself is held by
-/// `credential_and_financial_targets_are_refused_before_authorization` in
-/// `browser_type`, which refuses before any authorizer is consulted.
+/// A broad standing row cannot bypass the requirement to read a target first.
 #[tokio::test]
-async fn typing_a_password_is_refused_under_any_standing_row() {
+async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
     fixture.seed(
@@ -1006,18 +1002,18 @@ async fn typing_a_password_is_refused_under_any_standing_row() {
         .call(
             &route,
             "browser.type",
-            json!({"ref": "e1", "snapshot_id": "s1", "text": "hunter2"}),
+            json!({"ref": "e1", "text": "hunter2"}),
         )
         .await;
-    assert_eq!(typed["code"], "capability_not_admitted", "{typed}");
+    assert_eq!(typed["outcome"], "stale_snapshot", "{typed}");
     let flat = fixture
         .call(
             &route,
             "browser_use",
-            json!({"action": "type", "ref": "e1", "snapshot_id": "s1", "text": "hunter2"}),
+            json!({"action": "type", "ref": "e1", "text": "hunter2"}),
         )
         .await;
-    assert_eq!(flat["outcome"], "invalid_request", "{flat}");
+    assert_eq!(flat["outcome"], "stale_snapshot", "{flat}");
     assert!(
         !fixture
             .browser

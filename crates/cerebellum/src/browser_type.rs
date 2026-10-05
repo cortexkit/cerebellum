@@ -292,6 +292,16 @@ impl fmt::Debug for ClassificationFingerprint {
     }
 }
 
+/// A typing dispatch stores the target identity, classification, and expected
+/// frame and page documents, but never the text to be typed.
+#[derive(Clone)]
+pub struct TypeDispatch {
+    pub identity: crate::snapshot_store::BackendNodeIdentity,
+    pub classification: crate::classification::NonTypeClassificationRecord,
+    pub frame: Option<crate::snapshot_store::FrameDocument>,
+    pub document: Option<crate::snapshot_store::CommittedDocument>,
+}
+
 /// A browser.type request after closed-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserTypeRequest {
@@ -472,7 +482,7 @@ impl BrowserTypeExecutor {
                 reason_code: "missing_field".to_string(),
             };
         }
-        if request.text.len() > 8192 {
+        if request.text.chars().count() > 10_000 {
             return BrowserTypeResult::InvalidRequest {
                 field: "text".to_string(),
                 reason_code: "out_of_range".to_string(),
@@ -487,14 +497,7 @@ impl BrowserTypeExecutor {
 
         let initial = match driver.observe_type_target() {
             Ok(target) => target,
-            Err(_) => {
-                return finalize_rejected(
-                    journal,
-                    BrowserTypeResult::InternalError {
-                        reason_code: "cdp_failure".to_string(),
-                    },
-                )
-            }
+            Err(error) => return finalize_rejected(journal, observation_failure(&error)),
         };
         if let Err(reason) = verify_type_target(snapshot, &initial) {
             return finalize_rejected(journal, BrowserTypeResult::StaleSnapshot { reason });
@@ -557,14 +560,7 @@ impl BrowserTypeExecutor {
         // record is stale and is never adopted.
         let final_observation = match driver.observe_type_target() {
             Ok(target) => target,
-            Err(_) => {
-                return finalize_dispatched(
-                    journal,
-                    BrowserTypeResult::InternalError {
-                        reason_code: "cdp_failure".to_string(),
-                    },
-                )
-            }
+            Err(error) => return finalize_dispatched(journal, observation_failure(&error)),
         };
         if let Err(reason) = verify_type_target(snapshot, &final_observation) {
             return finalize_dispatched(journal, BrowserTypeResult::StaleSnapshot { reason });
@@ -592,6 +588,20 @@ impl BrowserTypeExecutor {
             );
         }
         finalize_dispatched(journal, BrowserTypeResult::Ok)
+    }
+}
+
+fn observation_failure(error: &TypeDriverError) -> BrowserTypeResult {
+    match error.reason.as_str() {
+        "document_changed" | "frame_changed" => BrowserTypeResult::StaleSnapshot {
+            reason: StaleReason::DocumentEpochChanged,
+        },
+        "classification_changed" | "node_changed" => BrowserTypeResult::StaleSnapshot {
+            reason: StaleReason::ResolvedNodeChanged,
+        },
+        _ => BrowserTypeResult::InternalError {
+            reason_code: "cdp_failure".into(),
+        },
     }
 }
 

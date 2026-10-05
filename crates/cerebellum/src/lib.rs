@@ -7072,9 +7072,8 @@ mod tests {
         // page truncation against probe rounding, not a mapping error, and a
         // scale error would have shown as a factor rather than a fraction.
         assert!(dispatchable.contains(browser::CLICK_POINT));
-        // browser.type stays out on the credential-surface policy, which no
-        // measurement changes.
-        assert!(!dispatchable.contains("browser.type"));
+        // Ordinary form composition is admitted; credential fields still refuse.
+        assert!(dispatchable.contains(browser::TYPE));
     }
 
     #[cfg(target_os = "macos")]
