@@ -361,24 +361,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .ok_or(NavigationDriveError::CdpFailure)?;
                 let depth = observation.records[owner_index].depth + 1;
                 if !allowed.contains(frame) {
-                    let name = if classification::canonical_grant_origin(&frame.origin).as_deref()
-                        == Some(frame.origin.as_str())
-                    {
-                        format!(
-                            "{}; content requires a read grant: browser.open_grant {}",
-                            frame.origin,
-                            serde_json::json!({"origins":[frame.origin],"severity_tier":2,"hazards":[]})
-                        )
-                    } else {
-                        format!("{}; opaque frame content is withheld; navigate the frame to a grantable HTTP(S) origin before requesting a read grant", frame.origin)
-                    };
-                    observation.records[owner_index].name = name;
-                    if let Some(text) = observation.dom_text.as_mut() {
-                        text.push_str(&format!(
-                            "\n[frame {}: content requires a read grant for {}]\n",
-                            frame.frame_id, frame.origin
-                        ));
-                    }
                     continue;
                 }
                 self.active_frame = Some(frame.clone());
@@ -1108,14 +1090,9 @@ mod tests {
         assert_eq!(references.len(), observation.refs.len());
     }
     #[test]
-    fn ungranted_frame_walk_withholds_content_and_names_origin() {
+    fn top_page_capture_plan_includes_cross_origin_content() {
         let (mut driver, frames) = fixture();
-        driver.set_read_frames(
-            frames
-                .into_iter()
-                .filter(|f| f.origin == "http://127.0.0.1:9000")
-                .collect(),
-        );
+        driver.set_read_frames(frames);
         for kind in [
             SnapshotKind::Actionable,
             SnapshotKind::Ax,
@@ -1124,23 +1101,18 @@ mod tests {
             let observation = driver
                 .snapshot_classified("isolated-fixture", kind, 7, "http://127.0.0.1:9000/", 1000)
                 .unwrap();
-            assert!(!observation
-                .records
-                .iter()
-                .any(|n| n.name == "Card number" || n.name == "Pay"));
-            assert!(!observation.refs.iter().any(|r| r
+            assert!(observation.records.iter().any(|n| n.name == "Card number"));
+            assert!(observation.records.iter().any(|n| n.name == "Pay"));
+            assert!(observation.refs.iter().any(|r| r
                 .frame_document
                 .as_ref()
                 .is_some_and(|f| f.frame_id == "cross")));
-            assert!(observation
-                .records
-                .iter()
-                .any(|n| n.name.contains("http://localhost:9001")
-                    && n.name.contains("browser.open_grant")));
-            assert!(!observation
-                .dom_text
-                .as_ref()
-                .is_some_and(|t| t.contains("cc-number")));
+            if kind == SnapshotKind::DomFull {
+                assert!(observation
+                    .dom_text
+                    .as_ref()
+                    .is_some_and(|t| t.contains("cc-number")));
+            }
         }
     }
     #[test]

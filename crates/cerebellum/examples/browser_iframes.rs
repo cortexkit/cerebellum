@@ -29,7 +29,7 @@ mod probe {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    const DEADLINE: u64 = 10_000;
+    const DEADLINE: u64 = 60_000;
     struct Pipe {
         commands: UnixStream,
         responses: UnixStream,
@@ -56,7 +56,7 @@ mod probe {
                 let body = if path.starts_with("GET /same ") {
                     "<button type='button' onclick=\"this.textContent='Same button '+(this.dataset.n=+(this.dataset.n||0)+1)\">Same button</button><a href='/same'>Same link</a>".to_string()
                 } else if path.starts_with("GET /cross ") {
-                    "<button type='button' onclick=\"this.textContent='Cross button '+(this.dataset.n=+(this.dataset.n||0)+1)\">Cross button</button><a href='/cross#link'>Cross link</a>".to_string()
+                    "<body style='background:rgb(245,3,9)'><button type='button' onclick=\"this.textContent='Cross button '+(this.dataset.n=+(this.dataset.n||0)+1)\">Cross button</button><a href='/cross#link'>Cross link</a>".to_string()
                 } else if path.starts_with("GET /payment ") {
                     "<form><input aria-label='Card number' autocomplete='cc-number'><button type='submit'>Pay</button></form>".to_string()
                 } else {
@@ -73,7 +73,7 @@ mod probe {
         let first_port = first.local_addr().unwrap().port();
         let second_port = second.local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{first_port}/");
-        let page = format!("<iframe style='position:absolute;left:0;top:0;width:300px;height:100px' src='/same'></iframe><iframe style='position:absolute;left:320px;top:0;width:300px;height:100px' src='http://localhost:{second_port}/cross'></iframe><iframe style='position:absolute;left:0;top:130px;width:300px;height:100px' src='http://localhost:{second_port}/payment'></iframe><div id='shadow' role='button' style='position:absolute;left:320px;top:130px;padding:12px'></div><script>window.getComputedStyle=()=>({{width:'1px',height:'1px',boxSizing:'content-box'}});shadow.attachShadow({{mode:'open'}}).innerHTML='<span>Shadow button</span>';shadow.onclick=()=>shadow.shadowRoot.querySelector('span').textContent='Shadow button '+(shadow.dataset.n=+(shadow.dataset.n||0)+1);</script>");
+        let page = format!("<iframe style='position:absolute;left:0;top:0;width:300px;height:100px' src='/same'></iframe><iframe style='position:absolute;left:320px;top:0;width:300px;height:100px' src='http://localhost:{second_port}/cross'></iframe><iframe style='position:absolute;left:0;top:130px;width:300px;height:100px' src='http://localhost:{second_port}/payment'></iframe><div id='shadow' role='button' style='position:absolute;left:320px;top:130px;padding:12px'></div><script>window.getComputedStyle=()=>({{width:'1px',height:'1px',boxSizing:'content-box'}});shadow.attachShadow({{mode:'open'}}).innerHTML='<span>Shadow button</span>';shadow.onclick=()=>shadow.shadowRoot.querySelector('span').textContent='Shadow button '+(shadow.dataset.n=+(shadow.dataset.n||0)+1);</script><iframe title='Sandbox' style='position:absolute;left:0;top:260px;width:300px;height:100px' sandbox srcdoc='<body style=&quot;background:rgb(3,245,9)&quot;><button>Sandbox button</button></body>'></iframe>");
         serve(first, page);
         serve(second, String::new());
         let profile = PathBuf::from(format!("/tmp/ck-browser-iframes-{}", std::process::id()));
@@ -135,21 +135,65 @@ mod probe {
         grants: &cerebellum::authorization::GrantStore,
         frames: &[cerebellum::snapshot_store::FrameDocument],
     ) -> Vec<cerebellum::snapshot_store::FrameDocument> {
-        frames
+        let main = frames
             .iter()
-            .filter(|frame| {
-                grants
-                    .authorize(
-                        cerebellum::authorization::AuthorizationRequest::snapshot(
-                            "probe", &frame.url, "probe",
-                        ),
-                        &frame.origin,
-                    )
-                    .ok()
-                    .is_some_and(|decision| grants.commit(&decision).is_ok())
-            })
-            .cloned()
-            .collect()
+            .find(|frame| frame.parent_id.is_none())
+            .unwrap();
+        let decision = grants
+            .authorize(
+                cerebellum::authorization::AuthorizationRequest::snapshot(
+                    "probe", &main.url, "probe",
+                ),
+                &main.origin,
+            )
+            .unwrap();
+        grants.commit(&decision).unwrap();
+        frames.to_vec()
+    }
+
+    // Distinct frame backgrounds prove that returned pixels include both the
+    // cross-origin document and the sandbox, not merely the top-page shell.
+    fn assert_embedded_pixels(encoded: &str) -> Result<(), String> {
+        let output = std::process::Command::new("python3").args(["-c", r#"
+import base64, struct, sys, zlib
+png = base64.b64decode(sys.argv[1])
+assert png[:8] == b'\x89PNG\r\n\x1a\n'
+p = 8; compressed = b''
+while p < len(png):
+    size = int.from_bytes(png[p:p+4], 'big'); kind = png[p+4:p+8]; data = png[p+8:p+8+size]; p += 12+size
+    if kind == b'IHDR':
+        width, height, depth, color, _, _, interlace = struct.unpack('>IIBBBBB', data)
+    if kind == b'IDAT': compressed += data
+assert depth == 8 and color in (2,6) and interlace == 0
+channels = 3 if color == 2 else 4
+stride = width * channels
+raw = zlib.decompress(compressed); previous = bytearray(stride); counts = {(245,3,9):0, (3,245,9):0}
+for y in range(height):
+    start = y*(stride+1); mode = raw[start]; row = bytearray(raw[start+1:start+1+stride])
+    for x in range(stride):
+        left = row[x-channels] if x >= channels else 0
+        up = previous[x]; corner = previous[x-channels] if x >= channels else 0
+        if mode == 1: value = left
+        elif mode == 2: value = up
+        elif mode == 3: value = (left+up)//2
+        elif mode == 4:
+            prediction = left+up-corner
+            distances = [abs(prediction-v) for v in (left,up,corner)]
+            value = (left,up,corner)[distances.index(min(distances))]
+        else: assert mode == 0; value = 0
+        row[x] = (row[x]+value)&255
+    for x in range(0,stride,channels):
+        rgb = tuple(row[x:x+3])
+        if rgb in counts: counts[rgb] += 1
+    previous = row
+assert all(n > 1000 for n in counts.values()), counts
+print('cross-origin and opaque-frame pixels:', counts)
+"#, encoded]).output().map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        println!("{}", String::from_utf8_lossy(&output.stdout).trim());
+        Ok(())
     }
 
     fn exercise(pipe: Pipe, url: &str) -> Result<(), String> {
@@ -191,26 +235,53 @@ mod probe {
         );
         let top_grants = GrantStore::new([top_grant.clone()]);
         driver.set_read_frames(readable_frames(&top_grants, &frames));
-        let redacted = driver
+        let embedded = driver
             .snapshot_classified("probe", SnapshotKind::Actionable, 1, url, DEADLINE)
-            .map_err(|e| format!("redacted snapshot: {e:?}"))?;
-        assert!(redacted.records.iter().any(|n| n.name == "Same button"));
-        assert!(!redacted
-            .records
+            .map_err(|e| format!("embedded snapshot: {e:?}"))?;
+        assert!(embedded.records.iter().any(|n| n.name == "Cross button"));
+        assert!(embedded.records.iter().any(|n| n.name == "Card number"));
+        assert!(embedded.records.iter().any(|n| n.name == "Sandbox button"));
+        let cross_ref = embedded
+            .refs
             .iter()
-            .any(|n| n.name == "Cross button" || n.name == "Card number"));
-        assert!(redacted
-            .records
-            .iter()
-            .any(|n| n.name.contains("localhost") && n.name.contains("read grant")));
-        println!("ungranted cross-site content withheld, exact origin grant named: PASS");
-        let denied_full = driver
+            .find(|r| r.captured.name == "Cross button")
+            .unwrap();
+        let cross_record = cross_ref
+            .classification
+            .as_deref()
+            .map_err(|e| e.to_string())?;
+        assert!(top_grants
+            .authorize(
+                AuthorizationRequest::click(
+                    "probe",
+                    Severity::new(COMPOSE, false, false),
+                    "probe",
+                    &cross_record.node_identity,
+                    cross_record
+                ),
+                &cross_ref.frame_document.as_ref().unwrap().origin
+            )
+            .is_err());
+        println!("top-page read exposes ungranted cross-origin and sandbox frames; frame action still denied: PASS");
+        let full = driver
             .snapshot_classified("probe", SnapshotKind::DomFull, 1, url, DEADLINE)
-            .map_err(|e| format!("denied dom_full: {e:?}"))?
+            .map_err(|e| format!("dom_full: {e:?}"))?
             .dom_text
-            .ok_or("missing denied dom_full")?;
-        assert!(!denied_full.contains("Cross button") && !denied_full.contains("cc-number"));
-        println!("dom_full withholds ungranted cross-origin document bodies: PASS");
+            .ok_or("missing dom_full")?;
+        assert!(
+            full.contains("Cross button")
+                && full.contains("cc-number")
+                && full.contains("Sandbox button")
+        );
+        println!("top-page dom_full includes cross-origin and opaque documents: PASS");
+        driver
+            .present("probe", DEADLINE)
+            .map_err(|e| format!("present headless probe tab: {e:?}"))?;
+        let image = driver
+            .screenshot("probe", 1, DEADLINE, false)
+            .map_err(|e| format!("screenshot: {e:?}"))?;
+        assert_embedded_pixels(&image.image_png_b64)?;
+        println!("top-page screenshot captures embedded documents without frame grants: PASS");
         let cross_origin = frames
             .iter()
             .find(|frame| frame.origin.contains("localhost"))
@@ -501,7 +572,7 @@ mod probe {
             "type executor refuses live cross-site card field before authorization/input: PASS"
         );
         println!(
-            "production-driver assertions: 15 groups passed; production browser.type route absent"
+            "production-driver assertions: 16 groups passed; production browser.type route absent"
         );
         Ok(())
     }

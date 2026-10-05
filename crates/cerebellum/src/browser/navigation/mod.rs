@@ -3532,9 +3532,9 @@ where
             return Err(NavigationDriveError::CdpFailure);
         }
         processed += 1;
-        // Frame-aware snapshots collect each frame's accessibility tree after
-        // checking its read grant. Ignore nodes explicitly tagged as another
-        // frame so this reply cannot disclose that other frame's content.
+        // Frame-aware snapshots collect each embedded document's own tree.
+        // Ignore nodes explicitly tagged as another frame so that document's
+        // content is collected once, under its own frame binding.
         if node
             .frame_id
             .as_ref()
@@ -5266,7 +5266,9 @@ mod tests {
         let remedy = reply["remedy"].as_str().unwrap();
         assert!(!remedy.contains("enclosing"), "{remedy}");
         assert!(
-            remedy.contains("frame") && remedy.contains("grant"),
+            remedy.contains("frame")
+                && remedy.contains("classification cause")
+                && !remedy.contains("read grant"),
             "{remedy}"
         );
     }

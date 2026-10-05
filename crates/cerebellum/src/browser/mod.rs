@@ -303,7 +303,7 @@ impl BrowserError {
             Self::RefAmbiguous { .. } => {
                 "take a fresh browser.snapshot and choose a ref that identifies exactly one current element"
             }
-            Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::TargetNotInDocument { .. }) => "the hit node is outside the classified document; take a fresh frame-aware snapshot; if its frame remains unavailable, inspect the frame origin and request its read grant",
+            Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::TargetNotInDocument { .. }) => "the hit node is outside the classified document; take a fresh frame-aware snapshot; if its frame remains unavailable, report the missing frame classification cause",
             Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::NotCaptured) => "take a new snapshot to capture target classification before clicking",
             Self::ClassificationUnavailable(_) => "the browser could not supply complete DOM classification; retry a fresh snapshot after the page finishes loading; if it persists, report the named classification cause",
             Self::ElementIntercepted | Self::Intercepted(_) => {
@@ -2762,36 +2762,11 @@ impl BrowserPlane {
                 reason_code: "frame_document_changed",
             });
         }
-        let mut readable = Vec::new();
-        for frame in &frames {
-            if frame.parent_id.is_none() {
-                readable.push(frame.clone());
-                continue;
-            }
-            match self
-                .authorize_read(identity, BrowserCapability::Snapshot, &frame.origin)
-                .await
-            {
-                Ok(()) => readable.push(frame.clone()),
-                Err(
-                    error @ (BrowserError::AuthorizationDenied { .. }
-                    | BrowserError::AuthorizationOriginScope { .. }
-                    | BrowserError::AuthorizationNoGrantForAction { .. }
-                    | BrowserError::AuthorizationSeverityInsufficient { .. }),
-                ) => {
-                    if zoom_frame
-                        .as_ref()
-                        .is_some_and(|target| target.frame_id == frame.frame_id)
-                    {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        // The top document's read grant covers its embedded documents, including
+        // opaque frames. Frame-origin grants remain mandatory for actions.
         if !frames.is_empty() {
             session_operation
-                .set_read_frames(readable)
+                .set_read_frames(frames.clone())
                 .map_err(map_navigation_drive_error)?;
         }
         self.reserve_journal(identity, BrowserCapability::Snapshot, persist_journal)
@@ -3593,12 +3568,6 @@ impl BrowserPlane {
         })?;
         session_operation = operation;
         let frames = frames.map_err(map_navigation_drive_error)?;
-        // Pixels cannot be safely filtered by DOM origin after capture. Require
-        // every visible frame's read grant before returning a whole-page image.
-        for frame in frames.iter().filter(|frame| frame.parent_id.is_some()) {
-            self.authorize_read(identity, BrowserCapability::Screenshot, &frame.origin)
-                .await?;
-        }
         let captured_frames = frames.clone();
         self.reserve_journal(identity, BrowserCapability::Screenshot, true)
             .await?;
@@ -3621,48 +3590,14 @@ impl BrowserPlane {
             // can sit between the capture and the check that it read the
             // authorized document.
             let live_after = session_operation.committed_document(&route_key, deadline_ms);
-            let frames_after = session_operation.frame_documents(&route_key, deadline_ms);
-            (session_operation, result, live_after, frames_after)
+            (session_operation, result, live_after)
         })
         .await
         .map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
-        let (session_operation, drive_result, live_after, frames_after) = driven;
+        let (session_operation, drive_result, live_after) = driven;
         session_operation.finish();
-        let frames_after = frames_after.map_err(map_navigation_drive_error)?;
-        if frames != frames_after {
-            let changed = frames.iter().find(|frame| !frames_after.contains(frame));
-            let authorized_origin = changed
-                .map(|frame| frame.origin.clone())
-                .unwrap_or_else(|| origin_from_url(&source_document.url));
-            let live_origin = changed
-                .and_then(|frame| {
-                    frames_after
-                        .iter()
-                        .find(|live| live.frame_id == frame.frame_id)
-                })
-                .map(|frame| frame.origin.clone())
-                .unwrap_or_else(|| "null".into());
-            let error = BrowserError::PageNavigatedDuringRead {
-                authorized_origin,
-                live_origin: live_origin.clone(),
-            };
-            self.record_snapshot_refusal(
-                identity,
-                &live_origin,
-                SnapshotRefusalReason::PageNavigatedDuringRead,
-            )
-            .await?;
-            self.finalize(
-                identity,
-                BrowserCapability::Screenshot,
-                Outcome::Denied,
-                error.detail().unwrap_or(Value::Null),
-            )
-            .await?;
-            return Err(error);
-        }
         let observation = drive_result.map_err(map_navigation_drive_error)?;
         self.confirm_read_document(
             identity,

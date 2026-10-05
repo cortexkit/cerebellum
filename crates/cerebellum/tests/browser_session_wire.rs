@@ -518,6 +518,7 @@ impl BrowserSessionLauncher for UndeclaredReplyLauncher {
 struct FrameFixture {
     financial: bool,
     action_origin_override: Option<String>,
+    churn_on_screenshot: bool,
     documents: Vec<cerebellum::snapshot_store::FrameDocument>,
     readable: Vec<cerebellum::snapshot_store::FrameDocument>,
 }
@@ -718,6 +719,7 @@ impl OwnedBrowserProcess for RecordingProcess {
             let fixture = fixture.lock().unwrap();
             if let Some(frame) = fixture.documents.iter().find(|f| f.parent_id.is_some()) {
                 if fixture.readable.contains(frame) {
+                    observation.dom_text = Some("<button>Sign in</button>".into());
                     let mut captured_frame = frame.clone();
                     if let Some(origin) = &fixture.action_origin_override {
                         captured_frame.origin = origin.clone();
@@ -779,6 +781,12 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: bool,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.effects.lock().unwrap().push("screenshot");
+        if let Some(fixture) = &self.frame_fixture {
+            let mut fixture = fixture.lock().unwrap();
+            if fixture.churn_on_screenshot {
+                fixture.documents[1].loader_id = "replacement-embed-loader".into();
+            }
+        }
         let viewport = ViewportObservation::new(
             0,
             TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
@@ -8054,6 +8062,7 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
     Arc::new(Mutex::new(FrameFixture {
         financial: false,
         action_origin_override: None,
+        churn_on_screenshot: false,
         readable: vec![],
         documents: vec![
             FrameDocument {
@@ -8079,7 +8088,7 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
 }
 
 #[tokio::test]
-async fn frame_read_grants_are_checked_before_capture() {
+async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin() {
     let fixture = frame_fixture();
     let launcher = Arc::new(RecordingLauncher {
         frame_fixture: Some(fixture.clone()),
@@ -8093,26 +8102,62 @@ async fn frame_read_grants_are_checked_before_capture() {
     planes.launch_service = Some(launcher.clone());
     grant_browser(&planes, "https://page.example", vec![]).await;
     launch_at(&planes, &launcher.page, "https://page.example").await;
-    let reply = invoke(&planes, 900, "browser.snapshot", json!({})).await;
-    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(reply["outcome"], "ok", "{reply}");
-    assert!(!reply.to_string().contains("Sign in"));
-    assert_eq!(fixture.lock().unwrap().readable.len(), 1);
-    assert!(reply.to_string().contains("https://payment.example"));
-    let image = invoke(&planes, 902, "browser.screenshot", json!({})).await;
+    for mode in ["actionable", "ax"] {
+        let snapshot = invoke(&planes, 900, "browser.snapshot", json!({"mode":mode})).await;
+        let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert!(snapshot.to_string().contains("Sign in"), "{snapshot}");
+        assert_eq!(fixture.lock().unwrap().readable.len(), 2);
+        let click = invoke(&planes, 901, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"check embedded action origin","severity":{"tier":2,"credential":false,"financial":false}})).await;
+        let click: Value = serde_json::from_slice(&click.body).unwrap();
+        assert_eq!(click["outcome"], "authorization_denied", "{click}");
+        assert_eq!(
+            click["detail"]["attempted_origin"],
+            "https://payment.example"
+        );
+        assert_eq!(
+            click["detail"]["grant_request"],
+            json!({"origins":["https://payment.example"],"severity_tier":2,"hazards":[]})
+        );
+        assert!(click["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("detail.grant_request"));
+        let zoom = invoke(
+            &planes,
+            902,
+            "browser.snapshot",
+            json!({"zoom":first_ref(&snapshot)}),
+        )
+        .await;
+        let zoom: Value = serde_json::from_slice(&zoom.body).unwrap();
+        assert_eq!(zoom["outcome"], "ok", "{zoom}");
+        assert!(zoom.to_string().contains("Sign in"));
+    }
+    let full = invoke(&planes, 905, "browser.snapshot", json!({"mode":"dom_full"})).await;
+    let full: Value = serde_json::from_slice(&full.body).unwrap();
+    assert_eq!(full["outcome"], "ok", "{full}");
+    assert!(full.to_string().contains("Sign in"));
+    let image = invoke(&planes, 903, "browser.screenshot", json!({})).await;
     let image: Value = serde_json::from_slice(&image.body).unwrap();
-    assert_eq!(image["outcome"], "authorization_denied", "{image}");
+    assert_eq!(image["outcome"], "ok", "{image}");
+    assert!(launcher.effects.lock().unwrap().contains(&"screenshot"));
+    let point = invoke(&planes, 904, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":image["snapshot_id"],"intent":"check point action origin","severity":{"tier":4,"credential":false,"financial":true}})).await;
+    let point: Value = serde_json::from_slice(&point.body).unwrap();
+    assert_eq!(point["outcome"], "authorization_denied", "{point}");
     assert_eq!(
-        image["detail"]["attempted_origin"],
+        point["detail"]["attempted_origin"],
         "https://payment.example"
     );
-    assert!(!launcher.effects.lock().unwrap().contains(&"screenshot"));
-    grant_browser(&planes, "https://payment.example", vec![]).await;
-    let reply = invoke(&planes, 901, "browser.snapshot", json!({})).await;
-    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(reply["outcome"], "ok", "{reply}");
-    assert_eq!(fixture.lock().unwrap().readable.len(), 2);
-    assert!(reply.to_string().contains("Sign in"));
+    assert_eq!(
+        point["detail"]["grant_request"]["origins"],
+        json!(["https://payment.example"])
+    );
+    assert!(point["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("detail.grant_request"));
+    assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
 }
 
 #[tokio::test]
@@ -8132,7 +8177,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     grant_browser(&planes, "https://payment.example", vec![]).await;
     launch_at(&planes, &launcher.page, "https://page.example").await;
     // Inject a ref naming another origin to exercise action authorization
-    // independently of the preceding capture's read-grant filter.
+    // independently of the top page's coverage of embedded reads.
     fixture.lock().unwrap().action_origin_override = Some("https://other-frame.example".into());
     let snapshot = invoke(&planes, 910, "browser.snapshot", json!({"mode":"ax"})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -8265,4 +8310,30 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
         }
         assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
     }
+}
+
+#[tokio::test]
+async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
+    let fixture = frame_fixture();
+    fixture.lock().unwrap().churn_on_screenshot = true;
+    let launcher = Arc::new(RecordingLauncher {
+        frame_fixture: Some(fixture.clone()),
+        ..Default::default()
+    });
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    grant_browser(&planes, "https://page.example", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example").await;
+    let image = invoke(&planes, 990, "browser.screenshot", json!({})).await;
+    let image: Value = serde_json::from_slice(&image.body).unwrap();
+    assert_eq!(image["outcome"], "ok", "{image}");
+    assert_eq!(
+        fixture.lock().unwrap().documents[1].loader_id,
+        "replacement-embed-loader"
+    );
+    assert!(launcher.effects.lock().unwrap().contains(&"screenshot"));
 }
