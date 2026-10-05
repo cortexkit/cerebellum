@@ -9,32 +9,16 @@ See [docs/charter.md](docs/charter.md).
 
 ## Building
 
-This workspace has **path dependencies on two sibling checkouts**:
-[cortexkit/subconscious](https://github.com/cortexkit/subconscious), which
-provides the wire protocol and transport, and
-[cortexkit/commons](https://github.com/cortexkit/commons), which provides the
-daemon-aligned data-home and config-home resolvers. They are path
-dependencies rather than registry versions, so both siblings have to be on
-disk: no published crate substitutes for either.
-
-Clone the three beside each other:
-
-    git clone https://github.com/cortexkit/subconscious.git
-    git clone https://github.com/cortexkit/commons.git
     git clone https://github.com/cortexkit/cerebellum.git
-    cd cerebellum && cargo build
+    cd cerebellum && cargo build --locked
 
-The paths are relative, so any sibling layout works. `subconscious-source.txt`
-and `commons-source.txt` pin the sibling crate contents this workspace is
-built against.
-
-**Keep `Cargo.lock` in step with the sibling.** While the committed lock
-disagrees with what the sibling supplies, every `cargo check` rewrites it —
-including the one `rust-analyzer` runs on its own, which produces a dirty
-`Cargo.lock` with no command to blame it on. Nothing has actually moved, but a
-dirty tree is indistinguishable from a real change at a glance. If the lock
-keeps reappearing as modified, commit it once against the current sibling and
-it stops.
+The wire protocol and transport come from
+[cortexkit/subconscious](https://github.com/cortexkit/subconscious) and the
+data-home and config-home resolvers from
+[cortexkit/commons](https://github.com/cortexkit/commons), as crates.io
+releases at exact versions. A commons crate that isn't published is a git
+dependency pinned to a full commit. No other checkout needs to be on disk, and
+the gate refuses any `path` dependency outside this repository.
 
 Verification runs through one script rather than a set of remembered commands:
 

@@ -30,10 +30,10 @@ go quickly; the gate exists for the cases where the shape is the question.
 - `scripts/rust-test-gate.sh` green, with its final `GATE PASSED` line in
   the pull request description.
 
-## Siblings
+## Dependencies
 
-This workspace builds against sibling checkouts of `cortexkit/subconscious`
-and `cortexkit/commons` at the revisions pinned in `subconscious-source.txt`
-and `commons-source.txt` (content-addressed subtree hashes). See the README
-for the layout. A `Cargo.lock` change that arrives with an unrelated commit
-is asked to be split out.
+Subconscious and commons crates come from crates.io at exact versions, or as
+a git dependency pinned to a full commit when a crate isn't published. Never
+add a `path` dependency outside this repository; the gate refuses it. Moving a
+dependency is its own commit, with its `Cargo.lock` change, never folded into
+an unrelated one.
