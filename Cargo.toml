@@ -16,38 +16,18 @@ members = [
 # no-op capability (`browser.status`). No browser, no CDP, no profile storage
 # — those are Spec B.
 #
-# The subc wire contract crates (subc-protocol, subc-transport, subc-jsonc) are
-# PATH dependencies on the sibling subconscious monorepo, pinned by subtree in
-# subconscious-source.txt. The test harness's daemon and client control crates
-# come from crates.io instead; see the patch section at the end of this file.
+# Fleet crates are exact registry releases; unpublished crates use a full git
+# revision. Cargo.lock records their checksums or commits, with no sibling layout.
 [workspace.dependencies]
-# The subc wire contract crates are PATH dependencies on the sibling subconscious
-# monorepo (same arrangement AFT and ck-quota use). The paths are RELATIVE, so
-# the workspace builds from any checkout that has the sibling beside it rather
-# than only on one developer's machine. A detached worktree lives outside this
-# repo's parent directory, and the sibling is placed beside it there when the
-# worktree is created; CI checks the sibling out next to this repo for the same
-# reason.
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-# The launch-nonce accessor. The module reads the secret the daemon launched it
-# with through this one function (a pipe on descriptor 3, or the environment
-# copy while modules move over), so it must be the same code the daemon's
-# handoff was written against: a sibling path, pinned like the wire crates.
-subc-os = { path = "../subconscious/crates/subc-os" }
-# Test-only: the in-process daemon the live tests boot, and the client control
-# types they speak to it. Taken from crates.io at a fixed version so the lock
-# moves on them only when this repo chooses, not whenever the sibling does.
-subc-control = "0.28.0"
-subc-daemon = "0.31.1"
-subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
-# The fleet commons, a second sibling beside subconscious, for the daemon-
-# aligned home resolvers (`resolve_data_home` / `resolve_config_home`). One
-# callable each, so this module CALLS the ladder the daemon publishes rather
-# than carrying a copy that drifts. Pinned by subtree in commons-source.txt
-# the same way the subconscious crates are.
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
-cortexkit-resource-busy = { path = "../commons/crates/cortexkit-resource-busy" }
+subc-protocol = "=0.29.1"
+subc-transport = "=0.10.0"
+subc-os = "=0.1.6"
+# Test-only in-process daemon and client control types.
+subc-control = "=0.28.0"
+subc-daemon = "=0.31.1"
+subc-jsonc = "=0.1.2"
+cortexkit-store-types = "=0.2.2"
+cortexkit-resource-busy = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,22 +39,3 @@ tokio-util = { version = "0.7", default-features = false }
 # default disposition restored so a supervisor sees a death by signal. The
 # default features add a signal-iterator thread this module does not use.
 signal-hook = { version = "0.4", default-features = false }
-
-# The test harness takes subc-daemon and subc-control from crates.io, so the
-# lock moves on the daemon only when this repo chooses. Those published crates
-# depend on the wire crates by version, and the test code hands wire types
-# between them and this module, so the wire crates must be ONE copy: this
-# patch points the registry's wire crates at the same sibling path the module
-# builds against. Without it cargo links two subc-protocols and every type
-# crossing between them fails to match.
-[patch.crates-io]
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
-# One copy of subc-os as well: the published daemon depends on it by version,
-# and a second copy would carry a second process-wide nonce cache.
-subc-os = { path = "../subconscious/crates/subc-os" }
-# The published tool-provider contract depends on cortexkit-store-types by
-# version; one copy, the sibling the module itself links and pins.
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
-cortexkit-resource-busy = { path = "../commons/crates/cortexkit-resource-busy" }

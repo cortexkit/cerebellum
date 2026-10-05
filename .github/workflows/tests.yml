@@ -92,36 +92,6 @@ jobs:
         with:
           path: cerebellum
 
-      # cerebellum path-deps two siblings: cortexkit/subconscious for the subc
-      # wire crates, and cortexkit/commons for the daemon-aligned home
-      # resolvers. Both are public repositories, so the default token checks
-      # them out.
-      - name: Checkout subconscious
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/subconscious
-          path: subconscious
-
-      - name: Checkout commons
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/commons
-          path: commons
-
-      # Both checkouts land side by side in the workspace directory, which is
-      # exactly what the relative path deps expect, so nothing needs to be
-      # moved or linked. The assertion is kept anyway: it fails AT THE LAYOUT,
-      # whereas the same problem discovered by cargo surfaces as a dependency
-      # resolution error and reads as a manifest fault rather than a missing
-      # checkout.
-      - name: Assert the sibling layout
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          ls -la .
-          test -d subconscious/crates/subc-protocol
-          test -d subconscious/crates/subc-transport
-          test -d commons/crates/cortexkit-store-types
 
       - uses: dtolnay/rust-toolchain@stable
         with:
