@@ -952,6 +952,7 @@ pub trait LaunchJournalPort {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformLaunchError {
     Spawn,
+    ResponsibilityDisclaimUnavailable,
     ImageIdentity,
     ProcessControl,
     PtraceUnavailable,
@@ -964,6 +965,11 @@ pub enum PlatformLaunchError {
 impl PlatformLaunchError {
     pub fn refusal(self) -> serde_json::Value {
         let (reason_code, remedy) = match self {
+            Self::ResponsibilityDisclaimUnavailable => return serde_json::json!({
+                "outcome": "responsibility_disclaim_unavailable",
+                "reason_code": "responsibility_disclaim_unavailable",
+                "remedy": "restore macOS responsibility disclaim support before retrying the launch",
+            }),
             Self::PtraceUnavailable => (
                 "ptrace_unavailable",
                 "grant CAP_SYS_PTRACE or lower ptrace_scope, then retry the launch".to_string(),
@@ -2266,7 +2272,12 @@ impl BarredProcessLauncher for MacOsProcessLauncher {
             self.cdp_response_write_fd,
         )
         .map(|child| MacOsBarredProcess(child, request.executable.clone()))
-        .map_err(|_| PlatformLaunchError::Spawn)
+        .map_err(|error| match error {
+            cerebellum_macos::SpawnError::ResponsibilityDisclaimUnavailable => {
+                PlatformLaunchError::ResponsibilityDisclaimUnavailable
+            }
+            _ => PlatformLaunchError::Spawn,
+        })
     }
 }
 
@@ -5589,6 +5600,7 @@ mod launch_outcome_schema_tests {
     fn every_platform_launch_refusal_passes_the_launch_reply_schema() {
         let errors = [
             PlatformLaunchError::Spawn,
+            PlatformLaunchError::ResponsibilityDisclaimUnavailable,
             PlatformLaunchError::ImageIdentity,
             PlatformLaunchError::ProcessControl,
             PlatformLaunchError::PtraceUnavailable,
@@ -5607,6 +5619,7 @@ mod launch_outcome_schema_tests {
             // compile until this test decides how to build it.
             match &error {
                 PlatformLaunchError::Spawn
+                | PlatformLaunchError::ResponsibilityDisclaimUnavailable
                 | PlatformLaunchError::ImageIdentity
                 | PlatformLaunchError::ProcessControl
                 | PlatformLaunchError::PtraceUnavailable

@@ -4705,6 +4705,7 @@ fn browser_launch_result_schema() -> Value {
             "identity_unverifiable",
             "executable_identity_mismatch",
             "launch_refused",
+            "responsibility_disclaim_unavailable",
             // The browser exited or went silent before its handshake, and this
             // layer cannot tell why.
             "profile_startup_indeterminate",

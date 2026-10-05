@@ -148,6 +148,7 @@ extern "C" {
 }
 
 extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn fork() -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
@@ -257,6 +258,7 @@ pub enum SpawnError {
     DuplicateDescriptor(io::ErrorKind),
     Fork(io::ErrorKind),
     Spawn(c_int),
+    ResponsibilityDisclaimUnavailable,
     ProcessMissing,
     ProcessInspectionDenied,
     ProcessLayoutMismatch,
@@ -497,6 +499,24 @@ pub fn spawn_barred(
     cdp_command_read_fd: RawFd,
     cdp_response_write_fd: RawFd,
 ) -> Result<BarredChild, SpawnError> {
+    spawn_barred_with_responsibility(
+        executable,
+        arguments,
+        environment,
+        cdp_command_read_fd,
+        cdp_response_write_fd,
+        true,
+    )
+}
+
+fn spawn_barred_with_responsibility(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    cdp_command_read_fd: RawFd,
+    cdp_response_write_fd: RawFd,
+    disclaim: bool,
+) -> Result<BarredChild, SpawnError> {
     if !executable.is_absolute() {
         return Err(SpawnError::InvalidExecutable);
     }
@@ -540,8 +560,11 @@ pub fn spawn_barred(
     let command_source = duplicate_descriptor(cdp_command_read_fd)?;
     let response_source = duplicate_descriptor(cdp_response_write_fd)?;
     let (death_read, death_write) = create_pipe()?;
-    let (mut actions, mut attributes) =
-        prepare_spawn(command_source.as_raw_fd(), response_source.as_raw_fd())?;
+    let (mut actions, mut attributes) = prepare_spawn(
+        command_source.as_raw_fd(),
+        response_source.as_raw_fd(),
+        disclaim,
+    )?;
 
     // `posix_spawn` may enter framework and libc initialization, so it must run
     // in the ordinary multithreaded process rather than in a child of `fork`.
@@ -775,6 +798,7 @@ pub fn process_descriptors(pid: u32) -> Result<Vec<RawFd>, io::ErrorKind> {
 fn prepare_spawn(
     command_source: RawFd,
     response_source: RawFd,
+    disclaim: bool,
 ) -> Result<(PosixSpawnFileActions, PosixSpawnAttr), SpawnError> {
     let mut actions: PosixSpawnFileActions = std::ptr::null_mut();
     let mut attributes: PosixSpawnAttr = std::ptr::null_mut();
@@ -836,6 +860,36 @@ fn prepare_spawn(
             let _ = unsafe { posix_spawnattr_destroy(&mut attributes) };
         }
         return Err(SpawnError::Spawn(status));
+    }
+    if disclaim {
+        // Resolve before fork. Without a successful responsibility disclaim,
+        // Chrome would inherit the module's Screen Recording, Accessibility,
+        // and Input Monitoring grants, so an unavailable operation forbids launch.
+        type SetDisclaim = unsafe extern "C" fn(*mut PosixSpawnAttr, c_int) -> c_int;
+        let result = crate::require_responsibility_disclaim(
+            || {
+                let symbol = unsafe {
+                    dlsym(
+                        (-2isize) as *mut c_void,
+                        c"responsibility_spawnattrs_setdisclaim".as_ptr(),
+                    )
+                };
+                if symbol.is_null() {
+                    None
+                } else {
+                    // SAFETY: this exact libSystem symbol uses the private Darwin
+                    // responsibility.h signature: int (posix_spawnattr_t *, int).
+                    // PosixSpawnAttr is Darwin's opaque pointer typedef.
+                    Some(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(symbol) })
+                }
+            },
+            |operation| unsafe { operation(&mut attributes, 1) },
+        );
+        if result.is_err() {
+            let _ = unsafe { posix_spawn_file_actions_destroy(&mut actions) };
+            let _ = unsafe { posix_spawnattr_destroy(&mut attributes) };
+            return Err(SpawnError::ResponsibilityDisclaimUnavailable);
+        }
     }
     Ok((actions, attributes))
 }
@@ -1089,6 +1143,92 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn disclaim_makes_fixture_its_own_responsible_process() {
+        let _serial = serialize_launch_fixtures();
+        let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let fixture = crate::content_named_fixture::content_named_fixture(
+            "responsibility",
+            "responsibility-fixture",
+            &bytes,
+            0o700,
+        );
+        let directory = TestDirectory::new("responsibility");
+        for disclaim in [false, true] {
+            let report = directory.join(if disclaim { "disclaimed" } else { "inherited" });
+            let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
+            let child = spawn_barred_with_responsibility(
+                &fixture,
+                &[
+                    "--ignored".into(),
+                    "--exact".into(),
+                    "launch::tests::responsibility_fixture_sleeper".into(),
+                ],
+                &[(
+                    "CEREBELLUM_RESPONSIBILITY_REPORT".into(),
+                    report.clone().into_os_string(),
+                )],
+                command_read.as_raw_fd(),
+                response_write.as_raw_fd(),
+                disclaim,
+            )
+            .unwrap()
+            .release()
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let contents = loop {
+                if let Ok(contents) = fs::read_to_string(&report) {
+                    if !contents.is_empty() {
+                        break contents;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not report responsibility"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let responsible: u32 = contents.parse().unwrap();
+            let pid = child.generation().pid;
+            child.terminate_and_reap().unwrap();
+            if disclaim {
+                assert_eq!(
+                    responsible, pid,
+                    "disclaimed fixture must own its privacy responsibility"
+                );
+            } else {
+                assert_ne!(
+                    responsible, pid,
+                    "control must inherit launcher responsibility"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by the responsibility contrast test"]
+    fn responsibility_fixture_sleeper() {
+        type ResponsiblePid = unsafe extern "C" fn(c_int) -> c_int;
+        let symbol = unsafe {
+            dlsym(
+                (-2isize) as *mut c_void,
+                c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+            )
+        };
+        assert!(!symbol.is_null(), "responsibility query unavailable");
+        // SAFETY: this exact libSystem symbol uses the private Darwin
+        // responsibility.h signature: pid_t (pid_t); Darwin pid_t is c_int.
+        let query = unsafe { std::mem::transmute::<*mut c_void, ResponsiblePid>(symbol) };
+        let responsible = unsafe { query(std::process::id() as c_int) };
+        assert!(responsible > 0);
+        fs::write(
+            std::env::var_os("CEREBELLUM_RESPONSIBILITY_REPORT").unwrap(),
+            responsible.to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     // Forking process fixtures concurrently makes each fixture inherit transient

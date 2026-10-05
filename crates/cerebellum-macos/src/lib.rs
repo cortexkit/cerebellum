@@ -39,6 +39,13 @@ mod event_tap;
 mod input;
 #[cfg(target_os = "macos")]
 mod launch;
+#[cfg(any(target_os = "macos", test))]
+mod responsibility;
+#[cfg(any(target_os = "macos", test))]
+pub use responsibility::{require_responsibility_disclaim, ResponsibilityDisclaimUnavailable};
+#[cfg(all(target_os = "macos", test))]
+#[path = "../../cerebellum/src/content_named_fixture.rs"]
+mod content_named_fixture;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
