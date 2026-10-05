@@ -66,32 +66,14 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 ///
 /// Membership is deliberately tight: a module belongs here only if driving
 /// browser or computer use is part of its normal orchestration. The subc-mcp
-/// facade is excluded by that rule rather than by exception — it fronts
-/// remote-model calls and is the containment boundary.
+/// facade only fronts remote-model calls, so it does not need these capabilities;
+/// keeping it outside this list preserves it as the boundary around those calls.
 ///
-/// An id is added BEFORE the module starts using it. The daemon keys modules by
-/// id and refuses a duplicate active id, so a rename is a flag day with no
-/// window in which both names resolve: the moment a module registers under a new
-/// id, a list still naming only the old one classifies it as untrusted and
-/// revokes its access. That failure is safe but silent, and it presents as a
-/// permission fault here rather than as a rename elsewhere. Both names are
-/// therefore carried across a rename, and the old one is dropped once the flip
-/// has settled.
-pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
-    // The agent orchestrator, being renamed `alfonso-core` -> `prefrontal-core`.
-    // Bare `prefrontal` is a spelling no module registers under, kept only until
-    // the rename settles. An unused id authorizes nobody, because the daemon
-    // issues a reserved principal only for a module it supervises -- so confirm
-    // against the daemon's list of live modules before removing any of these.
-    "alfonso-core",
-    "prefrontal",
-    "prefrontal-core",
-    // The routing module, renamed in the same flip.
-    "alfonso-routing",
-    "prefrontal-routing",
-    "aft",
-    "broca",
-];
+/// Add a new id here before a module starts using it. When a module is renamed,
+/// carry both its old and new ids during the transition so neither registration
+/// loses access.
+pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] =
+    &["prefrontal-core", "prefrontal-routing", "aft", "broca"];
 
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
@@ -163,12 +145,12 @@ mod tests {
     }
 
     #[test]
-    fn alfonso_core_is_first_party() {
+    fn retired_module_ids_are_untrusted() {
         assert_eq!(
             trust_for_principal(&Some(Principal::Reserved {
                 module_id: "alfonso-core".to_string()
             })),
-            PrincipalTrust::FirstParty
+            PrincipalTrust::Untrusted
         );
     }
 
@@ -178,23 +160,10 @@ mod tests {
     /// The ids are written out rather than iterated over
     /// [`FIRST_PARTY_MODULE_IDS`]: a loop over the list takes its expectations
     /// FROM the thing under test, so deleting an entry deletes its own check and
-    /// the silent revocation this test exists to catch passes. Measured, not
-    /// assumed -- an iterating version stayed green for three of the five ids.
-    ///
-    /// The orchestrator and the routing module each appear under both their old
-    /// and new ids because they are mid-rename; the old ids are removed here
-    /// when they are removed from the list.
+    /// could silently revoke that module's first-party admission.
     #[test]
     fn each_dependent_module_is_admitted() {
-        for module_id in [
-            "alfonso-core",
-            "prefrontal",
-            "prefrontal-core",
-            "alfonso-routing",
-            "prefrontal-routing",
-            "aft",
-            "broca",
-        ] {
+        for module_id in ["prefrontal-core", "prefrontal-routing", "aft", "broca"] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string()
@@ -310,19 +279,25 @@ mod tests {
         assert!(admits_session_calls(&reserved("prefrontal-core")));
     }
 
-    /// Every other first-party principal is still first-party, and still not
-    /// admitted to act in a conversation. Named by literal so that widening
-    /// the rule back to "any first-party principal" fails here.
+    /// Other first-party principals cannot make session calls, and retired
+    /// module ids are neither first-party nor admitted. Named by literal so that
+    /// widening the rule back to "any first-party principal" fails here.
     #[test]
     fn other_first_party_principals_make_no_session_calls() {
+        for retired_id in ["alfonso-core", "prefrontal", "alfonso-routing"] {
+            assert_eq!(
+                trust_for_principal(&reserved(retired_id)),
+                PrincipalTrust::Untrusted,
+                "{retired_id} is retired and must not remain first-party"
+            );
+            assert!(!admits_session_calls(&reserved(retired_id)));
+        }
+
         let others = [
             Some(Principal::Direct),
             reserved("aft"),
             reserved("broca"),
             reserved("prefrontal-routing"),
-            reserved("alfonso-routing"),
-            reserved("alfonso-core"),
-            reserved("prefrontal"),
         ];
         for principal in others {
             assert!(trust_for_principal(&principal).is_first_party());

@@ -9472,7 +9472,7 @@ mod tests {
     #[test]
     fn principal_backstop_accepts_the_executive() {
         let trust = trust_for_principal(&Some(Principal::Reserved {
-            module_id: "prefrontal".to_string(),
+            module_id: "prefrontal-core".to_string(),
         }));
         assert!(trust.is_first_party());
     }
