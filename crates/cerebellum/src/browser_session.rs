@@ -680,6 +680,18 @@ pub trait OwnedBrowserProcess: Send {
         Err(ClickDriveError::ClassificationChanged)
     }
 
+    /// Insert text only through a classified, frame-bound target.
+    fn type_classified(
+        &mut self,
+        _context_key: &str,
+        _target: &crate::browser_type::TypeDispatch,
+        _text: &str,
+        _clear_first: bool,
+        _deadline_ms: u64,
+    ) -> Result<crate::browser_type::BrowserTypeResult, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     fn generation_matches(&self) -> bool;
 
     /// Whether the recorded generation has positively gone, which is narrower
@@ -1557,6 +1569,20 @@ impl OperationGuard {
                 input_dispatched,
             )
         })
+    }
+
+    pub(crate) fn type_classified(
+        &mut self,
+        context_key: &str,
+        target: &crate::browser_type::TypeDispatch,
+        text: &str,
+        clear_first: bool,
+        deadline_ms: u64,
+    ) -> Result<crate::browser_type::BrowserTypeResult, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.type_classified(context_key, target, text, clear_first, deadline_ms),
+        )
     }
 
     /// Give the admission back while the caller holds this session's meta

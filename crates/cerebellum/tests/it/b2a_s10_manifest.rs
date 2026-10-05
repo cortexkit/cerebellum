@@ -49,26 +49,13 @@ fn has_browser_type(manifest: &ModuleManifest) -> bool {
 
 #[test]
 fn advertisement_suppressed_when_a_gate_fails() {
-    // Every gate passing ADMITS browser.type. Admission is asserted through the
-    // gate report rather than through the manifest, because advertising also
-    // requires that the capability can be dispatched, and browser.type has no
-    // dispatch route. Reading the manifest here would find it absent for that
-    // reason and hold however the gates behaved, which is the assertion this
-    // test exists to make.
+    // Fully supplied legacy release evidence advertises the working type route.
     assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
-
-    // And nothing is advertised that could not be served: with the gates fully
-    // satisfied, browser.type stays out of the manifest because no dispatch
-    // route exists for it. When one is added, this line is what fails, which is
-    // the moment the evidence gate stops being theoretical.
-    assert!(!has_browser_type(&build_with_unfenceable_evidence(
+    assert!(has_browser_type(&build_with_unfenceable_evidence(
         &valid_inputs()
     )));
 
-    // Suppressing any single gate withholds admission. Asserted through the
-    // report for the same reason: browser.type is absent from the manifest
-    // whatever the gates say, so a manifest assertion would pass with the gate
-    // deleted.
+    // Omitting a required B1 pin or journal bound fails gate evaluation.
     let mut no_pin = valid_inputs();
     no_pin.b1_pin = None;
     assert!(!evaluate_unfenceable_gates(&no_pin).passed());

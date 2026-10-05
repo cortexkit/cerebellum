@@ -917,6 +917,7 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
             "browser.close",
             "browser.navigate",
             "browser.snapshot",
+            "browser.type",
             "browser.click",
             // Both admitted after being driven through this wire path against
             // Chrome 151, THROUGH their authorization gates.
@@ -994,7 +995,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     // Implemented and deliberately not admitted. These are NOT unknown: naming
     // them that way tells a caller to stop asking for something we built and
     // withheld on purpose, and invites a bug report for a decision.
-    for (corr, unavailable) in [(16, "browser.wait_for"), (17, "browser.type")] {
+    for (corr, unavailable) in [(16, "browser.wait_for")] {
         let refused = invoke(&planes, corr, unavailable, json!({})).await;
         let refused: Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
@@ -3332,6 +3333,7 @@ struct ChromeLikePipe {
     commands: Arc<Mutex<Vec<String>>>,
     reads: VecDeque<Vec<u8>>,
     blocked_release_id: Option<u64>,
+    typing: Option<TypePage>,
 }
 
 impl ChromeLikePipe {
@@ -3376,7 +3378,36 @@ impl CdpPipeIo for ChromeLikePipe {
                 id,
                 json!({"backendNodeId":LINK_BACKEND_NODE,"frameId":MAIN_FRAME}),
             ),
-            "DOM.getFlattenedDocument" => self.reply(id, Value::Object(click_page_document())),
+            "DOM.getFlattenedDocument" => self.reply(
+                id,
+                Value::Object(
+                    self.typing
+                        .as_ref()
+                        .map(TypePage::document)
+                        .unwrap_or_else(click_page_document),
+                ),
+            ),
+            "DOM.focus" => self.reply(id, json!({})),
+            "DOM.resolveNode" => self.reply(id, json!({"object":{"objectId":"field"}})),
+            "Runtime.callFunctionOn" => {
+                self.reply(id, json!({"result":{"type":"boolean","value":true}}))
+            }
+            "Input.dispatchKeyEvent" => {
+                if command["params"]["type"] == "keyDown" {
+                    self.typing.as_ref().unwrap().value.lock().unwrap().clear();
+                }
+                self.reply(id, json!({}));
+            }
+            "Input.insertText" => {
+                self.typing
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .lock()
+                    .unwrap()
+                    .push_str(command["params"]["text"].as_str().unwrap());
+                self.reply(id, json!({}));
+            }
             "Page.getNavigationHistory" => {
                 let history = self.page.navigation_history();
                 self.reply(id, history)
@@ -3385,9 +3416,11 @@ impl CdpPipeIo for ChromeLikePipe {
                 let tree = self.page.frame_tree();
                 self.reply(id, tree)
             }
-            "DOM.scrollIntoViewIfNeeded" | "DOM.enable" | "Page.enable" | "Network.enable" => {
-                self.reply(id, json!({}))
-            }
+            "DOM.scrollIntoViewIfNeeded"
+            | "DOM.enable"
+            | "Page.enable"
+            | "Network.enable"
+            | "Target.setAutoAttach" => self.reply(id, json!({})),
             "Input.dispatchMouseEvent" if command["params"]["type"] == "mousePressed" => {
                 self.reply(id, json!({}))
             }
@@ -3471,9 +3504,22 @@ impl CdpPipeIo for ChromeLikePipe {
 struct CdpClickProcess {
     driver: CdpNavigationDriver<ChromeLikePipe>,
     snapshots: Arc<Mutex<usize>>,
+    typing: Option<TypePage>,
 }
 
 impl OwnedBrowserProcess for CdpClickProcess {
+    fn type_classified(
+        &mut self,
+        context_key: &str,
+        target: &cerebellum::browser_type::TypeDispatch,
+        text: &str,
+        clear_first: bool,
+        deadline_ms: u64,
+    ) -> Result<cerebellum::browser_type::BrowserTypeResult, NavigationDriveError> {
+        self.driver
+            .type_classified(context_key, target, text, clear_first, deadline_ms)
+    }
+
     fn main_frame_url(
         &mut self,
         context_key: &str,
@@ -3576,10 +3622,23 @@ impl OwnedBrowserProcess for CdpClickProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         *self.snapshots.lock().unwrap() += 1;
+        let field_frame = if self
+            .typing
+            .as_ref()
+            .is_some_and(|page| page.frame_origin.is_some())
+        {
+            "cross-frame"
+        } else {
+            MAIN_FRAME
+        };
         let identity =
-            BackendNodeIdentity::new("target-own", MAIN_FRAME, LINK_BACKEND_NODE).unwrap();
+            BackendNodeIdentity::new("target-own", field_frame, LINK_BACKEND_NODE).unwrap();
         let classification = classify_flattened_document(
-            &click_page_document(),
+            &self
+                .typing
+                .as_ref()
+                .map(TypePage::document)
+                .unwrap_or_else(click_page_document),
             &identity,
             document_epoch,
             current_origin,
@@ -3595,9 +3654,21 @@ impl OwnedBrowserProcess for CdpClickProcess {
             }],
             dom_text: None,
             refs: vec![RefRecord {
-                frame_document: None,
+                frame_document: self
+                    .typing
+                    .as_ref()
+                    .and_then(|page| page.frame_origin.as_ref())
+                    .map(|origin| cerebellum::snapshot_store::FrameDocument {
+                        navigation_revision: 0,
+                        frame_id: "cross-frame".into(),
+                        parent_id: Some(MAIN_FRAME.into()),
+                        session_id: "cross-session".into(),
+                        loader_id: "cross-loader".into(),
+                        url: format!("{origin}/field"),
+                        origin: origin.clone(),
+                    }),
                 captured: SnapshotRef::new("e1", "link", "Learn more", 0).unwrap(),
-                frame_path: vec![MAIN_FRAME.into()],
+                frame_path: vec![field_frame.into()],
                 backend_identity: Some(identity),
                 raw_role: Some("link".into()),
                 raw_name: Some("Learn more".into()),
@@ -3656,6 +3727,7 @@ struct CdpClickLauncher {
     snapshots: Arc<Mutex<usize>>,
     page: CommittedPage,
     commands: Arc<Mutex<Vec<String>>>,
+    typing: Option<TypePage>,
 }
 
 impl BrowserSessionLauncher for CdpClickLauncher {
@@ -3673,11 +3745,13 @@ impl BrowserSessionLauncher for CdpClickLauncher {
                         commands: Arc::clone(&self.commands),
                         reads: VecDeque::new(),
                         blocked_release_id: None,
+                        typing: self.typing.clone(),
                     },
                     CdpTransport::new(),
                     CdpFrameDecoder::default(),
                 ),
                 snapshots: Arc::clone(&self.snapshots),
+                typing: self.typing.clone(),
             }),
             cleanup: Box::new(RecordingCleanup {
                 effects: Arc::new(Mutex::new(Vec::new())),
@@ -3710,6 +3784,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
         snapshots: Arc::clone(&snapshots),
         page: page.clone(),
         commands: Arc::default(),
+        typing: None,
     }));
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -3808,6 +3883,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         snapshots: Arc::default(),
         page: page.clone(),
         commands: Arc::default(),
+        typing: None,
     }));
     bind_management_route(&planes).await;
     // Authorize the declared destination, but not the final redirect origin.
@@ -4349,6 +4425,7 @@ async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) 
         snapshots: Arc::new(Mutex::new(0)),
         page: page.clone(),
         commands: Arc::clone(&commands),
+        typing: None,
     }));
     planes.browser = Arc::new(
         BrowserPlane::with_session_gate(
@@ -8578,4 +8655,234 @@ async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
         "replacement-embed-loader"
     );
     assert!(launcher.effects.lock().unwrap().contains(&"screenshot"));
+}
+
+#[derive(Clone, Default)]
+struct TypePage {
+    input_type: String,
+    autocomplete: String,
+    frame_origin: Option<String>,
+    value: Arc<Mutex<String>>,
+}
+
+impl TypePage {
+    fn document(&self) -> serde_json::Map<String, Value> {
+        json!({"nodes":[{"nodeId":1,"backendNodeId":LINK_BACKEND_NODE,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type",if self.input_type.is_empty() { "text" } else { &self.input_type },"autocomplete",self.autocomplete]}]}).as_object().unwrap().clone()
+    }
+}
+
+async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) {
+    let committed = CommittedPage::default();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        scenario: ClickScenario::NoNavigation,
+        snapshots: Arc::default(),
+        page: committed.clone(),
+        commands: commands.clone(),
+        typing: Some(page),
+    }));
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(planes.sessions.clone(), planes.lease_clock.clone(), 3_000)
+            .with_result_schema_enforcement(
+                cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+            )
+            .with_in_memory_journal(cerebellum::journal::JournalConfig {
+                journal_retention_bytes: 1_048_576,
+                journal_max_entry_bytes: 65_536,
+            })
+            .with_grants_installed(GrantStore::new([ActionGrant::new(
+                "type",
+                1,
+                "test-session",
+                Severity::new(4, false, false),
+                [CLICK_PAGE_ORIGIN],
+            )])),
+    );
+    launch_at(&planes, &committed, CLICK_PAGE_ORIGIN).await;
+    let snapshot = body(&invoke(&planes, 900, "browser.snapshot", json!({"mode":"ax"})).await);
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    (planes, committed, commands)
+}
+
+async fn type_wire(planes: &Planes, text: &str, clear_first: bool) -> Value {
+    body(
+        &invoke(
+            planes,
+            901,
+            "browser_use",
+            json!({"action":"type","ref":"e1","text":text,"clear_first":clear_first}),
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn wire_type_plain_field_dispatches_characters() {
+    let page = TypePage::default();
+    let value = page.value.clone();
+    let (planes, _, commands) = type_fixture(page).await;
+    let reply = body(
+        &invoke(
+            &planes,
+            901,
+            "browser.type",
+            json!({"ref":"e1","text":"hello 🦀"}),
+        )
+        .await,
+    );
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["characters_dispatched"], 7);
+    assert_eq!(*value.lock().unwrap(), "hello 🦀");
+    let methods = commands.lock().unwrap();
+    assert!(methods.iter().any(|method| method == "DOM.focus"));
+    assert!(methods.iter().any(|method| method == "Input.insertText"));
+}
+
+#[tokio::test]
+async fn wire_type_clear_first_replaces_value() {
+    let page = TypePage::default();
+    let value = page.value.clone();
+    *value.lock().unwrap() = "previous".into();
+    let (planes, _, _) = type_fixture(page).await;
+    assert_eq!(
+        type_wire(&planes, "replacement", true).await["outcome"],
+        "ok"
+    );
+    assert_eq!(*value.lock().unwrap(), "replacement");
+}
+
+#[tokio::test]
+async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
+    for (input_type, autocomplete) in [
+        ("password", ""),
+        ("text", "cc-number"),
+        ("text", "current-password"),
+        ("text", "new-password"),
+        ("text", "one-time-code"),
+    ] {
+        let page = TypePage {
+            input_type: input_type.into(),
+            autocomplete: autocomplete.into(),
+            frame_origin: Some("https://payments.example".into()),
+            ..Default::default()
+        };
+        let (planes, _, commands) = type_fixture(page).await;
+        let before = planes.browser.journal_export_for_test().await;
+        let reply = type_wire(&planes, "secret", false).await;
+        assert_eq!(
+            reply["detail"]["reason_code"], "credential_input_unsupported",
+            "{reply}"
+        );
+        assert!(reply["remedy"].as_str().unwrap().contains("present"));
+        assert_eq!(planes.browser.journal_export_for_test().await, before);
+        assert!(!commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method.starts_with("Input.") || method == "DOM.focus"));
+    }
+}
+
+#[tokio::test]
+async fn wire_type_ungranted_frame_names_its_origin() {
+    let (planes, _, commands) = type_fixture(TypePage {
+        frame_origin: Some("https://ungranted.example".into()),
+        ..Default::default()
+    })
+    .await;
+    let reply = type_wire(&planes, "hello", false).await;
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert!(
+        reply.to_string().contains("https://ungranted.example"),
+        "{reply}"
+    );
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|method| method.starts_with("Input.")));
+}
+
+#[tokio::test]
+async fn wire_type_stale_document_refuses_before_input() {
+    let (planes, page, commands) = type_fixture(TypePage::default()).await;
+    page.commit("https://example.com/different-document");
+    let reply = type_wire(&planes, "hello", false).await;
+    assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|method| method.starts_with("Input.") || method == "DOM.focus"));
+}
+
+#[tokio::test]
+async fn wire_type_missing_text_is_refused_by_name() {
+    let (planes, _, _) = type_fixture(TypePage::default()).await;
+    let reply = body(
+        &invoke(
+            &planes,
+            902,
+            "browser_use",
+            json!({"action":"type","ref":"e1"}),
+        )
+        .await,
+    );
+    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    assert_eq!(reply["detail"]["field"], "text", "{reply}");
+    let granular = body(&invoke(&planes, 904, "browser.type", json!({"ref":"e1"})).await);
+    assert_eq!(granular["detail"]["field"], "text", "{granular}");
+}
+
+fn contains_type_secret(records: &[String], secret: &str) -> bool {
+    records.iter().any(|record| record.contains(secret))
+}
+
+#[tokio::test]
+async fn wire_type_planted_secret_absent_from_all_records() {
+    const SECRET: &str = "PLANTED-BROWSER-TYPE-SECRET-7f3c1e";
+    let page = TypePage::default();
+    let value = page.value.clone();
+    let (mut planes, _, _) = type_fixture(page).await;
+    let storage = with_readable_call_records(&mut planes);
+    let (tx, mut rx) = mpsc::channel(8);
+    let reply = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_on(
+            9,
+            903,
+            "browser_use",
+            json!({"action":"type","ref":"e1","text":SECRET}),
+            "pf:type-secret",
+        ),
+    )
+    .await;
+    assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+    assert_eq!(*value.lock().unwrap(), SECRET);
+    let journal = planes.browser.journal_export_for_test().await;
+    assert!(
+        journal.contains("browser.type") || journal.contains("\"type\""),
+        "{journal}"
+    );
+    let records = vec![
+        journal,
+        planes.browser.refusal_ring_export_for_test().await,
+        String::from_utf8(storage.contents().expect("keyed call record")).unwrap(),
+        body(&reply).to_string(),
+    ];
+    assert!(
+        !contains_type_secret(&records, SECRET),
+        "typed text reached records"
+    );
+    // Plant the marker into a copy of a real journal row to prove the same scanner detects it.
+    let mut planted = records.clone();
+    planted[0].push_str(SECRET);
+    assert!(contains_type_secret(&planted, SECRET));
 }

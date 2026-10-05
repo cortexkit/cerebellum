@@ -53,12 +53,21 @@ use cerebellum_core::identity::{ProfileDisposition, RouteIdentity, SessionKind};
 pub const NAVIGATE: &str = "browser.navigate";
 pub const SNAPSHOT: &str = "browser.snapshot";
 pub const CLICK: &str = "browser.click";
+pub const TYPE: &str = "browser.type";
 pub const SCREENSHOT: &str = "browser.screenshot";
 pub const CLICK_POINT: &str = "browser.click_point";
 pub const WAIT_FOR: &str = "browser.wait_for";
 /// The wire refusal code shared with the computer plane for a result-schema violation.
 pub const RESULT_SCHEMA_VIOLATION_CODE: &str = "computer_result_schema_violation";
-pub const ALL_TOOLS: [&str; 6] = [NAVIGATE, SNAPSHOT, CLICK, SCREENSHOT, CLICK_POINT, WAIT_FOR];
+pub const ALL_TOOLS: [&str; 7] = [
+    NAVIGATE,
+    SNAPSHOT,
+    CLICK,
+    TYPE,
+    SCREENSHOT,
+    CLICK_POINT,
+    WAIT_FOR,
+];
 
 /// Whether a browser capability has a working module-wire dispatch route.
 ///
@@ -71,6 +80,7 @@ pub fn has_wire_dispatch_route(name: &str) -> bool {
         NAVIGATE
             | SNAPSHOT
             | CLICK
+            | TYPE
             | SCREENSHOT
             | CLICK_POINT
             | crate::management::PRESENT
@@ -89,6 +99,7 @@ pub enum BrowserCapability {
     Navigate,
     Snapshot,
     Click,
+    Type,
     Screenshot,
     ClickPoint,
     WaitFor,
@@ -99,19 +110,24 @@ impl BrowserCapability {
             Self::Navigate => NAVIGATE,
             Self::Snapshot => SNAPSHOT,
             Self::Click => CLICK,
+            Self::Type => TYPE,
             Self::Screenshot => SCREENSHOT,
             Self::ClickPoint => CLICK_POINT,
             Self::WaitFor => WAIT_FOR,
         }
     }
     pub const fn is_unfenceable(self) -> bool {
-        matches!(self, Self::Navigate | Self::Click | Self::ClickPoint)
+        matches!(
+            self,
+            Self::Navigate | Self::Click | Self::Type | Self::ClickPoint
+        )
     }
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             NAVIGATE => Self::Navigate,
             SNAPSHOT => Self::Snapshot,
             CLICK => Self::Click,
+            TYPE => Self::Type,
             SCREENSHOT => Self::Screenshot,
             CLICK_POINT => Self::ClickPoint,
             WAIT_FOR => Self::WaitFor,
@@ -279,6 +295,9 @@ impl BrowserError {
         match self {
             Self::InvalidRequest { reason_code, .. } if *reason_code == "path_abandons_custody" => {
                 "omit path; authenticated-session pixels stay inside this module's retention machinery"
+            }
+            Self::InvalidRequest { reason_code: "credential_input_unsupported", .. } => {
+                "use browser_use present to hand sign-in or payment input to the person; resume afterward"
             }
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
@@ -1903,6 +1922,7 @@ impl BrowserPlane {
             BrowserCapability::Navigate => self.navigate(identity, args).await,
             BrowserCapability::Snapshot => self.snapshot(identity, args).await,
             BrowserCapability::Click => self.click(identity, args).await,
+            BrowserCapability::Type => self.type_text(identity, args).await,
             BrowserCapability::Screenshot => self.screenshot(identity, args).await,
             BrowserCapability::ClickPoint => self.click_point(identity, args).await,
             BrowserCapability::WaitFor => self.wait_for(identity, args).await,
@@ -4212,6 +4232,8 @@ struct BrowserToolDefinition {
     result_schema: Value,
 }
 
+mod typing;
+
 fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
     vec![
         BrowserToolDefinition {
@@ -4225,6 +4247,12 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             description: "Read the page as plain text in state_text: an outline of its landmarks by default, main content first; zoom names one ref to print that element's whole subtree. Use ax or dom_full only when something is missing.",
             request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"zoom":{"type":"string","description":"A ref from the last snapshot; prints that element's whole subtree instead of the outline. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
+        },
+        BrowserToolDefinition {
+            name: TYPE,
+            description: "Type into a ref from the latest snapshot; clear_first replaces its contents. Credential and payment fields require present instead.",
+            request_schema: json!({"type":"object","properties":{"ref":{"type":"string"},"text":{"type":"string","maxLength":10000},"clear_first":{"type":"boolean","default":false}},"required":["ref","text"],"additionalProperties":false}),
+            result_schema: reply_schema(json!({"characters_dispatched":integer_schema()}), &[]),
         },
         BrowserToolDefinition {
             name: CLICK,
@@ -5533,6 +5561,7 @@ fn journal_capability(capability: BrowserCapability) -> JournalCapability {
     match capability {
         BrowserCapability::Navigate => JournalCapability::Navigate,
         BrowserCapability::Click => JournalCapability::Click,
+        BrowserCapability::Type => JournalCapability::Type,
         BrowserCapability::ClickPoint => JournalCapability::ClickPoint,
         BrowserCapability::Snapshot => JournalCapability::Snapshot,
         BrowserCapability::Screenshot => JournalCapability::Screenshot,
@@ -6358,10 +6387,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn six_tools_have_closed_descriptors_and_browser_type_is_absent() {
+    async fn seven_tools_have_closed_descriptors_including_browser_type() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 6);
-        assert!(!tools.iter().any(|(name, _, _)| *name == "browser.type"));
+        assert_eq!(tools.len(), 7);
+        assert!(tools.iter().any(|(name, _, _)| *name == TYPE));
         assert!(tools
             .iter()
             .all(|(_, _, schema)| schema["additionalProperties"] == false));
@@ -6394,6 +6423,7 @@ mod tests {
                 BrowserCapability::Navigate
                 | BrowserCapability::Snapshot
                 | BrowserCapability::Click
+                | BrowserCapability::Type
                 | BrowserCapability::Screenshot
                 | BrowserCapability::ClickPoint
                 | BrowserCapability::WaitFor => capability,
@@ -6404,6 +6434,7 @@ mod tests {
             BrowserCapability::Navigate,
             BrowserCapability::Snapshot,
             BrowserCapability::Click,
+            BrowserCapability::Type,
             BrowserCapability::Screenshot,
             BrowserCapability::ClickPoint,
             BrowserCapability::WaitFor,
