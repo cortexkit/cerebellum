@@ -153,7 +153,7 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
     None
 }
 
-/// Whether this exact window is wholly on screen and unobstructed now.
+/// Whether this exact window is wholly on screen under the image visibility rules.
 /// The on-screen list is front-to-back; missing data never proves visibility.
 pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
     use crate::window_visibility::{visibility_from_windows, Rect, Window};
@@ -211,6 +211,14 @@ pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
             pid: identifier("kCGWindowOwnerPID"),
             bounds,
             alpha: number("kCGWindowAlpha"),
+            layer: number("kCGWindowLayer")
+                .filter(|v| {
+                    v.is_finite()
+                        && *v >= i64::MIN as f64
+                        && *v < i64::MAX as f64
+                        && v.fract() == 0.0
+                })
+                .map(|v| v as i64),
         });
     }
     let mut ids = [0u32; 32];
@@ -233,7 +241,7 @@ pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
             }
         })
         .collect::<Vec<_>>();
-    visibility_from_windows(pid, id, &entries, &displays)
+    visibility_from_windows(pid, id, &entries, &displays).0
 }
 
 #[cfg(test)]
