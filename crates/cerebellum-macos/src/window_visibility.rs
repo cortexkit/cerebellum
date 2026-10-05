@@ -64,8 +64,7 @@ pub(crate) enum VisibilityRule {
     OutsideDisplays,
     OverlappingWindow,
     HigherLayerUnionCoverage,
-    FrontmostLayerZero,
-    NoOverlap,
+    NoLayerZeroOverlap,
 }
 
 /// Remove a rectangle from a region represented by disjoint rectangles.
@@ -131,9 +130,9 @@ pub(crate) fn visibility_from_windows(
     if window.alpha == Some(0.0) {
         return (Covered, TargetTransparent);
     }
-    let Some(layer) = window.layer else {
+    if window.layer.is_none() {
         return (Unknown, MissingData);
-    };
+    }
     if displays.is_empty() || displays.iter().any(|rect| !rect.valid()) {
         return (Unknown, MissingData);
     }
@@ -162,25 +161,24 @@ pub(crate) fn visibility_from_windows(
         }
         above_windows.push((other, other_layer));
     }
-    let frontmost_layer_zero = layer == 0 && above_windows.iter().all(|(_, layer)| *layer != 0);
-    if frontmost_layer_zero {
-        // Floating bars do not imply stale pixels in the frontmost normal window.
-        // Only their union covering the entire frame withholds its image.
-        let mut remaining = vec![bounds];
-        for (other, _) in above_windows {
-            remaining = subtract(remaining, other);
-        }
-        if remaining.is_empty() {
-            return (Covered, HigherLayerUnionCoverage);
-        }
-        return (FullyVisible, FrontmostLayerZero);
-    }
-    for (other, _) in above_windows {
-        if bounds.intersection(other).is_some() {
+    for (other, layer) in &above_windows {
+        if *layer == 0 && bounds.intersection(*other).is_some() {
             return (Covered, OverlappingWindow);
         }
     }
-    (FullyVisible, NoOverlap)
+    // Occlusion, not global frontmost status, determines whether a normal window
+    // keeps drawing. Floating bars only withhold its image when their union
+    // covers the entire frame, even if another display has a normal window above.
+    let mut remaining = vec![bounds];
+    for (other, layer) in above_windows {
+        if layer != 0 {
+            remaining = subtract(remaining, other);
+        }
+    }
+    if remaining.is_empty() {
+        return (Covered, HigherLayerUnionCoverage);
+    }
+    (FullyVisible, NoLayerZeroOverlap)
 }
 
 #[cfg(test)]
@@ -212,7 +210,7 @@ mod tests {
             visibility_from_windows(7, 1, &[target()], &[rect(0.0, 100.0)]),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
         assert_eq!(
@@ -228,7 +226,7 @@ mod tests {
             visibility_from_windows(7, 1, &[target(), window(2, None)], &[rect(0.0, 100.0)]),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
         assert_eq!(
@@ -251,7 +249,7 @@ mod tests {
             visibility_from_windows(7, 1, &[target()], &[rect(0.0, 50.0), rect(50.0, 50.0)]),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
         assert_eq!(
@@ -261,7 +259,10 @@ mod tests {
                 &[window(2, Some(rect(100.0, 50.0))), target()],
                 &[rect(0.0, 100.0)]
             ),
-            (WindowVisibility::FullyVisible, VisibilityRule::NoOverlap)
+            (
+                WindowVisibility::FullyVisible,
+                VisibilityRule::NoLayerZeroOverlap
+            )
         );
     }
 
@@ -332,7 +333,7 @@ mod tests {
             ),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
     }
@@ -355,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_nonfrontmost_target_floating_overlap_covers() {
+    fn fence_other_display_layer_zero_with_floating_bar_stays_visible() {
         assert_eq!(
             visibility_from_windows(
                 7,
@@ -365,10 +366,36 @@ mod tests {
                     layered(3, 3, rect(99.0, 100.0)),
                     window(1, Some(rect(0.0, 100.0))),
                 ],
-                &[rect(0.0, 200.0)]
+                &[rect(0.0, 100.0), rect(100.0, 100.0)]
             ),
-            (WindowVisibility::Covered, VisibilityRule::OverlappingWindow)
+            (
+                WindowVisibility::FullyVisible,
+                VisibilityRule::NoLayerZeroOverlap
+            )
         );
+    }
+
+    #[test]
+    fn fence_layer_zero_overlap_with_floating_bar_covers() {
+        for pid in [7, 8] {
+            let normal = Window {
+                pid: Some(pid),
+                ..layered(2, 0, rect(99.0, 100.0))
+            };
+            assert_eq!(
+                visibility_from_windows(
+                    7,
+                    1,
+                    &[
+                        layered(3, 3, rect(99.0, 100.0)),
+                        normal,
+                        window(1, Some(rect(0.0, 100.0))),
+                    ],
+                    &[rect(0.0, 200.0)]
+                ),
+                (WindowVisibility::Covered, VisibilityRule::OverlappingWindow)
+            );
+        }
     }
 
     #[test]
@@ -449,7 +476,7 @@ mod tests {
             ),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
         let above = Window {
@@ -465,7 +492,7 @@ mod tests {
             ),
             (
                 WindowVisibility::FullyVisible,
-                VisibilityRule::FrontmostLayerZero
+                VisibilityRule::NoLayerZeroOverlap
             )
         );
     }
