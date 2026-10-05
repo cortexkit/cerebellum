@@ -73,6 +73,10 @@ fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {
     }
 
     assert!(
+        words.contains_key("responsibility_disclaim_unavailable"),
+        "the scan must cover the fail-closed macOS launch refusal"
+    );
+    assert!(
         words.len() > MINIMUM_DISTINCT_WORDS,
         "the scan found only {} distinct outcome words, so it is not reading the \
          launch path: {:?}",
