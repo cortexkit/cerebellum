@@ -1597,6 +1597,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     // before this read would inherit the launch-nonce pipe.
     launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
+    record_private_state_tightening();
     conclude(run(config, |_| {}).await)
 }
 
@@ -1775,7 +1776,6 @@ impl ModuleConfig {
 }
 
 async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleEnding {
-    record_private_state_tightening();
     // Listening starts before the connection is made, so a SIGTERM that
     // arrives while connecting is held until the module can act on it rather
     // than ending the process with no teardown.
@@ -6534,19 +6534,7 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
     send(writer, frame).await
 }
 
-/// Add the process-wide gauges to a health reply:
-///
-/// - `crashReportLeftovers: {removed, failed}`, how a person learns that a
-///   browser crash-report directory, which can hold page memory from an
-///   agent's signed-in sessions, could not be deleted where no session was
-///   there to report it;
-/// - `sigtermListener`, whether SIGTERM will run the module's teardown or
-///   just end the process (see [`sigterm_listener_state`]);
-/// - `computerGrantStore`, whether the operator's "always allow" app grants are
-///   in force, or withheld because their store could not be read.
-///
-/// All are atomics, so reading them keeps the health lane insulated, and
-/// none changes the status.
+/// Number of startup attempts to tighten private data permissions that failed.
 static PRIVATE_STATE_TIGHTEN_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -6559,6 +6547,20 @@ fn record_private_state_tightening() {
     }
 }
 
+/// Add the process-wide gauges to a health reply:
+///
+/// - `crashReportLeftovers: {removed, failed}`, counts of crash-report
+///   directories removed or left behind when no session was available to report
+///   them. These directories can contain page memory from signed-in sessions;
+/// - `privateStateTightenFailures`, the number of state directories or files
+///   whose owner-only mode could not be enforced at startup;
+/// - `sigtermListener`, whether SIGTERM will run the module's teardown or
+///   just end the process (see [`sigterm_listener_state`]);
+/// - `computerGrantStore`, whether the operator's "always allow" app grants are
+///   in force, or withheld because their store could not be read.
+///
+/// All are atomics, so reading them keeps the health lane insulated, and
+/// none changes the status.
 fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
     if let ModuleControlResponse::HealthCheck {
         metrics: Some(serde_json::Value::Object(metrics)),
