@@ -40,8 +40,8 @@ fn not_a_test() {
 
 #[cfg(test)]
 mod tests {
-    // Planes::new( in a comment is not a call.
-    const NOTE: &str = "Planes::new(";
+    // Planes::with_browser_config( in a comment is not a call.
+    const NOTE: &str = "Planes::with_browser_config(";
     /* nor JournalPersistence::Durable in a block comment */
 
     #[test]
@@ -86,11 +86,11 @@ mod split {
     fn durable() {
         let _ = Planes
             ::
-            new (health());
+            with_browser_config (health(), None);
     }
 }
 RUST
-expect "an offender split across lines in a cfg(test) module" 1 "crates/demo/src/lib.rs:27: Planes::new(" "$tree"
+expect "an offender split across lines in a cfg(test) module" 1 "crates/demo/src/lib.rs:27: Planes::with_browser_config(" "$tree"
 
 tree="$(fresh_tree out_of_line)"
 cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'
@@ -129,10 +129,21 @@ tree="$(fresh_tree for_test)"
 cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'
 
 pub fn drive_for_test() -> Planes {
-    Planes::new(health())
+    Planes::with_browser_config(health(), None)
 }
 RUST
-expect "an offender in a function named for tests" 1 "crates/demo/src/lib.rs:24: Planes::new(" "$tree"
+expect "an offender in a function named for tests" 1 "crates/demo/src/lib.rs:24: Planes::with_browser_config(" "$tree"
+
+# Planes::new journals in memory, so test code may call it.
+tree="$(fresh_tree new_is_isolated)"
+cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'
+
+#[test]
+fn uses_the_isolated_default() {
+    let _ = Planes::new(health());
+}
+RUST
+expect "Planes::new in test code passes, since it journals in memory" 0 "" "$tree"
 
 tree="$(fresh_tree call_records)"
 cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'

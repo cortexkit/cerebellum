@@ -45,8 +45,8 @@ from typing import Dict, List, Optional, Set, Tuple
 # Constructs that write to the operator's data home. Each is a token sequence,
 # `::` being two `:` tokens.
 OFFENDERS: List[Tuple[str, List[str]]] = [
-    # The plane constructors that journal durably.
-    ("Planes::new(", ["Planes", ":", ":", "new", "("]),
+    # The plane constructor that journals durably. `Planes::new` journals in
+    # memory, so it isn't listed.
     (
         "Planes::with_browser_config(",
         ["Planes", ":", ":", "with_browser_config", "("],
