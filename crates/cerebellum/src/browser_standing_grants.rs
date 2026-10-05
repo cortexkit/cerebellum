@@ -23,7 +23,7 @@
 //! standing grant and is never written over.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -449,7 +449,7 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        fs::create_dir_all(&directory).map_err(failed)?;
+        cerebellum_core::private_fs::create_dir_all(&directory).map_err(failed)?;
         let file_name = self
             .path
             .file_name()
@@ -463,10 +463,7 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
         // Written beside the target and renamed over it, so a crash mid-write
         // leaves either the old store or the new one, never half of one.
         let written = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
+            let mut file = cerebellum_core::private_fs::create_new_file(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);

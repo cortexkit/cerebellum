@@ -53,7 +53,7 @@
 //! would need a new vocabulary version.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -359,10 +359,7 @@ impl CallRecordStorage for FilesystemCallRecordStorage {
     fn append(&self, bytes: &[u8]) -> Result<(), CallRecordError> {
         self.raise_floor()?;
         let failed = |error: std::io::Error| CallRecordError::WriteFailed(error.to_string());
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .map_err(failed)?;
+        let mut file = cerebellum_core::private_fs::open_append(&self.path).map_err(failed)?;
         file.write_all(bytes).map_err(failed)?;
         file.sync_data().map_err(failed)
     }
@@ -371,7 +368,7 @@ impl CallRecordStorage for FilesystemCallRecordStorage {
         self.raise_floor()?;
         let failed = |error: std::io::Error| CallRecordError::WriteFailed(error.to_string());
         let directory = self.directory();
-        fs::create_dir_all(&directory).map_err(failed)?;
+        cerebellum_core::private_fs::create_dir_all(&directory).map_err(failed)?;
         let temporary = directory.join(format!(
             ".{CALL_RECORD_FILE}.{}.{}.tmp",
             std::process::id(),
@@ -380,10 +377,7 @@ impl CallRecordStorage for FilesystemCallRecordStorage {
         // Written beside the target and renamed over it, so a crash mid-write
         // leaves the old file or the new one, never half of one.
         let written = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
+            let mut file = cerebellum_core::private_fs::create_new_file(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);

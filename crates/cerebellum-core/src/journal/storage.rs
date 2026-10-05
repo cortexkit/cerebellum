@@ -4,7 +4,8 @@
 //! cloned bindings share durable state, while handles and tokens remain local to
 //! the binding that minted them.
 
-use std::fs::{self, File, OpenOptions};
+use crate::private_fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,17 +129,14 @@ impl FilesystemJournalStorage {
     pub fn prepare(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let storage = Self::new(path);
         let directory = storage.directory();
-        fs::create_dir_all(&directory).map_err(|source| StorageError::CreateDirectory {
+        private_fs::create_dir_all(&directory).map_err(|source| StorageError::CreateDirectory {
             path: directory.clone(),
             source: io_diagnostic(source),
         })?;
 
         let probe = unique_sibling_path(&storage.path, "probe");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)
-            .map_err(|source| StorageError::ProbeWrite {
+        let mut file =
+            private_fs::create_new_file(&probe).map_err(|source| StorageError::ProbeWrite {
                 path: probe.clone(),
                 source: io_diagnostic(source),
             })?;
@@ -424,14 +422,12 @@ impl JournalStorage for FilesystemJournalStorage {
             })?;
         let directory = self.directory();
         let temporary = unique_sibling_path(&self.path, "tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| StorageError::TemporaryWrite {
+        let mut file = private_fs::create_new_file(&temporary).map_err(|source| {
+            StorageError::TemporaryWrite {
                 path: temporary.clone(),
                 source: io_diagnostic(source),
-            })?;
+            }
+        })?;
         file.write_all(&bytes)
             .map_err(|source| StorageError::TemporaryWrite {
                 path: temporary.clone(),

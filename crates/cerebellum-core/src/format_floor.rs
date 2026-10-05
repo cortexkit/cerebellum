@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -431,19 +431,14 @@ fn raise_on_disk(path: &Path, format: DurableFormat) -> Result<(), FloorError> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&directory)
+    crate::private_fs::create_dir_all(&directory)
         .map_err(|error| io_error("create directory", &directory, error))?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| FORMAT_FLOOR_FILE.to_string());
     let lock_path = directory.join(format!(".{file_name}.lock"));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
+    let lock = crate::private_fs::open_lock(&lock_path)
         .map_err(|error| io_error("open lock", &lock_path, error))?;
     lock.lock()
         .map_err(|error| io_error("lock", &lock_path, error))?;
@@ -471,10 +466,7 @@ fn raise_on_disk(path: &Path, format: DurableFormat) -> Result<(), FloorError> {
         TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+        let mut file = crate::private_fs::create_new_file(&temporary)
             .map_err(|error| io_error("temporary write", &temporary, error))?;
         file.write_all(&bytes)
             .map_err(|error| io_error("temporary write", &temporary, error))?;

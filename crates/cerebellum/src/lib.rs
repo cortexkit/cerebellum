@@ -1597,6 +1597,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     // before this read would inherit the launch-nonce pipe.
     launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
+    record_private_state_tightening();
     conclude(run(config, |_| {}).await)
 }
 
@@ -6538,12 +6539,26 @@ pub async fn send_hello_with_browser_plane_pins_for_test(
     send(writer, frame).await
 }
 
+/// Number of startup attempts to tighten private data permissions that failed.
+static PRIVATE_STATE_TIGHTEN_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_private_state_tightening() {
+    if let Some(home) = cerebellum_core::platform_dirs::data_home() {
+        let root = home.join("cortexkit").join("cerebellum");
+        let failures = cerebellum_core::private_fs::tighten_data_tree(&root);
+        PRIVATE_STATE_TIGHTEN_FAILURES
+            .fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Add the process-wide gauges to a health reply:
 ///
-/// - `crashReportLeftovers: {removed, failed}`, how a person learns that a
-///   browser crash-report directory, which can hold page memory from an
-///   agent's signed-in sessions, could not be deleted where no session was
-///   there to report it;
+/// - `crashReportLeftovers: {removed, failed}`, counts of crash-report
+///   directories removed or left behind when no session was available to report
+///   them. These directories can contain page memory from signed-in sessions;
+/// - `privateStateTightenFailures`, the number of state directories or files
+///   whose owner-only mode could not be enforced at startup;
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
@@ -6558,6 +6573,12 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
     } = &mut report
     {
         let counts = browser_crash_reports::leftover_counts();
+        metrics.insert(
+            "privateStateTightenFailures".to_string(),
+            serde_json::Value::from(
+                PRIVATE_STATE_TIGHTEN_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),

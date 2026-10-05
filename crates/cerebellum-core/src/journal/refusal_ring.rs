@@ -5,7 +5,7 @@
 //! the caller that produced them.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::format_floor::{DurableFormat, FloorError, FormatFloor};
+use crate::private_fs;
 
 const REFUSAL_RING_SCHEMA_VERSION: u64 = 1;
 
@@ -288,13 +289,10 @@ where
 
 fn prepare_path(path: &Path) -> Result<(), RefusalRingError> {
     let directory = parent_directory(path);
-    fs::create_dir_all(&directory)
+    private_fs::create_dir_all(&directory)
         .map_err(|error| io_error("create directory", &directory, error))?;
     let probe = sibling_path(path, "probe");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
+    let mut file = private_fs::create_new_file(&probe)
         .map_err(|error| io_error("probe write", &probe, error))?;
     file.write_all(b"refusal ring storage probe")
         .map_err(|error| io_error("probe write", &probe, error))?;
@@ -347,10 +345,7 @@ where
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), RefusalRingError> {
     let directory = parent_directory(path);
     let temporary = sibling_path(path, "tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
+    let mut file = private_fs::create_new_file(&temporary)
         .map_err(|error| io_error("temporary write", &temporary, error))?;
     file.write_all(bytes)
         .map_err(|error| io_error("temporary write", &temporary, error))?;

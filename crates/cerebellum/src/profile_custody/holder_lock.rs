@@ -573,11 +573,8 @@ pub struct FilesystemProfileCustodyJournal {
 
 impl FilesystemProfileCustodyJournal {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
-        fs::create_dir_all(root.as_ref())?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.as_ref().join(JOURNAL_FILE))?;
+        cerebellum_core::private_fs::create_dir_all(root.as_ref())?;
+        let file = cerebellum_core::private_fs::open_append(&root.as_ref().join(JOURNAL_FILE))?;
         Ok(Self { file })
     }
 }
@@ -684,14 +681,9 @@ where
         liveness: P,
     ) -> Result<Self, ProfileCustodyLockError> {
         let root = managed_root.as_ref().join(LOCK_DIRECTORY);
-        fs::create_dir_all(&root)?;
+        cerebellum_core::private_fs::create_dir_all(&root)?;
         let coordination_path = root.join(COORDINATION_FILE);
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(coordination_path)?;
+        cerebellum_core::private_fs::open_lock(&coordination_path)?;
         // Chosen from where the locks live: the operator's floor for the
         // profiles under the module's data directory, none elsewhere.
         let floor = FormatFloor::governing(&root);
@@ -1019,10 +1011,7 @@ fn install_record(
 ) -> io::Result<()> {
     let temporary = root.join(format!(".install-{}.tmp", record.holder_id.as_str()));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
+        let mut file = cerebellum_core::private_fs::create_new_file(&temporary)?;
         serde_json::to_writer(&mut file, record).map_err(io::Error::other)?;
         file.sync_all()?;
         fs::hard_link(&temporary, destination)?;
@@ -1038,10 +1027,7 @@ fn replace_record(
     record: &ProfileCustodyLockRecord,
 ) -> io::Result<()> {
     let temporary = root.join(format!(".replace-{}.tmp", record.holder_id.as_str()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
+    let mut file = cerebellum_core::private_fs::create_new_file(&temporary)?;
     serde_json::to_writer(&mut file, record).map_err(io::Error::other)?;
     file.sync_all()?;
     fs::rename(&temporary, destination)?;

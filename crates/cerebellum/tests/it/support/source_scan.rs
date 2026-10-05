@@ -132,6 +132,21 @@ fn test_items(code: &[char]) -> Vec<(usize, usize)> {
     items
 }
 
+/// Shipped Rust code with comments, literals and test-only items blanked.
+/// Line breaks and character positions are preserved for structural scans.
+pub fn shipped_code(source: &str) -> String {
+    let original: Vec<char> = source.chars().collect();
+    let mut code = code_only(&original);
+    for (start, end) in test_items(&code) {
+        for character in &mut code[start..end] {
+            if *character != '\n' {
+                *character = ' ';
+            }
+        }
+    }
+    code.into_iter().collect()
+}
+
 /// The source with every comment and the contents of every string and char
 /// literal replaced by spaces, line breaks kept, so positions line up with
 /// the original. Structure (attributes, brackets) is read from this view only.
