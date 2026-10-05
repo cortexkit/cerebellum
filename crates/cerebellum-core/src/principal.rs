@@ -69,9 +69,12 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// facade only fronts remote-model calls, so it does not need these capabilities;
 /// keeping it outside this list preserves it as the boundary around those calls.
 ///
-/// Add a new id here before a module starts using it. When a module is renamed,
-/// carry both its old and new ids during the transition so neither registration
-/// loses access.
+/// Add a new id here before a module starts using it. The daemon refuses a
+/// duplicate active id, so a rename has no window in which both names resolve:
+/// the moment a module registers under a new id that this list doesn't name, it
+/// loses access, and the failure shows up here as a permission refusal rather
+/// than as a rename. Carry both the old and new ids across a rename, and drop
+/// the old one only once no module registers under it.
 pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] =
     &["prefrontal-core", "prefrontal-routing", "aft", "broca"];
 
