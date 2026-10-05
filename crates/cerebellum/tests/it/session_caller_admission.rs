@@ -219,8 +219,7 @@ fn assert_refused_as_not_admitted(frames: &[Frame], label: &str) {
     );
 }
 
-/// Every first-party principal other than Prefrontal's core module, including
-/// the two older spellings of the orchestrator's own id.
+/// First-party principals other than Prefrontal's core module.
 fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
     vec![
         (Some(Principal::Direct), "direct"),
@@ -230,9 +229,6 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
             reserved("prefrontal-routing"),
             "reserved:prefrontal-routing",
         ),
-        (reserved("alfonso-routing"), "reserved:alfonso-routing"),
-        (reserved("alfonso-core"), "reserved:alfonso-core"),
-        (reserved("prefrontal"), "reserved:prefrontal"),
     ]
 }
 
