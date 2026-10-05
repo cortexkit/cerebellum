@@ -49,13 +49,13 @@ fn has_browser_type(manifest: &ModuleManifest) -> bool {
 
 #[test]
 fn advertisement_suppressed_when_a_gate_fails() {
-    // Fully supplied legacy release evidence advertises the working type route.
+    // With every release input supplied, the checks pass and typing is advertised.
     assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
     assert!(has_browser_type(&build_with_unfenceable_evidence(
         &valid_inputs()
     )));
 
-    // Omitting a required B1 pin or journal bound fails gate evaluation.
+    // Omitting the browser-plane conformance pin (`b1_pin`) fails the checks.
     let mut no_pin = valid_inputs();
     no_pin.b1_pin = None;
     assert!(!evaluate_unfenceable_gates(&no_pin).passed());

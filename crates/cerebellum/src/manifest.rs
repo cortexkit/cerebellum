@@ -712,8 +712,8 @@ pub fn evaluate_unfenceable_gates(inputs: &UnfenceableReleaseInputs) -> ReleaseR
     ReleaseReport { outcomes }
 }
 
-/// Build the manifest with optional release evidence. Production browser typing
-/// is advertised through the same dispatchable catalogue as other browser tools.
+/// Build the manifest, adding the granular `browser.type` tool only when every
+/// release check passes and the browser plane has a wire route that serves it.
 pub fn build_with_unfenceable_evidence(inputs: &UnfenceableReleaseInputs) -> ModuleManifest {
     let mut manifest = build("cerebellum");
     if !evaluate_unfenceable_gates(inputs).passed() {
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn unfenceable_advertisement_requires_every_gate_to_pass() {
-        // Gate evaluation checks release evidence separately from the manifest builder.
+        // The release checks pass on their own, and the builder then advertises typing.
         assert!(evaluate_unfenceable_gates(&valid_inputs()).passed());
         assert!(has_browser_type(&build_with_unfenceable_evidence(
             &valid_inputs()

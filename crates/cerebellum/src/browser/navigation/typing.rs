@@ -38,9 +38,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         };
         let mut request = BrowserTypeRequest::new("ref", "snapshot", text);
         request.replace = clear_first;
-        // BrowserPlane has authorized and journaled this dispatch. These local
-        // adapters let the executor check the target again before and after
-        // focus without duplicating durable records or storing typed text.
+        // The caller authorized and journaled this dispatch before it reached
+        // the driver. The executor runs here only to re-check the target
+        // before and after focus, so it gets throwaway in-memory journal and
+        // authorizer stand-ins: no second journal record, no stored text.
         Ok(BrowserTypeExecutor::execute(
             &mut adapter,
             &mut RecordingJournal::default(),
