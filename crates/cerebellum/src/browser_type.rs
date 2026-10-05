@@ -63,30 +63,16 @@ pub struct FormDescendantClassification {
 impl FormDescendantClassification {
     fn credential(&self) -> bool {
         self.password
-            || self.autocomplete_tokens.iter().any(|token| {
-                matches!(
-                    token.as_str(),
-                    "current-password" | "new-password" | "one-time-code"
-                )
-            })
+            || self
+                .autocomplete_tokens
+                .iter()
+                .any(|token| crate::classification::credential_token(token))
     }
 
     fn financial(&self) -> bool {
-        self.autocomplete_tokens.iter().any(|token| {
-            matches!(
-                token.as_str(),
-                "cc-name"
-                    | "cc-given-name"
-                    | "cc-additional-name"
-                    | "cc-family-name"
-                    | "cc-number"
-                    | "cc-exp"
-                    | "cc-exp-month"
-                    | "cc-exp-year"
-                    | "cc-csc"
-                    | "cc-type"
-            )
-        })
+        self.autocomplete_tokens
+            .iter()
+            .any(|token| crate::classification::financial_token(token))
     }
 }
 
@@ -129,6 +115,51 @@ pub struct TypeTarget {
 }
 
 impl TypeTarget {
+    /// Copy frame-scoped DOM facts into an adapter's eligibility and geometry
+    /// observation. The identity also binds the frame's session and loader, so
+    /// the executor's final observation cannot adopt a replacement document.
+    pub fn apply_snapshot_ref(
+        &mut self,
+        reference: &crate::snapshot_store::RefRecord,
+    ) -> Result<(), crate::classification::ClassificationUnavailable> {
+        let record = reference.classification.as_ref().map_err(Clone::clone)?;
+        let frame = reference
+            .frame_document
+            .as_ref()
+            .ok_or(crate::classification::ClassificationUnavailable::NotCaptured)?;
+        let identity = serde_json::json!([
+            record.node_identity,
+            frame.frame_id,
+            frame.session_id,
+            frame.loader_id,
+            frame.url,
+            frame.origin,
+            frame.navigation_revision
+        ]);
+        self.node_identity =
+            Sha256::digest(serde_json::to_vec(&identity).expect("frame identity is serializable"))
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+        self.document_epoch = record.document_epoch;
+        self.form_owner = record.form_owner.clone();
+        self.autocomplete_tokens = record.target_autocomplete_tokens.clone();
+        self.password =
+            record.target_password || record.effective_input_type.as_deref() == Some("password");
+        self.form_descendants = record
+            .associated_form_controls
+            .iter()
+            .map(|node| FormDescendantClassification {
+                node_identity: node.node_identity.clone(),
+                form_owner: self.form_owner.clone(),
+                disabled: false,
+                autocomplete_tokens: node.autocomplete_tokens.clone(),
+                password: node.password,
+            })
+            .collect();
+        Ok(())
+    }
+
     /// Derive the single eligibility predicate set used at all browser.type
     /// boundaries.
     pub fn eligibility_predicates(&self) -> EligibilityPredicates {
@@ -164,28 +195,16 @@ impl TypeTarget {
             .filter(|node| node.form_owner == self.form_owner)
             .any(FormDescendantClassification::financial);
         let credential = self.password
-            || self.autocomplete_tokens.iter().any(|token| {
-                matches!(
-                    token.as_str(),
-                    "current-password" | "new-password" | "one-time-code"
-                )
-            })
+            || self
+                .autocomplete_tokens
+                .iter()
+                .any(|token| crate::classification::credential_token(token))
             || descendant_credential;
-        let financial = self.autocomplete_tokens.iter().any(|token| {
-            matches!(
-                token.as_str(),
-                "cc-name"
-                    | "cc-given-name"
-                    | "cc-additional-name"
-                    | "cc-family-name"
-                    | "cc-number"
-                    | "cc-exp"
-                    | "cc-exp-month"
-                    | "cc-exp-year"
-                    | "cc-csc"
-                    | "cc-type"
-            )
-        }) || descendant_financial;
+        let financial = self
+            .autocomplete_tokens
+            .iter()
+            .any(|token| crate::classification::financial_token(token))
+            || descendant_financial;
 
         ClassificationRecord {
             node_identity: self.node_identity.clone(),
@@ -1262,5 +1281,60 @@ mod tests {
         assert_eq!(result, BrowserTypeResult::Ok);
         assert_eq!(authorizer.calls, 1);
         assert!(fixture.inserted());
+    }
+    use crate::browser::navigation::classify_flattened_document;
+    use crate::snapshot_store::{BackendNodeIdentity, FrameDocument, RefRecord, SnapshotRef};
+
+    #[test]
+    fn frame_card_and_password_targets_use_shared_projection_before_type_authorization() {
+        for token in ["cc-number", "current-password"] {
+            let identity = BackendNodeIdentity::new("page", "payment-frame", 2).unwrap();
+            let document = json!({"nodes":[{"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"#document"},{"nodeId":2,"backendNodeId":2,"nodeType":1,"localName":"input","parentId":1,"attributes":["autocomplete",token]}]});
+            let record = classify_flattened_document(
+                document.as_object().unwrap(),
+                &identity,
+                7,
+                "http://localhost:9001/payment",
+            )
+            .unwrap();
+            let reference = RefRecord {
+                captured: SnapshotRef::new("e1", "textbox", "Card number", 0).unwrap(),
+                frame_path: vec!["payment-frame".into()],
+                backend_identity: Some(identity),
+                raw_role: None,
+                raw_name: None,
+                classification: Ok(Box::new(record)),
+                frame_document: Some(FrameDocument {
+                    navigation_revision: 0,
+                    frame_id: "payment-frame".into(),
+                    parent_id: Some("main".into()),
+                    session_id: "payment-session".into(),
+                    loader_id: "loader".into(),
+                    url: "http://localhost:9001/payment".into(),
+                    origin: "http://localhost:9001".into(),
+                }),
+            };
+            let mut target = target();
+            target.apply_snapshot_ref(&reference).unwrap();
+            let mut fixture = DeterministicTypeFixture::new(target.clone());
+            let mut journal = RecordingJournal::default();
+            let mut authorizer = RecordingAuthorizer::allowing();
+            let result = BrowserTypeExecutor::execute(
+                &mut fixture,
+                &mut journal,
+                &mut authorizer,
+                &target,
+                &request(false),
+            );
+            assert_eq!(
+                result,
+                BrowserTypeResult::InvalidRequest {
+                    field: "text".into(),
+                    reason_code: "credential_input_unsupported".into()
+                }
+            );
+            assert_eq!(authorizer.calls, 0);
+            assert!(!fixture.inserted());
+        }
     }
 }

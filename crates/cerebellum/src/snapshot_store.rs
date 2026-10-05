@@ -128,8 +128,22 @@ impl BackendNodeIdentity {
     }
 }
 
+/// Browser-reported identity of one frame document. Session changes invalidate
+/// refs even when Chrome retains a frame id across a renderer replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameDocument {
+    pub navigation_revision: u64,
+    pub frame_id: String,
+    pub parent_id: Option<String>,
+    pub session_id: String,
+    pub loader_id: String,
+    pub url: String,
+    pub origin: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefRecord {
+    pub frame_document: Option<FrameDocument>,
     pub captured: SnapshotRef,
     pub frame_path: Vec<String>,
     pub backend_identity: Option<BackendNodeIdentity>,
@@ -900,6 +914,7 @@ mod tests {
                 truncated: false,
                 refs_truncated: false,
                 refs: vec![RefRecord {
+                    frame_document: None,
                     captured: reference,
                     frame_path: vec![],
                     backend_identity: None,

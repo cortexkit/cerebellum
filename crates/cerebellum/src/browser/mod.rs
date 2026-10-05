@@ -303,7 +303,9 @@ impl BrowserError {
             Self::RefAmbiguous { .. } => {
                 "take a fresh browser.snapshot and choose a ref that identifies exactly one current element"
             }
-            Self::ClassificationUnavailable(_) => "take a fresh snapshot and click the enclosing element's ref instead",
+            Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::TargetNotInDocument { .. }) => "the hit node is outside the classified document; take a fresh frame-aware snapshot; if its frame remains unavailable, report the missing frame classification cause",
+            Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::NotCaptured) => "take a new snapshot to capture target classification before clicking",
+            Self::ClassificationUnavailable(_) => "the browser could not supply complete DOM classification; retry a fresh snapshot after the page finishes loading; if it persists, report the named classification cause",
             Self::ElementIntercepted | Self::Intercepted(_) => {
                 "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position"
             }
@@ -1247,7 +1249,10 @@ fn zoom_target(
         Some(record) => {
             let identity = record.backend_identity.as_ref()?;
             refs.iter()
-                .find(|fresh| fresh.backend_identity.as_ref() == Some(identity))
+                .find(|fresh| {
+                    fresh.backend_identity.as_ref() == Some(identity)
+                        && fresh.frame_document == record.frame_document
+                })
                 .map(|fresh| fresh.captured.reference.clone())
         }
         None => records
@@ -2716,6 +2721,54 @@ impl BrowserPlane {
             .await?;
         self.authorize_read(identity, BrowserCapability::Snapshot, &source_document.url)
             .await?;
+        let route = identity.conversation_key.clone();
+        let (operation, frames) = tokio::task::spawn_blocking(move || {
+            let frames = session_operation.frame_documents(&route, deadline_ms);
+            (session_operation, frames)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        session_operation = operation;
+        let frames = frames.map_err(map_navigation_drive_error)?;
+        let zoom_frame = if let Some(requested) = zoom {
+            let state = self.state.lock().await;
+            state
+                .contexts
+                .get(&identity.conversation_key)
+                .and_then(|context| {
+                    context
+                        .last_text_snapshot
+                        .as_ref()
+                        .and_then(|id| context.snapshots.get(id))
+                        .and_then(|snapshot| match snapshot {
+                            StoredSnapshot::Text(snapshot) => snapshot
+                                .refs
+                                .iter()
+                                .find(|reference| reference.captured.reference == requested)
+                                .and_then(|reference| reference.frame_document.clone()),
+                            _ => None,
+                        })
+                })
+        } else {
+            None
+        };
+        if zoom_frame
+            .as_ref()
+            .is_some_and(|frame| !frames.contains(frame))
+        {
+            return Err(BrowserError::StaleSnapshot {
+                reason_code: "frame_document_changed",
+            });
+        }
+        // The top document's read grant covers its embedded documents, including
+        // opaque frames. Frame-origin grants remain mandatory for actions.
+        if !frames.is_empty() {
+            session_operation
+                .set_read_frames(frames.clone())
+                .map_err(map_navigation_drive_error)?;
+        }
         self.reserve_journal(identity, BrowserCapability::Snapshot, persist_journal)
             .await?;
         self.commit(identity, BrowserCapability::Snapshot).await?;
@@ -2771,7 +2824,23 @@ impl BrowserPlane {
                     )
                     .await?;
                 }
-                return Err(map_navigation_drive_error(error));
+                let error = map_navigation_drive_error(error);
+                if let BrowserError::PageNavigatedDuringRead { live_origin, .. } = &error {
+                    self.record_snapshot_refusal(
+                        identity,
+                        live_origin,
+                        SnapshotRefusalReason::PageNavigatedDuringRead,
+                    )
+                    .await?;
+                    self.finalize(
+                        identity,
+                        BrowserCapability::Snapshot,
+                        Outcome::Denied,
+                        error.detail().unwrap_or(Value::Null),
+                    )
+                    .await?;
+                }
+                return Err(error);
             }
         };
         self.confirm_read_document(
@@ -3182,7 +3251,14 @@ impl BrowserPlane {
         // target's required severity is computed; refusing there lets the
         // refusal carry that exact value instead of a second estimate.
         let requested_severity = parse_severity(object)?;
-        let (backend_identity, classification, document_epoch, source_origin, source_document) = {
+        let (
+            backend_identity,
+            classification,
+            document_epoch,
+            source_origin,
+            source_document,
+            frame_document,
+        ) = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -3213,8 +3289,13 @@ impl BrowserPlane {
                 backend_identity,
                 record.classification.clone().map(|record| *record),
                 snapshot.document_epoch,
-                snapshot.source_origin.clone(),
+                record
+                    .frame_document
+                    .as_ref()
+                    .map(|frame| frame.origin.clone())
+                    .unwrap_or_else(|| snapshot.source_origin.clone()),
                 snapshot.source_document.clone(),
+                record.frame_document.clone(),
             )
         };
 
@@ -3334,6 +3415,19 @@ impl BrowserPlane {
             let live = session_operation.committed_document(&route_key, deadline_ms);
             if let Err(error) = check_snapshot_document(source_document.as_ref(), live) {
                 return (session_operation, Err(error));
+            }
+            if let Some(frame) = &frame_document {
+                match session_operation.prepare_frame(&route_key, frame, deadline_ms) {
+                    Ok(true) => {}
+                    _ => {
+                        return (
+                            session_operation,
+                            Err(BrowserError::StaleSnapshot {
+                                reason_code: "frame_document_changed",
+                            }),
+                        )
+                    }
+                }
             }
             let result = session_operation.click_classified(
                 &route_key,
@@ -3463,6 +3557,18 @@ impl BrowserPlane {
             &source_document.url,
         )
         .await?;
+        let route = identity.conversation_key.clone();
+        let (operation, frames) = tokio::task::spawn_blocking(move || {
+            let frames = session_operation.frame_documents(&route, deadline_ms);
+            (session_operation, frames)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        session_operation = operation;
+        let frames = frames.map_err(map_navigation_drive_error)?;
+        let captured_frames = frames.clone();
         self.reserve_journal(identity, BrowserCapability::Screenshot, true)
             .await?;
         self.commit(identity, BrowserCapability::Screenshot).await?;
@@ -3519,6 +3625,7 @@ impl BrowserPlane {
                 observation.after,
                 observation.invalidation_observed,
                 Some(source_document),
+                captured_frames,
             )
             .await?;
         self.finalize(
@@ -3575,7 +3682,7 @@ impl BrowserPlane {
         // As in `click`: authorization enforces the floor and reports the
         // severity it computed for this action.
         let requested_severity = parse_severity(object)?;
-        let (position, source_origin, source_document, document_epoch) = {
+        let (position, source_origin, source_document, document_epoch, screenshot_frames) = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
@@ -3635,6 +3742,7 @@ impl BrowserPlane {
                 screenshot.source_origin,
                 screenshot.source_document,
                 screenshot.document_epoch,
+                screenshot.frame_documents,
             )
         };
 
@@ -3678,15 +3786,24 @@ impl BrowserPlane {
         let observed = tokio::task::spawn_blocking(move || {
             let live = session_operation.committed_document(&route_key, deadline_ms);
             let result = check_snapshot_document(source_document.as_ref(), live).and_then(|_| {
+                let live_frames = session_operation
+                    .frame_documents(&route_key, deadline_ms)
+                    .map_err(map_navigation_drive_error)?;
+                if !screenshot_frames.is_empty() && live_frames != screenshot_frames {
+                    return Err(BrowserError::StaleSnapshot {
+                        reason_code: "frame_document_changed",
+                    });
+                }
                 session_operation
                     .classify_point(&route_key, position, document_epoch, &origin, deadline_ms)
                     .map_err(map_navigation_drive_error)?
                     .map_err(BrowserError::ClassificationUnavailable)
             });
-            (session_operation, result, source_document)
+            let frame = session_operation.point_frame_document();
+            (session_operation, result, source_document, frame)
         })
         .await;
-        let (operation, classification, source_document) = match observed {
+        let (operation, classification, source_document, frame_document) = match observed {
             Ok(value) => value,
             Err(_) => {
                 self.unpin_snapshot(identity, snapshot_id).await;
@@ -3696,6 +3813,11 @@ impl BrowserPlane {
             }
         };
         session_operation = operation;
+        let frame_document = frame_document.map_err(map_navigation_drive_error)?;
+        let source_origin = frame_document
+            .as_ref()
+            .map(|frame| frame.origin.clone())
+            .unwrap_or(source_origin);
         let classification = match classification {
             Ok(record) => record,
             Err(error) => {
@@ -3747,6 +3869,19 @@ impl BrowserPlane {
             let live = session_operation.committed_document(&route_key, deadline_ms);
             if let Err(error) = check_snapshot_document(source_document.as_ref(), live) {
                 return (session_operation, Err(error));
+            }
+            if let Some(frame) = &frame_document {
+                match session_operation.prepare_frame(&route_key, frame, deadline_ms) {
+                    Ok(true) => {}
+                    _ => {
+                        return (
+                            session_operation,
+                            Err(BrowserError::StaleSnapshot {
+                                reason_code: "frame_document_changed",
+                            }),
+                        )
+                    }
+                }
             }
             let result = session_operation.click_point_classified(
                 &route_key,
@@ -3882,10 +4017,12 @@ impl BrowserPlane {
             after,
             invalidation_observed,
             source_document,
+            Vec::new(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn retain_screenshot_inner(
         &self,
         identity: &RouteIdentity,
@@ -3897,6 +4034,7 @@ impl BrowserPlane {
         // the source. `None` falls back to the tracked page, as for text
         // snapshots.
         source_document: Option<CommittedDocument>,
+        frame_documents: Vec<crate::snapshot_store::FrameDocument>,
     ) -> Result<Value, BrowserError> {
         let coherent = capture_screenshot(before, payload, after, invalidation_observed)
             .map_err(map_coordinate_error)?;
@@ -3918,6 +4056,7 @@ impl BrowserPlane {
             });
         let mut snapshot = coherent.into_snapshot(id.clone(), source_origin);
         snapshot.source_document = source_document;
+        snapshot.frame_documents = frame_documents;
         let result = json!({"outcome":"ok","snapshot_id":snapshot.snapshot_id,"document_epoch":snapshot.document_epoch,"source_origin":snapshot.source_origin,"image":{"mime":"image/png","data_b64":snapshot.image_png_b64,"width_px":snapshot.image_width_px,"height_px":snapshot.image_height_px},"image_width_px":snapshot.image_width_px,"image_height_px":snapshot.image_height_px,"input_rect":{"x_input_css":snapshot.input_rect.x_input_css,"y_input_css":snapshot.input_rect.y_input_css,"width_input_css":snapshot.input_rect.width_input_css,"height_input_css":snapshot.input_rect.height_input_css},"device_scale_factor":snapshot.device_scale_factor,"visual_viewport_scale":snapshot.visual_viewport_scale});
         context
             .snapshots
@@ -5407,6 +5546,13 @@ fn map_journal_error(error: JournalError) -> BrowserError {
 
 fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveError) -> BrowserError {
     match error {
+        crate::browser_session::NavigationDriveError::FrameChanged {
+            authorized_origin,
+            live_origin,
+        } => BrowserError::PageNavigatedDuringRead {
+            authorized_origin,
+            live_origin,
+        },
         crate::browser_session::NavigationDriveError::NavigationFailed { error_text } => {
             BrowserError::NavigationFailed { error_text }
         }
@@ -5482,6 +5628,7 @@ mod tests {
     #[test]
     fn a_zoom_follows_its_element_when_the_page_renumbers() {
         let record = |reference: &str, backend: u64| crate::snapshot_store::RefRecord {
+            frame_document: None,
             captured: crate::snapshot_store::SnapshotRef::new(reference, "article", "Post", 0)
                 .unwrap(),
             frame_path: vec!["frame".into()],
@@ -5555,6 +5702,7 @@ mod tests {
         let refs: Vec<_> = records
             .iter()
             .map(|r| crate::snapshot_store::RefRecord {
+                frame_document: None,
                 captured: crate::snapshot_store::SnapshotRef::new(
                     r.reference.clone().unwrap(),
                     &r.role,
