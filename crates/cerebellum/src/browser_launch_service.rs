@@ -2962,7 +2962,9 @@ mod executable_identity_launch_tests {
 
     #[test]
     fn flow_profile_holder_names_flow_and_head_in_both_directions() {
-        let vector: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/flow-browser-profile.json")).unwrap();
+        let vector: cortexkit_resource_busy::ResourceBusy =
+            serde_json::from_str(include_str!("../tests/vectors/flow-browser-profile.json"))
+                .unwrap();
         vector.validate().unwrap();
         for flow_holds in [true, false] {
             let service = ProductionLaunchService::open(

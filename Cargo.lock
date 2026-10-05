@@ -164,6 +164,7 @@ checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 [[package]]
 name = "cortexkit-resource-busy"
 version = "0.1.0"
+source = "git+https://github.com/cortexkit/commons?rev=067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7#067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7"
 dependencies = [
  "serde",
 ]
@@ -184,6 +185,8 @@ dependencies = [
 [[package]]
 name = "cortexkit-store-types"
 version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
 ]
@@ -790,6 +793,8 @@ dependencies = [
 [[package]]
 name = "subc-jsonc"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34bce1b750055f70b5eb2d64088f577812c618f0b0ac9fab1b2f10a84a9522f4"
 dependencies = [
  "serde_json",
 ]
@@ -797,6 +802,8 @@ dependencies = [
 [[package]]
 name = "subc-os"
 version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5e60f23e1c51148c8a0db750481a5659726583bd05bff5bdd3b97cee4b59c6a"
 dependencies = [
  "libc",
  "rustix",
@@ -805,6 +812,8 @@ dependencies = [
 [[package]]
 name = "subc-protocol"
 version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bcb6c2bd02e6ab43479ae87791eb3cd5eb98d9a23ef8e12f1077248fd480a85"
 dependencies = [
  "serde",
  "serde_json",
@@ -813,6 +822,8 @@ dependencies = [
 [[package]]
 name = "subc-transport"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edb5dfb8ff70b1f585c2d13337dbabab75a06a20531eedfba31ceee3a565047"
 dependencies = [
  "getrandom",
  "hmac",

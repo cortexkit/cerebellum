@@ -139,180 +139,13 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
-# The remote-tracking ref to compare against, or the sibling's own HEAD when
-# there is none. An offline or remoteless checkout must not fail this phase for
-# a reason that has nothing to do with the pins: with no upstream to read, the
-# published question is unanswerable rather than answered no.
-sibling_published_ref() {
-  local sibling="$1" upstream
-  upstream="$(git -C "$sibling" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-  if [ -n "$upstream" ] && git -C "$sibling" rev-parse --verify --quiet "$upstream" >/dev/null; then
-    printf '%s' "$upstream"
-  else
-    printf 'HEAD'
-  fi
-}
-
-# Phase 0a: refuse if Cargo.lock already differs from HEAD before any cargo
-# command in this gate runs, and say which of the two states it is.
-#
-# Both states end in a CI red if the gate proceeds, which is why this refuses
-# rather than notes. Measured against this repo's history: eleven commits carry
-# a subc version bump under a message about something else, every one the same
-# mechanism (an unflagged cargo run rewrote the lock, `git add -A` took it).
-# The later check that the build rewrote no generated file cannot see those: it
-# compares the tree before the BUILD to after, and a lock rewritten by an
-# earlier cargo run is already in the "before", so it reads as pre-existing work
-# in progress and is ignored by design. That is how a stale lock reached CI on
-# 2026-09-19 and was refused there instead, a whole round trip later. Only a comparison against HEAD is anchored to something the
-# operator decided. Every cargo command below carries --locked, so this gate
-# itself is a reader; the rewrite, if any, happened before it started.
-#
-# The states need opposite remedies, and the discriminator is the one the
-# sibling-pin check below also applies: whether the sibling version the lock now
-# names is PUBLISHED. Published means the bump is real and committing the absorb
-# is the only correct outcome. Unpublished means the producer's working tree is
-# ahead of what any consumer can fetch, so the lock must be restored and the
-# producer told -- committing it would pin a version CI cannot resolve.
-check_lock_matches_head() {
-  local drift
-  drift="$(git diff --stat HEAD -- Cargo.lock 2>/dev/null)"
-  [ -n "$drift" ] || return 0
-  echo "    Cargo.lock differs from HEAD before this gate ran anything:" >&2
-  local unpublished=0 name version published
-  # A package's name is read from context lines AND added lines. A moved
-  # version sits under an unchanged `name` line, but a package new to the lock
-  # arrives as `+name` followed by `+version`, and reading names from context
-  # alone attributed the new package's version to whichever package the diff
-  # showed last -- then told the operator to `cargo update` the wrong crate.
-  while read -r name version; do
-    [ -n "$name" ] || continue
-    published="$(sibling_version "$name" published)"
-    local worktree
-    worktree="$(sibling_version "$name" worktree)"
-    if [ "$published" = not-a-path-dep ]; then
-      echo "      $name $version -- registry crate; commit or restore it" >&2
-      echo "        deliberately, never inside a commit about something else." >&2
-    elif [ "$version" = "$published" ]; then
-      echo "      $name $version -- PUBLISHED; commit this absorb as its own" >&2
-      echo "        lock change (git add Cargo.lock by path), then re-run." >&2
-    elif [ "$version" = "$worktree" ]; then
-      echo "      $name $version -- UNPUBLISHED: the sibling's working tree" >&2
-      echo "        has it, the published sibling has $published. Restore" >&2
-      echo "        the lock and tell the producer; committing this pins a" >&2
-      echo "        version CI cannot fetch." >&2
-      unpublished=1
-    else
-      echo "      $name $version -- STALE: the sibling publishes $published and" >&2
-      echo "        its working tree has $worktree. Run cargo update -p $name" >&2
-      echo "        and commit the absorb." >&2
-    fi
-  done <<EOF
-$(git diff HEAD -- Cargo.lock | awk '/^[ +]name = /{gsub(/"/,"",$3); n=$3} /^\+version/{gsub(/"/,"",$3); if (n != "") print n, $3}')
-EOF
-  if [ "$unpublished" -eq 1 ]; then
-    echo "    Refusing: at least one moved version is not published." >&2
-  else
-    echo "    Refusing: a lock change must be a commit, not a working-tree state." >&2
-  fi
-  return 1
-}
-
-# The version a sibling PUBLISHES for a crate, or `not-a-path-dep` when no
-# sibling owns it. Read from the sibling's upstream ref rather than its working
-# tree, because the working tree is exactly what cannot be trusted here.
-sibling_version() {
-  local crate="$1" mode="$2" sibling ref
-  for sibling in "$(dirname "$0")/../../subconscious" "$(dirname "$0")/../../commons"; do
-    [ -d "$sibling" ] || continue
-    git -C "$sibling" cat-file -e "HEAD:crates/$crate/Cargo.toml" 2>/dev/null || continue
-    if [ "$mode" = published ]; then
-      ref="$(sibling_published_ref "$sibling")"
-    else
-      ref=HEAD
-    fi
-    git -C "$sibling" show "$ref:crates/$crate/Cargo.toml" 2>/dev/null \
-      | awk -F'"' '/^version/ { print $2; exit }'
-    return 0
-  done
-  printf 'not-a-path-dep'
-}
-
-run_phase "the committed Cargo.lock is the one on disk" \
-  check_lock_matches_head
-
-# Phase 0b: refuse to certify against a sibling that is not the one this commit
-# declares. The workspace takes subc-* by PATH, so the crates compiled here come
-# from whatever ../subconscious currently holds -- and if that disagrees with the
-# committed Cargo.lock, cargo silently RESOLVES rather than failing: it rewrites
-# the lock to match what the sibling supplies and carries on.
-#
-# The rewrite can PRUNE as easily as it can bump. A contributor whose sibling was
-# behind saw entries removed (ahash, base64, cc) and got a full green run with an
-# identical test count -- a true number obtained against a downgraded dependency
-# graph. That is the shape worth refusing: an alarming rewrite gets investigated,
-# a pruning one reads as tidying.
-#
-# Checked against the same content-addressed subtree hashes scripts/release-build.sh
-# pins, so a gate run and a release build cannot disagree about which sibling is
-# the right one.
-check_sibling_matches_declaration() {
-  local drift=0
-  check_one_sibling subconscious "$(dirname "$0")/../subconscious-source.txt" || drift=1
-  check_one_sibling commons "$(dirname "$0")/../commons-source.txt" || drift=1
-  if [ "$drift" -ne 0 ]; then
-    echo "    move the sibling to the declared revisions, or repin its" >&2
-    echo "    *-source.txt if the move is intended. Building against a" >&2
-    echo "    different sibling silently rewrites Cargo.lock and reports a" >&2
-    echo "    true test count for a dependency graph nobody chose." >&2
-    return 1
-  fi
-}
-
-# One sibling, one declaration file. Same format for every sibling so a new
-# one is a line in the caller above, never a second copy of this loop.
-#
-# The pin is compared against the sibling's PUBLISHED head as well as its
-# working tree, because those answer different questions and only one of them
-# is what CI will clone. A subtree that exists only in the producer's working
-# tree passes a HEAD comparison and fails on the runner, and the failure that
-# arrives there is `generated files untouched by the build` -- a message about
-# our own lock being rewritten, naming nothing about the sibling. That cost two
-# separate investigations on 2026-09-19, one here and one at the producer, for
-# a bump held unpushed for about an hour.
-#
-# So the two mismatches get different words, because the remedy differs: a pin
-# matching an unpushed subtree means WAIT for the producer to push (repinning
-# would pin content no consumer can fetch), while matching neither means repin.
-check_one_sibling() {
-  local name="$1" declaration="$2" sibling drift=0
-  sibling="$(dirname "$0")/../../$name"
-  [ -f "$declaration" ] || { echo "    no $name declaration to check against" >&2; return 1; }
-  [ -d "$sibling" ] || { echo "    sibling checkout missing at $sibling" >&2; return 1; }
-  local upstream
-  upstream="$(sibling_published_ref "$sibling")"
-  while read -r declared crate; do
-    case "$declared" in ""|\#*) continue ;; esac
-    [ -z "$crate" ] && continue
-    local actual published
-    actual="$(git -C "$sibling" rev-parse "HEAD:crates/$crate" 2>/dev/null || echo missing)"
-    published="$(git -C "$sibling" rev-parse "$upstream:crates/$crate" 2>/dev/null || echo unknown)"
-    if [ "$actual" != "$declared" ]; then
-      echo "    $name/$crate: declared $declared, sibling has $actual" >&2
-      drift=1
-    elif [ "$published" != "$declared" ] && [ "$published" != unknown ]; then
-      echo "    $name/$crate: declared $declared matches the sibling's working tree" >&2
-      echo "      but $upstream has $published -- the subtree is UNPUSHED, so CI" >&2
-      echo "      cannot fetch what this pin names. Wait for the producer to push;" >&2
-      echo "      do not repin." >&2
-      drift=1
-    fi
-  done < "$declaration"
-  return "$drift"
-}
-
-run_phase "sibling matches the declared revisions" \
-  check_sibling_matches_declaration
+# Registry checksums and git revisions in Cargo.lock replace sibling source pins.
+# Check every manifest, including target-specific and test dependencies, before
+# Cargo runs so an external checkout can never become an implicit build input.
+run_phase "path dependency guard planted-violation self-tests" \
+  scripts/check-repo-path-deps.sh --self-test
+run_phase "repository-contained path dependencies" \
+  scripts/check-repo-path-deps.sh
 
 # Phase 0c: no test may build a plane that journals to the operator's disk.
 #
@@ -366,19 +199,11 @@ check_tests_do_not_journal_durably() {
 run_phase "no test journals to the operator's disk" \
   check_tests_do_not_journal_durably
 
-# Phase 1: formatting check, over THIS workspace's members only.
-#
-# Not `--all`: cargo fmt's --all follows path dependencies out of the
-# workspace, so it reaches every crate in ../subconscious and ../commons.
-# Measured here: `cargo fmt --all -- --check -v` listed both siblings' crates.
-# As a check that makes this gate fail on a sibling's formatting; as a write
-# (`cargo fmt --all` before a commit) it rewrites files in another
-# repository's checkout. The member list comes from cargo metadata rather
-# than a hand-kept string, and an empty list refuses rather than checking
-# nothing and passing.
+# Phase 1: format workspace members. Keep the scope explicit so only this
+# repository's source is checked, and refuse an empty member list.
 check_members_formatted() {
   local members
-  members="$(cargo metadata --format-version 1 --no-deps \
+  members="$(cargo metadata --locked --format-version 1 --no-deps \
     | python3 -c 'import json,sys; print(" ".join("-p " + p["name"] for p in json.load(sys.stdin)["packages"]))')"
   if [ -z "$members" ]; then
     echo "    cargo metadata listed no workspace members; refusing to check nothing" >&2
@@ -387,7 +212,7 @@ check_members_formatted() {
   # shellcheck disable=SC2086
   cargo fmt $members -- --check
 }
-run_phase "workspace members are formatted (not --all: that reaches the siblings)" \
+run_phase "workspace members are formatted" \
   check_members_formatted
 
 # Phase 2: structural wiring. A module that exists on disk but is not declared
@@ -398,8 +223,8 @@ run_phase "scripts/module-wiring-gate.sh" \
   ./scripts/module-wiring-gate.sh
 
 # Phase 3: clippy with warnings as errors, across all targets.
-run_phase "cargo clippy --workspace --all-targets --quiet -- -D warnings" \
-  cargo clippy --workspace --all-targets --quiet -- -D warnings
+run_phase "cargo clippy --locked --workspace --all-targets --quiet -- -D warnings" \
+  cargo clippy --locked --workspace --all-targets --quiet -- -D warnings
 
 # The same lint against the platform CI actually runs on. A macOS-only gate
 # cannot see code that stops compiling when the macOS seam disappears, and this
@@ -446,8 +271,8 @@ elif [ -z "$linux_cc_ready" ]; then
   printf '    ring and libsqlite3-sys compile C; install zig, or set CC_x86_64_unknown_linux_gnu\n'
   not_verified="$not_verified; linux lint (no C cross-compiler)"
 else
-  run_phase "cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
-    cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
+  run_phase "cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
+    cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
 fi
 
 # Windows: LIBRARY targets only, deliberately.
@@ -474,8 +299,8 @@ fi
 # reason that says nothing about the code. Reported by iceteaSA in #18.
 for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
   if [ -d "$(rustc --print target-libdir --target "$windows_target" 2>/dev/null)" ]; then
-    run_phase "cargo clippy --workspace --target $windows_target -- -D warnings" \
-      cargo clippy --workspace --target "$windows_target" --quiet -- -D warnings
+    run_phase "cargo clippy --locked --workspace --target $windows_target -- -D warnings" \
+      cargo clippy --locked --workspace --target "$windows_target" --quiet -- -D warnings
   else
     printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
     not_verified="$not_verified; $windows_target build (target not installed)"
@@ -484,15 +309,15 @@ for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
 done
 
 # Phase 4: compile + all tests (lib, bins, integration).
-run_phase "cargo test --workspace --quiet" \
-  cargo test --workspace --quiet
+run_phase "cargo test --locked --workspace --quiet" \
+  cargo test --locked --workspace --quiet
 
 # Phase 5: the identity-resolution observer seam is feature-gated so production
 # builds emit no observer code. A plain `cargo test` therefore skips the
 # conformance test that exercises it, so run that feature explicitly — otherwise
 # the seam could rot unnoticed.
-run_phase "cargo test -p cerebellum --features test-observer --test conformance --quiet" \
-  cargo test -p cerebellum --features test-observer --test conformance --quiet
+run_phase "cargo test --locked -p cerebellum --features test-observer --test conformance --quiet" \
+  cargo test --locked -p cerebellum --features test-observer --test conformance --quiet
 
 # Phase 5b: staging refuses a build below the format floor. The gate lives in a
 # script rather than a test, so a test run never exercises it; its proofs point

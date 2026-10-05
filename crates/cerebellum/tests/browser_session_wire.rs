@@ -7424,7 +7424,8 @@ mod resource_busy_wire {
             serde_json::from_value(reply["detail"].clone()).unwrap();
         detail.validate().unwrap();
         assert_eq!(detail.resource, "browser_profile");
-        let vector: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/flow-browser-profile.json")).unwrap();
+        let vector: cortexkit_resource_busy::ResourceBusy =
+            serde_json::from_str(include_str!("vectors/flow-browser-profile.json")).unwrap();
         vector.validate().unwrap();
         assert_eq!(
             detail.holder,
@@ -7463,7 +7464,7 @@ mod resource_busy_wire {
 
     #[test]
     fn fleet_head_browser_profile_vector_decodes_with_provider_types() {
-        let bytes = include_str!("../../../../commons/crates/cortexkit-resource-busy/tests/vectors/head-browser-profile.json");
+        let bytes = include_str!("vectors/head-browser-profile.json");
         let detail: cortexkit_resource_busy::ResourceBusy = serde_json::from_str(bytes).unwrap();
         detail.validate().unwrap();
         assert_eq!(detail.holder, cortexkit_resource_busy::Holder::head());
