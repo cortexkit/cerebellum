@@ -6879,10 +6879,15 @@ mod tests {
 
         fn snapshot(root: &std::path::Path) -> BTreeMap<PathBuf, Option<std::time::SystemTime>> {
             let mut entries = BTreeMap::new();
-            let Ok(children) = fs::read_dir(root) else { return entries };
+            let Ok(children) = fs::read_dir(root) else {
+                return entries;
+            };
             for child in children.flatten() {
                 let path = child.path();
-                let modified = child.metadata().ok().and_then(|metadata| metadata.modified().ok());
+                let modified = child
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
                 entries.insert(path, modified);
             }
             entries
@@ -6890,19 +6895,26 @@ mod tests {
 
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            });
         let browser_root = data_home.map(|root| root.join("cortexkit/cerebellum/browser"));
         let before = browser_root.as_deref().map(snapshot);
 
         let planes = Planes::new(Arc::new(HealthState::new()));
-        let (reply, question) = planes.management
+        let (reply, question) = planes
+            .management
             .open_profile_root_rebind("isolated-rebind-test", true)
             .await;
         assert_eq!(reply["outcome"], "internal_failure");
         assert_eq!(reply["stage"], "profile_registry_unavailable");
         assert!(question.is_none());
         if let (Some(root), Some(before)) = (browser_root, before) {
-            assert_eq!(snapshot(&root), before, "isolated rebind touched the operator browser data home");
+            assert_eq!(
+                snapshot(&root),
+                before,
+                "isolated rebind touched the operator browser data home"
+            );
         }
     }
 
