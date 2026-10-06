@@ -324,9 +324,11 @@ pub trait AppStateSource: Send + Sync {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 
-    /// Hardware key, button and scroll input addressed to this target while
-    /// it was frontmost. `Ok((coverage_start, latest))` certifies continuous
-    /// observation since `coverage_start`; `latest` excludes synthetic input.
+    /// Session-wide hardware key, button and scroll timestamps, without
+    /// event content or target attribution. The guard uses this signal only
+    /// when the target is frontmost at check time.
+    /// `Ok((coverage_start, latest))` certifies continuous observation since
+    /// `coverage_start`; `latest` excludes synthetic input.
     /// An unavailable observer must not fall back to sender-blind HID ages.
     fn hardware_input(
         &self,

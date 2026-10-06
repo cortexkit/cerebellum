@@ -626,3 +626,20 @@ async fn config_filter_matches_emoji_label_and_discloses_unpopulated_window_cont
         .await;
     assert_eq!(shell["unreadable_subtrees"], 1, "{shell}");
 }
+
+#[tokio::test]
+async fn session_hardware_input_requires_a_fresh_read_when_the_target_becomes_frontmost() {
+    let rig = rig().await;
+    let send = rig.read().await;
+    {
+        let mut state = rig.desk.state();
+        state.frontmost = Some(grant().pid + 1);
+        state.input.push((0, Instant::now()));
+        state.frontmost = Some(grant().pid);
+    }
+    assert_person_refusal(&rig.press(&send).await, "input_seen");
+    assert!(rig.presses().is_empty());
+    let send = rig.read().await;
+    assert_eq!(rig.press(&send).await["outcome"], "completed");
+    assert_eq!(rig.presses(), vec![SEND]);
+}

@@ -6562,7 +6562,10 @@ fn record_private_state_tightening() {
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
-///   in force, or withheld because their store could not be read.
+///   in force, or withheld because their store could not be read;
+/// - `hardwareInputObserver: {state, disabled_reenabled_count}`, whether the
+///   timestamp-only hardware observer is running and how often it recovered
+///   from a disabled tap. Reading health never starts the observer.
 ///
 /// All are atomics, so reading them keeps the health lane insulated, and
 /// none changes the status.
@@ -6590,6 +6593,15 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         metrics.insert(
             "computerGrantStore".to_string(),
             serde_json::Value::from(computer_grants::durable_grant_store_health()),
+        );
+        #[cfg(target_os = "macos")]
+        let (observer_state, reenabled_count) =
+            cerebellum_macos::SessionEventTap::hardware_observer_health();
+        #[cfg(not(target_os = "macos"))]
+        let (observer_state, reenabled_count) = ("platform_unsupported", 0_u64);
+        metrics.insert(
+            "hardwareInputObserver".to_string(),
+            serde_json::json!({"state": observer_state, "disabled_reenabled_count": reenabled_count}),
         );
     }
     report

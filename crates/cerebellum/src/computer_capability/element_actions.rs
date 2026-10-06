@@ -1255,9 +1255,10 @@ where
                 "outcome": "observer_unavailable",
                 "reason": "hardware_input_observer_unavailable",
                 "remedy": "The module could not tell whether the person is using this app. \
-                           Nothing was sent. Restore the module's Input Monitoring access \
-                           and restart the module to start a live hardware observer, \
-                           then call read_state again to establish the covered interval.",
+                           Nothing was sent. Call read_state again after the hardware observer \
+                           recovers to establish a new covered interval. Check hardwareInputObserver \
+                           in module health; if Input Monitoring is unavailable, restore access \
+                           and restart the module before reading again.",
             })),
         }
     }

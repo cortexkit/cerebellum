@@ -971,20 +971,16 @@ impl AppStateSource for Desk {
 
     fn hardware_input(
         &self,
-        target: &ProcessGrant,
+        _target: &ProcessGrant,
     ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
         let state = self.state();
         let since = state.hardware_coverage.ok_or(ElementActionError::Failed)?;
-        let latest = (state.frontmost == Some(target.pid))
-            .then(|| {
-                state
-                    .input
-                    .iter()
-                    .filter(|(pid, _)| *pid == 0)
-                    .map(|(_, at)| *at)
-                    .max()
-            })
-            .flatten();
+        let latest = state
+            .input
+            .iter()
+            .filter(|(pid, _)| *pid == 0)
+            .map(|(_, at)| *at)
+            .max();
         Ok((since, latest))
     }
 

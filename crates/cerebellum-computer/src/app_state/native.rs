@@ -235,9 +235,9 @@ impl AppStateSource for MacAppStateSource {
 
     fn hardware_input(
         &self,
-        target: &ProcessGrant,
+        _target: &ProcessGrant,
     ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
-        cerebellum_macos::SessionEventTap::hardware_input_snapshot(target.pid)
+        cerebellum_macos::SessionEventTap::hardware_input_snapshot()
             .ok_or(ElementActionError::Failed)
     }
 

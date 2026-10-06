@@ -84,8 +84,8 @@ pub enum PersonChange {
     /// The application's focused window is another one, or shows another
     /// title.
     WindowChanged,
-    /// A hardware key press, click or scroll arrived while the application
-    /// was frontmost.
+    /// Hardware key, click or scroll input arrived since the read, and the
+    /// application is frontmost when checked.
     InputSeen,
 }
 
@@ -103,11 +103,11 @@ impl PersonChange {
 /// Compare what the agent saw with the application now.
 ///
 /// `frontmost_now` is whether the application is frontmost at this moment,
-/// and `person_input_at` when hardware input last arrived at this target,
+/// and `person_input_at` when session-wide hardware input last arrived,
 /// as reported by a continuously covering observer. Input
-/// counts only while the application is frontmost, because only then did it
-/// go to this application: a person typing to the agent in another window is
-/// the usual case, and refusing on it would refuse every action.
+/// counts only when the application is frontmost at check time. This is
+/// deliberately conservative: input in another app followed by a switch to
+/// this target can require a fresh read too, but background actions proceed.
 pub fn person_change(
     seen: &SeenMarks,
     now: &SeenMarks,
