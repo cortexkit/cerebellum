@@ -15,6 +15,8 @@
 
 #![cfg(test)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1209,6 +1211,7 @@ async fn start_live_daemon_with_browser(
     )
     .expect("write isolated subc daemon configuration");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
+        .with_privacy_trampoline(support::privacy_trampoline())
         .with_daemon_config_path(&daemon_config_path)
         .expect("load isolated subc daemon configuration")
         // The daemon captures each child's stderr into a run directory it

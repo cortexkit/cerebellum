@@ -273,7 +273,7 @@ done
 # Registry checksums and pinned git revisions identify the dependency source.
 # Refuse external paths before building, and refuse lockfile re-resolution.
 scripts/check-repo-path-deps.sh
-cargo build --release --locked -p cerebellum "$@"
+cargo build --release --locked -p cerebellum --bin ck-cerebellum "$@"
 
 echo
 echo "==> what this build advertises"
