@@ -226,6 +226,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
                     self.frame_sessions.retain(|_, value| value != session);
                     self.configured_frame_sessions.remove(session);
+                    self.focus_emulated_sessions.remove(session);
                 }
             }
             _ => {}

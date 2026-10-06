@@ -5,7 +5,10 @@ pub(super) fn check_type_document(
     expected: Option<&CommittedDocument>,
     live: Result<CommittedDocument, crate::browser_session::NavigationDriveError>,
 ) -> Result<(), BrowserError> {
-    check_snapshot_document(expected, live)
+    let live = live.map_err(|_| BrowserError::TypeNotReady {
+        reason_code: "type_document_not_ready",
+    })?;
+    check_snapshot_document(expected, Ok(live))
 }
 
 impl BrowserPlane {
@@ -197,7 +200,9 @@ impl BrowserPlane {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
         operation.finish();
-        let result = result.map_err(map_navigation_drive_error)?;
+        let result = result.map_err(|_| BrowserError::TypeNotReady {
+            reason_code: "type_attachment_not_ready",
+        })?;
         let response = result.to_value();
         if let BrowserTypeResult::Ok = result {
             let response = json!({"outcome":"ok","characters_dispatched":characters});
@@ -210,13 +215,13 @@ impl BrowserPlane {
             .await?;
             return Ok(response);
         }
-        self.finalize(
-            identity,
-            BrowserCapability::Type,
-            Outcome::StaleSnapshot,
-            response,
-        )
-        .await?;
+        let outcome = if matches!(result, BrowserTypeResult::NotReady { .. }) {
+            Outcome::Denied
+        } else {
+            Outcome::StaleSnapshot
+        };
+        self.finalize(identity, BrowserCapability::Type, outcome, response)
+            .await?;
         Err(match result {
             BrowserTypeResult::InvalidRequest { field, reason_code } => {
                 BrowserError::InvalidRequest {
@@ -230,6 +235,22 @@ impl BrowserPlane {
             }
             BrowserTypeResult::StaleSnapshot { .. } => BrowserError::StaleSnapshot {
                 reason_code: "document_or_target_changed",
+            },
+            BrowserTypeResult::NotReady { reason_code } => BrowserError::TypeNotReady {
+                reason_code: match reason_code.as_str() {
+                    "type_runtime_not_ready" => "type_runtime_not_ready",
+                    "type_context_not_ready" => "type_context_not_ready",
+                    "type_deadline_expired" => "type_deadline_expired",
+                    "type_frame_not_ready" => "type_frame_not_ready",
+                    "type_document_not_ready" => "type_document_not_ready",
+                    "type_clear_not_ready" => "type_clear_not_ready",
+                    "type_caret_not_ready" => "type_caret_not_ready",
+                    "type_focus_not_ready" => "type_focus_not_ready",
+                    "type_selection_not_ready" => "type_selection_not_ready",
+                    "type_insert_not_ready" => "type_insert_not_ready",
+                    "type_attachment_not_ready" => "type_attachment_not_ready",
+                    _ => "type_observation_not_ready",
+                },
             },
             BrowserTypeResult::AuthorizationDenied => {
                 map_authorization_error(crate::authorization::AuthorizationError::NoGrant)

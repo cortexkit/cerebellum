@@ -251,6 +251,9 @@ pub enum BrowserError {
         inflight_count: u64,
         deadline_ms: u64,
     },
+    TypeNotReady {
+        reason_code: &'static str,
+    },
     BrowserCrashed,
     Internal {
         reason_code: JournalReasonCode,
@@ -285,6 +288,7 @@ impl BrowserError {
             Self::NavigationFailed { .. } => "navigation_failed",
             Self::PageNavigatedDuringRead { .. } => "page_navigated_during_read",
             Self::NotSettled { .. } => "not_settled",
+            Self::TypeNotReady { .. } => "type_not_ready",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
             Self::SessionStateUnavailable => "internal_failure",
@@ -299,6 +303,7 @@ impl BrowserError {
             Self::InvalidRequest { reason_code: "credential_input_unsupported", .. } => {
                 "use browser_use present to hand sign-in or payment input to the person; resume afterward"
             }
+            Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }
@@ -402,6 +407,7 @@ impl BrowserError {
             Self::InvalidRequest { field, reason_code } => {
                 json!({"field":field,"reason_code":reason_code})
             }
+            Self::TypeNotReady { reason_code } => json!({"reason_code":reason_code}),
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::PageChangedSinceSnapshot {
                 snapshot_origin,
@@ -4510,6 +4516,7 @@ fn browser_result_outcome_schema() -> Value {
         "navigation_failed",
         "page_navigated_during_read",
         "not_settled",
+        "type_not_ready",
         "browser_crashed",
         "internal_error",
         "internal_failure"
@@ -5548,6 +5555,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::NavigationPolicyRejected { .. }
         | BrowserError::InvalidCoordinates { .. }
         | BrowserError::ImageTooLarge { .. } => Outcome::InternalError,
+        BrowserError::TypeNotReady { .. } => Outcome::Denied,
     }
 }
 /// One journal capability per browser capability, with no collapsing.
