@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v15.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v16.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -749,7 +749,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v13_from_v12(&recreated_v12(), historical_revision(13).as_str().unwrap());
     let generated =
         vocabulary_mint::v14_from_v13(&generated, historical_revision(14).as_str().unwrap());
-    let generated = vocabulary_mint::v15_from_v14(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v15_from_v14(&generated, historical_revision(15).as_str().unwrap());
+    let generated = vocabulary_mint::v16_from_v15(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -915,7 +917,7 @@ fn every_row_declares_the_consent_envelope_and_the_invalid_request_fields() {
 /// targets, no diff cap word, no state_changed_by_person refusal, and no
 /// list_apps row.
 fn recreated_v14() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v15();
     vocabulary["revision"] = historical_revision(14);
     assert_eq!(
         vocabulary["rows"].as_array_mut().unwrap().pop().unwrap()["capability_id"],
@@ -1169,4 +1171,36 @@ fn v14_refusal_words_are_in_closed_enums_and_validate() {
         }),
     )
     .unwrap();
+}
+
+/// Remove observer_unavailable from press_element, press_point and write_text
+/// and strip its description, reconstructing revision 15 exactly.
+fn recreated_v15() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(15);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if vocabulary_mint::V15_ELEMENT_ROWS.contains(&row["capability_id"].as_str().unwrap()) {
+            let outcome = &mut row["result_schema"]["properties"]["outcome"];
+            assert_eq!(
+                outcome["enum"].as_array_mut().unwrap().pop(),
+                Some(json!("observer_unavailable"))
+            );
+            let description = outcome["description"]
+                .as_str()
+                .unwrap()
+                .strip_suffix(vocabulary_mint::V16_OBSERVER_ADDITION)
+                .unwrap()
+                .to_owned();
+            outcome["description"] = json!(description);
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v16_only_makes_the_changes_recreated_v15_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v15()).unwrap()),
+        "671ab7a2017cb556448c42661dd5e1b8fcb3f3aa360c54ee291518c59c5fe5c4"
+    );
 }

@@ -1737,3 +1737,28 @@ pub fn v15_from_v14(v14: &Value, revision: &str) -> Value {
     rows.push(list_apps());
     v15
 }
+
+/// The hardware-input check for a frontmost application can lack observation
+/// coverage without establishing either person activity or a consent failure.
+pub const V16_OBSERVER_ADDITION: &str = " observer_unavailable means the module cannot establish continuous hardware-input observation since the last read of a frontmost target; nothing was sent, and no person activity is asserted.";
+
+pub fn v16_from_v15(v15: &Value, revision: &str) -> Value {
+    let mut vocabulary = v15.clone();
+    vocabulary["revision"] = json!(revision);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if V15_ELEMENT_ROWS.contains(&row["capability_id"].as_str().unwrap()) {
+            let outcome = &mut row["result_schema"]["properties"]["outcome"];
+            outcome["enum"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("observer_unavailable"));
+            let description = format!(
+                "{}{}",
+                outcome["description"].as_str().unwrap(),
+                V16_OBSERVER_ADDITION
+            );
+            outcome["description"] = json!(description);
+        }
+    }
+    vocabulary
+}

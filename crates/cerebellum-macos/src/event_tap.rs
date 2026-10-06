@@ -5,6 +5,146 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use crate::input::InputMonitoringAccess;
 
+/// Deliberate hardware events exclude motion, synthetic sources and private
+/// state (which can have a zero source PID).
+fn is_hardware_deliberate(pid: i64, source_state: i64, event_type: u32) -> bool {
+    pid == 0 && source_state != -1 && matches!(event_type, 1 | 3 | 10 | 22 | 25)
+}
+
+/// The entire recorded payload of the process-lifetime hardware observer.
+/// It intentionally has no key code, character, flags, coordinates or PID.
+#[derive(Debug, Clone, Copy)]
+struct HardwareObservation {
+    event_type: u32,
+    at: std::time::Instant,
+}
+
+impl HardwareObservation {
+    fn new(event_type: u32, at: std::time::Instant) -> Self {
+        Self { event_type, at }
+    }
+}
+
+#[derive(Default)]
+struct HardwareHistory {
+    since: Option<std::time::Instant>,
+    latest: [Option<std::time::Instant>; 5],
+}
+
+impl HardwareHistory {
+    fn record(&mut self, pid: i64, source_state: i64, observation: HardwareObservation) {
+        if self.since.is_none()
+            || !is_hardware_deliberate(pid, source_state, observation.event_type)
+        {
+            return;
+        }
+        let slot = match observation.event_type {
+            1 => 0,
+            3 => 1,
+            25 => 2,
+            10 => 3,
+            22 => 4,
+            _ => return,
+        };
+        self.latest[slot] = self.latest[slot].max(Some(observation.at));
+    }
+
+    fn invalidate(&mut self) {
+        self.since = None;
+        self.latest = [None; 5];
+    }
+}
+
+const OBSERVER_NOT_STARTED: u8 = 0;
+const OBSERVER_RUNNING: u8 = 1;
+const OBSERVER_NO_PERMISSION: u8 = 2;
+const OBSERVER_UNAVAILABLE: u8 = 3;
+
+struct ObserverHealth {
+    state: std::sync::atomic::AtomicU8,
+    disabled_reenabled_count: std::sync::atomic::AtomicU64,
+}
+
+impl ObserverHealth {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(OBSERVER_NOT_STARTED),
+            disabled_reenabled_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn set_state(&self, state: u8) {
+        self.state
+            .store(state, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (&'static str, u64) {
+        let state = match self.state.load(std::sync::atomic::Ordering::Relaxed) {
+            OBSERVER_NOT_STARTED => "not_started",
+            OBSERVER_RUNNING => "running",
+            OBSERVER_NO_PERMISSION => "unavailable_no_permission",
+            _ => "unavailable",
+        };
+        (
+            state,
+            self.disabled_reenabled_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+fn note_hardware_disable(
+    event_type: u32,
+    history: &std::sync::Mutex<HardwareHistory>,
+    health: &ObserverHealth,
+) -> bool {
+    if !matches!(event_type, u32::MAX | 0xFFFF_FFFE) {
+        return false;
+    }
+    history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .invalidate();
+    health.set_state(OBSERVER_UNAVAILABLE);
+    true
+}
+
+trait HardwareTapControl {
+    fn is_enabled(&self) -> bool;
+    fn enable(&self);
+}
+
+/// Recover observation without pretending the disabled interval was covered.
+/// Both the liveness worker and injected-disable tests use this same path.
+fn recover_hardware_observer(
+    tap: &impl HardwareTapControl,
+    history: &std::sync::Mutex<HardwareHistory>,
+    health: &ObserverHealth,
+    now: impl FnOnce() -> std::time::Instant,
+) {
+    {
+        let mut state = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tap.is_enabled() && state.since.is_some() {
+            return;
+        }
+        state.invalidate();
+        health.set_state(OBSERVER_UNAVAILABLE);
+    }
+    tap.enable();
+    let mut state = history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tap.is_enabled() {
+        state.since = Some(now());
+        health
+            .disabled_reenabled_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        health.set_state(OBSERVER_RUNNING);
+    }
+}
+
 /// One event as the tap delivered it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionEvent {
@@ -108,11 +248,26 @@ mod framework {
         CGEventTapPlacement, CGEventTapProxy, CGEventType,
     };
 
-    use super::{session_event_channel, tap_create_failure, SessionEvent, SessionEventTapError};
+    use super::{
+        note_hardware_disable, recover_hardware_observer, session_event_channel,
+        tap_create_failure, HardwareHistory, HardwareObservation, HardwareTapControl,
+        ObserverHealth, SessionEvent, SessionEventTapError, OBSERVER_NO_PERMISSION,
+        OBSERVER_RUNNING, OBSERVER_UNAVAILABLE,
+    };
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static HARDWARE: Mutex<HardwareHistory> = Mutex::new(HardwareHistory {
+        since: None,
+        latest: [None; 5],
+    });
+    static HARDWARE_STARTED: OnceLock<()> = OnceLock::new();
+    static HARDWARE_HEALTH: ObserverHealth = ObserverHealth::new();
     use crate::input::input_monitoring_access;
 
     struct TapCallbackState {
         tx: SyncSender<SessionEvent>,
+        hardware_only: bool,
     }
 
     /// CoreFoundation objects whose retain counts are atomic. The generated
@@ -161,6 +316,74 @@ mod framework {
     }
 
     impl SessionEventTap {
+        /// Start one process-lifetime observer lazily at the first state read.
+        /// No permission request is made. Missing access or a disabled tap is
+        /// unavailable, never evidence that a person acted. Coverage begins
+        /// after the run loop is ready; callers compare it to their read mark.
+        /// Its callback records only one timestamp per deliberate event kind.
+        /// A worker checks enabled status every 10 ms and re-enables disabled
+        /// taps with a new coverage boundary. No event content or PID is kept.
+        pub fn hardware_input_snapshot() -> Option<(Instant, Option<Instant>)> {
+            HARDWARE_STARTED.get_or_init(|| {
+                if input_monitoring_access() != crate::input::InputMonitoringAccess::Granted {
+                    HARDWARE_HEALTH.set_state(OBSERVER_NO_PERMISSION);
+                    return;
+                }
+                HARDWARE_HEALTH.set_state(OBSERVER_UNAVAILABLE);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let spawned = thread::Builder::new()
+                    .name("hardware-input-observer".into())
+                    .spawn(move || {
+                        let Ok(tap) = Self::listen_impl(1, true) else {
+                            let _ = ready_tx.send(());
+                            return;
+                        };
+                        {
+                            let mut state = HARDWARE
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.since = tap.is_enabled().then(Instant::now);
+                            if state.since.is_some() {
+                                HARDWARE_HEALTH.set_state(OBSERVER_RUNNING);
+                            }
+                        }
+                        let _ = ready_tx.send(());
+                        loop {
+                            recover_hardware_observer(
+                                &tap,
+                                &HARDWARE,
+                                &HARDWARE_HEALTH,
+                                Instant::now,
+                            );
+                            match tap.events().recv_timeout(Duration::from_millis(10)) {
+                                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    HARDWARE
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .invalidate();
+                                    HARDWARE_HEALTH.set_state(OBSERVER_UNAVAILABLE);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                if spawned.is_ok() {
+                    let _ = ready_rx.recv();
+                }
+            });
+            let state = HARDWARE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Some((state.since?, state.latest.iter().flatten().copied().max()))
+        }
+
+        /// Read-only health facts; this neither starts the observer nor asks
+        /// for permission, and uses atomics to keep the health lane insulated.
+        pub fn hardware_observer_health() -> (&'static str, u64) {
+            HARDWARE_HEALTH.snapshot()
+        }
+
         /// Start a session-scoped listen-only tap.
         ///
         /// `unread_bound` is how many events may sit undrained before the
@@ -169,8 +392,15 @@ mod framework {
         /// disables is reported by [`Self::is_enabled`]; this does not re-enable
         /// it.
         pub fn listen(unread_bound: usize) -> Result<Self, SessionEventTapError> {
+            Self::listen_impl(unread_bound, false)
+        }
+
+        fn listen_impl(
+            unread_bound: usize,
+            hardware_only: bool,
+        ) -> Result<Self, SessionEventTapError> {
             let (tx, rx) = session_event_channel(unread_bound);
-            let state = Box::new(TapCallbackState { tx });
+            let state = Box::new(TapCallbackState { tx, hardware_only });
             let user_info = Box::into_raw(state);
 
             // SAFETY: `tap_callback` only reads integer fields from the event
@@ -245,6 +475,16 @@ mod framework {
         }
     }
 
+    impl HardwareTapControl for SessionEventTap {
+        fn is_enabled(&self) -> bool {
+            SessionEventTap::is_enabled(self)
+        }
+
+        fn enable(&self) {
+            CGEvent::tap_enable(&self.port, true);
+        }
+    }
+
     impl Drop for SessionEventTap {
         fn drop(&mut self) {
             CGEvent::tap_enable(&self.port, false);
@@ -282,6 +522,36 @@ mod framework {
             Some(unsafe { event.as_ref() }),
             CGEventField::EventSourceUnixProcessID,
         );
+        if state.hardware_only {
+            let source_state = CGEvent::integer_value_field(
+                Some(unsafe { event.as_ref() }),
+                CGEventField::EventSourceStateID,
+            );
+            if note_hardware_disable(event_type.0, &HARDWARE, &HARDWARE_HEALTH) {
+                return event.as_ptr();
+            }
+            if super::is_hardware_deliberate(source_unix_process_id, source_state, event_type.0) {
+                let timestamp_ns = CGEvent::timestamp(Some(unsafe { event.as_ref() }));
+                let observed_at_ns = super::uptime_now_ns();
+                let at = Instant::now().checked_sub(Duration::from_nanos(
+                    observed_at_ns.saturating_sub(timestamp_ns),
+                ));
+                if let Some(at) = at {
+                    let observation = HardwareObservation::new(event_type.0, at);
+                    HARDWARE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(source_unix_process_id, source_state, observation);
+                } else {
+                    HARDWARE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .invalidate();
+                    HARDWARE_HEALTH.set_state(OBSERVER_UNAVAILABLE);
+                }
+            }
+            return event.as_ptr();
+        }
         let marker_nonce = CGEvent::integer_value_field(
             Some(unsafe { event.as_ref() }),
             CGEventField::EventSourceUserData,
@@ -365,5 +635,137 @@ mod tests {
                 input_monitoring: InputMonitoringAccess::Granted
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn hardware_history_excludes_synthetic_private_and_motion_and_records_each_kind() {
+        let at = Instant::now();
+        let mut history = HardwareHistory {
+            since: Some(at),
+            ..HardwareHistory::default()
+        };
+        for (pid, state, kind) in [(42, 1, 10), (0, -1, 10), (0, 1, 5)] {
+            history.record(pid, state, HardwareObservation::new(kind, at));
+        }
+        assert_eq!(history.latest, [None; 5]);
+        for (slot, kind) in [1, 3, 25, 10, 22].into_iter().enumerate() {
+            history.latest = [None; 5];
+            history.record(0, 1, HardwareObservation::new(kind, at));
+            let mut expected = [None; 5];
+            expected[slot] = Some(at);
+            assert_eq!(history.latest, expected);
+        }
+        history.invalidate();
+        history.record(0, 1, HardwareObservation::new(10, at));
+        assert_eq!(history.latest, [None; 5]);
+    }
+
+    #[test]
+    fn hardware_observation_shape_retains_only_kind_and_timestamp() {
+        // Pin the recorded payload, not its byte size: adding a content field
+        // must fail even if padding would leave the allocation size unchanged.
+        let source = include_str!("event_tap.rs");
+        let body = source
+            .split("struct HardwareObservation {")
+            .nth(1)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        let fields: Vec<_> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(fields, ["event_type: u32,", "at: std::time::Instant,"]);
+    }
+
+    struct InjectedTap {
+        enabled: Cell<bool>,
+        enable_calls: Cell<usize>,
+        can_enable: bool,
+    }
+
+    impl HardwareTapControl for InjectedTap {
+        fn is_enabled(&self) -> bool {
+            self.enabled.get()
+        }
+        fn enable(&self) {
+            self.enable_calls.set(self.enable_calls.get() + 1);
+            self.enabled.set(self.can_enable);
+        }
+    }
+
+    #[test]
+    fn disabled_hardware_observer_reenables_and_restarts_coverage() {
+        for disabled_kind in [u32::MAX, u32::MAX - 1] {
+            let before = Instant::now();
+            let after = before + Duration::from_secs(1);
+            let history = Mutex::new(HardwareHistory {
+                since: Some(before),
+                latest: [Some(before); 5],
+            });
+            let health = ObserverHealth::new();
+            health.set_state(OBSERVER_RUNNING);
+            let tap = InjectedTap {
+                enabled: Cell::new(false),
+                enable_calls: Cell::new(0),
+                can_enable: true,
+            };
+            assert!(note_hardware_disable(disabled_kind, &history, &health));
+            assert!(history.lock().unwrap().since.is_none());
+            assert_eq!(health.snapshot(), ("unavailable", 0));
+            recover_hardware_observer(&tap, &history, &health, || after);
+            assert_eq!(tap.enable_calls.get(), 1);
+            assert!(tap.enabled.get());
+            assert_eq!(history.lock().unwrap().since, Some(after));
+            assert_eq!(history.lock().unwrap().latest, [None; 5]);
+            assert_eq!(health.snapshot(), ("running", 1));
+            // Normal polling must not keep moving the coverage boundary.
+            recover_hardware_observer(&tap, &history, &health, Instant::now);
+            assert_eq!(tap.enable_calls.get(), 1);
+            assert_eq!(history.lock().unwrap().since, Some(after));
+            history
+                .lock()
+                .unwrap()
+                .record(0, 1, HardwareObservation::new(10, after));
+            assert_eq!(history.lock().unwrap().latest[3], Some(after));
+        }
+    }
+
+    #[test]
+    fn failed_hardware_reenable_stays_unavailable_and_does_not_count_success() {
+        let history = Mutex::new(HardwareHistory::default());
+        let health = ObserverHealth::new();
+        let tap = InjectedTap {
+            enabled: Cell::new(false),
+            enable_calls: Cell::new(0),
+            can_enable: false,
+        };
+        recover_hardware_observer(&tap, &history, &health, Instant::now);
+        assert_eq!(tap.enable_calls.get(), 1);
+        assert!(history.lock().unwrap().since.is_none());
+        assert_eq!(health.snapshot(), ("unavailable", 0));
+    }
+
+    #[test]
+    fn hardware_observer_health_distinguishes_not_started_permission_and_running() {
+        let health = ObserverHealth::new();
+        assert_eq!(health.snapshot(), ("not_started", 0));
+        health.set_state(OBSERVER_NO_PERMISSION);
+        assert_eq!(health.snapshot(), ("unavailable_no_permission", 0));
+        health.set_state(OBSERVER_RUNNING);
+        assert_eq!(health.snapshot(), ("running", 0));
     }
 }

@@ -827,7 +827,9 @@ async fn image_and_empty_reads_use_the_same_single_summary_row() {
             serde_json::from_slice::<Value>(&result).unwrap(),
             json!({
                 "element_count": if unreadable {0} else {1},
-                "unreadable_subtrees": if unreadable {1} else {0},
+                // A window-only shell is incomplete even when its AX read
+                // succeeded; image capture does not populate its AX content.
+                "unreadable_subtrees": 1,
                 "image_returned": include_image,
                 "routes": {"public": 0, "skylight": 0},
                 "release_routes": {"public": 0, "skylight": 0},
@@ -882,7 +884,8 @@ async fn serialized_read_row_has_all_four_desk_check_fields() {
     assert!(reply.get("manual_accessibility").is_none());
     let row = recorded_read(&storage);
     assert_eq!(row["element_count"].as_u64(), Some(1));
-    assert_eq!(row["unreadable_subtrees"].as_u64(), Some(3));
+    // Count three source-reported gaps plus one unpopulated window.
+    assert_eq!(row["unreadable_subtrees"].as_u64(), Some(4));
     assert_eq!(row["image_returned"].as_bool(), Some(false));
     assert_eq!(row["manual_accessibility"].as_str(), Some("newly_enabled"));
     assert!(row.get("unreadable_count").is_none());

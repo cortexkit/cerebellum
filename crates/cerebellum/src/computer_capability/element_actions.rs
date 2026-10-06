@@ -19,9 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use cerebellum_computer::app_state::person::{
-    last_input_instant, person_change, OwnInputLedger, PersonChange, SeenMarks,
-};
+use cerebellum_computer::app_state::person::{person_change, PersonChange, SeenMarks};
 use cerebellum_computer::app_state::render::{is_session_ending_title, render_diff};
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 
@@ -112,21 +110,29 @@ pub(crate) fn state_changed_by_person_reply(app_name: &str, change: PersonChange
 /// shown it, by a read or an action reply's diff. `None` when it was never
 /// shown this process, since there is then nothing to compare against.
 ///
-/// Every reading here is taken now: the focused element and window are read
-/// again, the frontmost application asked, and the platform's input count
-/// read once and set against this module's own posts.
+/// Focus and window changes remain usable even when hardware observation is
+/// unavailable. Only a frontmost target requires continuous input coverage.
 pub(crate) fn person_change_since_seen(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
-    own_input: &OwnInputLedger,
     conversation_key: &str,
     grant: &ProcessGrant,
-) -> Option<PersonChange> {
-    let seen = sessions.last_seen(conversation_key, grant)?;
+) -> Result<Option<PersonChange>, ()> {
+    let Some(seen) = sessions.last_seen(conversation_key, grant) else {
+        return Ok(None);
+    };
     let now = SeenMarks::read(source, grant);
-    let frontmost_now = source.frontmost_pid() == Some(grant.pid);
-    let person_input_at = own_input.latest_person_input(last_input_instant(source));
-    person_change(&seen, &now, frontmost_now, person_input_at)
+    if let Some(change) = person_change(&seen, &now, false, None) {
+        return Ok(Some(change));
+    }
+    match source.frontmost_pid() {
+        Some(pid) if pid != grant.pid => Ok(None),
+        Some(_) => match source.hardware_input(grant) {
+            Ok((since, latest)) if since <= seen.at => Ok(person_change(&seen, &now, true, latest)),
+            _ => Err(()),
+        },
+        None => Err(()),
+    }
 }
 
 fn blocked_menu_item_reply() -> Value {
@@ -1232,26 +1238,29 @@ where
     ) -> Option<Value> {
         let source = self.app_state_source.clone();
         let sessions = management.app_state_sessions().clone();
-        let own_input = self.own_input.clone();
         let conversation_key = conversation_key.to_string();
         let checked = grant.clone();
         let change = tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(checked.pid, None);
-            person_change_since_seen(
-                source.as_ref(),
-                &sessions,
-                &own_input,
-                &conversation_key,
-                &checked,
-            )
+            person_change_since_seen(source.as_ref(), &sessions, &conversation_key, &checked)
         })
-        .await
-        .ok()
-        .flatten()?;
-        Some(state_changed_by_person_reply(
-            &management.application_name(grant),
-            change,
-        ))
+        .await;
+        match change {
+            Ok(Ok(Some(change))) => Some(state_changed_by_person_reply(
+                &management.application_name(grant),
+                change,
+            )),
+            Ok(Ok(None)) => None,
+            _ => Some(json!({
+                "outcome": "observer_unavailable",
+                "reason": "hardware_input_observer_unavailable",
+                "remedy": "The module could not tell whether the person is using this app. \
+                           Nothing was sent. Call read_state again after the hardware observer \
+                           recovers to establish a new covered interval. Check hardwareInputObserver \
+                           in module health; if Input Monitoring is unavailable, restore access \
+                           and restart the module before reading again.",
+            })),
+        }
     }
 
     /// The refusal for an element action whose `target` names another

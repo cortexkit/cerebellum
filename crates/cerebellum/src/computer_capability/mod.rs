@@ -858,7 +858,7 @@ where
         })
         .await
         .unwrap_or((Err(AppStateReadError::Unreadable), None, None));
-        let raw = match raw {
+        let mut raw = match raw {
             Ok(raw) => raw,
             Err(AppStateReadError::TargetGone) => {
                 let mut reply = json!({
@@ -889,9 +889,10 @@ where
             }
         };
 
+        let unpopulated = raw.mark_unpopulated_content();
         let observed = sessions.observe(&conversation_key, &grant, &raw);
         let app_name = management.application_name(&grant);
-        let rendered = render_state(
+        let mut rendered = render_state(
             &StateHeader {
                 app_name: &app_name,
                 focused_element_id: observed.focused_element_id.as_deref(),
@@ -903,6 +904,9 @@ where
                 text: parsed.text_filter.as_deref(),
             },
         );
+        if unpopulated > 0 {
+            rendered.text.push_str("Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n");
+        }
         if !rendered.zoom_found {
             let mut reply = stale_zoom_reply();
             admission.decorate(&mut reply);
