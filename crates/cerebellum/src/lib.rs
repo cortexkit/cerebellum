@@ -3305,6 +3305,10 @@ async fn handle_management_request(
     }
     if method == management::WOULD_ASK
         && !cerebellum_core::principal::admits_session_calls(&facts.principal)
+        && !(facts.flow_id.is_some()
+            && facts.acts_as_agent
+            && facts.agent_project_id_attested
+            && matches!(&facts.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "basal"))
     {
         return send_route_error(
             writer,
@@ -3313,7 +3317,7 @@ async fn handle_management_request(
             epoch,
             corr,
             "principal_denied",
-            "grants.would_ask is reserved to reserved:prefrontal-core",
+            "grants.would_ask requires reserved:prefrontal-core or an owner-authorized reserved:basal flow",
         )
         .await;
     }
@@ -3460,6 +3464,27 @@ async fn handle_management_request(
                 .await
             }
         };
+        if let Some(flow_id) = facts.flow_id.as_deref() {
+            let field = if request.agent_id != facts.identity.agent_project_id {
+                Some("agent_id")
+            } else if request.flow_id != flow_id {
+                Some("flow_id")
+            } else {
+                None
+            };
+            if let Some(field) = field {
+                return send_invalid_request_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    field,
+                    "scope_mismatch",
+                )
+                .await;
+            }
+        }
         let reply = planes.management.would_ask(&request);
         let items = reply["items"]
             .as_array()
@@ -5994,8 +6019,12 @@ async fn serve_browser_with_consent(
         return Ok(reply);
     };
     if facts.flow_id.is_some() {
+        let detail = management::browser_missing_grant(
+            scope["origins"][0].as_str().expect("grant request origin"),
+            scope["severity_tier"].as_u64().expect("grant request tier"),
+        );
         reply["outcome"] = json!("consent_unavailable");
-        reply["detail"] = json!({"reason": "unattended_flow"});
+        reply["detail"] = detail;
         reply["remedy"] =
             json!("an unattended flow cannot ask a person; configure its owner's standing grant");
         return planes.browser.finish_reply(capability.name(), reply);
@@ -11765,6 +11794,23 @@ mod relayed_computer_call_tests {
         tx: &mpsc::Sender<Frame>,
         rx: &mut mpsc::Receiver<Frame>,
     ) {
+        bind_basal_flow_target(
+            planes,
+            tx,
+            rx,
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+        )
+        .await;
+    }
+
+    async fn bind_basal_flow_target(
+        planes: &Planes,
+        tx: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+        target: subc_protocol::RouteTarget,
+    ) {
         let stamp = subc_protocol::scope::ScopeStamp {
             owner: session_caller_principal_for_test().unwrap(),
             scope_ref: "flow-head".into(),
@@ -11783,9 +11829,7 @@ mod relayed_computer_call_tests {
             role_versions: None,
             route_channel: CHANNEL,
             epoch: EPOCH,
-            target: subc_protocol::RouteTarget::ToolProvider {
-                module_id: "cerebellum".into(),
-            },
+            target,
             identity: subc_protocol::BindIdentity::new("/test/project", "test", "test-session"),
             principal: Some(subc_protocol::Principal::Reserved {
                 module_id: "basal".into(),
@@ -11838,10 +11882,9 @@ mod relayed_computer_call_tests {
         }
         for granted in [false, true] {
             let reads = Arc::new(AtomicUsize::new(0));
-            let mut planes = planes_with_source(
-                &InMemoryJournalStorage::new(),
-                Arc::new(CountReads(reads.clone())),
-            );
+            let audit_storage = InMemoryJournalStorage::new();
+            let mut planes =
+                planes_with_source(&audit_storage, Arc::new(CountReads(reads.clone())));
             let storage = Arc::new(InMemoryGrantStorage::new());
             storage
                 .save(&GrantStoreState {
@@ -11864,7 +11907,10 @@ mod relayed_computer_call_tests {
                 .unwrap();
             planes.management = Arc::new(ManagementPlane::with_computer_grants(
                 Arc::new(Running),
-                Arc::new(ComputerGrants::open(storage, Some("machine".into()))),
+                Arc::new(ComputerGrants::open(
+                    storage.clone(),
+                    Some("machine".into()),
+                )),
             ));
             // A grant given in this conversation must not authorize the flow;
             // only the owner's persistent app grant may.
@@ -11905,6 +11951,104 @@ mod relayed_computer_call_tests {
                 assert_eq!(body["outcome"], "consent_unavailable", "{body}");
                 assert_eq!(body["reason"], "unattended_flow");
                 assert_eq!(reads.load(Ordering::SeqCst), 0);
+                let token = body["detail"]["grant"].as_str().unwrap();
+                let label = body["detail"]["grant_label"].as_str().unwrap();
+                let decoded = management::decode_grant(token).unwrap();
+                assert_eq!(
+                    decoded,
+                    json!({"tool":"computer_use","target":APP,"signer":"certificate leaf[subject.OU] = \"FIXTURE001\"","level":4})
+                );
+                assert!(label.starts_with("control of "));
+                bind_basal_flow_target(
+                    &planes,
+                    &tx,
+                    &mut rx,
+                    subc_protocol::RouteTarget::ManagementSurface {
+                        module_id: "cerebellum".into(),
+                    },
+                )
+                .await;
+                let query = json!({"method":management::WOULD_ASK,"params":{"agent_id":"test-project","flow_id":"flow-computer","items":[{"grant":token}]}});
+                for restored in [false, true] {
+                    if restored {
+                        storage
+                            .save(&GrantStoreState {
+                                version: GRANT_STORE_VERSION,
+                                records: vec![AlwaysGrantRecord {
+                                    agent_project_id: "test-project".into(),
+                                    bundle_identity: APP.into(),
+                                    team_id: Some("FIXTURE001".into()),
+                                    designated_requirement: Some(
+                                        "certificate leaf[subject.OU] = \"FIXTURE001\"".into(),
+                                    ),
+                                    machine_uuid: "machine".into(),
+                                    created_at_ms: 1,
+                                }],
+                            })
+                            .unwrap();
+                        planes.management = Arc::new(ManagementPlane::with_computer_grants(
+                            Arc::new(Running),
+                            Arc::new(ComputerGrants::open(
+                                storage.clone(),
+                                Some("machine".into()),
+                            )),
+                        ));
+                    }
+                    handle_frame(
+                        Frame::build(
+                            FrameType::Request,
+                            control_flags(),
+                            CHANNEL,
+                            EPOCH,
+                            90,
+                            serde_json::to_vec(&query).unwrap(),
+                        )
+                        .unwrap(),
+                        &tx,
+                        &planes,
+                    )
+                    .await
+                    .unwrap();
+                    let answer = rx.recv().await.unwrap();
+                    assert_eq!(answer.header.ty, FrameType::Response);
+                    let answer: Value = serde_json::from_slice(&answer.body).unwrap();
+                    assert_eq!(
+                        answer["items"][0]["verdict"],
+                        if restored { "yes" } else { "would_ask" },
+                        "{answer}"
+                    );
+                }
+                let mut wrong_signer = decoded.clone();
+                wrong_signer["signer"] = json!("another signer");
+                let mut wrong_query = query.clone();
+                wrong_query["params"]["items"][0]["grant"] =
+                    json!(management::encode_grant(wrong_signer));
+                handle_frame(
+                    Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        CHANNEL,
+                        EPOCH,
+                        91,
+                        serde_json::to_vec(&wrong_query).unwrap(),
+                    )
+                    .unwrap(),
+                    &tx,
+                    &planes,
+                )
+                .await
+                .unwrap();
+                let answer: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert_eq!(answer["items"][0]["verdict"], "would_ask", "{answer}");
+                let journal = planes.browser.journal_export_for_test().await;
+                assert!(!journal.is_empty());
+                assert!(!journal.contains(token));
+                assert!(!journal.contains(label));
+                let audit = serde_json::to_value(audit_storage.load().unwrap()).unwrap();
+                assert!(
+                    audit["entries"].as_object().unwrap().is_empty(),
+                    "a refused computer action must not create an action journal record"
+                );
             }
             assert_eq!(planes.elicitor.outstanding(), 0);
             assert!(rx.try_recv().is_err());

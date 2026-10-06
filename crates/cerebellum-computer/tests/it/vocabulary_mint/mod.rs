@@ -1762,3 +1762,19 @@ pub fn v16_from_v15(v15: &Value, revision: &str) -> Value {
     }
     vocabulary
 }
+
+/// Add the stateless missing-permission description to consent-capable rows.
+pub fn v17_from_v16(previous: &Value, revision: &str) -> Value {
+    let mut vocabulary = previous.clone();
+    vocabulary["revision"] = json!(revision);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let schema = &mut row["result_schema"];
+        if schema["properties"]["outcome"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("consent_unavailable")))
+        {
+            schema["properties"]["detail"] = json!({"type":"object","additionalProperties":false,"required":["reason","grant","grant_label"],"properties":{"reason":{"type":"string"},"grant":{"type":"string"},"grant_label":{"type":"string"}}});
+        }
+    }
+    vocabulary
+}
