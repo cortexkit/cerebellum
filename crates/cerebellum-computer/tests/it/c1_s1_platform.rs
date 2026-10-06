@@ -1234,8 +1234,9 @@ fn recreated_v16() -> Value {
     vocabulary
 }
 
-/// Remove the call-time permission outcome and its detail fields, restoring
-/// the consent-only detail contract from revision 17.
+/// Remove `permission_missing`, `detail.permission` and `detail.state`, then
+/// require `detail.reason`, `detail.grant` and `detail.grant_label` again for
+/// the consent-only detail object.
 fn recreated_v17() -> Value {
     let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
     vocabulary["revision"] = historical_revision(17);

@@ -52,9 +52,10 @@ fn context(state: PermissionLiveness) -> CapabilityAdvertisementContext {
     }
 }
 
-/// Real HELLO advertisement, including the configured browser surface. Compare
-/// serialized definitions, not just action membership: descriptions and every
-/// schema property are prompt-cache inputs too.
+/// Compare the tool definitions in the HELLO message the module sends the daemon,
+/// including the configured browser surface. Compare serialized definitions, not
+/// just action membership: descriptions and every schema property are prompt-cache
+/// inputs too.
 #[test]
 fn permission_states_never_change_serialized_tool_definitions() {
     let browser = crate::BrowserSurface::Available(crate::BrowserConfig {
@@ -78,8 +79,9 @@ fn permission_states_never_change_serialized_tool_definitions() {
         })
     };
     let live = definitions(PermissionLiveness::Live);
-    // Also exercise every declaration on non-macOS hosts, where the actual
-    // HELLO correctly offers only wait from the computer plane.
+    // Also build declarations with platform support enabled on every host. On
+    // non-macOS hosts, the HELLO message the module sends the daemon offers only
+    // computer.wait from the computer plane, leaving the other rows untested.
     let live_declarations = capability_declarations(&context(PermissionLiveness::Live), true);
     assert_eq!(
         live_declarations
@@ -147,7 +149,9 @@ mod wire {
                     .with_session_lock_for_test(Some(false)),
                 )
             });
-        // Use the production advertisement, not a hand-selected admitted set.
+        // Missing-permission calls must be advertised before they can return a
+        // permission refusal. Build the admitted set with the production
+        // advertisement function rather than installing a test-only list.
         planes.computer_admitted = Arc::new(
             crate::computer_release_evidence(&context(PermissionLiveness::Unavailable))
                 .gate_admitted_capabilities
@@ -355,8 +359,9 @@ mod wire {
                 }
             }
         }
-        // Type has its own drop-check mutation control above; each additional
-        // required service must still be checked independently of accessibility.
+        // For computer.type, deny PostEvent and InputMonitoring independently
+        // while Accessibility stays live. Neither permission can be assumed
+        // from the Accessibility grant.
         for missing in [
             PermissionService::PostEvent,
             PermissionService::InputMonitoring,

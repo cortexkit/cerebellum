@@ -1041,24 +1041,10 @@ struct PermissionProbePanicked;
 #[cfg(target_os = "macos")]
 fn computer_permission_readings(
 ) -> Result<(Vec<PermissionProbeResult>, Option<String>), PermissionProbePanicked> {
-    // Taken on a background thread, because a reading from the main thread is
-    // discarded: the main thread of this process runs the module's event loop,
-    // and what it can do is not evidence about the threads that will actually
-    // perform captures. Probing here rather than on the startup thread is what
-    // makes the reading count -- a probe taken on the main thread reports a
-    // granted permission and the policy resolves it to unknown, so calls
-    // would refuse on a machine where capture works.
-    //
-    // Joined immediately: this runs once at startup, and the answer is needed
-    // before the manifest can be built.
-    //
-    // NO TEST HERE CAN CATCH THE REMOVAL OF THIS THREAD, which is why it must
-    // not be read as ceremony. The test harness runs every test on a thread of
-    // its own -- including under --test-threads=1 -- so a reading taken on the
-    // caller's thread is already off-main and the policy accepts it either way.
-    // The case arises only in the real binary, where startup runs on the main
-    // thread: there, without this thread, the raw reading says granted and the
-    // resolved liveness is unknown, so calls are refused.
+    // A reading taken on the event-loop main thread is discarded as unreliable,
+    // so startup probes run on a spawned thread, joined before building the
+    // manifest. Tests run off-main even with --test-threads=1, so no test catches
+    // removing the spawned thread: its caller would already be off-main in tests.
     std::thread::spawn(|| {
         (
             computer::platform::native::probe_permissions(),
@@ -1159,14 +1145,16 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
     }
 }
 
-/// The computer-plane advertisement context used when sending HELLO.
+/// The computer-plane context for the HELLO message the module sends the daemon.
 ///
 /// Public so that a test can check the manifest this module really sends,
 /// rather than one assembled to look like it.
 ///
-/// Permission readings are retained for diagnostics and call-time admission,
-/// never for advertisement. They are non-requesting startup queries, cached for
-/// the lifetime of this process; a new grant requires restarting cerebellum.
+/// Permission readings are taken once at startup and never re-queried, by design.
+/// A later grant is not seen until cerebellum restarts. Readings serve diagnostics
+/// and call-time admission, not advertisement. The queries never request a grant,
+/// so permission checks cannot change advertisement or raise a system permission
+/// prompt.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
     static CONTEXT: std::sync::OnceLock<ComputerCapabilityAdvertisementContext> =
         std::sync::OnceLock::new();

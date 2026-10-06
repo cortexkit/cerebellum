@@ -73,8 +73,9 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
         .into_iter()
         .find(|tool| tool.name == "computer_use")
         .unwrap();
-    // Captured from the pre-change all-live manifest at 4ccbafad, which includes
-    // the schema shipped at 3c4871b0. Pin bytes independently of the builder.
+    // The fixture holds the all-live computer_use definition served before the
+    // change. Compare it byte for byte so the expected value does not come from
+    // the builder under test.
     assert_eq!(
         serde_json::to_vec(tool).unwrap(),
         include_bytes!("../fixtures/computer-use-all-live.json")
