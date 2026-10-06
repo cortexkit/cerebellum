@@ -33,3 +33,4 @@ cerebellum-windows = { path = "../cerebellum-windows" }
 # framework path through cerebellum-macos.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-core-graphics = "=0.3.2"
+cerebellum-macos = { path = "../cerebellum-macos", features = ["test-support"] }
