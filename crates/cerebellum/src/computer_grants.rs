@@ -793,6 +793,8 @@ pub enum ConsentRefusal {
         reason: &'static str,
         remedy: &'static str,
     },
+    /// A flow needs a durable application permission.
+    MissingFlowGrant { detail: Value },
     /// The module began draining while the call waited.
     Draining,
     /// The call's route unbound while it waited; nobody is left to answer.
@@ -840,6 +842,9 @@ impl ConsentRefusal {
                 "reason": reason,
                 "remedy": remedy,
             }),
+            Self::MissingFlowGrant { detail } => {
+                json!({"outcome":"consent_unavailable", "reason":"unattended_flow", "detail":detail, "remedy":"an unattended flow cannot ask a person; configure its owner's persistent app grant"})
+            }
             Self::Draining => json!({
                 "outcome": "module_draining",
                 "remedy": "retry after the module restarts",
@@ -1146,6 +1151,23 @@ impl ComputerGrants {
         }
     }
 
+    pub(crate) fn has_exact_standing_app_grant(
+        &self,
+        agent: &str,
+        bundle: &str,
+        signer: &str,
+    ) -> bool {
+        match &*lock(&self.always) {
+            AlwaysState::Loaded(records) => records.iter().any(|record| {
+                record.agent_project_id == agent
+                    && record.bundle_identity == bundle
+                    && self.machine_uuid.as_deref() == Some(record.machine_uuid.as_str())
+                    && record.designated_requirement.as_deref() == Some(signer)
+            }),
+            AlwaysState::Failed(_) => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn seed_conversation_app_for_test(&self, conversation: &str, bundle: &str) {
         lock(&self.state).conversation_apps.insert(
@@ -1313,7 +1335,21 @@ impl ComputerGrants {
             }
         }
         if context.unattended {
-            return Err(ConsentRefusal::Unavailable { reason: "unattended_flow", remedy: "an unattended flow cannot ask a person; configure its owner's persistent app grant" });
+            if let GrantNeed::App {
+                bundle_identity,
+                display_name,
+                code,
+            } = need
+            {
+                let identity = code.identity().map_err(|unreadable| unreadable.refusal())?;
+                return Err(ConsentRefusal::MissingFlowGrant {
+                    detail: json!({"reason":"unattended_flow", "grant":crate::management::encode_grant(json!({"tool":"computer_use", "target":bundle_identity, "signer":identity.designated_requirement, "level":4})), "grant_label":format!("control of {display_name}")}),
+                });
+            }
+            return Err(ConsentRefusal::Unavailable {
+                reason: "takeover_not_for_flows",
+                remedy: "takeover requires an attended session",
+            });
         }
         // The identity a grant made by this question is bound to. Read before
         // asking, so nobody is asked about a process no grant could be bound

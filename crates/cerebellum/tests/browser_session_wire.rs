@@ -9192,3 +9192,142 @@ async fn navigate_response_timeout_requires_snapshot() {
 async fn navigate_zero_budget_never_dispatches() {
     navigate_unanswered("Target.createTarget", "navigate_deadline_expired", false).await;
 }
+
+fn decode_missing_grant(token: &str) -> Value {
+    let encoded = token
+        .strip_prefix("g1.")
+        .unwrap()
+        .rsplit_once('.')
+        .unwrap()
+        .0;
+    serde_json::from_slice(&cerebellum_core::serde_base64::decode(encoded).unwrap()).unwrap()
+}
+
+async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Value {
+    let mut frame = request(corr, "unused", json!({}));
+    frame.body = serde_json::to_vec(&json!({"method":"grants.would_ask","params":params})).unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(reply.header.ty, FrameType::Request);
+    assert_eq!(planes.elicitor.outstanding(), 0);
+    assert!(rx.try_recv().is_err());
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
+    let (planes, launcher) = flow_planes();
+    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
+    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    let token = reply["detail"]["grant"].as_str().unwrap();
+    let label = reply["detail"]["grant_label"].as_str().unwrap();
+    assert_eq!(
+        decode_missing_grant(token),
+        json!({"tool":"browser_use","subject":{"domain":"page.example"},"level":2})
+    );
+    assert_eq!(
+        label,
+        "browser access to page.example up to clicking ordinary links and buttons"
+    );
+    bind_flow_wire_target(
+        &planes,
+        Some(flow_stamp()),
+        reserved("basal"),
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .await;
+    let params = json!({"agent_id":"pj-scope-agent","flow_id":"flow-7","items":[{"grant":token}]});
+    let before = flow_permission_query(&planes, 3, params.clone()).await;
+    assert_eq!(before["items"][0]["verdict"], "would_ask", "{before}");
+    seed_scope_standing_grant(&planes).await;
+    let apex_only = flow_permission_query(&planes, 30, params.clone()).await;
+    assert_eq!(apex_only["items"][0]["verdict"], "would_ask", "{apex_only}");
+    planes
+        .management
+        .standing_browser_grants()
+        .record(
+            "pj-scope-agent",
+            cerebellum::browser_standing_grants::StandingSubject::Domain("page.example".into()),
+            1,
+            vec![],
+            None,
+            "lower-permission",
+        )
+        .unwrap();
+    let lower = flow_permission_query(&planes, 31, params.clone()).await;
+    assert_eq!(lower["items"][0]["verdict"], "would_ask", "{lower}");
+    assert_eq!(lower["items"][0]["reason"], "level_above_grant", "{lower}");
+    planes
+        .management
+        .standing_browser_grants()
+        .record(
+            "pj-scope-agent",
+            cerebellum::browser_standing_grants::StandingSubject::Domain("page.example".into()),
+            2,
+            vec![],
+            None,
+            "permission-restored",
+        )
+        .unwrap();
+    let after = flow_permission_query(&planes, 4, params.clone()).await;
+    assert_eq!(after["items"][0]["verdict"], "yes", "{after}");
+    let mut other = params.clone();
+    other["agent_id"] = json!("another-agent");
+    let denied = flow_permission_query(&planes, 5, other).await;
+    assert!(denied.to_string().contains("agent_id"), "{denied}");
+    assert!(denied.get("items").is_none(), "{denied}");
+    let mut other = params.clone();
+    other["flow_id"] = json!("another-flow");
+    let denied = flow_permission_query(&planes, 6, other).await;
+    assert!(denied.to_string().contains("flow_id"), "{denied}");
+    assert!(denied.get("items").is_none(), "{denied}");
+    for (corr, broken, reason) in [
+        (7, token.replacen("g1.", "g99.", 1), "version"),
+        (8, format!("{token}0"), "checksum"),
+    ] {
+        let mut invalid = params.clone();
+        invalid["items"][0]["grant"] = json!(broken);
+        let answer = flow_permission_query(&planes, corr, invalid).await;
+        assert_eq!(answer["items"][0]["verdict"], "invalid_grant", "{answer}");
+        assert_eq!(answer["items"][0]["reason"], "invalid_grant");
+        assert_eq!(answer["items"][0]["field"], reason);
+    }
+    for (field, value) in [
+        ("tool", json!("other_use")),
+        ("level", json!(9)),
+        ("subject", json!({"domain":"com"})),
+        ("unexpected", json!(true)),
+    ] {
+        use sha2::{Digest, Sha256};
+        let mut grant = decode_missing_grant(token);
+        grant[field] = value;
+        let bytes = serde_json::to_vec(&grant).unwrap();
+        let broken = format!(
+            "g1.{}.{:x}",
+            cerebellum_core::serde_base64::encode(&bytes),
+            Sha256::digest(&bytes)
+        );
+        let answer = flow_permission_query(
+            &planes,
+            9,
+            json!({"agent_id":"pj-scope-agent","flow_id":"flow-7","items":[{"grant":broken}]}),
+        )
+        .await;
+        assert_eq!(answer["items"][0]["verdict"], "invalid_grant", "{answer}");
+        assert_eq!(answer["items"][0]["field"], field, "{answer}");
+    }
+    let journal = planes.browser.journal_export_for_test().await;
+    assert!(!journal.is_empty());
+    assert!(!journal.contains(token), "token leaked into journal");
+    assert!(!journal.contains(label), "label leaked into journal");
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}

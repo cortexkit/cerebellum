@@ -660,6 +660,22 @@ impl ManagementPlane {
             .items
             .iter()
             .map(|item| {
+                if let Some(grant) = &item.grant {
+                    let grant = match grant {
+                        Ok(grant) => grant,
+                        Err(field) => return json!({"tool":"unknown","target":"","verdict":"invalid_grant","reason":"invalid_grant","field":field}),
+                    };
+                    let tool = grant["tool"].as_str().unwrap();
+                    let target = if tool == "browser_use" {
+                        grant["subject"]["origin"].as_str().map(str::to_owned).unwrap_or_else(|| format!("https://{}", grant["subject"]["domain"].as_str().unwrap()))
+                    } else { grant["target"].as_str().unwrap().to_owned() };
+                    let (verdict, reason) = if tool == "browser_use" {
+                        browser_token_grant_answer(&self.standing_browser_grants, &request.agent_id, grant, &target)
+                    } else if self.computer_grants.has_exact_standing_app_grant(&request.agent_id, &target, grant["signer"].as_str().unwrap()) {
+                        ("yes", "standing_grant")
+                    } else { ("would_ask", "no_standing_grant") };
+                    return json!({"tool":tool,"target":target,"verdict":verdict,"reason":reason});
+                }
                 let target = item.target.as_str().unwrap_or("null");
                 let valid = if item.tool == "browser_use" {
                     canonical_grant_origin(target).as_deref() == Some(target)
@@ -2222,10 +2238,48 @@ fn browser_standing_grant_answer(
     }
 }
 
+fn browser_token_grant_answer(
+    standing: &StandingBrowserGrants,
+    agent: &str,
+    grant: &Value,
+    origin: &str,
+) -> (&'static str, &'static str) {
+    if grant["subject"].get("domain").is_none() {
+        return browser_standing_grant_answer(standing, agent, origin, grant["level"].as_u64());
+    }
+    if standing.store_error().is_some() {
+        return ("would_ask", "browser_standing_grants_unavailable");
+    }
+    // An origin row at the domain's apex does not cover its subdomains.
+    let rows = standing.live_rows(agent);
+    let ceilings: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.subject.to_value() == grant["subject"]
+                || matches!(
+                    row.subject,
+                    crate::browser_standing_grants::StandingSubject::AllSites
+                )
+        })
+        .map(|row| u64::from(row.severity().tier))
+        .collect();
+    if ceilings
+        .iter()
+        .any(|ceiling| *ceiling >= grant["level"].as_u64().unwrap())
+    {
+        ("yes", "standing_grant")
+    } else if !ceilings.is_empty() {
+        ("would_ask", "level_above_grant")
+    } else {
+        ("would_ask", "no_standing_grant")
+    }
+}
+
 pub(crate) struct WouldAskItem {
     tool: String,
     target: Value,
     level: Option<u64>,
+    grant: Option<Result<Value, String>>,
 }
 pub(crate) struct WouldAskRequest {
     pub agent_id: String,
@@ -2276,6 +2330,21 @@ pub(crate) fn parse_would_ask(
         let item = item
             .as_object()
             .ok_or_else(|| error(&prefix, "wrong_type"))?;
+        if let Some(token) = item.get("grant") {
+            if item.len() != 1 {
+                return Err(error(&format!("{prefix}.grant"), "unknown_field"));
+            }
+            let decoded = token
+                .as_str()
+                .ok_or_else(|| error(&format!("{prefix}.grant"), "wrong_type"))?;
+            parsed.push(WouldAskItem {
+                tool: "browser_use".into(),
+                target: json!(""),
+                level: None,
+                grant: Some(decode_grant(decoded)),
+            });
+            continue;
+        }
         if let Some(field) = item
             .keys()
             .filter(|k| !matches!(k.as_str(), "tool" | "target" | "level"))
@@ -2307,6 +2376,7 @@ pub(crate) fn parse_would_ask(
             tool: tool.to_string(),
             target: target.clone(),
             level,
+            grant: None,
         });
     }
     Ok(WouldAskRequest {
@@ -2321,13 +2391,92 @@ pub(crate) fn would_ask_result_schema() -> Value {
         "items":{"type":"array","items":{
             "type":"object","required":["tool","target","verdict","reason"],"additionalProperties":false,
             "properties":{
-                "tool":{"type":"string","enum":["browser_use","computer_use"]},
+                "tool":{"type":"string","enum":["browser_use","computer_use","unknown"]},
                 "target":{"type":"string"},
-                "verdict":{"type":"string","enum":["yes","no","would_ask"]},
-                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target"]}
+                "verdict":{"type":"string","enum":["yes","no","would_ask","invalid_grant"]},
+                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target","invalid_grant"]},
+                "field":{"type":"string"}
             }
         }}
     }})
+}
+
+/// A stateless description of a missing permission, not an authorization credential.
+/// The checksum rejects damaged or edited descriptions; possession grants no access.
+pub(crate) fn encode_grant(value: Value) -> String {
+    let bytes = serde_json::to_vec(&value).expect("grant description serializes");
+    use sha2::{Digest, Sha256};
+    format!(
+        "g1.{}.{:x}",
+        cerebellum_core::serde_base64::encode(&bytes),
+        Sha256::digest(&bytes)
+    )
+}
+
+pub(crate) fn decode_grant(token: &str) -> Result<Value, String> {
+    let encoded = token.strip_prefix("g1.").ok_or("version")?;
+    let (encoded, checksum) = encoded.rsplit_once('.').ok_or("encoding")?;
+    let bytes = cerebellum_core::serde_base64::decode(encoded).map_err(|_| "encoding")?;
+    use sha2::{Digest, Sha256};
+    if format!("{:x}", Sha256::digest(&bytes)) != checksum {
+        return Err("checksum".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "encoding")?;
+    let object = value.as_object().ok_or("grant")?;
+    let tool = value["tool"].as_str().ok_or("tool")?;
+    let fields: &[&str] = match tool {
+        "browser_use" => &["tool", "subject", "level"],
+        "computer_use" => &["tool", "target", "signer", "level"],
+        _ => return Err("tool".into()),
+    };
+    for field in object.keys() {
+        if !fields.contains(&field.as_str()) {
+            return Err(field.clone());
+        }
+    }
+    if !value["level"]
+        .as_u64()
+        .is_some_and(|v| (1..=4).contains(&v))
+    {
+        return Err("level".into());
+    }
+    if tool == "browser_use" {
+        let subject: crate::browser_standing_grants::StandingSubject =
+            serde_json::from_value(value["subject"].clone()).map_err(|_| "subject")?;
+        if matches!(
+            subject,
+            crate::browser_standing_grants::StandingSubject::AllSites
+        ) {
+            return Err("subject".into());
+        }
+    } else {
+        if value["level"] != 4 {
+            return Err("level".into());
+        }
+        if !value["target"].as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }) {
+            return Err("target".into());
+        }
+        if !value["signer"].as_str().is_some_and(|s| !s.is_empty()) {
+            return Err("signer".into());
+        }
+    }
+    if encode_grant(value.clone()) != token {
+        return Err("encoding".into());
+    }
+    Ok(value)
+}
+
+pub(crate) fn browser_missing_grant(origin: &str, level: u64) -> Value {
+    let subject = crate::browser_standing_grants::always_subject(origin.to_owned());
+    let label = match &subject {
+        crate::browser_standing_grants::StandingSubject::Domain(domain) => domain.as_str(),
+        _ => origin,
+    };
+    json!({"reason":"unattended_flow", "grant":encode_grant(json!({"tool":"browser_use", "subject":subject.to_value(), "level":level})), "grant_label":format!("browser access to {label} {}", browser_grant_level_words(level as u8).trim_end_matches('.').to_lowercase())})
 }
 
 #[cfg(test)]

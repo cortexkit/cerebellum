@@ -4425,6 +4425,8 @@ fn refusal_detail_schema() -> Value {
             "reason_code":string_schema(),
             "navigation_sent":boolean_schema(),
             "reason":string_schema(),
+            "grant":string_schema(),
+            "grant_label":string_schema(),
             "attempted_origin":string_schema(),
             "granted_origins":string_array_schema(),
             "authorized_origin":string_schema(),

@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v16.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v17.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -751,7 +751,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v14_from_v13(&generated, historical_revision(14).as_str().unwrap());
     let generated =
         vocabulary_mint::v15_from_v14(&generated, historical_revision(15).as_str().unwrap());
-    let generated = vocabulary_mint::v16_from_v15(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v16_from_v15(&generated, historical_revision(16).as_str().unwrap());
+    let generated = vocabulary_mint::v17_from_v16(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1176,7 +1178,7 @@ fn v14_refusal_words_are_in_closed_enums_and_validate() {
 /// Remove observer_unavailable from press_element, press_point and write_text
 /// and strip its description, reconstructing revision 15 exactly.
 fn recreated_v15() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v16();
     vocabulary["revision"] = historical_revision(15);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         if vocabulary_mint::V15_ELEMENT_ROWS.contains(&row["capability_id"].as_str().unwrap()) {
@@ -1202,5 +1204,38 @@ fn v16_only_makes_the_changes_recreated_v15_undoes() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v15()).unwrap()),
         "671ab7a2017cb556448c42661dd5e1b8fcb3f3aa360c54ee291518c59c5fe5c4"
+    );
+}
+
+/// Remove the optional consent-unavailable detail (reason, grant and grant_label)
+/// added in revision 17, recovering the previous frozen vocabulary bytes.
+fn recreated_v16() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(16);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let schema = &mut row["result_schema"];
+        if schema["properties"]["outcome"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("consent_unavailable")))
+        {
+            assert_eq!(
+                schema["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("detail"),
+                Some(
+                    json!({"type":"object","additionalProperties":false,"required":["reason","grant","grant_label"],"properties":{"reason":{"type":"string"},"grant":{"type":"string"},"grant_label":{"type":"string"}}})
+                )
+            );
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v17_only_makes_the_changes_recreated_v16_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v16()).unwrap()),
+        "c5e13e0f02eb666df554c7e2f73f86edcfee6f0b587c3b9cd09564856079cde5"
     );
 }
