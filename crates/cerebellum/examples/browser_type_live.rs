@@ -23,6 +23,8 @@ async fn main() {
         eprintln!("--runs must be positive");
         std::process::exit(1);
     }
+    let navigate_only = args.iter().any(|arg| arg == "--navigate-only");
+    let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
     for index in 1..=runs {
         let no_settle = args.iter().any(|arg| arg == "--no-settle")
@@ -31,11 +33,12 @@ async fn main() {
             "Cold run {index}/{runs}; navigate wait={}",
             if no_settle { "none" } else { "settle" }
         );
-        if let Err(error) = probe::run(no_settle).await {
+        if let Err(error) = probe::run(no_settle, navigate_only, &mut outcomes).await {
             eprintln!("FAIL: {error}");
             failures += 1;
         }
     }
+    println!("NAVIGATE OUTCOMES: {outcomes:?}");
     println!("COLD RUN SUMMARY: {runs} runs, {failures} failed");
     if failures != 0 {
         std::process::exit(1);
@@ -511,13 +514,18 @@ mod probe {
         pipe: &Pipe,
         origin: &str,
         no_settle: bool,
+        navigate_only: bool,
+        outcomes: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(), String> {
         let mut corr = 0;
         let launched = invoke(planes, &mut corr, "browser.launch", json!({})).await?;
         check_outcome(&launched, "launched")?;
         let result = async {
             let navigated = invoke(planes, &mut corr, "browser.navigate", json!({"url":format!("{origin}/"),"intent":"open isolated typing fixture","wait":if no_settle { "none" } else { "settle" },"severity":{"tier":1,"credential":false,"financial":false}})).await?;
+            *outcomes.entry(navigated["outcome"].as_str().unwrap_or("missing").to_string()).or_default() += 1;
+            println!("NAVIGATE REPLY: {navigated}");
             check_ok(&navigated)?;
+            if navigate_only { return Ok(()); }
             let version = pipe.evaluate("navigator.userAgent")?;
             println!("Chrome: {version}");
             let snapshot = invoke(planes, &mut corr, "browser.snapshot", json!({"mode":"ax"})).await?;
@@ -562,7 +570,11 @@ mod probe {
         result
     }
 
-    pub async fn run(no_settle: bool) -> Result<(), String> {
+    pub async fn run(
+        no_settle: bool,
+        navigate_only: bool,
+        outcomes: &mut std::collections::BTreeMap<String, usize>,
+    ) -> Result<(), String> {
         let page = Page::start()?;
         let scratch = Scratch::new()?;
         let chrome = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -650,7 +662,15 @@ mod probe {
                 [page.origin()],
             )])),
         );
-        let result = exercise(&planes, &pipe, &page.origin(), no_settle).await;
+        let result = exercise(
+            &planes,
+            &pipe,
+            &page.origin(),
+            no_settle,
+            navigate_only,
+            outcomes,
+        )
+        .await;
         if result.is_err() {
             for command in pipe.0.lock().unwrap().trace.values() {
                 eprintln!("CDP TRACE NO RESPONSE {command}");

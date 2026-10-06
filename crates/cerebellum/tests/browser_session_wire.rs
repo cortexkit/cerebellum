@@ -3325,6 +3325,7 @@ fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
 /// A CDP pipe that answers the driver's commands the way Chrome does and,
 /// on the mouse release, emits the scenario's page events.
 struct ChromeLikePipe {
+    unanswered: Option<&'static str>,
     scenario: ClickScenario,
     /// The main frame's committed URL, which `Page.getNavigationHistory`
     /// reports and a main-frame `Page.frameNavigated` moves.
@@ -3356,7 +3357,14 @@ impl CdpPipeIo for ChromeLikePipe {
             .lock()
             .unwrap()
             .push(command["method"].as_str().unwrap().to_string());
+        if self.unanswered == command["method"].as_str() {
+            return Ok(());
+        }
         match command["method"].as_str().unwrap() {
+            "Page.navigate" => {
+                self.page.commit(command["params"]["url"].as_str().unwrap());
+                self.reply(id, json!({"frameId":MAIN_FRAME}));
+            }
             "Target.createTarget" => {
                 self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
             }
@@ -3572,6 +3580,17 @@ struct CdpClickProcess {
 }
 
 impl OwnedBrowserProcess for CdpClickProcess {
+    fn navigate(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline_ms: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .navigate(context_key, url, wait, deadline_ms, tracker)
+    }
     fn type_classified(
         &mut self,
         context_key: &str,
@@ -3787,6 +3806,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
 }
 
 struct CdpClickLauncher {
+    unanswered: Option<&'static str>,
     scenario: ClickScenario,
     snapshots: Arc<Mutex<usize>>,
     page: CommittedPage,
@@ -3804,6 +3824,7 @@ impl BrowserSessionLauncher for CdpClickLauncher {
             process: Box::new(CdpClickProcess {
                 driver: CdpNavigationDriver::new(
                     ChromeLikePipe {
+                        unanswered: self.unanswered,
                         scenario: self.scenario,
                         page: self.page.clone(),
                         commands: Arc::clone(&self.commands),
@@ -3844,6 +3865,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: None,
         scenario,
         snapshots: Arc::clone(&snapshots),
         page: page.clone(),
@@ -3943,6 +3965,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: None,
         scenario: ClickScenario::CrossOriginRedirect,
         snapshots: Arc::default(),
         page: page.clone(),
@@ -4485,6 +4508,7 @@ async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) 
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: None,
         scenario: ClickScenario::NoNavigation,
         snapshots: Arc::new(Mutex::new(0)),
         page: page.clone(),
@@ -8752,6 +8776,7 @@ async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<S
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: None,
         scenario: ClickScenario::NoNavigation,
         snapshots: Arc::default(),
         page: committed.clone(),
@@ -9062,4 +9087,108 @@ async fn wire_type_emulates_focus_once_per_attached_session() {
             .count(),
         1
     );
+}
+
+async fn navigate_unanswered(method: &'static str, code: &str, sent: bool) {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let cfg = BrowserConfig {
+        navigation_settle_deadline_ms: if code == "navigate_deadline_expired" {
+            0
+        } else {
+            100
+        },
+        ..config()
+    };
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(cfg.clone()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: Some(method),
+        scenario: ClickScenario::NoNavigation,
+        snapshots: Arc::default(),
+        page: CommittedPage::default(),
+        commands: commands.clone(),
+        typing: None,
+    }));
+    planes.browser = Arc::new(
+        BrowserPlane::with_session_gate(
+            planes.sessions.clone(),
+            planes.lease_clock.clone(),
+            cfg.navigation_settle_deadline_ms,
+        )
+        .with_result_schema_enforcement(
+            cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+        )
+        .with_grants_installed(GrantStore::new([ActionGrant::new(
+            "browse",
+            1,
+            "test-session",
+            Severity::new(4, false, false),
+            ["https://example.com"],
+        )])),
+    );
+    let launched = invoke(&planes, 1, "browser.launch", json!({})).await;
+    let launched: Value = serde_json::from_slice(&launched.body).unwrap();
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    let reply = invoke(&planes, 2, "browser.navigate", json!({"url":"https://example.com", "intent":"open page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}})).await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "navigate_not_ready", "{reply}");
+    assert_eq!(reply["detail"]["reason_code"], code, "{reply}");
+    assert_eq!(reply["detail"]["navigation_sent"], sent, "{reply}");
+    let commands = commands.lock().unwrap();
+    if code == "navigate_deadline_expired" {
+        assert!(commands.is_empty(), "{commands:?}");
+    } else {
+        assert!(
+            commands.iter().any(|command| command == method),
+            "{commands:?}"
+        );
+    }
+    assert_eq!(
+        commands.iter().any(|method| method == "Page.navigate"),
+        sent,
+        "{commands:?}"
+    );
+    let remedy = reply["remedy"].as_str().unwrap();
+    assert!(
+        if sent {
+            remedy.contains("snapshot first")
+        } else {
+            remedy.contains("Page.navigate was not sent")
+        },
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn navigate_target_timeout_is_retryable() {
+    navigate_unanswered("Target.createTarget", "navigate_target_not_ready", false).await;
+}
+#[tokio::test]
+async fn navigate_attachment_timeout_is_retryable() {
+    navigate_unanswered(
+        "Target.attachToTarget",
+        "navigate_attachment_not_ready",
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn navigate_page_timeout_is_retryable() {
+    navigate_unanswered("Page.enable", "navigate_page_not_ready", false).await;
+}
+#[tokio::test]
+async fn navigate_network_timeout_is_retryable() {
+    navigate_unanswered("Network.enable", "navigate_network_not_ready", false).await;
+}
+#[tokio::test]
+async fn navigate_response_timeout_requires_snapshot() {
+    navigate_unanswered("Page.navigate", "navigate_response_not_ready", true).await;
+}
+
+#[tokio::test]
+async fn navigate_zero_budget_never_dispatches() {
+    navigate_unanswered("Target.createTarget", "navigate_deadline_expired", false).await;
 }
