@@ -251,6 +251,10 @@ pub enum BrowserError {
         inflight_count: u64,
         deadline_ms: u64,
     },
+    NavigateNotReady {
+        reason_code: &'static str,
+        navigation_sent: bool,
+    },
     TypeNotReady {
         reason_code: &'static str,
     },
@@ -288,6 +292,7 @@ impl BrowserError {
             Self::NavigationFailed { .. } => "navigation_failed",
             Self::PageNavigatedDuringRead { .. } => "page_navigated_during_read",
             Self::NotSettled { .. } => "not_settled",
+            Self::NavigateNotReady { .. } => "navigate_not_ready",
             Self::TypeNotReady { .. } => "type_not_ready",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
@@ -303,6 +308,8 @@ impl BrowserError {
             Self::InvalidRequest { reason_code: "credential_input_unsupported", .. } => {
                 "use browser_use present to hand sign-in or payment input to the person; resume afterward"
             }
+            Self::NavigateNotReady { navigation_sent: false, .. } => "the setup step in detail.reason_code did not become ready before the deadline; Page.navigate was not sent; retry navigation when the browser is ready",
+            Self::NavigateNotReady { navigation_sent: true, .. } => "Page.navigate was sent but its response did not arrive before the deadline; navigation may have completed; snapshot first to inspect the current page, then retry only if needed",
             Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
@@ -407,6 +414,10 @@ impl BrowserError {
             Self::InvalidRequest { field, reason_code } => {
                 json!({"field":field,"reason_code":reason_code})
             }
+            Self::NavigateNotReady {
+                reason_code,
+                navigation_sent,
+            } => json!({"reason_code":reason_code,"navigation_sent":navigation_sent}),
             Self::TypeNotReady { reason_code } => json!({"reason_code":reason_code}),
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::PageChangedSinceSnapshot {
@@ -4412,6 +4423,7 @@ fn refusal_detail_schema() -> Value {
             "field":string_schema(),
             "decision":string_schema(),
             "reason_code":string_schema(),
+            "navigation_sent":boolean_schema(),
             "reason":string_schema(),
             "attempted_origin":string_schema(),
             "granted_origins":string_array_schema(),
@@ -4517,6 +4529,7 @@ fn browser_result_outcome_schema() -> Value {
         "page_navigated_during_read",
         "not_settled",
         "type_not_ready",
+        "navigate_not_ready",
         "browser_crashed",
         "internal_error",
         "internal_failure"
@@ -5555,7 +5568,9 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::NavigationPolicyRejected { .. }
         | BrowserError::InvalidCoordinates { .. }
         | BrowserError::ImageTooLarge { .. } => Outcome::InternalError,
-        BrowserError::TypeNotReady { .. } => Outcome::Denied,
+        BrowserError::TypeNotReady { .. } | BrowserError::NavigateNotReady { .. } => {
+            Outcome::Denied
+        }
     }
 }
 /// One journal capability per browser capability, with no collapsing.
@@ -5584,6 +5599,13 @@ fn map_journal_error(error: JournalError) -> BrowserError {
 
 fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveError) -> BrowserError {
     match error {
+        crate::browser_session::NavigationDriveError::NavigateNotReady {
+            reason_code,
+            navigation_sent,
+        } => BrowserError::NavigateNotReady {
+            reason_code,
+            navigation_sent,
+        },
         crate::browser_session::NavigationDriveError::FrameChanged {
             authorized_origin,
             live_origin,
@@ -5601,6 +5623,7 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
             }
         }
         crate::browser_session::NavigationDriveError::CdpFailure
+        | crate::browser_session::NavigationDriveError::CommandDeadline { .. }
         | crate::browser_session::NavigationDriveError::CommandFailed { .. } => {
             BrowserError::Internal {
                 reason_code: JournalReasonCode::CdpFailure,

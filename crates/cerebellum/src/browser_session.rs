@@ -360,6 +360,15 @@ pub enum NavigationDriveError {
     StateUnavailable,
     ConnectorFailure,
     CdpFailure,
+    /// A command exhausted its budget, independently of protocol integrity.
+    CommandDeadline {
+        method: String,
+        command_sent: bool,
+    },
+    NavigateNotReady {
+        reason_code: &'static str,
+        navigation_sent: bool,
+    },
     FrameChanged {
         authorized_origin: String,
         live_origin: String,
@@ -2966,6 +2975,14 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
         NavigationDriveError::StateUnavailable => "browser session state unavailable".to_string(),
         NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
         NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
+        NavigationDriveError::CommandDeadline {
+            method,
+            command_sent,
+        } => format!("browser command deadline: {method}, sent={command_sent}"),
+        NavigationDriveError::NavigateNotReady {
+            reason_code,
+            navigation_sent,
+        } => format!("browser navigation not ready: {reason_code}, sent={navigation_sent}"),
         NavigationDriveError::FrameChanged {
             authorized_origin,
             live_origin,

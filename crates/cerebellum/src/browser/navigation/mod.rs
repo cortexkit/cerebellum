@@ -2180,6 +2180,39 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         tracker: &mut Tracker,
         clock: &mut C,
     ) -> Result<(), NavigationDriveError> {
+        self.navigate_before_deadline(context_key, url, wait, deadline_ms, tracker, clock)
+            .map_err(|error| match error {
+                NavigationDriveError::CommandDeadline {
+                    method,
+                    command_sent,
+                } => {
+                    let reason_code = match method.as_str() {
+                        _ if !command_sent => "navigate_deadline_expired",
+                        "Target.createTarget" => "navigate_target_not_ready",
+                        "Target.attachToTarget" => "navigate_attachment_not_ready",
+                        "Page.enable" => "navigate_page_not_ready",
+                        "Network.enable" => "navigate_network_not_ready",
+                        "Page.navigate" if command_sent => "navigate_response_not_ready",
+                        _ => "navigate_deadline_expired",
+                    };
+                    NavigationDriveError::NavigateNotReady {
+                        reason_code,
+                        navigation_sent: method == "Page.navigate" && command_sent,
+                    }
+                }
+                error => error,
+            })
+    }
+
+    fn navigate_before_deadline<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline_ms: u64,
+        tracker: &mut Tracker,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
@@ -2419,6 +2452,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             self.dismiss_pending_javascript_dialogs(deadline, dialogs, &mut tracking, clock)?;
         }
 
+        // Setup shares the action's budget. Do not send another command after
+        // a cold renderer has consumed it: a retry must know whether navigation ran.
+        if clock.now() >= deadline {
+            return Err(NavigationDriveError::CommandDeadline {
+                method: method.to_string(),
+                command_sent: false,
+            });
+        }
         let command = self
             .transport
             .issue_command(method, params, session_id, clock.now())
@@ -2440,7 +2481,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 return Ok(response);
             }
             if clock.now() >= deadline {
-                return Err(NavigationDriveError::CdpFailure);
+                return Err(NavigationDriveError::CommandDeadline {
+                    method: method.to_string(),
+                    command_sent: true,
+                });
             }
             let response = match tracking.as_mut() {
                 Some((context_key, tracker)) => self.read_turn(
