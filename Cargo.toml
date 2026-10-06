@@ -24,7 +24,7 @@ subc-transport = "=0.10.0"
 subc-os = "=0.1.6"
 # Test-only in-process daemon and client control types.
 subc-control = "=0.28.0"
-subc-daemon = "=0.31.1"
+subc-daemon = "=0.32.1"
 subc-jsonc = "=0.1.2"
 cortexkit-store-types = "=0.2.2"
 cortexkit-resource-busy = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }

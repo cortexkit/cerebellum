@@ -18,6 +18,20 @@ test-observer = ["cerebellum-core/test-observer"]
 name = "ck-cerebellum"
 path = "src/main.rs"
 
+# Built by cargo test for embedded daemon supervisors; release builds select
+# only ck-cerebellum and staging never copies this test helper.
+[[bin]]
+name = "cerebellum-test-privacy-trampoline"
+path = "tests/support/privacy_trampoline.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cerebellum-test-nonce-holder"
+path = "tests/support/nonce_holder.rs"
+test = false
+bench = false
+
 [lib]
 name = "cerebellum"
 path = "src/lib.rs"

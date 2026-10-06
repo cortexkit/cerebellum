@@ -1,6 +1,8 @@
 //! Flow admission and consent over real daemon routes to the supervised binary.
 #![cfg(unix)]
 
+mod support;
+
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -70,7 +72,8 @@ async fn client_request(stream: &mut TcpStream, corr: u64, request: ClientContro
     }
 }
 
-/// A connection attested with the nonce from the daemon's supervised shell.
+/// A connection authenticated with the launch nonce supplied by a helper
+/// process spawned by the daemon.
 struct Owner {
     writer: mpsc::Sender<Frame>,
     answers: mpsc::Receiver<Frame>,
@@ -233,6 +236,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn start(carrier: &str, standing: bool) -> Self {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -270,19 +274,20 @@ impl Fixture {
         let daemon_path = directory.join("subc.jsonc");
         let mut modules = serde_json::Map::new();
         for id in [OWNER, carrier] {
-            modules.insert(id.into(), json!({"program":"/bin/sh", "args":["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
+            modules.insert(id.into(), json!({"program":env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
                 "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime,"NONCE_OUT":directory.join(format!("{id}-nonce"))}, "reserved":true}));
         }
-        // Start the production module only after seeding the isolated grant store.
-        // The shell preserves the daemon's nonce descriptor across exec.
-        modules.insert("cerebellum".into(), json!({"program":"/bin/sh", "args":["-c", "while [ ! -f \"$READY\" ]; do sleep 0.05; done; exec \"$BINARY\" \"$@\"", "flow-module"],
-            "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime,"READY":directory.join("ready"),"BINARY":module_binary()}, "reserved":true}));
+        // Launch the module directly: a shell that immediately execs another image
+        // races the daemon's verification of the configured executable.
+        modules.insert("cerebellum".into(), json!({"program":module_binary(),
+            "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime}, "reserved":true}));
         fs::write(
             &daemon_path,
             serde_json::to_vec(&json!({"version":1,"modules":modules})).unwrap(),
         )
         .unwrap();
         let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_path, 0)
+            .with_privacy_trampoline(support::privacy_trampoline())
             .with_daemon_config_path(&daemon_path)
             .unwrap()
             .with_capture_logs_dir(run.join("logs"))
@@ -290,17 +295,7 @@ impl Fixture {
             .with_live_children_record(run.join("live-children.json"))
             .with_machine_id_path(data.join("cortexkit/machine-id"))
             .with_scope_authority_owners(vec![OWNER.into()]);
-        let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
-        let connection = timeout(STARTUP, async {
-            loop {
-                if let Ok(c) = connection_file::read(&connection_path) {
-                    break c;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // Seed consent before the supervised module can read its grant store.
         if standing {
             use cerebellum::browser_standing_grants::{
                 FilesystemStandingGrantStorage, StandingBrowserGrants, StandingSubject,
@@ -326,7 +321,17 @@ impl Fixture {
                 )
                 .unwrap();
         }
-        fs::write(directory.join("ready"), b"ready").unwrap();
+        let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
+        let connection = timeout(STARTUP, async {
+            loop {
+                if let Ok(c) = connection_file::read(&connection_path) {
+                    break c;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let owner_nonce = read_nonce(&directory, OWNER).await;
         let nonce = read_nonce(&directory, carrier).await;
         let mut owner = Owner::register(&connection, &owner_nonce, OWNER).await;

@@ -10,7 +10,7 @@
 //!
 //! The daemon admits a `Reserved` principal only for a nonce it handed to a
 //! process it spawned. So `cerebellum` is configured as a module whose program
-//! is a shell that writes its nonce to a file and sleeps; this test registers
+//! is a test helper that writes its nonce to a file and stays alive; this test registers
 //! as `cerebellum` with that nonce and cerebellum's real manifest, which also
 //! shows that manifest no longer forbids routes to a credentials provider.
 //!
@@ -20,6 +20,8 @@
 //! route stamped anything but `reserved:cerebellum` gets the vault's own
 //! answer to a caller without the deposit grant, `not_found`.
 #![cfg(unix)]
+
+mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -216,7 +218,7 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
     std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
 
-    // The daemon, with cerebellum configured as a shell that hands the test
+    // The daemon, with cerebellum configured as a helper that hands the test
     // its launch nonce.
     let nonce_file = directory.join("cerebellum-nonce");
     let connection_file_path = directory.join("subc-connection.json");
@@ -227,10 +229,10 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
             "version": 1,
             "modules": {
                 CEREBELLUM: {
-                    "program": "/bin/sh",
+                    "program": env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
                     // The daemon passes the nonce only on a pipe at descriptor 3
                     // (named by SUBC_LAUNCH_NONCE_FD), never in the environment.
-                    "args": ["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
+
                     "env": {
                         "HOME": home,
                         "XDG_CONFIG_HOME": home.join(".config"),
@@ -251,6 +253,7 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
         .join("cortexkit")
         .join("run");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
+        .with_privacy_trampoline(support::privacy_trampoline())
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
         .with_live_children_record(run.join("live-children.json"))

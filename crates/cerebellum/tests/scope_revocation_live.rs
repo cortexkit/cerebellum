@@ -9,8 +9,8 @@
 //! The daemon admits a scope sync only from the connection that presented the
 //! owner's launch nonce, which only a process the daemon spawned is given. So
 //! the owner (`prefrontal-core`, which the daemon authorizes by default) is
-//! configured as a module whose program is a shell that writes its nonce to a
-//! file and then sleeps, and this test registers and syncs as that module with
+//! configured as a module whose test helper writes its nonce to a file
+//! and stays alive, and this test registers and syncs as that module with
 //! the nonce. The same nonce, presented on a client connection, opens routes
 //! as the owner.
 //!
@@ -26,6 +26,8 @@
 //! `a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question`
 //! covers that answer.
 #![cfg(unix)]
+
+mod support;
 
 use std::fs;
 use std::path::PathBuf;
@@ -362,10 +364,10 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     std::env::remove_var("SUBC_LAUNCH_NONCE_FD");
 
-    // The daemon, with the owner configured as a shell that hands the test
+    // The daemon, with the owner configured as a helper that hands the test
     // its launch nonce. The daemon passes the nonce only on a pipe at
     // descriptor 3 (named by SUBC_LAUNCH_NONCE_FD); there is no environment
-    // copy, so the shell reads the pipe.
+    // copy, so the helper reads the pipe.
     let nonce_file = directory.join("owner-nonce");
     let connection_file_path = directory.join("subc-connection.json");
     let daemon_config_path = directory.join("subc.jsonc");
@@ -375,8 +377,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
             "version": 1,
             "modules": {
                 OWNER: {
-                    "program": "/bin/sh",
-                    "args": ["-c", "cat <&3 > \"$NONCE_OUT.tmp\" && mv \"$NONCE_OUT.tmp\" \"$NONCE_OUT\" && exec sleep 600"],
+                    "program": env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
                     "env": {
                         "HOME": home,
                         "XDG_CONFIG_HOME": home.join(".config"),
@@ -397,6 +398,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         .join("cortexkit")
         .join("run");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
+        .with_privacy_trampoline(support::privacy_trampoline())
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
         .with_live_children_record(run.join("live-children.json"))
