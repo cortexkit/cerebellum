@@ -14,6 +14,10 @@ import sys
 from pathlib import Path
 from typing import List, Set, Tuple
 
+# Loading the shared scanner as a module would otherwise write a __pycache__
+# directory beside it, which the gate rightly reports as a file the build
+# created in the tree.
+sys.dont_write_bytecode = True
 SCANNER_PATH = Path(__file__).with_name("durable-journal-scan.py")
 SPEC = importlib.util.spec_from_file_location("durable_journal_scan", SCANNER_PATH)
 if SPEC is None or SPEC.loader is None:
