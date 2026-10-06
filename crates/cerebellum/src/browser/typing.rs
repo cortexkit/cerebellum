@@ -140,8 +140,9 @@ impl BrowserPlane {
     ) -> Result<Value, BrowserError> {
         {
             let grants = self.grants.lock().await;
-            // Typing changes page state, so it needs at least tier 2, the same floor a click on a form control gets; a field the
-            // classifier ranks higher keeps its higher tier.
+            // Typing changes page state, so it needs at least tier 2, the same
+            // floor a click on a form control gets; a field the classifier
+            // ranks higher keeps its higher tier.
             let severity = crate::authorization::Severity::new(
                 dispatch.classification.required_tier.max(2),
                 false,
