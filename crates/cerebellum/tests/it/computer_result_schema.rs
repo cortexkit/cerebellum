@@ -141,7 +141,8 @@ async fn served_synthetic_replies() -> Vec<(&'static str, Value)> {
     let mut replies = Vec::with_capacity(cases.len());
     for (capability_id, arguments) in cases {
         let clock = FakeClock::new();
-        let plane = ComputerPlane::new(audit());
+        let plane = ComputerPlane::new(audit())
+            .with_permission_liveness(super::support::computer::live_permissions());
         let management = unleased_management();
         let reply = plane
             .serve(

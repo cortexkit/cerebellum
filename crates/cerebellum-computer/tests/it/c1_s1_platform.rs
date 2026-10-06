@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v17.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v18.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -753,7 +753,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v15_from_v14(&generated, historical_revision(15).as_str().unwrap());
     let generated =
         vocabulary_mint::v16_from_v15(&generated, historical_revision(16).as_str().unwrap());
-    let generated = vocabulary_mint::v17_from_v16(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v17_from_v16(&generated, historical_revision(17).as_str().unwrap());
+    let generated = vocabulary_mint::v18_from_v17(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1210,7 +1212,7 @@ fn v16_only_makes_the_changes_recreated_v15_undoes() {
 /// Remove the optional consent-unavailable detail (reason, grant and grant_label)
 /// added in revision 17, recovering the previous frozen vocabulary bytes.
 fn recreated_v16() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary: Value = recreated_v17();
     vocabulary["revision"] = historical_revision(16);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let schema = &mut row["result_schema"];
@@ -1230,6 +1232,61 @@ fn recreated_v16() -> Value {
         }
     }
     vocabulary
+}
+
+/// Remove the call-time permission outcome and its detail fields, restoring
+/// the consent-only detail contract from revision 17.
+fn recreated_v17() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(17);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if row["required_permission_services"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            continue;
+        }
+        let schema = &mut row["result_schema"];
+        assert_eq!(
+            schema["properties"]["outcome"]["enum"]
+                .as_array_mut()
+                .unwrap()
+                .pop(),
+            Some(json!("permission_missing"))
+        );
+        let detail = &mut schema["properties"]["detail"];
+        let properties = detail["properties"].as_object_mut().unwrap();
+        assert_eq!(
+            properties.remove("permission"),
+            Some(
+                json!({"type":"string","enum":["accessibility","screen_recording","input_monitoring"]})
+            )
+        );
+        assert_eq!(
+            properties.remove("state"),
+            Some(
+                json!({"type":"string","enum":["live","unavailable","granted_pending_relaunch","unresolved","probe_failed"]})
+            )
+        );
+        if properties.is_empty() {
+            schema["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("detail");
+        } else {
+            detail["required"] = json!(["reason", "grant", "grant_label"]);
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v18_only_makes_the_changes_recreated_v17_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v17()).unwrap()),
+        "3b7b6fc633fb5a35cd8e4fb5ef8da1c4d196fe43ab5295fb1be7c1e8cc1d746d"
+    );
 }
 
 #[test]

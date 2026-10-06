@@ -412,6 +412,7 @@ type TestPlane = ComputerPlane<
 /// both pass and a dispatch reaches the driver.
 fn plane_with(shared: &Arc<Mutex<Shared>>) -> TestPlane {
     ComputerPlane::with_synthetic_driver(audit(), SyntheticDriver::factory(Arc::clone(shared)))
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(focused_text_desk().source())
 }
 
@@ -559,7 +560,8 @@ async fn every_listed_session_ending_chord_is_refused_above_an_app_grant() {
         audit(),
         ResultSchemaEnforcement::Withhold,
         SyntheticDriver::factory(Arc::clone(&shared)),
-    );
+    )
+    .with_permission_liveness(super::support::computer::live_permissions());
     let mut tested = 0;
 
     for blocked in BLOCKED_CHORDS
@@ -724,7 +726,8 @@ async fn session_floor_leaves_command_near_misses_grantable() {
 #[tokio::test]
 async fn withholding_mode_preserves_keys_invalid_request_diagnostics() {
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
-        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold);
+        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
+            .with_permission_liveness(super::support::computer::live_permissions());
     let clock = FakeClock::new();
     let management = management();
 
@@ -948,6 +951,7 @@ async fn typed_text_never_reaches_the_journal() {
         support::computer::audit_with_storage(storage.clone()),
         SyntheticDriver::factory(Arc::clone(&shared)),
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(focused_text_desk().source());
     let clock = FakeClock::new();
     let management = granted_management().await;
@@ -1108,6 +1112,7 @@ fn plane_on(shared: &Arc<Mutex<Shared>>, desk: &Desk, bracket_admitted: bool) ->
         ResultSchemaEnforcement::Withhold,
         SyntheticDriver::factory(Arc::clone(shared)),
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source())
     .with_fronting_bracket_admitted(bracket_admitted)
 }
@@ -1565,6 +1570,7 @@ async fn route_summaries_reach_the_journal_not_the_wire_on_success_and_auth_fail
             support::computer::audit_with_storage(storage.clone()),
             SyntheticDriver::factory(Arc::clone(&shared)),
         )
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(focused_text_desk().source());
         let management = granted_management().await;
         let reply = serve(

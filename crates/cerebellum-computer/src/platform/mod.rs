@@ -146,7 +146,7 @@ impl PermissionLivenessReport {
     }
 
     /// The report for a probe that never returned. Every service reads
-    /// `ProbeFailed` so each suppression reason names the crash instead of
+    /// `ProbeFailed` so each call-time refusal names the crash instead of
     /// describing a grant nobody looked at.
     pub fn probe_failed() -> Self {
         Self {
@@ -197,7 +197,7 @@ impl PermissionLivenessProbe {
 /// Keeps only permission readings that can be credited to the identified process.
 ///
 /// Without an identified responsible process, no reading is sufficient evidence
-/// to advertise a capability, so the report remains unresolved for every service.
+/// to execute a capability, so the report remains unresolved for every service.
 pub fn attributed_permission_liveness(
     responsible_process: Option<&str>,
     results: &[PermissionProbeResult],
@@ -213,7 +213,7 @@ pub fn attributed_permission_liveness(
 /// Startup results that capability advertisement consumes on every platform.
 ///
 /// Platform-specific probes populate this report; hosts without a supported
-/// probe retain the default, which advertises no private envelope or grants.
+/// probe retain the default, which establishes no private envelope or grants.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupCapabilityProbe {
     pub os_major: u16,
@@ -274,7 +274,8 @@ impl ImmutableReleaseInputs {
     }
 }
 
-/// Builds the fixed declaration set from release inputs and startup evidence.
+/// Builds the fixed declaration set from release inputs and platform availability.
+/// Permission readings remain diagnostic facts and never change the tool surface.
 ///
 /// `platform_available` distinguishes a host that can serve the platform driver
 /// from one that can only report the frozen vocabulary. The latter keeps all
@@ -351,12 +352,11 @@ fn capability_declaration(
             | "computer.write_text"
     ) {
         // Reads and actions through the accessibility API: each advertised on
-        // its own review and the accessibility grant. The state read has one
+        // its own review. The state read has one
         // review and the presses and writes another, because acting on an
         // element is a different surface from reading it. Screen Recording is
-        // deliberately not a condition, because it serves only the optional
-        // image, and folding it in would hide the tree on every machine where
-        // it is off; a missing grant is reported on the image instead.
+        // only needed for the optional image. Permission requirements are checked
+        // when called, not when building the prompt-visible tool surface.
         let review_missing = if id == "computer.read_state" {
             context
                 .inputs
@@ -379,28 +379,7 @@ fn capability_declaration(
         } else if context.inputs.release_signing_topology_revision.is_none() {
             Some("release signing topology revision is not bound".to_string())
         } else {
-            match context
-                .startup
-                .permissions
-                .state(PermissionService::Accessibility)
-            {
-                PermissionLiveness::Live => None,
-                PermissionLiveness::Unavailable => {
-                    Some("Accessibility permission is not granted".to_string())
-                }
-                PermissionLiveness::GrantedPendingRelaunch => Some(
-                    "Accessibility permission is granted but not usable until this process restarts"
-                        .to_string(),
-                ),
-                PermissionLiveness::Unresolved => {
-                    Some("Accessibility permission is not established".to_string())
-                }
-                PermissionLiveness::ProbeFailed => Some(
-                    "the permission probe did not complete (module fault, not a settings \
-                     state); check the module log rather than System Settings"
-                        .to_string(),
-                ),
-            }
+            None
         };
         advertised = suppression_reason.is_none();
     } else if id == "computer.list_apps" {
@@ -424,12 +403,8 @@ fn capability_declaration(
         suppression_reason =
             (!advertised).then(|| "computer action vocabulary input unresolved".to_string());
     } else if matches!(id, "computer.type" | "computer.keys") {
-        // The keystroke rows, the only actuating rows served over the wire.
-        //
-        // Each condition names itself rather than collapsing into one reason:
-        // an unbound review is a build-time omission an operator cannot fix on
-        // the machine, while a missing permission is the opposite. A reader
-        // given one message for both has to rule out the other by hand.
+        // Keystroke advertisement is a build-time decision. Startup permission
+        // readings decide whether a call can proceed, not which schema is sent.
         suppression_reason = if !context.inputs.vocabulary_ready() {
             Some("computer action vocabulary input unresolved".to_string())
         } else if context.inputs.input_review_revision.is_none() {
@@ -441,29 +416,7 @@ fn capability_declaration(
         } else if !context.inputs.input_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
         } else {
-            // Every permission the frozen vocabulary names for this row. Both
-            // keystroke rows name accessibility: whether per-process posting
-            // needs that grant is not established, and each row reads the
-            // target's focused element before posting, which does.
-            permissions
-                .iter()
-                .find_map(|service| match context.startup.permissions.state(*service) {
-                    PermissionLiveness::Live => None,
-                    PermissionLiveness::Unavailable => {
-                        Some(format!("{service:?} permission is not granted"))
-                    }
-                    PermissionLiveness::GrantedPendingRelaunch => Some(format!(
-                        "{service:?} permission is granted but not usable until this process restarts"
-                    )),
-                    PermissionLiveness::Unresolved => {
-                        Some(format!("{service:?} permission is not established"))
-                    }
-                    PermissionLiveness::ProbeFailed => Some(
-                        "the permission probe did not complete (module fault, not a \
-                         settings state); check the module log rather than System Settings"
-                            .to_string(),
-                    ),
-                })
+            None
         };
         advertised = suppression_reason.is_none();
     } else if matches!(
@@ -472,9 +425,8 @@ fn capability_declaration(
             | ComputerCapability::TakeoverDrag
             | ComputerCapability::TakeoverScroll
     ) {
-        // The real-pointer rows. Each unbound review names itself, for the
-        // same reason the keystroke rows do: a build-time omission and a
-        // permission the person can grant have different remedies.
+        // The real-pointer rows require both release reviews, independently of
+        // the permissions that will be needed when a caller uses them.
         suppression_reason = if !platform_available {
             Some("no global pointer dispatch on this platform".to_string())
         } else if !context.inputs.vocabulary_ready() {
@@ -486,30 +438,7 @@ fn capability_declaration(
         } else if !context.inputs.takeover_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
         } else {
-            // Every permission the frozen row names, plus accessibility: the
-            // move and drag find the application under a point by an
-            // accessibility hit test, and none of the three can check which
-            // application is in front without it.
-            permissions
-                .iter()
-                .chain(std::iter::once(&PermissionService::Accessibility))
-                .find_map(|service| match context.startup.permissions.state(*service) {
-                    PermissionLiveness::Live => None,
-                    PermissionLiveness::Unavailable => {
-                        Some(format!("{service:?} permission is not granted"))
-                    }
-                    PermissionLiveness::GrantedPendingRelaunch => Some(format!(
-                        "{service:?} permission is granted but not usable until this process restarts"
-                    )),
-                    PermissionLiveness::Unresolved => {
-                        Some(format!("{service:?} permission is not established"))
-                    }
-                    PermissionLiveness::ProbeFailed => Some(
-                        "the permission probe did not complete (module fault, not a \
-                         settings state); check the module log rather than System Settings"
-                            .to_string(),
-                    ),
-                })
+            None
         };
         advertised = suppression_reason.is_none();
     }
@@ -600,8 +529,7 @@ fn capability_declaration(
         //
         // So the events are right and the per-process path does not carry
         // pointer events. Claiming Supported for a pointer row would offer a
-        // caller a background capability that cannot deliver -- the defect the
-        // permission gate exists to prevent, one field over.
+        // caller a background capability that cannot deliver.
         //
         // Those rows are not broken: they are deliverable through the GLOBAL
         // path, which seizes the shared cursor and is the authority this module
@@ -805,8 +733,8 @@ pub struct CapabilityDeclaration {
     pub suppression_reason: Option<String>,
 }
 
-/// Inputs needed to build declarations from the frozen artifact and startup
-/// probes. The declaration builder never turns an unresolved field into a guess.
+/// Static inputs needed to build declarations, plus startup diagnostic evidence.
+/// The permission report is retained for callers, not consulted by advertisement.
 #[derive(Debug, Clone)]
 pub struct CapabilityAdvertisementContext {
     pub inputs: ImmutableReleaseInputs,

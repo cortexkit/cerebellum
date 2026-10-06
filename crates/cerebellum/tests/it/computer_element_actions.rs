@@ -52,6 +52,7 @@ impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for 
 
 fn plane(desk: &Desk) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(desk.source())
         .with_image_freshness_source(Arc::new(VisibleFixture))
 }
@@ -936,6 +937,7 @@ async fn written_and_typed_text_never_reach_the_journal() {
         support::computer::audit_with_storage(storage.clone()),
         ResultSchemaEnforcement::Withhold,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk().source());
     let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
     let consent = || {
@@ -1223,6 +1225,7 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
         support::computer::audit_with_storage(storage.clone()),
         ResultSchemaEnforcement::Withhold,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source());
     let management = support::computer::management_with(Arc::new(support::computer::Fixed(
         TargetResolution::Resolved(target.clone()),

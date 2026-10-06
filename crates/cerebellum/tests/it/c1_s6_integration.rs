@@ -65,6 +65,22 @@ fn valid_context() -> ComputerCapabilityAdvertisementContext {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn tonights_all_live_computer_use_definition_is_byte_identical() {
+    let manifest = build_manifest_with_computer_plane("cerebellum", &valid_context());
+    let tool = tools(&manifest)
+        .into_iter()
+        .find(|tool| tool.name == "computer_use")
+        .unwrap();
+    // Captured from the pre-change all-live manifest at 4ccbafad, which includes
+    // the schema shipped at 3c4871b0. Pin bytes independently of the builder.
+    assert_eq!(
+        serde_json::to_vec(tool).unwrap(),
+        include_bytes!("../fixtures/computer-use-all-live.json")
+    );
+}
+
 fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> Vec<String> {
     capability_declarations(context, true)
         .into_iter()
@@ -286,10 +302,8 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
 
 /// A suppressed capability says which condition suppressed it.
 ///
-/// The reason exists so an operator can tell a missing build input from an
-/// ungranted permission: one is fixed by a release, the other by the person at
-/// the machine. A single reason naming both leaves them to rule out the wrong
-/// one by hand.
+/// The reason names a missing build input. Permission state must never be a
+/// suppression reason; its distinct states are returned at the wire instead.
 ///
 /// Each case is produced by spoiling exactly one condition of an otherwise
 /// valid context, so the reason is attributable to the clause under test rather
@@ -320,15 +334,10 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     let denied = startup_with_accessibility(PermissionLiveness::Unavailable);
     permission_denied.permissions = denied.permissions.clone();
     permission_denied.startup = denied;
-    assert_eq!(
-        declaration_reason(&permission_denied),
-        Some("Accessibility permission is not granted".to_string())
-    );
+    assert_eq!(declaration_reason(&permission_denied), None);
 
-    // An unresolved permission is a DIFFERENT case from a denied one: nothing
-    // said no, the reading was never accepted. Reporting them alike would send
-    // someone to the permission settings for a probe that ran in the wrong
-    // place.
+    // Neither a denied grant nor an unresolved reading changes advertisement.
+    // The wire admission matrix asserts their distinct refusal states.
     let mut permission_unresolved = valid_context();
     let unresolved = StartupCapabilityProbe {
         os_major: 26,
@@ -337,10 +346,7 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     };
     permission_unresolved.permissions = unresolved.permissions.clone();
     permission_unresolved.startup = unresolved;
-    assert_eq!(
-        declaration_reason(&permission_unresolved),
-        Some("Accessibility permission is not established".to_string())
-    );
+    assert_eq!(declaration_reason(&permission_unresolved), None);
 }
 
 /// The advertisement context reports what the system says, not a placeholder.

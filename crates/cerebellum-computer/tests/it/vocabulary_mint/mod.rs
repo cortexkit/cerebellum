@@ -1778,3 +1778,34 @@ pub fn v17_from_v16(previous: &Value, revision: &str) -> Value {
     }
     vocabulary
 }
+
+/// Add permission_missing only to rows with permission requirements. Request
+/// schemas stay untouched, preserving the all-live prompt-visible definition.
+pub fn v18_from_v17(previous: &Value, revision: &str) -> Value {
+    let mut vocabulary = previous.clone();
+    vocabulary["revision"] = json!(revision);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if row["required_permission_services"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            continue;
+        }
+        let schema = &mut row["result_schema"];
+        schema["properties"]["outcome"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("permission_missing"));
+        let detail = schema["properties"].as_object_mut().unwrap().entry("detail").or_insert_with(|| {
+            json!({"type":"object","additionalProperties":false,"required":[],"properties":{}})
+        });
+        // The result dialect cannot express alternatives. Consent refusals
+        // carry reason/grant/grant_label; permission refusals carry permission/state.
+        detail["required"] = json!([]);
+        detail["properties"]["permission"] =
+            json!({"type":"string","enum":["accessibility","screen_recording","input_monitoring"]});
+        detail["properties"]["state"] = json!({"type":"string","enum":["live","unavailable","granted_pending_relaunch","unresolved","probe_failed"]});
+    }
+    vocabulary
+}

@@ -27,6 +27,27 @@ use serde_json::{json, Value};
 pub const GRANTEE: &str = "pj-example";
 pub const TARGET_BUNDLE_ID: &str = "com.apple.Safari";
 
+/// Explicit startup readings for tests of behavior beyond permission admission.
+/// Never borrow the TCC state of the developer running the suite.
+pub fn live_permissions() -> cerebellum_computer::platform::PermissionLivenessReport {
+    use cerebellum_computer::platform::*;
+    PermissionLivenessReport::from_results(
+        [
+            PermissionService::Accessibility,
+            PermissionService::ScreenRecording,
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+        ]
+        .into_iter()
+        .map(|service| PermissionProbeResult {
+            service,
+            liveness: PermissionLiveness::Live,
+            responsible_process: "ck-cerebellum".into(),
+            off_main: true,
+        }),
+    )
+}
+
 #[derive(Clone)]
 pub struct TestRedactor;
 

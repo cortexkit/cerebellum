@@ -1594,6 +1594,7 @@ mod tests {
                 ComputerPlane::with_synthetic_driver(audit, || {
                     NativeComputerPlatformDriver::default().without_expected_post_condition()
                 })
+                .with_permission_liveness(crate::computer_capability::live_for_test())
                 .with_session_lock_for_test(Some(false)),
             )
         });

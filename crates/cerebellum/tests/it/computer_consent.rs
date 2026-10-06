@@ -156,6 +156,7 @@ type TestPlane = ComputerPlane<
 fn plane(driver: &CountingDriver) -> TestPlane {
     let driver = driver.clone();
     ComputerPlane::with_synthetic_driver(audit(), move || driver.clone())
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(support::computer::focused_text_desk().source())
 }
 

@@ -87,6 +87,12 @@ mod element_actions;
 pub mod image_freshness;
 use image_freshness::{image_freshness_decision, ImageFreshnessSource, NativeImageFreshnessSource};
 mod keystrokes;
+#[cfg(test)]
+mod permission_tests;
+mod permissions;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+pub(crate) use permissions::live_for_test;
 mod takeover;
 
 use crate::computer_grants::{ConsentContext, ConsentRefusal};
@@ -438,6 +444,9 @@ where
     S: JournalStorage,
 {
     audit: Arc<Mutex<ComputerAudit<R, T, S>>>,
+    /// Startup-only readings, retained so a grant made while running cannot
+    /// silently enable dispatch before the module has restarted.
+    permissions: cerebellum_computer::platform::PermissionLivenessReport,
     /// The capture backend type a pixel-returning row will capture with. No
     /// served row captures today, so nothing is held; the type stays so the
     /// plane's shape does not change when the state read's image arrives.
@@ -542,6 +551,7 @@ where
     ) -> Self {
         Self {
             audit: Arc::new(Mutex::new(audit)),
+            permissions: crate::default_computer_context().startup.permissions,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
             image_freshness_source: Arc::new(NativeImageFreshnessSource),
@@ -559,6 +569,16 @@ where
             #[cfg(test)]
             session_lock_for_test: None,
         }
+    }
+
+    /// Supply the immutable startup readings used for call-time admission.
+    /// Tests inject readings here instead of depending on the host's TCC state.
+    pub fn with_permission_liveness(
+        mut self,
+        permissions: cerebellum_computer::platform::PermissionLivenessReport,
+    ) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     /// Serve as though the screen-lock reading were `state`, whatever the
@@ -680,6 +700,17 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
+        // Before target lookup, consent or any platform work: offering a tool
+        // does not imply the startup permission readings allow it to execute.
+        if let Some(reply) = permissions::refusal(capability.capability(), &self.permissions) {
+            let reply = match capability.0 {
+                Served::Type | Served::Keys => {
+                    synthetic_wire_envelope(keystrokes::refused_before_posting(reply))
+                }
+                _ => reply,
+            };
+            return self.finish_reply(capability.capability(), reply);
+        }
         // Every served row reads or acts through accessibility or posts input,
         // and a locked screen hides every application's interface from both.
         // Checked before the request touches anything -- no target resolved,
@@ -938,13 +969,20 @@ where
             element_count: count_elements(&raw.roots),
             unreadable_subtrees: raw.unreadable_subtrees,
         };
+        // Screen Recording serves only the optional image, never the tree.
+        // Do not construct a capture backend when the startup reading was not
+        // live: a later grant still requires restarting this plane.
+        let image_permission_live = self
+            .permissions
+            .state(cerebellum_computer::platform::PermissionService::ScreenRecording)
+            == PermissionLiveness::Live;
         match self
             .journal_state_read(
                 identity,
                 summary,
                 manual_accessibility,
                 now_ms,
-                parsed.include_image.then(|| make_backend(&grant)),
+                (parsed.include_image && image_permission_live).then(|| make_backend(&grant)),
             )
             .await
         {
@@ -971,7 +1009,13 @@ where
             Ok((None, Some(reason))) => {
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
             }
-            Ok((None, None)) => {}
+            Ok((None, None)) => {
+                if parsed.include_image && !image_permission_live {
+                    reply["image_unavailable"] = json!({
+                        "reason": ImageUnavailable::ScreenRecordingNotLive.as_str(),
+                    });
+                }
+            }
             Err(_) => {
                 let mut refusal = read_audit_unavailable_reply();
                 admission.decorate(&mut refusal);
@@ -2539,7 +2583,11 @@ fn synthetic_wire_envelope(mut reply: Value) -> Value {
     object
         .entry("containment_rung")
         .or_insert_with(|| Value::String("global_none".to_string()));
-    object.remove("detail");
+    // Permission admission names both the missing service and its startup
+    // state. Preserve those diagnostics through the keystroke envelope.
+    if object.get("outcome").and_then(Value::as_str) != Some("permission_missing") {
+        object.remove("detail");
+    }
     reply
 }
 
@@ -3697,7 +3745,8 @@ mod cancel_wire_tests {
         )
         .unwrap();
         let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
-            ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::Withhold);
+            ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::Withhold)
+                .with_permission_liveness(permissions::live_for_test());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         for capability in [ComputerCapability::Type, ComputerCapability::Keys] {
             let reply =

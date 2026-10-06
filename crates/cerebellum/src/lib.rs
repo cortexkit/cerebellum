@@ -1046,8 +1046,8 @@ fn computer_permission_readings(
     // and what it can do is not evidence about the threads that will actually
     // perform captures. Probing here rather than on the startup thread is what
     // makes the reading count -- a probe taken on the main thread reports a
-    // granted permission and the policy resolves it to unknown, so the plane
-    // would advertise nothing on a machine where capture works.
+    // granted permission and the policy resolves it to unknown, so calls
+    // would refuse on a machine where capture works.
     //
     // Joined immediately: this runs once at startup, and the answer is needed
     // before the manifest can be built.
@@ -1058,7 +1058,7 @@ fn computer_permission_readings(
     // caller's thread is already off-main and the policy accepts it either way.
     // The case arises only in the real binary, where startup runs on the main
     // thread: there, without this thread, the raw reading says granted and the
-    // resolved liveness is unknown, so nothing is advertised.
+    // resolved liveness is unknown, so calls are refused.
     std::thread::spawn(|| {
         (
             computer::platform::native::probe_permissions(),
@@ -1164,12 +1164,16 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
 /// Public so that a test can check the manifest this module really sends,
 /// rather than one assembled to look like it.
 ///
-/// The permission state is read from the system here rather than supplied,
-/// because a capability is advertised on the strength of a grant and a grant
-/// that is merely assumed is not one. The readings are cheap queries -- no
-/// capture is performed, so this does not pay the first-capture cost that
-/// contends with other processes.
+/// Permission readings are retained for diagnostics and call-time admission,
+/// never for advertisement. They are non-requesting startup queries, cached for
+/// the lifetime of this process; a new grant requires restarting cerebellum.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
+    static CONTEXT: std::sync::OnceLock<ComputerCapabilityAdvertisementContext> =
+        std::sync::OnceLock::new();
+    CONTEXT.get_or_init(probe_computer_context).clone()
+}
+
+fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
     let readings = computer_permission_readings();
     let probe_panicked = readings.is_err();
     // A panicked probe contributes no readings; the report below is then
@@ -11247,6 +11251,7 @@ mod computer_consent_wire_tests {
                         computer_capability::NativeComputerPlatformDriver::default()
                             .without_expected_post_condition()
                     })
+                    .with_permission_liveness(computer_capability::live_for_test())
                     .with_session_lock_for_test(Some(false)),
                 )
             });
@@ -11697,6 +11702,7 @@ mod relayed_computer_call_tests {
                 computer_capability::NativeComputerPlatformDriver::default()
                     .without_expected_post_condition()
             })
+            .with_permission_liveness(computer_capability::live_for_test())
             .with_session_lock_for_test(Some(false))
             .with_app_state_source(source),
         ));

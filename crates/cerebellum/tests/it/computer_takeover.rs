@@ -400,6 +400,7 @@ fn rig() -> Rig {
             }
         },
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source());
     let management = Arc::new(ManagementPlane::new(Arc::new(TwoApplications)));
     let image_id = management.app_state_sessions().register_image(
