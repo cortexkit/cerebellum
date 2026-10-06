@@ -7,11 +7,10 @@
 //! old read would act on a screen it has not seen. Before an action, the
 //! application's focused element and focused window are read again and
 //! compared with what they were when the agent last saw the application, and
-//! the platform's count of recent input is checked for input that was not
-//! this module's own.
-//!
-//! Nothing here watches continuously: every reading is taken at the moment
-//! an action asks, which is what keeps the check cheap.
+//! a continuously observed hardware-input signal is checked. Sender-blind
+//! input ages cannot establish that a person acted: other programs can post
+//! synthetic events too. The legacy posting ledger below remains available
+//! for compatibility, but cannot attribute input to the person.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -64,6 +63,9 @@ pub struct SeenMarks {
 impl SeenMarks {
     /// Read the application's focused element and focused window now.
     pub fn read(source: &dyn AppStateSource, target: &ProcessGrant) -> Self {
+        // Start hardware observation before establishing the read baseline.
+        // Its coverage timestamp is checked again before a frontmost action.
+        let _ = source.hardware_input(target);
         let at = Instant::now();
         Self {
             focused: Reading::from_result(source.focused_element(target)),
@@ -82,8 +84,8 @@ pub enum PersonChange {
     /// The application's focused window is another one, or shows another
     /// title.
     WindowChanged,
-    /// A key press, click or scroll that this module did not post arrived
-    /// while the application was frontmost.
+    /// A hardware key press, click or scroll arrived while the application
+    /// was frontmost.
     InputSeen,
 }
 
@@ -101,8 +103,8 @@ impl PersonChange {
 /// Compare what the agent saw with the application now.
 ///
 /// `frontmost_now` is whether the application is frontmost at this moment,
-/// and `person_input_at` when the person's latest input arrived, with this
-/// module's own posts already set aside (see [`OwnInputLedger`]). Input
+/// and `person_input_at` when hardware input last arrived at this target,
+/// as reported by a continuously covering observer. Input
 /// counts only while the application is frontmost, because only then did it
 /// go to this application: a person typing to the agent in another window is
 /// the usual case, and refusing on it would refuse every action.
@@ -138,8 +140,11 @@ pub fn person_change(
     None
 }
 
-/// When this module posted input, so that the platform's input count can be
-/// read without taking this module's own posts for the person's.
+/// Legacy bookkeeping of this module's posting intervals.
+///
+/// This excludes only our posts, not synthetic input from other programs.
+/// It is not a hardware-input observer and must not be used as evidence of
+/// person activity.
 ///
 /// The count says only when the latest input arrived, not who sent it, and
 /// on macOS it includes events this module posts. A post therefore hides any
@@ -222,9 +227,9 @@ impl OwnInputLedger {
         }
     }
 
-    /// When the person's latest input arrived, given when the platform last
-    /// counted input: that reading if it was not this module's own, or the
-    /// person's input remembered from before a post, whichever is later.
+    /// The latest input not explained by this module's posting intervals.
+    /// Despite the legacy name, this may be another process's synthetic
+    /// input and must not establish that a person acted.
     pub fn latest_person_input(&self, last_input: Option<Instant>) -> Option<Instant> {
         let state = self.lock();
         let current = last_input.filter(|at| !state.is_own(*at));

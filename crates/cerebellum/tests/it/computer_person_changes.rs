@@ -490,3 +490,139 @@ async fn an_action_never_shown_the_application_is_not_refused() {
     assert_ne!(reply["outcome"], "state_changed_by_person", "{reply}");
     assert_eq!(rig.posts(), 1);
 }
+
+#[tokio::test]
+async fn another_process_s_synthetic_input_is_not_attributed_to_the_person() {
+    let rig = rig().await;
+    let send = rig.read().await;
+    rig.desk.state().input.push((4242, Instant::now()));
+    let reply = rig.press(&send).await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.presses(), vec![SEND]);
+}
+
+#[tokio::test]
+async fn every_filtered_read_even_without_matches_refreshes_person_marks() {
+    for filter in [
+        json!({"text_filter": "missing"}),
+        json!({"text_filter": "Composer"}),
+        json!({"role_filter": ["AXLink"]}),
+        json!({"role_filter": ["AXButton"]}),
+    ] {
+        let rig = rig().await;
+        let send = rig.read().await;
+        {
+            let mut state = rig.desk.state();
+            state.focus = DeskFocus::Element(11);
+            state.window = Some((1, Some("Inbox".into())));
+            state.input.push((0, Instant::now()));
+        }
+        let mut arguments = filter;
+        arguments["target"] = json!(TARGET_BUNDLE_ID);
+        let read = rig.serve("computer.read_state", arguments).await;
+        assert_eq!(read["outcome"], "completed", "{read}");
+        let reply = rig.press(&send).await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(rig.presses(), vec![SEND]);
+        rig.desk.state().input.push((0, Instant::now()));
+        assert_person_refusal(&rig.press(&send).await, "input_seen");
+        assert_eq!(rig.presses(), vec![SEND]);
+    }
+}
+
+#[tokio::test]
+async fn first_read_of_a_frontmost_process_does_not_count_input_predating_the_read() {
+    let rig = rig().await;
+    rig.desk
+        .state()
+        .input
+        .push((0, Instant::now() - Duration::from_secs(60)));
+    let send = rig.read().await;
+    let reply = rig.press(&send).await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.presses(), vec![SEND]);
+}
+
+#[tokio::test]
+async fn uncovered_frontmost_input_refuses_honestly_but_background_and_focus_checks_work() {
+    let rig = rig().await;
+    let send = rig.read().await;
+    rig.desk.state().hardware_coverage = None;
+    let reply = rig.press(&send).await;
+    assert_eq!(reply["outcome"], "observer_unavailable", "{reply}");
+    assert!(reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("could not tell whether"));
+    assert!(rig.presses().is_empty());
+    let typed = rig.type_text().await;
+    assert_eq!(typed["outcome"], "observer_unavailable", "{typed}");
+    assert_eq!(rig.posts(), 0);
+    rig.desk.state().focus = DeskFocus::Element(11);
+    assert_person_refusal(&rig.press(&send).await, "focus_changed");
+    rig.desk.state().focus = DeskFocus::Element(COMPOSER);
+    rig.desk.state().window = Some((1, Some("Inbox".into())));
+    assert_person_refusal(&rig.press(&send).await, "window_changed");
+    rig.desk.state().window = Some((1, Some("Draft".into())));
+    rig.desk.state().frontmost = Some(grant().pid + 1);
+    assert_eq!(rig.press(&send).await["outcome"], "completed");
+    assert_eq!(rig.presses(), vec![SEND]);
+}
+
+#[tokio::test]
+async fn observer_started_after_read_requires_a_new_read() {
+    let rig = rig().await;
+    let send = rig.read().await;
+    rig.desk.state().hardware_coverage = Some(Instant::now());
+    assert_eq!(rig.press(&send).await["outcome"], "observer_unavailable");
+    let send = rig.read().await;
+    assert_eq!(rig.press(&send).await["outcome"], "completed");
+}
+
+#[tokio::test]
+async fn config_filter_matches_emoji_label_and_discloses_unpopulated_window_content() {
+    let rig = rig().await;
+    rig.desk.state().roots = vec![RawElement::fixture(1, "AXWindow")
+        .titled("Dashboard")
+        .with_children(vec![RawElement::fixture(2, "AXWebArea")])];
+    let empty = rig
+        .serve(
+            "computer.read_state",
+            json!({"target": TARGET_BUNDLE_ID, "text_filter": "Config"}),
+        )
+        .await;
+    assert_eq!(empty["outcome"], "completed", "{empty}");
+    assert_eq!(empty["unreadable_subtrees"], 1, "{empty}");
+    assert!(empty["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Accessibility content incomplete"));
+    rig.desk.state().roots = vec![RawElement::fixture(1, "AXWindow")
+        .titled("Dashboard")
+        .with_children(vec![RawElement::fixture(2, "AXWebArea").with_children(
+            vec![RawElement::fixture(SEND, "AXButton").titled("⚙️ Config")],
+        )])];
+    for filter in [
+        json!({"text_filter": "Config"}),
+        json!({"text_filter": "config"}),
+        json!({"role_filter": ["AXButton", "AXLink"]}),
+    ] {
+        let mut arguments = filter;
+        arguments["target"] = json!(TARGET_BUNDLE_ID);
+        let reply = rig.serve("computer.read_state", arguments).await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(reply["unreadable_subtrees"], 0, "{reply}");
+        assert!(
+            reply["state_text"].as_str().unwrap().contains("⚙️ Config"),
+            "{reply}"
+        );
+    }
+    rig.desk.state().roots = vec![RawElement::fixture(1, "AXWindow").titled("Dashboard")];
+    let shell = rig
+        .serve(
+            "computer.read_state",
+            json!({"target": TARGET_BUNDLE_ID, "text_filter": "Config"}),
+        )
+        .await;
+    assert_eq!(shell["unreadable_subtrees"], 1, "{shell}");
+}

@@ -5,6 +5,47 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use crate::input::InputMonitoringAccess;
 
+/// Deliberate hardware events exclude motion, synthetic sources and private
+/// state (which can have a zero source PID).
+fn is_hardware_deliberate(pid: i64, source_state: i64, event_type: u32) -> bool {
+    pid == 0 && source_state != -1 && matches!(event_type, 1 | 3 | 10 | 22 | 25)
+}
+
+#[derive(Default)]
+struct HardwareHistory {
+    since: Option<std::time::Instant>,
+    latest: std::collections::BTreeMap<u32, std::time::Instant>,
+}
+
+impl HardwareHistory {
+    fn record(
+        &mut self,
+        pid: i64,
+        source_state: i64,
+        event_type: u32,
+        target: Option<u32>,
+        at: std::time::Instant,
+    ) {
+        if self.since.is_none() || !is_hardware_deliberate(pid, source_state, event_type) {
+            return;
+        }
+        let Some(target) = target else {
+            // Unknown attribution invalidates coverage rather than certifying
+            // that nobody acted. Restarting establishes a new covered interval.
+            self.since = None;
+            return;
+        };
+        if self.latest.len() >= 1024 && !self.latest.contains_key(&target) {
+            self.since = None;
+            return;
+        }
+        self.latest
+            .entry(target)
+            .and_modify(|latest| *latest = (*latest).max(at))
+            .or_insert(at);
+    }
+}
+
 /// One event as the tap delivered it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionEvent {
@@ -108,11 +149,23 @@ mod framework {
         CGEventTapPlacement, CGEventTapProxy, CGEventType,
     };
 
-    use super::{session_event_channel, tap_create_failure, SessionEvent, SessionEventTapError};
+    use super::{
+        session_event_channel, tap_create_failure, HardwareHistory, SessionEvent,
+        SessionEventTapError,
+    };
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static HARDWARE: Mutex<HardwareHistory> = Mutex::new(HardwareHistory {
+        since: None,
+        latest: std::collections::BTreeMap::new(),
+    });
+    static HARDWARE_STARTED: OnceLock<()> = OnceLock::new();
     use crate::input::input_monitoring_access;
 
     struct TapCallbackState {
         tx: SyncSender<SessionEvent>,
+        hardware_only: bool,
     }
 
     /// CoreFoundation objects whose retain counts are atomic. The generated
@@ -161,6 +214,60 @@ mod framework {
     }
 
     impl SessionEventTap {
+        /// Start one process-lifetime observer lazily at the first state read.
+        /// No permission request is made. Missing access or a disabled tap is
+        /// unavailable, never evidence that a person acted. Coverage begins
+        /// after the run loop is ready; callers compare it to their read mark.
+        /// Its callback updates bounded per-target history without queueing.
+        /// A worker checks enabled status every 10 ms.
+        pub fn hardware_input_snapshot(target: u32) -> Option<(Instant, Option<Instant>)> {
+            HARDWARE_STARTED.get_or_init(|| {
+                if input_monitoring_access() != crate::input::InputMonitoringAccess::Granted {
+                    return;
+                }
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let spawned = thread::Builder::new()
+                    .name("hardware-input-observer".into())
+                    .spawn(move || {
+                        let Ok(tap) = Self::listen_impl(1, true) else {
+                            let _ = ready_tx.send(());
+                            return;
+                        };
+                        HARDWARE
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .since = tap.is_enabled().then(Instant::now);
+                        let _ = ready_tx.send(());
+                        loop {
+                            if !tap.is_enabled() {
+                                HARDWARE
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .since = None;
+                                break;
+                            }
+                            match tap.events().recv_timeout(Duration::from_millis(10)) {
+                                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    HARDWARE
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .since = None;
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                if spawned.is_ok() {
+                    let _ = ready_rx.recv();
+                }
+            });
+            let state = HARDWARE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Some((state.since?, state.latest.get(&target).copied()))
+        }
+
         /// Start a session-scoped listen-only tap.
         ///
         /// `unread_bound` is how many events may sit undrained before the
@@ -169,8 +276,15 @@ mod framework {
         /// disables is reported by [`Self::is_enabled`]; this does not re-enable
         /// it.
         pub fn listen(unread_bound: usize) -> Result<Self, SessionEventTapError> {
+            Self::listen_impl(unread_bound, false)
+        }
+
+        fn listen_impl(
+            unread_bound: usize,
+            hardware_only: bool,
+        ) -> Result<Self, SessionEventTapError> {
             let (tx, rx) = session_event_channel(unread_bound);
-            let state = Box::new(TapCallbackState { tx });
+            let state = Box::new(TapCallbackState { tx, hardware_only });
             let user_info = Box::into_raw(state);
 
             // SAFETY: `tap_callback` only reads integer fields from the event
@@ -288,6 +402,45 @@ mod framework {
         ) as u64;
         let timestamp_ns = CGEvent::timestamp(Some(unsafe { event.as_ref() }));
         let observed_at_ns = super::uptime_now_ns();
+        if state.hardware_only {
+            let source_state = CGEvent::integer_value_field(
+                Some(unsafe { event.as_ref() }),
+                CGEventField::EventSourceStateID,
+            );
+            if event_type.0 == u32::MAX || event_type.0 == u32::MAX - 1 {
+                HARDWARE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .since = None;
+            } else if super::is_hardware_deliberate(
+                source_unix_process_id,
+                source_state,
+                event_type.0,
+            ) {
+                let target = crate::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok());
+                let at = Instant::now().checked_sub(Duration::from_nanos(
+                    observed_at_ns.saturating_sub(timestamp_ns),
+                ));
+                if let Some(at) = at {
+                    HARDWARE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(
+                            source_unix_process_id,
+                            source_state,
+                            event_type.0,
+                            target,
+                            at,
+                        );
+                } else {
+                    HARDWARE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .since = None;
+                }
+            }
+            return event.as_ptr();
+        }
         let _ = state.tx.send(SessionEvent {
             source_unix_process_id,
             event_type: event_type.0,
@@ -365,5 +518,32 @@ mod tests {
                 input_monitoring: InputMonitoringAccess::Granted
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn hardware_history_excludes_synthetic_private_and_motion_and_keeps_event_target() {
+        let at = Instant::now();
+        let mut history = HardwareHistory {
+            since: Some(at),
+            ..HardwareHistory::default()
+        };
+        for (pid, state, kind) in [(42, 1, 10), (0, -1, 10), (0, 1, 5)] {
+            history.record(pid, state, kind, Some(7), at);
+        }
+        assert!(history.latest.is_empty());
+        for kind in [1, 3, 10, 22, 25] {
+            history.latest.clear();
+            history.record(0, 1, kind, Some(8), at);
+            assert_eq!(history.latest.get(&8), Some(&at));
+            assert!(!history.latest.contains_key(&7));
+        }
+        history.record(0, 1, 10, None, at);
+        assert!(history.since.is_none());
     }
 }

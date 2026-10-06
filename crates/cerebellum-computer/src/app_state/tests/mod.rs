@@ -667,11 +667,23 @@ fn a_new_process_generation_starts_a_new_session() {
     let sessions = AppStateSessions::new();
     let before = read(&sessions, &state(vec![window()]));
     let send = id_of(&before, "Send");
+    sessions.remember_seen(
+        CONVERSATION,
+        &grant(),
+        super::person::SeenMarks {
+            focused: super::person::Reading::Read(None),
+            window: super::person::Reading::Read(None),
+            at: std::time::Instant::now(),
+        },
+    );
+    assert!(sessions.last_seen(CONVERSATION, &grant()).is_some());
     let relaunched = ProcessGrant {
         process_generation_evidence: "start:200".into(),
         ..grant()
     };
+    assert!(sessions.last_seen(CONVERSATION, &relaunched).is_none());
     let after = sessions.observe(CONVERSATION, &relaunched, &state(vec![window()]));
+    assert!(sessions.last_seen(CONVERSATION, &relaunched).is_none());
     assert_ne!(id_of(&after, "Send"), send);
     assert!(matches!(
         sessions.resolve(CONVERSATION, &send),

@@ -100,6 +100,34 @@ pub struct RawAppState {
 }
 
 impl RawAppState {
+    /// Empty web areas and windows containing only layout shells cannot prove
+    /// that their content is absent. WebKit can expose these shells before its
+    /// accessibility tree is populated. Mark the gap before filtering, so a
+    /// no-match result does not certify that a control is missing.
+    pub fn mark_unpopulated_content(&mut self) -> usize {
+        fn content(node: &RawElement) -> bool {
+            !matches!(
+                node.role.as_deref(),
+                Some("AXWindow" | "AXGroup" | "AXScrollArea" | "AXSplitGroup" | "AXWebArea")
+            ) || node.children.iter().any(content)
+        }
+        fn mark(node: &mut RawElement) -> usize {
+            let shell = (node.role.as_deref() == Some("AXWebArea") && node.children.is_empty())
+                || (node.role.as_deref() == Some("AXWindow") && !content(node));
+            if shell {
+                if node.unreadable_children == 0 {
+                    node.unreadable_children = 1;
+                    return 1;
+                }
+                return 0;
+            }
+            node.children.iter_mut().map(mark).sum()
+        }
+        let gaps = self.roots.iter_mut().map(mark).sum();
+        self.unreadable_subtrees += gaps;
+        gaps
+    }
+
     /// Whether every element that exists was visited, so one missing from
     /// this read is known to be gone.
     pub fn is_complete(&self) -> bool {
@@ -293,6 +321,17 @@ pub trait AppStateSource: Send + Sync {
         &self,
         _target: &ProcessGrant,
     ) -> Result<Option<WindowMark>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// Hardware key, button and scroll input addressed to this target while
+    /// it was frontmost. `Ok((coverage_start, latest))` certifies continuous
+    /// observation since `coverage_start`; `latest` excludes synthetic input.
+    /// An unavailable observer must not fall back to sender-blind HID ages.
+    fn hardware_input(
+        &self,
+        _target: &ProcessGrant,
+    ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 

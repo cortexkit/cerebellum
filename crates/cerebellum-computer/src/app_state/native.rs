@@ -233,9 +233,16 @@ impl AppStateSource for MacAppStateSource {
             }))
     }
 
-    /// Read from the HID system's table, which counts the person's hardware
-    /// input and also the events this module posts at the session tap; the
-    /// caller tells the two apart by when this module posted.
+    fn hardware_input(
+        &self,
+        target: &ProcessGrant,
+    ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
+        cerebellum_macos::SessionEventTap::hardware_input_snapshot(target.pid)
+            .ok_or(ElementActionError::Failed)
+    }
+
+    /// Sender-blind HID age, retained for posting bookkeeping. It cannot
+    /// identify the person because other processes' synthetic events count too.
     fn time_since_last_input(&self) -> Option<std::time::Duration> {
         let seconds = cerebellum_macos::seconds_since_last_deliberate_input(
             cerebellum_macos::EventSourceStateTable::HidSystem,

@@ -745,6 +745,7 @@ pub struct DeskState {
     /// was counted. Like the HID system's table, the count takes this
     /// module's own posts as well as the person's.
     pub input: Vec<(i64, std::time::Instant)>,
+    pub hardware_coverage: Option<std::time::Instant>,
     /// The running applications `list_apps` lists and a target given by
     /// name is matched against; `None` when the list cannot be read.
     pub running: Option<Vec<cerebellum_computer::app_state::source::RunningApp>>,
@@ -776,6 +777,7 @@ impl Desk {
             focus_reads: 0,
             window: None,
             input: Vec::new(),
+            hardware_coverage: Some(std::time::Instant::now()),
             running: Some(vec![cerebellum_computer::app_state::source::RunningApp {
                 name: "Safari".into(),
                 bundle_identity: grant().bundle_identity,
@@ -965,6 +967,25 @@ impl AppStateSource for Desk {
                 title,
             }
         }))
+    }
+
+    fn hardware_input(
+        &self,
+        target: &ProcessGrant,
+    ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
+        let state = self.state();
+        let since = state.hardware_coverage.ok_or(ElementActionError::Failed)?;
+        let latest = (state.frontmost == Some(target.pid))
+            .then(|| {
+                state
+                    .input
+                    .iter()
+                    .filter(|(pid, _)| *pid == 0)
+                    .map(|(_, at)| *at)
+                    .max()
+            })
+            .flatten();
+        Ok((since, latest))
     }
 
     /// The age of the newest counted input; an input counted for a moment
