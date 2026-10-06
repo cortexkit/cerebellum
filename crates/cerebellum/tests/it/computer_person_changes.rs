@@ -248,6 +248,7 @@ async fn rig() -> Rig {
         ResultSchemaEnforcement::Withhold,
         factory,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source());
     Rig {
         desk,

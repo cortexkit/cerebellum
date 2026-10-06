@@ -73,6 +73,7 @@ const COMMON_OUTCOMES: &[&str] = &[
     "ambiguous_app",
     "no_running_app_named",
     "state_changed_by_person",
+    "permission_missing",
 ];
 
 fn dispatch_refusals() -> Vec<DispatchError> {
@@ -200,6 +201,7 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         );
     }
     replies.extend([
+        keystrokes::refused_before_posting(permissions::refusal(capability, &Default::default()).unwrap()),
         parse_synthetic_request(capability, &json!({})).unwrap_err(),
         keystrokes::FocusRefusal::Secure.reply(),
         keystrokes::FocusRefusal::Unreadable.reply(),

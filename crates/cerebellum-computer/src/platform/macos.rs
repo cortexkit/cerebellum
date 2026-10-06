@@ -1765,14 +1765,13 @@ mod tests {
         }
     }
 
-    /// computer.read_state is advertised on its own review and accessibility
-    /// alone: with its review unbound it is withheld and says why, and with
-    /// Screen Recording off it is still advertised, because only the optional
-    /// image needs that grant.
+    /// The state read's review still gates advertisement, but neither of its
+    /// permissions does. The wire admission tests cover missing accessibility
+    /// and the optional image disclosure independently.
     #[test]
     fn read_state_is_gated_on_its_own_review_and_not_on_screen_recording() {
         let driver = MacOs26PlatformDriver::default();
-        let accessibility_only = live(&[PermissionService::Accessibility]);
+        let accessibility_only = PermissionLivenessReport::default();
         let context = |inputs: ImmutableReleaseInputs| CapabilityAdvertisementContext {
             inputs,
             permissions: accessibility_only.clone(),
@@ -1794,14 +1793,10 @@ mod tests {
         );
     }
 
-    /// computer.keys is withheld when accessibility is denied.
-    ///
-    /// Its row names accessibility because keys reads the target's focused
-    /// element before posting, to refuse a secure field; on a machine that
-    /// grants posting and input monitoring but denies accessibility, keys
-    /// would advertise and then be unable to make that check.
+    /// Missing accessibility leaves keys advertised. Its secure-field reading
+    /// is protected by call-time admission, covered through both wire names.
     #[test]
-    fn computer_keys_is_withheld_without_accessibility() {
+    fn computer_keys_is_advertised_without_accessibility() {
         let driver = MacOs26PlatformDriver::default();
         assert!(
             crate::platform::vocabulary::required_permission_services("computer.keys")
@@ -1811,9 +1806,8 @@ mod tests {
         let context = |permissions: PermissionLivenessReport| CapabilityAdvertisementContext {
             inputs: fully_bound_inputs(),
             permissions: permissions.clone(),
-            // The gate reads startup.permissions, so the readings must be
-            // installed THERE. Setting the sibling field alone produced a
-            // fixture that granted nothing while appearing to grant a lot.
+            // Keep both diagnostic copies consistent, though neither decides
+            // advertisement.
             startup: StartupCapabilityProbe {
                 permissions,
                 ..driver.startup_probe().clone()
@@ -1828,12 +1822,11 @@ mod tests {
             ])),
         );
         assert!(
-            !without.advertised,
-            "computer.keys advertised with accessibility denied"
+            without.advertised,
+            "computer.keys was withheld because accessibility is missing"
         );
 
-        // The same context plus accessibility clears the refusal, so the one
-        // above is the accessibility check and not some unrelated gate.
+        // Granting accessibility must not change any declaration field.
         let with = driver.declaration(
             "computer.keys",
             &context(live(&[
@@ -1847,22 +1840,13 @@ mod tests {
             "computer.keys was suppressed after every permission became live: {:?}",
             with.suppression_reason
         );
+        assert_eq!(without, with);
     }
 
-    /// Binding every release input does not, by itself, activate an actuating row.
-    ///
-    /// The context below binds all six attestations and supplies NO permission
-    /// readings. Both are required, and this fixes the direction that matters:
-    /// a build carrying every review is still refused on a machine that has not
-    /// granted the services the vocabulary names. A reviewer approving the code
-    /// does not thereby approve access to a stranger's desktop.
-    ///
-    /// The suppression reason changed when the wire handlers landed -- it was
-    /// "no wire serving handler", which stopped being true -- and the reason is
-    /// asserted rather than only the refusal, because a row refused for a reason
-    /// nobody checks can start being refused for a reason that is wrong.
+    /// Bound release inputs advertise input even without permission readings;
+    /// execution is refused by call-time admission instead.
     #[test]
-    fn other_actuating_rows_remain_suppressed_for_fully_bound_release_inputs() {
+    fn actuating_rows_are_advertised_for_fully_bound_release_inputs_without_readings() {
         let driver = MacOs26PlatformDriver::default();
         let context = CapabilityAdvertisementContext {
             inputs: ImmutableReleaseInputs {
@@ -1893,25 +1877,15 @@ mod tests {
 
         for id in ["computer.type", "computer.keys"] {
             let declaration = driver.declaration(id, &context);
-            assert!(!declaration.advertised, "{id} was advertised");
-            let reason = declaration
-                .suppression_reason
-                .expect("a suppressed capability states why");
-            assert!(
-                reason.contains("permission is not established"),
-                "{id} is suppressed for an unexpected reason: {reason}"
-            );
+            assert!(declaration.advertised, "{id} was withheld");
+            assert_eq!(declaration.suppression_reason, None);
         }
     }
 
-    /// A probe that panicked is not an absent grant, and the reason must say
-    /// so on every row that consults permissions. The two send an operator to
-    /// different places -- "not established" is answered in System Settings;
-    /// a crashed probe is a module fault that no settings change repairs --
-    /// so a report that names the wrong one costs a real person a wrong trip.
-    /// Fixed against every OTHER gate so a row can only be withheld for this.
+    /// A crashed probe remains diagnostic evidence but cannot hide tools. The
+    /// wire tests preserve probe_failed separately from unresolved and denied.
     #[test]
-    fn a_panicked_permission_probe_is_named_as_a_module_fault_not_as_an_absent_grant() {
+    fn a_panicked_permission_probe_preserves_advertisement_and_diagnostic_state() {
         let driver = MacOs26PlatformDriver::default();
         let mut startup = driver.startup_probe().clone();
         startup.permissions = PermissionLivenessReport::probe_failed();
@@ -1944,18 +1918,14 @@ mod tests {
 
         for id in ["computer.type", "computer.keys"] {
             let declaration = driver.declaration(id, &context);
-            assert!(!declaration.advertised, "{id} was advertised");
-            let reason = declaration
-                .suppression_reason
-                .expect("a suppressed capability states why");
-            assert!(
-                reason.contains("probe did not complete") && reason.contains("module fault"),
-                "{id} names something other than the crash: {reason}"
-            );
-            assert!(
-                !reason.contains("not established") && !reason.contains("not granted"),
-                "{id} describes a grant nobody looked at: {reason}"
-            );
+            assert!(declaration.advertised, "{id} was withheld");
+            assert_eq!(declaration.suppression_reason, None);
+            for service in declaration.required_permissions {
+                assert_eq!(
+                    context.startup.permissions.state(service),
+                    PermissionLiveness::ProbeFailed
+                );
+            }
         }
     }
 

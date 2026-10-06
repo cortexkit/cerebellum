@@ -217,6 +217,7 @@ fn rig(lock: Option<bool>) -> Rig {
         ResultSchemaEnforcement::Withhold,
         move || driver.clone(),
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source())
     // Admitted so a keystroke into a background target reaches the fronting
     // question; no test here fronts anything unless it asks for that.

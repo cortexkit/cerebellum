@@ -89,6 +89,7 @@ type Plane<S = cerebellum_core::journal::InMemoryJournalStorage> = ComputerPlane
 
 fn plane(source: Arc<FixtureSource>) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(source)
         .with_image_freshness_source(Arc::new(FixtureFreshness {
             repaints: false,
@@ -391,6 +392,63 @@ async fn the_window_image_is_served_with_its_header_size_and_its_mapping() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+/// A startup denial cannot be bypassed by a capture backend that would now be
+/// live. Screen Recording remains optional: return the tree and disclose the
+/// missing image, without constructing a backend or asking the OS again.
+#[tokio::test]
+async fn startup_screen_recording_readings_withhold_only_the_image_until_restart() {
+    use cerebellum_computer::platform::{
+        PermissionLivenessReport, PermissionProbeResult, PermissionService,
+    };
+    let management = granted_management().await;
+    let clock = FakeClock::new();
+    for state in [
+        PermissionLiveness::Unavailable,
+        PermissionLiveness::GrantedPendingRelaunch,
+        PermissionLiveness::Unresolved,
+        PermissionLiveness::ProbeFailed,
+    ] {
+        let report = PermissionLivenessReport::from_results(
+            [
+                (PermissionService::Accessibility, PermissionLiveness::Live),
+                (PermissionService::ScreenRecording, state),
+            ]
+            .into_iter()
+            .map(|(service, liveness)| PermissionProbeResult {
+                service,
+                liveness,
+                responsible_process: "ck-cerebellum".into(),
+                off_main: true,
+            }),
+        );
+        let plane = plane(FixtureSource::new(vec![chat_window()])).with_permission_liveness(report);
+        let reply = plane
+            .serve(
+                servable("computer.read_state").unwrap(),
+                &json!({"target": TARGET_BUNDLE_ID, "include_image": true}),
+                ServeContext {
+                    cancel: cerebellum::CancelHandle::for_uninterruptible_probe(),
+                    grantee: GRANTEE,
+                    identity: identity(),
+                    management: &management,
+                    consent: no_relay(),
+                    clock: &clock,
+                    now_ms: 10,
+                },
+                |_| panic!("a missing startup permission must not construct the capture backend"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
+        assert_eq!(
+            reply["image_unavailable"]["reason"], "screen_recording_not_live",
+            "{reply}"
+        );
+        assert!(reply.get("image").is_none(), "{reply}");
+    }
+}
+
 /// Each way the image can fail at the wire returns the tree, no image, and
 /// the declared reason; custody refusing the image releases no bytes.
 #[tokio::test]
@@ -436,6 +494,7 @@ async fn a_missing_image_is_declared_and_the_tree_still_returns() {
         support::computer::failing_audit(),
         ResultSchemaEnforcement::Withhold,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(FixtureSource::new(vec![chat_window()]))
     .with_image_freshness_source(Arc::new(FixtureFreshness {
         repaints: false,
@@ -724,6 +783,7 @@ async fn no_image_read_writes_one_text_free_row() {
         support::computer::audit_with_storage(storage.clone()),
         ResultSchemaEnforcement::Withhold,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(source);
     let before = plane.journal_entry_count().await;
     let reply = serve(
@@ -766,6 +826,7 @@ async fn failed_read_journal_withholds_tree_and_image() {
             support::computer::failing_audit(),
             ResultSchemaEnforcement::Withhold,
         )
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(FixtureSource::new(vec![
             RawElement::fixture(1, "AXWindow").titled(LABEL)
         ]));
@@ -799,6 +860,7 @@ async fn image_and_empty_reads_use_the_same_single_summary_row() {
             support::computer::audit_with_storage(storage.clone()),
             ResultSchemaEnforcement::Withhold,
         )
+        .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(source)
         .with_image_freshness_source(Arc::new(FixtureFreshness {
             repaints: false,
@@ -870,6 +932,7 @@ async fn serialized_read_row_has_all_four_desk_check_fields() {
         support::computer::audit_with_storage(storage.clone()),
         ResultSchemaEnforcement::Withhold,
     )
+    .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(Arc::new(ReportingSource(source)));
     let reply = serve(
         &plane,
