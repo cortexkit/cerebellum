@@ -754,7 +754,7 @@ mod probe {
                     if let Some(pid) = cerebellum_macos::frontmost_process_id() {
                         *seen.topmost.entry(pid).or_default() += 1;
                     }
-                    if tick % 5 == 0 {
+                    if tick.is_multiple_of(5) {
                         if let Some(pid) = active_application_pid() {
                             *seen.active.entry(pid).or_default() += 1;
                         }
