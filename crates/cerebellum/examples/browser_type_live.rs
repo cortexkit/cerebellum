@@ -24,6 +24,7 @@ async fn main() {
         std::process::exit(1);
     }
     let navigate_only = args.iter().any(|arg| arg == "--navigate-only");
+    let headed = args.iter().any(|arg| arg == "--headed");
     let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
     for index in 1..=runs {
@@ -33,7 +34,7 @@ async fn main() {
             "Cold run {index}/{runs}; navigate wait={}",
             if no_settle { "none" } else { "settle" }
         );
-        if let Err(error) = probe::run(no_settle, navigate_only, &mut outcomes).await {
+        if let Err(error) = probe::run(no_settle, navigate_only, headed, &mut outcomes).await {
             eprintln!("FAIL: {error}");
             failures += 1;
         }
@@ -573,6 +574,7 @@ mod probe {
     pub async fn run(
         no_settle: bool,
         navigate_only: bool,
+        headed: bool,
         outcomes: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(), String> {
         let page = Page::start()?;
@@ -581,8 +583,16 @@ mod probe {
         if !chrome.is_file() {
             return Err("Google Chrome is not installed".into());
         }
+        // Headed mode launches the way production does: no startup window, so
+        // the only window is the background page the driver creates. It shows
+        // whether typing ever brings Chrome in front of the person's work.
+        let first_arg = if headed {
+            "--no-startup-window"
+        } else {
+            "--headless=new"
+        };
         let args: Vec<OsString> = [
-            "--headless=new".to_string(),
+            first_arg.to_string(),
             "--remote-debugging-pipe".into(),
             "--no-first-run".into(),
             "--no-default-browser-check".into(),
@@ -662,6 +672,7 @@ mod probe {
                 [page.origin()],
             )])),
         );
+        let focus = headed.then(|| FocusWatch::start(scratch.0.clone()));
         let result = exercise(
             &planes,
             &pipe,
@@ -671,6 +682,14 @@ mod probe {
             outcomes,
         )
         .await;
+        let result = match (result, focus.map(FocusWatch::finish)) {
+            (Ok(()), Some(Err(focus))) => Err(focus),
+            (result, Some(Ok(report))) => {
+                println!("{report}");
+                result
+            }
+            (result, _) => result,
+        };
         if result.is_err() {
             for command in pipe.0.lock().unwrap().trace.values() {
                 eprintln!("CDP TRACE NO RESPONSE {command}");
@@ -705,5 +724,103 @@ mod probe {
         }
         println!("Profile cleanup              | PASS | throwaway /tmp profile deleted");
         result
+    }
+
+    /// Watches, while a headed run types, whether Chrome ever comes in front
+    /// of the person's work: the owner of the topmost normal window every
+    /// 100 ms, and the active application every 500 ms. It only reads; it never
+    /// activates, clicks or types anything.
+    struct FocusWatch {
+        stop: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<FocusSamples>,
+    }
+
+    #[derive(Default)]
+    struct FocusSamples {
+        samples: usize,
+        chrome_pids: std::collections::BTreeSet<i32>,
+        topmost: std::collections::BTreeMap<i32, usize>,
+        active: std::collections::BTreeMap<i32, usize>,
+    }
+
+    impl FocusWatch {
+        fn start(profile: PathBuf) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut seen = FocusSamples::default();
+                let mut tick = 0usize;
+                while !flag.load(Ordering::SeqCst) {
+                    if let Some(pid) = cerebellum_macos::frontmost_process_id() {
+                        *seen.topmost.entry(pid).or_default() += 1;
+                    }
+                    if tick % 5 == 0 {
+                        if let Some(pid) = active_application_pid() {
+                            *seen.active.entry(pid).or_default() += 1;
+                        }
+                        seen.chrome_pids.extend(pids_naming(&profile));
+                    }
+                    seen.samples += 1;
+                    tick += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                seen
+            });
+            Self { stop, thread }
+        }
+
+        fn finish(self) -> Result<String, String> {
+            self.stop.store(true, Ordering::SeqCst);
+            let seen = self.thread.join().map_err(|_| "focus watch panicked")?;
+            let report = format!(
+                "FOCUS: {} samples; Chrome pids {:?}; topmost normal-window owners {:?}; active apps {:?}",
+                seen.samples, seen.chrome_pids, seen.topmost, seen.active
+            );
+            if seen.chrome_pids.is_empty() {
+                return Err(format!(
+                    "{report}; no Chrome process was seen, so the watch proves nothing"
+                ));
+            }
+            let fronted = seen
+                .chrome_pids
+                .iter()
+                .any(|pid| seen.topmost.contains_key(pid) || seen.active.contains_key(pid));
+            if fronted {
+                Err(format!("{report}; CHROME CAME TO THE FRONT"))
+            } else {
+                Ok(format!("{report}; Chrome stayed behind"))
+            }
+        }
+    }
+
+    fn active_application_pid() -> Option<i32> {
+        let asn = std::process::Command::new("/usr/bin/lsappinfo")
+            .arg("front")
+            .output()
+            .ok()?;
+        let asn = String::from_utf8_lossy(&asn.stdout).trim().to_string();
+        let info = std::process::Command::new("/usr/bin/lsappinfo")
+            .args(["info", "-only", "pid", &asn])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&info.stdout)
+            .rsplit('=')
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn pids_naming(profile: &std::path::Path) -> Vec<i32> {
+        std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", &profile.display().to_string()])
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
