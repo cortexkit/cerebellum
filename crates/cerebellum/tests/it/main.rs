@@ -34,3 +34,5 @@ mod private_data_write_scan;
 mod profile_root_rebind;
 mod session_caller_admission;
 mod support;
+
+mod browser_focus;

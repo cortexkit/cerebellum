@@ -234,9 +234,20 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
     }
 
     fn focus_type_target(&mut self, _: &str) -> Result<(), TypeDriverError> {
-        // DOM focus alone can leave the tab backgrounded. The first insertion
-        // would then activate it and run focus handlers after caret preparation.
-        self.command("Page.bringToFront", serde_json::json!({}))?;
+        // Emulate document focus without activating Chrome or raising its window.
+        // Separate frame targets have their own sessions and need their own setting.
+        let session = self
+            .driver
+            .frame_attachment(&self.target.identity)
+            .map_err(|_| TypeDriverError::new("type_frame_not_ready"))?
+            .session_id;
+        if !self.driver.focus_emulated_sessions.contains(&session) {
+            self.command(
+                "Emulation.setFocusEmulationEnabled",
+                serde_json::json!({"enabled":true}),
+            )?;
+            self.driver.focus_emulated_sessions.insert(session);
+        }
         self.command(
             "DOM.focus",
             serde_json::json!({"backendNodeId":self.target.identity.backend_node_id}),
@@ -274,7 +285,7 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             .and_then(|object| object.get("objectId"))
             .and_then(Value::as_str)
             .ok_or_else(|| TypeDriverError::new("cdp_failure"))?;
-        let focused = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return this.getRootNode().activeElement === this; }","returnByValue":true}))?;
+        let focused = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }","returnByValue":true}))?;
         if focused
             .get("result")
             .and_then(|result| result.get("value"))

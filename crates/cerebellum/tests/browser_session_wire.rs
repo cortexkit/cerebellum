@@ -3387,8 +3387,9 @@ impl CdpPipeIo for ChromeLikePipe {
                         .unwrap_or_else(click_page_document),
                 ),
             ),
-            "Page.bringToFront" => {
-                *self.typing.as_ref().unwrap().fronted.lock().unwrap() = true;
+            "Emulation.setFocusEmulationEnabled" => {
+                *self.typing.as_ref().unwrap().has_focus.lock().unwrap() =
+                    command["params"]["enabled"].as_bool().unwrap();
                 self.reply(id, json!({}));
             }
             "DOM.focus" => {
@@ -3428,6 +3429,8 @@ impl CdpPipeIo for ChromeLikePipe {
                     Some(true)
                 } else if function.contains("length === 0") {
                     Some(page.value.lock().unwrap().is_empty())
+                } else if function.contains("hasFocus()") {
+                    Some(*page.has_focus.lock().unwrap())
                 } else {
                     Some(true)
                 };
@@ -3455,7 +3458,7 @@ impl CdpPipeIo for ChromeLikePipe {
                 let text = command["params"]["text"].as_str().unwrap();
                 let mut value = page.value.lock().unwrap();
                 let mut caret = page.caret.lock().unwrap();
-                if page.background && !*page.fronted.lock().unwrap() {
+                if !*page.has_focus.lock().unwrap() {
                     *caret = 0;
                 }
                 if *page.selected.lock().unwrap() {
@@ -8726,8 +8729,7 @@ struct TypePage {
     ignore_delete: bool,
     fail_focus: bool,
     cold_runtime: bool,
-    background: bool,
-    fronted: Arc<Mutex<bool>>,
+    has_focus: Arc<Mutex<bool>>,
     runtime_enabled: Arc<Mutex<bool>>,
     autocomplete: String,
     frame_origin: Option<String>,
@@ -9031,15 +9033,32 @@ async fn wire_type_initializes_runtime_before_resolving_cold_target() {
 }
 
 #[tokio::test]
-async fn wire_type_focuses_tab_before_setting_append_caret() {
-    let page = TypePage {
-        background: true,
-        ..Default::default()
-    };
+async fn wire_type_emulates_focus_before_setting_append_caret() {
+    let page = TypePage::default();
+    assert!(!*page.has_focus.lock().unwrap());
     let value = page.value.clone();
     *value.lock().unwrap() = "existing".into();
     let (planes, _, _) = type_fixture(page).await;
     let reply = type_wire(&planes, " suffix", false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(*value.lock().unwrap(), "existing suffix");
+}
+
+#[tokio::test]
+async fn wire_type_emulates_focus_once_per_attached_session() {
+    let page = TypePage::default();
+    let has_focus = page.has_focus.clone();
+    let (planes, _, commands) = type_fixture(page).await;
+    assert_eq!(type_wire(&planes, "first", false).await["outcome"], "ok");
+    assert_eq!(type_wire(&planes, "second", false).await["outcome"], "ok");
+    assert!(*has_focus.lock().unwrap());
+    assert_eq!(
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| method.as_str() == "Emulation.setFocusEmulationEnabled")
+            .count(),
+        1
+    );
 }
