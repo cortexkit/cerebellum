@@ -1765,9 +1765,11 @@ mod tests {
         }
     }
 
-    /// The state read's review still gates advertisement, but neither of its
-    /// permissions does. The wire admission tests cover missing accessibility
-    /// and the optional image disclosure independently.
+    /// The application-state review (`app_state_review_revision`) gates
+    /// advertisement of `computer.read_state`. Accessibility is needed at call
+    /// time to read the tree, and Screen Recording is needed only for the optional
+    /// image; neither permission gates advertisement. Wire tests separately
+    /// verify the Accessibility refusal and the missing-image disclosure.
     #[test]
     fn read_state_is_gated_on_its_own_review_and_not_on_screen_recording() {
         let driver = MacOs26PlatformDriver::default();
@@ -1793,8 +1795,10 @@ mod tests {
         );
     }
 
-    /// Missing accessibility leaves keys advertised. Its secure-field reading
-    /// is protected by call-time admission, covered through both wire names.
+    /// `computer.keys` stays advertised without Accessibility. At call time,
+    /// Accessibility is needed to inspect the target's focused element and refuse
+    /// keystrokes into secure text fields. Wire tests exercise this refusal through
+    /// `computer.keys` and `computer_use` with action `keys`.
     #[test]
     fn computer_keys_is_advertised_without_accessibility() {
         let driver = MacOs26PlatformDriver::default();
@@ -1806,8 +1810,9 @@ mod tests {
         let context = |permissions: PermissionLivenessReport| CapabilityAdvertisementContext {
             inputs: fully_bound_inputs(),
             permissions: permissions.clone(),
-            // Keep both diagnostic copies consistent, though neither decides
-            // advertisement.
+            // Keep CapabilityAdvertisementContext.permissions and
+            // CapabilityAdvertisementContext.startup.permissions consistent;
+            // neither report decides advertisement.
             startup: StartupCapabilityProbe {
                 permissions,
                 ..driver.startup_probe().clone()
@@ -1882,8 +1887,10 @@ mod tests {
         }
     }
 
-    /// A crashed probe remains diagnostic evidence but cannot hide tools. The
-    /// wire tests preserve probe_failed separately from unresolved and denied.
+    /// `probe_failed` means the startup probe panicked before reporting.
+    /// `unresolved` means no usable permission reading was established; a denied
+    /// permission is reported as `unavailable`. None of these states hides tools,
+    /// and the wire tests keep them distinct in call-time refusals.
     #[test]
     fn a_panicked_permission_probe_preserves_advertisement_and_diagnostic_state() {
         let driver = MacOs26PlatformDriver::default();

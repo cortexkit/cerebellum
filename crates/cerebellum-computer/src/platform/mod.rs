@@ -145,9 +145,9 @@ impl PermissionLivenessReport {
         }
     }
 
-    /// The report for a probe that never returned. Every service reads
-    /// `ProbeFailed` so each call-time refusal names the crash instead of
-    /// describing a grant nobody looked at.
+    /// Mark every service `ProbeFailed` when the startup probe fails to return,
+    /// so call-time refusals report a failed probe rather than a permission
+    /// denial.
     pub fn probe_failed() -> Self {
         Self {
             states: BTreeMap::new(),
@@ -512,31 +512,11 @@ fn capability_declaration(
         // WANTS instead of what the driver can do, which is the same shape as a
         // frozen column nothing verifies: the claim and its subject never meet.
         semantic_path: semantic_support,
-        // Supported on the platform itself rather than on a private envelope:
-        // the per-process path is public CGEventPostToPid, which needs no symbol
-        // resolution. The private-envelope flag is still carried for the
-        // OBSERVED path and for callers that ask about it, but it does not
-        // decide whether background delivery exists.
-        // Background delivery is claimed per SYNTHETIC EVENT CLASS, because the
-        // per-process path carries one and not the other. Measured on macOS 26
-        // against a native application, with the target backgrounded and focus
-        // sampled throughout:
-        //
-        //   keystroke posted to the pid    lands
-        //   drag posted to the pid         no effect, even with the target
-        //                                  frontmost, while the SAME constructed
-        //                                  events posted globally do select
-        //
-        // So the events are right and the per-process path does not carry
-        // pointer events. Claiming Supported for a pointer row would offer a
-        // caller a background capability that cannot deliver.
-        //
-        // Those rows are not broken: they are deliverable through the GLOBAL
-        // path, which seizes the shared cursor and is the authority this module
-        // calls observed mode. That separately gated path is now built, but it
-        // does not turn a global cursor action into background delivery. The
-        // honest claim here remains Unsupported because the per-process path
-        // does not carry these events.
+        // CGEventPostToPid delivers keystrokes to a background process, but it
+        // does not deliver pointer events. Pointer events need global dispatch,
+        // which moves the real cursor, so it is not background delivery.
+        // The private-envelope flag records recognition of private SkyLight
+        // symbols; it does not decide whether background delivery is supported.
         synthetic_background: background_support,
         // Derived from the dispatch modes rather than asserted beside them, so
         // the two cannot disagree about whether a row has an observed path.
