@@ -2146,6 +2146,13 @@ pub use platform::{
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn announce_permission_skip(test_name: &str, reason: &str) {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "test {test_name} ... SKIPPED: {reason}");
+    }
+
     #[derive(Clone)]
     struct FakeSource {
         process_exists: bool,
@@ -4083,6 +4090,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pid_outside_the_platform_range_is_reported_as_missing() {
+        if let Some(reason) =
+            crate::test_support::accessibility_skip_reason(accessibility_is_permitted)
+        {
+            announce_permission_skip(
+                "a_pid_outside_the_platform_range_is_reported_as_missing",
+                reason,
+            );
+            return;
+        }
         assert_eq!(
             read_accessibility_tree(u32::MAX, options(10, 10)),
             Err(AxReadError::NoSuchProcess { pid: u32::MAX })
@@ -4095,6 +4111,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_test_process_tree_is_read_when_it_exposes_accessibility_values() {
+        if let Some(reason) =
+            crate::test_support::accessibility_skip_reason(accessibility_is_permitted)
+        {
+            announce_permission_skip(
+                "the_test_process_tree_is_read_when_it_exposes_accessibility_values",
+                reason,
+            );
+            return;
+        }
         let pid = std::process::id();
         match read_accessibility_tree(pid, options(16, 1_000)) {
             Ok(tree) => {

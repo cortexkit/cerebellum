@@ -6,6 +6,10 @@ license = "MIT"
 publish = false
 description = "Raw macOS framework readings for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
 
+[features]
+# Exposes permission-skip helpers only when a dependent test target opts in.
+test-support = []
+
 [lib]
 name = "cerebellum_macos"
 path = "src/lib.rs"

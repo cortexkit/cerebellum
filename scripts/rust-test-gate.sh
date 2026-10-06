@@ -199,6 +199,22 @@ check_tests_do_not_journal_durably() {
 run_phase "no test journals to the operator's disk" \
   check_tests_do_not_journal_durably
 
+# A preflight is a reading, not a request. A test that calls one of the
+# requesting APIs can put a system dialog on the desk running the gate, so the
+# source guard uses the same Rust-aware test-code regions as the journal scan
+# and proves it sees planted requests before scanning this workspace.
+check_tests_do_not_request_macOS_permissions() {
+  scripts/lib/mac-permission-request-scan.test.sh >/dev/null || {
+    echo "    the permission scanner's planted-request proofs failed:" >&2
+    scripts/lib/mac-permission-request-scan.test.sh 2>&1 | grep -v '^ok ' | sed 's/^/      /' >&2
+    return 1
+  }
+  python3 scripts/lib/mac-permission-request-scan.py .
+}
+
+run_phase "no test requests macOS permissions" \
+  check_tests_do_not_request_macOS_permissions
+
 # Phase 1: format workspace members. Keep the scope explicit so only this
 # repository's source is checked, and refuse an empty member list.
 check_members_formatted() {

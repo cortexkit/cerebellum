@@ -18,6 +18,8 @@ use crate::capture::{
     CaptureBackend, EnumeratedWindow, VisionWindowFrame, WindowCaptureFrame, WindowCaptureRequest,
     WindowChange, WindowChangeKind, WindowFrame,
 };
+#[cfg(test)]
+use cerebellum_macos::test_support as permission_test_support;
 
 /// The process this system attributes our permission grants to.
 ///
@@ -774,15 +776,29 @@ mod tests {
     /// allows and fail for a reason unrelated to what they assert.
     static FIRST_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn skip_without_screen_recording(test_name: &str) -> bool {
+        let Some(reason) = permission_test_support::screen_recording_skip_reason(
+            cerebellum_macos::screen_capture_is_permitted,
+        ) else {
+            return false;
+        };
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "test {test_name} ... SKIPPED: {reason}");
+        true
+    }
+
     /// Whether this machine can currently produce window pixels at all.
     ///
     /// Two states prevent it and they are different: capture may not be
     /// permitted, or the screen may be locked. A locked screen still answers
     /// questions about windows while refusing their contents, so a test that
     /// only checks enumeration would proceed and then fail on the picture.
-    fn pixels_are_obtainable() -> bool {
-        cerebellum_macos::screen_capture_is_permitted()
-            && cerebellum_macos::screen_is_locked() != Some(true)
+    fn pixels_are_obtainable(test_name: &str) -> bool {
+        if skip_without_screen_recording(test_name) {
+            return false;
+        }
+        cerebellum_macos::screen_is_locked() != Some(true)
     }
 
     /// Skip a live capture assertion only when the screen became locked after the test
@@ -980,6 +996,9 @@ mod tests {
     /// exercising the filter at all.
     #[test]
     fn enumeration_returns_only_the_targets_windows() {
+        if skip_without_screen_recording("enumeration_returns_only_the_targets_windows") {
+            return;
+        }
         let _serialized = FIRST_CAPTURE.lock();
         let Ok(all) = cerebellum_macos::enumerate_windows(timeout()) else {
             return;
@@ -1037,6 +1056,10 @@ mod tests {
     /// dropped the check entirely would mark these verified.
     #[test]
     fn windows_of_an_unverifiable_owner_are_returned_unverified() {
+        if skip_without_screen_recording("windows_of_an_unverifiable_owner_are_returned_unverified")
+        {
+            return;
+        }
         let _serialized = FIRST_CAPTURE.lock();
         let Ok(all) = cerebellum_macos::enumerate_windows(timeout()) else {
             return;
@@ -1064,7 +1087,7 @@ mod tests {
     /// Capturing through the backend yields the target's pixels.
     #[test]
     fn capturing_through_the_backend_yields_pixels() {
-        if !pixels_are_obtainable() {
+        if !pixels_are_obtainable("capturing_through_the_backend_yields_pixels") {
             return;
         }
         let _serialized = FIRST_CAPTURE.lock();
@@ -1133,7 +1156,7 @@ mod tests {
     /// tell, since the window id alone is a valid id.
     #[test]
     fn capturing_a_window_owned_by_another_process_refuses() {
-        if !pixels_are_obtainable() {
+        if !pixels_are_obtainable("capturing_a_window_owned_by_another_process_refuses") {
             return;
         }
         let _serialized = FIRST_CAPTURE.lock();

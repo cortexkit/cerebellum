@@ -50,6 +50,8 @@ mod content_named_fixture;
 mod macos;
 #[cfg(target_os = "macos")]
 mod process_table;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 // The record-offset selection is pure and compiled for unit tests on every
 // host; the calls into the private framework are macOS-only.
 #[cfg(any(target_os = "macos", test))]

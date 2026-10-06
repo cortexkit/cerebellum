@@ -21,6 +21,7 @@
 //!   - wrong space: row i holds source row i + k for some other band (or the
 //!     capture fails, or holds no pattern at all);
 //!   - ignored: row i holds source row 2i, the whole height squeezed.
+
 //!
 //! WHY A HELPER PROCESS, AND WHY THIS TARGET HAS NO TEST HARNESS. AppKit windows
 //! must be created on a process's main thread, and the standard test harness
@@ -36,6 +37,10 @@
 //! a single-window capture reads the window's own contents whether or not
 //! anything covers it, so it never needs to be in front. The test reads the
 //! frontmost process before and after, and fails if the helper became it.
+
+#[cfg(target_os = "macos")]
+#[path = "../src/test_support.rs"]
+mod permission_test_support;
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -59,6 +64,7 @@ mod pattern {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use super::permission_test_support::{run_after_permission_preflight, Permission};
     use cerebellum_macos::{
         capture_window, enumerate_windows, frontmost_process_id, screen_capture_is_permitted,
         screen_is_locked, CaptureSourceRect, RawCapture,
@@ -158,15 +164,20 @@ mod pattern {
     }
 
     fn measure() -> Outcome {
+        match run_after_permission_preflight(
+            Permission::ScreenRecording,
+            screen_capture_is_permitted,
+            measure_with_screen_recording,
+        ) {
+            Ok(outcome) => outcome,
+            Err(reason) => Outcome::Skipped(reason.to_string()),
+        }
+    }
+
+    fn measure_with_screen_recording() -> Outcome {
         if screen_is_locked() == Some(true) {
             return Outcome::Skipped(
                 "the screen is locked, so no window is realised and no pixels are readable"
-                    .to_string(),
-            );
-        }
-        if !screen_capture_is_permitted() {
-            return Outcome::Skipped(
-                "Screen Recording is not granted to this process, so no window can be captured"
                     .to_string(),
             );
         }

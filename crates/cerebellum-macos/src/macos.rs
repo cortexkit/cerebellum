@@ -1385,19 +1385,39 @@ mod tests {
     /// process, so a lock here covers them.
     static WINDOW_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Whether this machine can currently produce window pixels at all.
-    ///
-    /// Two states prevent it and they are different: capture may not be
-    /// permitted, or the screen may be locked. A locked screen still answers
-    /// questions about windows while refusing their contents, so a test that
-    /// only checks enumeration would proceed and then fail on the picture.
-    ///
-    /// Tests asserting a property OF a capture stop when this is false, since a
-    /// machine that cannot capture has nothing to say about it. Tests asserting
-    /// a REFUSAL do not need it: they are about what is refused, and both
-    /// states refuse.
-    fn pixels_are_obtainable() -> bool {
-        screen_capture_is_permitted() && screen_is_locked() != Some(true)
+    /// Whether this machine's screen is unlocked for a live pixel reading.
+    /// Screen Recording is checked separately first so a missing grant always
+    /// produces the same named skip before any window-server operation.
+    fn screen_is_unlocked() -> bool {
+        screen_is_locked() != Some(true)
+    }
+
+    fn skip_without_screen_recording(test_name: &str) -> bool {
+        let Some(reason) =
+            crate::test_support::screen_recording_skip_reason(screen_capture_is_permitted)
+        else {
+            return false;
+        };
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "test {test_name} ... SKIPPED: {reason}");
+        true
+    }
+
+    #[test]
+    fn a_denied_fake_permission_source_stops_before_the_protected_operation() {
+        let reached_protected_operation = std::cell::Cell::new(false);
+        let denied = crate::test_support::run_after_permission_preflight(
+            crate::test_support::Permission::ScreenRecording,
+            || false,
+            || reached_protected_operation.set(true),
+        );
+
+        assert_eq!(
+            denied,
+            Err("Screen Recording is not granted to the process running this test")
+        );
+        assert!(!reached_protected_operation.get());
     }
 
     /// The attribution resolves to a real executable on this system.
@@ -1524,6 +1544,11 @@ mod tests {
     /// either kind, which is what the original equivalence was reaching for.
     #[test]
     fn a_denied_permission_query_means_enumeration_cannot_succeed() {
+        if skip_without_screen_recording(
+            "a_denied_permission_query_means_enumeration_cannot_succeed",
+        ) {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         let permitted = screen_capture_is_permitted();
         let enumerated = enumerate_windows(Duration::from_secs(10));
@@ -1548,6 +1573,9 @@ mod tests {
     /// to answer has nothing to say about it.
     #[test]
     fn enumerated_windows_carry_an_owning_process() {
+        if skip_without_screen_recording("enumerated_windows_carry_an_owning_process") {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
             return;
@@ -1578,6 +1606,9 @@ mod tests {
     /// there rather than claiming a result.
     #[test]
     fn an_expired_deadline_refuses_rather_than_waits() {
+        if skip_without_screen_recording("an_expired_deadline_refuses_rather_than_waits") {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         if enumerate_windows(Duration::from_secs(10)).is_err() {
             return;
@@ -1627,7 +1658,9 @@ mod tests {
     /// say about it.
     #[test]
     fn a_captured_window_yields_pixels_of_its_own_size() {
-        if !pixels_are_obtainable() {
+        if skip_without_screen_recording("a_captured_window_yields_pixels_of_its_own_size")
+            || !screen_is_unlocked()
+        {
             return;
         }
         let _serialized = WINDOW_SERVER.lock();
@@ -1721,6 +1754,9 @@ mod tests {
     /// happened.
     #[test]
     fn a_padded_width_is_repacked_rather_than_carried() {
+        if skip_without_screen_recording("a_padded_width_is_repacked_rather_than_carried") {
+            return;
+        }
         let Ok(windows) = enumerate_windows(Duration::from_secs(10)) else {
             return;
         };
@@ -1747,6 +1783,9 @@ mod tests {
     /// answered with whatever now holds that id.
     #[test]
     fn capturing_a_window_that_is_gone_refuses() {
+        if skip_without_screen_recording("capturing_a_window_that_is_gone_refuses") {
+            return;
+        }
         let _serialized = WINDOW_SERVER.lock();
         // Above any id the window server has assigned on a running system.
         assert!(capture_window(u32::MAX - 1, Duration::from_secs(10), None).is_err());
@@ -1816,7 +1855,10 @@ mod tests {
     /// server.
     #[test]
     fn creating_a_filter_without_the_window_server_connection_kills_the_process() {
-        if !pixels_are_obtainable() {
+        if skip_without_screen_recording(
+            "creating_a_filter_without_the_window_server_connection_kills_the_process",
+        ) || !screen_is_unlocked()
+        {
             return;
         }
         let _serialized = WINDOW_SERVER.lock();
@@ -1917,7 +1959,10 @@ mod tests {
     /// [`capture_window`] is the only thing standing between it and an abort.
     #[test]
     fn capturing_establishes_the_window_server_connection_itself() {
-        if !pixels_are_obtainable() {
+        if skip_without_screen_recording(
+            "capturing_establishes_the_window_server_connection_itself",
+        ) || !screen_is_unlocked()
+        {
             return;
         }
         let _serialized = WINDOW_SERVER.lock();
@@ -2044,6 +2089,9 @@ mod tests {
     /// in the unlocked case.
     #[test]
     fn a_session_reports_a_definite_lock_state() {
+        if skip_without_screen_recording("a_session_reports_a_definite_lock_state") {
+            return;
+        }
         // Enumeration succeeding establishes that there IS a session to ask,
         // which is the only condition under which None would be correct. It
         // does NOT establish that the screen is unlocked: a locked screen
