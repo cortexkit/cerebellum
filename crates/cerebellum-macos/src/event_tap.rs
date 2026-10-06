@@ -5,8 +5,12 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use crate::input::InputMonitoringAccess;
 
-/// Deliberate hardware events exclude motion, synthetic sources and private
-/// state (which can have a zero source PID).
+/// A deliberate act by a person at the hardware: a key press (10), a left,
+/// right or other mouse-button press (1, 3, 25) or a scroll (22). Pointer
+/// motion is excluded because it isn't an act on an app. A nonzero source PID
+/// means another process synthesised the event. The private source state
+/// (`kCGEventSourceStatePrivate`, -1) is excluded because synthetic events
+/// posted from a private source can still carry a zero source PID.
 fn is_hardware_deliberate(pid: i64, source_state: i64, event_type: u32) -> bool {
     pid == 0 && source_state != -1 && matches!(event_type, 1 | 3 | 10 | 22 | 25)
 }
@@ -114,8 +118,10 @@ trait HardwareTapControl {
     fn enable(&self);
 }
 
-/// Recover observation without pretending the disabled interval was covered.
-/// Both the liveness worker and injected-disable tests use this same path.
+/// Re-enable a tap macOS disabled, and restart coverage from now: input that
+/// arrived while the tap was off was never seen, so an action whose last read
+/// predates the gap must read again rather than be treated as observed.
+/// The liveness worker and the injected-disable tests share this function.
 fn recover_hardware_observer(
     tap: &impl HardwareTapControl,
     history: &std::sync::Mutex<HardwareHistory>,
