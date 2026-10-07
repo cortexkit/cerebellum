@@ -803,10 +803,14 @@ mod probe {
             .args(["info", "-only", "pid", &asn])
             .output()
             .ok()?;
-        String::from_utf8_lossy(&info.stdout)
-            .rsplit('=')
+        // `lsappinfo info` prints a block whose pid appears as `pid = N`;
+        // take the number after the first `pid` key rather than the last `=`.
+        let text = String::from_utf8_lossy(&info.stdout).to_string();
+        let after = text.split("pid").nth(1)?;
+        after
+            .trim_start_matches(|c: char| c == ' ' || c == '=' || c == '"')
+            .split(|c: char| !c.is_ascii_digit())
             .next()?
-            .trim()
             .parse()
             .ok()
     }
