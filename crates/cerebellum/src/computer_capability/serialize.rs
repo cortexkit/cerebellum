@@ -2,9 +2,9 @@
 //!
 //! A reservation is polled once when it is issued, not first polled by the
 //! spawned request. Tokio's mutex queues on that first poll. The frame loop
-//! resolves the app and issues this ticket before spawning, without awaiting
-//! the app lock. A slow spawn therefore cannot let a later frame overtake it,
-//! and neither consent nor dispatch blocks the frame reader.
+//! only reserves a conversation position. The spawned task resolves the app,
+//! reserves its app position, then releases the conversation lane before
+//! waiting for the app. Platform work can never hold the frame reader.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use cerebellum_computer::app_state::session::ElementResolution;
 use cerebellum_computer::app_state::source::HitScope;
@@ -24,6 +25,8 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{ComputerPlane, Servable, ServeContext, Served};
 use crate::computer_grants::ConsentRefusal;
+
+const RESOLUTION_LIMIT: Duration = Duration::from_secs(2);
 
 type LockFuture = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
 
@@ -44,10 +47,6 @@ impl Reservation {
         }
         Self { future }
     }
-
-    async fn acquire(self) -> OwnedMutexGuard<()> {
-        self.future.await
-    }
 }
 
 type Key = (String, String);
@@ -63,7 +62,7 @@ struct Registry(Mutex<HashMap<Key, Entry>>);
 /// Counts queued as well as executing calls. A final drop removes the entry
 /// under the same map lock as insertion, so there can never be two live locks
 /// for one key. Field order releases the lock before removing its map entry.
-pub(super) struct AppGuard {
+pub(super) struct LaneGuard {
     _lock: OwnedMutexGuard<()>,
     _lease: Lease,
 }
@@ -84,28 +83,41 @@ impl Drop for Lease {
     }
 }
 
-pub(crate) struct AppReservation {
+pub(crate) struct QueuePosition {
     reservation: Reservation,
     lease: Lease,
 }
 
+impl QueuePosition {
+    async fn acquire(mut self) -> LaneGuard {
+        // Borrow the future while awaiting so cancellation drops the queued
+        // position before its lease, just like a completed guard's fields.
+        let lock = self.reservation.future.as_mut().await;
+        LaneGuard {
+            _lock: lock,
+            _lease: self.lease,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Serializer {
+    conversations: Arc<Registry>,
     registry: Arc<Registry>,
 }
 
-impl Serializer {
-    fn reserve(&self, key: Key) -> AppReservation {
-        let mut entries = self.registry.0.lock().unwrap_or_else(|e| e.into_inner());
+impl Registry {
+    fn reserve(self: &Arc<Self>, key: Key) -> QueuePosition {
+        let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.entry(key.clone()).or_insert_with(|| Entry {
             mutex: Arc::new(AsyncMutex::new(())),
             users: 0,
         });
         entry.users += 1;
-        AppReservation {
+        QueuePosition {
             reservation: Reservation::new(entry.mutex.clone()),
             lease: Lease {
-                registry: self.registry.clone(),
+                registry: self.clone(),
                 key,
             },
         }
@@ -113,25 +125,21 @@ impl Serializer {
 }
 
 tokio::task_local! {
-    static ARRIVAL: RefCell<Option<AppReservation>>;
+    static ARRIVAL: RefCell<Option<QueuePosition>>;
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) async fn scope<T>(
-    arrival: Option<AppReservation>,
-    future: impl Future<Output = T>,
-) -> T {
+pub(crate) async fn scope<T>(arrival: Option<QueuePosition>, future: impl Future<Output = T>) -> T {
     ARRIVAL.scope(RefCell::new(arrival), future).await
 }
 
-/// Resolve and reserve in frame order, but never wait for the app lock here.
-/// Admission is checked before any platform lookup; refused calls still go
-/// through the ordinary handler to receive its existing refusal.
+/// Reserve a conversation's FIFO position without resolving a target or
+/// querying the platform. Refused calls still use the normal reply handler.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) async fn arrive(
+pub(crate) fn arrive(
     frame: &subc_protocol::Frame,
     planes: &crate::Planes,
-) -> Option<AppReservation> {
+) -> Option<QueuePosition> {
     let body: Value = serde_json::from_slice(&frame.body).ok()?;
     let name = body.get("name")?.as_str()?;
     let arguments = body.get("arguments")?;
@@ -176,14 +184,12 @@ pub(crate) async fn arrive(
     if super::permissions::refusal(capability.capability(), &plane.permissions).is_some() {
         return None;
     }
-    plane
-        .reserve_app(
-            capability,
-            arguments,
-            &facts.identity.conversation_key,
-            &planes.management,
-        )
-        .await
+    Some(
+        plane
+            .serializer
+            .conversations
+            .reserve((facts.identity.conversation_key, String::new())),
+    )
 }
 
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
@@ -199,7 +205,7 @@ where
         capability: Servable,
         arguments: &Value,
         context: &ServeContext<'_, C>,
-    ) -> Result<Option<AppGuard>, ConsentRefusal> {
+    ) -> Result<Option<LaneGuard>, ConsentRefusal> {
         if matches!(capability.0, Served::ListApps) || valid_request(capability, arguments).is_err()
         {
             return Ok(None);
@@ -209,23 +215,32 @@ where
             .ok()
             .flatten();
         let enter = async {
-            let ticket = match ticket {
-                Some(ticket) => ticket,
-                None => {
-                    self.reserve_app(
-                        capability,
-                        arguments,
-                        &context.identity.conversation_key,
-                        context.management,
-                    )
-                    .await?
-                }
-            };
-            let lock = ticket.reservation.acquire().await;
-            Some(AppGuard {
-                _lock: lock,
-                _lease: ticket.lease,
-            })
+            let ticket = ticket.unwrap_or_else(|| {
+                self.serializer
+                    .conversations
+                    .reserve((context.identity.conversation_key.clone(), String::new()))
+            });
+            let conversation = ticket.acquire().await;
+            // Ordering is best-effort when resolution exceeds two seconds:
+            // run this call unserialized rather than letting a wedged platform
+            // query stall every other app in the conversation. Dropping the
+            // await cannot stop a running blocking query, but that query owns
+            // neither lane and cannot reserve an app lock after the timeout.
+            let app = tokio::time::timeout(
+                RESOLUTION_LIMIT,
+                self.reserve_app(
+                    capability,
+                    arguments,
+                    &context.identity.conversation_key,
+                    context.management,
+                ),
+            )
+            .await
+            .ok()
+            .flatten();
+            drop(conversation);
+            let ticket = app?;
+            Some(ticket.acquire().await)
         };
         let mut drain = context.consent.drain.clone();
         tokio::select! {
@@ -246,12 +261,13 @@ where
         arguments: &Value,
         conversation: &str,
         management: &Arc<crate::management::ManagementPlane>,
-    ) -> Option<AppReservation> {
+    ) -> Option<QueuePosition> {
         let app = self
             .serialization_app(capability, arguments, conversation, management)
             .await?;
         Some(
             self.serializer
+                .registry
                 .reserve((conversation.to_string(), app.to_lowercase())),
         )
     }
@@ -277,10 +293,6 @@ where
             Served::PressPoint => sessions
                 .resolve_image(conversation, arguments.get("image_id")?.as_str()?)
                 .map(|image| image.bundle_identity),
-            // Scroll has no point that can be resolved before dispatch. It uses
-            // a conversation-local takeover lane rather than guessing the app
-            // currently under the shared pointer.
-            Served::TakeoverScroll => Some("takeover".to_string()),
             Served::TakeoverMove | Served::TakeoverDrag => {
                 let request =
                     super::takeover::parse_request(capability.capability(), arguments).ok()?;
@@ -299,18 +311,18 @@ where
                 }) {
                     return None;
                 }
-                let current = management.resolve_process(&image.bundle_identity).ok()?;
-                if current.pid != image.pid
-                    || current.process_generation_evidence != image.process_generation
-                {
-                    return None;
-                }
                 let (x, y) = points[0];
                 let (x, y) = image.mapping.pixel_to_desktop(x as f64, y as f64);
                 let point = SyntheticPoint { x, y };
                 let source = self.app_state_source.clone();
                 let management = management.clone();
                 tokio::task::spawn_blocking(move || {
+                    let current = management.resolve_process(&image.bundle_identity).ok()?;
+                    if current.pid != image.pid
+                        || current.process_generation_evidence != image.process_generation
+                    {
+                        return None;
+                    }
                     let at = (point.x, point.y);
                     if let Ok(Some((_, owner))) =
                         source.element_at(HitScope::Application { pid: image.pid }, at)
@@ -337,7 +349,7 @@ where
                 .resolve_target_name(arguments.get("app")?.as_str()?)
                 .await
                 .ok(),
-            Served::ReadState | Served::Type | Served::Keys => self
+            Served::ReadState | Served::Type | Served::Keys | Served::TakeoverScroll => self
                 .resolve_target_name(arguments.get("target")?.as_str()?)
                 .await
                 .ok(),
@@ -401,7 +413,8 @@ mod tests {
     use super::*;
     use crate::*;
     use cerebellum_computer::app_state::source::{
-        AppStateReadError, AppStateSource, RawAppState, ReadBounds, RunningApp,
+        AppStateReadError, AppStateSource, ElementActionError, ElementHandle, RawAppState,
+        ReadBounds, RunningApp,
     };
     use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -442,14 +455,53 @@ mod tests {
         reads: AtomicUsize,
         events: mpsc::UnboundedSender<Event>,
         released: (Mutex<bool>, Condvar),
+        hits: AtomicUsize,
+        hits_returned: AtomicUsize,
+        hit_started: mpsc::UnboundedSender<usize>,
+        hit_released: (Mutex<bool>, Condvar),
     }
     impl Desk {
+        fn release_hit(&self) {
+            *self.hit_released.0.lock().unwrap() = true;
+            self.hit_released.1.notify_all();
+        }
+
         fn release(&self) {
             *self.released.0.lock().unwrap() = true;
             self.released.1.notify_all();
         }
     }
+    struct ReleaseHit(Arc<Desk>);
+    impl Drop for ReleaseHit {
+        fn drop(&mut self) {
+            self.0.release_hit();
+        }
+    }
+
     impl AppStateSource for Desk {
+        fn element_at(
+            &self,
+            _: HitScope,
+            _: (f64, f64),
+        ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+            let number = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.hit_started.send(number);
+            if number == 1 {
+                let (released, timeout) = self
+                    .hit_released
+                    .1
+                    .wait_timeout_while(
+                        self.hit_released.0.lock().unwrap(),
+                        Duration::from_secs(10),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                drop(released);
+                assert!(!timeout.timed_out(), "scripted hit test was never released");
+            }
+            self.hits_returned.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
         fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
             Ok(vec![RunningApp {
                 name: "Editor".into(),
@@ -489,6 +541,7 @@ mod tests {
         planes: Planes,
         desk: Arc<Desk>,
         events: mpsc::UnboundedReceiver<Event>,
+        hit_events: mpsc::UnboundedReceiver<usize>,
         wire: DuplexStream,
         replies: mpsc::Receiver<Frame>,
         dispatch: JoinHandle<Result<(), ModuleError>>,
@@ -535,10 +588,15 @@ mod tests {
 
     fn rig(second_conversation: bool, slowed: Option<SlowDispatch>) -> Rig {
         let (events_tx, events) = mpsc::unbounded_channel();
+        let (hit_started, hit_events) = mpsc::unbounded_channel();
         let desk = Arc::new(Desk {
             reads: AtomicUsize::new(0),
             events: events_tx,
             released: (Mutex::new(false), Condvar::new()),
+            hits: AtomicUsize::new(0),
+            hits_returned: AtomicUsize::new(0),
+            hit_started,
+            hit_released: (Mutex::new(true), Condvar::new()),
         });
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
@@ -558,7 +616,17 @@ mod tests {
             .with_session_lock_for_test(Some(false))
             .with_app_state_source(desk.clone()),
         ));
-        planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
+        planes.computer_admitted = Arc::new(
+            [
+                "computer.read_state",
+                "computer.takeover_move",
+                "computer.takeover_scroll",
+                "computer.keys",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
         bind(&planes, 7, "one");
         bind(&planes, 8, if second_conversation { "two" } else { "one" });
         if let Some(SlowDispatch {
@@ -599,12 +667,70 @@ mod tests {
             planes,
             desk,
             events,
+            hit_events,
             wire,
             replies,
             dispatch,
         }
     }
     impl Rig {
+        fn block_hit(&self) -> ReleaseHit {
+            *self.desk.hit_released.0.lock().unwrap() = false;
+            ReleaseHit(self.desk.clone())
+        }
+
+        fn move_request(&self, channel: u16, corr: u64) -> Frame {
+            use cerebellum_computer::app_state::{image::ImageMapping, session::RegisteredImage};
+            let conversation = self
+                .planes
+                .routes
+                .get(channel, 1)
+                .unwrap()
+                .identity
+                .conversation_key;
+            let image = self.planes.management.app_state_sessions().register_image(
+                &conversation,
+                RegisteredImage {
+                    bundle_identity: APP.to_string(),
+                    pid: 42,
+                    process_generation: "fixture-generation".into(),
+                    width_px: 100,
+                    height_px: 100,
+                    mapping: ImageMapping::for_window(
+                        (0.0, 0.0),
+                        (100.0, 100.0),
+                        (100, 100),
+                        (100, 100),
+                    )
+                    .unwrap(),
+                },
+            );
+            frame(
+                FrameType::Request,
+                channel,
+                corr,
+                serde_json::json!({
+                    "name": "computer_use", "arguments": {"action": "takeover_move", "image_id": image, "to": {"x": 10, "y": 20}},
+                }),
+            )
+        }
+
+        async fn hit_started(&mut self) {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), self.hit_events.recv())
+                    .await
+                    .expect("resolution reached the scripted hit test"),
+                Some(1)
+            );
+        }
+
+        async fn fast_reply(&mut self) -> Frame {
+            tokio::time::timeout(Duration::from_secs(1), self.replies.recv())
+                .await
+                .expect("frame reader and cancellation remain responsive during resolution")
+                .unwrap()
+        }
+
         async fn send(&mut self, frame: Frame) {
             subc_transport::write_frame(&mut self.wire, &frame)
                 .await
@@ -652,8 +778,10 @@ mod tests {
         async fn idle(&self) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    let registry = &self.planes.computer.as_ref().unwrap().serializer.registry;
-                    if registry.0.lock().unwrap().is_empty() {
+                    let serializer = &self.planes.computer.as_ref().unwrap().serializer;
+                    if serializer.registry.0.lock().unwrap().is_empty()
+                        && serializer.conversations.0.lock().unwrap().is_empty()
+                    {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -860,5 +988,215 @@ mod tests {
     #[tokio::test]
     async fn drain_releases_owner_and_waiter() {
         parked(FrameType::Push).await;
+    }
+
+    #[tokio::test]
+    async fn blocked_hit_test_does_not_block_other_routes_or_cancel_frames() {
+        let mut rig = rig(true, None);
+        rig.grant(8, OTHER).await;
+        rig.desk.release();
+        let release = rig.block_hit();
+        rig.send(rig.move_request(7, 1)).await;
+        rig.hit_started().await;
+        rig.send(request(8, 2, OTHER)).await;
+        let independent = rig.fast_reply().await;
+        assert_eq!(
+            (independent.header.ty, independent.header.corr),
+            (FrameType::Response, 2)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&independent.body).unwrap()["outcome"],
+            "completed"
+        );
+        assert_eq!(
+            rig.desk.hits_returned.load(Ordering::SeqCst),
+            0,
+            "the hit-test latch is still held"
+        );
+        rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
+            .await;
+        let cancelled = rig.fast_reply().await;
+        assert_eq!(
+            (cancelled.header.ty, cancelled.header.corr),
+            (FrameType::Response, 1)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cancelled.body).unwrap()["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            rig.desk.hits_returned.load(Ordering::SeqCst),
+            0,
+            "Cancel did not wait for the platform query"
+        );
+        rig.idle().await;
+        drop(release);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn resolution_timeout_runs_unserialized_and_releases_conversation() {
+        let mut rig = rig(false, None);
+        rig.grant(8, OTHER).await;
+        rig.desk.release();
+        let release = rig.block_hit();
+        rig.send(rig.move_request(7, 1)).await;
+        rig.hit_started().await;
+        rig.send(request(8, 2, OTHER)).await;
+        let responses = tokio::time::timeout(Duration::from_secs(4), async {
+            let mut responses = std::collections::BTreeMap::new();
+            for _ in 0..2 {
+                let frame = rig.replies.recv().await.unwrap();
+                assert_eq!(frame.header.ty, FrameType::Response);
+                responses.insert(
+                    frame.header.corr,
+                    serde_json::from_slice::<Value>(&frame.body).unwrap(),
+                );
+            }
+            responses
+        })
+        .await
+        .expect("resolution timeout must run the call and release the conversation lane");
+        assert_eq!(
+            responses[&1]["outcome"], "target_not_frontmost",
+            "the move's ordinary handler ran without ordering"
+        );
+        assert_eq!(
+            responses[&2]["outcome"], "completed",
+            "the conversation's other app was released"
+        );
+        assert_eq!(
+            rig.desk.hits.load(Ordering::SeqCst),
+            3,
+            "one unresolved ordering hit and two ordinary placement hits"
+        );
+        assert_eq!(
+            rig.desk.hits_returned.load(Ordering::SeqCst),
+            2,
+            "the original ordering query is still blocked"
+        );
+        rig.idle().await;
+        drop(release);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn drain_interrupts_resolution_and_conversation_wait() {
+        let mut rig = rig(false, None);
+        rig.grant(8, OTHER).await;
+        rig.desk.release();
+        let release = rig.block_hit();
+        rig.send(rig.move_request(7, 1)).await;
+        rig.hit_started().await;
+        rig.send(request(8, 2, OTHER)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let queued = rig
+                    .planes
+                    .computer
+                    .as_ref()
+                    .unwrap()
+                    .serializer
+                    .conversations
+                    .0
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|entry| entry.users == 2);
+                if queued {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second call occupies a conversation queue position");
+        rig.send(frame(
+            FrameType::Push,
+            0,
+            0,
+            serde_json::json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+        ))
+        .await;
+        let mut correlations = Vec::new();
+        for _ in 0..2 {
+            let response = rig.fast_reply().await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            correlations.push(response.header.corr);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response.body).unwrap()["outcome"],
+                "module_draining"
+            );
+        }
+        correlations.sort();
+        assert_eq!(correlations, [1, 2]);
+        assert_eq!(rig.desk.hits_returned.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.desk.reads.load(Ordering::SeqCst), 0);
+        rig.idle().await;
+        drop(release);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn scroll_waits_for_keys_on_its_resolved_target() {
+        let mut rig = rig(false, None);
+        rig.send(frame(FrameType::Request, 7, 1, serde_json::json!({
+            "name":"computer_use", "arguments":{"action":"keys", "target":"Editor", "keys":["d"]},
+        }))).await;
+        let keys_question = rig.reply().await;
+        assert_eq!(keys_question.header.ty, FrameType::Request);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&keys_question.body).unwrap()["params"]["target"]
+                ["kind"],
+            "app"
+        );
+        rig.send(frame(FrameType::Request, 7, 2, serde_json::json!({
+            "name":"computer_use", "arguments":{"action":"takeover_scroll", "target":APP, "axis":"vertical", "amount_lines":2},
+        }))).await;
+        let early = tokio::time::timeout(Duration::from_millis(100), rig.replies.recv()).await;
+        assert!(
+            early.is_err(),
+            "scroll overtook the keys call on the same app: {early:?}"
+        );
+        // Cancelling rather than approving avoids posting any real input. The
+        // second call's takeover question proves it entered its handler only
+        // after the first app-lane owner finished.
+        rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
+            .await;
+        let mut keys_finished = false;
+        let mut scroll_question = None;
+        for _ in 0..2 {
+            let frame = rig.reply().await;
+            match frame.header.ty {
+                FrameType::Response => {
+                    assert_eq!(frame.header.corr, 1);
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&frame.body).unwrap()["outcome"],
+                        "cancelled"
+                    );
+                    keys_finished = true;
+                }
+                FrameType::Request => scroll_question = Some(frame),
+                _ => panic!("unexpected frame: {frame:?}"),
+            }
+        }
+        assert!(keys_finished);
+        let question = scroll_question.expect("scroll ran after keys released the lane");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&question.body).unwrap()["params"]["target"]["kind"],
+            "machine"
+        );
+        rig.send(frame(FrameType::Cancel, 7, 2, serde_json::json!({})))
+            .await;
+        let response = rig.reply().await;
+        assert_eq!(
+            (response.header.ty, response.header.corr),
+            (FrameType::Response, 2)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["outcome"],
+            "cancelled"
+        );
+        rig.finish().await;
     }
 }

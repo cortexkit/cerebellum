@@ -3127,7 +3127,7 @@ async fn handle_frame(
                 frame.header.corr,
             ));
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            let computer_arrival = computer_capability::computer_arrival(&frame, planes).await;
+            let computer_arrival = computer_capability::computer_arrival(&frame, planes);
             let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
