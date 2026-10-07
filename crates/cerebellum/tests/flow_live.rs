@@ -205,11 +205,11 @@ fn reserved(module_id: &str) -> Principal {
     }
 }
 
-fn module_binary() -> PathBuf {
+fn module_binary(scratch_dir: &std::path::Path) -> PathBuf {
     let binary = std::env::var_os("CEREBELLUM_FLOW_E2E_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ck-cerebellum")));
-    let binary = fs::canonicalize(binary).expect("flow test module binary exists");
+    let binary = support::ckdev_binary(binary, scratch_dir);
     eprintln!("flow e2e binary: {}", binary.display());
     binary
 }
@@ -277,9 +277,10 @@ impl Fixture {
             modules.insert(id.into(), json!({"program":env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
                 "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime,"NONCE_OUT":directory.join(format!("{id}-nonce"))}, "reserved":true}));
         }
+        let module_binary = module_binary(&directory);
         // Launch the module directly: a shell that immediately execs another image
         // races the daemon's verification of the configured executable.
-        modules.insert("cerebellum".into(), json!({"program":module_binary(),
+        modules.insert("cerebellum".into(), json!({"program":module_binary,
             "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime}, "reserved":true}));
         fs::write(
             &daemon_path,

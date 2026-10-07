@@ -1127,15 +1127,17 @@ async fn start_live_daemon_with_browser(
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
         });
+    let binary = support::ckdev_binary(binary, &directory);
     // Pay the first-exec cost of a freshly built binary before the registration
     // deadline starts.  macOS validates a newly written executable's signature on
     // its first exec and caches the result: measured 5-22s for the first run of a
-    // fresh copy of this binary, and 0.00s for every run afterwards.  cargo
-    // rebuilds ck-cerebellum, the daemon spawns it, and that validation lands
-    // inside the window this test measures -- so a rebuild made the test time the
-    // kernel rather than registration, which is why it failed only on the first
-    // run after a build.  The module exits immediately without --subc, so this
-    // costs nothing once the binary is already validated.
+    // fresh copy of this binary, and 0.00s for every run afterwards. Cargo
+    // rebuilds ck-cerebellum, and the test daemon's first exec used to put that
+    // validation inside the registration deadline. The test first gives the
+    // binary a ckdev name so this test process never launches a production-named
+    // image, while retaining the original inode when hard links are available.
+    // The module exits immediately without --subc, so this costs nothing once
+    // the binary is already validated.
     let _ = tokio::process::Command::new(&binary)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
