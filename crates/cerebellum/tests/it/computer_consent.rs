@@ -840,8 +840,9 @@ async fn an_always_answer_to_a_takeover_question_grants_nothing() {
     assert!(!grants.holds(&caller("conversation-1", true), &GrantNeed::Takeover));
 }
 
-/// Two calls needing the same grant at once raise one question between them.
-/// The answer runs the first; the second is told the grant is held.
+/// Two submitted calls on one app raise one question. The first holds the
+/// app's FIFO lane while asking; the second runs later under the recorded
+/// conversation grant, rather than joining the first call's consent wait.
 #[tokio::test]
 async fn two_concurrent_calls_raise_exactly_one_question() {
     let driver = CountingDriver::default();
@@ -852,7 +853,7 @@ async fn two_concurrent_calls_raise_exactly_one_question() {
         let carrier = carrier.clone();
         async move {
             until(|| carrier.questions().len() == 1).await;
-            // Give the second call time to join before the answer lands.
+            // Let the second call reach the app queue before answering.
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(carrier.answer_next(answer("allow_conversation")));
         }
@@ -880,15 +881,21 @@ async fn two_concurrent_calls_raise_exactly_one_question() {
         second["outcome"].as_str().unwrap().to_string(),
     ];
     outcomes.sort();
+    assert_eq!(outcomes, ["delivery_unconfirmed", "delivery_unconfirmed"]);
+    let dispatched = driver.0.lock().unwrap();
     assert_eq!(
-        outcomes,
-        ["consent_granted_not_executed", "delivery_unconfirmed"]
+        dispatched.len(),
+        2,
+        "both queued calls run under the app grant"
     );
-    assert_eq!(
-        driver.0.lock().unwrap().len(),
-        1,
-        "one answer ran two calls"
-    );
+    assert!(matches!(
+        dispatched[0].action,
+        cerebellum_computer::platform::SyntheticAction::TypeText { .. }
+    ));
+    assert!(matches!(
+        dispatched[1].action,
+        cerebellum_computer::platform::SyntheticAction::KeyCombination { .. }
+    ));
 }
 
 /// Revoking a durable grant removes the record, and the next call asks again.

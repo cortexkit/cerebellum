@@ -91,9 +91,12 @@ mod keystrokes;
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
+mod serialize;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 pub(crate) use permissions::live_for_test;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) use serialize::{arrive as computer_arrival, scope as serialized_call};
 mod takeover;
 
 use crate::computer_grants::{ConsentContext, ConsentRefusal};
@@ -445,6 +448,7 @@ where
     S: JournalStorage,
 {
     audit: Arc<Mutex<ComputerAudit<R, T, S>>>,
+    serializer: serialize::Serializer,
     /// Startup-only readings, retained so a grant made while running cannot
     /// silently enable dispatch before the module has restarted.
     permissions: cerebellum_computer::platform::PermissionLivenessReport,
@@ -553,6 +557,7 @@ where
     ) -> Self {
         Self {
             audit: Arc::new(Mutex::new(audit)),
+            serializer: serialize::Serializer::default(),
             permissions: crate::default_computer_context().startup.permissions,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
@@ -725,11 +730,19 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
+        let _serialized = match self.serialize(capability, arguments, &context).await {
+            Ok(guard) => guard,
+            Err(refusal) => {
+                return self.finish_reply(
+                    capability.capability(),
+                    serialize::queued_refusal(capability, arguments, refusal),
+                );
+            }
+        };
         // Every served row reads or acts through accessibility or posts input,
         // and a locked screen hides every application's interface from both.
-        // Checked before the request touches anything -- no target resolved,
-        // no person asked, nothing posted -- so the caller learns the reason
-        // by name instead of reading an empty tree as an empty application.
+        // Read after taking the app lock: the screen may have locked while this
+        // call was queued. Consent and dispatch must see that current reading.
         let lock_state = self.session_locked();
         if lock_state == Some(true) {
             let reply = match capability.0 {

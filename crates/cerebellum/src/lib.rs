@@ -3152,6 +3152,8 @@ async fn handle_frame(
                 frame.header.epoch,
                 frame.header.corr,
             ));
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let computer_arrival = computer_capability::computer_arrival(&frame, planes);
             let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
@@ -3161,6 +3163,13 @@ async fn handle_frame(
                     handler().await;
                 }
                 let _cancellation = cancellation;
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let _ = computer_capability::serialized_call(
+                    computer_arrival,
+                    handle_route_request(frame, &writer, &planes),
+                )
+                .await;
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 let _ = handle_route_request(frame, &writer, &planes).await;
             }));
             Ok(true)
