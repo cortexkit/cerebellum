@@ -726,7 +726,8 @@ mod tests {
                 "takeover_drag",
                 "takeover_scroll",
                 "wait",
-                "list_apps"
+                "list_apps",
+                "open_app"
             ])
         );
         let without_keys: Vec<_> = computer_names()
@@ -819,7 +820,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(requirements.len(), 11, "{requirements:?}");
+        assert_eq!(requirements.len(), 12, "{requirements:?}");
         for (action, required) in [
             ("read_state", vec!["target"]),
             ("press_element", vec!["element_id"]),
@@ -832,6 +833,7 @@ mod tests {
             ("takeover_scroll", vec!["target", "axis", "amount_lines"]),
             ("wait", vec!["app", "predicate", "timeout_ms"]),
             ("list_apps", vec![]),
+            ("open_app", vec!["target"]),
         ] {
             assert_eq!(required_for(action), required, "{action}");
         }

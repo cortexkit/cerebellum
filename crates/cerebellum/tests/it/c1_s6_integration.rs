@@ -709,11 +709,14 @@ fn every_tree_read_is_withdrawn_by_the_app_state_key() {
             "{row} was in the manifest with the app_state review unbound"
         );
     }
-    // Unbinding the key withdraws exactly the tree reads and nothing else.
+    // The key withdraws tree reads and app launch, which resolves its bundle
+    // from the same reviewed application inventory, but nothing else.
     if cfg!(target_os = "macos") {
         let expected: Vec<String> = with_key
             .iter()
-            .filter(|row| !TREE_READS.contains(&row.as_str()))
+            .filter(|row| {
+                !TREE_READS.contains(&row.as_str()) && row.as_str() != "computer.open_app"
+            })
             .cloned()
             .collect();
         assert_eq!(without_key, expected);

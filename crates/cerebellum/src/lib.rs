@@ -450,6 +450,16 @@ fn declaration_gate_passes(
         ]
         .iter()
         .all(|gate| gate_passes(outcomes, gate))
+    } else if id == "computer.open_app" {
+        // Launch selects a bundle from app state and acts under a signer-bound
+        // app grant, so both surface reviews and the release signer must bind.
+        [
+            "app_state_review_revision",
+            "element_addressed_review_revision",
+            "release_signing_topology_revision",
+        ]
+        .iter()
+        .all(|gate| gate_passes(outcomes, gate))
     } else if matches!(
         id,
         "computer.press_element" | "computer.press_point" | "computer.write_text"

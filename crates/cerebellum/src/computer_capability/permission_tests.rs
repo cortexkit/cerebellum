@@ -88,7 +88,7 @@ fn permission_states_never_change_serialized_tool_definitions() {
             .iter()
             .filter(|row| row.advertised)
             .count(),
-        11
+        12
     );
     for state in [
         PermissionLiveness::Unavailable,
@@ -397,4 +397,30 @@ mod wire {
             .await;
         }
     }
+}
+
+/// A new platform row must not disappear in the module's second, explicit
+/// release gate table. Test on every host without borrowing its TCC readings.
+#[test]
+fn every_advertised_platform_row_is_admitted_by_the_module_release_gate() {
+    let context = context(PermissionLiveness::Live);
+    let outcomes = crate::computer_gate_outcomes(&context);
+    let advertised: Vec<_> = capability_declarations(&context, true)
+        .into_iter()
+        .filter(|row| row.advertised)
+        .collect();
+    assert_eq!(
+        advertised.len(),
+        12,
+        "the all-bound fixture must exercise every vocabulary row"
+    );
+    let missing: Vec<_> = advertised
+        .iter()
+        .filter(|row| !crate::declaration_gate_passes(row, &outcomes))
+        .map(|row| row.capability_id.as_str())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "platform-advertised capabilities missing a module release-gate arm: {missing:?}"
+    );
 }
