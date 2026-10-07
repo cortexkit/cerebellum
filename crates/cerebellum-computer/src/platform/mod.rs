@@ -350,26 +350,32 @@ fn capability_declaration(
             | "computer.press_element"
             | "computer.press_point"
             | "computer.write_text"
+            | "computer.open_app"
     ) {
-        // Reads and actions through the accessibility API: each advertised on
-        // its own review. The state read has one
-        // review and the presses and writes another, because acting on an
-        // element is a different surface from reading it. Screen Recording is
-        // only needed for the optional image. Permission requirements are checked
-        // when called, not when building the prompt-visible tool surface.
-        let review_missing = if id == "computer.read_state" {
-            context
-                .inputs
-                .app_state_review_revision
-                .is_none()
-                .then_some("application state review revision is not bound")
-        } else {
-            context
-                .inputs
-                .element_addressed_review_revision
-                .is_none()
-                .then_some("element-addressed action review revision is not bound")
-        };
+        // State reads and element actions use accessibility; application launch
+        // uses LaunchServices instead. Each is advertised on its own review.
+        // Screen Recording is only needed for a state read's optional image.
+        // Permission requirements are checked at call time, not while building
+        // the prompt-visible tool surface.
+        // Launch needs both the inventory review and action review: resolving
+        // installed names and acting under a signer-bound grant are separate
+        // surfaces. Like element actions, it also binds the release signer.
+        let review_missing =
+            if id == "computer.open_app" && context.inputs.app_state_review_revision.is_none() {
+                Some("application state review revision is not bound")
+            } else if id == "computer.read_state" {
+                context
+                    .inputs
+                    .app_state_review_revision
+                    .is_none()
+                    .then_some("application state review revision is not bound")
+            } else {
+                context
+                    .inputs
+                    .element_addressed_review_revision
+                    .is_none()
+                    .then_some("element-addressed action review revision is not bound")
+            };
         suppression_reason = if !platform_available {
             Some("no application-state reader on this platform".to_string())
         } else if !context.inputs.vocabulary_ready() {
@@ -456,7 +462,8 @@ fn capability_declaration(
         ComputerCapability::ReadState
         | ComputerCapability::PressElement
         | ComputerCapability::PressPoint
-        | ComputerCapability::WriteText => vec![DispatchMode::Background],
+        | ComputerCapability::WriteText
+        | ComputerCapability::OpenApp => vec![DispatchMode::Background],
         ComputerCapability::Type | ComputerCapability::Keys => {
             vec![DispatchMode::Background, DispatchMode::Observed]
         }
@@ -473,6 +480,7 @@ fn capability_declaration(
             ComputerCapability::PressElement
                 | ComputerCapability::PressPoint
                 | ComputerCapability::WriteText
+                | ComputerCapability::OpenApp
         ) {
         SupportState::Supported
     } else {

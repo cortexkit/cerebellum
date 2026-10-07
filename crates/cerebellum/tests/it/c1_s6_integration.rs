@@ -73,8 +73,7 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
         .into_iter()
         .find(|tool| tool.name == "computer_use")
         .unwrap();
-    // The fixture holds the all-live computer_use definition served before the
-    // change. Compare it byte for byte so the expected value does not come from
+    // The fixture holds the deliberately minted all-live computer_use definition. Compare it byte for byte so the expected value does not come from
     // the builder under test.
     assert_eq!(
         serde_json::to_vec(tool).unwrap(),
@@ -104,6 +103,7 @@ fn every_served_row() -> Vec<&'static str> {
         "computer.takeover_scroll",
         "computer.wait",
         "computer.list_apps",
+        "computer.open_app",
     ]
 }
 
@@ -136,8 +136,8 @@ fn empty_runtime_advertisement_reports_every_frozen_row_without_functional_claim
         startup: StartupCapabilityProbe::default(),
     };
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.frozen_row_count, 11);
-    assert_eq!(evidence.canonical_row_count, 11);
+    assert_eq!(evidence.frozen_row_count, 12);
+    assert_eq!(evidence.canonical_row_count, 12);
     assert_eq!(evidence.advertised_row_count, 0);
     assert_eq!(evidence.exercised_row_count, 0);
     assert_eq!(
@@ -189,7 +189,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         .iter()
         .all(|name| cerebellum::dispatchable_tool(name).is_some()));
 
-    assert_eq!(evidence.frozen_row_count, 11);
+    assert_eq!(evidence.frozen_row_count, 12);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
@@ -507,7 +507,11 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "app_state_review_revision" => assert_eq!(
                 admitted,
-                every_served_row_but(&["computer.read_state", "computer.list_apps"]),
+                every_served_row_but(&[
+                    "computer.read_state",
+                    "computer.list_apps",
+                    "computer.open_app"
+                ]),
                 "{gate} governs the state read and the application list"
             ),
             "element_addressed_review_revision" => assert_eq!(
@@ -515,9 +519,10 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 every_served_row_but(&[
                     "computer.press_element",
                     "computer.press_point",
-                    "computer.write_text"
+                    "computer.write_text",
+                    "computer.open_app"
                 ]),
-                "{gate} governs the element presses and writes alone"
+                "{gate} governs the element presses, writes and app launch"
             ),
             // Both reviews govern the takeover rows and nothing else. The
             // takeover review also admits bringing a background application

@@ -87,6 +87,9 @@ mod element_actions;
 pub mod image_freshness;
 use image_freshness::{image_freshness_decision, ImageFreshnessSource, NativeImageFreshnessSource};
 mod keystrokes;
+mod open_app;
+#[cfg(test)]
+mod open_app_tests;
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
@@ -320,6 +323,7 @@ enum Served {
     TakeoverScroll,
     Wait,
     ListApps,
+    OpenApp,
 }
 
 impl Servable {
@@ -335,6 +339,7 @@ impl Servable {
             Served::TakeoverDrag => ComputerCapability::TakeoverDrag,
             Served::TakeoverScroll => ComputerCapability::TakeoverScroll,
             Served::Wait => ComputerCapability::Wait,
+            Served::OpenApp => ComputerCapability::OpenApp,
             Served::ListApps => ComputerCapability::ListApps,
         }
     }
@@ -364,6 +369,7 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::TakeoverMove => Served::TakeoverMove,
         ComputerCapability::TakeoverDrag => Served::TakeoverDrag,
         ComputerCapability::TakeoverScroll => Served::TakeoverScroll,
+        ComputerCapability::OpenApp => Served::OpenApp,
         ComputerCapability::ListApps => Served::ListApps,
         // Readable from the journal only; never served.
         ComputerCapability::Click
@@ -711,11 +717,9 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
-        // Every served row reads or acts through accessibility or posts input,
-        // and a locked screen hides every application's interface from both.
-        // Checked before the request touches anything -- no target resolved,
-        // no person asked, nothing posted -- so the caller learns the reason
-        // by name instead of reading an empty tree as an empty application.
+        // A locked screen hides application interfaces and cannot admit a new
+        // launch either. Check before lookup, consent or platform work so no
+        // call mistakes hidden windows for an application with nothing there.
         let lock_state = self.session_locked();
         if lock_state == Some(true) {
             let reply = match capability.0 {
@@ -732,6 +736,7 @@ where
                     .await
             }
             Served::Wait => self.serve_wait(arguments, context).await,
+            Served::OpenApp => self.serve_open_app(arguments, context).await,
             Served::ListApps => self.serve_list_apps(arguments, context).await,
             Served::PressElement => self.serve_press_element(arguments, context).await,
             Served::PressPoint => self.serve_press_point(arguments, context).await,
@@ -1676,13 +1681,8 @@ where
         }
     }
 
-    /// `computer.list_apps`: the running regular applications, by name,
-    /// bundle identity and pid.
-    ///
-    /// No application's grant is asked for: the list names applications and
-    /// reveals nothing of any window. The caller still reached this through
-    /// an admitted session route, and the read is journaled with the count of
-    /// applications alone, never their names.
+    /// Names and identities only, without any per-app grant. The read is
+    /// bounded and journaled by count, never by application names.
     async fn serve_list_apps<C: MonotonicClock>(
         &self,
         arguments: &Value,
@@ -1692,14 +1692,22 @@ where
             return refusal;
         }
         let source = self.app_state_source.clone();
-        let listed = tokio::task::spawn_blocking(move || source.running_apps())
-            .await
-            .unwrap_or(Err(AppStateReadError::Unreadable));
+        let listed = tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            let running = source.running_apps()?;
+            let installed = source
+                .installed_apps(std::time::Duration::from_secs(2).saturating_sub(start.elapsed()));
+            Ok::<_, AppStateReadError>((running, installed))
+        })
+        .await
+        .unwrap_or(Err(AppStateReadError::Unreadable));
         let audit = self.audit.clone();
         let identity = context.identity;
         let summary = match &listed {
-            Ok(apps) => json!({"app_count": apps.len()}),
-            Err(_) => json!({"app_count": 0, "listed": false}),
+            Ok((apps, installed)) => {
+                json!({"app_count": (apps.len() + installed.apps.iter().filter(|app| !apps.iter().any(|running| running.bundle_identity == app.bundle_identity)).map(|app| (&app.name, &app.bundle_identity)).collect::<std::collections::BTreeSet<_>>().len()).min(500)})
+            }
+            Err(_) => json!({"app_count":0,"listed":false}),
         };
         let journaled = tokio::task::spawn_blocking(move || {
             journal_list_apps(&mut audit.blocking_lock(), identity, &summary)
@@ -1707,31 +1715,54 @@ where
         .await
         .unwrap_or(Err(()));
         if journaled.is_err() {
-            return json!({
-                "outcome": "audit_unavailable",
-                "remedy": "the module could not record the listing, so it withheld it; retry shortly",
-            });
+            return json!({"outcome":"audit_unavailable","remedy":"the module could not record the listing, so it withheld it; retry shortly"});
         }
         match listed {
-            Ok(apps) => json!({
-                "outcome": "completed",
-                STATE_TEXT_FIELD: running_apps_text(&apps),
-                "apps": apps
-                    .iter()
-                    .map(|app| json!({
-                        "name": app.name,
-                        "bundle_identity": app.bundle_identity,
-                        "pid": app.pid,
-                        "frontmost": app.frontmost,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-            Err(_) => json!({
-                "outcome": "targets_unreadable",
-                "unreadable": {"reason": "window_list_unavailable"},
-                "remedy": "the running applications could not be read; retry, and if it keeps \
-                           failing name the application by its bundle identity",
-            }),
+            Ok((mut running, installed)) => {
+                running.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then(a.pid.cmp(&b.pid))
+                });
+                let mut inactive: Vec<_> = installed
+                    .apps
+                    .into_iter()
+                    .filter(|app| {
+                        !running
+                            .iter()
+                            .any(|r| r.bundle_identity == app.bundle_identity)
+                    })
+                    .collect();
+                inactive.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then(a.bundle_identity.cmp(&b.bundle_identity))
+                });
+                let mut identities = std::collections::BTreeSet::new();
+                inactive.retain(|app| {
+                    identities.insert((app.name.clone(), app.bundle_identity.clone()))
+                });
+                let truncated = running.len() + inactive.len() > 500;
+                running.truncate(500);
+                inactive.truncate(500 - running.len());
+                let mut text = running_apps_text(&running);
+                text.push_str("installed (not running):\n");
+                for app in &inactive {
+                    text.push_str(&format!(
+                        "{} · {}\n",
+                        cerebellum_computer::app_state::render::one_line(&app.name),
+                        cerebellum_computer::app_state::render::one_line(&app.bundle_identity)
+                    ));
+                }
+                let mut apps: Vec<_> = running.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity,"running":true,"pid":app.pid,"frontmost":app.frontmost})).collect();
+                apps.extend(inactive.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity,"running":false,"frontmost":false})));
+                json!({"outcome":"completed", STATE_TEXT_FIELD:text, "apps":apps, "truncated":truncated,"installed_list":if installed.complete {"complete"} else {"partial"}})
+            }
+            Err(_) => {
+                json!({"outcome":"targets_unreadable","unreadable":{"reason":"window_list_unavailable"},"remedy":"the running applications could not be read; retry, or name an application by bundle identity"})
+            }
         }
     }
 }
@@ -2080,6 +2111,7 @@ pub(crate) fn served_request_fields(
             &element_actions::WRITE_TEXT_FIELDS,
             &element_actions::WRITE_TEXT_REQUIRED,
         )),
+        ComputerCapability::OpenApp => Some((&["target"], &["target"])),
         ComputerCapability::ListApps => Some((&[], &[])),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
@@ -2105,6 +2137,7 @@ pub(crate) fn parse_served_request(
 ) -> Result<(), Value> {
     match capability {
         ComputerCapability::ReadState => parse_read_state_request(arguments).map(|_| ()),
+        ComputerCapability::OpenApp => open_app::parse_request(arguments).map(|_| ()),
         ComputerCapability::ListApps => parse_list_apps_request(arguments),
         ComputerCapability::Wait => parse_wait_request(arguments).map(|_| ()),
         ComputerCapability::PressElement => {
@@ -2785,6 +2818,10 @@ mod wait_tests {
     #[test]
     fn every_served_parser_holds_requests_to_its_declared_fields() {
         let samples = [
+            (
+                ComputerCapability::OpenApp,
+                json!({"target":"com.example.Editor"}),
+            ),
             (
                 ComputerCapability::Type,
                 json!({"target": "com.example.Editor", "text": "hi"}),

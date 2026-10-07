@@ -21,6 +21,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use objc2_core_foundation::{CFNumber, CFNumberType, CFRetained, CFString};
+use objc2_foundation::{NSString, NSURL};
 
 type CfTypeRef = *const c_void;
 type CfDictionaryRef = *const c_void;
@@ -67,6 +68,12 @@ extern "C" {
     static kSecCodeInfoTeamIdentifier: CfStringRef;
     static kSecCodeInfoFlags: CfStringRef;
 
+    fn SecStaticCodeCreateWithPath(path: CfTypeRef, flags: u32, code: *mut SecCodeRef) -> i32;
+    fn SecStaticCodeCheckValidity(
+        code: SecCodeRef,
+        flags: u32,
+        requirement: SecRequirementRef,
+    ) -> i32;
     fn SecCodeCopyGuestWithAttributes(
         host: SecCodeRef,
         attributes: CfDictionaryRef,
@@ -285,8 +292,10 @@ unsafe fn string_value(value: CfTypeRef) -> Option<String> {
 }
 
 fn read_identity(pid: u32) -> Result<CodeSigningIdentity, CodeSigningError> {
-    let code = guest_for_pid(pid)?;
+    identity_of_code(guest_for_pid(pid)?)
+}
 
+fn identity_of_code(code: Owned) -> Result<CodeSigningIdentity, CodeSigningError> {
     let mut information: CfDictionaryRef = std::ptr::null();
     // SAFETY: `code` is live; the output slot receives one owned dictionary.
     let status = unsafe {
@@ -359,6 +368,18 @@ fn requirement_text(requirement: &Owned) -> Result<String, CodeSigningError> {
 }
 
 fn check_requirement(pid: u32, requirement: &str) -> Result<RequirementCheck, CodeSigningError> {
+    let code = guest_for_pid(pid)?;
+    let compiled = compiled_requirement(requirement)?;
+    // SAFETY: both objects are live for the duration of the call.
+    let status = unsafe { SecCodeCheckValidity(code.get(), 0, compiled.get()) };
+    match status {
+        0 => Ok(RequirementCheck::Satisfied),
+        ERR_SEC_CS_NO_SUCH_CODE => Err(CodeSigningError::NoSuchCode(status)),
+        other => Ok(RequirementCheck::NotSatisfied(other)),
+    }
+}
+
+fn compiled_requirement(requirement: &str) -> Result<Owned, CodeSigningError> {
     let text: CFRetained<CFString> = CFString::from_str(requirement);
     let mut compiled: SecRequirementRef = std::ptr::null();
     // SAFETY: `text` is a live CFString; the output slot receives one owned
@@ -374,15 +395,58 @@ fn check_requirement(pid: u32, requirement: &str) -> Result<RequirementCheck, Co
         Some(compiled) if status == 0 => compiled,
         _ => return Err(CodeSigningError::RequirementText(status)),
     };
-    let code = guest_for_pid(pid)?;
-    // SAFETY: both objects are live for the duration of the call.
-    let status = unsafe { SecCodeCheckValidity(code.get(), 0, compiled.get()) };
-    match status {
-        0 => Ok(RequirementCheck::Satisfied),
-        // The process went away between the lookup and the check: nothing was
-        // learned about its signer.
-        ERR_SEC_CS_NO_SUCH_CODE => Err(CodeSigningError::NoSuchCode(status)),
-        other => Ok(RequirementCheck::NotSatisfied(other)),
+    Ok(compiled)
+}
+
+/// Validate the signature on disk before describing its signer. An invalid
+/// seal must not become an approved application merely by carrying metadata.
+pub fn bundle_code_signing_identity(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<CodeSigningIdentity, CodeSigningError> {
+    let path = path.to_owned();
+    bounded(timeout, move || {
+        let code = static_code(&path)?;
+        // SAFETY: the static code is live; a null requirement validates its seal.
+        let status = unsafe { SecStaticCodeCheckValidity(code.get(), 0, std::ptr::null()) };
+        if status != 0 {
+            return Err(CodeSigningError::SigningInformation(status));
+        }
+        identity_of_code(code)
+    })
+}
+
+pub fn bundle_code_satisfies_requirement(
+    path: &std::path::Path,
+    requirement: &str,
+    timeout: Duration,
+) -> Result<RequirementCheck, CodeSigningError> {
+    let path = path.to_owned();
+    let requirement = requirement.to_owned();
+    bounded(timeout, move || {
+        let code = static_code(&path)?;
+        let requirement = compiled_requirement(&requirement)?;
+        // SAFETY: both owned framework objects are live.
+        let status = unsafe { SecStaticCodeCheckValidity(code.get(), 0, requirement.get()) };
+        Ok(if status == 0 {
+            RequirementCheck::Satisfied
+        } else {
+            RequirementCheck::NotSatisfied(status)
+        })
+    })
+}
+
+fn static_code(path: &std::path::Path) -> Result<Owned, CodeSigningError> {
+    let text = NSString::from_str(path.to_str().ok_or(CodeSigningError::NoSuchCode(0))?);
+    let url = NSURL::fileURLWithPath(&text);
+    let mut code = std::ptr::null();
+    // SAFETY: NSURL is toll-free bridged to CFURL and lives through the call;
+    // the Create function returns an owned static-code reference.
+    let status =
+        unsafe { SecStaticCodeCreateWithPath((&*url as *const NSURL).cast(), 0, &mut code) };
+    match Owned::adopt(code) {
+        Some(code) if status == 0 => Ok(code),
+        _ => Err(CodeSigningError::NoSuchCode(status)),
     }
 }
 

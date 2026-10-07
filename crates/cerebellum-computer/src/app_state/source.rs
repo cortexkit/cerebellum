@@ -352,6 +352,34 @@ pub trait AppStateSource: Send + Sync {
     fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
         Err(AppStateReadError::UnsupportedOnPlatform)
     }
+
+    /// Read only installed bundle names and identities, stopping at the deadline.
+    fn installed_apps(&self, _timeout: Duration) -> InstalledApps {
+        InstalledApps {
+            apps: Vec::new(),
+            complete: false,
+        }
+    }
+
+    /// Read and validate the signature of the selected bundle on disk.
+    fn bundle_signature(&self, _app: &InstalledApp) -> Result<BundleSignature, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+
+    /// Validate that the bundle still satisfies the approved signer requirement.
+    fn bundle_satisfies(&self, _app: &InstalledApp, _requirement: &str) -> bool {
+        false
+    }
+
+    /// Launch via the platform application service, not as our child. The
+    /// caller requests no activation and bounds both process and window waits.
+    fn open_app(
+        &self,
+        _app: &InstalledApp,
+        _bounds: OpenAppBounds,
+    ) -> Result<OpenedApp, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
+    }
 }
 
 /// An application's focused window as one reading saw it: which window, and
@@ -379,6 +407,55 @@ pub struct RunningApp {
     pub name: String,
     pub bundle_identity: String,
     pub pid: u32,
+    pub frontmost: bool,
+}
+
+/// A bundle discovered without reading its executable or resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledApp {
+    pub name: String,
+    pub bundle_identity: String,
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstalledApps {
+    pub apps: Vec<InstalledApp>,
+    /// False on deadline, unreadable directories or malformed metadata.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleSignature {
+    pub signed: bool,
+    pub ad_hoc: bool,
+    pub team_id: Option<String>,
+    pub designated_requirement: Option<String>,
+    pub apple_anchored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAppBounds {
+    pub activates: bool,
+    pub process_timeout: Duration,
+    pub window_timeout: Duration,
+}
+
+impl Default for OpenAppBounds {
+    fn default() -> Self {
+        Self {
+            activates: false,
+            process_timeout: Duration::from_secs(30),
+            window_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenedApp {
+    pub pid: u32,
+    pub already_running: bool,
+    pub has_window: bool,
     pub frontmost: bool,
 }
 

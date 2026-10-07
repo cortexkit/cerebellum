@@ -28,9 +28,16 @@
 #[cfg(any(target_os = "macos", test))]
 mod accessibility;
 #[cfg(target_os = "macos")]
+mod applications;
+#[cfg(target_os = "macos")]
 mod ax_actions;
 #[cfg(target_os = "macos")]
 mod ax_state;
+#[cfg(target_os = "macos")]
+pub use applications::{
+    installed_applications, open_application, responsible_pid, workspace_running_applications,
+    ApplicationOpenResult, InstalledApplication, InstalledApplicationList,
+};
 #[cfg(target_os = "macos")]
 mod code_signing;
 #[cfg(any(target_os = "macos", test))]
@@ -103,8 +110,8 @@ pub use ax_state::{
 };
 #[cfg(target_os = "macos")]
 pub use code_signing::{
-    code_satisfies_requirement, code_signing_identity, CodeSigningError, CodeSigningIdentity,
-    RequirementCheck,
+    bundle_code_satisfies_requirement, bundle_code_signing_identity, code_satisfies_requirement,
+    code_signing_identity, CodeSigningError, CodeSigningIdentity, RequirementCheck,
 };
 #[cfg(target_os = "macos")]
 pub use event_tap::{uptime_now_ns, SessionEventTap};

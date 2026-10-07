@@ -1238,7 +1238,7 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
     assert_eq!(
         listed["state_text"],
         format!(
-            "Safari · {} · pid {} · frontmost\n{SECRET_NAME} · {SECRET_BUNDLE} · pid 4321\n",
+            "Safari · {} · pid {} · frontmost\n{SECRET_NAME} · {SECRET_BUNDLE} · pid 4321\ninstalled (not running):\n",
             target.bundle_identity,
             grant().pid
         )

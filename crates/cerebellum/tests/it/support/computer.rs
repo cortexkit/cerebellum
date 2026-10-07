@@ -770,6 +770,10 @@ pub struct DeskState {
     /// The running applications `list_apps` lists and a target given by
     /// name is matched against; `None` when the list cannot be read.
     pub running: Option<Vec<cerebellum_computer::app_state::source::RunningApp>>,
+    pub installed: cerebellum_computer::app_state::source::InstalledApps,
+    pub signature: Option<cerebellum_computer::app_state::source::BundleSignature>,
+    pub opens: Vec<cerebellum_computer::app_state::source::OpenAppBounds>,
+    pub opened: cerebellum_computer::app_state::source::OpenedApp,
 }
 
 /// A fixture application: its tree, its elements' facts and text, its focus,
@@ -799,6 +803,24 @@ impl Desk {
             window: None,
             input: Vec::new(),
             hardware_coverage: Some(std::time::Instant::now()),
+            installed: cerebellum_computer::app_state::source::InstalledApps {
+                apps: Vec::new(),
+                complete: true,
+            },
+            signature: Some(cerebellum_computer::app_state::source::BundleSignature {
+                signed: true,
+                ad_hoc: false,
+                team_id: Some(FIXTURE_TEAM.into()),
+                designated_requirement: Some(team_identity(FIXTURE_TEAM).designated_requirement),
+                apple_anchored: false,
+            }),
+            opens: Vec::new(),
+            opened: cerebellum_computer::app_state::source::OpenedApp {
+                pid: grant().pid,
+                already_running: false,
+                has_window: true,
+                frontmost: false,
+            },
             running: Some(vec![cerebellum_computer::app_state::source::RunningApp {
                 name: "Safari".into(),
                 bundle_identity: grant().bundle_identity,
@@ -1010,6 +1032,45 @@ impl AppStateSource for Desk {
     fn time_since_last_input(&self) -> Option<std::time::Duration> {
         let latest = self.state().input.iter().map(|(_, at)| *at).max()?;
         Some(std::time::Instant::now().saturating_duration_since(latest))
+    }
+
+    fn installed_apps(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> cerebellum_computer::app_state::source::InstalledApps {
+        self.state().installed.clone()
+    }
+
+    fn bundle_signature(
+        &self,
+        _app: &cerebellum_computer::app_state::source::InstalledApp,
+    ) -> Result<cerebellum_computer::app_state::source::BundleSignature, AppStateReadError> {
+        self.state()
+            .signature
+            .clone()
+            .ok_or(AppStateReadError::Unreadable)
+    }
+
+    fn bundle_satisfies(
+        &self,
+        _app: &cerebellum_computer::app_state::source::InstalledApp,
+        requirement: &str,
+    ) -> bool {
+        self.state().signature.as_ref().is_some_and(|signature| {
+            signature.signed
+                && !signature.ad_hoc
+                && signature.designated_requirement.as_deref() == Some(requirement)
+        })
+    }
+
+    fn open_app(
+        &self,
+        _app: &cerebellum_computer::app_state::source::InstalledApp,
+        bounds: cerebellum_computer::app_state::source::OpenAppBounds,
+    ) -> Result<cerebellum_computer::app_state::source::OpenedApp, AppStateReadError> {
+        let mut state = self.state();
+        state.opens.push(bounds);
+        Ok(state.opened)
     }
 
     fn running_apps(

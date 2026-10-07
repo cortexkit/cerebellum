@@ -755,11 +755,12 @@ impl WindowsPlatformDriver {
                         None
                     };
                 }
-                // The application-state reader, and the element presses and
-                // writes built on it, are macOS accessibility; Windows has
-                // none of them, and the Windows review never covered them.
+                // App state and its element actions use macOS accessibility;
+                // app launch uses LaunchServices. Windows implements neither
+                // surface, and its actuation review covers neither.
                 "computer.read_state"
                 | "computer.list_apps"
+                | "computer.open_app"
                 | "computer.press_element"
                 | "computer.press_point"
                 | "computer.write_text" => {
