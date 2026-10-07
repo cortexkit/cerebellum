@@ -215,6 +215,22 @@ check_tests_do_not_request_macOS_permissions() {
 run_phase "no test requests macOS permissions" \
   check_tests_do_not_request_macOS_permissions
 
+# A real daemon execs a test module through the privacy trampoline, so both the
+# smoke launch and the configured module path must be ckdev links. Check each
+# spawn or configured program independently so a helper on a neighboring line
+# cannot hide a direct production-named execution.
+check_test_binaries_use_ckdev_names() {
+  scripts/lib/ckdev-naming-scan.test.sh >/dev/null || {
+    echo "    the ckdev naming scan's planted controls failed:" >&2
+    scripts/lib/ckdev-naming-scan.test.sh 2>&1 | grep -v '^ok ' | sed 's/^/      /' >&2
+    return 1
+  }
+  python3 scripts/lib/ckdev-naming-scan.py .
+}
+
+run_phase "test and script ck-* executions use ckdev names" \
+  check_test_binaries_use_ckdev_names
+
 # Phase 1: format workspace members. Keep the scope explicit so only this
 # repository's source is checked, and refuse an empty member list.
 check_members_formatted() {

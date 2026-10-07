@@ -153,8 +153,12 @@ refuse_unless_hardened "$STAGE/$DEPLOYED_NAME" || {
 }
 
 # THE ARTIFACT GATE. Ask the signed bytes what they are, after signing, on the
-# exact file that will be placed.
-reported="$("$STAGE/$DEPLOYED_NAME" --version)"
+# exact file that will be placed. Execute a hard link with a dev name: the
+# deployed artifact keeps its production name, while macOS sees only ckdev- for
+# this off-staging verification run.
+DEV_NAME="ckdev-${DEPLOYED_NAME#ck-}"
+ln "$STAGE/$DEPLOYED_NAME" "$STAGE/$DEV_NAME"
+reported="$("$STAGE/$DEV_NAME" --version)"
 reported_rev="$(printf '%s' "$reported" | grep -oE '\([0-9a-f]{40}\)' | tr -d '()' || true)"
 reported_tree="$(printf '%s' "$reported" | grep -oE 'tree=[a-z]+' | cut -d= -f2 || true)"
 
