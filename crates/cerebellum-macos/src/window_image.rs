@@ -156,21 +156,45 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
 /// Whether this exact window is wholly on screen under the image visibility rules.
 /// The on-screen list is front-to-back; missing data never proves visibility.
 pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
-    use crate::window_visibility::{visibility_from_windows, Rect, Window};
     use crate::WindowVisibility;
-    let Some(windows) = CGWindowListCopyWindowInfo(
-        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
-        0,
-    ) else {
+    let Some(entries) = cursor_window_list() else {
         return WindowVisibility::Unknown;
     };
+    window_visibility_with_entries(pid, id, &entries)
+}
+
+static CURSOR_GENERATION: std::sync::Mutex<Option<crate::ProcessGeneration>> =
+    std::sync::Mutex::new(None);
+
+/// Register only the kernel generation the barred launcher recorded. A pid
+/// reused by another application must not make that application's windows
+/// disappear from an occlusion reading.
+pub fn register_cursor_generation(generation: Option<crate::ProcessGeneration>) {
+    *CURSOR_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
+}
+
+fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
+    use crate::window_visibility::{Rect, Window};
+    let windows = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
     // SAFETY: CoreGraphics documents this result as an array of string-keyed dictionaries.
     let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
     let mut entries = Vec::new();
+    let cursor = *CURSOR_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cursor_pid = cursor
+        .filter(|g| {
+            crate::process_start_time(g.pid)
+                == crate::ProcessStartTime::Started(g.start_time_micros)
+        })
+        .map(|g| g.pid);
     for index in 0..windows.len() {
-        let Some(window) = windows.get(index) else {
-            return WindowVisibility::Unknown;
-        };
+        let window = windows.get(index)?;
         let number = |key: &str| -> Option<f64> {
             window
                 .get(&CFString::from_str(key))?
@@ -207,6 +231,9 @@ pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
                 .map(|v| v as u32)
         };
         entries.push(Window {
+            cursor_picture: cursor_pid.is_some()
+                && identifier("kCGWindowOwnerPID") == cursor_pid
+                && number("kCGWindowLayer").is_some_and(|layer| layer != 0.0),
             id: identifier("kCGWindowNumber"),
             pid: identifier("kCGWindowOwnerPID"),
             bounds,
@@ -221,6 +248,25 @@ pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
                 .map(|v| v as i64),
         });
     }
+    Some(entries)
+}
+
+/// Uses the same front-to-back list as the image visibility reading.
+pub fn visible_cursor_point(pid: u32, point: Option<[f64; 2]>) -> Option<[f64; 2]> {
+    crate::window_visibility::cursor_point_from_windows(pid, point, &cursor_window_list()?)
+}
+
+pub(crate) fn normal_frontmost_process_id() -> Option<i32> {
+    crate::window_visibility::frontmost_from_windows(&cursor_window_list()?)
+}
+
+fn window_visibility_with_entries(
+    pid: u32,
+    id: u32,
+    entries: &[crate::window_visibility::Window],
+) -> crate::WindowVisibility {
+    use crate::window_visibility::{visibility_from_windows, Rect};
+    use crate::WindowVisibility;
     let mut ids = [0u32; 32];
     let mut count = 0;
     // SAFETY: ids has capacity for 32 display IDs and count is a valid output pointer.
@@ -241,7 +287,7 @@ pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
             }
         })
         .collect::<Vec<_>>();
-    visibility_from_windows(pid, id, &entries, &displays).0
+    visibility_from_windows(pid, id, entries, &displays).0
 }
 
 #[cfg(test)]

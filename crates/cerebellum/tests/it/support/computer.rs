@@ -736,6 +736,8 @@ pub enum DeskFocus {
 
 #[derive(Debug)]
 pub struct DeskState {
+    pub cursor_frame: Option<[f64; 4]>,
+    pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
     /// Swapped in for `roots` by the first press or write, so the diff that
     /// follows has something to report.
@@ -782,6 +784,8 @@ pub struct Desk(pub Arc<Mutex<DeskState>>);
 impl Desk {
     pub fn new(roots: Vec<RawElement>) -> Self {
         Self(Arc::new(Mutex::new(DeskState {
+            cursor_frame: None,
+            cursor_visible: false,
             roots,
             after_action: None,
             focus_after_action: None,
@@ -845,6 +849,15 @@ fn utf16_byte_offset(text: &str, utf16: usize) -> usize {
 }
 
 impl AppStateSource for Desk {
+    fn cursor_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+        self.state().cursor_frame
+    }
+
+    fn visible_cursor_point(&self, _: &ProcessGrant, point: Option<[f64; 2]>) -> Option<[f64; 2]> {
+        self.state()
+            .cursor_visible
+            .then_some(point.unwrap_or([112.0, 62.0]))
+    }
     fn read_app_state(
         &self,
         _target: &ProcessGrant,

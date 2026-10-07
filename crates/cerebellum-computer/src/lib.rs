@@ -7,6 +7,7 @@ pub mod app_state;
 pub mod audit;
 pub mod capture;
 pub mod capture_custody;
+pub mod cursor;
 pub mod dispatch;
 pub mod grounding;
 pub mod platform;

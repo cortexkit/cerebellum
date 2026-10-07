@@ -48,11 +48,62 @@ impl Rect {
 
 /// A list entry may lack bounds; omitting it would falsely prove visibility.
 pub(crate) struct Window {
+    /// Trusted helper generation, not a title or an app-supplied window name.
+    pub cursor_picture: bool,
     pub id: Option<u32>,
     pub pid: Option<u32>,
     pub bounds: Option<Rect>,
     pub alpha: Option<f64>,
     pub layer: Option<i64>,
+}
+
+/// A floating cursor cannot supply the frontmost normal application's pid.
+pub(crate) fn frontmost_from_windows(windows: &[Window]) -> Option<i32> {
+    windows.iter().find_map(|window| {
+        if window.layer != Some(0) {
+            return None;
+        }
+        i32::try_from(window.pid?).ok().filter(|pid| *pid > 0)
+    })
+}
+
+pub(crate) fn cursor_point_from_windows(
+    pid: u32,
+    point: Option<[f64; 2]>,
+    windows: &[Window],
+) -> Option<[f64; 2]> {
+    let inside = |rect: Rect, p: [f64; 2]| {
+        rect.valid()
+            && p.iter().all(|v| v.is_finite())
+            && p[0] >= rect.x
+            && p[0] < rect.x + rect.width
+            && p[1] >= rect.y
+            && p[1] < rect.y + rect.height
+    };
+    for (index, target) in windows.iter().enumerate() {
+        if target.pid != Some(pid)
+            || target.layer != Some(0)
+            || target.alpha.is_none_or(|v| v <= 0.0 || !v.is_finite())
+        {
+            continue;
+        }
+        let bounds = target.bounds?;
+        let p = point.unwrap_or([bounds.x + 12.0, bounds.y + 12.0]);
+        if !inside(bounds, p) {
+            continue;
+        }
+        for above in &windows[..index] {
+            if above.pid == Some(pid) || above.alpha == Some(0.0) {
+                continue;
+            }
+            let layer = above.layer?;
+            if layer == 0 && inside(above.bounds?, p) {
+                return None;
+            }
+        }
+        return Some(p);
+    }
+    None
 }
 
 /// The visibility rule selected, without adding runtime logging or wire fields.
@@ -147,6 +198,9 @@ pub(crate) fn visibility_from_windows(
     }
     let mut above_windows = Vec::new();
     for above in &windows[..index] {
+        if above.cursor_picture {
+            continue;
+        }
         if above.alpha == Some(0.0) {
             continue;
         }
@@ -185,6 +239,90 @@ pub(crate) fn visibility_from_windows(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cursor_picture_cannot_cover_even_a_tiny_target_window() {
+        let target = || {
+            window(
+                1,
+                Some(Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 60.0,
+                    height: 24.0,
+                }),
+            )
+        };
+        let picture = Window {
+            cursor_picture: true,
+            pid: Some(99),
+            ..layered(
+                2,
+                3,
+                Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 48.0,
+                },
+            )
+        };
+        assert_eq!(
+            visibility_from_windows(7, 1, &[picture, target()], &[rect(0.0, 1000.0)]),
+            visibility_from_windows(7, 1, &[target()], &[rect(0.0, 1000.0)])
+        );
+    }
+
+    #[test]
+    fn cursor_floating_picture_does_not_change_frontmost_or_coverage() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        let overlay = Window {
+            pid: Some(99),
+            ..layered(
+                2,
+                3,
+                Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 48.0,
+                },
+            )
+        };
+        let before = [target()];
+        let after = [overlay, target()];
+        assert_eq!(frontmost_from_windows(&before), Some(7));
+        assert_eq!(frontmost_from_windows(&after), Some(7));
+        assert_eq!(
+            visibility_from_windows(7, 1, &before, &[rect(0.0, 1000.0)]),
+            visibility_from_windows(7, 1, &after, &[rect(0.0, 1000.0)])
+        );
+    }
+
+    #[test]
+    fn cursor_visible_point_ignores_floating_but_not_other_normal_windows() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        let cover = |layer| Window {
+            pid: Some(99),
+            ..layered(2, layer, rect(20.0, 120.0))
+        };
+        assert_eq!(
+            cursor_point_from_windows(7, Some([40.0, 40.0]), &[cover(3), target()]),
+            Some([40.0, 40.0])
+        );
+        assert_eq!(
+            cursor_point_from_windows(7, Some([40.0, 40.0]), &[cover(0), target()]),
+            None
+        );
+        assert_eq!(
+            cursor_point_from_windows(7, Some([1200.0, 40.0]), &[target()]),
+            None
+        );
+        assert_eq!(
+            cursor_point_from_windows(7, None, &[target()]),
+            Some([12.0, 12.0])
+        );
+    }
+
     fn rect(x: f64, width: f64) -> Rect {
         Rect {
             x,
@@ -195,6 +333,7 @@ mod tests {
     }
     fn window(id: u32, bounds: Option<Rect>) -> Window {
         Window {
+            cursor_picture: false,
             id: Some(id),
             pid: Some(7),
             bounds,

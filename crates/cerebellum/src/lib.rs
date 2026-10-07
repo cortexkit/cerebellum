@@ -1609,6 +1609,7 @@ pub async fn run_entry_prepared_for_test(
         connection_file_path,
         module_id: DEFAULT_MODULE_ID.into(),
         health: HealthConfig::default(),
+        agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
     conclude(run(config, prepare).await)
@@ -1664,6 +1665,7 @@ fn die_by_sigterm() -> Result<(), ModuleError> {
 struct ShutdownTeardown(Arc<ShutdownTeardownState>);
 
 struct ShutdownTeardownState {
+    cursor: Option<computer_capability::cursor::Coordinator>,
     sessions: browser_session::BrowserSessions,
     browser: Option<BrowserConfig>,
     idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1686,9 +1688,11 @@ impl ShutdownTeardown {
         sessions: browser_session::BrowserSessions,
         browser: Option<BrowserConfig>,
         idle_enforcer: Option<tokio::task::JoinHandle<()>>,
+        cursor: Option<computer_capability::cursor::Coordinator>,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
+            cursor,
             sessions,
             browser,
             idle_enforcer: std::sync::Mutex::new(idle_enforcer),
@@ -1704,6 +1708,9 @@ impl ShutdownTeardown {
             .started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            if let Some(cursor) = &self.0.cursor {
+                cursor.shutdown();
+            }
             let enforcer = self
                 .0
                 .idle_enforcer
@@ -1734,6 +1741,7 @@ struct ModuleConfig {
     connection_file_path: PathBuf,
     module_id: String,
     health: HealthConfig,
+    agent_cursor: bool,
     browser: BrowserSurface,
 }
 
@@ -1762,6 +1770,7 @@ impl ModuleConfig {
             connection_file_path,
             module_id,
             health: parsed.health,
+            agent_cursor: parsed.computer_use.agent_cursor,
             browser,
         })
     }
@@ -1800,6 +1809,9 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
             config.module_id.clone(),
         )));
     prepare(&mut planes);
+    if let Some(cursor) = planes_cursor(&planes) {
+        cursor.enable(config.agent_cursor);
+    }
     // Recovery publishes the service before module_loop takes the transport, so
     // an attested orphan from a previous process cannot race a fresh spawn. That
     // ordering matters on every platform that can launch, not only the first one
@@ -1853,6 +1865,7 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
         planes.sessions.clone(),
         browser_config.clone(),
         idle_enforcer,
+        planes_cursor(&planes),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -1980,8 +1993,21 @@ where
         planes.sessions.clone(),
         browser_config.cloned(),
         idle_enforcer,
+        planes_cursor(&planes),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
+}
+
+fn planes_cursor(planes: &Planes) -> Option<computer_capability::cursor::Coordinator> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        planes.computer.as_ref().ok().map(|plane| plane.cursor())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = planes;
+        None
+    }
 }
 
 /// The connection-ending half of [`serve_until_disconnect`], sharing its
@@ -9834,6 +9860,7 @@ mod connection_liveness_tests {
                 queue_age_stale_ms: 30_000,
                 in_flight_age_stale_ms: 30_000,
             },
+            agent_cursor: false,
             browser: BrowserSurface::NotConfigured,
         }
     }

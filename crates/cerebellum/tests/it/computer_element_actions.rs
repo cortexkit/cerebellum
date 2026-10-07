@@ -1305,3 +1305,196 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
     assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
     assert!(plane.result_schema_findings().is_empty());
 }
+
+/// The cursor transport is the helper's pipe double. A dropped receiver models
+/// its death without ever starting AppKit on the desk running the gate.
+#[tokio::test]
+async fn cursor_every_action_reply_is_byte_identical_on_off_and_dead_transport() {
+    use cerebellum::computer_capability::cursor::Coordinator;
+    let management = granted_management().await;
+    let actions = [
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+        "computer.type",
+        "computer.keys",
+        "computer.read_state",
+        "computer.wait",
+        "computer.list_apps",
+        "computer.takeover_move",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
+    ];
+    for action in actions {
+        let mut replies = Vec::new();
+        for mode in 0..3 {
+            let desk = desk();
+            desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
+            desk.state().cursor_visible = true;
+            desk.state().focus = support::computer::DeskFocus::Element(12);
+            desk.state().application_hit = Some((10, Some(grant().pid)));
+            let base = plane(&desk);
+            let state = serve(
+                &base,
+                &management,
+                "computer.read_state",
+                json!({"target": TARGET_BUNDLE_ID}),
+            )
+            .await;
+            let button = id_of(state["state_text"].as_str().unwrap(), "Send");
+            let field = id_of(state["state_text"].as_str().unwrap(), "Composer");
+            let image = read_with_image(&base, &management).await;
+            let args = match action {
+                "computer.press_element" => json!({"element_id":button}),
+                "computer.press_point" => json!({"image_id":image,"x":10,"y":10}),
+                "computer.write_text" => {
+                    json!({"element_id":field,"text":"hello world","write_mode":"replace_value"})
+                }
+                "computer.type" => json!({"target":TARGET_BUNDLE_ID,"text":"planted typed secret"}),
+                "computer.keys" => json!({"target":TARGET_BUNDLE_ID,"keys":["return"]}),
+                "computer.read_state" => json!({"target":TARGET_BUNDLE_ID}),
+                "computer.wait" => {
+                    json!({"app":TARGET_BUNDLE_ID,"predicate":cerebellum_computer::dispatch::post_condition::PostCondition::ElementEnabledIs { element: cerebellum_computer::platform::AccessibilityElementName::role_and_title("AXButton", "Save"), expected: true },"timeout_ms":0})
+                }
+                "computer.list_apps" => json!({}),
+                "computer.takeover_move" => json!({"image_id":image,"to":{"x":10,"y":10}}),
+                "computer.takeover_drag" => {
+                    json!({"image_id":image,"from":{"x":10,"y":10},"to":{"x":20,"y":20}})
+                }
+                _ => json!({"target":TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":1}),
+            };
+            let (cursor, mut receiver) = Coordinator::channel();
+            let plane = if mode == 0 {
+                base
+            } else {
+                base.with_cursor(cursor.clone())
+            };
+            let has_picture = matches!(
+                action,
+                "computer.press_element"
+                    | "computer.press_point"
+                    | "computer.write_text"
+                    | "computer.type"
+                    | "computer.keys"
+                    | "computer.read_state"
+            ) || (action == "computer.wait"
+                && cfg!(any(target_os = "macos", target_os = "windows")));
+            let call = serve(&plane, &management, action, args);
+            let reply = if mode == 2 && has_picture {
+                let (reply, killed) = tokio::join!(call, async {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                            .await
+                            .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
+                            .unwrap();
+                    assert!(!serde_json::to_string(&event)
+                        .unwrap()
+                        .contains("planted typed secret"));
+                    cursor.shutdown();
+                    drop(receiver);
+                });
+                let () = killed;
+                reply
+            } else {
+                if mode == 2 {
+                    cursor.shutdown();
+                }
+                let reply = call.await;
+                if mode == 1 && has_picture {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                            .await
+                            .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
+                            .unwrap();
+                    assert!(!serde_json::to_string(&event)
+                        .unwrap()
+                        .contains("planted typed secret"));
+                }
+                reply
+            };
+            replies.push(serde_json::to_vec(&reply).unwrap());
+        }
+        assert_eq!(replies[0], replies[1], "{action}: cursor changed the reply");
+        assert_eq!(
+            replies[0], replies[2],
+            "{action}: dead helper changed the reply"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cursor_planted_label_reaches_pipe_but_not_journal_or_call_records() {
+    use cerebellum::computer_capability::cursor::Coordinator;
+    use cerebellum::journal::call_records::{
+        Begin, CallRecords, DispatchEvidence, InMemoryCallRecordStorage, Settlement,
+    };
+    const PLANT: &str = "CURSOR_PRIVATE";
+    let desk = desk();
+    desk.state().cursor_visible = true;
+    desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
+    desk.state().elements.get_mut(&10).unwrap().facts.title = Some(PLANT.into());
+    let storage = InMemoryJournalStorage::new();
+    let base: Plane = ComputerPlane::new(support::computer::audit_with_storage(storage.clone()))
+        .with_permission_liveness(support::computer::live_permissions())
+        .with_app_state_source(desk.source());
+    let management = granted_management().await;
+    let read = serve(
+        &base,
+        &management,
+        "computer.read_state",
+        json!({"target":TARGET_BUNDLE_ID}),
+    )
+    .await;
+    let button = id_of(read["state_text"].as_str().unwrap(), "Send");
+    let (cursor, mut receiver) = Coordinator::channel();
+    let plane = base.with_cursor(cursor);
+    let records = InMemoryCallRecordStorage::new();
+    let calls = CallRecords::open(Box::new(records.clone()), 0);
+    let Begin::Execute(ticket) = calls.begin("direct", "cursor-test", "conversation", 1) else {
+        panic!("fresh call must execute")
+    };
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id":button}),
+    )
+    .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        event.label.unwrap().contains("CURSOR_PRIVATE"),
+        "the planted label must reach the actual pipe double"
+    );
+    let frame = subc_protocol::Frame::build_with_version(
+        subc_protocol::PROTOCOL_VERSION,
+        subc_protocol::FrameType::Response,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        1,
+        1,
+        7,
+        serde_json::to_vec(&reply).unwrap(),
+    )
+    .unwrap();
+    calls.settle(
+        ticket,
+        Settlement::from_reply(
+            &frame,
+            DispatchEvidence {
+                committed: true,
+                ..Default::default()
+            },
+        ),
+        2,
+    );
+    assert!(!format!("{:?}", storage.load().unwrap()).contains(PLANT));
+    let recorded = String::from_utf8(records.contents().unwrap()).unwrap();
+    assert!(
+        recorded.contains("cursor-test"),
+        "the call records must actually have been written"
+    );
+    assert!(!recorded.contains(PLANT));
+    assert!(!serde_json::to_string(&reply).unwrap().contains(PLANT));
+}

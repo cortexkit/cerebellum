@@ -1995,3 +1995,69 @@ async fn a_keyed_type_refused_at_a_secure_field_answers_refused() {
         json!({"answer": "refused", "reason": "secure_field_refused"})
     );
 }
+
+#[tokio::test]
+async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pipe_dies() {
+    use cerebellum::computer_capability::cursor::Coordinator;
+    for (action, arguments) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["return"])),
+    ] {
+        let management = granted_management().await;
+        let clock = FakeClock::new();
+        let mut replies = Vec::new();
+        let mut posts = Vec::new();
+        for mode in 0..3 {
+            let shared = Shared::handle();
+            let desk = focused_text_desk();
+            desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
+            desk.state().cursor_visible = true;
+            let base = plane_with(&shared).with_app_state_source(desk.source());
+            serve(
+                &base,
+                "computer.read_state",
+                json!({"target":TARGET_BUNDLE_ID}),
+                &management,
+                &clock,
+            )
+            .await;
+            let (cursor, mut receiver) = Coordinator::channel();
+            let plane = if mode == 0 {
+                base
+            } else {
+                base.with_cursor(cursor.clone())
+            };
+            let call = serve(&plane, action, arguments.clone(), &management, &clock);
+            let reply = if mode == 2 {
+                let (reply, ()) = tokio::join!(call, async {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    cursor.shutdown();
+                    drop(receiver);
+                });
+                reply
+            } else {
+                let reply = call.await;
+                if mode == 1 {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                        .await
+                        .unwrap_or_else(|e| panic!("{action} mode {mode}: {e}; reply={reply}"))
+                        .unwrap();
+                }
+                reply
+            };
+            assert!(
+                !dispatched_calls(&shared).is_empty(),
+                "{action} must reach the real serving dispatch entry point"
+            );
+            posts.push(dispatched_calls(&shared));
+            replies.push(serde_json::to_vec(&reply).unwrap());
+        }
+        assert_eq!(replies[0], replies[1], "{action}");
+        assert_eq!(replies[0], replies[2], "{action}");
+        assert_eq!(posts[0], posts[1], "{action}");
+        assert_eq!(posts[0], posts[2], "{action}");
+    }
+}

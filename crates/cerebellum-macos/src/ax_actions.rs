@@ -69,6 +69,12 @@ extern "C" {
     ) -> i32;
     fn AXUIElementGetPid(element: CfTypeRef, pid: *mut c_int) -> i32;
     fn AXValueGetValue(value: CfTypeRef, value_type: u32, out: *mut c_void) -> bool;
+    fn AXValueGetTypeID() -> usize;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFGetTypeID(value: CfTypeRef) -> usize;
 }
 
 /// Why an action on an element did not happen, or could not be read.
@@ -129,6 +135,59 @@ fn copy(element: CfTypeRef, name: &'static str) -> Result<Option<CFRetained<CFTy
     } else {
         Err(code)
     }
+}
+
+/// Read position and size once without preparing the app or changing a shared
+/// element's messaging timeout. The caller discards results past its deadline.
+pub fn cursor_element_frame(element: &AxRetainedElement) -> Option<[f64; 4]> {
+    require_trust().ok()?;
+    let position = copy(element.as_ptr(), "AXPosition").ok()??;
+    let size = copy(element.as_ptr(), "AXSize").ok()??;
+    // Applications can expose an attribute of the wrong type. Only AXValue
+    // objects may be passed to AXValueGetValue, even when the key is familiar.
+    if unsafe {
+        CFGetTypeID(CFRetained::as_ptr(&position).as_ptr().cast()) != AXValueGetTypeID()
+            || CFGetTypeID(CFRetained::as_ptr(&size).as_ptr().cast()) != AXValueGetTypeID()
+    } {
+        return None;
+    }
+    let mut origin = [0.0f64; 2];
+    let mut extent = [0.0f64; 2];
+    // SAFETY: AXPosition/AXSize are documented AXValue CGPoint/CGSize values;
+    // AXValueGetValue checks the requested type and writes two doubles.
+    if !unsafe {
+        AXValueGetValue(
+            CFRetained::as_ptr(&position).as_ptr().cast(),
+            1,
+            origin.as_mut_ptr().cast(),
+        )
+    } || !unsafe {
+        AXValueGetValue(
+            CFRetained::as_ptr(&size).as_ptr().cast(),
+            2,
+            extent.as_mut_ptr().cast(),
+        )
+    } || !origin.iter().chain(extent.iter()).all(|v| v.is_finite())
+        || extent.iter().any(|v| *v <= 0.0)
+    {
+        return None;
+    }
+    Some([origin[0], origin[1], extent[0], extent[1]])
+}
+
+/// Cosmetic reads must not enable manual accessibility or reset the messaging
+/// timeout of an element shared with dispatch. Never read AXValue here.
+pub fn cursor_element_label(element: &AxRetainedElement) -> Option<(Option<String>, bool)> {
+    require_trust().ok()?;
+    let role = string(element.as_ptr(), "AXRole").ok()??;
+    let subrole = string(element.as_ptr(), "AXSubrole").ok()?;
+    let secure = role == "AXSecureTextField" || subrole.as_deref() == Some("AXSecureTextField");
+    let title = if secure {
+        None
+    } else {
+        string(element.as_ptr(), "AXTitle").ok()?
+    };
+    Some((title, secure))
 }
 
 /// A string attribute; `Ok(None)` when the element has no such value or it is

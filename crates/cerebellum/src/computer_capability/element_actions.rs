@@ -1178,6 +1178,14 @@ where
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
+        self.cursor.schedule(
+            identity.agent_project_id.clone(),
+            cerebellum_computer::cursor::CursorKind::Write,
+            grant.clone(),
+            self.app_state_source.clone(),
+            Some(handle.clone()),
+            None,
+        );
         let mut reply = tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
             let mut audit = audit.blocking_lock();
@@ -1299,8 +1307,10 @@ where
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
+        let cursor = self.cursor.clone();
         tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+            let point = match &target { PressTarget::Point(point) => Some([point.0, point.1]), _ => None };
             let (element_id, handle) = match target {
                 PressTarget::Element { element_id, handle } => (element_id, handle),
                 PressTarget::Point(point) => {
@@ -1324,6 +1334,8 @@ where
                     }
                 }
             };
+            cursor.schedule(identity.agent_project_id.clone(), cerebellum_computer::cursor::CursorKind::Press,
+                grant.clone(), source.clone(), Some(handle.clone()), point);
             let mut audit = audit.blocking_lock();
             let mut journal = ElementJournal {
                 audit: &mut audit,
