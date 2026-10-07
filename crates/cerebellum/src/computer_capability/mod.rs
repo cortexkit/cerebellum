@@ -83,6 +83,7 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+pub mod cursor;
 mod element_actions;
 pub mod image_freshness;
 use image_freshness::{image_freshness_decision, ImageFreshnessSource, NativeImageFreshnessSource};
@@ -469,6 +470,7 @@ where
     /// posts for the person's. One ledger for every conversation: a post
     /// counts as this module's whichever conversation asked for it.
     own_input: Arc<OwnInputLedger>,
+    cursor: cursor::Coordinator,
     /// The screen-lock reading this crate's own tests serve under, in place of
     /// the machine's. Tests that drive the production plane through the frame
     /// loop must not refuse or disclose according to whether the developer's
@@ -566,6 +568,7 @@ where
             make_synthetic_driver,
             fronting_bracket_admitted: false,
             own_input: Arc::new(OwnInputLedger::new()),
+            cursor: cursor::Coordinator::default(),
             #[cfg(test)]
             session_lock_for_test: None,
         }
@@ -601,6 +604,17 @@ where
     /// Read application state from `source` instead of the platform's reader.
     pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
         self.app_state_source = source;
+        self
+    }
+
+    pub fn cursor(&self) -> cursor::Coordinator {
+        self.cursor.clone()
+    }
+
+    /// Inject a memory-only cursor transport for deterministic desk doubles.
+    #[doc(hidden)]
+    pub fn with_cursor(mut self, cursor: cursor::Coordinator) -> Self {
+        self.cursor = cursor;
         self
     }
 
@@ -873,6 +887,14 @@ where
 
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
+        self.cursor.schedule(
+            identity.agent_project_id.clone(),
+            cerebellum_computer::cursor::CursorKind::Reading,
+            grant.clone(),
+            self.app_state_source.clone(),
+            None,
+            None,
+        );
         let (raw, manual_accessibility, seen) = tokio::task::spawn_blocking(move || {
             let _scope =
                 cerebellum_computer::audit::AccessibilityReadScope::new(read_grant.pid, None);
@@ -1161,6 +1183,14 @@ where
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let predicate = parsed.predicate;
+            self.cursor.schedule(
+                identity.agent_project_id.clone(),
+                cerebellum_computer::cursor::CursorKind::Reading,
+                grant.clone(),
+                self.app_state_source.clone(),
+                None,
+                None,
+            );
             let timeout_ms = parsed.timeout_ms;
             let audit = self.audit.clone();
             match tokio::task::spawn_blocking(move || {
@@ -1329,6 +1359,18 @@ where
                 return unposted(reply);
             }
         };
+        self.cursor.schedule(
+            identity.agent_project_id.clone(),
+            if capability == ComputerCapability::Type {
+                cerebellum_computer::cursor::CursorKind::Type
+            } else {
+                cerebellum_computer::cursor::CursorKind::Keys
+            },
+            grant.clone(),
+            self.app_state_source.clone(),
+            focus.as_ref().map(|focus| focus.handle.clone()),
+            None,
+        );
 
         // Only shortcut modifiers need the fronting bracket. Plain typing
         // stays inside the target process without taking the person's focus.

@@ -249,6 +249,27 @@ pub enum HitScope {
 /// Everything but the read has a refusing default, so a platform or fixture
 /// that only reads still compiles and every action on it is refused by name.
 pub trait AppStateSource: Send + Sync {
+    /// A title and secure-field flag, without reading the element's value.
+    fn cursor_label(&self, element: &ElementHandle) -> Option<(Option<String>, bool)> {
+        let facts = self.element_facts(element).ok()?;
+        let secure = facts.is_secure();
+        Some((facts.title, secure))
+    }
+    /// Best-effort geometry for a cosmetic picture. No values are read.
+    fn cursor_frame(&self, _element: &ElementHandle) -> Option<[f64; 4]> {
+        None
+    }
+
+    /// A point in a target window not hidden by another app's normal window.
+    /// With no element point, choose the target window's top-left badge inset.
+    fn visible_cursor_point(
+        &self,
+        _target: &ProcessGrant,
+        _point: Option<[f64; 2]>,
+    ) -> Option<[f64; 2]> {
+        None
+    }
+
     fn read_app_state(
         &self,
         target: &ProcessGrant,

@@ -47,7 +47,11 @@ pub use responsibility::{require_responsibility_disclaim, ResponsibilityDisclaim
 #[path = "../../cerebellum/src/content_named_fixture.rs"]
 mod content_named_fixture;
 #[cfg(target_os = "macos")]
+mod cursor_overlay;
+#[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub use cursor_overlay::{run_agent_cursor, OverlayEvent};
 #[cfg(target_os = "macos")]
 mod process_table;
 #[cfg(any(test, feature = "test-support"))]
@@ -88,9 +92,10 @@ pub use accessibility::{
 pub use ax_actions::enable_manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_actions::{
-    element_at_position, element_facts, element_selected_range, element_text_value,
-    focused_element, focused_window, press_element, request_frontmost, write_element_text,
-    AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,
+    cursor_element_frame, cursor_element_label, element_at_position, element_facts,
+    element_selected_range, element_text_value, focused_element, focused_window, press_element,
+    request_frontmost, write_element_text, AxElementActionError, AxElementFacts, AxHitScope,
+    AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use manual_accessibility::prepare_manual_accessibility;
@@ -124,9 +129,9 @@ pub use input::{
 };
 #[cfg(target_os = "macos")]
 pub use launch::{
-    executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
-    BarredChild, ExecutedImageIdentity, ImageIdentityError, ProcessControlError, ProcessGeneration,
-    ReleasedChild, SpawnError, TerminationOutcome,
+    executed_image_identity, process_descriptors, spawn_barred, spawn_barred_stdin,
+    terminate_exact_generation, BarredChild, ExecutedImageIdentity, ImageIdentityError,
+    ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError, TerminationOutcome,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
@@ -150,4 +155,7 @@ pub use skylight::{
     OwnedKeyEvent, PostResult,
 };
 #[cfg(target_os = "macos")]
-pub use window_image::{encode_scaled_jpeg, frontmost_window_id, window_visibility};
+pub use window_image::{
+    encode_scaled_jpeg, frontmost_window_id, register_cursor_generation, visible_cursor_point,
+    window_visibility,
+};

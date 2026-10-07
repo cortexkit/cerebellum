@@ -517,6 +517,49 @@ fn spawn_barred_with_responsibility(
     cdp_response_write_fd: RawFd,
     disclaim: bool,
 ) -> Result<BarredChild, SpawnError> {
+    spawn_barred_impl(
+        executable,
+        arguments,
+        environment,
+        cdp_command_read_fd,
+        cdp_response_write_fd,
+        disclaim,
+        false,
+    )
+}
+
+/// The barred browser protocol reserves stdin for /dev/null. This minimal
+/// variant maps its command pipe to stdin instead, leaving stdout and stderr
+/// silent and retaining the guardian, kernel generation and responsibility
+/// disclaim. It does not inherit any daemon credentials or environment.
+pub fn spawn_barred_stdin(
+    executable: &Path,
+    arguments: &[OsString],
+) -> Result<(BarredChild, OwnedFd), SpawnError> {
+    let (read, write) = create_pipe()?;
+    let (unused_read, unused_write) = create_pipe()?;
+    let child = spawn_barred_impl(
+        executable,
+        arguments,
+        &[],
+        read.as_raw_fd(),
+        unused_write.as_raw_fd(),
+        true,
+        true,
+    )?;
+    drop((read, unused_read, unused_write));
+    Ok((child, write))
+}
+
+fn spawn_barred_impl(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    cdp_command_read_fd: RawFd,
+    cdp_response_write_fd: RawFd,
+    disclaim: bool,
+    stdin_mode: bool,
+) -> Result<BarredChild, SpawnError> {
     if !executable.is_absolute() {
         return Err(SpawnError::InvalidExecutable);
     }
@@ -564,6 +607,7 @@ fn spawn_barred_with_responsibility(
         command_source.as_raw_fd(),
         response_source.as_raw_fd(),
         disclaim,
+        stdin_mode,
     )?;
 
     // `posix_spawn` may enter framework and libc initialization, so it must run
@@ -799,27 +843,34 @@ fn prepare_spawn(
     command_source: RawFd,
     response_source: RawFd,
     disclaim: bool,
+    stdin_mode: bool,
 ) -> Result<(PosixSpawnFileActions, PosixSpawnAttr), SpawnError> {
     let mut actions: PosixSpawnFileActions = std::ptr::null_mut();
     let mut attributes: PosixSpawnAttr = std::ptr::null_mut();
     let mut status = unsafe { posix_spawn_file_actions_init(&mut actions) };
-    if status == 0 {
+    if status == 0 && !stdin_mode {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 3) };
     }
-    if status == 0 {
+    if status == 0 && !stdin_mode {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, response_source, 4) };
     }
     // Standard descriptors are opened fresh on /dev/null in the child rather
     // than inherited, so nothing the browser prints reaches this process's own
     // streams. Descriptors a file action opens survive CLOEXEC_DEFAULT.
     for (fd, flags) in [(0, O_RDONLY), (1, O_WRONLY), (2, O_WRONLY)] {
+        if fd == 0 && stdin_mode {
+            continue;
+        }
         if status == 0 {
             status = unsafe {
                 posix_spawn_file_actions_addopen(&mut actions, fd, NULL_DEVICE.as_ptr(), flags, 0)
             };
         }
     }
-    for fd in 3..=4 {
+    if status == 0 && stdin_mode {
+        status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 0) };
+    }
+    for fd in if stdin_mode { 0..=0 } else { 3..=4 } {
         if status == 0 {
             status = unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, fd) };
         }

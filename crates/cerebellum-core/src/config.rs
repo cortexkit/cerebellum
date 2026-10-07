@@ -17,6 +17,8 @@
 //!
 //! The config file is `~/.config/cortexkit/cerebellum.jsonc` (JSONC: comments
 //! and trailing commas are stripped via `subc_jsonc` before JSON parsing).
+//! `computer_use.agent_cursor` is an optional Boolean, default true. It only
+//! controls ephemeral cursor pictures and takes effect at module startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,14 +59,18 @@ pub enum ConfigReason {
     Malformed(String),
     /// The config document was not a JSON object at the top level.
     TopLevelNotObject,
+    ComputerUseNotObject,
+    NotBoolean,
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.reason {
             ConfigReason::HealthNotObject => write!(f, "health: expected a JSON object"),
-            ConfigReason::UnknownMember(m) if m == "action_age_stale_ms" => write!(f, "health.action_age_stale_ms was renamed to health.queue_age_stale_ms; it now budgets the oldest queued age only"),
-            ConfigReason::UnknownMember(m) => write!(f, "health: unknown member `{m}`"),
+            ConfigReason::ComputerUseNotObject => write!(f, "computer_use: expected a JSON object"),
+            ConfigReason::NotBoolean => write!(f, "{}: expected a Boolean", self.field),
+            ConfigReason::UnknownMember(m) if self.field == "health" && m == "action_age_stale_ms" => write!(f, "health.action_age_stale_ms was renamed to health.queue_age_stale_ms; it now budgets the oldest queued age only"),
+            ConfigReason::UnknownMember(m) => write!(f, "{}: unknown member `{m}`", self.field),
             ConfigReason::NotInteger => write!(f, "{}: expected a positive integer", self.field),
             ConfigReason::NotPositive => {
                 write!(
@@ -125,18 +131,49 @@ impl Default for HealthConfig {
     }
 }
 
-/// The top-level parsed configuration. Spec A owns only the `health` surface;
-/// other top-level keys are permitted (later cerebellum specifications own
-/// them) and ignored by this slice.
+/// Health and cosmetic computer settings. Other top-level keys are permitted
+/// and parsed by their respective plane-specific loaders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub health: HealthConfig,
+    pub computer_use: ComputerUseConfig,
+}
+
+/// Cosmetic settings grant no input or capture authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputerUseConfig {
+    pub agent_cursor: bool,
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self { agent_cursor: true }
+    }
+}
+
+#[cfg(test)]
+mod cursor_config_tests {
+    use super::*;
+    #[test]
+    fn cursor_setting_is_default_true_and_strictly_boolean() {
+        assert!(parse_config("{}").unwrap().computer_use.agent_cursor);
+        assert!(
+            !parse_config(r#"{"computer_use":{"agent_cursor":false}}"#)
+                .unwrap()
+                .computer_use
+                .agent_cursor
+        );
+        assert!(parse_config(r#"{"computer_use":{"agent_cursor":"false"}}"#).is_err());
+        assert!(parse_config(r#"{"computer_use":{"unknown":true}}"#).is_err());
+        assert!(parse_config(r#"{"computer_use":null}"#).is_err());
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             health: HealthConfig::DEFAULT,
+            computer_use: ComputerUseConfig::default(),
         }
     }
 }
@@ -189,7 +226,31 @@ pub fn parse_config_value(value: &serde_json::Value) -> Result<Config, ConfigErr
         HealthConfig::DEFAULT
     };
 
-    Ok(Config { health })
+    let mut computer_use = ComputerUseConfig::default();
+    if let Some(value) = obj.get("computer_use") {
+        let object = value.as_object().ok_or(ConfigError {
+            field: "computer_use",
+            reason: ConfigReason::ComputerUseNotObject,
+        })?;
+        for key in object.keys() {
+            if key != "agent_cursor" {
+                return Err(ConfigError {
+                    field: "computer_use",
+                    reason: ConfigReason::UnknownMember(key.clone()),
+                });
+            }
+        }
+        if let Some(value) = object.get("agent_cursor") {
+            computer_use.agent_cursor = value.as_bool().ok_or(ConfigError {
+                field: "computer_use.agent_cursor",
+                reason: ConfigReason::NotBoolean,
+            })?;
+        }
+    }
+    Ok(Config {
+        health,
+        computer_use,
+    })
 }
 
 fn parse_health(value: &serde_json::Value) -> Result<HealthConfig, ConfigError> {

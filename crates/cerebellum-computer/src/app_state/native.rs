@@ -90,6 +90,23 @@ fn convert(element: AxStateElement) -> RawElement {
 pub struct MacAppStateSource;
 
 impl AppStateSource for MacAppStateSource {
+    fn cursor_label(&self, element: &ElementHandle) -> Option<(Option<String>, bool)> {
+        cerebellum_macos::cursor_element_label(retained(element).ok()?)
+    }
+    fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+        cerebellum_macos::cursor_element_frame(retained(element).ok()?)
+    }
+
+    fn visible_cursor_point(
+        &self,
+        target: &ProcessGrant,
+        point: Option<[f64; 2]>,
+    ) -> Option<[f64; 2]> {
+        if verify_grant(target.pid, target) != GrantVerification::Current {
+            return None;
+        }
+        cerebellum_macos::visible_cursor_point(target.pid, point)
+    }
     /// Read the granted process, and only while it is still the granted
     /// process: a pid reused by another program after the grant was made is
     /// refused rather than read under the old grant.
