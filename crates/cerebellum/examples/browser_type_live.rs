@@ -808,7 +808,7 @@ mod probe {
         let text = String::from_utf8_lossy(&info.stdout).to_string();
         let after = text.split("pid").nth(1)?;
         after
-            .trim_start_matches(|c: char| c == ' ' || c == '=' || c == '"')
+            .trim_start_matches([' ', '=', '"'])
             .split(|c: char| !c.is_ascii_digit())
             .next()?
             .parse()
