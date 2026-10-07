@@ -422,7 +422,27 @@ pub fn post_event_at_hid_tap_for_measurement(event: OwnedCgEvent) -> CgEventPost
     CgEventPostCall
 }
 
-/// Read the first normal-level window, ignoring floating cosmetic windows.
+/// Read the unix process id of the application that owns the topmost normal
+/// window on screen, ignoring the agent cursor's own floating window.
+///
+/// This is the reading the observed dispatch loop takes before every post,
+/// so it has to be cheap, CURRENT, and permitted under what the module
+/// already holds. Three sources were measured on a VM under the daemon's own
+/// attribution and rejected: System Events over AppleScript answers correctly
+/// in 170-260 ms, most of the latency between a person's input and the
+/// sequence stopping; NSWorkspace answers in 31 us from a cache a process
+/// without a run loop never refreshes, so it kept naming the first
+/// application it ever saw across four switches; the system-wide
+/// accessibility element's focused application answered
+/// kAXErrorCannotComplete in that process even with accessibility trusted.
+/// The window list is served live by the window server under the screen
+/// recording grant the module holds for capture, in z-order, and the first
+/// window at the normal layer belongs to the application a cursor event
+/// would reach.
+///
+/// A focus reading, not an identity: which process the pid is right now is
+/// the caller's generation check. `None` when the list cannot be read or has
+/// no normal-layer window; both are refusals for the policy caller.
 pub fn frontmost_process_id() -> Option<i32> {
     crate::window_image::normal_frontmost_process_id()
 }
