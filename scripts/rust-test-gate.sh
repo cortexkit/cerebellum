@@ -291,8 +291,11 @@ not_verified=
 # supplies it locally. Keep the cross lane available for operators who explicitly
 # request it, but do not spend a second build on a signal CI already provides.
 host_os="$(uname -s)"
-if [ "${CEREBELLUM_GATE_LINUX_LINT:-}" != 1 ] &&
-  { [ "$host_os" = Darwin ] || [ "$host_os" = Linux ]; }; then
+if [ "${CEREBELLUM_GATE_LINUX_LINT:-}" != 1 ] && [ "$host_os" = Linux ]; then
+  # The host clippy phase above already linted Linux natively; nothing is
+  # left unverified, so the verdict names nothing.
+  printf '==> SKIPPED: linux cross lint (the host clippy phase is the Linux lint here)\n'
+elif [ "${CEREBELLUM_GATE_LINUX_LINT:-}" != 1 ] && [ "$host_os" = Darwin ]; then
   printf '==> SKIPPED: linux lint (delegated to CI)\n'
   not_verified="$not_verified; linux lint (delegated to CI)"
 else
