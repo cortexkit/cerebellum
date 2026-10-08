@@ -777,8 +777,10 @@ pub struct DeskState {
     pub signature: Option<cerebellum_computer::app_state::source::BundleSignature>,
     pub opens: Vec<cerebellum_computer::app_state::source::OpenAppBounds>,
     pub url_schemes: Vec<String>,
+    pub url_schemes_after_read: Option<Vec<String>>,
     pub opened_urls: Vec<String>,
     pub opened: cerebellum_computer::app_state::source::OpenedApp,
+    pub open_error: Option<cerebellum_computer::app_state::source::OpenAppError>,
 }
 
 /// A fixture application: its tree, its elements' facts and text, its focus,
@@ -823,13 +825,17 @@ impl Desk {
             }),
             opens: Vec::new(),
             url_schemes: Vec::new(),
+            url_schemes_after_read: None,
             opened_urls: Vec::new(),
             opened: cerebellum_computer::app_state::source::OpenedApp {
                 pid: grant().pid,
                 already_running: false,
                 has_window: true,
                 frontmost: false,
+                process_started_ms: 50,
+                first_window_ms: Some(100),
             },
+            open_error: None,
             running: Some(vec![cerebellum_computer::app_state::source::RunningApp {
                 name: "Safari".into(),
                 bundle_identity: grant().bundle_identity,
@@ -1085,17 +1091,25 @@ impl AppStateSource for Desk {
         &self,
         _app: &cerebellum_computer::app_state::source::InstalledApp,
         bounds: cerebellum_computer::app_state::source::OpenAppBounds,
-    ) -> Result<cerebellum_computer::app_state::source::OpenedApp, AppStateReadError> {
+    ) -> Result<
+        cerebellum_computer::app_state::source::OpenedApp,
+        cerebellum_computer::app_state::source::OpenAppError,
+    > {
         let mut state = self.state();
         state.opens.push(bounds);
-        Ok(state.opened)
+        state.open_error.map_or(Ok(state.opened), Err)
     }
 
     fn bundle_url_schemes(
         &self,
         _: &cerebellum_computer::app_state::source::InstalledApp,
     ) -> Result<Vec<String>, AppStateReadError> {
-        Ok(self.state().url_schemes.clone())
+        let mut state = self.state();
+        let schemes = state.url_schemes.clone();
+        if let Some(next) = state.url_schemes_after_read.take() {
+            state.url_schemes = next;
+        }
+        Ok(schemes)
     }
 
     fn open_app_url(
@@ -1103,7 +1117,10 @@ impl AppStateSource for Desk {
         app: &cerebellum_computer::app_state::source::InstalledApp,
         url: &str,
         bounds: cerebellum_computer::app_state::source::OpenAppBounds,
-    ) -> Result<cerebellum_computer::app_state::source::OpenedApp, AppStateReadError> {
+    ) -> Result<
+        cerebellum_computer::app_state::source::OpenedApp,
+        cerebellum_computer::app_state::source::OpenAppError,
+    > {
         self.state().opened_urls.push(url.to_owned());
         self.open_app(app, bounds)
     }

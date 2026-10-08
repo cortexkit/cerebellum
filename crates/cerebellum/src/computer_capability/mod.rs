@@ -487,6 +487,7 @@ where
     /// Where application state is read from: the platform's accessibility
     /// reader in a running module, a fixture in tests.
     app_state_source: Arc<dyn AppStateSource>,
+    launch_history: Arc<crate::open_app_history::LaunchHistory>,
     image_freshness_source: Arc<dyn ImageFreshnessSource>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
@@ -589,6 +590,7 @@ where
             permissions: crate::default_computer_context().startup.permissions,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
+            launch_history: Arc::new(crate::open_app_history::LaunchHistory::in_memory()),
             image_freshness_source: Arc::new(NativeImageFreshnessSource),
             result_schema_enforcement,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
@@ -614,6 +616,14 @@ where
         permissions: cerebellum_computer::platform::PermissionLivenessReport,
     ) -> Self {
         self.permissions = permissions;
+        self
+    }
+
+    pub(crate) fn with_launch_history(
+        mut self,
+        history: crate::open_app_history::LaunchHistory,
+    ) -> Self {
+        self.launch_history = Arc::new(history);
         self
     }
 

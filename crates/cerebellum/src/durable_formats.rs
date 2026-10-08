@@ -25,6 +25,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         cerebellum_core::journal::AUDIT_JOURNAL_FORMAT,
         cerebellum_core::journal::REFUSAL_RING_FORMAT,
         crate::computer_grants::GRANT_STORE_FORMAT,
+        crate::open_app_history::LAUNCH_HISTORY_FORMAT,
         crate::browser_standing_grants::STANDING_GRANT_STORE_FORMAT,
         crate::browser_launch::LAUNCH_ENTRY_FORMAT,
         crate::browser_launch::LAUNCH_RECOVERY_CLEAR_FORMAT,
@@ -62,5 +63,10 @@ mod tests {
         let names: BTreeSet<_> = formats.iter().map(|format| format.name).collect();
         assert_eq!(names.len(), formats.len(), "a format is listed twice");
         assert!(formats.iter().all(|format| format.version > 0));
+    }
+
+    #[test]
+    fn open_app_history_reader_is_listed_for_the_staging_floor_gate() {
+        assert!(readable_formats().contains(&crate::open_app_history::LAUNCH_HISTORY_FORMAT));
     }
 }

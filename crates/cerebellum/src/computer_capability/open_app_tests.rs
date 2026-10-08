@@ -30,6 +30,13 @@ fn rig() -> (crate::Planes, support::Desk, InMemoryJournalStorage) {
 }
 
 fn rig_with_lock(locked: bool) -> (crate::Planes, support::Desk, InMemoryJournalStorage) {
+    rig_with_history(locked, crate::open_app_history::LaunchHistory::in_memory())
+}
+
+fn rig_with_history(
+    locked: bool,
+    history: crate::open_app_history::LaunchHistory,
+) -> (crate::Planes, support::Desk, InMemoryJournalStorage) {
     use cerebellum_computer::capture_custody::*;
     let mut planes = crate::Planes::with_browser_config_journaling(
         Arc::new(cerebellum_core::health::HealthState::default()),
@@ -66,9 +73,14 @@ fn rig_with_lock(locked: bool) -> (crate::Planes, support::Desk, InMemoryJournal
     )
     .unwrap();
     planes.computer = Ok(Arc::new(
-        ComputerPlane::with_synthetic_driver(audit, NativeComputerPlatformDriver::default)
-            .with_session_lock_for_test(Some(locked))
-            .with_app_state_source(desk.source()),
+        ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+            audit,
+            ResultSchemaEnforcement::Withhold,
+            NativeComputerPlatformDriver::default,
+        )
+        .with_launch_history(history)
+        .with_session_lock_for_test(Some(locked))
+        .with_app_state_source(desk.source()),
     ));
     // Permissions deliberately absent: inventory, LaunchServices and public
     // window metadata require none and must not ask the OS to grant anything.
@@ -84,6 +96,15 @@ fn rig_with_lock(locked: bool) -> (crate::Planes, support::Desk, InMemoryJournal
 }
 
 async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value, usize) {
+    wire_with_decision(planes, action, arguments, "allow_conversation").await
+}
+
+async fn wire_with_decision(
+    planes: &crate::Planes,
+    action: &str,
+    arguments: Value,
+    decision: &str,
+) -> (Value, usize) {
     let mut arguments = arguments;
     arguments["action"] = json!(action);
     let request = Frame::build_with_version(
@@ -133,7 +154,7 @@ async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value,
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
+                serde_json::to_vec(&json!({"decision":decision})).unwrap(),
             )
             .unwrap();
             crate::handle_frame_for_test(answer, &tx, planes)
@@ -426,4 +447,266 @@ async fn open_app_partial_inventory_missing_match_discloses_unreadable_part() {
         assert_eq!(questions, 0);
         assert!(desk.state().opens.is_empty());
     }
+}
+
+#[tokio::test]
+async fn open_app_slow_retry_learns_timeout_and_reports_usual_readiness() {
+    let (planes, desk, _) = rig();
+    // A previous ready launch supplies a median; the next cold start times out.
+    desk.state().opened.first_window_ms = Some(30_000);
+    let (ready, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(ready["outcome"], "launched", "{ready}");
+    assert!(ready.get("usual_ready_ms").is_none());
+    desk.state().open_error = Some(cerebellum_computer::app_state::source::OpenAppError::TimedOut);
+    let (timed_out, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(timed_out["outcome"], "launch_failed", "{timed_out}");
+    assert_eq!(timed_out["usual_ready_ms"], 30_000);
+    {
+        let mut state = desk.state();
+        state.open_error = None;
+        state.opened.first_window_ms = Some(50_000);
+    }
+    let (retry, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(retry["outcome"], "launched", "{retry}");
+    assert_eq!(questions, 0);
+    assert_eq!(retry["usual_ready_ms"], 30_000);
+    assert!(retry["launch_note"]
+        .as_str()
+        .unwrap()
+        .contains("slower than usual"));
+    let state = desk.state();
+    assert_eq!(state.opens[1].ready_timeout, Duration::from_secs(40));
+    assert_eq!(state.opens[2].ready_timeout, Duration::from_secs(80));
+    assert!(!state.opens[2].activates);
+}
+
+#[tokio::test]
+async fn open_app_second_slow_launch_after_timeout_gets_a_longer_deadline() {
+    let (planes, desk, _) = rig();
+    {
+        let mut state = desk.state();
+        state.opened.has_window = false;
+        state.opened.first_window_ms = None;
+    }
+    let (first, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(first["outcome"], "launched_no_window", "{first}");
+    {
+        let mut state = desk.state();
+        state.opened.has_window = true;
+        state.opened.first_window_ms = Some(50_000);
+    }
+    let (second, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(second["outcome"], "launched", "{second}");
+    assert!(
+        second.get("usual_ready_ms").is_none(),
+        "a timeout budget is not an observed ready time: {second}"
+    );
+    assert!(second.get("launch_note").is_none());
+    assert_eq!(desk.state().opens[1].ready_timeout, Duration::from_secs(80));
+    desk.state().opened.first_window_ms = Some(75_000);
+    let (third, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(third["outcome"], "launched", "{third}");
+    assert_eq!(third["usual_ready_ms"], 50_000);
+    assert!(third["launch_note"]
+        .as_str()
+        .unwrap()
+        .contains("slower than usual"));
+}
+
+#[tokio::test]
+async fn open_app_history_real_recording_path_excludes_planted_display_text_and_paths() {
+    const SECRET: &str = "plantedlaunchsecret7b9a";
+    let root = std::env::temp_dir().join(format!(
+        "ck-open-app-leak-{}-{}",
+        std::process::id(),
+        crate::wall_clock_ms()
+    ));
+    let path = root.join("launches.json");
+    let (planes, desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    {
+        let mut state = desk.state();
+        state.installed.apps[0].name = format!("Editor-{SECRET}");
+        state.installed.apps[0].path = root.join(format!("{SECRET}.app"));
+        state.window = Some((91, Some(format!("Document {SECRET}"))));
+    }
+    let scanner = |bytes: &[u8]| {
+        bytes
+            .windows(SECRET.len())
+            .any(|part| part == SECRET.as_bytes())
+    };
+    let control = serde_json::to_vec(&json!({"name":format!("Editor-{SECRET}"),"title":format!("Document {SECRET}"),"path":format!("/{SECRET}.app")})).unwrap();
+    assert!(
+        scanner(&control),
+        "the planted-string scanner must find its positive control"
+    );
+    assert!(!path.exists(), "opening the store must not create it");
+    let (reply, _) = wire(
+        &planes,
+        "open_app",
+        json!({"target":format!("Editor-{SECRET}")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "launched", "{reply}");
+    assert_eq!(desk.state().opens.len(), 1);
+    let bytes = std::fs::read(&path).unwrap();
+    let document: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(document["apps"][0]["launches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        document["apps"][0]["launches"][0]["observation"]["first_window_ms"],
+        100
+    );
+    assert!(
+        !scanner(&bytes),
+        "display text or a path leaked into launch history"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn open_app_history_read_and_write_failures_never_block_or_surface_on_wire() {
+    let root = std::env::temp_dir().join(format!(
+        "ck-open-app-store-failure-{}-{}",
+        std::process::id(),
+        crate::wall_clock_ms()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("history.json");
+    std::fs::write(&path, b"corrupt history").unwrap();
+    let (planes, desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(reply["outcome"], "launched", "{reply}");
+    assert!(reply.get("usual_ready_ms").is_none());
+    assert_eq!(
+        desk.state().opens[0],
+        cerebellum_computer::app_state::source::OpenAppBounds::default()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"corrupt history");
+    std::fs::remove_file(&path).unwrap();
+    let history = crate::open_app_history::LaunchHistory::at(path.clone());
+    // A directory planted after load makes the first atomic replacement fail.
+    std::fs::create_dir(&path).unwrap();
+    let (planes, desk, _) = rig_with_history(false, history);
+    for _ in 0..2 {
+        let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+        assert_eq!(reply["outcome"], "launched", "{reply}");
+        assert!(reply.get("usual_ready_ms").is_none());
+        assert!(reply.get("launch_note").is_none());
+    }
+    assert!(desk
+        .state()
+        .opens
+        .iter()
+        .all(|bounds| *bounds == cerebellum_computer::app_state::source::OpenAppBounds::default()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn open_app_refusals_do_not_create_or_replace_launch_history() {
+    let root = std::env::temp_dir().join(format!(
+        "ck-open-app-refusals-{}-{}",
+        std::process::id(),
+        crate::wall_clock_ms()
+    ));
+    let path = root.join("history.json");
+    let (planes, desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    let (refused, _) = wire(
+        &planes,
+        "open_app",
+        json!({"target":"Safari","url":"unregistered:page"}),
+    )
+    .await;
+    assert_eq!(refused["outcome"], "url_scheme_refused", "{refused}");
+    assert!(!path.exists());
+    desk.state().opened.first_window_ms = Some(30_000);
+    for _ in 0..3 {
+        let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+        assert_eq!(reply["outcome"], "launched", "{reply}");
+    }
+    let recorded = std::fs::read(&path).unwrap();
+    // More refusals than the retention limit must not displace real launches.
+    for _ in 0..21 {
+        let (reply, _) = wire(
+            &planes,
+            "open_app",
+            json!({"target":"Safari","url":"unregistered:page"}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "url_scheme_refused", "{reply}");
+        assert!(reply.get("usual_ready_ms").is_none());
+        assert!(reply.get("launch_note").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    }
+    let (denied_planes, denied_desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    let (denied, questions) = wire_with_decision(
+        &denied_planes,
+        "open_app",
+        json!({"target":"Safari"}),
+        "deny",
+    )
+    .await;
+    assert_eq!(denied["outcome"], "consent_denied", "{denied}");
+    assert_eq!(questions, 1);
+    assert!(denied_desk.state().opens.is_empty());
+    assert!(denied.get("usual_ready_ms").is_none());
+    assert!(denied.get("launch_note").is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    desk.state().signature.as_mut().unwrap().ad_hoc = true;
+    let (unsigned, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(unsigned["outcome"], "consent_unavailable", "{unsigned}");
+    assert!(unsigned.get("usual_ready_ms").is_none());
+    assert!(unsigned.get("launch_note").is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn open_app_url_readmission_failure_is_not_a_launch_history_sample() {
+    let root = std::env::temp_dir().join(format!(
+        "ck-open-app-readmission-{}-{}",
+        std::process::id(),
+        crate::wall_clock_ms()
+    ));
+    let path = root.join("history.json");
+    let (planes, desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    let (ready, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(ready["outcome"], "launched", "{ready}");
+    let recorded = std::fs::read(&path).unwrap();
+    {
+        let mut state = desk.state();
+        state.url_schemes = vec!["synthetic-editor".into()];
+        // The bundle drops its registered scheme between admission and dispatch.
+        state.url_schemes_after_read = Some(Vec::new());
+    }
+    let (refused, _) = wire(
+        &planes,
+        "open_app",
+        json!({"target":"Safari","url":"synthetic-editor:page"}),
+    )
+    .await;
+    assert_eq!(refused["outcome"], "launch_failed", "{refused}");
+    assert_eq!(desk.state().opens.len(), 1);
+    assert!(desk.state().opened_urls.is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        recorded,
+        "URL readmission failed before any launch attempt; history must remain untouched"
+    );
+    assert!(refused.get("usual_ready_ms").is_none());
+    assert!(refused.get("launch_note").is_none());
+    std::fs::remove_dir_all(root).unwrap();
 }

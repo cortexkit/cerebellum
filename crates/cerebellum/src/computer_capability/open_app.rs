@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::computer_grants::{AppCode, AppIdentity, AppIdentityUnreadable, GrantNeed};
-use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps, OpenAppBounds};
+use crate::open_app_history::{AppKey, Observation, Outcome};
+use cerebellum_computer::app_state::source::OpenAppError;
+use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 struct BundleCode {
@@ -64,7 +67,7 @@ where
                 .await
                 .unwrap_or_default();
         let mut reply = self
-            .serve_installed_open_app(&request.target, request.url.as_deref(), &listed, context)
+            .serve_installed_open_app(&request, &listed, context)
             .await;
         // Unreadable bundles elsewhere do not invalidate a found target: its
         // bytes still need a signer-bound grant naming that application. Disclose
@@ -79,12 +82,11 @@ where
 
     async fn serve_installed_open_app<C: MonotonicClock>(
         &self,
-        target: &str,
-        url: Option<&str>,
+        request: &OpenRequest,
         listed: &InstalledApps,
         context: ServeContext<'_, C>,
     ) -> Value {
-        let app = match resolve_installed(target, &listed.apps) {
+        let app = match resolve_installed(&request.target, &listed.apps) {
             Ok(app) => app,
             Err(mut reply) => {
                 if !listed.complete && reply["outcome"] == "no_installed_app_named" {
@@ -93,7 +95,7 @@ where
                 return reply;
             }
         };
-        if let Some(url) = url {
+        if let Some(url) = request.url.as_deref() {
             let source = self.app_state_source.clone();
             let bundle = app.clone();
             let registered =
@@ -113,14 +115,14 @@ where
         // Validate even when a conversation already holds a grant. The grant's
         // requirement is then checked against these on-disk bytes by require.
         let read_code = code.clone();
-        if tokio::task::spawn_blocking(move || read_code.identity())
+        let identity = tokio::task::spawn_blocking(move || read_code.identity())
             .await
             .ok()
-            .and_then(Result::ok)
-            .is_none()
-        {
+            .and_then(Result::ok);
+        let Some(identity) = identity else {
             return json!({"outcome":"consent_unavailable", "detail":{"reason":"app_identity_unreadable","grant":"app","grant_label":app.name}, "remedy":"the installed application must carry a valid, non-ad-hoc signature before it can be launched"});
-        }
+        };
+        let history_key = AppKey::verified(&app.bundle_identity, &identity);
         let need = GrantNeed::App {
             bundle_identity: app.bundle_identity.clone(),
             display_name: app.name.clone(),
@@ -175,31 +177,84 @@ where
         };
         let source = self.app_state_source.clone();
         let launching = app.clone();
-        let url = url.map(str::to_owned);
+        let url = request.url.clone();
+        let bounds = history_key
+            .as_ref()
+            .map(|key| self.launch_history.advice(key).bounds)
+            .unwrap_or_default();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let launch_started = attempted.clone();
         let opened = tokio::task::spawn_blocking(move || {
-            if let Some(url) = url {
+            if let Some(url) = url.as_deref() {
                 // Consent can outlive a bundle update. Re-read the declarations
                 // immediately before dispatch, just as the signer is rechecked.
                 let schemes = source.bundle_url_schemes(&launching).unwrap_or_default();
-                if admit_url(&url, &schemes, &launching.bundle_identity).is_err() {
-                    return Err(AppStateReadError::Unreadable);
+                if admit_url(url, &schemes, &launching.bundle_identity).is_err() {
+                    return Err(OpenAppError::Failed);
                 }
-                source.open_app_url(&launching, &url, OpenAppBounds::default())
+            }
+            // URL revalidation can refuse before any launch call. Keep that
+            // out of history, while still counting a worker failure after the
+            // platform was asked to open the app as a real launch attempt.
+            launch_started.store(true, Ordering::Release);
+            if let Some(url) = url {
+                source.open_app_url(&launching, &url, bounds)
             } else {
-                source.open_app(&launching, OpenAppBounds::default())
+                source.open_app(&launching, bounds)
             }
         })
         .await
-        .unwrap_or(Err(AppStateReadError::Unreadable));
+        .unwrap_or(Err(OpenAppError::Failed));
+        let mut observation = Observation::default();
+        match &opened {
+            Ok(opened) => {
+                observation.process_started_ms = Some(opened.process_started_ms);
+                observation.first_window_ms = opened
+                    .has_window
+                    .then_some(opened.first_window_ms)
+                    .flatten();
+                if !opened.has_window {
+                    // The default budget totals 40 seconds: 30 for a process,
+                    // then 10 for a window. Doubling only the short window
+                    // stage gives 20 seconds, below that minimum total, so it
+                    // would repeat the same wait. Use the full configured
+                    // budget as a conservative timeout sample instead.
+                    observation.timeout_floor_ms = Some(bounds.ready_timeout.as_millis() as u64);
+                }
+            }
+            Err(OpenAppError::TimedOut) => {
+                observation.timeout_floor_ms = Some(bounds.ready_timeout.as_millis() as u64);
+            }
+            Err(OpenAppError::Failed) => {}
+        }
         let mut reply = match opened {
             Ok(opened) => json!({
                 "outcome": if opened.already_running { "already_running" } else if opened.has_window { "launched" } else { "launched_no_window" },
                 "pid": opened.pid, "has_window": opened.has_window, "frontmost": opened.frontmost,
             }),
-            Err(_) => {
-                json!({"outcome":"launch_failed", "remedy":"LaunchServices did not return a process within 30 seconds; list_apps before retrying because the application may still start"})
+            Err(OpenAppError::TimedOut) => {
+                json!({"outcome":"launch_failed", "remedy":format!("LaunchServices did not return a process within its {} ms process wait; list_apps before retrying because the application may still start", bounds.process_timeout.as_millis())})
+            }
+            Err(OpenAppError::Failed) => {
+                json!({"outcome":"launch_failed", "remedy":"LaunchServices could not open the application; list_apps before retrying because the application may still start"})
             }
         };
+        if let (true, Some(key), Some(outcome)) = (
+            attempted.load(Ordering::Acquire),
+            history_key,
+            Outcome::from_reply(reply["outcome"].as_str().unwrap_or("")),
+        ) {
+            let advice = self.launch_history.advice(&key);
+            let elapsed = observation.first_window_ms;
+            if self.launch_history.record(key, observation, outcome) {
+                if let Some(usual) = advice.usual_ready_ms {
+                    reply["usual_ready_ms"] = json!(usual);
+                    if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed > usual) {
+                        reply["launch_note"] = json!(format!("This launch is slower than usual ({elapsed} ms elapsed; usual readiness {usual} ms)."));
+                    }
+                }
+            }
+        }
         // Only app and outcome go into the journal: no path, window content,
         // request text, pid or frontmost state is copied there.
         let summary = json!({"app":{"name":app.name,"bundle_identity":app.bundle_identity},"outcome":reply["outcome"]});

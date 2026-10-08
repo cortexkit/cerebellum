@@ -120,6 +120,15 @@ floor "$home/cortexkit/cerebellum/journal/format-floor.json" '{first: supported[
 expect "a journal floor one version above the build refuses" 1 "$home" "  $first: on disk at version"
 
 new_data_home
+floor "$home/cortexkit/cerebellum/journal/format-floor.json" '{"open-app-launch-history": 1}'
+expect "the launch-history reader is listed at its first format version" 0 "$home"
+
+new_data_home
+floor "$home/cortexkit/cerebellum/journal/format-floor.json" '{"open-app-launch-history": 2}'
+expect "a newer launch-history floor refuses staging by name" 1 "$home" \
+  "open-app-launch-history: on disk at version 2, this build reads up to 1"
+
+new_data_home
 printf '{"version": 1, "floors": {"a-format-no-build-reads": 1}}' \
   >"$home/cortexkit/cerebellum/journal/format-floor.json"
 expect "a floor naming a format the build does not read refuses" 1 "$home" \

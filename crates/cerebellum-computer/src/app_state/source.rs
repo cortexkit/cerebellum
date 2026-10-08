@@ -417,8 +417,8 @@ pub trait AppStateSource: Send + Sync {
         _app: &InstalledApp,
         _url: &str,
         _bounds: OpenAppBounds,
-    ) -> Result<OpenedApp, AppStateReadError> {
-        Err(AppStateReadError::UnsupportedOnPlatform)
+    ) -> Result<OpenedApp, OpenAppError> {
+        Err(OpenAppError::Failed)
     }
 
     /// Launch via the platform application service, not as our child. The
@@ -427,8 +427,8 @@ pub trait AppStateSource: Send + Sync {
         &self,
         _app: &InstalledApp,
         _bounds: OpenAppBounds,
-    ) -> Result<OpenedApp, AppStateReadError> {
-        Err(AppStateReadError::UnsupportedOnPlatform)
+    ) -> Result<OpenedApp, OpenAppError> {
+        Err(OpenAppError::Failed)
     }
 }
 
@@ -489,6 +489,8 @@ pub struct OpenAppBounds {
     pub activates: bool,
     pub process_timeout: Duration,
     pub window_timeout: Duration,
+    /// Total budget from launch dispatch, shared by both wait stages.
+    pub ready_timeout: Duration,
 }
 
 impl Default for OpenAppBounds {
@@ -497,6 +499,7 @@ impl Default for OpenAppBounds {
             activates: false,
             process_timeout: Duration::from_secs(30),
             window_timeout: Duration::from_secs(10),
+            ready_timeout: Duration::from_secs(40),
         }
     }
 }
@@ -507,6 +510,16 @@ pub struct OpenedApp {
     pub already_running: bool,
     pub has_window: bool,
     pub frontmost: bool,
+    /// Elapsed from launch dispatch to the platform's process callback.
+    pub process_started_ms: u64,
+    /// Elapsed from launch dispatch to the first observed window, if any.
+    pub first_window_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAppError {
+    TimedOut,
+    Failed,
 }
 
 /// The reader for a platform with none: every read is refused by name.
