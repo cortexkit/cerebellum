@@ -1456,6 +1456,17 @@ pub trait PlatformDriver {
             "fronted per-process synthetic dispatch",
         ))
     }
+    /// Run one image read inside the same observed front/restore bracket as keys.
+    /// An error means the bracket never started; its callback must not run then.
+    fn read_fronted(
+        &mut self,
+        _target: &ProcessGrant,
+        _maximum_interval_ms: u64,
+        _cancelled: &dyn Fn() -> bool,
+        _read: &mut dyn FnMut(),
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        Err(DriverError::Unsupported("fronted image read"))
+    }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
         -> Result<FrontingSnapshot, DriverError>;

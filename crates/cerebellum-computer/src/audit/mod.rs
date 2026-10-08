@@ -438,7 +438,7 @@ impl PlaneJournalCodec for ComputerJournalCodec {
             "severity_inputs": Self::severity(input.severity_inputs),
         });
         // Read summaries stay directly queryable without decoding opaque result
-        // bytes. Copy only the closed numeric/Boolean fields, never tree text.
+        // bytes. Copy only counts, Booleans and typed image facts, never tree text.
         if self.writes_current_family() {
             if let Ok(summary) = serde_json::from_slice::<Value>(&input.completed_result) {
                 if summary["element_count"].is_u64()
@@ -447,6 +447,18 @@ impl PlaneJournalCodec for ComputerJournalCodec {
                 {
                     for key in ["element_count", "unreadable_subtrees", "image_returned"] {
                         entry[key] = summary[key].clone();
+                    }
+                    if let Ok(decision) = serde_json::from_value::<
+                        crate::app_state::image::ImageDecision,
+                    >(summary["image_decision"].clone())
+                    {
+                        entry["image_decision"] = json!(decision);
+                    }
+                    if let Ok(fronting) = serde_json::from_value::<
+                        crate::app_state::image::ImageFronting,
+                    >(summary["image_fronting"].clone())
+                    {
+                        entry["image_fronting"] = json!(fronting);
                     }
                 }
             }

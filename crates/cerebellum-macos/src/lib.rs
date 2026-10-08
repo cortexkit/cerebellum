@@ -75,7 +75,7 @@ mod window_image;
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
 #[cfg(any(target_os = "macos", test))]
-pub use window_visibility::WindowVisibility;
+pub use window_visibility::{VisibilityRule, WindowVisibility};
 
 // The export gate MATCHES the module gate above. `accessibility` compiles off
 // macOS under `test` on purpose, so its platform-neutral logic -- cycle
@@ -167,5 +167,5 @@ pub use skylight::{
 #[cfg(target_os = "macos")]
 pub use window_image::{
     encode_scaled_jpeg, frontmost_window_id, register_cursor_generation, visible_cursor_point,
-    window_visibility,
+    window_visibility, window_visibility_decision,
 };

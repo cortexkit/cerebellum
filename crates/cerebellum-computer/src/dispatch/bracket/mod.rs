@@ -46,9 +46,9 @@ pub struct UnitPosted {
 
 /// The platform a bracket runs on.
 ///
-/// A unit is the smallest run of events that must not be split across a
-/// restore: one character of typed text, or one whole key chord, whose
-/// modifiers must never stay held while another application is in front.
+/// A unit must not be split across a restore: one image read, one character
+/// of typed text, or one whole key chord. A chord's modifiers must never stay
+/// held while another application is in front.
 pub trait FrontingBracketHost {
     type Tap;
 
@@ -398,6 +398,65 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
     report
 }
 
+/// Use the observed bracket for one read, without posting a key or pointer event.
+/// The observer heartbeat, idle gate, bound and restore are identical to keys.
+pub fn run_fronting_read<H: FrontingBracketHost>(
+    host: &mut H,
+    estimator: &mut UserIdleEstimator,
+    mut plan: BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    read: &mut dyn FnMut(),
+) -> BracketReport {
+    struct ReadingHost<'a, H> {
+        host: &'a mut H,
+        read: &'a mut dyn FnMut(),
+    }
+    impl<H: FrontingBracketHost> FrontingBracketHost for ReadingHost<'_, H> {
+        type Tap = H::Tap;
+        fn now_ms(&mut self) -> u64 {
+            self.host.now_ms()
+        }
+        fn pause_ms(&mut self, ms: u64) {
+            self.host.pause_ms(ms);
+        }
+        fn frontmost_pid(&mut self) -> Option<u32> {
+            self.host.frontmost_pid()
+        }
+        fn request_front(&mut self, pid: u32) -> bool {
+            self.host.request_front(pid)
+        }
+        fn our_pid(&self) -> i64 {
+            self.host.our_pid()
+        }
+        fn create_tap(&mut self) -> Option<Self::Tap> {
+            self.host.create_tap()
+        }
+        fn read_idle(&mut self) -> IdleReading {
+            self.host.read_idle()
+        }
+        fn drain(&mut self, tap: &Self::Tap) -> Vec<SourcedInputEvent> {
+            self.host.drain(tap)
+        }
+        fn post_heartbeat(&mut self) -> HeartbeatProbe {
+            self.host.post_heartbeat()
+        }
+        fn observe_heartbeat(
+            &mut self,
+            tap: &Self::Tap,
+            probe: HeartbeatProbe,
+            watcher: &mut SeizeWatcher,
+        ) -> HeartbeatObservation {
+            self.host.observe_heartbeat(tap, probe, watcher)
+        }
+        fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
+            (self.read)();
+            Ok(UnitPosted::default())
+        }
+    }
+    plan.units = 1;
+    run_fronting_bracket(&mut ReadingHost { host, read }, estimator, plan, cancelled)
+}
+
 /// Put the previous application back and record how long the target was in
 /// front. Returns that interval.
 fn restore<H: FrontingBracketHost>(
@@ -411,7 +470,9 @@ fn restore<H: FrontingBracketHost>(
     if previous == target {
         report.restore = RestoreStatus::NotNeeded;
         let now = host.borrow_mut().now_ms();
-        return now.saturating_sub(fronted_at);
+        let interval = now.saturating_sub(fronted_at);
+        report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
+        return interval;
     }
     let restore_at = host.borrow_mut().now_ms();
     // A failed request is not given up on at once: the previous application

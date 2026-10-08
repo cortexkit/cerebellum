@@ -1419,6 +1419,68 @@ impl PlatformDriver for MacOs26PlatformDriver {
         self.input_route_evidence = host.transport.evidence;
         Ok(report)
     }
+    fn read_fronted(
+        &mut self,
+        target: &ProcessGrant,
+        maximum_interval_ms: u64,
+        cancelled: &dyn Fn() -> bool,
+        read: &mut dyn FnMut(),
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        if self
+            .takeover_dispatch_review_revision
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty())
+        {
+            return Err(DriverError::StartupRefused(
+                "takeover_dispatch_review_revision is not bound",
+            ));
+        }
+        target.validate()?;
+        let generation = target
+            .process_generation_evidence
+            .parse::<u64>()
+            .map_err(|_| {
+                DriverError::InvalidRequest(
+                    "process generation evidence is not a kernel start time",
+                )
+            })?;
+        if cerebellum_macos::process_start_time_micros(target.pid) != Some(generation) {
+            return Err(DriverError::Unsupported(
+                "target process generation changed",
+            ));
+        }
+        let started = Instant::now();
+        let (tap, heartbeat) = open_session_observation(started)?;
+        let mut host = MacBracketHost {
+            started,
+            tap: Some(tap),
+            heartbeat,
+            target: ProcessEventTarget {
+                pid: target.pid,
+                start_time_micros: generation,
+            },
+            units: Vec::new(),
+            transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+        };
+        let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(crate::dispatch::run_fronting_read(
+            &mut host,
+            &mut user_idle,
+            crate::dispatch::BracketPlan {
+                target_pid: target.pid,
+                units: 1,
+                maximum_interval_ms,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            cancelled,
+            &mut || {
+                // Fronting can take time; never capture a replacement process.
+                if cerebellum_macos::process_start_time_micros(target.pid) == Some(generation) {
+                    read();
+                }
+            },
+        ))
+    }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;
         let frontmost = cerebellum_macos::frontmost_process_id()

@@ -27,10 +27,18 @@ pub enum ImageUnavailable {
     ImageNotScalable,
     /// Chromium may have stopped painting while the window was covered.
     WindowCoveredMayBeStale,
+    /// Fronting an image read requires the conversation's machine takeover grant.
+    ImageNeedsTakeover,
+    /// The front/restore interval exceeded the same bound used by keys.
+    FrontingBoundExceeded,
+    /// The observed fronting bracket could not complete.
+    FrontingUnavailable,
+    /// The previous frontmost application could not be restored.
+    RestoreFailed,
 }
 
 impl ImageUnavailable {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 14] = [
         Self::ScreenRecordingNotLive,
         Self::NoWindowCaptured,
         Self::CaptureUnavailable,
@@ -41,6 +49,10 @@ impl ImageUnavailable {
         Self::AuditUnavailable,
         Self::ImageNotScalable,
         Self::WindowCoveredMayBeStale,
+        Self::ImageNeedsTakeover,
+        Self::FrontingBoundExceeded,
+        Self::FrontingUnavailable,
+        Self::RestoreFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -55,6 +67,55 @@ impl ImageUnavailable {
             Self::AuditUnavailable => "audit_unavailable",
             Self::ImageNotScalable => "image_not_scalable",
             Self::WindowCoveredMayBeStale => "window_covered_may_be_stale",
+            Self::ImageNeedsTakeover => "image_needs_takeover",
+            Self::FrontingBoundExceeded => "fronting_bound_exceeded",
+            Self::FrontingUnavailable => "fronting_unavailable",
+            Self::RestoreFailed => "restore_failed",
+        }
+    }
+}
+
+/// Text-free deciding visibility rule, not a guess derived from missing pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDecision {
+    Unknown,
+    TargetAbsent,
+    TargetTransparent,
+    OutsideDisplays,
+    CoveredByWindow,
+    FullyOverlaid,
+    FullyVisible,
+    FrontedThenVisible,
+}
+
+/// Aggregate front/restore facts; never window or element text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageFronting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_frontmost: Option<u32>,
+    pub attempted: bool,
+    pub restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_in_front: Option<u32>,
+    pub longest_fronted_interval_ms: u64,
+}
+
+impl From<&crate::dispatch::BracketReport> for ImageFronting {
+    fn from(report: &crate::dispatch::BracketReport) -> Self {
+        use crate::dispatch::RestoreStatus;
+        Self {
+            previous_frontmost: report.previous_frontmost,
+            attempted: report.chunks > 0,
+            restored: matches!(
+                report.restore,
+                RestoreStatus::Restored | RestoreStatus::NotNeeded
+            ),
+            left_in_front: match report.restore {
+                RestoreStatus::Failed { left_in_front } => left_in_front,
+                _ => None,
+            },
+            longest_fronted_interval_ms: report.longest_fronted_interval_ms,
         }
     }
 }

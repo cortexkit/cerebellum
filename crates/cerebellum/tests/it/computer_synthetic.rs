@@ -54,6 +54,8 @@ struct Shared {
     global: Result<DispatchResult, DriverError>,
     fronted: FrontedScript,
     route_evidence: cerebellum_computer::platform::input_route::InputRouteEvidence,
+    image_frontmost: Arc<std::sync::atomic::AtomicU32>,
+    image_front_requests: Vec<u32>,
 }
 
 impl Shared {
@@ -77,6 +79,8 @@ impl Shared {
             }),
             fronted: FrontedScript::default(),
             route_evidence: Default::default(),
+            image_frontmost: Arc::new(std::sync::atomic::AtomicU32::new(OTHER_APPLICATION_PID)),
+            image_front_requests: Vec::new(),
         }))
     }
 }
@@ -200,6 +204,8 @@ impl PlatformDriver for SyntheticDriver {
             unit_failure: script.unit_failure.clone(),
             seize_after_first_unit: script.seize_after_first_unit,
             units_posted: 0,
+            image_frontmost: None,
+            front_requests: Vec::new(),
         };
         let chunks_started = std::cell::Cell::new(0);
         let scripted_cancel = || {
@@ -217,6 +223,49 @@ impl PlatformDriver for SyntheticDriver {
             },
             &scripted_cancel,
         ))
+    }
+
+    fn read_fronted(
+        &mut self,
+        target: &ProcessGrant,
+        bound: u64,
+        cancelled: &dyn Fn() -> bool,
+        read: &mut dyn FnMut(),
+    ) -> Result<cerebellum_computer::dispatch::BracketReport, DriverError> {
+        let (script, frontmost) = {
+            let shared = self.0.lock().unwrap();
+            (shared.fronted.clone(), shared.image_frontmost.clone())
+        };
+        let mut desk = FrontingDesk {
+            now: 0,
+            frontmost: Some(OTHER_APPLICATION_PID),
+            pending: None,
+            refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
+            front_latency_ms: script.front_latency_ms.unwrap_or(2),
+            unit_failure: None,
+            seize_after_first_unit: false,
+            units_posted: 0,
+            image_frontmost: Some(frontmost),
+            front_requests: Vec::new(),
+        };
+        let report = cerebellum_computer::dispatch::run_fronting_read(
+            &mut desk,
+            &mut cerebellum_computer::dispatch::UserIdleEstimator::new(),
+            cerebellum_computer::dispatch::BracketPlan {
+                target_pid: target.pid,
+                units: 1,
+                maximum_interval_ms: bound,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            cancelled,
+            read,
+        );
+        self.0
+            .lock()
+            .unwrap()
+            .image_front_requests
+            .extend(desk.front_requests);
+        Ok(report)
     }
 
     fn query_focus(
@@ -314,6 +363,8 @@ struct FrontingDesk {
     unit_failure: Option<SequencePostFailure>,
     seize_after_first_unit: bool,
     units_posted: usize,
+    image_frontmost: Option<Arc<std::sync::atomic::AtomicU32>>,
+    front_requests: Vec<u32>,
 }
 
 impl FrontingDesk {
@@ -322,6 +373,9 @@ impl FrontingDesk {
         if let Some((pid, at)) = self.pending {
             if self.now >= at {
                 self.frontmost = Some(pid);
+                if let Some(frontmost) = &self.image_frontmost {
+                    frontmost.store(pid, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.pending = None;
             }
         }
@@ -340,6 +394,7 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         self.frontmost
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        self.front_requests.push(pid);
         if self.refuse_front_of != Some(pid) {
             self.pending = Some((pid, self.now + self.front_latency_ms));
         }
@@ -398,6 +453,8 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
         })
     }
 }
+
+mod image_read;
 
 type TestPlane = ComputerPlane<
     InMemoryCaptureBackend,

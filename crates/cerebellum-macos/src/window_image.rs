@@ -156,9 +156,19 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
 /// Whether this exact window is wholly on screen under the image visibility rules.
 /// The on-screen list is front-to-back; missing data never proves visibility.
 pub fn window_visibility(pid: u32, id: u32) -> crate::WindowVisibility {
-    use crate::WindowVisibility;
+    window_visibility_decision(pid, id).0
+}
+
+/// Return the rule as well as the visibility; no window titles are retained.
+pub fn window_visibility_decision(
+    pid: u32,
+    id: u32,
+) -> (crate::WindowVisibility, crate::VisibilityRule) {
     let Some(entries) = cursor_window_list() else {
-        return WindowVisibility::Unknown;
+        return (
+            crate::WindowVisibility::Unknown,
+            crate::VisibilityRule::MissingData,
+        );
     };
     window_visibility_with_entries(pid, id, &entries)
 }
@@ -264,7 +274,7 @@ fn window_visibility_with_entries(
     pid: u32,
     id: u32,
     entries: &[crate::window_visibility::Window],
-) -> crate::WindowVisibility {
+) -> (crate::WindowVisibility, crate::VisibilityRule) {
     use crate::window_visibility::{visibility_from_windows, Rect};
     use crate::WindowVisibility;
     let mut ids = [0u32; 32];
@@ -272,7 +282,10 @@ fn window_visibility_with_entries(
     // SAFETY: ids has capacity for 32 display IDs and count is a valid output pointer.
     let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
     if status != 0 || count == 0 || count as usize >= ids.len() {
-        return WindowVisibility::Unknown;
+        return (
+            WindowVisibility::Unknown,
+            crate::VisibilityRule::MissingData,
+        );
     }
     let displays = ids[..count as usize]
         .iter()
@@ -287,7 +300,7 @@ fn window_visibility_with_entries(
             }
         })
         .collect::<Vec<_>>();
-    visibility_from_windows(pid, id, entries, &displays).0
+    visibility_from_windows(pid, id, entries, &displays)
 }
 
 #[cfg(test)]

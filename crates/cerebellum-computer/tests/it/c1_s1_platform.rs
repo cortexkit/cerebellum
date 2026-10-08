@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v20.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v21.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -759,7 +759,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v18_from_v17(&generated, historical_revision(18).as_str().unwrap());
     let generated =
         vocabulary_mint::v19_from_v18(&generated, historical_revision(19).as_str().unwrap());
-    let generated = vocabulary_mint::v20_from_v19(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v20_from_v19(&generated, historical_revision(20).as_str().unwrap());
+    let generated = vocabulary_mint::v21_from_v20(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1321,7 +1323,7 @@ fn recreated_v18() -> Value {
 }
 
 fn recreated_v19() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v20();
     vocabulary["revision"] = historical_revision(19);
     let schemas: Value =
         serde_json::from_str(include_str!("../fixtures/v19_round_trip_schemas.json")).unwrap();
@@ -1332,6 +1334,59 @@ fn recreated_v19() -> Value {
         }
     }
     vocabulary
+}
+
+fn recreated_v20() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(20);
+    let row = vocabulary["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.read_state")
+        .unwrap();
+    assert_eq!(
+        row["result_schema"]["properties"]["outcome"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .pop()
+            .unwrap(),
+        "state_changed_by_person"
+    );
+    row["request_schema"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("bring_to_front");
+    row["result_schema"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("image_fronting");
+    let unavailable = &mut row["result_schema"]["properties"]["image_unavailable"]["properties"];
+    unavailable.as_object_mut().unwrap().remove("detail");
+    for reason in [
+        "restore_failed",
+        "fronting_unavailable",
+        "fronting_bound_exceeded",
+        "image_needs_takeover",
+    ] {
+        assert_eq!(
+            unavailable["reason"]["enum"]
+                .as_array_mut()
+                .unwrap()
+                .pop()
+                .unwrap(),
+            reason
+        );
+    }
+    vocabulary
+}
+
+#[test]
+fn v21_only_makes_the_changes_recreated_v20_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v20()).unwrap()),
+        "d56bbea03e117fc18bed6b9d6bfbd3437f277255219279a7e853b2979b6e4c7f"
+    );
 }
 
 #[test]

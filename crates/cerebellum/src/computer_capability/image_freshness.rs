@@ -7,7 +7,7 @@ fn repaints_while_covered(bundle_identity: &str) -> bool {
     COVERED_WINDOW_REPAINTING_APPS.contains(&bundle_identity)
 }
 
-use cerebellum_computer::app_state::image::ImageUnavailable;
+use cerebellum_computer::app_state::image::{ImageDecision, ImageUnavailable};
 use cerebellum_computer::platform::ProcessGrant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,26 +34,61 @@ pub fn image_freshness_decision(
 /// The boolean certifies measured repainting while covered, not an engine guess.
 pub trait ImageFreshnessSource: Send + Sync {
     fn inspect(&self, target: &ProcessGrant, window_id: Option<&str>) -> (bool, WindowVisibility);
+
+    /// Sources without a deciding rule cannot distinguish a cover from an
+    /// off-screen or absent window. Only report a rule the source established.
+    fn inspect_decision(
+        &self,
+        target: &ProcessGrant,
+        window_id: Option<&str>,
+    ) -> (bool, WindowVisibility, ImageDecision) {
+        let (repaints, visibility) = self.inspect(target, window_id);
+        let decision = match visibility {
+            WindowVisibility::FullyVisible => ImageDecision::FullyVisible,
+            WindowVisibility::Covered | WindowVisibility::Unknown => ImageDecision::Unknown,
+        };
+        (repaints, visibility, decision)
+    }
 }
 
 pub(super) struct NativeImageFreshnessSource;
 
 impl ImageFreshnessSource for NativeImageFreshnessSource {
     fn inspect(&self, target: &ProcessGrant, window_id: Option<&str>) -> (bool, WindowVisibility) {
+        let (repaints, visibility, _) = self.inspect_decision(target, window_id);
+        (repaints, visibility)
+    }
+
+    fn inspect_decision(
+        &self,
+        target: &ProcessGrant,
+        window_id: Option<&str>,
+    ) -> (bool, WindowVisibility, ImageDecision) {
         #[cfg(target_os = "macos")]
         {
             let id = match window_id {
                 Some(id) => id.parse::<u32>().ok(),
                 None => cerebellum_macos::frontmost_window_id(target.pid),
             };
-            let visibility = id.map(|id| cerebellum_macos::window_visibility(target.pid, id));
+            let visibility =
+                id.map(|id| cerebellum_macos::window_visibility_decision(target.pid, id));
+            use cerebellum_macos::VisibilityRule as Rule;
             use cerebellum_macos::WindowVisibility as Native;
             (
                 repaints_while_covered(&target.bundle_identity),
                 match visibility {
-                    Some(Native::FullyVisible) => WindowVisibility::FullyVisible,
-                    Some(Native::Covered) => WindowVisibility::Covered,
-                    Some(Native::Unknown) | None => WindowVisibility::Unknown,
+                    Some((Native::FullyVisible, _)) => WindowVisibility::FullyVisible,
+                    Some((Native::Covered, _)) => WindowVisibility::Covered,
+                    Some((Native::Unknown, _)) | None => WindowVisibility::Unknown,
+                },
+                match visibility.map(|(_, rule)| rule) {
+                    Some(Rule::TargetAbsent) => ImageDecision::TargetAbsent,
+                    Some(Rule::TargetTransparent) => ImageDecision::TargetTransparent,
+                    Some(Rule::OutsideDisplays) => ImageDecision::OutsideDisplays,
+                    Some(Rule::OverlappingWindow) => ImageDecision::CoveredByWindow,
+                    Some(Rule::HigherLayerUnionCoverage) => ImageDecision::FullyOverlaid,
+                    Some(Rule::NoLayerZeroOverlap) => ImageDecision::FullyVisible,
+                    Some(Rule::MissingData) | None => ImageDecision::Unknown,
                 },
             )
         }
@@ -63,6 +98,7 @@ impl ImageFreshnessSource for NativeImageFreshnessSource {
             (
                 repaints_while_covered(&target.bundle_identity),
                 WindowVisibility::Unknown,
+                ImageDecision::Unknown,
             )
         }
     }

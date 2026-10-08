@@ -993,6 +993,10 @@ fn every_image_unavailable_reason_is_reachable() {
         ImageUnavailable::CaptureUnavailable,
         ImageUnavailable::CaptureFailed,
         ImageUnavailable::WindowCoveredMayBeStale,
+        ImageUnavailable::ImageNeedsTakeover,
+        ImageUnavailable::FrontingBoundExceeded,
+        ImageUnavailable::FrontingUnavailable,
+        ImageUnavailable::RestoreFailed,
     ] {
         assert_eq!(run(&mut ScriptedCustody::default(), Err(reason)), reason);
     }
