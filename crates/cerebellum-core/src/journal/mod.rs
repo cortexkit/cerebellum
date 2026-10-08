@@ -46,8 +46,9 @@ pub use late_events::{
     LateEventQueue, LateEventSequence,
 };
 pub use origin::{
-    origin_invalid_count, CallOriginRecord, OriginCarrier, ORIGIN_INVALID_MARKER,
-    ORIGIN_MODULE_ID_MAX_LEN,
+    message_position_from_request_member, message_position_invalid_count, origin_invalid_count,
+    CallOriginRecord, ComputerOrderRecord, ComputerOrdering, OriginCarrier, MESSAGE_INDEX_MAX,
+    ORIGIN_INVALID_MARKER, ORIGIN_MODULE_ID_MAX_LEN,
 };
 pub use redaction::{redact_then_truncate, RedactionUnavailable, Redactor};
 pub use refusal_ring::{
@@ -80,6 +81,12 @@ pub struct JournalIdentity {
     /// without one byte-identical to the previous journal schema.
     #[serde(default, skip_serializing_if = "CallOriginRecord::is_absent")]
     pub origin: CallOriginRecord,
+    /// Computer-call ordering, when the call traversed the conversation queue.
+    /// Carried with the identity into blocking audit writes, so it describes
+    /// this call rather than whichever task happens to write next. No opaque
+    /// model message identifier is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_order: Option<ComputerOrderRecord>,
     /// The request this obligation serves, marked when its dispatch is
     /// committed. Never persisted; a reloaded identity carries a detached one.
     #[serde(skip)]
@@ -1687,6 +1694,7 @@ mod tests {
             agent_project_id: "a".to_string(),
             session_kind: SessionKind::Primary,
             origin: CallOriginRecord::Absent,
+            computer_order: None,
         }
     }
 

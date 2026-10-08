@@ -742,7 +742,7 @@ where
         &self,
         capability: Servable,
         arguments: &Value,
-        context: ServeContext<'_, C>,
+        mut context: ServeContext<'_, C>,
         // The capture backend for the state read's window image, the one
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
@@ -758,7 +758,7 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
-        let _serialized = match self.serialize(capability, arguments, &context).await {
+        let _serialized = match self.serialize(capability, arguments, &mut context).await {
             Ok(guard) => guard,
             Err(refusal) => {
                 return self.finish_reply(
@@ -3691,6 +3691,7 @@ mod startup_reconciliation_tests {
                     agent_project_id: "project-1".into(),
                     session_kind: SessionKind::Primary,
                     origin: Default::default(),
+                    computer_order: None,
                 },
                 descriptor,
             )

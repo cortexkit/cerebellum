@@ -340,6 +340,12 @@ impl ComputerJournalCodec {
         if !value.origin.is_absent() {
             identity["origin"] = json!(value.origin);
         }
+        if let Some(order) = value.computer_order {
+            if let Some(index) = order.message_index {
+                identity["message_index"] = json!(index);
+            }
+            identity["ordering"] = json!(order.ordering);
+        }
         identity
     }
 
@@ -1248,6 +1254,7 @@ pub fn journal_identity(
         agent_project_id: agent_project_id.into(),
         session_kind,
         origin: Default::default(),
+        computer_order: None,
     }
 }
 

@@ -8,8 +8,7 @@
 //! attribution only: admission, call-key lookups and cancellation stay keyed
 //! on the route's own principal and bind facts and never read this value.
 //!
-//! The recorded value carries exactly the members the wire protocol defines
-//! for an origin (`carrier`, a principal; `call_key`, an opaque key), each
+//! The recorded attribution carries only `carrier` and `call_key`, each
 //! within the protocol's own bounds. Any other member a caller sends is
 //! dropped while decoding, so no caller-chosen text beyond those bounds can
 //! reach an audit record.
@@ -18,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subc_protocol::tool_call::{validate_call_origin, CallOrigin};
+use subc_protocol::tool_call::{
+    validate_call_key, validate_call_origin, CallOrigin, MessagePosition,
+};
 use subc_protocol::Principal;
 
 /// The marker an audit record carries when a call arrived with an origin
@@ -34,6 +35,52 @@ pub const ORIGIN_INVALID_MARKER: &str = "origin_invalid";
 pub const ORIGIN_MODULE_ID_MAX_LEN: usize = 255;
 
 static ORIGIN_INVALID_COUNT: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_POSITION_INVALID_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Indices larger than a small integer are not useful for a bounded ordering
+/// window. Reject only the hint, never the call or its caller attribution.
+pub const MESSAGE_INDEX_MAX: u32 = u16::MAX as u32;
+
+pub fn message_position_invalid_count() -> u64 {
+    MESSAGE_POSITION_INVALID_COUNT.load(Ordering::Relaxed)
+}
+
+/// Decode the ordering hint independently of attribution. The opaque message
+/// id stays in memory only; audit records keep the index and ordering outcome.
+pub fn message_position_from_request_member(member: Option<&Value>) -> Option<MessagePosition> {
+    let position = member?
+        .get("message_position")
+        .filter(|value| !value.is_null())?;
+    match MessagePosition::deserialize(position) {
+        Ok(position)
+            if position.index <= MESSAGE_INDEX_MAX
+                && validate_call_key(&position.message_id).is_ok() =>
+        {
+            Some(position)
+        }
+        _ => {
+            MESSAGE_POSITION_INVALID_COUNT.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// How a computer call obtained its conversation position. This is audit
+/// metadata, not a tool reply or an authorization decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerOrdering {
+    Position,
+    Arrival,
+    SkippedGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerOrderRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_index: Option<u32>,
+    pub ordering: ComputerOrdering,
+}
 
 /// How many requests in this process carried an origin that failed
 /// validation and were recorded with [`ORIGIN_INVALID_MARKER`] instead.
@@ -94,9 +141,11 @@ impl CallOriginRecord {
     }
 
     fn validated(member: &Value) -> Option<Self> {
-        // The wire type drops members it does not define, so a caller's extra
-        // text never survives this step.
-        let origin = CallOrigin::deserialize(member).ok()?;
+        // A malformed ordering hint must not discard otherwise valid caller
+        // attribution. Validate the two independently, and never persist the id.
+        let mut attribution = member.as_object()?.clone();
+        attribution.remove("message_position");
+        let origin = CallOrigin::deserialize(Value::Object(attribution)).ok()?;
         validate_call_origin(&origin).ok()?;
         let carrier = match origin.carrier {
             Principal::Reserved { module_id } => {

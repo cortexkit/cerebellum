@@ -203,6 +203,7 @@ impl JournalStore {
                 SessionKind::Ephemeral => cerebellum_core::identity::SessionKind::Ephemeral,
             },
             origin: identity.origin.clone(),
+            computer_order: None,
         }
     }
 

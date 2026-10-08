@@ -115,6 +115,7 @@ fn identity() -> JournalIdentity {
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
         origin: Default::default(),
+        computer_order: None,
     }
 }
 
