@@ -56,6 +56,8 @@ EVENT="${WATCH_CI_EVENT:-push}"
 # knobs exist so tests can drive the resolver without waiting out that budget.
 RESOLVE_ATTEMPTS="${WATCH_CI_RESOLVE_ATTEMPTS:-40}"
 RESOLVE_SLEEP="${WATCH_CI_RESOLVE_SLEEP:-15}"
+# Seconds between polls of a run that is still going, a knob for tests.
+POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
 ARG="${1:-}"
 RID=""
 WATCH_SHA=""
@@ -144,7 +146,14 @@ while true; do
   fi
 
   if [ "$STATUS" = "completed" ]; then
-    CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
+    # Every verdict below must come from a call that returned. A failed read
+    # retries on the next poll rather than reading as an empty set of failed
+    # jobs, which would land a commit whose CI result was never seen.
+    if ! CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null) || [ -z "$CONC" ]; then
+      echo "watch-ci: could not read run $RID's conclusion; retrying" >&2
+      sleep "$POLL_SLEEP"
+      continue
+    fi
     if [ "$CONC" = "success" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC"
       exit 0
@@ -154,8 +163,12 @@ while true; do
     # 'OpenCode 2 (Linux Docker)' was cancelled and main's 25 required checks
     # were all green). The sha is landable then, so the verdict is the set of
     # non-advisory jobs, not the run's summary conclusion.
-    GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not) | .name] | join("; ")')
+    if ! GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
+      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not) | .name] | join("; ")' 2>/dev/null); then
+      echo "watch-ci: could not read run $RID's jobs; retrying" >&2
+      sleep "$POLL_SLEEP"
+      continue
+    fi
     if [ -z "$GATING_BAD" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC advisory_only=1"
       exit 0
@@ -164,5 +177,5 @@ while true; do
     exit 1
   fi
 
-  sleep 45
+  sleep "$POLL_SLEEP"
 done

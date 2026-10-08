@@ -358,6 +358,11 @@ run_phase "cargo test --locked -p cerebellum --features test-observer --test con
 run_phase "scripts/lib/format-floor-gate.test.sh" \
   scripts/lib/format-floor-gate.test.sh
 
+# Phase 5b2: the CI watcher that decides whether a train lands must never read
+# a failed GitHub call as a green run. Driven against a fake gh, no network.
+run_phase "scripts/watch-ci.test.sh" \
+  scripts/watch-ci.test.sh
+
 # Phase 5c: staging and placement refuse a binary without hardened runtime or
 # with get-task-allow, since either lets a same-user debugger read the module.
 # Like the floor gate, the check is a script a test run never reaches, so its
