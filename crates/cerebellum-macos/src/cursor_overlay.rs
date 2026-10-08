@@ -2,9 +2,10 @@
 //! This module has no input posting, target-app activation, or capture APIs.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
+
+use crate::cursor_schedule::{CursorSchedule, PictureStep, Wait};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -72,7 +73,6 @@ struct Picture {
     from: [f64; 2],
     to: [f64; 2],
     current: [f64; 2],
-    started: Instant,
     duration_ms: f64,
     reduce: bool,
 }
@@ -123,7 +123,6 @@ impl Picture {
             from: to,
             to,
             current: to,
-            started: Instant::now(),
             duration_ms: 0.0,
             reduce: false,
         }
@@ -147,13 +146,11 @@ impl Picture {
                 self.reduce,
             )
         };
-        self.started = Instant::now();
         self.panel.setAlphaValue(1.0);
         self.panel.orderFrontRegardless();
     }
 
-    fn tick(&mut self, desktop_top: f64, position: GlidePosition) {
-        let elapsed = self.started.elapsed().as_secs_f64() * 1000.0;
+    fn tick(&mut self, elapsed: f64, alpha: f64, desktop_top: f64, position: GlidePosition) {
         let fraction = if self.duration_ms <= 0.0 {
             1.0
         } else {
@@ -173,11 +170,7 @@ impl Picture {
         };
         self.badge.ivars().pulse.set(pulse);
         self.badge.setNeedsDisplay(true);
-        let alpha = (1.0 - (elapsed - 1500.0).max(0.0) / 250.0).clamp(0.0, 1.0);
         self.panel.setAlphaValue(alpha);
-        if alpha == 0.0 {
-            self.panel.orderOut(None);
-        }
     }
 }
 
@@ -198,47 +191,64 @@ pub fn run_agent_cursor(
     let desktop_top = NSScreen::screens(mtm)
         .firstObject()
         .map_or(0.0, |screen| screen.frame().size.height);
-    let mut pictures = BTreeMap::<String, Picture>::new();
+    let mut pictures = CursorSchedule::<Picture>::new();
+    let mut pending = None;
     loop {
-        let closed = objc2::rc::autoreleasepool(|_| {
+        let wait = objc2::rc::autoreleasepool(|_| {
             // Bounded by the producer's queue; animation still gets a turn when
             // a noisy agent is continuously sending events.
             for _ in 0..32 {
-                match events.try_recv() {
+                match pending.take().map_or_else(|| events.try_recv(), Ok) {
                     Ok(event) => {
                         if !event.to.iter().all(|v| v.is_finite()) {
                             continue;
                         }
-                        if !pictures.contains_key(&event.agent) && pictures.len() >= 64 {
-                            continue;
+                        if let Some(picture) =
+                            pictures.picture_for_event(event.agent.clone(), Instant::now(), || {
+                                Picture::new(mtm, event.to)
+                            })
+                        {
+                            picture.update(event, duration);
                         }
-                        let picture = pictures
-                            .entry(event.agent.clone())
-                            .or_insert_with(|| Picture::new(mtm, event.to));
-                        picture.update(event, duration);
                     }
-                    Err(TryRecvError::Disconnected) => return true,
+                    Err(TryRecvError::Disconnected) => return None,
                     Err(TryRecvError::Empty) => break,
                 }
             }
-            for picture in pictures.values_mut() {
-                picture.tick(desktop_top, position);
+            let wait = pictures.advance(Instant::now(), |picture, step| match step {
+                PictureStep::Draw { elapsed_ms, alpha } => {
+                    picture.tick(elapsed_ms, alpha, desktop_top, position);
+                }
+                PictureStep::Hide => picture.panel.orderOut(None),
+            });
+            if let Wait::Frame(interval) = wait {
+                let date = NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64());
+                // Only live pictures need AppKit's timed pump; it never posts input.
+                if let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&date),
+                    unsafe { NSDefaultRunLoopMode },
+                    true,
+                ) {
+                    app.sendEvent(&event);
+                }
             }
-            let date = NSDate::dateWithTimeIntervalSinceNow(1.0 / 60.0);
-            // This pumps AppKit's main-thread run loop; it never posts input.
-            if let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                NSEventMask::Any,
-                Some(&date),
-                unsafe { NSDefaultRunLoopMode },
-                true,
-            ) {
-                app.sendEvent(&event);
-            }
+            // Flush the final orderOut before sleeping without any live panels.
             app.updateWindows();
-            false
+            Some(wait)
         });
-        if closed {
-            break;
+        match wait {
+            None => break,
+            Some(Wait::Event) => {
+                // The stdin reader already runs in the background. Receiving here
+                // wakes immediately on new pictures or EOF, without an idle timer
+                // or a synthetic AppKit event that could carry input authority.
+                match events.recv() {
+                    Ok(event) => pending = Some(event),
+                    Err(_) => break,
+                }
+            }
+            Some(Wait::Frame(_)) => {}
         }
     }
 }

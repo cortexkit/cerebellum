@@ -56,6 +56,8 @@ pub use responsibility::{require_responsibility_disclaim, ResponsibilityDisclaim
 mod content_named_fixture;
 #[cfg(target_os = "macos")]
 mod cursor_overlay;
+#[cfg(any(target_os = "macos", test))]
+mod cursor_schedule;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
