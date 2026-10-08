@@ -25,11 +25,39 @@ pub struct InstalledApplication {
 pub struct InstalledApplicationList {
     pub apps: Vec<InstalledApplication>,
     pub complete: bool,
+    pub unreadable: Vec<InstalledInventoryFailure>,
+}
+
+/// A bundle or directory omitted from an incomplete inventory, never its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledInventoryFailure {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Default)]
+struct InventoryProgress {
+    list: InstalledApplicationList,
+    reading: PathBuf,
+}
+
+fn unreadable(sink: &Mutex<InventoryProgress>, path: &Path, reason: impl Into<String>) {
+    sink.lock()
+        .unwrap()
+        .list
+        .unreadable
+        .push(InstalledInventoryFailure {
+            path: path.to_owned(),
+            reason: reason.into(),
+        });
 }
 
 /// Snapshot partial progress even when a filesystem read stalls past the bound.
 pub fn installed_applications(timeout: Duration) -> InstalledApplicationList {
-    let result = Arc::new(Mutex::new(InstalledApplicationList::default()));
+    let result = Arc::new(Mutex::new(InventoryProgress {
+        reading: PathBuf::from("/Applications"),
+        ..Default::default()
+    }));
     let sink = result.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let deadline = Instant::now() + timeout;
@@ -48,18 +76,37 @@ pub fn installed_applications(timeout: Duration) -> InstalledApplicationList {
             for root in roots {
                 complete &= scan(&root, 1, deadline, &sink);
                 if Instant::now() >= deadline {
+                    unreadable(
+                        &sink,
+                        &root,
+                        "inventory deadline exceeded while scanning this directory",
+                    );
                     complete = false;
                     break;
                 }
             }
             complete &= Instant::now() < deadline;
-            sink.lock().unwrap().complete = complete;
+            sink.lock().unwrap().list.complete = complete;
             let _ = tx.send(());
         });
-    if spawned.is_ok() {
-        let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let failure = match spawned {
+        Ok(_) => rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .err()
+            .map(|error| {
+                format!("inventory worker did not finish within its time budget: {error}")
+            }),
+        Err(error) => Some(format!("inventory worker could not start: {error}")),
+    };
+    let progress = result.lock().unwrap();
+    let mut snapshot = progress.list.clone();
+    if let Some(reason) = failure {
+        snapshot.complete = false;
+        snapshot.unreadable.push(InstalledInventoryFailure {
+            path: progress.reading.clone(),
+            reason,
+        });
     }
-    let mut snapshot = result.lock().unwrap().clone();
     snapshot.apps.sort_by(|a, b| {
         a.name
             .to_lowercase()
@@ -68,55 +115,86 @@ pub fn installed_applications(timeout: Duration) -> InstalledApplicationList {
     });
     snapshot.apps.dedup_by(|a, b| a.path == b.path);
     snapshot
+        .unreadable
+        .sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
+    snapshot.unreadable.dedup();
+    snapshot
 }
 
-fn scan(
-    root: &Path,
-    depth: usize,
-    deadline: Instant,
-    sink: &Mutex<InstalledApplicationList>,
-) -> bool {
+fn scan(root: &Path, depth: usize, deadline: Instant, sink: &Mutex<InventoryProgress>) -> bool {
+    sink.lock().unwrap().reading = root.to_owned();
+    if Instant::now() >= deadline {
+        unreadable(
+            sink,
+            root,
+            "inventory deadline exceeded; directory was not fully scanned",
+        );
+        return false;
+    }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+        Err(error) => {
+            unreadable(sink, root, format!("cannot read directory: {error}"));
+            return false;
+        }
     };
     let mut complete = true;
     for entry in entries {
         if Instant::now() >= deadline {
+            unreadable(
+                sink,
+                root,
+                "inventory deadline exceeded; directory was not fully scanned",
+            );
             return false;
         }
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => {
+            Err(error) => {
+                unreadable(sink, root, format!("cannot read directory entry: {error}"));
                 complete = false;
                 continue;
             }
         };
         let path = entry.path();
+        sink.lock().unwrap().reading = path.clone();
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
         {
             match metadata(&path) {
-                Some(app) => sink.lock().unwrap().apps.push(app),
-                None => complete = false,
+                Ok(app) => sink.lock().unwrap().list.apps.push(app),
+                Err(reason) => {
+                    unreadable(sink, &path.join("Contents/Info.plist"), reason);
+                    complete = false;
+                }
             }
-        } else if depth > 0 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            complete &= scan(&path, depth - 1, deadline, sink);
+        } else if depth > 0 {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => complete &= scan(&path, depth - 1, deadline, sink),
+                Ok(_) => {}
+                Err(error) => {
+                    unreadable(sink, &path, format!("cannot read entry type: {error}"));
+                    complete = false;
+                }
+            }
         }
+        sink.lock().unwrap().reading = root.to_owned();
     }
     complete
 }
 
-fn metadata(path: &Path) -> Option<InstalledApplication> {
+fn metadata(path: &Path) -> Result<InstalledApplication, String> {
     autoreleasepool(|_| {
-        let plist = NSString::from_str(path.join("Contents/Info.plist").to_str()?);
-        let class = AnyClass::get(c"NSDictionary")?;
+        let plist_path = path.join("Contents/Info.plist");
+        let plist = NSString::from_str(plist_path.to_str().ok_or("Info.plist path is not UTF-8")?);
+        let class =
+            AnyClass::get(c"NSDictionary").ok_or("Foundation dictionary class unavailable")?;
         // SAFETY: this documented plist reader returns nil or an owned dictionary.
         let dictionary: Option<Retained<AnyObject>> =
             unsafe { msg_send![class, dictionaryWithContentsOfFile: &*plist] };
-        let dictionary = dictionary?;
+        let dictionary = dictionary.ok_or("Info.plist is unreadable or not a valid dictionary")?;
         let string = |key: &str| -> Option<String> {
             let key = NSString::from_str(key);
             // SAFETY: dictionary lookup returns a borrowed object kept live by
@@ -132,7 +210,9 @@ fn metadata(path: &Path) -> Option<InstalledApplication> {
             }
             Some(unsafe { &*value.cast::<NSString>() }.to_string())
         };
-        let bundle_identifier = string("CFBundleIdentifier").filter(|id| !id.is_empty())?;
+        let bundle_identifier = string("CFBundleIdentifier")
+            .filter(|id| !id.is_empty())
+            .ok_or("CFBundleIdentifier is missing, empty or not a string")?;
         let name = string("CFBundleDisplayName")
             .or_else(|| string("CFBundleName"))
             .unwrap_or_else(|| {
@@ -141,7 +221,7 @@ fn metadata(path: &Path) -> Option<InstalledApplication> {
                     .to_string_lossy()
                     .into_owned()
             });
-        Some(InstalledApplication {
+        Ok(InstalledApplication {
             name,
             bundle_identifier,
             path: path.to_owned(),
@@ -325,7 +405,7 @@ mod tests {
         app(&root.join("Folder"), "Nested");
         app(&root.join("Folder/Deeper"), "Excluded");
         app(&root.join("Direct.app/Contents"), "InsideBundle");
-        let result = Mutex::new(InstalledApplicationList::default());
+        let result = Mutex::new(InventoryProgress::default());
         assert!(scan(
             &root,
             1,
@@ -335,15 +415,62 @@ mod tests {
         let mut names: Vec<_> = result
             .lock()
             .unwrap()
+            .list
             .apps
             .iter()
             .map(|app| app.name.clone())
             .collect();
         names.sort();
         assert_eq!(names, ["Direct", "Nested"]);
-        let expired = Mutex::new(InstalledApplicationList::default());
+        let expired = Mutex::new(InventoryProgress::default());
         assert!(!scan(&root, 1, Instant::now(), &expired));
-        assert!(expired.lock().unwrap().apps.is_empty());
+        assert!(expired.lock().unwrap().list.apps.is_empty());
+        assert_eq!(expired.lock().unwrap().list.unreadable[0].path, root);
+        assert!(expired.lock().unwrap().list.unreadable[0]
+            .reason
+            .contains("deadline exceeded"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_scan_reports_each_bad_plist_without_losing_readable_apps() {
+        let root =
+            std::env::temp_dir().join(format!("ck-app-inventory-failures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, plist) in [
+            ("Good", Some("<plist><dict><key>CFBundleIdentifier</key><string>com.example.Good</string></dict></plist>")),
+            ("Missing", None),
+            ("NoIdentifier", Some("<plist><dict><key>CFBundleName</key><string>NoIdentifier</string></dict></plist>")),
+        ] {
+            let contents = root.join(format!("{name}.app/Contents"));
+            std::fs::create_dir_all(&contents).unwrap();
+            if let Some(plist) = plist {
+                std::fs::write(contents.join("Info.plist"), plist).unwrap();
+            }
+        }
+        let result = Mutex::new(InventoryProgress::default());
+        assert!(!scan(
+            &root,
+            1,
+            Instant::now() + Duration::from_secs(2),
+            &result
+        ));
+        let progress = result.lock().unwrap();
+        assert_eq!(progress.list.apps.len(), 1);
+        assert_eq!(progress.list.apps[0].name, "Good");
+        assert_eq!(progress.list.unreadable.len(), 2);
+        for (name, reason) in [
+            ("Missing", "Info.plist is unreadable"),
+            ("NoIdentifier", "CFBundleIdentifier is missing"),
+        ] {
+            assert!(
+                progress.list.unreadable.iter().any(|failure| failure.path
+                    == root.join(format!("{name}.app/Contents/Info.plist"))
+                    && failure.reason.starts_with(reason)),
+                "{:?}",
+                progress.list.unreadable
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

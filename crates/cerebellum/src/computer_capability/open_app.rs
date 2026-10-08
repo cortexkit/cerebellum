@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::computer_grants::{AppCode, AppIdentity, AppIdentityUnreadable, GrantNeed};
-use cerebellum_computer::app_state::source::{InstalledApp, OpenAppBounds};
+use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps, OpenAppBounds};
 use std::time::Duration;
 
 struct BundleCode {
@@ -63,17 +63,32 @@ where
             tokio::task::spawn_blocking(move || source.installed_apps(Duration::from_secs(2)))
                 .await
                 .unwrap_or_default();
-        if !listed.complete {
-            return json!({"outcome":"installed_list_partial", "installed_list":"partial", "remedy":"the installed inventory is incomplete, so a unique target cannot be established; retry after the unreadable directory or metadata is available"});
-        }
-        let app = match resolve_installed(&target, &listed.apps) {
+        let mut reply = self
+            .serve_installed_open_app(&target, &listed, context)
+            .await;
+        // Unreadable bundles elsewhere do not invalidate a found target: its
+        // bytes still need a signer-bound grant naming that application. Disclose
+        // the inventory limit on both launches and inventory-backed refusals.
+        reply["installed_list"] = json!(if listed.complete {
+            "complete"
+        } else {
+            "partial"
+        });
+        reply
+    }
+
+    async fn serve_installed_open_app<C: MonotonicClock>(
+        &self,
+        target: &str,
+        listed: &InstalledApps,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        let app = match resolve_installed(target, &listed.apps) {
             Ok(app) => app,
             Err(mut reply) => {
-                reply["installed_list"] = json!(if listed.complete {
-                    "complete"
-                } else {
-                    "partial"
-                });
+                if !listed.complete && reply["outcome"] == "no_installed_app_named" {
+                    reply["remedy"] = json!("the application may be in the unreadable part of the installed inventory; restore access and retry, or use the exact name or bundle identity of an app shown by list_apps");
+                }
                 return reply;
             }
         };

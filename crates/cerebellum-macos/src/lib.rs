@@ -37,6 +37,7 @@ mod ax_state;
 pub use applications::{
     installed_applications, open_application, responsible_pid, workspace_running_applications,
     ApplicationOpenResult, InstalledApplication, InstalledApplicationList,
+    InstalledInventoryFailure,
 };
 #[cfg(target_os = "macos")]
 mod code_signing;

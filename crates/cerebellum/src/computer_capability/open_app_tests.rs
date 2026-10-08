@@ -141,6 +141,7 @@ async fn open_app_first_use_asks_and_granted_launch_does_not_activate() {
     let (first, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
     assert_eq!(questions, 1);
     assert_eq!(first["outcome"], "launched", "{first}");
+    assert_eq!(first["installed_list"], "complete");
     let (second, questions) = wire(&planes, "open_app", json!({"target":"com.apple.Safari"})).await;
     assert_eq!(questions, 0);
     assert_eq!(second["outcome"], "launched", "{second}");
@@ -175,14 +176,21 @@ async fn open_app_ambiguous_name_lists_candidates_without_launching() {
         installed("Editor", "com.one.Editor"),
         installed("Editor", "com.two.Editor"),
     ];
-    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Editor"})).await;
-    assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
-    assert_eq!(
-        reply["candidates"],
-        json!([{"name":"Editor","bundle_identity":"com.one.Editor"},{"name":"Editor","bundle_identity":"com.two.Editor"}])
-    );
-    assert_eq!(questions, 0);
-    assert!(desk.state().opens.is_empty());
+    for complete in [true, false] {
+        desk.state().installed.complete = complete;
+        let (reply, questions) = wire(&planes, "open_app", json!({"target":"Editor"})).await;
+        assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
+        assert_eq!(
+            reply["installed_list"],
+            if complete { "complete" } else { "partial" }
+        );
+        assert_eq!(
+            reply["candidates"],
+            json!([{"name":"Editor","bundle_identity":"com.one.Editor"},{"name":"Editor","bundle_identity":"com.two.Editor"}])
+        );
+        assert_eq!(questions, 0);
+        assert!(desk.state().opens.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -332,12 +340,38 @@ async fn open_app_locked_screen_refuses_before_consent_or_launch() {
 }
 
 #[tokio::test]
-async fn open_app_partial_inventory_cannot_certify_a_unique_name() {
+async fn open_app_partial_inventory_launches_a_unique_signer_approved_match() {
     let (planes, desk, _) = rig();
     desk.state().installed.complete = false;
     let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
-    assert_eq!(reply["outcome"], "installed_list_partial", "{reply}");
+    assert_eq!(reply["outcome"], "launched", "{reply}");
     assert_eq!(reply["installed_list"], "partial");
-    assert_eq!(questions, 0);
-    assert!(desk.state().opens.is_empty());
+    assert_eq!(questions, 1);
+    assert_eq!(desk.state().opens.len(), 1);
+    assert!(!desk.state().opens[0].activates);
+}
+
+#[tokio::test]
+async fn open_app_partial_inventory_missing_match_discloses_unreadable_part() {
+    let (planes, desk, _) = rig();
+    for complete in [true, false] {
+        desk.state().installed.complete = complete;
+        let (reply, questions) = wire(&planes, "open_app", json!({"target":"Missing"})).await;
+        assert_eq!(reply["outcome"], "no_installed_app_named", "{reply}");
+        assert_eq!(
+            reply["installed_list"],
+            if complete { "complete" } else { "partial" }
+        );
+        if !complete {
+            assert!(
+                reply["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .contains("may be in the unreadable part"),
+                "{reply}"
+            );
+        }
+        assert_eq!(questions, 0);
+        assert!(desk.state().opens.is_empty());
+    }
 }
