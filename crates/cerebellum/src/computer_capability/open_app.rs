@@ -54,7 +54,7 @@ where
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
-        let target = match parse_request(arguments) {
+        let request = match parse_request(arguments) {
             Ok(target) => target,
             Err(reply) => return reply,
         };
@@ -64,7 +64,7 @@ where
                 .await
                 .unwrap_or_default();
         let mut reply = self
-            .serve_installed_open_app(&target, &listed, context)
+            .serve_installed_open_app(&request.target, request.url.as_deref(), &listed, context)
             .await;
         // Unreadable bundles elsewhere do not invalidate a found target: its
         // bytes still need a signer-bound grant naming that application. Disclose
@@ -80,6 +80,7 @@ where
     async fn serve_installed_open_app<C: MonotonicClock>(
         &self,
         target: &str,
+        url: Option<&str>,
         listed: &InstalledApps,
         context: ServeContext<'_, C>,
     ) -> Value {
@@ -92,6 +93,19 @@ where
                 return reply;
             }
         };
+        if let Some(url) = url {
+            let source = self.app_state_source.clone();
+            let bundle = app.clone();
+            let registered =
+                tokio::task::spawn_blocking(move || source.bundle_url_schemes(&bundle))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+            if let Err(reply) = admit_url(url, &registered, &app.bundle_identity) {
+                return reply;
+            }
+        }
         let code = Arc::new(BundleCode {
             source: self.app_state_source.clone(),
             app: app.clone(),
@@ -161,8 +175,19 @@ where
         };
         let source = self.app_state_source.clone();
         let launching = app.clone();
+        let url = url.map(str::to_owned);
         let opened = tokio::task::spawn_blocking(move || {
-            source.open_app(&launching, OpenAppBounds::default())
+            if let Some(url) = url {
+                // Consent can outlive a bundle update. Re-read the declarations
+                // immediately before dispatch, just as the signer is rechecked.
+                let schemes = source.bundle_url_schemes(&launching).unwrap_or_default();
+                if admit_url(&url, &schemes, &launching.bundle_identity).is_err() {
+                    return Err(AppStateReadError::Unreadable);
+                }
+                source.open_app_url(&launching, &url, OpenAppBounds::default())
+            } else {
+                source.open_app(&launching, OpenAppBounds::default())
+            }
         })
         .await
         .unwrap_or(Err(AppStateReadError::Unreadable));
@@ -196,14 +221,60 @@ where
     }
 }
 
-pub(super) fn parse_request(arguments: &Value) -> Result<String, Value> {
+pub(super) struct OpenRequest {
+    pub target: String,
+    pub url: Option<String>,
+}
+
+pub(super) fn parse_request(arguments: &Value) -> Result<OpenRequest, Value> {
     let object = arguments
         .as_object()
         .ok_or_else(|| invalid_read_state_request("arguments", "expected an object"))?;
-    if let Some(field) = object.keys().find(|key| key.as_str() != "target") {
+    if let Some(field) = object
+        .keys()
+        .find(|key| !["target", "url"].contains(&key.as_str()))
+    {
         return Err(invalid_read_state_request(field, "unknown_field"));
     }
-    required_text(object, "target")
+    let url = optional_text(object, "url")?;
+    if let Some(url) = &url {
+        if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) || url_scheme(url).is_none()
+        {
+            return Err(invalid_read_state_request("url", "invalid_url"));
+        }
+    }
+    Ok(OpenRequest {
+        target: required_text(object, "target")?,
+        url,
+    })
+}
+
+fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once(':')?;
+    (scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'+' | b'-' | b'.')))
+    .then_some(scheme)
+}
+
+fn admit_url(url: &str, registered: &[String], bundle: &str) -> Result<(), Value> {
+    let scheme = url_scheme(url).unwrap_or("");
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "file" | "http" | "https"
+    ) && registered
+        .iter()
+        .any(|claimed| claimed.eq_ignore_ascii_case(scheme))
+    {
+        return Ok(());
+    }
+    Err(
+        json!({"outcome":"url_scheme_refused", "scheme":scheme, "target":bundle, "remedy":format!("scheme {scheme:?} is forbidden or not declared by {bundle}'s CFBundleURLTypes; use a registered app page address")}),
+    )
 }
 
 pub(super) fn resolve_installed(

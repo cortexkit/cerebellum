@@ -125,6 +125,8 @@ pub struct AxStateElement {
     pub enabled: bool,
     pub focused: bool,
     pub expanded: Option<bool>,
+    pub menu_visible: bool,
+    pub closed_menu_children: usize,
     /// Where a link or a web page points (`AXURL`), as its absolute string.
     pub url: Option<String>,
     pub children: Vec<AxStateElement>,
@@ -163,7 +165,7 @@ pub struct AxAppStateBounds {
 
 /// The attributes read per element, in one message to the application.
 /// Their positions are the indexes `Reader::read` takes them by.
-const ATTRIBUTES: [&str; 12] = [
+const ATTRIBUTES: [&str; 13] = [
     "AXRole",
     "AXSubrole",
     "AXTitle",
@@ -176,6 +178,7 @@ const ATTRIBUTES: [&str; 12] = [
     "AXExpanded",
     "AXChildren",
     "AXURL",
+    "AXVisible",
 ];
 
 pub(crate) fn process_exists(pid: c_int) -> bool {
@@ -237,6 +240,7 @@ fn is_error_marker(value: &CFType) -> bool {
 }
 
 struct Reader {
+    expand_menus: bool,
     /// Every element already read, by hash. An element reachable twice -- an
     /// application that lists itself among its own children, which Electron
     /// applications do, or a child shared by two parents -- is read once, so
@@ -281,6 +285,15 @@ impl Reader {
     }
 
     fn read(&mut self, element: AxRetainedElement, depth: usize) -> ElementRead {
+        self.read_menu(element, depth, false)
+    }
+
+    fn read_menu(
+        &mut self,
+        element: AxRetainedElement,
+        depth: usize,
+        selected_menu: bool,
+    ) -> ElementRead {
         let Some(seconds) = self.remaining_seconds() else {
             self.bound_reached = true;
             return ElementRead::Unreadable;
@@ -369,6 +382,8 @@ impl Reader {
             enabled: bool_at(7).unwrap_or(true),
             focused: bool_at(8).unwrap_or(false),
             expanded: bool_at(9),
+            menu_visible: bool_at(12).unwrap_or(false) || selected_menu,
+            closed_menu_children: 0,
             url: value_at(11).and_then(|value| url_string(&value)),
             children: Vec::new(),
             unreadable_children: 0,
@@ -388,6 +403,13 @@ impl Reader {
                     .collect()
             })
             .unwrap_or_default();
+        // Closed menus expose hundreds of dormant items in some applications.
+        // Read the title and child count, not every item's attributes. A zoom
+        // explicitly opts into that traversal; a selected title opens it too.
+        if read.role.as_deref() == Some("AXMenu") && !read.menu_visible && !self.expand_menus {
+            read.closed_menu_children = children.len();
+            return ElementRead::Read(Box::new(read));
+        }
         if !children.is_empty() && depth >= self.max_depth {
             self.bound_reached = true;
             return ElementRead::Read(Box::new(read));
@@ -401,7 +423,11 @@ impl Reader {
                 break;
             }
             self.visited += 1;
-            match self.read(child, depth + 1) {
+            match self.read_menu(
+                child,
+                depth + 1,
+                read.role.as_deref() == Some("AXMenuBarItem") && read.selected,
+            ) {
                 ElementRead::Read(child) => read.children.push(*child),
                 ElementRead::Unreadable => {
                     read.unreadable_children += 1;
@@ -474,6 +500,15 @@ pub fn read_app_state(pid: u32, bounds: AxAppStateBounds) -> Result<AxAppState, 
 }
 
 fn read_app_state_once(pid: u32, bounds: AxAppStateBounds) -> Result<AxAppState, AxAppStateError> {
+    read_app_state_with_menus(pid, bounds, false)
+}
+
+/// Expand dormant menu items only for an explicit zoom request.
+pub fn read_app_state_with_menus(
+    pid: u32,
+    bounds: AxAppStateBounds,
+    expand_menus: bool,
+) -> Result<AxAppState, AxAppStateError> {
     let Ok(pid) = c_int::try_from(pid) else {
         return Err(AxAppStateError::ProcessGone);
     };
@@ -521,6 +556,7 @@ fn read_app_state_once(pid: u32, bounds: AxAppStateBounds) -> Result<AxAppState,
         .map(|name| CFString::from_static_str(name))
         .collect();
     let mut reader = Reader {
+        expand_menus,
         visited_elements: std::collections::HashMap::new(),
         names: CFArray::from_retained_objects(&names),
         value_name: CFString::from_static_str("AXValue"),

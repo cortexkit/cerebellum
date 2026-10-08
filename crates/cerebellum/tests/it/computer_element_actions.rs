@@ -282,6 +282,121 @@ async fn pressing_a_live_element_presses_it_and_returns_the_diff() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+#[tokio::test]
+async fn a_press_batch_stops_at_the_first_failed_press() {
+    let desk = desk();
+    desk.state().after_action = Some(after_send());
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let send = id_of(&tree, " button Send");
+    let label = id_of(&tree, " text Hello");
+    let journaled = plane.journal_entry_count().await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_ids":[send, label, send]}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "no_press_action", "{reply}");
+    assert_eq!(reply["stopped_at"], 2);
+    assert_eq!(reply["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(reply["steps"][0]["outcome"], "completed");
+    assert_eq!(reply["steps"][1]["outcome"], "no_press_action");
+    assert_eq!(
+        desk.state().presses,
+        [10],
+        "the third press must never reach the source"
+    );
+    assert!(reply["state_text"].as_str().unwrap().contains(" text Sent"));
+    assert!(
+        !reply["state_text"].as_str().unwrap().contains("~"),
+        "a parent's new child must not pretend its unchanged line changed: {reply}"
+    );
+    assert_eq!(
+        plane.journal_entry_count().await - journaled,
+        2,
+        "each attempted press has its own journal row"
+    );
+}
+
+#[tokio::test]
+async fn four_disclosure_presses_share_one_report_and_keep_their_order() {
+    let roots = vec![RawElement::fixture(1, "AXWindow")
+        .titled("Automation")
+        .with_children(
+            (10..14)
+                .map(|id| {
+                    RawElement::fixture(id, "AXDisclosureTriangle")
+                        .titled(&format!("Automation {id}"))
+                })
+                .collect(),
+        )];
+    let mut desk = Desk::new(roots);
+    for id in 10..14 {
+        desk = desk.with_element(
+            id,
+            DeskElement {
+                facts: facts("AXDisclosureTriangle", &["AXPress"]),
+                ..Default::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = serve(
+        &plane,
+        &management,
+        "computer.read_state",
+        json!({"target":TARGET_BUNDLE_ID, "role_filter":["AXDisclosureTriangle"]}),
+    )
+    .await["state_text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ids: Vec<_> = (10..14)
+        .map(|id| id_of(&tree, &format!("Automation {id}")))
+        .collect();
+    let journaled = plane.journal_entry_count().await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_ids":ids}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().presses, [10, 11, 12, 13]);
+    assert_eq!(reply["steps"].as_array().unwrap().len(), 4);
+    assert!(reply.get("stopped_at").is_none());
+    assert_eq!(plane.journal_entry_count().await - journaled, 4);
+    assert_eq!(reply["state_report"], "diff");
+    assert!(reply["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("No change seen"));
+}
+
+#[tokio::test]
+async fn press_filters_return_the_new_panes_checkboxes_and_labels() {
+    let desk = desk();
+    let mut after = after_send();
+    after[0]
+        .children
+        .push(RawElement::fixture(14, "AXCheckBox").titled("Full Disk Access"));
+    desk.state().after_action = Some(after);
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = serve(&plane, &management, "computer.press_element", json!({"element_id":id_of(&tree, " button Send"), "role_filter":["check box", "text"], "text_filter":"Access"})).await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["state_report"], "filtered_state");
+    let text = reply["state_text"].as_str().unwrap();
+    assert!(text.contains("check box Full Disk Access"));
+    assert!(!text.contains(" button Send"));
+}
+
 /// A press that changes nothing is still a press: the empty diff is reported
 /// as it is, after the settle bound, not turned into a failure.
 #[tokio::test]

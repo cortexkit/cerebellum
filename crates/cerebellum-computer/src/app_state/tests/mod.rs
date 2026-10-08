@@ -12,6 +12,7 @@ use super::session::{AppStateSessions, ElementResolution, StateDiff, MAX_SESSION
 use super::source::{ElementValue, FixtureElementToken, RawAppState, RawElement};
 use crate::platform::ProcessGrant;
 
+mod change_reports;
 mod golden;
 
 const CONVERSATION: &str = "conversation-1";

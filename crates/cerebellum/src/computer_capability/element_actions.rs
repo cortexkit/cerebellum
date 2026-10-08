@@ -20,7 +20,7 @@
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::person::{person_change, PersonChange, SeenMarks};
-use cerebellum_computer::app_state::render::{is_session_ending_title, render_diff};
+use cerebellum_computer::app_state::render::is_session_ending_title;
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 
 // One reply field name for both planes, so a host lifts browser and computer
@@ -188,15 +188,38 @@ fn required_string(object: &serde_json::Map<String, Value>, field: &str) -> Resu
 }
 
 /// Every field `computer.press_element` accepts, and the ones it requires.
-pub(crate) const PRESS_ELEMENT_FIELDS: [&str; 2] = ["element_id", "target"];
+pub(crate) const PRESS_ELEMENT_FIELDS: [&str; 6] = [
+    "element_id",
+    "element_ids",
+    "target",
+    "role_filter",
+    "text_filter",
+    "zoom",
+];
 #[cfg(test)]
-pub(crate) const PRESS_ELEMENT_REQUIRED: [&str; 1] = ["element_id"];
+pub(crate) const PRESS_ELEMENT_REQUIRED: [&str; 0] = [];
 /// Every field `computer.press_point` accepts, and the ones it requires.
-pub(crate) const PRESS_POINT_FIELDS: [&str; 4] = ["image_id", "target", "x", "y"];
+pub(crate) const PRESS_POINT_FIELDS: [&str; 7] = [
+    "image_id",
+    "target",
+    "x",
+    "y",
+    "role_filter",
+    "text_filter",
+    "zoom",
+];
 #[cfg(test)]
 pub(crate) const PRESS_POINT_REQUIRED: [&str; 3] = ["image_id", "x", "y"];
 /// Every field `computer.write_text` accepts, and the ones it requires.
-pub(crate) const WRITE_TEXT_FIELDS: [&str; 4] = ["element_id", "target", "text", "write_mode"];
+pub(crate) const WRITE_TEXT_FIELDS: [&str; 7] = [
+    "element_id",
+    "target",
+    "text",
+    "write_mode",
+    "role_filter",
+    "text_filter",
+    "zoom",
+];
 #[cfg(test)]
 pub(crate) const WRITE_TEXT_REQUIRED: [&str; 3] = ["element_id", "text", "write_mode"];
 
@@ -209,15 +232,36 @@ fn optional_target(object: &serde_json::Map<String, Value>) -> Result<Option<Str
 }
 
 pub(crate) struct ParsedPressElement {
-    pub element_id: String,
+    pub element_ids: Vec<String>,
+    pub batch: bool,
     pub target: Option<String>,
+    pub view: super::StateView,
 }
 
 pub(crate) fn parse_press_element(arguments: &Value) -> Result<ParsedPressElement, Value> {
     let object = object_with_fields(arguments, &PRESS_ELEMENT_FIELDS)?;
+    let batch = object.contains_key("element_ids");
+    let element_ids = match (object.get("element_id"), object.get("element_ids")) {
+        (Some(_), Some(_)) => return Err(invalid("element_ids", "mutually_exclusive")),
+        (Some(_), None) => vec![required_string(object, "element_id")?],
+        (None, Some(Value::Array(ids))) if !ids.is_empty() && ids.len() <= 8 => ids
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("element_ids", "wrong_type"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        (None, Some(Value::Array(_))) => return Err(invalid("element_ids", "out_of_bounds")),
+        (None, Some(_)) => return Err(invalid("element_ids", "wrong_type")),
+        (None, None) => return Err(invalid("element_id", "missing_field")),
+    };
     Ok(ParsedPressElement {
-        element_id: required_string(object, "element_id")?,
+        element_ids,
+        batch,
         target: optional_target(object)?,
+        view: super::parse_state_view(object)?,
     })
 }
 
@@ -230,6 +274,7 @@ pub(crate) struct ParsedPressPoint {
 
 pub(crate) fn parse_press_point(arguments: &Value) -> Result<ParsedPressPoint, Value> {
     let object = object_with_fields(arguments, &PRESS_POINT_FIELDS)?;
+    super::parse_state_view(object)?;
     let image_id = required_string(object, "image_id")?;
     let target = optional_target(object)?;
     let coordinate = |field: &str| match object.get(field) {
@@ -263,6 +308,7 @@ pub(crate) struct ParsedWriteText {
 
 pub(crate) fn parse_write_text(arguments: &Value) -> Result<ParsedWriteText, Value> {
     let object = object_with_fields(arguments, &WRITE_TEXT_FIELDS)?;
+    super::parse_state_view(object)?;
     let element_id = required_string(object, "element_id")?;
     let target = optional_target(object)?;
     // Empty text is allowed: replacing a value with nothing clears it.
@@ -822,27 +868,25 @@ pub(crate) fn adopt(
     }
 }
 
-/// Wait up to `bound` for the application's state to differ from the
-/// conversation's baseline, then diff against it and make that read the new
-/// baseline. An unchanged state after the bound is reported as an empty diff.
-/// `None` when the application could not be read at all.
-///
-/// The read that becomes the baseline also becomes what the conversation
-/// was last shown of the focused element and window, since the diff shows
-/// it: a change this action caused is then never taken for the person's.
-/// The focused element and window are read just before each tree read, so
-/// they and the tree describe one moment.
-pub(crate) fn settle_and_observe(
+/// Wait for an effect without moving the baseline during polling. Only the
+/// final read becomes the baseline and the conversation's last-seen focus.
+pub(crate) fn settle_and_observe_view(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
     conversation_key: &str,
     grant: &ProcessGrant,
     bound: Duration,
+    expand_menus: bool,
 ) -> Option<SessionRead> {
     let deadline = Instant::now() + bound;
     loop {
         let seen = SeenMarks::read(source, grant);
-        match source.read_app_state(grant, ReadBounds::default()) {
+        let raw = if expand_menus {
+            source.read_app_state_expanding_menus(grant, ReadBounds::default())
+        } else {
+            source.read_app_state(grant, ReadBounds::default())
+        };
+        match raw {
             Ok(read) => {
                 if Instant::now() >= deadline
                     || sessions.differs_from_baseline(conversation_key, grant, &read)
@@ -869,17 +913,34 @@ const DIFF_UNREADABLE: &str =
 /// Add what an action changed to its reply, as text in the read grammar,
 /// with the cap's disclosure, the focused element and how much of the read
 /// behind it could not be opened.
+#[cfg(test)]
 pub(crate) fn add_diff(reply: &mut Value, observed: Option<&SessionRead>) {
+    add_diff_view(reply, observed, &super::StateView::default());
+}
+
+pub(crate) fn add_diff_view(
+    reply: &mut Value,
+    observed: Option<&SessionRead>,
+    view: &super::StateView,
+) {
     let Some(observed) = observed else {
         reply[STATE_TEXT_FIELD] = json!(DIFF_UNREADABLE);
         reply["unreadable_subtrees"] = json!(1);
         return;
     };
-    let rendered = render_diff(
-        &observed.roots,
-        &observed.diff,
-        observed.focused_element_id.as_deref(),
+    use cerebellum_computer::app_state::render::{render_change_report, StateHeader};
+    let rendered = render_change_report(
+        &StateHeader {
+            app_name: "Application state",
+            focused_element_id: observed.focused_element_id.as_deref(),
+        },
+        observed,
+        &view.request(),
     );
+    reply["state_report"] = json!(rendered.kind);
+    if view.zoom.is_some() {
+        reply["zoom_found"] = json!(rendered.zoom_found);
+    }
     reply[STATE_TEXT_FIELD] = json!(rendered.text);
     if let Some(truncation) = rendered.truncation {
         reply["truncation"] = json!({
@@ -951,10 +1012,106 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
-        let ParsedPressElement { element_id, target } = match parse_press_element(arguments) {
+        let parsed = match parse_press_element(arguments) {
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
+        if !parsed.batch {
+            return self
+                .serve_press_single(&parsed.element_ids[0], parsed.target, parsed.view, context)
+                .await;
+        }
+        let sessions = context.management.app_state_sessions();
+        let conversation = &context.identity.conversation_key;
+        // A batch holds the first application's serialization lane throughout.
+        // Refuse a different application's id at its step rather than acting
+        // in an application whose lane this call does not own.
+        let first = sessions.resolve(conversation, &parsed.element_ids[0]);
+        let grant = match first {
+            cerebellum_computer::app_state::session::ElementResolution::Live {
+                bundle_identity,
+                pid,
+                process_generation,
+                ..
+            } => Some(ProcessGrant {
+                bundle_identity,
+                pid,
+                process_generation_evidence: process_generation,
+            }),
+            _ => None,
+        };
+        let before = grant
+            .as_ref()
+            .and_then(|grant| sessions.latest(conversation, grant));
+        let mut steps = Vec::new();
+        let mut reply = json!({"outcome":"completed"});
+        let mut acted = false;
+        let mut unreadable = false;
+        for (index, id) in parsed.element_ids.iter().enumerate() {
+            let different_app = match (grant.as_ref(), sessions.resolve(conversation, id)) {
+                (
+                    Some(first),
+                    cerebellum_computer::app_state::session::ElementResolution::Live {
+                        bundle_identity,
+                        pid,
+                        process_generation,
+                        ..
+                    },
+                ) => {
+                    first.bundle_identity != bundle_identity
+                        || first.pid != pid
+                        || first.process_generation_evidence != process_generation
+                }
+                _ => false,
+            };
+            reply = if different_app {
+                target_mismatch_reply("batch application")
+            } else {
+                self.serve_press_single(
+                    id,
+                    parsed.target.clone(),
+                    super::StateView::default(),
+                    context.clone(),
+                )
+                .await
+            };
+            let success = reply["outcome"] == "completed";
+            acted |= success;
+            unreadable |= success && reply[STATE_TEXT_FIELD] == DIFF_UNREADABLE;
+            steps.push(json!({"step":index + 1, "element_id":id, "outcome":reply["outcome"]}));
+            if !success {
+                reply["stopped_at"] = json!(index + 1);
+                break;
+            }
+        }
+        if acted {
+            if unreadable {
+                add_diff_view(&mut reply, None, &parsed.view);
+            } else if let Some(after) = grant
+                .as_ref()
+                .and_then(|grant| sessions.latest(conversation, grant))
+            {
+                let combined = if let Some(before) = before {
+                    after.compared_with(&before)
+                } else {
+                    after
+                };
+                reply.as_object_mut().unwrap().remove("truncation");
+                add_diff_view(&mut reply, Some(&combined), &parsed.view);
+            }
+        }
+        reply["steps"] = json!(steps);
+        reply
+    }
+
+    async fn serve_press_single<C: cerebellum_core::clock::MonotonicClock>(
+        &self,
+        element_id: &str,
+        target: Option<String>,
+        view: super::StateView,
+        context: super::ServeContext<'_, C>,
+    ) -> Value {
+        let element_id = element_id.to_owned();
         let super::ServeContext {
             cancel,
             identity,
@@ -1017,6 +1174,7 @@ where
                 ComputerCapability::PressElement,
                 grant,
                 PressTarget::Element { element_id, handle },
+                view,
             )
             .await;
         admission.decorate(&mut reply);
@@ -1034,6 +1192,8 @@ where
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
+        let view = super::parse_state_view(arguments.as_object().expect("parsed object"))
+            .expect("validated view");
         let super::ServeContext {
             cancel,
             identity,
@@ -1103,6 +1263,7 @@ where
                 ComputerCapability::PressPoint,
                 grant,
                 PressTarget::Point(point),
+                view,
             )
             .await;
         admission.decorate(&mut reply);
@@ -1120,6 +1281,8 @@ where
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
+        let view = super::parse_state_view(arguments.as_object().expect("parsed object"))
+            .expect("validated view");
         let super::ServeContext {
             cancel,
             identity,
@@ -1210,14 +1373,15 @@ where
                 reply["outcome"].as_str(),
                 Some("completed" | "delivery_unconfirmed")
             ) {
-                let observed = settle_and_observe(
+                let observed = settle_and_observe_view(
                     source.as_ref(),
                     &sessions,
                     &conversation_key,
                     &grant,
                     settle,
+                    sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                 );
-                add_diff(&mut reply, observed.as_ref());
+                add_diff_view(&mut reply, observed.as_ref(), &view);
             }
             if journal.finish().is_err() {
                 return audit_unavailable_reply(true);
@@ -1303,6 +1467,7 @@ where
         capability: ComputerCapability,
         grant: ProcessGrant,
         target: PressTarget,
+        view: super::StateView,
     ) -> Value {
         let audit = self.audit.clone();
         let source = self.app_state_source.clone();
@@ -1347,14 +1512,15 @@ where
             };
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if reply["outcome"] == "completed" {
-                let observed = settle_and_observe(
+                let observed = settle_and_observe_view(
                     source.as_ref(),
                     &sessions,
                     &identity.conversation_key,
                     &grant,
                     settle,
+                    sessions.zoom_expands_menus(&identity.conversation_key, &grant, view.zoom.as_deref()),
                 );
-                add_diff(&mut reply, observed.as_ref());
+                add_diff_view(&mut reply, observed.as_ref(), &view);
             }
             if journal.finish().is_err() {
                 return audit_unavailable_reply(true);

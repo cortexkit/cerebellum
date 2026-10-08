@@ -79,6 +79,8 @@ fn convert(element: AxStateElement) -> RawElement {
         enabled: element.enabled,
         focused: element.focused,
         expanded: element.expanded,
+        menu_visible: element.menu_visible,
+        closed_menu_children: element.closed_menu_children,
         url: element.url,
         children: element.children.into_iter().map(convert).collect(),
         unreadable_children: element.unreadable_children,
@@ -88,6 +90,44 @@ fn convert(element: AxStateElement) -> RawElement {
 /// Reads applications through the macOS accessibility API.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacAppStateSource;
+
+impl MacAppStateSource {
+    fn read_native(
+        &self,
+        target: &ProcessGrant,
+        bounds: ReadBounds,
+        expand_menus: bool,
+    ) -> Result<RawAppState, AppStateReadError> {
+        match verify_grant(target.pid, target) {
+            GrantVerification::Current => {}
+            GrantVerification::TargetGone | GrantVerification::TargetReplaced => {
+                return Err(AppStateReadError::TargetGone)
+            }
+            _ => return Err(AppStateReadError::Unreadable),
+        }
+        let bounds = AxAppStateBounds {
+            max_elements: bounds.max_elements,
+            max_depth: bounds.max_depth,
+            timeout: bounds.timeout,
+        };
+        let state = if expand_menus {
+            cerebellum_macos::read_app_state_with_menus(target.pid, bounds, true)
+        } else {
+            read_app_state(target.pid, bounds)
+        }
+        .map_err(|error| match error {
+            AxAppStateError::NotPermitted => AppStateReadError::AccessibilityNotPermitted,
+            AxAppStateError::ProcessGone => AppStateReadError::TargetGone,
+            AxAppStateError::Unreadable { .. } => AppStateReadError::Unreadable,
+        })?;
+        Ok(RawAppState {
+            roots: state.roots.into_iter().map(convert).collect(),
+            focused: state.focused.map(handle),
+            unreadable_subtrees: state.unreadable_subtrees,
+            read_bound_reached: state.bound_reached,
+        })
+    }
+}
 
 impl AppStateSource for MacAppStateSource {
     fn cursor_label(&self, element: &ElementHandle) -> Option<(Option<String>, bool)> {
@@ -115,34 +155,15 @@ impl AppStateSource for MacAppStateSource {
         target: &ProcessGrant,
         bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
-        match verify_grant(target.pid, target) {
-            GrantVerification::Current => {}
-            GrantVerification::TargetGone | GrantVerification::TargetReplaced => {
-                return Err(AppStateReadError::TargetGone)
-            }
-            GrantVerification::TargetUnreadable | GrantVerification::DifferentProcess => {
-                return Err(AppStateReadError::Unreadable)
-            }
-        }
-        let state = read_app_state(
-            target.pid,
-            AxAppStateBounds {
-                max_elements: bounds.max_elements,
-                max_depth: bounds.max_depth,
-                timeout: bounds.timeout,
-            },
-        )
-        .map_err(|error| match error {
-            AxAppStateError::NotPermitted => AppStateReadError::AccessibilityNotPermitted,
-            AxAppStateError::ProcessGone => AppStateReadError::TargetGone,
-            AxAppStateError::Unreadable { .. } => AppStateReadError::Unreadable,
-        })?;
-        Ok(RawAppState {
-            roots: state.roots.into_iter().map(convert).collect(),
-            focused: state.focused.map(handle),
-            unreadable_subtrees: state.unreadable_subtrees,
-            read_bound_reached: state.bound_reached,
-        })
+        self.read_native(target, bounds, false)
+    }
+
+    fn read_app_state_expanding_menus(
+        &self,
+        target: &ProcessGrant,
+        bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        self.read_native(target, bounds, true)
     }
 
     fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
@@ -349,6 +370,37 @@ impl AppStateSource for MacAppStateSource {
         let opened = cerebellum_macos::open_application(
             &app.path,
             &app.bundle_identity,
+            bounds.activates,
+            bounds.process_timeout,
+            bounds.window_timeout,
+        )
+        .map_err(|_| AppStateReadError::Unreadable)?;
+        Ok(super::source::OpenedApp {
+            pid: opened.pid,
+            already_running: opened.already_running,
+            has_window: opened.has_window,
+            frontmost: opened.frontmost,
+        })
+    }
+
+    fn bundle_url_schemes(
+        &self,
+        app: &super::source::InstalledApp,
+    ) -> Result<Vec<String>, AppStateReadError> {
+        cerebellum_macos::application_url_schemes(&app.path)
+            .map_err(|_| AppStateReadError::Unreadable)
+    }
+
+    fn open_app_url(
+        &self,
+        app: &super::source::InstalledApp,
+        url: &str,
+        bounds: super::source::OpenAppBounds,
+    ) -> Result<super::source::OpenedApp, AppStateReadError> {
+        let opened = cerebellum_macos::open_application_with_url(
+            &app.path,
+            &app.bundle_identity,
+            Some(url),
             bounds.activates,
             bounds.process_timeout,
             bounds.window_timeout,

@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v19.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v20.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -757,7 +757,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v17_from_v16(&generated, historical_revision(17).as_str().unwrap());
     let generated =
         vocabulary_mint::v18_from_v17(&generated, historical_revision(18).as_str().unwrap());
-    let generated = vocabulary_mint::v19_from_v18(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v19_from_v18(&generated, historical_revision(19).as_str().unwrap());
+    let generated = vocabulary_mint::v20_from_v19(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1306,7 +1308,7 @@ fn v17_only_makes_the_changes_recreated_v16_undoes() {
 /// Rebuild the previous inventory row and remove only the new launch row.
 /// The pinned previous digest makes any unlisted change fail loudly.
 fn recreated_v18() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v19();
     vocabulary["revision"] = historical_revision(18);
     let rows = vocabulary["rows"].as_array_mut().unwrap();
     assert_eq!(rows.pop().unwrap()["capability_id"], "computer.open_app");
@@ -1316,6 +1318,28 @@ fn recreated_v18() -> Value {
         .unwrap();
     *list = serde_json::from_str(include_str!("../fixtures/v18_list_apps.json")).unwrap();
     vocabulary
+}
+
+fn recreated_v19() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(19);
+    let schemas: Value =
+        serde_json::from_str(include_str!("../fixtures/v19_round_trip_schemas.json")).unwrap();
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if let Some(previous) = schemas.get(row["capability_id"].as_str().unwrap()) {
+            row["request_schema"] = previous["request_schema"].clone();
+            row["result_schema"] = previous["result_schema"].clone();
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v20_only_makes_the_changes_recreated_v19_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v19()).unwrap()),
+        "695ce63f020973b79dd61e7fed23e52cf7aac58bf3650c4257abec4ca0245e33"
+    );
 }
 
 #[test]

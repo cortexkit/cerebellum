@@ -476,6 +476,7 @@ async fn computer_type_reports_pid_structural_and_unconfirmed_delivery() {
             "containment_rung": "pid_structural",
             "target_fronted": false,
             "effect_status": "effect_indeterminate",
+            "state_report": "diff",
             "state_text": "No change seen since the last read.\n",
             "unreadable_subtrees": 0,
         })
