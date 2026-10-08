@@ -40,6 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pipe = std::fs::File::from(pipe);
     let mut samples = 0;
     let mut failures = Vec::new();
+    // `lsappinfo front` names the active application's session number. Field
+    // reads (`info -only pid`) come back NULL from a shell that disclaimed its
+    // responsible process, so the check compares the front session number with
+    // the one taken before the helper drew anything: any activation changes it.
+    let front_asn = || -> Result<String, Box<dyn std::error::Error>> {
+        let front = Command::new("/usr/bin/lsappinfo").arg("front").output()?;
+        if !front.status.success() {
+            return Err("lsappinfo front failed".into());
+        }
+        Ok(String::from_utf8(front.stdout)?.trim().to_owned())
+    };
+    let before = front_asn()?;
     for point in points {
         let event = CursorEvent {
             agent: "Focus probe".into(),
@@ -52,26 +64,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipe.write_all(&event.encode_line().ok_or("invalid pipe event")?)?;
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {
-            let front = Command::new("/usr/bin/lsappinfo").arg("front").output()?;
-            if !front.status.success() {
-                return Err("lsappinfo front failed".into());
-            }
-            let asn = String::from_utf8(front.stdout)?.trim().to_owned();
-            let info = Command::new("/usr/bin/lsappinfo")
-                .args(["info", "-only", "pid", &asn])
-                .output()?;
-            if !info.status.success() {
-                return Err("lsappinfo could not resolve the active app pid".into());
-            }
-            let info = String::from_utf8(info.stdout)?;
-            let active = info
-                .split_once('=')
-                .and_then(|(_, value)| value.trim().trim_matches('"').parse::<u32>().ok());
+            let asn = front_asn()?;
             let normal =
                 cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok());
             samples += 1;
-            println!("sample {samples}: lsappinfo front={asn} active_pid={active:?} frontmost_normal_pid={normal:?} helper_pid={pid}");
-            if active.is_none() || normal.is_none() || active == Some(pid) || normal == Some(pid) {
+            println!("sample {samples}: lsappinfo front={asn} frontmost_normal_pid={normal:?} helper_pid={pid}");
+            if asn.is_empty() || asn != before || normal.is_none() || normal == Some(pid) {
                 failures.push(samples);
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -83,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("helper wait failed: {e:?}"))?;
     if failures.is_empty() && samples > 0 {
         println!(
-            "PASS: {samples} active-app and normal-window samples never named helper pid {pid}"
+            "PASS: {samples} samples kept the front application {before} and never named helper pid {pid}"
         );
         Ok(())
     } else {

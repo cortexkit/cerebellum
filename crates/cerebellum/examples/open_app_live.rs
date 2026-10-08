@@ -76,7 +76,7 @@ async fn main() {
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                serde_json::to_vec(&json!({"decision":"allow_once"})).unwrap(),
+                serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
             )
             .unwrap();
             cerebellum::handle_frame_for_test(answer, &tx, &planes)
