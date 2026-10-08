@@ -1346,6 +1346,12 @@ fn recreated_v20() -> Value {
         .find(|row| row["capability_id"] == "computer.read_state")
         .unwrap();
     assert_eq!(
+        row.as_object_mut()
+            .unwrap()
+            .remove("maximum_fronting_read_interval_ms"),
+        Some(json!(300))
+    );
+    assert_eq!(
         row["result_schema"]["properties"]["outcome"]["enum"]
             .as_array_mut()
             .unwrap()

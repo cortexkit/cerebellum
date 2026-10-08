@@ -157,6 +157,8 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
         }
         if let Some(fronting) = &evidence.fronting {
             result["image_fronting"] = serde_json::json!(fronting);
+            result["longest_fronted_interval_ms"] =
+                serde_json::json!(fronting.longest_fronted_interval_ms);
         }
         self.audit
             .finalize_dispatched(

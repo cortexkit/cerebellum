@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "c7c8801ee1b7fffe2a5691383297e50f31c79dade5955ae2e6b49f83643dcbc0";
+    "cfe82e8302f59219cdb715aa6ff8743f4daf29e7918b7923e703342c7efc24a5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -345,6 +345,10 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
     let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
     keys.sort_unstable();
     let mut expected_sorted = expected.to_vec();
+    // Image reads have their own bound; keyboard rows keep the posting bound.
+    if object["capability_id"] == "computer.read_state" {
+        expected_sorted.push("maximum_fronting_read_interval_ms");
+    }
     expected_sorted.sort_unstable();
     if keys != expected_sorted {
         return Err(VocabularyValidationError::WrongRowKeys(
@@ -493,6 +497,15 @@ fn validate_numeric_invariants(
     id: &str,
     row: &serde_json::Map<String, Value>,
 ) -> Result<(), VocabularyValidationError> {
+    if id == "computer.read_state"
+        && !row["maximum_fronting_read_interval_ms"]
+            .as_u64()
+            .is_some_and(|bound| bound > 0 && bound <= 500)
+    {
+        return Err(VocabularyValidationError::NumericInvariant(format!(
+            "{id}.maximum_fronting_read_interval_ms"
+        )));
+    }
     let positive = [
         "maximum_accessibility_tree_settle_interval_ms",
         "maximum_attendance_check_to_dispatch_interval_ms",
@@ -1008,6 +1021,47 @@ pub fn required_permission_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_fronting_bound_is_a_positive_integer_at_most_half_a_second() {
+        let vocabulary: Value =
+            serde_json::from_slice(COMPUTER_ACTION_VOCABULARY_ARTIFACT).unwrap();
+        let mut row = vocabulary["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["capability_id"] == "computer.read_state")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            validate_numeric_invariants("computer.read_state", row.as_object().unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            frozen_row_bound_ms("computer.read_state", "maximum_fronting_read_interval_ms"),
+            Some(300)
+        );
+        assert_eq!(
+            frozen_row_bound_ms("computer.keys", "maximum_fronting_bracket_interval_ms"),
+            Some(100)
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(501),
+            serde_json::json!(-1),
+            serde_json::json!(300.5),
+            serde_json::json!("300"),
+            Value::Null,
+        ] {
+            row["maximum_fronting_read_interval_ms"] = invalid;
+            assert_eq!(
+                validate_numeric_invariants("computer.read_state", row.as_object().unwrap()),
+                Err(VocabularyValidationError::NumericInvariant(
+                    "computer.read_state.maximum_fronting_read_interval_ms".into()
+                ))
+            );
+        }
+    }
 
     #[test]
     fn a_reply_with_a_field_its_closed_result_schema_does_not_declare_is_caught() {

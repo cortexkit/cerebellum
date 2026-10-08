@@ -458,6 +458,8 @@ impl PlaneJournalCodec for ComputerJournalCodec {
                         crate::app_state::image::ImageFronting,
                     >(summary["image_fronting"].clone())
                     {
+                        entry["longest_fronted_interval_ms"] =
+                            json!(fronting.longest_fronted_interval_ms);
                         entry["image_fronting"] = json!(fronting);
                     }
                 }

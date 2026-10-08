@@ -1207,7 +1207,7 @@ where
             let image = release_through_custody(&mut custody, || {
                 // The observed bracket posts a heartbeat, just as keys does;
                 // do not mistake that input for the person's next action.
-                let posting = (image_plan.bring_to_front && image_plan.takeover).then(|| {
+                let mut posting = (image_plan.bring_to_front && image_plan.takeover).then(|| {
                     own_input.begin_posting(person::last_input_instant(input_source.as_ref()))
                 });
                 let captured = read_image::capture(
@@ -1217,6 +1217,11 @@ where
                     &grant,
                     &image_plan,
                     &evidence,
+                    &mut || {
+                        if let Some(posting) = posting.take() {
+                            own_input.end_posting(posting);
+                        }
+                    },
                 );
                 if let Some(posting) = posting {
                     own_input.end_posting(posting);

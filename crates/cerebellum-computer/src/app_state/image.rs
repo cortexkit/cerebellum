@@ -29,7 +29,7 @@ pub enum ImageUnavailable {
     WindowCoveredMayBeStale,
     /// Fronting an image read requires the conversation's machine takeover grant.
     ImageNeedsTakeover,
-    /// The front/restore interval exceeded the same bound used by keys.
+    /// The capture front/restore interval exceeded the image read's own bound.
     FrontingBoundExceeded,
     /// The observed fronting bracket could not complete.
     FrontingUnavailable,

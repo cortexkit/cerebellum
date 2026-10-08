@@ -5,7 +5,8 @@ use cerebellum_computer::app_state::image::{
 };
 use cerebellum_computer::app_state::ImageReadEvidence;
 use cerebellum_computer::capture::{
-    CaptureBackend, CaptureError, ScopedCaptureController, SingleWindowCaptureError,
+    CaptureBackend, CaptureError, ScopedCaptureController, SingleWindowCapture,
+    SingleWindowCaptureError,
 };
 use cerebellum_computer::dispatch::{BracketStop, RestoreStatus};
 use cerebellum_computer::platform::{PermissionLiveness, PlatformDriver, ProcessGrant};
@@ -29,10 +30,11 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     grant: &ProcessGrant,
     plan: &ImageReadPlan,
     evidence: &std::cell::RefCell<ImageReadEvidence>,
+    after_fronting: &mut dyn FnMut(),
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     let now_ms = plan.now_ms;
     if !plan.bring_to_front {
-        return capture_visible(backend, freshness, grant, evidence, false, now_ms);
+        return capture_visible(backend, freshness, grant, evidence, now_ms);
     }
     let (_, _, decision) = freshness.inspect_decision(grant, None);
     evidence.borrow_mut().decision = Some(decision);
@@ -42,34 +44,46 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !plan.bracket_admitted {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
+    // The declared 300 ms read bound is provisional pending a live measurement
+    // by the placed module. Keys retain their independently sized 100 ms bound.
     let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
-        "computer.keys",
-        "maximum_fronting_bracket_interval_ms",
+        "computer.read_state",
+        "maximum_fronting_read_interval_ms",
     )
-    .unwrap_or(100);
-    let mut backend = Some(backend);
+    .ok_or(ImageUnavailable::FrontingUnavailable)?;
+    if backend.screen_recording_liveness() != PermissionLiveness::Live {
+        return Err(ImageUnavailable::ScreenRecordingNotLive);
+    }
+    let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
+        .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
-    let report = driver
-        .read_fronted(
-            grant,
-            bound,
-            &|| plan.cancel.as_ref().is_some_and(|c| c.is_cancelled()),
-            &mut || {
-                // Even a backend panic must return through the bracket's restore.
-                captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    capture_visible(
-                        backend.take().expect("one bracket read"),
-                        freshness,
-                        grant,
-                        evidence,
-                        true,
-                        now_ms,
-                    )
-                }))
-                .unwrap_or(Err(ImageUnavailable::CaptureFailed));
-            },
-        )
-        .map_err(|_| ImageUnavailable::FrontingUnavailable)?;
+    let bracket = driver.read_fronted(
+        grant,
+        bound,
+        &|| plan.cancel.as_ref().is_some_and(|c| c.is_cancelled()),
+        &mut || {
+            // Even a backend panic must return through the bracket's restore.
+            captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_visibility(freshness, grant, evidence, None, false)?;
+                let pending = controller
+                    .capture_frontmost_window_unencoded_for_vision(now_ms)
+                    .map_err(image_capture_error)?;
+                check_visibility(
+                    freshness,
+                    grant,
+                    evidence,
+                    Some(&pending.window.window_id),
+                    false,
+                )?;
+                Ok(pending)
+            }))
+            .unwrap_or(Err(ImageUnavailable::CaptureFailed));
+        },
+    );
+    // The heartbeat's own-input bookkeeping must not hide input that arrives
+    // while the previous app is back in front and the JPEG is being encoded.
+    after_fronting();
+    let report = bracket.map_err(|_| ImageUnavailable::FrontingUnavailable)?;
     evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
     if matches!(report.restore, RestoreStatus::Failed { .. }) {
         return Err(ImageUnavailable::RestoreFailed);
@@ -81,10 +95,16 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !report.held(bound) {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
-    if captured.is_ok() && report.previous_frontmost != Some(grant.pid) {
+    let pending = captured?;
+    // The app is restored before any scaling or JPEG encoding. Encoding never
+    // recaptures: pixels remain the snapshot certified while the app was visible.
+    let captured = controller
+        .encode_window_for_vision(pending)
+        .map_err(image_capture_error)?;
+    if report.previous_frontmost != Some(grant.pid) {
         evidence.borrow_mut().decision = Some(ImageDecision::FrontedThenVisible);
     }
-    captured
+    Ok(window_image(captured, grant))
 }
 
 fn capture_visible<B: CaptureBackend>(
@@ -92,38 +112,56 @@ fn capture_visible<B: CaptureBackend>(
     freshness: &dyn ImageFreshnessSource,
     grant: &ProcessGrant,
     evidence: &std::cell::RefCell<ImageReadEvidence>,
-    fronted: bool,
     now_ms: u64,
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     if backend.screen_recording_liveness() != PermissionLiveness::Live {
         return Err(ImageUnavailable::ScreenRecordingNotLive);
     }
-    let check = |window_id: Option<&str>| {
-        let (repaints, visibility, decision) = freshness.inspect_decision(grant, window_id);
-        evidence.borrow_mut().decision = Some(decision);
-        // A fronted read is never captured while still covered, even for an
-        // engine with measured background repainting.
-        image_freshness_decision(repaints && !fronted, visibility)?;
-        Ok(())
-    };
-    check(None)?;
+    check_visibility(freshness, grant, evidence, None, true)?;
     let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     let captured = controller
         .capture_frontmost_window_for_vision(now_ms)
-        .map_err(|error| match error {
-            SingleWindowCaptureError::NoWindow => ImageUnavailable::NoWindowCaptured,
-            SingleWindowCaptureError::Capture(
-                CaptureError::PermissionUnavailable | CaptureError::PermissionPendingRelaunch,
-            ) => ImageUnavailable::ScreenRecordingNotLive,
-            SingleWindowCaptureError::Capture(CaptureError::UnsupportedOnPlatform) => {
-                ImageUnavailable::CaptureUnavailable
-            }
-            SingleWindowCaptureError::Capture(_) => ImageUnavailable::CaptureFailed,
-        })?;
+        .map_err(image_capture_error)?;
     // Selection and capture can race a cover; certify the exact captured window.
-    check(Some(&captured.window.window_id))?;
-    Ok(WindowImageCapture {
+    check_visibility(
+        freshness,
+        grant,
+        evidence,
+        Some(&captured.window.window_id),
+        true,
+    )?;
+    Ok(window_image(captured, grant))
+}
+
+fn check_visibility(
+    freshness: &dyn ImageFreshnessSource,
+    grant: &ProcessGrant,
+    evidence: &std::cell::RefCell<ImageReadEvidence>,
+    window_id: Option<&str>,
+    allow_covered_repainting: bool,
+) -> Result<(), ImageUnavailable> {
+    let (repaints, visibility, decision) = freshness.inspect_decision(grant, window_id);
+    evidence.borrow_mut().decision = Some(decision);
+    // Fronted reads never capture a still-covered window, even for a measured engine.
+    image_freshness_decision(repaints && allow_covered_repainting, visibility)
+}
+
+fn image_capture_error(error: SingleWindowCaptureError) -> ImageUnavailable {
+    match error {
+        SingleWindowCaptureError::NoWindow => ImageUnavailable::NoWindowCaptured,
+        SingleWindowCaptureError::Capture(
+            CaptureError::PermissionUnavailable | CaptureError::PermissionPendingRelaunch,
+        ) => ImageUnavailable::ScreenRecordingNotLive,
+        SingleWindowCaptureError::Capture(CaptureError::UnsupportedOnPlatform) => {
+            ImageUnavailable::CaptureUnavailable
+        }
+        SingleWindowCaptureError::Capture(_) => ImageUnavailable::CaptureFailed,
+    }
+}
+
+fn window_image(captured: SingleWindowCapture, grant: &ProcessGrant) -> WindowImageCapture {
+    WindowImageCapture {
         window_id: captured.window.window_id.clone(),
         owning_pid: grant.pid,
         window_origin: (
@@ -139,5 +177,5 @@ fn capture_visible<B: CaptureBackend>(
             captured.frame.captured_height_px,
         ),
         jpeg: captured.frame.jpeg,
-    })
+    }
 }

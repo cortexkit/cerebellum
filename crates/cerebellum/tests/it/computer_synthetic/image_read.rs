@@ -59,6 +59,7 @@ impl ImageFreshnessSource for Freshness {
 struct TrackedCapture {
     inner: InMemoryCaptureBackend,
     captures: Arc<AtomicUsize>,
+    encodes: Arc<AtomicUsize>,
     frontmost: Arc<AtomicU32>,
 }
 impl CaptureBackend for TrackedCapture {
@@ -110,6 +111,30 @@ impl CaptureBackend for TrackedCapture {
     fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError> {
         self.inner.begin_teardown()
     }
+    fn capture_window_unencoded_for_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
+        assert_eq!(
+            self.frontmost.load(Ordering::SeqCst),
+            grant().pid,
+            "raw capture must happen before restore"
+        );
+        self.captures.fetch_add(1, Ordering::SeqCst);
+        self.inner.capture_window_unencoded_for_vision(request)
+    }
+    fn encode_window_for_vision(
+        &mut self,
+        pending: PendingVisionWindowFrame,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        assert_eq!(
+            self.frontmost.load(Ordering::SeqCst),
+            OTHER_APPLICATION_PID,
+            "scaling and encoding must happen after restore"
+        );
+        self.encodes.fetch_add(1, Ordering::SeqCst);
+        self.inner.encode_window_for_vision(pending)
+    }
     fn poll_teardown(&mut self, elapsed_ms: u64) -> Result<BackendTeardownProgress, BackendError> {
         self.inner.poll_teardown(elapsed_ms)
     }
@@ -125,6 +150,7 @@ async fn read(
     shared.lock().unwrap().fronted = script;
     let frontmost = shared.lock().unwrap().image_frontmost.clone();
     let captures = Arc::new(AtomicUsize::new(0));
+    let encodes = Arc::new(AtomicUsize::new(0));
     let storage = InMemoryJournalStorage::new();
     let desk = background(Desk::new(vec![RawElement::fixture(1, "AXWindow")
         .titled(WINDOW_SECRET)
@@ -166,6 +192,7 @@ async fn read(
             |_| TrackedCapture {
                 inner: capturing(jpeg(1250, 750, 0)),
                 captures: captures.clone(),
+                encodes: encodes.clone(),
                 frontmost,
             },
         )
@@ -176,6 +203,11 @@ async fn read(
         "read_state never asks for takeover"
     );
     assert!(plane.result_schema_findings().is_empty());
+    assert_eq!(
+        encodes.load(Ordering::SeqCst),
+        usize::from(reply.get("image").is_some()),
+        "withheld images are not encoded"
+    );
     assert_eq!(reply["outcome"], "completed", "the tree succeeded: {reply}");
     assert!(reply["state_text"]
         .as_str()
@@ -192,6 +224,17 @@ async fn read(
     let result: Value = serde_json::from_slice(&opaque).unwrap();
     assert_eq!(row["image_decision"], result["image_decision"]);
     assert_eq!(row["image_fronting"], result["image_fronting"]);
+    assert_eq!(
+        row["longest_fronted_interval_ms"],
+        result["longest_fronted_interval_ms"]
+    );
+    if row.get("image_fronting").is_some() {
+        assert!(row["longest_fronted_interval_ms"].is_u64());
+        assert_eq!(
+            row["longest_fronted_interval_ms"],
+            row["image_fronting"]["longest_fronted_interval_ms"]
+        );
+    }
     (reply, row, shared, captures.load(Ordering::SeqCst))
 }
 
@@ -238,7 +281,7 @@ async fn fronting_overrun_discloses_bound_and_withholds_image() {
     let (reply, row, shared, captures) = read(
         true,
         FrontingScript {
-            front_latency_ms: Some(51),
+            front_latency_ms: Some(151),
             ..Default::default()
         },
         false,
@@ -255,7 +298,7 @@ async fn fronting_overrun_discloses_bound_and_withholds_image() {
         row["image_fronting"]["longest_fronted_interval_ms"]
             .as_u64()
             .unwrap()
-            > 100
+            > 300
     );
     assert_eq!(
         shared
@@ -373,4 +416,33 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
         }
         assert!(shared.lock().unwrap().image_front_requests.is_empty());
     }
+}
+
+#[tokio::test]
+async fn image_reads_use_their_own_bound_and_encode_after_restore() {
+    let (reply, row, shared, captures) = read(
+        true,
+        FrontingScript {
+            front_latency_ms: Some(100),
+            ..Default::default()
+        },
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        reply.get("image").is_some(),
+        "a 200 ms image bracket fits the read bound, not the keys bound: {reply}"
+    );
+    assert_eq!(captures, 1);
+    assert_eq!(row["longest_fronted_interval_ms"], 200);
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .image_frontmost
+            .load(Ordering::SeqCst),
+        OTHER_APPLICATION_PID
+    );
+    assert_eq!(row["image_decision"], "fronted_then_visible");
 }

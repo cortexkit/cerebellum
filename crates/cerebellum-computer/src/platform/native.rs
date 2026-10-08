@@ -15,8 +15,8 @@ use super::{
 };
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
-    CaptureBackend, EnumeratedWindow, VisionWindowFrame, WindowCaptureFrame, WindowCaptureRequest,
-    WindowChange, WindowChangeKind, WindowFrame,
+    CaptureBackend, EnumeratedWindow, PendingVisionWindowFrame, VisionWindowFrame,
+    WindowCaptureFrame, WindowCaptureRequest, WindowChange, WindowChangeKind, WindowFrame,
 };
 #[cfg(test)]
 use cerebellum_macos::test_support as permission_test_support;
@@ -538,14 +538,20 @@ impl CaptureBackend for NativeCaptureBackend {
     /// Capture one window, re-check its owner, and resample it to the vision
     /// limits as JPEG.
     ///
-    /// Scaled here, where the raw pixels are, so nothing past this point holds
-    /// a full-resolution copy. A capture with no area is returned as such,
-    /// with no image, so the caller can name that failure rather than a
-    /// scaling one.
+    /// Ordinary reads finish immediately; fronted reads use the same two phases
+    /// separately so one raw buffer can wait until the previous app is restored.
     fn capture_window_for_vision(
         &mut self,
         request: &WindowCaptureRequest,
     ) -> Result<VisionWindowFrame, BackendError> {
+        let pending = self.capture_window_unencoded_for_vision(request)?;
+        self.encode_window_for_vision(pending)
+    }
+
+    fn capture_window_unencoded_for_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
         let window_id: u32 = request.filter.window_id.parse().map_err(|_| {
             BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
         })?;
@@ -561,28 +567,42 @@ impl CaptureBackend for NativeCaptureBackend {
             .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;
         let captured_height_px = u32::try_from(capture.height)
             .map_err(|_| BackendError::Capture("the capture is too tall".into()))?;
-        let jpeg = match cerebellum_core::vision::fit_within_vision_limits(
-            captured_width_px,
-            captured_height_px,
+        Ok(PendingVisionWindowFrame {
+            frame: VisionWindowFrame {
+                owner_identity: request.target.clone(),
+                owner_identity_verified: true,
+                captured_width_px,
+                captured_height_px,
+                jpeg: Vec::new(),
+                captured_at_ms: request.captured_at_ms,
+            },
+            bgra: Some(capture.bgra),
+        })
+    }
+
+    fn encode_window_for_vision(
+        &mut self,
+        pending: PendingVisionWindowFrame,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        let mut frame = pending.frame;
+        let bgra = pending
+            .bgra
+            .ok_or_else(|| BackendError::Capture("the native frame has no raw pixels".into()))?;
+        frame.jpeg = match cerebellum_core::vision::fit_within_vision_limits(
+            frame.captured_width_px,
+            frame.captured_height_px,
         ) {
             Some((width, height)) => cerebellum_macos::encode_scaled_jpeg(
-                &capture.bgra,
-                capture.width,
-                capture.height,
+                &bgra,
+                frame.captured_width_px as usize,
+                frame.captured_height_px as usize,
                 width as usize,
                 height as usize,
             )
             .map_err(BackendError::Capture)?,
             None => Vec::new(),
         };
-        Ok(VisionWindowFrame {
-            owner_identity: request.target.clone(),
-            owner_identity_verified: true,
-            captured_width_px,
-            captured_height_px,
-            jpeg,
-            captured_at_ms: request.captured_at_ms,
-        })
+        Ok(frame)
     }
 
     /// Whole-display capture is not served.
