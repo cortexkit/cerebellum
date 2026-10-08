@@ -1986,3 +1986,26 @@ pub fn v21_from_v20(previous: &Value, revision: &str) -> Value {
         "required":["attempted","restored","longest_fronted_interval_ms"]});
     next
 }
+
+/// Revision 22 reports the usual launch time from this Mac's history, grouped
+/// by bundle id and verified signer so another developer's build cannot inherit it.
+pub fn v22_from_v21(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let row = next["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.open_app")
+        .unwrap();
+    row["effect_observation"]["deadline_ms"] = json!(120000);
+    row["result_schema"]["properties"]["outcome"]["description"] = json!("LaunchServices opens without activation; launched_no_window means no first window appeared within the readiness wait. Signer-bound local timing history can extend the default wait, up to a total launch budget of 120 seconds.");
+    row["result_schema"]["properties"]["usual_ready_ms"] = json!({
+        "type":"integer",
+        "description":"Median successful cold-start readiness on this Mac for this bundle and verified signer, before this launch. When only timeouts exist, their median conservative launch budget is used instead. Absent when history has no timing samples or is unavailable."
+    });
+    row["result_schema"]["properties"]["launch_note"] = json!({
+        "type":"string","description":"Explains when this launch took longer than the usual observed readiness time."
+    });
+    next
+}

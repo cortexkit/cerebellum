@@ -43,6 +43,7 @@ pub mod login_import;
 pub mod management;
 pub mod manifest;
 pub mod network;
+mod open_app_history;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
@@ -2888,6 +2889,14 @@ impl Planes {
                             driver
                         },
                     )
+                    .with_launch_history(match journal {
+                        JournalPersistence::Durable => {
+                            open_app_history::LaunchHistory::production()
+                        }
+                        JournalPersistence::Isolated => {
+                            open_app_history::LaunchHistory::in_memory()
+                        }
+                    })
                     // The fronting bracket is served only by a build carrying
                     // its review; without it a background target is refused.
                     .with_fronting_bracket_admitted(
@@ -6645,6 +6654,8 @@ fn record_private_state_tightening() {
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
 ///   in force, or withheld because their store could not be read;
+/// - `openAppLaunchHistory`, whether optional timing history is available or
+///   launches are using default waits after a read or write failure;
 /// - `hardwareInputObserver: {state, disabled_reenabled_count}`, whether the
 ///   timestamp-only hardware observer is running and how often it recovered
 ///   from a disabled tap. Reading health never starts the observer.
@@ -6675,6 +6686,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         metrics.insert(
             "computerGrantStore".to_string(),
             serde_json::Value::from(computer_grants::durable_grant_store_health()),
+        );
+        metrics.insert(
+            "openAppLaunchHistory".to_string(),
+            serde_json::Value::from(open_app_history::durable_history_health()),
         );
         #[cfg(target_os = "macos")]
         let (observer_state, reenabled_count) =

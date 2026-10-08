@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v21.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v22.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -761,7 +761,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v19_from_v18(&generated, historical_revision(19).as_str().unwrap());
     let generated =
         vocabulary_mint::v20_from_v19(&generated, historical_revision(20).as_str().unwrap());
-    let generated = vocabulary_mint::v21_from_v20(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v21_from_v20(&generated, historical_revision(21).as_str().unwrap());
+    let generated = vocabulary_mint::v22_from_v21(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1337,7 +1339,7 @@ fn recreated_v19() -> Value {
 }
 
 fn recreated_v20() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v21();
     vocabulary["revision"] = historical_revision(20);
     let row = vocabulary["rows"]
         .as_array_mut()
@@ -1408,5 +1410,23 @@ fn v19_only_makes_the_changes_recreated_v18_undoes() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v18()).unwrap()),
         "49ffd007a34982ae3a938c1b439274b270935facff8977f953c82bceb2475f4f"
+    );
+}
+
+fn recreated_v21() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(21);
+    let open = row_mut(&mut vocabulary, "computer.open_app");
+    open["effect_observation"]["deadline_ms"] = json!(40000);
+    open["result_schema"]["properties"]["outcome"]["description"] = json!("LaunchServices opens without activation; launched_no_window means no first window appeared within ten seconds after the process arrived.");
+    remove_properties(open, "result_schema", &["usual_ready_ms", "launch_note"]);
+    vocabulary
+}
+
+#[test]
+fn v22_only_makes_the_changes_recreated_v21_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v21()).unwrap()),
+        "cfe82e8302f59219cdb715aa6ff8743f4daf29e7918b7923e703342c7efc24a5"
     );
 }

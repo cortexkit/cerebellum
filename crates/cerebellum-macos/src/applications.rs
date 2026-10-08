@@ -321,6 +321,8 @@ pub struct ApplicationOpenResult {
     pub already_running: bool,
     pub has_window: bool,
     pub frontmost: bool,
+    pub process_started_ms: u64,
+    pub first_window_ms: Option<u64>,
 }
 
 /// Open the exact selected URL. The completion pid, not a shell child or a
@@ -331,6 +333,7 @@ pub fn open_application(
     activates: bool,
     process_timeout: Duration,
     window_timeout: Duration,
+    ready_timeout: Duration,
 ) -> Result<ApplicationOpenResult, String> {
     open_application_with_url(
         path,
@@ -339,9 +342,12 @@ pub fn open_application(
         activates,
         process_timeout,
         window_timeout,
+        ready_timeout,
     )
 }
 
+// Keep the URL launch and plain launch on the same bounded implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn open_application_with_url(
     path: &Path,
     bundle: &str,
@@ -349,7 +355,10 @@ pub fn open_application_with_url(
     activates: bool,
     process_timeout: Duration,
     window_timeout: Duration,
+    ready_timeout: Duration,
 ) -> Result<ApplicationOpenResult, String> {
+    let started = Instant::now();
+    let ready_deadline = started + ready_timeout;
     let running = workspace_running_applications()?;
     let matching: Vec<_> = running
         .iter()
@@ -402,10 +411,16 @@ pub fn open_application_with_url(
             }
             Ok::<(), String>(())
         })?;
-        rx.recv_timeout(process_timeout)
-            .map_err(|_| "process_timeout")??
+        rx.recv_timeout(bounded_wait(
+            Instant::now(),
+            process_timeout,
+            ready_deadline,
+        ))
+        .map_err(|_| "process_timeout")??
     };
-    let deadline = Instant::now() + window_timeout;
+    let process_started_ms = started.elapsed().as_millis() as u64;
+    let now = Instant::now();
+    let deadline = now + bounded_wait(now, window_timeout, ready_deadline);
     let has_window = loop {
         if process_has_window(pid) {
             break true;
@@ -413,15 +428,23 @@ pub fn open_application_with_url(
         if Instant::now() >= deadline {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     };
     Ok(ApplicationOpenResult {
         pid,
         already_running,
         has_window,
+        process_started_ms,
+        first_window_ms: has_window.then(|| started.elapsed().as_millis() as u64),
         frontmost: crate::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
             == Some(pid),
     })
+}
+
+fn bounded_wait(now: Instant, stage_timeout: Duration, ready_deadline: Instant) -> Duration {
+    stage_timeout.min(ready_deadline.saturating_duration_since(now))
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -472,6 +495,40 @@ pub fn responsible_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_and_window_waits_share_one_total_launch_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(120);
+        assert_eq!(
+            bounded_wait(started, Duration::from_secs(120), deadline),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            bounded_wait(
+                started + Duration::from_secs(90),
+                Duration::from_secs(120),
+                deadline
+            ),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            bounded_wait(deadline, Duration::from_secs(120), deadline),
+            Duration::ZERO
+        );
+        assert_eq!(
+            bounded_wait(
+                deadline + Duration::from_secs(1),
+                Duration::from_secs(120),
+                deadline
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            bounded_wait(started, Duration::from_secs(10), deadline),
+            Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn page_schemes_come_only_from_the_selected_bundles_url_types() {

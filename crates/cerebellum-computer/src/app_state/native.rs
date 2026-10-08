@@ -366,20 +366,29 @@ impl AppStateSource for MacAppStateSource {
         &self,
         app: &super::source::InstalledApp,
         bounds: super::source::OpenAppBounds,
-    ) -> Result<super::source::OpenedApp, AppStateReadError> {
+    ) -> Result<super::source::OpenedApp, super::source::OpenAppError> {
         let opened = cerebellum_macos::open_application(
             &app.path,
             &app.bundle_identity,
             bounds.activates,
             bounds.process_timeout,
             bounds.window_timeout,
+            bounds.ready_timeout,
         )
-        .map_err(|_| AppStateReadError::Unreadable)?;
+        .map_err(|error| {
+            if error == "process_timeout" {
+                super::source::OpenAppError::TimedOut
+            } else {
+                super::source::OpenAppError::Failed
+            }
+        })?;
         Ok(super::source::OpenedApp {
             pid: opened.pid,
             already_running: opened.already_running,
             has_window: opened.has_window,
             frontmost: opened.frontmost,
+            process_started_ms: opened.process_started_ms,
+            first_window_ms: opened.first_window_ms,
         })
     }
 
@@ -396,7 +405,7 @@ impl AppStateSource for MacAppStateSource {
         app: &super::source::InstalledApp,
         url: &str,
         bounds: super::source::OpenAppBounds,
-    ) -> Result<super::source::OpenedApp, AppStateReadError> {
+    ) -> Result<super::source::OpenedApp, super::source::OpenAppError> {
         let opened = cerebellum_macos::open_application_with_url(
             &app.path,
             &app.bundle_identity,
@@ -404,13 +413,22 @@ impl AppStateSource for MacAppStateSource {
             bounds.activates,
             bounds.process_timeout,
             bounds.window_timeout,
+            bounds.ready_timeout,
         )
-        .map_err(|_| AppStateReadError::Unreadable)?;
+        .map_err(|error| {
+            if error == "process_timeout" {
+                super::source::OpenAppError::TimedOut
+            } else {
+                super::source::OpenAppError::Failed
+            }
+        })?;
         Ok(super::source::OpenedApp {
             pid: opened.pid,
             already_running: opened.already_running,
             has_window: opened.has_window,
             frontmost: opened.frontmost,
+            process_started_ms: opened.process_started_ms,
+            first_window_ms: opened.first_window_ms,
         })
     }
 }

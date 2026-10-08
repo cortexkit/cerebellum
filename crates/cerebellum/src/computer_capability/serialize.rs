@@ -866,7 +866,7 @@ mod tests {
             &self,
             app: &InstalledApp,
             _: OpenAppBounds,
-        ) -> Result<OpenedApp, AppStateReadError> {
+        ) -> Result<OpenedApp, cerebellum_computer::app_state::source::OpenAppError> {
             if self.launch_blocked.load(Ordering::SeqCst) {
                 self.events
                     .send(Event::LaunchStarted(app.bundle_identity.clone()))
@@ -897,6 +897,8 @@ mod tests {
                 already_running: false,
                 has_window: true,
                 frontmost: false,
+                process_started_ms: 50,
+                first_window_ms: Some(100),
             })
         }
         fn read_app_state(
