@@ -82,6 +82,18 @@ pub struct ComputerOrderRecord {
     pub ordering: ComputerOrdering,
 }
 
+impl ComputerOrderRecord {
+    /// Only position-based ordering changes the durable contract. Arrival
+    /// ordering is the legacy behavior, including hints that fell back to it.
+    pub fn positioned(self) -> Option<Self> {
+        (self.message_index.is_some() && self.ordering != ComputerOrdering::Arrival).then_some(self)
+    }
+
+    pub fn is_legacy(order: &Option<Self>) -> bool {
+        order.and_then(Self::positioned).is_none()
+    }
+}
+
 /// How many requests in this process carried an origin that failed
 /// validation and were recorded with [`ORIGIN_INVALID_MARKER`] instead.
 pub fn origin_invalid_count() -> u64 {

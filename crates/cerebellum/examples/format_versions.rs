@@ -10,6 +10,8 @@
 //! the constant that format's reader checks, and the paths from the same
 //! data-home resolver the module's stores use, so staging reimplements
 //! neither.
+//! These are reader ceilings, not versions eagerly written at startup: both
+//! journal formats stay at v3 until a record carries positioned ordering.
 
 use serde_json::json;
 

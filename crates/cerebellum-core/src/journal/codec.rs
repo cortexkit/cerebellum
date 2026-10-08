@@ -134,6 +134,13 @@ pub trait PlaneJournalCodec {
     /// Required rather than defaulted, so a new codec states which it is
     /// instead of silently writing a decoded format with no floor.
     fn entry_format(&self) -> Option<crate::format_floor::DurableFormat>;
+
+    /// The format of a record actually present in the candidate write. Most
+    /// codecs have one fixed format; conditional writers override this so
+    /// supporting a newer version alone does not raise the rollback floor.
+    fn entry_format_for(&self, _codec_version: &str) -> Option<crate::format_floor::DurableFormat> {
+        self.entry_format()
+    }
 }
 
 impl<T: PlaneJournalCodec + ?Sized> PlaneJournalCodec for Box<T> {
@@ -181,5 +188,9 @@ impl<T: PlaneJournalCodec + ?Sized> PlaneJournalCodec for Box<T> {
 
     fn entry_format(&self) -> Option<crate::format_floor::DurableFormat> {
         (**self).entry_format()
+    }
+
+    fn entry_format_for(&self, codec_version: &str) -> Option<crate::format_floor::DurableFormat> {
+        (**self).entry_format_for(codec_version)
     }
 }

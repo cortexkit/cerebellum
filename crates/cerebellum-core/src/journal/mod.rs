@@ -85,7 +85,7 @@ pub struct JournalIdentity {
     /// Carried with the identity into blocking audit writes, so it describes
     /// this call rather than whichever task happens to write next. No opaque
     /// model message identifier is persisted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "ComputerOrderRecord::is_legacy")]
     pub computer_order: Option<ComputerOrderRecord>,
     /// The request this obligation serves, marked when its dispatch is
     /// committed. Never persisted; a reloaded identity carries a detached one.
@@ -1434,7 +1434,26 @@ where
         // Raise the entry format's floor before saving. Otherwise an entry
         // could reach disk in a version the floor does not record, and staging
         // would accept a build that cannot read it.
-        if let Some(format) = self.codec.entry_format() {
+        // The codec's default format protects legacy writes. A conditional
+        // newer format is floored only when an actual record carries it, not
+        // merely because this build can read or encode that version.
+        let versions = candidate
+            .reservations
+            .values()
+            .map(|record| record.provisional.codec_version.as_str())
+            .chain(
+                candidate
+                    .entries
+                    .values()
+                    .map(|record| record.codec_id.as_str()),
+            );
+        let format = self
+            .codec
+            .entry_format()
+            .into_iter()
+            .chain(versions.filter_map(|version| self.codec.entry_format_for(version)))
+            .max_by_key(|format| format.version);
+        if let Some(format) = format {
             self.raise_format_floor(format)?;
         }
         self.storage

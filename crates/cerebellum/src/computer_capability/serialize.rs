@@ -454,7 +454,7 @@ where
                     .arrive(context.identity.conversation_key.clone(), None)
             });
             let (conversation, order) = ticket.acquire().await;
-            context.identity.computer_order = Some(order);
+            context.identity.computer_order = order.positioned();
             #[cfg(test)]
             self.serializer.entered.lock().unwrap().push(order);
             // Ordering is best-effort when resolution exceeds two seconds:
@@ -1414,7 +1414,7 @@ mod tests {
             [None, None, Some(0), Some(1), Some(2)]
         );
         let rows = rig.audit_rows().await;
-        assert_eq!(rows[0]["identity"]["ordering"], "arrival");
+        assert!(rows[0]["identity"].get("ordering").is_none());
         assert!(rows[0]["identity"].get("message_index").is_none());
         rig.finish().await;
     }
@@ -1513,7 +1513,7 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row["identity"]["origin"]["status"] == "relayed"
-                && row["identity"]["ordering"] == "arrival"));
+                && row["identity"].get("ordering").is_none()));
         rig.finish().await;
     }
 

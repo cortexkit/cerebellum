@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use super::{DurableState, StorageError};
 use crate::format_floor::{DurableFormat, FormatFloor};
 
-/// Version 3 added the optional `origin` member to each record's identity: the
-/// caller behind a relayed call. A version 2 file is read as it stands, since
-/// a record without the member means the call named no origin.
-const JOURNAL_SCHEMA_VERSION: u64 = 3;
+/// Version 4 adds position-based computer ordering to record identities.
+/// Writes without that metadata remain at version 3, keeping rollback to an
+/// origin-aware build possible until the first positioned record is written.
+const JOURNAL_SCHEMA_VERSION: u64 = 4;
+const ORIGIN_JOURNAL_SCHEMA_VERSION: u64 = 3;
 
 /// The journal file format, shared by every audit journal this module keeps
 /// (browser, computer and launch): they are written and read by this one
@@ -204,12 +205,14 @@ impl FilesystemJournalStorage {
                 path: self.path.clone(),
                 source,
             })?;
-            value["schema_version"] = JOURNAL_SCHEMA_VERSION.into();
-        } else if version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
-            // Nothing to convert, and nothing is rewritten here: the next save
-            // writes the current version, raising the floor before it does.
-            value["schema_version"] = JOURNAL_SCHEMA_VERSION.into();
-        } else if version != JOURNAL_SCHEMA_VERSION {
+            value["schema_version"] = ORIGIN_JOURNAL_SCHEMA_VERSION.into();
+        } else if ![
+            PREVIOUS_JOURNAL_SCHEMA_VERSION,
+            ORIGIN_JOURNAL_SCHEMA_VERSION,
+            JOURNAL_SCHEMA_VERSION,
+        ]
+        .contains(&version)
+        {
             return Err(StorageError::UnknownSchemaVersion {
                 path: self.path.clone(),
                 found: version,
@@ -405,14 +408,28 @@ impl JournalStorage for FilesystemJournalStorage {
     }
 
     fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+        let positioned = state
+            .reservations
+            .values()
+            .map(|record| &record.identity)
+            .chain(state.entries.values().map(|record| &record.identity))
+            .any(|identity| !super::ComputerOrderRecord::is_legacy(&identity.computer_order));
+        let schema_version = if positioned {
+            JOURNAL_SCHEMA_VERSION
+        } else {
+            ORIGIN_JOURNAL_SCHEMA_VERSION
+        };
         // Before anything is written: a journal in this format on disk with
         // no floor naming it would let staging pass a build that cannot read
         // it.
         self.floor
-            .raise(AUDIT_JOURNAL_FORMAT)
+            .raise(DurableFormat::new(
+                AUDIT_JOURNAL_FORMAT.name,
+                schema_version,
+            ))
             .map_err(StorageError::FormatFloor)?;
         let stored = StoredJournal {
-            schema_version: JOURNAL_SCHEMA_VERSION,
+            schema_version,
             state: state.clone(),
         };
         let bytes =
@@ -549,6 +566,176 @@ mod tests {
         }
     }
 
+    fn state_with_order(order: Option<crate::journal::ComputerOrderRecord>) -> DurableState {
+        let identity = crate::journal::JournalIdentity {
+            principal: "fixture".into(),
+            conversation_key: "conversation".into(),
+            agent_project_id: "project".into(),
+            session_kind: crate::identity::SessionKind::Primary,
+            origin: Default::default(),
+            witness: crate::dispatch_witness::DispatchWitness::detached(),
+            computer_order: order,
+        };
+        let mut state = state(2);
+        state.reservations.insert(
+            1,
+            crate::journal::ReservationRecord {
+                identity,
+                invocation_descriptor: b"fixture".to_vec(),
+                provisional: crate::journal::EncodedJournalState {
+                    durable_bytes: b"{}".to_vec(),
+                    accounted_serialized_size: 2,
+                    codec_version: "fixture/v1".into(),
+                },
+                codec_id: "fixture/v1".into(),
+                charge: 2,
+                state: crate::journal::LifecycleState::Active,
+                marker: None,
+                dispatch: None,
+                attachments: Default::default(),
+            },
+        );
+        state
+    }
+
+    // Frozen origin-era identity fields, deliberately independent of the live
+    // JournalIdentity type. Retagging a positioned record as v3 must not make
+    // its new field readable by the strict rollback reader.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct V3Identity {
+        #[serde(rename = "principal")]
+        _principal: String,
+        #[serde(rename = "conversation_key")]
+        _conversation_key: String,
+        #[serde(rename = "agent_project_id")]
+        _agent_project_id: String,
+        #[serde(rename = "session_kind")]
+        _session_kind: serde_json::Value,
+        #[serde(default, rename = "origin")]
+        _origin: Option<serde_json::Value>,
+    }
+
+    fn v3_reader(bytes: &[u8]) -> Result<(), String> {
+        let stored: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if stored["schema_version"].as_u64() != Some(3) {
+            return Err("unsupported schema version".into());
+        }
+        for collection in ["reservations", "entries"] {
+            for record in stored["state"][collection].as_object().unwrap().values() {
+                serde_json::from_value::<V3Identity>(record["identity"].clone())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v3_rollback_reader_rejects_positioned_records_but_current_reader_accepts_both() {
+        use crate::journal::{ComputerOrderRecord, ComputerOrdering};
+        let directory = TemporaryDirectory::new("position-reader");
+        let path = directory.join("journal.json");
+        let storage = FilesystemJournalStorage::new(&path);
+        let legacy = state_with_order(None);
+        storage.save(&legacy).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        v3_reader(&bytes).expect("the rollback fixture reaches and accepts a v3 identity");
+        assert_eq!(storage.load().unwrap(), legacy);
+        for ordering in [ComputerOrdering::Position, ComputerOrdering::SkippedGap] {
+            let positioned = state_with_order(Some(ComputerOrderRecord {
+                message_index: Some(2),
+                ordering,
+            }));
+            storage.save(&positioned).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(encoded["schema_version"], 4);
+            assert_eq!(v3_reader(&bytes).unwrap_err(), "unsupported schema version");
+            assert_eq!(storage.load().unwrap(), positioned);
+            encoded["schema_version"] = 3.into();
+            assert!(v3_reader(&serde_json::to_vec(&encoded).unwrap())
+                .unwrap_err()
+                .contains("computer_order"));
+        }
+    }
+
+    #[test]
+    fn unpositioned_records_keep_v3_and_leave_the_existing_floor_byte_identical() {
+        use crate::journal::{ComputerOrderRecord, ComputerOrdering};
+        let directory = TemporaryDirectory::new("position-unused");
+        let path = directory.join("journal.json");
+        let floor = directory.join("format-floor.json");
+        let storage = FilesystemJournalStorage::new(&path)
+            .with_format_floor(crate::format_floor::FormatFloor::at(&floor));
+        storage.load().unwrap();
+        assert!(!floor.exists(), "opening a journal raised a floor");
+        storage.save(&state_with_order(None)).unwrap();
+        let old_floor = fs::read(&floor).unwrap();
+        assert_eq!(
+            crate::format_floor::read_floors(&floor)
+                .unwrap()
+                .get("audit-journal"),
+            Some(&3)
+        );
+        for message_index in [None, Some(2)] {
+            storage
+                .save(&state_with_order(Some(ComputerOrderRecord {
+                    message_index,
+                    ordering: ComputerOrdering::Arrival,
+                })))
+                .unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(encoded["schema_version"], 3);
+            assert!(encoded["state"]["reservations"]["1"]["identity"]
+                .get("computer_order")
+                .is_none());
+            v3_reader(&bytes).unwrap();
+            assert_eq!(fs::read(&floor).unwrap(), old_floor);
+        }
+    }
+
+    #[test]
+    fn positioned_record_requires_v4_floor_before_replacing_v3_journal() {
+        use crate::journal::{ComputerOrderRecord, ComputerOrdering};
+        let directory = TemporaryDirectory::new("position-floor-first");
+        let path = directory.join("journal.json");
+        let floor = directory.join("format-floor.json");
+        let storage = FilesystemJournalStorage::new(&path)
+            .with_format_floor(crate::format_floor::FormatFloor::at(&floor));
+        storage.save(&state_with_order(None)).unwrap();
+        let legacy = fs::read(&path).unwrap();
+        let old_floor = fs::read(&floor).unwrap();
+        // The v3 raise is cached. Blocking the next raise isolates the new v4
+        // floor, rather than proving only that any journal write needs a floor.
+        fs::remove_file(&floor).unwrap();
+        fs::create_dir(&floor).unwrap();
+        let positioned = state_with_order(Some(ComputerOrderRecord {
+            message_index: Some(2),
+            ordering: ComputerOrdering::Position,
+        }));
+        assert!(matches!(
+            storage.save(&positioned),
+            Err(StorageError::FormatFloor(_))
+        ));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            legacy,
+            "a v4 record reached disk before its floor"
+        );
+        fs::remove_dir(&floor).unwrap();
+        fs::write(&floor, old_floor).unwrap();
+        storage.save(&positioned).unwrap();
+        assert_eq!(
+            crate::format_floor::read_floors(&floor)
+                .unwrap()
+                .get("audit-journal"),
+            Some(&4)
+        );
+        assert_eq!(storage.load().unwrap(), positioned);
+    }
+
     #[test]
     fn saved_state_round_trips_through_a_new_binding() {
         let directory = TemporaryDirectory::new("round-trip");
@@ -663,7 +850,10 @@ mod tests {
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read atomically migrated journal"))
                 .expect("parse migrated journal");
-        assert_eq!(migrated["schema_version"], JOURNAL_SCHEMA_VERSION);
+        assert_eq!(
+            migrated["schema_version"], 3,
+            "migration without ordering stays rollback-compatible"
+        );
         let migrated_entry = &migrated["state"]["entries"]["1"];
         assert!(migrated_entry["invocation_descriptor"].is_string());
         assert!(migrated_entry["bytes"].is_string());
@@ -681,14 +871,14 @@ mod tests {
     fn unrecognized_schema_version_is_typed_and_never_starts_fresh() {
         let directory = TemporaryDirectory::new("unknown-version");
         let path = directory.join("journal.json");
-        fs::write(&path, br#"{"schema_version":4,"state":{}}"#).expect("write future journal");
+        fs::write(&path, br#"{"schema_version":5,"state":{}}"#).expect("write future journal");
 
         assert_eq!(
             FilesystemJournalStorage::new(&path).load(),
             Err(StorageError::UnknownSchemaVersion {
                 path,
-                found: 4,
-                supported: 3,
+                found: 5,
+                supported: 4,
             })
         );
     }
@@ -748,7 +938,7 @@ mod tests {
             .expect("save");
 
         let floors = crate::format_floor::read_floors(&floor_path).expect("read floors");
-        assert_eq!(floors.get("audit-journal"), Some(&JOURNAL_SCHEMA_VERSION));
+        assert_eq!(floors.get("audit-journal"), Some(&3));
     }
 
     #[test]
