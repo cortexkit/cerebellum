@@ -76,38 +76,19 @@ pub(crate) enum Outcome {
     AlreadyRunning,
     LaunchedNoWindow,
     LaunchFailed,
-    Refused,
-    ConsentPending,
-    ConsentDenied,
-    ConsentGrantedNotExecuted,
-    ConsentUnavailable,
-    ScreenLocked,
-    ModuleDraining,
-    RouteClosed,
-    UrlSchemeRefused,
     Cancelled,
-    AuditUnavailable,
 }
 
 impl Outcome {
-    pub(crate) fn from_reply(outcome: &str) -> Self {
-        match outcome {
+    pub(crate) fn from_reply(outcome: &str) -> Option<Self> {
+        Some(match outcome {
             "launched" => Self::Launched,
             "already_running" => Self::AlreadyRunning,
             "launched_no_window" => Self::LaunchedNoWindow,
             "launch_failed" => Self::LaunchFailed,
             "cancelled" => Self::Cancelled,
-            "audit_unavailable" => Self::AuditUnavailable,
-            "consent_pending" => Self::ConsentPending,
-            "consent_denied" => Self::ConsentDenied,
-            "consent_granted_not_executed" => Self::ConsentGrantedNotExecuted,
-            "consent_unavailable" => Self::ConsentUnavailable,
-            "screen_locked" => Self::ScreenLocked,
-            "module_draining" => Self::ModuleDraining,
-            "route_closed" => Self::RouteClosed,
-            "url_scheme_refused" => Self::UrlSchemeRefused,
-            _ => Self::Refused,
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -157,7 +138,6 @@ impl Default for Document {
 pub(crate) struct Advice {
     pub bounds: OpenAppBounds,
     pub usual_ready_ms: Option<u64>,
-    pub has_history: bool,
 }
 
 fn percentile(samples: &mut [u64], percent: usize) -> Option<u64> {
@@ -181,11 +161,7 @@ fn advice(launches: &[Launch]) -> Advice {
                 .flatten()
         })
         .collect();
-    let mut timeouts: Vec<_> = launches
-        .iter()
-        .filter_map(|launch| timeout_sample(&launch.observation))
-        .collect();
-    let usual_ready_ms = percentile(&mut successful, 50).or_else(|| percentile(&mut timeouts, 50));
+    let usual_ready_ms = percentile(&mut successful, 50);
     let mut samples = successful.clone();
     samples.extend(
         launches
@@ -218,7 +194,6 @@ fn advice(launches: &[Launch]) -> Advice {
     Advice {
         bounds,
         usual_ready_ms,
-        has_history: !launches.is_empty(),
     }
 }
 
@@ -283,32 +258,6 @@ impl LaunchHistory {
             .map(|a| a.launches.as_slice())
             .unwrap_or(&[]);
         advice(launches)
-    }
-
-    pub(crate) fn prepare_launch(&self, key: &AppKey) -> Advice {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let launches = state
-            .document
-            .as_ref()
-            .and_then(|document| document.apps.iter().find(|app| &app.key == key))
-            .map(|app| app.launches.as_slice())
-            .unwrap_or(&[]);
-        let learned = advice(launches);
-        // Readable history can live in a directory that has become unwritable.
-        // Prove an atomic replacement still works before using learned waits.
-        // Empty history is not written here: its first launch must stay lazy.
-        if learned.has_history {
-            if let Some(path) = &state.path {
-                if save(path, &state.floor, state.document.as_ref().unwrap()).is_err() {
-                    state.document = None;
-                    if state.production {
-                        HEALTH.store(3, Ordering::Release);
-                    }
-                    return advice(&[]);
-                }
-            }
-        }
-        learned
     }
 
     pub(crate) fn record(&self, key: AppKey, observation: Observation, outcome: Outcome) -> bool {
@@ -492,8 +441,7 @@ mod tests {
         ));
         let advice = history.advice(&app);
         assert_eq!(advice.bounds.ready_timeout, Duration::from_secs(80));
-        assert_eq!(advice.usual_ready_ms, Some(40_000));
-        assert!(advice.has_history);
+        assert_eq!(advice.usual_ready_ms, None);
         record(&history, app.clone(), 30_000);
         record(&history, app.clone(), 35_000);
         assert_eq!(
@@ -539,16 +487,15 @@ mod tests {
             history.advice(&real).bounds.ready_timeout,
             Duration::from_secs(100)
         );
-        assert!(!history.advice(&impostor).has_history);
+        assert!(history.advice(&impostor).usual_ready_ms.is_none());
         assert_eq!(history.advice(&impostor).bounds, OpenAppBounds::default());
         let mut apple = identity("REALTEAM");
         apple.team_id = None;
         apple.apple_anchored = true;
-        assert!(
-            !history
-                .advice(&AppKey::verified("com.editor", &apple).unwrap())
-                .has_history
-        );
+        assert!(history
+            .advice(&AppKey::verified("com.editor", &apple).unwrap())
+            .usual_ready_ms
+            .is_none());
     }
 
     #[test]
@@ -563,8 +510,8 @@ mod tests {
         let refreshed = key("com.app0", "REALTEAM");
         record(&history, refreshed.clone(), 10);
         record(&history, key("com.new", "REALTEAM"), 10);
-        assert!(!history.advice(&oldest).has_history);
-        assert!(history.advice(&refreshed).has_history);
+        assert!(history.advice(&oldest).usual_ready_ms.is_none());
+        assert!(history.advice(&refreshed).usual_ready_ms.is_some());
         for n in 0..30 {
             record(&history, refreshed.clone(), n);
         }
@@ -578,10 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn already_running_and_refusals_do_not_teach_cold_start_readiness() {
+    fn already_running_and_failed_launches_do_not_teach_cold_start_readiness() {
         let history = LaunchHistory::in_memory();
         let app = key("com.editor", "REALTEAM");
-        for outcome in [Outcome::AlreadyRunning, Outcome::Refused] {
+        for outcome in [Outcome::AlreadyRunning, Outcome::LaunchFailed] {
             assert!(history.record(
                 app.clone(),
                 Observation {
@@ -645,7 +592,7 @@ mod tests {
             fs::write(&path, bytes).unwrap();
             let history = LaunchHistory::at(path.clone());
             assert_eq!(history.advice(&app).bounds, OpenAppBounds::default());
-            assert!(!history.record(app.clone(), Observation::default(), Outcome::Refused));
+            assert!(!history.record(app.clone(), Observation::default(), Outcome::LaunchFailed));
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         fs::remove_file(&path).unwrap();
@@ -653,7 +600,7 @@ mod tests {
         let blocker = root.join("blocker");
         fs::write(&blocker, b"file").unwrap();
         history.0.lock().unwrap().floor = FormatFloor::at(blocker.join("format-floor.json"));
-        assert!(!history.record(app.clone(), Observation::default(), Outcome::Refused));
+        assert!(!history.record(app.clone(), Observation::default(), Outcome::LaunchFailed));
         assert!(!path.exists());
         assert_eq!(history.advice(&app).bounds, OpenAppBounds::default());
         fs::remove_dir_all(root).unwrap();
@@ -669,5 +616,36 @@ mod tests {
         assert_eq!(resource["version"], LAUNCH_HISTORY_FORMAT.version);
         assert_eq!(resource["max_apps"], MAX_APPS);
         assert_eq!(resource["max_launches_per_app"], MAX_LAUNCHES);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::Outcome;
+
+    #[test]
+    fn admission_refusals_are_not_launch_outcomes() {
+        for refusal in [
+            "consent_pending",
+            "consent_denied",
+            "screen_locked",
+            "module_draining",
+            "route_closed",
+            "url_scheme_refused",
+            "audit_unavailable",
+            "consent_unavailable",
+            "invalid_request",
+        ] {
+            assert!(Outcome::from_reply(refusal).is_none(), "{refusal}");
+        }
+        for launch in [
+            "launched",
+            "already_running",
+            "launched_no_window",
+            "launch_failed",
+            "cancelled",
+        ] {
+            assert!(Outcome::from_reply(launch).is_some(), "{launch}");
+        }
     }
 }

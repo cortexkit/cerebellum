@@ -2002,7 +2002,7 @@ pub fn v22_from_v21(previous: &Value, revision: &str) -> Value {
     row["result_schema"]["properties"]["outcome"]["description"] = json!("LaunchServices opens without activation; launched_no_window means no first window appeared within the readiness wait. Signer-bound local timing history can extend the default wait, up to a total launch budget of 120 seconds.");
     row["result_schema"]["properties"]["usual_ready_ms"] = json!({
         "type":"integer",
-        "description":"Median successful cold-start readiness on this Mac for this bundle and verified signer, before this launch. When only timeouts exist, their median conservative launch budget is used instead. Absent when history has no timing samples or is unavailable."
+        "description":"Median successful cold-start readiness on this Mac for this bundle and verified signer, before this launch. Absent until a successful cold start is observed or when history is unavailable; never added to admission refusals."
     });
     row["result_schema"]["properties"]["launch_note"] = json!({
         "type":"string","description":"Explains when this launch took longer than the usual observed readiness time."

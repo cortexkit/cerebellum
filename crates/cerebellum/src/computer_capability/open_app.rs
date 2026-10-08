@@ -6,6 +6,7 @@ use crate::computer_grants::{AppCode, AppIdentity, AppIdentityUnreadable, GrantN
 use crate::open_app_history::{AppKey, Observation, Outcome};
 use cerebellum_computer::app_state::source::OpenAppError;
 use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 struct BundleCode {
@@ -65,41 +66,9 @@ where
             tokio::task::spawn_blocking(move || source.installed_apps(Duration::from_secs(2)))
                 .await
                 .unwrap_or_default();
-        let mut observation = Observation::default();
-        let mut key = None;
         let mut reply = self
-            .serve_installed_open_app(&request, &listed, context, &mut observation, &mut key)
+            .serve_installed_open_app(&request, &listed, context)
             .await;
-        // History is indexed by bundle id plus a trusted signer. A missing
-        // inventory match or unreadable signature cannot supply that pair.
-        // Other refusals still count as outcomes, but never as readiness samples.
-        if key.is_none() {
-            if let Ok(app) = resolve_installed(&request.target, &listed.apps) {
-                let code = BundleCode {
-                    source: self.app_state_source.clone(),
-                    app: app.clone(),
-                };
-                if let Ok(Ok(identity)) = tokio::task::spawn_blocking(move || code.identity()).await
-                {
-                    key = AppKey::verified(&app.bundle_identity, &identity);
-                }
-            }
-        }
-        if let Some(key) = key {
-            let advice = self.launch_history.advice(&key);
-            let elapsed = observation.first_window_ms;
-            let outcome = Outcome::from_reply(reply["outcome"].as_str().unwrap_or(""));
-            if self.launch_history.record(key, observation, outcome) && advice.has_history {
-                if let Some(usual) = advice.usual_ready_ms {
-                    reply["usual_ready_ms"] = json!(usual);
-                }
-                if let (Some(elapsed), Some(usual)) = (elapsed, advice.usual_ready_ms) {
-                    if elapsed > usual {
-                        reply["launch_note"] = json!(format!("This launch is slower than usual ({elapsed} ms elapsed; usual readiness {usual} ms)."));
-                    }
-                }
-            }
-        }
         // Unreadable bundles elsewhere do not invalidate a found target: its
         // bytes still need a signer-bound grant naming that application. Disclose
         // the inventory limit on both launches and inventory-backed refusals.
@@ -116,8 +85,6 @@ where
         request: &OpenRequest,
         listed: &InstalledApps,
         context: ServeContext<'_, C>,
-        observation: &mut Observation,
-        history_key: &mut Option<AppKey>,
     ) -> Value {
         let app = match resolve_installed(&request.target, &listed.apps) {
             Ok(app) => app,
@@ -155,7 +122,7 @@ where
         let Some(identity) = identity else {
             return json!({"outcome":"consent_unavailable", "detail":{"reason":"app_identity_unreadable","grant":"app","grant_label":app.name}, "remedy":"the installed application must carry a valid, non-ad-hoc signature before it can be launched"});
         };
-        *history_key = AppKey::verified(&app.bundle_identity, &identity);
+        let history_key = AppKey::verified(&app.bundle_identity, &identity);
         let need = GrantNeed::App {
             bundle_identity: app.bundle_identity.clone(),
             display_name: app.name.clone(),
@@ -213,16 +180,24 @@ where
         let url = request.url.clone();
         let bounds = history_key
             .as_ref()
-            .map(|key| self.launch_history.prepare_launch(key).bounds)
+            .map(|key| self.launch_history.advice(key).bounds)
             .unwrap_or_default();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let launch_started = attempted.clone();
         let opened = tokio::task::spawn_blocking(move || {
-            if let Some(url) = url {
+            if let Some(url) = url.as_deref() {
                 // Consent can outlive a bundle update. Re-read the declarations
                 // immediately before dispatch, just as the signer is rechecked.
                 let schemes = source.bundle_url_schemes(&launching).unwrap_or_default();
-                if admit_url(&url, &schemes, &launching.bundle_identity).is_err() {
+                if admit_url(url, &schemes, &launching.bundle_identity).is_err() {
                     return Err(OpenAppError::Failed);
                 }
+            }
+            // URL revalidation can refuse before any launch call. Keep that
+            // out of history, while still counting a worker failure after the
+            // platform was asked to open the app as a real launch attempt.
+            launch_started.store(true, Ordering::Release);
+            if let Some(url) = url {
                 source.open_app_url(&launching, &url, bounds)
             } else {
                 source.open_app(&launching, bounds)
@@ -230,6 +205,7 @@ where
         })
         .await
         .unwrap_or(Err(OpenAppError::Failed));
+        let mut observation = Observation::default();
         match &opened {
             Ok(opened) => {
                 observation.process_started_ms = Some(opened.process_started_ms);
@@ -263,6 +239,22 @@ where
                 json!({"outcome":"launch_failed", "remedy":"LaunchServices could not open the application; list_apps before retrying because the application may still start"})
             }
         };
+        if let (true, Some(key), Some(outcome)) = (
+            attempted.load(Ordering::Acquire),
+            history_key,
+            Outcome::from_reply(reply["outcome"].as_str().unwrap_or("")),
+        ) {
+            let advice = self.launch_history.advice(&key);
+            let elapsed = observation.first_window_ms;
+            if self.launch_history.record(key, observation, outcome) {
+                if let Some(usual) = advice.usual_ready_ms {
+                    reply["usual_ready_ms"] = json!(usual);
+                    if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed > usual) {
+                        reply["launch_note"] = json!(format!("This launch is slower than usual ({elapsed} ms elapsed; usual readiness {usual} ms)."));
+                    }
+                }
+            }
+        }
         // Only app and outcome go into the journal: no path, window content,
         // request text, pid or frontmost state is copied there.
         let summary = json!({"app":{"name":app.name,"bundle_identity":app.bundle_identity},"outcome":reply["outcome"]});

@@ -96,6 +96,15 @@ fn rig_with_history(
 }
 
 async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value, usize) {
+    wire_with_decision(planes, action, arguments, "allow_conversation").await
+}
+
+async fn wire_with_decision(
+    planes: &crate::Planes,
+    action: &str,
+    arguments: Value,
+    decision: &str,
+) -> (Value, usize) {
     let mut arguments = arguments;
     arguments["action"] = json!(action);
     let request = Frame::build_with_version(
@@ -145,7 +154,7 @@ async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value,
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
+                serde_json::to_vec(&json!({"decision":decision})).unwrap(),
             )
             .unwrap();
             crate::handle_frame_for_test(answer, &tx, planes)
@@ -488,12 +497,20 @@ async fn open_app_second_slow_launch_after_timeout_gets_a_longer_deadline() {
     }
     let (second, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
     assert_eq!(second["outcome"], "launched", "{second}");
-    assert!(second.as_object().unwrap().contains_key("usual_ready_ms"));
-    assert_eq!(
-        second["usual_ready_ms"], 40_000,
-        "without a success, the median is a timeout lower bound: {second}"
+    assert!(
+        second.get("usual_ready_ms").is_none(),
+        "a timeout budget is not an observed ready time: {second}"
     );
+    assert!(second.get("launch_note").is_none());
     assert_eq!(desk.state().opens[1].ready_timeout, Duration::from_secs(80));
+    desk.state().opened.first_window_ms = Some(75_000);
+    let (third, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(third["outcome"], "launched", "{third}");
+    assert_eq!(third["usual_ready_ms"], 50_000);
+    assert!(third["launch_note"]
+        .as_str()
+        .unwrap()
+        .contains("slower than usual"));
 }
 
 #[tokio::test]
@@ -590,9 +607,9 @@ async fn open_app_history_read_and_write_failures_never_block_or_surface_on_wire
 }
 
 #[tokio::test]
-async fn open_app_readable_history_that_cannot_be_replaced_uses_default_wait() {
+async fn open_app_refusals_do_not_create_or_replace_launch_history() {
     let root = std::env::temp_dir().join(format!(
-        "ck-open-app-replacement-failure-{}-{}",
+        "ck-open-app-refusals-{}-{}",
         std::process::id(),
         crate::wall_clock_ms()
     ));
@@ -601,28 +618,95 @@ async fn open_app_readable_history_that_cannot_be_replaced_uses_default_wait() {
         false,
         crate::open_app_history::LaunchHistory::at(path.clone()),
     );
-    {
-        let mut state = desk.state();
-        state.opened.process_started_ms = 25_000;
-        state.opened.first_window_ms = Some(30_000);
-    }
+    let (refused, _) = wire(
+        &planes,
+        "open_app",
+        json!({"target":"Safari","url":"unregistered:page"}),
+    )
+    .await;
+    assert_eq!(refused["outcome"], "url_scheme_refused", "{refused}");
+    assert!(!path.exists());
+    desk.state().opened.first_window_ms = Some(30_000);
     for _ in 0..3 {
         let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
         assert_eq!(reply["outcome"], "launched", "{reply}");
     }
-    // Load valid learned timings, then make atomic replacement impossible.
-    let history = crate::open_app_history::LaunchHistory::at(path.clone());
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
-    let (planes, desk, _) = rig_with_history(false, history);
-    let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
-    assert_eq!(reply["outcome"], "launched", "{reply}");
-    assert_eq!(
-        desk.state().opens[0],
-        cerebellum_computer::app_state::source::OpenAppBounds::default()
+    let recorded = std::fs::read(&path).unwrap();
+    // More refusals than the retention limit must not displace real launches.
+    for _ in 0..21 {
+        let (reply, _) = wire(
+            &planes,
+            "open_app",
+            json!({"target":"Safari","url":"unregistered:page"}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "url_scheme_refused", "{reply}");
+        assert!(reply.get("usual_ready_ms").is_none());
+        assert!(reply.get("launch_note").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    }
+    let (denied_planes, denied_desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
     );
-    assert!(reply.get("usual_ready_ms").is_none());
-    assert!(reply.get("launch_note").is_none());
-    assert!(path.is_dir());
+    let (denied, questions) = wire_with_decision(
+        &denied_planes,
+        "open_app",
+        json!({"target":"Safari"}),
+        "deny",
+    )
+    .await;
+    assert_eq!(denied["outcome"], "consent_denied", "{denied}");
+    assert_eq!(questions, 1);
+    assert!(denied_desk.state().opens.is_empty());
+    assert!(denied.get("usual_ready_ms").is_none());
+    assert!(denied.get("launch_note").is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    desk.state().signature.as_mut().unwrap().ad_hoc = true;
+    let (unsigned, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(unsigned["outcome"], "consent_unavailable", "{unsigned}");
+    assert!(unsigned.get("usual_ready_ms").is_none());
+    assert!(unsigned.get("launch_note").is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn open_app_url_readmission_failure_is_not_a_launch_history_sample() {
+    let root = std::env::temp_dir().join(format!(
+        "ck-open-app-readmission-{}-{}",
+        std::process::id(),
+        crate::wall_clock_ms()
+    ));
+    let path = root.join("history.json");
+    let (planes, desk, _) = rig_with_history(
+        false,
+        crate::open_app_history::LaunchHistory::at(path.clone()),
+    );
+    let (ready, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(ready["outcome"], "launched", "{ready}");
+    let recorded = std::fs::read(&path).unwrap();
+    {
+        let mut state = desk.state();
+        state.url_schemes = vec!["synthetic-editor".into()];
+        // The bundle drops its registered scheme between admission and dispatch.
+        state.url_schemes_after_read = Some(Vec::new());
+    }
+    let (refused, _) = wire(
+        &planes,
+        "open_app",
+        json!({"target":"Safari","url":"synthetic-editor:page"}),
+    )
+    .await;
+    assert_eq!(refused["outcome"], "launch_failed", "{refused}");
+    assert_eq!(desk.state().opens.len(), 1);
+    assert!(desk.state().opened_urls.is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        recorded,
+        "URL readmission failed before any launch attempt; history must remain untouched"
+    );
+    assert!(refused.get("usual_ready_ms").is_none());
+    assert!(refused.get("launch_note").is_none());
     std::fs::remove_dir_all(root).unwrap();
 }
