@@ -74,14 +74,26 @@ fn permission_states_never_change_serialized_tool_definitions() {
             &browser,
         );
         let tools = manifest["provides"][0]["tools"].as_array().unwrap();
+        // A missing tool is compared as absent rather than unwrapped: where no app
+        // identity reader exists, `computer_use` is absent in every state, and
+        // that absence must also not vary with permissions.
         ["computer_use", "browser_use"].map(|name| {
-            serde_json::to_vec(tools.iter().find(|tool| tool["name"] == name).unwrap()).unwrap()
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| serde_json::to_vec(tool).unwrap())
         })
     };
     let live = definitions(PermissionLiveness::Live);
+    assert!(live[1].is_some(), "browser_use must be offered");
+    assert_eq!(
+        live[0].is_some(),
+        cfg!(target_os = "macos"),
+        "computer_use is offered exactly where app grants can be minted"
+    );
     // Also build declarations with platform support enabled on every host. On
-    // non-macOS hosts, the HELLO message the module sends the daemon offers only
-    // computer.wait from the computer plane, leaving the other rows untested.
+    // non-macOS hosts, the HELLO message the module sends the daemon offers no
+    // computer plane at all, leaving every row untested there.
     let live_declarations = capability_declarations(&context(PermissionLiveness::Live), true);
     assert_eq!(
         live_declarations
