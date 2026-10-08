@@ -285,26 +285,38 @@ run_phase "cargo clippy --locked --workspace --all-targets --quiet -- -D warning
 # printed only mid-log is invisible to anyone who reads the last line, which is
 # the line this script tells them to read.
 not_verified=
-linux_cc_ready=
-if [ -n "${CC_x86_64_unknown_linux_gnu:-}" ]; then
-  linux_cc_ready=1
-elif command -v zig >/dev/null 2>&1; then
-  CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
-  AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
-  export CC_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
-  linux_cc_ready=1
-fi
-if [ ! -d "$(rustc --print target-libdir --target x86_64-unknown-linux-gnu 2>/dev/null)" ]; then
-  printf '==> SKIPPED: the linux target is not installed, so cross-platform lint did not run\n'
-  printf '    install it with: rustup target add x86_64-unknown-linux-gnu\n'
-  not_verified="$not_verified; linux lint (target not installed)"
-elif [ -z "$linux_cc_ready" ]; then
-  printf '==> SKIPPED: no C compiler for x86_64-unknown-linux-gnu, so cross-platform lint did not run\n'
-  printf '    ring and libsqlite3-sys compile C; install zig, or set CC_x86_64_unknown_linux_gnu\n'
-  not_verified="$not_verified; linux lint (no C cross-compiler)"
+
+# Ubuntu CI runs this gate natively, where the host clippy phase checks Linux.
+# On macOS the same CI run supplies that signal; on Linux the host phase already
+# supplies it locally. Keep the cross lane available for operators who explicitly
+# request it, but do not spend a second build on a signal CI already provides.
+host_os="$(uname -s)"
+if [ "${CEREBELLUM_GATE_LINUX_LINT:-}" != 1 ] &&
+  { [ "$host_os" = Darwin ] || [ "$host_os" = Linux ]; }; then
+  printf '==> SKIPPED: linux lint (delegated to CI)\n'
+  not_verified="$not_verified; linux lint (delegated to CI)"
 else
-  run_phase "cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
-    cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
+  linux_cc_ready=
+  if [ -n "${CC_x86_64_unknown_linux_gnu:-}" ]; then
+    linux_cc_ready=1
+  elif command -v zig >/dev/null 2>&1; then
+    CC_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-cc.sh"
+    AR_x86_64_unknown_linux_gnu="$repo_root/scripts/zig-cross-ar.sh"
+    export CC_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
+    linux_cc_ready=1
+  fi
+  if [ ! -d "$(rustc --print target-libdir --target x86_64-unknown-linux-gnu 2>/dev/null)" ]; then
+    printf '==> SKIPPED: the linux target is not installed, so cross-platform lint did not run\n'
+    printf '    install it with: rustup target add x86_64-unknown-linux-gnu\n'
+    not_verified="$not_verified; linux lint (target not installed)"
+  elif [ -z "$linux_cc_ready" ]; then
+    printf '==> SKIPPED: no C compiler for x86_64-unknown-linux-gnu, so cross-platform lint did not run\n'
+    printf '    ring and libsqlite3-sys compile C; install zig, or set CC_x86_64_unknown_linux_gnu\n'
+    not_verified="$not_verified; linux lint (no C cross-compiler)"
+  else
+    run_phase "cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings" \
+      cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu --quiet -- -D warnings
+  fi
 fi
 
 # Windows: LIBRARY targets only, deliberately.
@@ -329,16 +341,25 @@ fi
 # skip branch unreachable, and on a host without the Windows targets (CI) the
 # phase ran and failed the whole gate, 25 runs in a row, for a toolchain
 # reason that says nothing about the code. Reported by iceteaSA in #18.
-for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-  if [ -d "$(rustc --print target-libdir --target "$windows_target" 2>/dev/null)" ]; then
-    run_phase "cargo clippy --locked --workspace --target $windows_target -- -D warnings" \
-      cargo clippy --locked --workspace --target "$windows_target" --quiet -- -D warnings
-  else
-    printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
-    not_verified="$not_verified; $windows_target build (target not installed)"
-    printf '    install it with: rustup target add %s\n' "$windows_target"
-  fi
-done
+# A runner can execute both Windows targets, so keep the local lanes as the
+# default but allow both to be delegated together when requested.
+if [ "${CEREBELLUM_GATE_WINDOWS_LINT:-}" = remote ]; then
+  for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+    printf '==> SKIPPED: run remotely instead: cargo clippy --locked --workspace --target %s -- -D warnings\n' "$windows_target"
+  done
+  not_verified="$not_verified; windows lint x86_64+aarch64 (run remotely)"
+else
+  for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+    if [ -d "$(rustc --print target-libdir --target "$windows_target" 2>/dev/null)" ]; then
+      run_phase "cargo clippy --locked --workspace --target $windows_target -- -D warnings" \
+        cargo clippy --locked --workspace --target "$windows_target" --quiet -- -D warnings
+    else
+      printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
+      not_verified="$not_verified; $windows_target build (target not installed)"
+      printf '    install it with: rustup target add %s\n' "$windows_target"
+    fi
+  done
+fi
 
 # Phase 4: compile + all tests (lib, bins, integration).
 run_phase "cargo test --locked --workspace --quiet" \
@@ -348,8 +369,8 @@ run_phase "cargo test --locked --workspace --quiet" \
 # builds emit no observer code. A plain `cargo test` therefore skips the
 # conformance test that exercises it, so run that feature explicitly — otherwise
 # the seam could rot unnoticed.
-run_phase "cargo test --locked -p cerebellum --features test-observer --test conformance --quiet" \
-  cargo test --locked -p cerebellum --features test-observer --test conformance --quiet
+run_phase "cargo test --locked -p cerebellum --features test-observer --test conformance -- --exact feature_gated_identity_observer_records_resolved_facts" \
+  scripts/lib/observer-conformance-gate.sh feature_gated_identity_observer_records_resolved_facts
 
 # Phase 5b: staging refuses a build below the format floor. The gate lives in a
 # script rather than a test, so a test run never exercises it; its proofs point
