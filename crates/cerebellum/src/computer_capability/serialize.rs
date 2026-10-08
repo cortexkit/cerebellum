@@ -349,14 +349,14 @@ where
                 .ok()
                 .flatten()
             }
-            Served::Wait => self
-                .resolve_target_name(arguments.get("app")?.as_str()?)
-                .await
-                .ok(),
-            Served::ReadState | Served::Type | Served::Keys | Served::TakeoverScroll => self
-                .resolve_target_name(arguments.get("target")?.as_str()?)
-                .await
-                .ok(),
+            Served::Wait => {
+                self.resolve_target_name_or_installed(arguments.get("app")?.as_str()?)
+                    .await
+            }
+            Served::ReadState | Served::Type | Served::Keys | Served::TakeoverScroll => {
+                self.resolve_target_name_or_installed(arguments.get("target")?.as_str()?)
+                    .await
+            }
             // The app has no process yet, so resolve it from the installed
             // inventory. Its lane is the bundle identity that later calls on
             // the running app resolve to, so they queue behind the launch.
@@ -374,6 +374,24 @@ where
                 .flatten()
             }
         }
+    }
+
+    async fn resolve_target_name_or_installed(&self, target: &str) -> Option<String> {
+        if let Ok(bundle_identity) = self.resolve_target_name(target).await {
+            return Some(bundle_identity);
+        }
+
+        let source = self.app_state_source.clone();
+        let target = target.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let listed = source.installed_apps(std::time::Duration::from_secs(1));
+            super::open_app::resolve_installed(&target, &listed.apps)
+                .ok()
+                .map(|app| app.bundle_identity)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
@@ -434,10 +452,11 @@ mod tests {
     use super::*;
     use crate::*;
     use cerebellum_computer::app_state::source::{
-        AppStateReadError, AppStateSource, ElementActionError, ElementHandle, RawAppState,
-        ReadBounds, RunningApp,
+        AppStateReadError, AppStateSource, BundleSignature, ElementActionError, ElementHandle,
+        InstalledApp, InstalledApps, OpenAppBounds, OpenedApp, RawAppState, ReadBounds, RunningApp,
     };
     use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Condvar;
     use std::time::Duration;
@@ -449,9 +468,14 @@ mod tests {
     const APP: &str = "com.example.Editor";
     const OTHER: &str = "com.example.Viewer";
 
-    struct Running;
+    struct Running {
+        desk: Arc<Desk>,
+    }
     impl management::TargetResolver for Running {
         fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+            if !self.desk.is_running(bundle_identity) {
+                return TargetResolution::NotRunning;
+            }
             TargetResolution::Resolved(ProcessGrant {
                 pid: if bundle_identity == APP { 42 } else { 43 },
                 bundle_identity: bundle_identity.to_string(),
@@ -467,6 +491,7 @@ mod tests {
     enum Event {
         Start(usize),
         End(usize),
+        LaunchStarted(String),
     }
 
     /// Each read reports its invocation number through a different real reply:
@@ -480,8 +505,30 @@ mod tests {
         hits_returned: AtomicUsize,
         hit_started: mpsc::UnboundedSender<usize>,
         hit_released: (Mutex<bool>, Condvar),
+        scripted_installed: Mutex<Option<Vec<InstalledApp>>>,
+        scripted_running: Mutex<Option<HashSet<String>>>,
+        launch_blocked: AtomicBool,
+        launch_released: (Mutex<bool>, Condvar),
+        running_queries: AtomicUsize,
+        read_targets: Mutex<Vec<String>>,
     }
     impl Desk {
+        fn script_apps(&self, installed: Vec<InstalledApp>, running: &[&str]) {
+            *self.scripted_installed.lock().unwrap() = Some(installed);
+            *self.scripted_running.lock().unwrap() =
+                Some(running.iter().map(|bundle| (*bundle).to_string()).collect());
+            *self.launch_released.0.lock().unwrap() = false;
+            self.launch_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn is_running(&self, bundle_identity: &str) -> bool {
+            self.scripted_running
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|running| running.contains(bundle_identity))
+        }
+
         fn release_hit(&self) {
             *self.hit_released.0.lock().unwrap() = true;
             self.hit_released.1.notify_all();
@@ -490,6 +537,11 @@ mod tests {
         fn release(&self) {
             *self.released.0.lock().unwrap() = true;
             self.released.1.notify_all();
+        }
+
+        fn release_launch(&self) {
+            *self.launch_released.0.lock().unwrap() = true;
+            self.launch_released.1.notify_all();
         }
     }
     struct ReleaseHit(Arc<Desk>);
@@ -524,18 +576,102 @@ mod tests {
             Ok(None)
         }
         fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
-            Ok(vec![RunningApp {
-                name: "Editor".into(),
-                bundle_identity: APP.into(),
-                pid: 42,
-                frontmost: true,
-            }])
+            self.running_queries.fetch_add(1, Ordering::SeqCst);
+            let scripted = self.scripted_installed.lock().unwrap().clone();
+            let Some(installed) = scripted else {
+                return Ok(vec![RunningApp {
+                    name: "Editor".into(),
+                    bundle_identity: APP.into(),
+                    pid: 42,
+                    frontmost: true,
+                }]);
+            };
+            let running = self.scripted_running.lock().unwrap();
+            let running = running.as_ref().expect("scripted running inventory");
+            Ok(installed
+                .into_iter()
+                .filter(|app| running.contains(&app.bundle_identity))
+                .map(|app| RunningApp {
+                    name: app.name,
+                    pid: if app.bundle_identity == APP { 42 } else { 43 },
+                    bundle_identity: app.bundle_identity,
+                    frontmost: false,
+                })
+                .collect())
+        }
+
+        fn installed_apps(&self, _: Duration) -> InstalledApps {
+            InstalledApps {
+                apps: self
+                    .scripted_installed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default(),
+                complete: true,
+            }
+        }
+
+        fn bundle_signature(&self, _: &InstalledApp) -> Result<BundleSignature, AppStateReadError> {
+            Ok(BundleSignature {
+                signed: true,
+                ad_hoc: false,
+                team_id: Some("fixture-team".into()),
+                designated_requirement: Some("fixture-requirement".into()),
+                apple_anchored: false,
+            })
+        }
+
+        fn bundle_satisfies(&self, _: &InstalledApp, _: &str) -> bool {
+            true
+        }
+
+        fn open_app(
+            &self,
+            app: &InstalledApp,
+            _: OpenAppBounds,
+        ) -> Result<OpenedApp, AppStateReadError> {
+            if self.launch_blocked.load(Ordering::SeqCst) {
+                self.events
+                    .send(Event::LaunchStarted(app.bundle_identity.clone()))
+                    .unwrap();
+                let (released, timeout) = self
+                    .launch_released
+                    .1
+                    .wait_timeout_while(
+                        self.launch_released.0.lock().unwrap(),
+                        Duration::from_secs(5),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "scripted app launch was never released"
+                );
+                drop(released);
+                self.scripted_running
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("scripted running inventory")
+                    .insert(app.bundle_identity.clone());
+            }
+            Ok(OpenedApp {
+                pid: if app.bundle_identity == APP { 42 } else { 43 },
+                already_running: false,
+                has_window: true,
+                frontmost: false,
+            })
         }
         fn read_app_state(
             &self,
-            _: &ProcessGrant,
+            target: &ProcessGrant,
             _: ReadBounds,
         ) -> Result<RawAppState, AppStateReadError> {
+            self.read_targets
+                .lock()
+                .unwrap()
+                .push(target.bundle_identity.clone());
             let number = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
             self.events.send(Event::Start(number)).unwrap();
             let (released, timeout) = self
@@ -592,6 +728,23 @@ mod tests {
             }),
         )
     }
+    fn open_request(channel: u16, corr: u64, app: &str) -> Frame {
+        frame(
+            FrameType::Request,
+            channel,
+            corr,
+            serde_json::json!({
+                "name": "computer_use", "arguments": {"action": "open_app", "target": app},
+            }),
+        )
+    }
+    fn installed_app(name: &str, bundle_identity: &str) -> InstalledApp {
+        InstalledApp {
+            name: name.into(),
+            bundle_identity: bundle_identity.into(),
+            path: std::path::PathBuf::from(format!("/fixture/{name}.app")),
+        }
+    }
     fn bind(planes: &Planes, channel: u16, session: &str) {
         planes.routes.insert(channel, 1, AcceptedBindFacts::from_bind(
             &subc_protocol::BindIdentity::new("/serialization", "fixture", session.to_string()),
@@ -618,13 +771,21 @@ mod tests {
             hits_returned: AtomicUsize::new(0),
             hit_started,
             hit_released: (Mutex::new(true), Condvar::new()),
+            scripted_installed: Mutex::new(None),
+            scripted_running: Mutex::new(None),
+            launch_blocked: AtomicBool::new(false),
+            launch_released: (Mutex::new(true), Condvar::new()),
+            running_queries: AtomicUsize::new(0),
+            read_targets: Mutex::new(Vec::new()),
         });
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
             JournalPersistence::Isolated,
         );
-        planes.management = Arc::new(management::ManagementPlane::new(Arc::new(Running)));
+        planes.management = Arc::new(management::ManagementPlane::new(Arc::new(Running {
+            desk: desk.clone(),
+        })));
         planes.computer = Ok(Arc::new(
             ComputerPlane::with_synthetic_driver(
                 super::super::computer_audit(JournalPersistence::Isolated).unwrap(),
@@ -640,6 +801,7 @@ mod tests {
         planes.computer_admitted = Arc::new(
             [
                 "computer.read_state",
+                "computer.open_app",
                 "computer.takeover_move",
                 "computer.takeover_scroll",
                 "computer.keys",
@@ -778,6 +940,46 @@ mod tests {
             ))
             .await;
         }
+        async fn start_held_launch(&mut self, channel: u16, corr: u64, app: &str) {
+            self.send(open_request(channel, corr, app)).await;
+            let question = self.reply().await;
+            assert_eq!(question.header.ty, FrameType::Request);
+            self.allow(&question).await;
+            assert_eq!(
+                self.event().await,
+                Event::LaunchStarted(if app == "Calculator" {
+                    APP.into()
+                } else {
+                    app.into()
+                })
+            );
+        }
+
+        async fn read_response_after_launch(&mut self, corr: u64) -> (Value, Value) {
+            let mut launch_reply = None;
+            let mut read_reply = None;
+            while launch_reply.is_none() || read_reply.is_none() {
+                let frame = self.reply().await;
+                if frame.header.ty == FrameType::Request {
+                    assert_eq!(frame.header.corr, corr);
+                    self.allow(&frame).await;
+                    continue;
+                }
+                assert_eq!(frame.header.ty, FrameType::Response);
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                if frame.header.corr == 1 {
+                    launch_reply = Some(body);
+                } else if frame.header.corr == corr {
+                    read_reply = Some(body);
+                } else {
+                    panic!(
+                        "unexpected response correlation {}: {body}",
+                        frame.header.corr
+                    );
+                }
+            }
+            (launch_reply.unwrap(), read_reply.unwrap())
+        }
         async fn grant(&mut self, channel: u16, app: &str) {
             // Prime only the grant: invalid zoom prevents any desk read.
             let prime = request(channel, 100 + u64::from(channel), app);
@@ -842,6 +1044,88 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(rig.reply().await.header.ty, FrameType::Response);
         }
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn read_state_by_name_waits_for_held_open_app() {
+        let mut rig = rig(false, None);
+        rig.desk.script_apps(
+            vec![
+                installed_app("Calculator", APP),
+                installed_app("Viewer", OTHER),
+            ],
+            &[OTHER],
+        );
+        rig.desk.release();
+        rig.start_held_launch(7, 1, "Calculator").await;
+
+        let queries_before_read = rig.desk.running_queries.load(Ordering::SeqCst);
+        rig.send(request(7, 2, "Calculator")).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rig.desk.running_queries.load(Ordering::SeqCst) == queries_before_read {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read resolves the target while Calculator is not running");
+        assert!(!rig.desk.is_running(APP));
+        assert_eq!(rig.desk.reads.load(Ordering::SeqCst), 0);
+        let early = tokio::time::timeout(Duration::from_millis(100), rig.replies.recv()).await;
+        rig.desk.release_launch();
+        assert!(
+            early.is_err(),
+            "read ran before the launch completed: {early:?}"
+        );
+
+        let (opened, read) = rig.read_response_after_launch(2).await;
+        assert_eq!(opened["outcome"], "launched", "{opened}");
+        assert_ne!(read["outcome"], "not_running", "{read}");
+        assert_eq!(rig.event().await, Event::Start(1));
+        assert_eq!(rig.event().await, Event::End(1));
+        assert_eq!(*rig.desk.read_targets.lock().unwrap(), [APP]);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn different_app_read_runs_while_open_app_is_held() {
+        let mut rig = rig(false, None);
+        rig.desk.script_apps(
+            vec![
+                installed_app("Calculator", APP),
+                installed_app("Viewer", OTHER),
+            ],
+            &[OTHER],
+        );
+        rig.grant(8, OTHER).await;
+        rig.desk.release();
+        rig.start_held_launch(7, 1, "Calculator").await;
+
+        rig.send(request(8, 2, OTHER)).await;
+        assert_eq!(rig.event().await, Event::Start(1));
+        assert_eq!(*rig.desk.read_targets.lock().unwrap(), [OTHER]);
+        assert_eq!(rig.event().await, Event::End(1));
+        let independent = rig.reply().await;
+        assert_eq!(
+            (independent.header.ty, independent.header.corr),
+            (FrameType::Response, 2)
+        );
+        assert_ne!(
+            serde_json::from_slice::<Value>(&independent.body).unwrap()["outcome"],
+            "not_running"
+        );
+        assert!(!rig.desk.is_running(APP), "launch remains held");
+
+        rig.desk.release_launch();
+        let opened = rig.reply().await;
+        assert_eq!(
+            (opened.header.ty, opened.header.corr),
+            (FrameType::Response, 1)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&opened.body).unwrap()["outcome"],
+            "launched"
+        );
         rig.finish().await;
     }
 
