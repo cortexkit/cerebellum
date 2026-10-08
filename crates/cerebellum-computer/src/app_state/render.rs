@@ -22,7 +22,7 @@
 
 use std::collections::HashSet;
 
-use super::session::StateDiff;
+use super::session::{SessionRead, StateDiff};
 use super::source::{ElementValue, RawElement};
 
 /// The longest label or value rendered, in characters. Labels are
@@ -109,7 +109,9 @@ impl ElementDescription {
     /// so an element that only moved is unchanged.
     pub fn signature(&self) -> String {
         format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            self.role.as_deref().unwrap_or(""),
+            self.subrole.as_deref().unwrap_or(""),
             self.role_words,
             self.label,
             self.markers.join(" "),
@@ -453,6 +455,8 @@ pub struct ObservedNode {
     /// Session-ending menu items, and everything beneath them. Never
     /// rendered.
     pub hazard: bool,
+    pub menu_open: bool,
+    pub menu_child_count: usize,
     pub children: Vec<ObservedNode>,
 }
 
@@ -554,6 +558,30 @@ fn is_menu_bar(node: &ObservedNode) -> bool {
     raw_role(node) == "AXMenuBar"
 }
 
+fn is_closed_menu(node: &ObservedNode) -> bool {
+    matches!(raw_role(node), "AXMenu" | "AXMenuBarItem") && !node.menu_open
+}
+
+pub(crate) fn is_sidebar(node: &ObservedNode) -> bool {
+    matches!(raw_subrole(node), "AXSidebar" | "AXSourceList")
+        || node.description.label.eq_ignore_ascii_case("sidebar")
+        || (matches!(raw_role(node), "AXGroup" | "AXScrollArea" | "AXSplitGroup")
+            && !node.children.is_empty()
+            && node.children.iter().all(is_sidebar))
+}
+
+/// Content wins the byte budget over navigation chrome. Source order within
+/// each class stays intact, preserving the pane's reading order.
+fn region_priority(node: &ObservedNode) -> u8 {
+    if matches!(raw_role(node), "AXMenuBar" | "AXMenu" | "AXMenuBarItem") {
+        2
+    } else if is_sidebar(node) {
+        1
+    } else {
+        0
+    }
+}
+
 /// The collapsed view of one element: zero elements when it carries nothing,
 /// its children in its place when it only wraps them, or itself.
 ///
@@ -571,7 +599,12 @@ fn is_menu_bar(node: &ObservedNode) -> bool {
 /// `inherited_label` is the one-line label of the nearest labelled ancestor.
 /// `keep_root` keeps the element itself whatever it is, for the element a
 /// caller zoomed into and for the top-level windows.
-fn build<'a>(node: &'a ObservedNode, inherited_label: &str, keep_root: bool) -> Vec<View<'a>> {
+fn build<'a>(
+    node: &'a ObservedNode,
+    inherited_label: &str,
+    keep_root: bool,
+    expand_menus: bool,
+) -> Vec<View<'a>> {
     let Some(id) = node.element_id.as_deref() else {
         return Vec::new();
     };
@@ -587,8 +620,10 @@ fn build<'a>(node: &'a ObservedNode, inherited_label: &str, keep_root: bool) -> 
     let mut children: Vec<View<'a>> = node
         .children
         .iter()
-        .flat_map(|child| build(child, passed_label, false))
+        .filter(|_| expand_menus || !is_closed_menu(node))
+        .flat_map(|child| build(child, passed_label, false, expand_menus))
         .collect();
+    children.sort_by_key(|view| region_priority(view.node));
     if children.len() == 1
         && is_plain_container(children[0].node)
         && one_line(&children[0].node.description.label).is_empty()
@@ -715,6 +750,7 @@ struct Emitter {
     limit: usize,
     omitted: usize,
     labels_truncated: bool,
+    capped: bool,
 }
 
 impl Emitter {
@@ -724,13 +760,15 @@ impl Emitter {
             limit,
             omitted: 0,
             labels_truncated: false,
+            capped: false,
         }
     }
 
     /// Add one line at `depth`; a line that does not fit is counted instead.
     fn push(&mut self, depth: usize, text: &str) -> bool {
         let indent = 2 * depth;
-        if self.text.len() + indent + text.len() + 1 > self.limit {
+        if self.capped || self.text.len() + indent + text.len() + 1 > self.limit {
+            self.capped = true;
             self.omitted += 1;
             return false;
         }
@@ -741,7 +779,13 @@ impl Emitter {
     }
 
     fn element(&mut self, depth: usize, view: &View<'_>) {
-        let (text, truncated) = line(view.id, &view.node.description);
+        let (mut text, truncated) = line(view.id, &view.node.description);
+        if is_closed_menu(view.node) && view.children.is_empty() {
+            text.push_str(&format!(
+                "  [{} children; closed]",
+                view.node.menu_child_count
+            ));
+        }
         if self.push(depth, &text) {
             self.labels_truncated |= truncated;
         }
@@ -763,6 +807,12 @@ enum Expand {
 /// Print a view and everything beneath it, summarising long runs of
 /// repeated siblings except where `expand` says.
 fn print_full(view: &View<'_>, depth: usize, expand: Expand, out: &mut Emitter) {
+    let expand = if view.node.menu_open && matches!(raw_role(view.node), "AXMenuBarItem" | "AXMenu")
+    {
+        Expand::Everything
+    } else {
+        expand
+    };
     out.element(depth, view);
     let below = if expand == Expand::Everything {
         Expand::Everything
@@ -854,7 +904,10 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
             if out.text.len() > MAX_OUTLINE_BYTES {
                 out.omitted += 1;
             } else if is_menu_bar(view.node) {
-                out.push(depth, &format!("menu bar (zoom: {MENU_BAR_ZOOM})"));
+                out.element(depth, view);
+                for title in &view.children {
+                    print_full(title, depth + 1, Expand::Nothing, out);
+                }
             } else if view.bytes <= INLINE_REGION_BYTES {
                 print_full(view, depth, Expand::Nothing, out);
             } else if is_transparent(view) {
@@ -1085,7 +1138,17 @@ pub fn render_state(
     roots: &[ObservedNode],
     request: &StateRequest<'_>,
 ) -> RenderedState {
-    let mut out = Emitter::new(MAX_STATE_TEXT_BYTES);
+    render_state_bounded(head, roots, request, MAX_STATE_TEXT_BYTES)
+}
+
+pub fn render_state_bounded(
+    head: &StateHeader<'_>,
+    roots: &[ObservedNode],
+    request: &StateRequest<'_>,
+    limit: usize,
+) -> RenderedState {
+    // Reserve the disclosure before spending the budget on content.
+    let mut out = Emitter::new(limit.saturating_sub(160));
     out.push(0, &header(head, roots));
 
     let target: Option<&ObservedNode> = match request.zoom {
@@ -1095,13 +1158,15 @@ pub fn render_state(
     };
     let zoom_found = request.zoom.is_none() || target.is_some();
     let scope: Vec<View<'_>> = match (request.zoom, target) {
-        (Some(_), Some(target)) => build(target, "", true),
+        (Some(_), Some(target)) => build(target, "", true, true),
         (Some(_), None) => Vec::new(),
         (None, _) => roots
             .iter()
-            .flat_map(|root| build(root, "", true))
+            .flat_map(|root| build(root, "", true, false))
             .collect(),
     };
+    let mut scope = scope;
+    scope.sort_by_key(|view| region_priority(view.node));
 
     if request.narrows() {
         let mut found = Vec::new();
@@ -1138,20 +1203,30 @@ pub fn render_state(
         }
         if out.omitted > 0 {
             out.text.push_str(&format!(
-                "… the outline stops at {} KB; zoom into an id above, or use text_filter or role_filter\n",
-                MAX_OUTLINE_BYTES / 1024
+                "… {} outline elements cut (menus and sidebars after main content); zoom or filter to see the rest\n",
+                out.omitted
             ));
-            // The outline's own stop is a choice of view, not a loss: every
-            // element it leaves out is one zoom or filter away.
-            out.omitted = 0;
+            // The disclosure names the lower-priority chrome that shares this
+            // budget; a zoom or filter can recover any omitted content.
         }
+    }
+
+    if out.omitted > 0 && (request.narrows() || request.zoom.is_some()) {
+        out.text.push_str(&format!(
+            "… {} elements cut; narrow the zoom or filters\n",
+            out.omitted
+        ));
     }
 
     let unnumbered: usize = roots.iter().map(count_unnumbered).sum();
     let omitted = out.omitted + unnumbered;
     let truncation = if omitted > 0 {
         Some(Truncation {
-            reason: TruncationReason::ElementCapReached,
+            reason: if limit <= MAX_DIFF_BYTES {
+                TruncationReason::DiffCapReached
+            } else {
+                TruncationReason::ElementCapReached
+            },
             omitted_elements: omitted,
         })
     } else if out.labels_truncated {
@@ -1178,6 +1253,94 @@ pub struct RenderedDiff {
     pub text: String,
     /// Present when the diff passed [`MAX_DIFF_BYTES`] and left lines out.
     pub truncation: Option<Truncation>,
+}
+
+/// An action changes either a few lines or the page the caller was working
+/// with. A page replacement is a state outline, never a wall of added ids.
+pub struct RenderedChangeReport {
+    pub text: String,
+    pub truncation: Option<Truncation>,
+    pub kind: &'static str,
+    pub zoom_found: bool,
+}
+
+pub fn render_change_report(
+    head: &StateHeader<'_>,
+    observed: &SessionRead,
+    request: &StateRequest<'_>,
+) -> RenderedChangeReport {
+    // A newly visible menu needs its items even if a prior explicit zoom already
+    // numbered them. Show that subtree as state, not as falsely added IDs.
+    let opened_menu = if !request.narrows() && request.zoom.is_none() {
+        let mut stack: Vec<_> = observed.roots.iter().collect();
+        let mut found = None;
+        while let Some(node) = stack.pop() {
+            if !node.hazard
+                && node.menu_open
+                && matches!(raw_role(node), "AXMenu" | "AXMenuBarItem")
+            {
+                if let Some(id) = node.element_id.as_deref() {
+                    if observed.diff.changed.iter().any(|changed| changed == id) {
+                        found = Some(id);
+                        break;
+                    }
+                }
+            }
+            stack.extend(&node.children);
+        }
+        found
+    } else {
+        None
+    };
+    let menu_request = StateRequest {
+        zoom: opened_menu.map(Zoom::Element),
+        ..Default::default()
+    };
+    if observed.replacement || request.narrows() || request.zoom.is_some() || opened_menu.is_some()
+    {
+        let state = render_state_bounded(
+            head,
+            &observed.roots,
+            if opened_menu.is_some() && !observed.replacement {
+                &menu_request
+            } else {
+                request
+            },
+            MAX_DIFF_BYTES - 32,
+        );
+        RenderedChangeReport {
+            text: format!(
+                "{}\n{}",
+                if observed.replacement {
+                    "State replaced:"
+                } else if opened_menu.is_some() {
+                    "Opened menu:"
+                } else {
+                    "Requested state:"
+                },
+                state.text
+            ),
+            truncation: state.truncation,
+            kind: if observed.replacement {
+                "replacement"
+            } else {
+                "filtered_state"
+            },
+            zoom_found: state.zoom_found,
+        }
+    } else {
+        let diff = render_diff(
+            &observed.roots,
+            &observed.diff,
+            observed.focused_element_id.as_deref(),
+        );
+        RenderedChangeReport {
+            text: diff.text,
+            truncation: diff.truncation,
+            kind: "diff",
+            zoom_found: true,
+        }
+    }
 }
 
 /// Ids as the shortest list of ids and ranges: `kq4, kq7-9, kq12`. A range
@@ -1259,8 +1422,10 @@ pub fn render_diff(
     let added: HashSet<&str> = diff.added.iter().map(String::as_str).collect();
     let views: Vec<View<'_>> = roots
         .iter()
-        .flat_map(|root| build(root, "", true))
+        .flat_map(|root| build(root, "", true, false))
         .collect();
+    let mut views = views;
+    views.sort_by_key(|view| region_priority(view.node));
     let mut found = Vec::new();
     for view in &views {
         collect_changes(view, 0, &changed, &added, &mut found);
@@ -1285,7 +1450,13 @@ pub fn render_diff(
     let mut left_changed = 0;
     let mut left_added = 0;
     for (prefix, depth, view) in &found {
-        let (text, truncated) = line(view.id, &view.node.description);
+        let (mut text, truncated) = line(view.id, &view.node.description);
+        if is_closed_menu(view.node) {
+            text.push_str(&format!(
+                "  [{} children; closed]",
+                view.node.menu_child_count
+            ));
+        }
         let text = format!("{prefix} {}{text}", "  ".repeat(*depth));
         if body.push(0, &text) {
             body.labels_truncated |= truncated;

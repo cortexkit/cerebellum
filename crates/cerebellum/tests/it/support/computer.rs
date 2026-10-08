@@ -775,6 +775,8 @@ pub struct DeskState {
     pub installed: cerebellum_computer::app_state::source::InstalledApps,
     pub signature: Option<cerebellum_computer::app_state::source::BundleSignature>,
     pub opens: Vec<cerebellum_computer::app_state::source::OpenAppBounds>,
+    pub url_schemes: Vec<String>,
+    pub opened_urls: Vec<String>,
     pub opened: cerebellum_computer::app_state::source::OpenedApp,
 }
 
@@ -819,6 +821,8 @@ impl Desk {
                 apple_anchored: false,
             }),
             opens: Vec::new(),
+            url_schemes: Vec::new(),
+            opened_urls: Vec::new(),
             opened: cerebellum_computer::app_state::source::OpenedApp {
                 pid: grant().pid,
                 already_running: false,
@@ -1084,6 +1088,23 @@ impl AppStateSource for Desk {
         let mut state = self.state();
         state.opens.push(bounds);
         Ok(state.opened)
+    }
+
+    fn bundle_url_schemes(
+        &self,
+        _: &cerebellum_computer::app_state::source::InstalledApp,
+    ) -> Result<Vec<String>, AppStateReadError> {
+        Ok(self.state().url_schemes.clone())
+    }
+
+    fn open_app_url(
+        &self,
+        app: &cerebellum_computer::app_state::source::InstalledApp,
+        url: &str,
+        bounds: cerebellum_computer::app_state::source::OpenAppBounds,
+    ) -> Result<cerebellum_computer::app_state::source::OpenedApp, AppStateReadError> {
+        self.state().opened_urls.push(url.to_owned());
+        self.open_app(app, bounds)
     }
 
     fn running_apps(

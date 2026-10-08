@@ -518,7 +518,10 @@ kq17 main Home timeline  [2 elements: Timeline: Your Home Timeline, ~3.8 KB]
 kq108 complementary Trending
   kq109 link Wren Workshop opens its seed library Trending now · News · 849 posts, Value: example.com/i/trending/1
   kq110 link Paper Kite Club shares a folding guide, Value: example.com/i/trending/2
-menu bar (zoom: menubar)
+kq111 menu bar
+  kq112 menu bar item Apple  [0 children; closed]
+  kq113 menu bar item Chrome  [0 children; closed]
+  kq114 menu bar item File  [0 children; closed]
 ";
 
 /// X's timeline outlines to its landmarks, its tabs and one line per post,
@@ -634,12 +637,18 @@ kq12 group
   kq250 list
     31 rows (zoom: kq250)
 kq623 text DB: 7208.9 MB · 17927 memories · 11834 compartments · 3170 notes
-menu bar (zoom: menubar)
+kq624 menu bar
+  kq625 menu bar item Magic Context  [8 children; closed]
+  kq635 menu bar item File  [8 children; closed]
+  kq645 menu bar item Edit  [8 children; closed]
+  kq655 menu bar item View  [8 children; closed]
+  kq665 menu bar item Window  [8 children; closed]
+  kq675 menu bar item Help  [8 children; closed]
 ";
 
 /// The dashboard that read as 49 KB outlines in under 1.5 KB: two hundred
-/// chart points and thirty-one rows are one line each, and the menu bar is
-/// one line.
+/// chart points and thirty-one rows are one line each, and closed menus show
+/// only their titles and child counts.
 #[test]
 fn dashboard_outline_is_golden() {
     let read = observe(dashboard());

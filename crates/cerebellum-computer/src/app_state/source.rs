@@ -73,6 +73,10 @@ pub struct RawElement {
     pub focused: bool,
     /// `None` where the element exposes no expanded state.
     pub expanded: Option<bool>,
+    /// Whether a menu is currently on screen; only menu roles use this field.
+    pub menu_visible: bool,
+    /// Direct children deliberately not traversed in a closed menu.
+    pub closed_menu_children: usize,
     /// The address a link or a web page points at (`AXURL`), when it has one.
     pub url: Option<String>,
     pub children: Vec<RawElement>,
@@ -128,8 +132,9 @@ impl RawAppState {
         gaps
     }
 
-    /// Whether every element that exists was visited, so one missing from
-    /// this read is known to be gone.
+    /// Whether every requested subtree was read. Closed menu contents are
+    /// deliberately unrequested, not unreadable; the session preserves known
+    /// descendant identities beneath those menus instead of removing them.
     pub fn is_complete(&self) -> bool {
         self.unreadable_subtrees == 0 && !self.read_bound_reached
     }
@@ -276,6 +281,15 @@ pub trait AppStateSource: Send + Sync {
         bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError>;
 
+    /// A zoom may explicitly request the contents of closed menus.
+    fn read_app_state_expanding_menus(
+        &self,
+        target: &ProcessGrant,
+        bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        self.read_app_state(target, bounds)
+    }
+
     /// What the element is now: owner, role, title, actions, settability.
     fn element_facts(&self, _element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)
@@ -390,6 +404,21 @@ pub trait AppStateSource: Send + Sync {
     /// Validate that the bundle still satisfies the approved signer requirement.
     fn bundle_satisfies(&self, _app: &InstalledApp, _requirement: &str) -> bool {
         false
+    }
+
+    /// Schemes declared by this exact bundle's CFBundleURLTypes, not defaults
+    /// chosen by LaunchServices or by another installed application.
+    fn bundle_url_schemes(&self, _app: &InstalledApp) -> Result<Vec<String>, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+
+    fn open_app_url(
+        &self,
+        _app: &InstalledApp,
+        _url: &str,
+        _bounds: OpenAppBounds,
+    ) -> Result<OpenedApp, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
     }
 
     /// Launch via the platform application service, not as our child. The
@@ -534,6 +563,8 @@ impl RawElement {
             enabled: true,
             focused: false,
             expanded: None,
+            menu_visible: false,
+            closed_menu_children: 0,
             url: None,
             children: Vec::new(),
             unreadable_children: 0,

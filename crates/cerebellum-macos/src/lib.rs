@@ -35,9 +35,9 @@ mod ax_actions;
 mod ax_state;
 #[cfg(target_os = "macos")]
 pub use applications::{
-    installed_applications, open_application, responsible_pid, workspace_running_applications,
-    ApplicationOpenResult, InstalledApplication, InstalledApplicationList,
-    InstalledInventoryFailure,
+    application_url_schemes, installed_applications, open_application, open_application_with_url,
+    responsible_pid, workspace_running_applications, ApplicationOpenResult, InstalledApplication,
+    InstalledApplicationList, InstalledInventoryFailure,
 };
 #[cfg(target_os = "macos")]
 mod code_signing;
@@ -111,8 +111,8 @@ pub use manual_accessibility::prepare_manual_accessibility;
 mod manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_state::{
-    read_app_state, AxAppState, AxAppStateBounds, AxAppStateError, AxRetainedElement,
-    AxStateElement, AxStateValue,
+    read_app_state, read_app_state_with_menus, AxAppState, AxAppStateBounds, AxAppStateError,
+    AxRetainedElement, AxStateElement, AxStateValue,
 };
 #[cfg(target_os = "macos")]
 pub use code_signing::{

@@ -96,6 +96,9 @@ struct Entry {
     /// A session-ending menu item, or something beneath one: numbered so a
     /// press on it can be recognised and refused, never shown.
     refusing: bool,
+    /// Menu ancestors let a deliberately collapsed menu preserve the identities
+    /// of its unread descendants without claiming they disappeared.
+    menu_ancestors: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -109,6 +112,7 @@ struct Session {
     /// read or an action reply's diff, and when. An action compares them
     /// with the application now to learn whether the person used it since.
     seen: Option<SeenMarks>,
+    latest: Option<SessionRead>,
 }
 
 impl Session {
@@ -151,6 +155,7 @@ impl Session {
                 in_baseline: false,
                 absent_reads: 0,
                 refusing,
+                menu_ancestors: Vec::new(),
             },
         );
         Some(number)
@@ -185,6 +190,102 @@ pub struct SessionRead {
     pub focused_element_id: Option<String>,
     pub unreadable_subtrees: usize,
     pub diff: StateDiff,
+    pub replacement: bool,
+    pub complete: bool,
+}
+
+impl SessionRead {
+    /// Compare element lines by identity, independent of their parents.
+    pub fn compared_with(mut self, before: &Self) -> Self {
+        let old = element_lines(&before.roots);
+        let new = element_lines(&self.roots);
+        self.diff = StateDiff::default();
+        for (id, signature) in &new {
+            match old.get(id) {
+                None => self.diff.added.push(id.clone()),
+                Some(previous) if previous != signature => self.diff.changed.push(id.clone()),
+                _ => {}
+            }
+        }
+        if self.complete {
+            self.diff.removed = old
+                .keys()
+                .filter(|id| !new.contains_key(*id))
+                .cloned()
+                .collect();
+        }
+        self.replacement = mostly_replaced(&before.roots, &self.roots, &self.diff);
+        self
+    }
+}
+
+fn element_lines(roots: &[ObservedNode]) -> BTreeMap<String, String> {
+    let mut lines = BTreeMap::new();
+    let mut stack: Vec<_> = roots.iter().collect();
+    while let Some(node) = stack.pop() {
+        if node.hazard {
+            continue;
+        }
+        if let Some(id) = &node.element_id {
+            let signature = if matches!(
+                node.description.role.as_deref(),
+                Some("AXMenu" | "AXMenuBarItem")
+            ) {
+                format!(
+                    "{}\0{}\0{}",
+                    node.description.signature(),
+                    node.menu_open,
+                    node.menu_child_count
+                )
+            } else {
+                node.description.signature()
+            };
+            lines.insert(id.clone(), signature);
+        }
+        if node.menu_open
+            || !matches!(
+                node.description.role.as_deref(),
+                Some("AXMenu" | "AXMenuBarItem")
+            )
+        {
+            stack.extend(&node.children);
+        }
+    }
+    lines
+}
+
+fn content_ids(roots: &[ObservedNode]) -> HashSet<&str> {
+    let mut ids = HashSet::new();
+    let mut stack: Vec<_> = roots.iter().collect();
+    while let Some(node) = stack.pop() {
+        let role = node.description.role.as_deref().unwrap_or("");
+        if node.hazard
+            || matches!(role, "AXMenuBar" | "AXMenu" | "AXMenuBarItem")
+            || super::render::is_sidebar(node)
+        {
+            continue;
+        }
+        if let Some(id) = node.element_id.as_deref() {
+            ids.insert(id);
+        }
+        stack.extend(&node.children);
+    }
+    ids
+}
+
+fn mostly_replaced(before: &[ObservedNode], after: &[ObservedNode], diff: &StateDiff) -> bool {
+    let old = content_ids(before);
+    let new = content_ids(after);
+    let affected: HashSet<_> = diff
+        .added
+        .iter()
+        .chain(&diff.changed)
+        .chain(&diff.removed)
+        .map(String::as_str)
+        .filter(|id| old.contains(id) || new.contains(id))
+        .collect();
+    let population = old.union(&new).count();
+    population > 0 && affected.len() * 2 > population
 }
 
 /// Where an element id leads.
@@ -383,6 +484,7 @@ impl AppStateSessions {
                 by_hash: HashMap::new(),
                 has_baseline: false,
                 seen: None,
+                latest: None,
             });
         let session = state
             .sessions
@@ -397,12 +499,13 @@ impl AppStateSessions {
             next_number,
             seen: HashSet::new(),
             diff: StateDiff::default(),
+            closed_menus: HashSet::new(),
         };
         let roots: Vec<ObservedNode> = read
             .roots
             .iter()
             .enumerate()
-            .map(|(index, root)| walk.node(root, None, index, false, false))
+            .map(|(index, root)| walk.node(root, None, index, false, false, (false, &[])))
             .collect();
         let Walk {
             tag: _,
@@ -410,6 +513,7 @@ impl AppStateSessions {
             next_number,
             seen,
             mut diff,
+            closed_menus,
         } = walk;
         let last_new = *next_number;
 
@@ -420,7 +524,12 @@ impl AppStateSessions {
             if seen.contains(&entry.number) {
                 entry.in_baseline = true;
                 entry.absent_reads = 0;
-            } else if complete {
+            } else if complete
+                && !entry
+                    .menu_ancestors
+                    .iter()
+                    .any(|menu| closed_menus.contains(menu))
+            {
                 // Only a read that visited everything can say an element is
                 // gone. A read that left a subtree unopened may simply not
                 // have reached it, so it neither removes nor ages anything.
@@ -466,12 +575,60 @@ impl AppStateSessions {
         let focused_element_id =
             focused_number.map(|number| session_element_id(&self.run_tag, number));
 
-        SessionRead {
+        let mut observed = SessionRead {
             roots,
             focused_element_id,
             unreadable_subtrees: read.unreadable_subtrees,
             diff,
+            replacement: false,
+            complete: read.is_complete(),
+        };
+        let session = state.sessions.get_mut(&key).expect("live session");
+        if let Some(before) = &session.latest {
+            observed.replacement = mostly_replaced(&before.roots, &observed.roots, &observed.diff);
         }
+        session.latest = Some(observed.clone());
+        observed
+    }
+
+    pub fn latest(&self, conversation_key: &str, target: &ProcessGrant) -> Option<SessionRead> {
+        self.lock()
+            .sessions
+            .get(&SessionKey::new(conversation_key, target))?
+            .latest
+            .clone()
+    }
+
+    /// A content zoom must not pay for unrelated closed menu trees.
+    pub fn zoom_expands_menus(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        zoom: Option<&str>,
+    ) -> bool {
+        let Some(zoom) = zoom else {
+            return false;
+        };
+        if zoom
+            .trim()
+            .eq_ignore_ascii_case(super::render::MENU_BAR_ZOOM)
+        {
+            return true;
+        }
+        let Some(read) = self.latest(conversation_key, target) else {
+            return false;
+        };
+        let mut stack: Vec<_> = read.roots.iter().collect();
+        while let Some(node) = stack.pop() {
+            if node.element_id.as_deref() == Some(zoom.trim()) {
+                return matches!(
+                    node.description.role.as_deref(),
+                    Some("AXMenuBar" | "AXMenuBarItem" | "AXMenu")
+                );
+            }
+            stack.extend(&node.children);
+        }
+        false
     }
 
     /// Give an element found some other way than by a read -- a hit test --
@@ -532,13 +689,17 @@ impl AppStateSessions {
             return true;
         }
         let mut seen = HashSet::new();
+        let mut closed_menus = HashSet::new();
         let mut stack: Vec<&RawElement> = read.roots.iter().collect();
         while let Some(element) = stack.pop() {
             stack.extend(element.children.iter());
             match session.find(&element.handle) {
                 Some(number) => {
+                    if element.closed_menu_children > 0 {
+                        closed_menus.insert(number);
+                    }
                     let entry = &session.entries[&number];
-                    if !entry.in_baseline || entry.signature != describe(element).signature() {
+                    if !entry.in_baseline || entry.signature != element_signature(element) {
                         return true;
                     }
                     seen.insert(number);
@@ -547,10 +708,14 @@ impl AppStateSessions {
             }
         }
         read.is_complete()
-            && session
-                .entries
-                .values()
-                .any(|entry| entry.in_baseline && !seen.contains(&entry.number))
+            && session.entries.values().any(|entry| {
+                entry.in_baseline
+                    && !seen.contains(&entry.number)
+                    && !entry
+                        .menu_ancestors
+                        .iter()
+                        .any(|menu| closed_menus.contains(menu))
+            })
     }
 
     /// Record what the conversation was just shown of this process's focused
@@ -686,6 +851,7 @@ struct Walk<'a> {
     next_number: &'a mut u64,
     seen: HashSet<u64>,
     diff: StateDiff,
+    closed_menus: HashSet<u64>,
 }
 
 impl Walk<'_> {
@@ -703,14 +869,16 @@ impl Walk<'_> {
         index: usize,
         mut hazard: bool,
         in_apple_menu: bool,
+        menu_context: (bool, &[u64]),
     ) -> ObservedNode {
+        let (selected_menu, menu_ancestors) = menu_context;
         let description = describe(element);
         let is_apple_menu = parent_role == Some("AXMenuBar")
             && index == 0
             && element.role.as_deref() == Some("AXMenuBarItem");
         hazard |= is_session_ending_item(element)
             || (in_apple_menu && element.role.as_deref() == Some("AXMenuItem"));
-        let signature = description.signature();
+        let signature = element_signature(element);
 
         let number = match self.session.find(&element.handle) {
             Some(number) => {
@@ -725,7 +893,9 @@ impl Walk<'_> {
                 entry.refusing |= hazard;
                 if !entry.refusing && !self.seen.contains(&number) {
                     let id = session_element_id(self.tag, number);
-                    if !entry.in_baseline {
+                    if entry.signature.is_empty() {
+                        // Hit-test adoption allocates an id before any tree
+                        // read has shown its line. Its first appearance is new.
                         self.diff.added.push(id);
                     } else if entry.signature != signature {
                         self.diff.changed.push(id);
@@ -751,9 +921,24 @@ impl Walk<'_> {
         };
         if let Some(number) = number {
             self.seen.insert(number);
+            self.session
+                .entries
+                .get_mut(&number)
+                .expect("numbered entry")
+                .menu_ancestors = menu_ancestors.to_vec();
+            if element.closed_menu_children > 0 {
+                self.closed_menus.insert(number);
+            }
         }
 
-        let children = element
+        let mut child_menus = menu_ancestors.to_vec();
+        if element.role.as_deref() == Some("AXMenu") {
+            if let Some(number) = number {
+                child_menus.push(number);
+            }
+        }
+
+        let children: Vec<ObservedNode> = element
             .children
             .iter()
             .enumerate()
@@ -764,6 +949,10 @@ impl Walk<'_> {
                     child_index,
                     hazard,
                     in_apple_menu || is_apple_menu,
+                    (
+                        element.role.as_deref() == Some("AXMenuBarItem") && element.selected,
+                        &child_menus,
+                    ),
                 )
             })
             .collect();
@@ -772,8 +961,40 @@ impl Walk<'_> {
             element_id: number.map(|number| session_element_id(self.tag, number)),
             description,
             hazard,
+            menu_open: element.menu_visible
+                || element.selected
+                || selected_menu
+                || children_menu_open(&children),
+            menu_child_count: if element.role.as_deref() == Some("AXMenuBarItem") {
+                children
+                    .iter()
+                    .map(|child: &ObservedNode| child.menu_child_count)
+                    .sum()
+            } else {
+                element.children.len() + element.closed_menu_children
+            },
             children,
         }
+    }
+}
+
+fn children_menu_open(children: &[ObservedNode]) -> bool {
+    children
+        .iter()
+        .any(|child| child.description.role.as_deref() == Some("AXMenu") && child.menu_open)
+}
+
+fn element_signature(element: &RawElement) -> String {
+    let description = describe(element);
+    if matches!(element.role.as_deref(), Some("AXMenu" | "AXMenuBarItem")) {
+        format!(
+            "{}\0{}\0{}",
+            description.signature(),
+            element.menu_visible,
+            element.children.len() + element.closed_menu_children
+        )
+    } else {
+        description.signature()
     }
 }
 

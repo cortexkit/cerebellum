@@ -410,6 +410,28 @@ pub struct ServeContext<'a, C: MonotonicClock> {
     pub now_ms: u64,
 }
 
+impl<C: MonotonicClock> Clone for ServeContext<'_, C> {
+    fn clone(&self) -> Self {
+        Self {
+            grantee: self.grantee,
+            cancel: self.cancel.clone(),
+            identity: self.identity.clone(),
+            management: self.management,
+            consent: ConsentContext {
+                caller: self.consent.caller.clone(),
+                unattended: self.consent.unattended,
+                carrier: self.consent.carrier.clone(),
+                route: self.consent.route.clone(),
+                drain: self.consent.drain.clone(),
+                park_guard: self.consent.park_guard.clone(),
+                park_limit: self.consent.park_limit,
+            },
+            clock: self.clock,
+            now_ms: self.now_ms,
+        }
+    }
+}
+
 /// What the serving boundary does after detecting a result-schema violation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ResultSchemaEnforcement {
@@ -916,6 +938,8 @@ where
             None,
             None,
         );
+        let expand_menus =
+            sessions.zoom_expands_menus(&conversation_key, &grant, parsed.zoom.as_deref());
         let (raw, manual_accessibility, seen) = tokio::task::spawn_blocking(move || {
             let _scope =
                 cerebellum_computer::audit::AccessibilityReadScope::new(read_grant.pid, None);
@@ -923,7 +947,11 @@ where
             // tree is read shows up at the next action rather than passing
             // as something this read showed.
             let seen = SeenMarks::read(source.as_ref(), &read_grant);
-            let raw = source.read_app_state(&read_grant, ReadBounds::default());
+            let raw = if expand_menus {
+                source.read_app_state_expanding_menus(&read_grant, ReadBounds::default())
+            } else {
+                source.read_app_state(&read_grant, ReadBounds::default())
+            };
             (
                 raw,
                 cerebellum_computer::audit::AccessibilityReadScope::current(),
@@ -1283,6 +1311,8 @@ where
             Ok(parsed) => parsed,
             Err(refusal) => return unposted(refusal),
         };
+        let view = parse_state_view(arguments.as_object().expect("parsed object"))
+            .expect("validated view");
         parsed.target = match self.resolve_target_name(&parsed.target).await {
             Ok(bundle_identity) => bundle_identity,
             Err(refusal) => return unposted(refusal),
@@ -1687,14 +1717,15 @@ where
                         finished["effect_status"] = json!("effect_observed");
                     }
                 }
-                let observed = element_actions::settle_and_observe(
+                let observed = element_actions::settle_and_observe_view(
                     source.as_ref(),
                     &sessions,
                     &conversation_key,
                     &grant,
                     settle,
+                    sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                 );
-                element_actions::add_diff(&mut finished, observed.as_ref());
+                element_actions::add_diff_view(&mut finished, observed.as_ref(), &view);
                 finished
             })
             .await
@@ -1943,7 +1974,42 @@ fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value>
         Some(target) => target,
         None => return Err(invalid_read_state_request("target", "missing_field")),
     };
-    let role_filter = match object.get("role_filter") {
+    let view = parse_state_view(object)?;
+    let include_image = match object.get("include_image") {
+        None => false,
+        Some(Value::Bool(include)) => *include,
+        Some(_) => return Err(invalid_read_state_request("include_image", "wrong_type")),
+    };
+    Ok(ParsedReadState {
+        target,
+        role_filter: view.roles,
+        zoom: view.zoom,
+        text_filter: view.text,
+        include_image,
+    })
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StateView {
+    roles: Vec<String>,
+    zoom: Option<String>,
+    text: Option<String>,
+}
+
+impl StateView {
+    fn request(&self) -> StateRequest<'_> {
+        StateRequest {
+            zoom: self.zoom.as_deref().map(Zoom::parse),
+            roles: &self.roles,
+            text: self.text.as_deref(),
+        }
+    }
+}
+
+pub(crate) fn parse_state_view(
+    object: &serde_json::Map<String, Value>,
+) -> Result<StateView, Value> {
+    let roles = match object.get("role_filter") {
         None => Vec::new(),
         Some(Value::String(role)) if !role.trim().is_empty() => vec![role.clone()],
         Some(Value::Array(roles)) if roles.is_empty() => {
@@ -1965,17 +2031,10 @@ fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value>
         }
         Some(_) => return Err(invalid_read_state_request("role_filter", "wrong_type")),
     };
-    let include_image = match object.get("include_image") {
-        None => false,
-        Some(Value::Bool(include)) => *include,
-        Some(_) => return Err(invalid_read_state_request("include_image", "wrong_type")),
-    };
-    Ok(ParsedReadState {
-        target,
-        role_filter,
+    Ok(StateView {
+        roles,
         zoom: optional_text(object, "zoom")?,
-        text_filter: optional_text(object, "text_filter")?,
-        include_image,
+        text: optional_text(object, "text_filter")?,
     })
 }
 
@@ -2169,11 +2228,18 @@ pub(crate) fn served_request_fields(
             &element_actions::WRITE_TEXT_FIELDS,
             &element_actions::WRITE_TEXT_REQUIRED,
         )),
-        ComputerCapability::OpenApp => Some((&["target"], &["target"])),
+        ComputerCapability::OpenApp => Some((&["target", "url"], &["target"])),
         ComputerCapability::ListApps => Some((&[], &[])),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
-            Some((fields, fields))
+            Some((
+                fields,
+                if capability == ComputerCapability::Type {
+                    &["target", "text"]
+                } else {
+                    &["keys", "target"]
+                },
+            ))
         }
         ComputerCapability::TakeoverMove
         | ComputerCapability::TakeoverDrag
@@ -2393,8 +2459,8 @@ fn required_text(object: &serde_json::Map<String, Value>, field: &str) -> Result
 /// Every one of them is also required.
 fn synthetic_request_fields(capability: ComputerCapability) -> Option<&'static [&'static str]> {
     match capability {
-        ComputerCapability::Type => Some(&["target", "text"]),
-        ComputerCapability::Keys => Some(&["keys", "target"]),
+        ComputerCapability::Type => Some(&["target", "text", "role_filter", "text_filter", "zoom"]),
+        ComputerCapability::Keys => Some(&["keys", "target", "role_filter", "text_filter", "zoom"]),
         _ => None,
     }
 }
@@ -2420,8 +2486,14 @@ fn parse_synthetic_request(
         return Err(invalid_synthetic_request(field, "unknown_field"));
     }
     match capability {
-        ComputerCapability::Type => parse_type_request(object),
-        ComputerCapability::Keys => parse_keys_request(object),
+        ComputerCapability::Type => {
+            parse_state_view(object)?;
+            parse_type_request(object)
+        }
+        ComputerCapability::Keys => {
+            parse_state_view(object)?;
+            parse_keys_request(object)
+        }
         _ => Err(json!({"outcome": "invalid_request"})),
     }
 }
@@ -2878,15 +2950,15 @@ mod wait_tests {
         let samples = [
             (
                 ComputerCapability::OpenApp,
-                json!({"target":"com.example.Editor"}),
+                json!({"target":"com.example.Editor", "url":"synthetic-editor:page"}),
             ),
             (
                 ComputerCapability::Type,
-                json!({"target": "com.example.Editor", "text": "hi"}),
+                json!({"target": "com.example.Editor", "text": "hi", "role_filter":["button"], "text_filter":"Save", "zoom":"menubar"}),
             ),
             (
                 ComputerCapability::Keys,
-                json!({"keys": ["s"], "target": "com.example.Editor"}),
+                json!({"keys": ["s"], "target": "com.example.Editor", "role_filter":["button"], "text_filter":"Save", "zoom":"menubar"}),
             ),
             (
                 ComputerCapability::Wait,

@@ -283,7 +283,11 @@ where
         match capability.0 {
             Served::ListApps => None,
             Served::PressElement | Served::WriteText => {
-                match sessions.resolve(conversation, arguments.get("element_id")?.as_str()?) {
+                let id = arguments
+                    .get("element_id")
+                    .or_else(|| arguments.get("element_ids")?.as_array()?.first())?
+                    .as_str()?;
+                match sessions.resolve(conversation, id) {
                     ElementResolution::Live {
                         bundle_identity, ..
                     } => Some(bundle_identity),
@@ -361,7 +365,7 @@ where
                 let source = self.app_state_source.clone();
                 tokio::task::spawn_blocking(move || {
                     let listed = source.installed_apps(std::time::Duration::from_secs(1));
-                    super::open_app::resolve_installed(&target, &listed.apps)
+                    super::open_app::resolve_installed(&target.target, &listed.apps)
                         .ok()
                         .map(|app| app.bundle_identity)
                 })

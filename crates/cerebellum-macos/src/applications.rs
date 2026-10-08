@@ -229,6 +229,62 @@ fn metadata(path: &Path) -> Result<InstalledApplication, String> {
     })
 }
 
+/// Read declared schemes from the selected bundle, without consulting the
+/// machine's default handlers. Every Objective-C value is class-checked before
+/// it is interpreted as an array, dictionary or string.
+pub fn application_url_schemes(path: &Path) -> Result<Vec<String>, String> {
+    autoreleasepool(|_| {
+        let plist_path = path.join("Contents/Info.plist");
+        let plist = NSString::from_str(plist_path.to_str().ok_or("invalid_bundle_path")?);
+        let dictionary: Option<Retained<AnyObject>> = unsafe {
+            msg_send![AnyClass::get(c"NSDictionary").ok_or("dictionary_unavailable")?, dictionaryWithContentsOfFile: &*plist]
+        };
+        let dictionary = dictionary.ok_or("unreadable_url_types")?;
+        let types: *mut AnyObject = unsafe {
+            msg_send![&*dictionary, objectForKey: &*NSString::from_str("CFBundleURLTypes")]
+        };
+        if types.is_null() {
+            return Ok(Vec::new());
+        }
+        let array_class = AnyClass::get(c"NSArray").ok_or("array_unavailable")?;
+        let dictionary_class = AnyClass::get(c"NSDictionary").ok_or("dictionary_unavailable")?;
+        let string_class = AnyClass::get(c"NSString").ok_or("string_unavailable")?;
+        let is_array: bool = unsafe { msg_send![types, isKindOfClass: array_class] };
+        if !is_array {
+            return Err("invalid_url_types".into());
+        }
+        let mut schemes = Vec::new();
+        let types = unsafe { &*types.cast::<NSArray<AnyObject>>() };
+        for entry in types.iter() {
+            let is_dictionary: bool =
+                unsafe { msg_send![&*entry, isKindOfClass: dictionary_class] };
+            if !is_dictionary {
+                return Err("invalid_url_type".into());
+            }
+            let values: *mut AnyObject = unsafe {
+                msg_send![&*entry, objectForKey: &*NSString::from_str("CFBundleURLSchemes")]
+            };
+            if values.is_null() {
+                continue;
+            }
+            let is_array: bool = unsafe { msg_send![values, isKindOfClass: array_class] };
+            if !is_array {
+                return Err("invalid_url_schemes".into());
+            }
+            for value in unsafe { &*values.cast::<NSArray<AnyObject>>() }.iter() {
+                let is_string: bool = unsafe { msg_send![&*value, isKindOfClass: string_class] };
+                if !is_string {
+                    return Err("invalid_url_scheme".into());
+                }
+                schemes.push(
+                    unsafe { &*(&*value as *const AnyObject).cast::<NSString>() }.to_string(),
+                );
+            }
+        }
+        Ok(schemes)
+    })
+}
+
 /// Read-only AppKit process metadata, refreshed by pid from the kernel rather
 /// than NSWorkspace's notification-maintained list (our worker has no run loop).
 /// Unlike SCShareableContent, this cannot request Screen Recording.
@@ -276,6 +332,24 @@ pub fn open_application(
     process_timeout: Duration,
     window_timeout: Duration,
 ) -> Result<ApplicationOpenResult, String> {
+    open_application_with_url(
+        path,
+        bundle,
+        None,
+        activates,
+        process_timeout,
+        window_timeout,
+    )
+}
+
+pub fn open_application_with_url(
+    path: &Path,
+    bundle: &str,
+    page_url: Option<&str>,
+    activates: bool,
+    process_timeout: Duration,
+    window_timeout: Duration,
+) -> Result<ApplicationOpenResult, String> {
     let running = workspace_running_applications()?;
     let matching: Vec<_> = running
         .iter()
@@ -285,7 +359,8 @@ pub fn open_application(
         return Err("multiple_running_instances".into());
     }
     let already_running = !matching.is_empty();
-    let pid = if let Some(app) = matching.first() {
+    let pid = if page_url.is_none() && !matching.is_empty() {
+        let app = matching[0];
         app.pid
     } else {
         let (tx, rx) = mpsc::sync_channel(1);
@@ -316,9 +391,17 @@ pub fn open_application(
                 let _ = tx.send(result);
             });
             unsafe {
-                let _: () = msg_send![&*workspace, openApplicationAtURL: &*url, configuration: &*config, completionHandler: &*completion];
+                if let Some(page) = page_url {
+                    let page: Option<Retained<NSURL>> = msg_send![AnyClass::get(c"NSURL").ok_or("URL_class_unavailable")?, URLWithString: &*NSString::from_str(page)];
+                    let page = page.ok_or("invalid_page_url")?;
+                    let pages = NSArray::from_retained_slice(&[page]);
+                    let _: () = msg_send![&*workspace, openURLs: &*pages, withApplicationAtURL: &*url, configuration: &*config, completionHandler: &*completion];
+                } else {
+                    let _: () = msg_send![&*workspace, openApplicationAtURL: &*url, configuration: &*config, completionHandler: &*completion];
+                }
             }
-        });
+            Ok::<(), String>(())
+        })?;
         rx.recv_timeout(process_timeout)
             .map_err(|_| "process_timeout")??
     };
@@ -389,6 +472,28 @@ pub fn responsible_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_schemes_come_only_from_the_selected_bundles_url_types() {
+        let root = std::env::temp_dir().join(format!("ck-page-schemes-{}", std::process::id()));
+        let contents = root.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let path = contents.join("Info.plist");
+        std::fs::write(&path, "<plist><dict><key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>x-apple.systempreferences</string><string>synthetic-editor</string></array></dict></array></dict></plist>").unwrap();
+        assert_eq!(
+            application_url_schemes(&root).unwrap(),
+            ["x-apple.systempreferences", "synthetic-editor"]
+        );
+        std::fs::write(
+            &path,
+            "<plist><dict><key>CFBundleURLTypes</key><string>not an array</string></dict></plist>",
+        )
+        .unwrap();
+        assert!(application_url_schemes(&root).is_err());
+        std::fs::write(&path, "<plist><dict></dict></plist>").unwrap();
+        assert!(application_url_schemes(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn installed_scan_reads_only_plists_and_one_subfolder_level() {

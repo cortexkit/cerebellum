@@ -84,7 +84,18 @@ fn rig_with_lock(locked: bool) -> (crate::Planes, support::Desk, InMemoryJournal
 }
 
 async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value, usize) {
-    let request = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), 9, 3, 71, serde_json::to_vec(&json!({"name":"computer_use","arguments":{"action":action, "target":arguments.get("target").cloned().unwrap_or(Value::Null)}})).unwrap()).unwrap();
+    let mut arguments = arguments;
+    arguments["action"] = json!(action);
+    let request = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        9,
+        3,
+        71,
+        serde_json::to_vec(&json!({"name":"computer_use","arguments":arguments})).unwrap(),
+    )
+    .unwrap();
     // list_apps accepts no target, including null.
     let request = if action == "list_apps" {
         Frame::build_with_version(
@@ -133,6 +144,47 @@ async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value,
             return (value, questions);
         }
     }
+}
+
+#[tokio::test]
+async fn open_app_refuses_unregistered_and_forbidden_schemes_by_name() {
+    let (planes, desk, _) = rig();
+    desk.state().url_schemes = vec![
+        "x-apple.systempreferences".into(),
+        "file".into(),
+        "https".into(),
+        "http".into(),
+    ];
+    for scheme in ["unregistered", "file", "http", "https"] {
+        let (reply, questions) = wire(
+            &planes,
+            "open_app",
+            json!({"target":"Safari", "url":format!("{scheme}:synthetic-page")}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "url_scheme_refused", "{reply}");
+        assert_eq!(reply["scheme"], scheme);
+        assert!(reply["remedy"].as_str().unwrap().contains(scheme));
+        assert_eq!(questions, 0);
+    }
+    assert!(desk.state().opens.is_empty());
+}
+
+#[tokio::test]
+async fn open_app_registered_page_keeps_consent_signer_and_no_activation() {
+    let (planes, desk, _) = rig();
+    desk.state().url_schemes = vec!["x-apple.systempreferences".into()];
+    let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari", "url":url})).await;
+    assert_eq!(reply["outcome"], "launched", "{reply}");
+    assert_eq!(questions, 1);
+    assert_eq!(desk.state().opened_urls, [url]);
+    assert!(!desk.state().opens[0].activates);
+    desk.state().signature.as_mut().unwrap().ad_hoc = true;
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari", "url":url})).await;
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(questions, 0);
+    assert_eq!(desk.state().opened_urls.len(), 1);
 }
 
 #[tokio::test]
