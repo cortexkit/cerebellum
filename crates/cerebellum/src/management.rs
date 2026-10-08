@@ -226,6 +226,11 @@ pub struct PlatformResolver {
 }
 
 impl PlatformResolver {
+    /// Whether the production resolver supplies an app-code identity reader.
+    /// Keep this aligned with its `TargetResolver::app_code` implementation:
+    /// the default reader refuses every identity, so it cannot mint app grants.
+    pub(crate) const HAS_APP_IDENTITY_READER: bool = cfg!(target_os = "macos");
+
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(10),
