@@ -101,9 +101,13 @@ if [ -z "$RID" ]; then
     WATCH_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
   fi
   for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
+    # One push can start two runs of the gating workflow for the same sha (a
+    # new branch's push), and concurrency cancels the older one at once. The
+    # newest run is the one that tests; latching the first listed one read a
+    # cancellation as the verdict.
     RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
       --json databaseId,headSha \
-      --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
+      --jq "[.[] | select(.headSha==\"$WATCH_SHA\") | .databaseId] | max // empty")
     [ -n "$RID" ] && break
     sleep "$RESOLVE_SLEEP"
   done
