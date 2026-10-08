@@ -362,6 +362,10 @@ run_phase "scripts/lib/format-floor-gate.test.sh" \
 # a failed GitHub call as a green run. Driven against a fake gh, no network.
 run_phase "scripts/watch-ci.test.sh" \
   scripts/watch-ci.test.sh
+# Phase 5b3: the train lock's stale-owner recovery never takes a lock another
+# train acquired meanwhile. Drives the real script in a scratch repository.
+run_phase "scripts/train-push-lock.test.sh" \
+  scripts/train-push-lock.test.sh
 
 # Phase 5c: staging and placement refuse a binary without hardened runtime or
 # with get-task-allow, since either lets a same-user debugger read the module.
