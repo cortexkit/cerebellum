@@ -562,10 +562,25 @@ fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
 ) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
     #[cfg(target_os = "windows")]
-    let declarations = computer::platform::WindowsPlatformDriver::default().declarations(context);
+    let mut declarations =
+        computer::platform::WindowsPlatformDriver::default().declarations(context);
     #[cfg(not(target_os = "windows"))]
-    let declarations =
+    let mut declarations =
         computer::platform::capability_declarations(context, cfg!(target_os = "macos"));
+    // Driver declarations describe reviewed platform operations, not whether
+    // this module can authorize them. A computer plane needs app grants for its
+    // scoped actions; the production resolver cannot mint those without an
+    // identity reader.
+    // Withhold at the module assembly boundary so both HELLO and release
+    // evidence agree, without changing driver-level review declarations. This
+    // is a compile-time fact, not a probe of the person's grants or permissions.
+    if !management::PlatformResolver::HAS_APP_IDENTITY_READER {
+        for declaration in &mut declarations {
+            declaration.advertised = false;
+            declaration.suppression_reason =
+                Some("no production app identity reader for computer grants".to_owned());
+        }
+    }
     let outcomes = computer_gate_outcomes(context);
     (declarations, outcomes)
 }

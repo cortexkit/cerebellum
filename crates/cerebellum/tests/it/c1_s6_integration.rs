@@ -81,6 +81,30 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn no_app_identity_reader_means_no_computer_advertisement_even_with_all_release_bindings() {
+    let context = valid_context();
+    let evidence = computer_release_evidence(&context);
+    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 14]);
+    assert_eq!(evidence.canonical_row_count, 12);
+    assert!(
+        evidence.advertised_capabilities.is_empty(),
+        "release bindings cannot supply the missing production app identity reader: {:?}",
+        evidence.advertised_capabilities
+    );
+    assert!(evidence.gate_admitted_capabilities.is_empty());
+    assert_eq!(
+        evidence.scope,
+        ComputerAdvertisementScope::EmptyRuntimeAdvertisement
+    );
+    assert_eq!(evidence.advertised_row_count, 0);
+    let manifest = build_manifest_with_computer_plane("cerebellum", &context);
+    assert!(tools(&manifest)
+        .iter()
+        .all(|tool| tool.name != "computer_use" && !tool.name.starts_with("computer.")));
+}
+
 fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> Vec<String> {
     capability_declarations(context, true)
         .into_iter()
@@ -163,16 +187,16 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
-    // Advertisement is now the conjunction of gate admission and
-    // dispatchability, so the identifier half is asserted here and the manifest
-    // half below.
+    // Advertisement also requires production grant support and dispatchability,
+    // so the driver-level identifier half is asserted here and the module's
+    // manifest half below.
     assert_eq!(available_capabilities(&context), every_served_row());
     assert_eq!(
         evidence.gate_admitted_capabilities,
         if cfg!(target_os = "macos") {
             every_served_row()
         } else {
-            vec!["computer.wait"]
+            vec![]
         }
     );
 
@@ -194,8 +218,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
 
     // The scope describes what is advertised rather than what the identifiers
     // admit. With every row now served, a macOS build carrying every review
-    // advertises ALL of the frozen rows; elsewhere only wait is served, which
-    // is PARTIAL.
+    // advertises ALL of the frozen rows; elsewhere no production app identity
+    // reader exists, so no app grant can authorize even wait.
     //
     // This is a release-visible claim: it says what a caller can do on the
     // computer plane rather than only what it declares. Changing this
@@ -206,7 +230,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         if cfg!(target_os = "macos") {
             ComputerAdvertisementScope::AllFrozenRows
         } else {
-            ComputerAdvertisementScope::PartialRuntimeAdvertisement
+            ComputerAdvertisementScope::EmptyRuntimeAdvertisement
         }
     );
     assert_eq!(
@@ -214,10 +238,9 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         if cfg!(target_os = "macos") {
             every_served_row()
         } else {
-            vec!["computer.wait"]
+            vec![]
         },
-        "the advertised set is no longer exactly the state read, the element actions, the \
-         keystroke rows, the takeover rows and wait"
+        "the advertised set must match the platform's production grant support"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -226,7 +249,10 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // A functional plane needs BOTH an advertised row and an exercised one, so
     // both halves are asserted: either alone is a claim the other does not
     // support.
-    assert!(computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane);
+    assert_eq!(
+        computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane,
+        cfg!(target_os = "macos")
+    );
 
     // Advertising without exercising is not a functional claim. This is the
     // half that matters: a module that offered capabilities nobody had run
@@ -399,17 +425,25 @@ fn the_advertisement_context_reflects_this_system() {
 /// The check runs against the context the module really ships, and also against
 /// a context with every release identifier supplied, because that is the change
 /// that would create a mismatch. A development build binds no review, so it may
-/// advertise nothing at all; the fully bound context is what keeps the check
-/// from passing on an empty list.
+/// advertise nothing at all; the fully bound context keeps the macOS check
+/// from passing on an empty list. Other platforms intentionally offer nothing
+/// because the production resolver cannot supply app identities for grants.
 #[test]
 fn every_shipped_advertisement_can_be_dispatched() {
     let shipped =
         build_manifest_with_computer_plane("cerebellum", &cerebellum::default_computer_context());
     let bound = build_manifest_with_computer_plane("cerebellum", &valid_context());
-    assert!(
-        !tools(&bound).is_empty(),
-        "an empty manifest would satisfy this vacuously"
-    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            !tools(&bound).is_empty(),
+            "an empty manifest would satisfy this vacuously"
+        );
+    } else {
+        assert!(
+            tools(&bound).is_empty(),
+            "no app identity reader means no production computer tools"
+        );
+    }
     for manifest in [&shipped, &bound] {
         for tool in tools(manifest) {
             assert_eq!(
