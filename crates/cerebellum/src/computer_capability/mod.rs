@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cerebellum_computer::app_state::image::{
-    release_through_custody, ImageUnavailable, ReleasedImage, WindowImageCapture,
+    release_through_custody, ImageFronting, ImageUnavailable, ReleasedImage,
 };
 use cerebellum_computer::app_state::render::{render_state, StateHeader, StateRequest, Zoom};
 // The browser plane's reply field, shared so that both planes' state reaches a
@@ -28,9 +28,7 @@ use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
 use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
-use cerebellum_computer::capture::{
-    CaptureBackend, CaptureError, ScopedCaptureController, SingleWindowCaptureError,
-};
+use cerebellum_computer::capture::CaptureBackend;
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
     AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
@@ -86,7 +84,9 @@ use tokio::sync::Mutex;
 pub mod cursor;
 mod element_actions;
 pub mod image_freshness;
-use image_freshness::{image_freshness_decision, ImageFreshnessSource, NativeImageFreshnessSource};
+use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
+mod read_image;
+use read_image::ImageReadPlan;
 mod keystrokes;
 mod open_app;
 #[cfg(test)]
@@ -898,6 +898,20 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        let takeover = !consent.unattended
+            && management.computer_grants().holds(
+                &consent.caller,
+                &crate::computer_grants::GrantNeed::Takeover,
+            );
+        if parsed.include_image && parsed.bring_to_front && takeover {
+            if let Some(mut refusal) = self
+                .refuse_if_person_changed(management, &identity.conversation_key, &grant)
+                .await
+            {
+                admission.decorate(&mut refusal);
+                return refusal;
+            }
+        }
         let sessions = management.app_state_sessions().clone();
         let conversation_key = identity.conversation_key.clone();
 
@@ -978,7 +992,17 @@ where
                     unreadable_subtrees: 1,
                 };
                 let mut reply = if self
-                    .journal_state_read(identity, summary, manual_accessibility, now_ms, None)
+                    .journal_state_read(
+                        identity,
+                        summary,
+                        manual_accessibility,
+                        now_ms,
+                        None,
+                        ImageReadPlan {
+                            requested: parsed.include_image,
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .is_ok()
                 {
@@ -1054,10 +1078,21 @@ where
                 manual_accessibility,
                 now_ms,
                 (parsed.include_image && image_permission_live).then(|| make_backend(&grant)),
+                ImageReadPlan {
+                    requested: parsed.include_image,
+                    bring_to_front: parsed.bring_to_front,
+                    takeover,
+                    bracket_admitted: self.fronting_bracket_admitted,
+                    cancel: Some(cancel),
+                    now_ms,
+                },
             )
             .await
         {
-            Ok((Some(image), _)) => {
+            Ok((Some(image), _, fronting)) => {
+                if let Some(fronting) = fronting {
+                    reply["image_fronting"] = json!(fronting);
+                }
                 let image_id = sessions.register_image(
                     &conversation_key,
                     RegisteredImage {
@@ -1077,10 +1112,19 @@ where
                     "height_px": image.height_px,
                 });
             }
-            Ok((None, Some(reason))) => {
+            Ok((None, Some(reason), fronting)) => {
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
+                if reason == ImageUnavailable::ImageNeedsTakeover {
+                    reply["image_unavailable"]["detail"] = json!({
+                        "grant": "takeover", "grant_label": "control of your mouse and keyboard",
+                        "scope": {"takeover": "machine"},
+                    });
+                }
+                if let Some(fronting) = fronting {
+                    reply["image_fronting"] = json!(fronting);
+                }
             }
-            Ok((None, None)) => {
+            Ok((None, None, _)) => {
                 if parsed.include_image && !image_permission_live {
                     reply["image_unavailable"] = json!({
                         "reason": ImageUnavailable::ScreenRecordingNotLive.as_str(),
@@ -1111,23 +1155,42 @@ where
         manual_accessibility: Option<&'static str>,
         now_ms: u64,
         backend: Option<B>,
-    ) -> Result<(Option<ReleasedImage>, Option<ImageUnavailable>), ImageUnavailable> {
+        image_plan: ImageReadPlan,
+    ) -> Result<
+        (
+            Option<ReleasedImage>,
+            Option<ImageUnavailable>,
+            Option<ImageFronting>,
+        ),
+        ImageUnavailable,
+    > {
         use cerebellum_computer::app_state::image::ImageCustody;
         let audit = self.audit.clone();
         let grant = summary.grant_identity.clone();
         let freshness = self.image_freshness_source.clone();
+        let make_driver = self.make_synthetic_driver.clone();
+        let own_input = self.own_input.clone();
+        let input_source = self.app_state_source.clone();
         tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
                 grant.pid,
                 manual_accessibility,
             );
             let mut audit = audit.blocking_lock();
+            let evidence =
+                std::cell::RefCell::new(cerebellum_computer::app_state::ImageReadEvidence {
+                    decision: image_plan
+                        .requested
+                        .then_some(cerebellum_computer::app_state::image::ImageDecision::Unknown),
+                    fronting: None,
+                });
             let mut custody = AuditImageCustody {
                 audit: &mut audit,
                 identity,
                 now_ms,
                 summary,
                 finalized: false,
+                image_evidence: &evidence,
             };
             let Some(backend) = backend else {
                 let reservation = custody
@@ -1136,59 +1199,42 @@ where
                 custody
                     .finalize_read(reservation, false)
                     .map_err(|_| ImageUnavailable::AuditUnavailable)?;
-                return Ok((None, None));
+                let reason =
+                    (image_plan.requested && image_plan.bring_to_front && !image_plan.takeover)
+                        .then_some(ImageUnavailable::ImageNeedsTakeover);
+                return Ok((None, reason, None));
             };
             let image = release_through_custody(&mut custody, || {
-                if backend.screen_recording_liveness() != PermissionLiveness::Live {
-                    return Err(ImageUnavailable::ScreenRecordingNotLive);
-                }
-                let (repaints, visibility) = freshness.inspect(&grant, None);
-                image_freshness_decision(repaints, visibility)?;
-                let mut controller =
-                    ScopedCaptureController::with_v1_bounds(backend, grant.clone())
-                        .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
-                let captured = controller
-                    .capture_frontmost_window_for_vision(now_ms)
-                    .map_err(|error| match error {
-                        SingleWindowCaptureError::NoWindow => ImageUnavailable::NoWindowCaptured,
-                        SingleWindowCaptureError::Capture(
-                            CaptureError::PermissionUnavailable
-                            | CaptureError::PermissionPendingRelaunch,
-                        ) => ImageUnavailable::ScreenRecordingNotLive,
-                        SingleWindowCaptureError::Capture(CaptureError::UnsupportedOnPlatform) => {
-                            ImageUnavailable::CaptureUnavailable
+                // The observed bracket posts a heartbeat, just as keys does;
+                // do not mistake that input for the person's next action.
+                let mut posting = (image_plan.bring_to_front && image_plan.takeover).then(|| {
+                    own_input.begin_posting(person::last_input_instant(input_source.as_ref()))
+                });
+                let captured = read_image::capture(
+                    backend,
+                    &mut make_driver(),
+                    freshness.as_ref(),
+                    &grant,
+                    &image_plan,
+                    &evidence,
+                    &mut || {
+                        if let Some(posting) = posting.take() {
+                            own_input.end_posting(posting);
                         }
-                        SingleWindowCaptureError::Capture(_) => ImageUnavailable::CaptureFailed,
-                    })?;
-                // Selection and capture may race a window move or cover, so recheck
-                // visibility for the captured window before returning its pixels.
-                let (repaints, visibility) =
-                    freshness.inspect(&grant, Some(&captured.window.window_id));
-                image_freshness_decision(repaints, visibility)?;
-                Ok(WindowImageCapture {
-                    window_id: captured.window.window_id.clone(),
-                    owning_pid: grant.pid,
-                    window_origin: (
-                        f64::from(captured.window.frame.x),
-                        f64::from(captured.window.frame.y),
-                    ),
-                    window_points: (
-                        f64::from(captured.window.frame.width),
-                        f64::from(captured.window.frame.height),
-                    ),
-                    captured_px: (
-                        captured.frame.captured_width_px,
-                        captured.frame.captured_height_px,
-                    ),
-                    jpeg: captured.frame.jpeg,
-                })
+                    },
+                );
+                if let Some(posting) = posting {
+                    own_input.end_posting(posting);
+                }
+                captured
             });
             if !custody.finalized {
                 return Err(ImageUnavailable::AuditUnavailable);
             }
+            let fronting = evidence.into_inner().fronting;
             Ok(match image {
-                Ok(image) => (Some(image), None),
-                Err(reason) => (None, Some(reason)),
+                Ok(image) => (Some(image), None, fronting),
+                Err(reason) => (None, Some(reason), fronting),
             })
         })
         .await
@@ -1923,12 +1969,13 @@ fn native_app_state_source() -> Arc<dyn AppStateSource> {
 const MAX_ROLE_FILTERS: usize = 16;
 
 /// Every field `computer.read_state` accepts. Only `target` is required.
-const READ_STATE_REQUEST_FIELDS: [&str; 5] = [
+const READ_STATE_REQUEST_FIELDS: [&str; 6] = [
     "target",
     "role_filter",
     "zoom",
     "text_filter",
     "include_image",
+    "bring_to_front",
 ];
 #[cfg(test)]
 const READ_STATE_REQUIRED_FIELDS: [&str; 1] = ["target"];
@@ -1941,6 +1988,7 @@ struct ParsedReadState {
     zoom: Option<String>,
     text_filter: Option<String>,
     include_image: bool,
+    bring_to_front: bool,
 }
 
 fn invalid_read_state_request(field: &str, reason: &str) -> Value {
@@ -1980,12 +2028,18 @@ fn parse_read_state_request(arguments: &Value) -> Result<ParsedReadState, Value>
         Some(Value::Bool(include)) => *include,
         Some(_) => return Err(invalid_read_state_request("include_image", "wrong_type")),
     };
+    let bring_to_front = match object.get("bring_to_front") {
+        None => false,
+        Some(Value::Bool(front)) => *front,
+        Some(_) => return Err(invalid_read_state_request("bring_to_front", "wrong_type")),
+    };
     Ok(ParsedReadState {
         target,
         role_filter: view.roles,
         zoom: view.zoom,
         text_filter: view.text,
         include_image,
+        bring_to_front,
     })
 }
 

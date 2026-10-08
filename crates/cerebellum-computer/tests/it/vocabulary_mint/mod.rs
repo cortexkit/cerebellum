@@ -1943,3 +1943,46 @@ pub fn v20_from_v19(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Revision 21 admits optional image fronting only under held machine takeover.
+pub fn v21_from_v20(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let row = next["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.read_state")
+        .unwrap();
+    row["result_schema"]["properties"]["outcome"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("state_changed_by_person"));
+    row["request_schema"]["properties"]["bring_to_front"] = json!({
+        "type":"boolean", "default":false,
+        "description":"With include_image, temporarily front the app under the conversation's existing mouse-and-keyboard takeover grant, then restore before scaling and encoding. maximum_fronting_read_interval_ms is provisionally 300 ms pending live measurement by the placed module; keys retain their own bound. Never asks for takeover; without it the tree returns with image_needs_takeover."
+    });
+    row["maximum_fronting_read_interval_ms"] = json!(300);
+    let unavailable = &mut row["result_schema"]["properties"]["image_unavailable"]["properties"];
+    for reason in [
+        "image_needs_takeover",
+        "fronting_bound_exceeded",
+        "fronting_unavailable",
+        "restore_failed",
+    ] {
+        unavailable["reason"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(reason));
+    }
+    unavailable["detail"] = json!({"type":"object","additionalProperties":false,
+        "properties":{"grant":{"type":"string","enum":["takeover"]},"grant_label":{"type":"string"},
+            "scope":{"type":"object","additionalProperties":false,"properties":{"takeover":{"type":"string","enum":["machine"]}},"required":["takeover"]}},
+        "required":["grant","grant_label","scope"]});
+    row["result_schema"]["properties"]["image_fronting"] = json!({"type":"object","additionalProperties":false,
+        "description":"Observed capture front/restore facts, excluding scaling and encoding. An image is withheld if the provisional 300 ms read bound was exceeded or restore failed; the tree still returns. The bound awaits live measurement by the placed module.",
+        "properties":{"previous_frontmost":{"type":"integer"},"attempted":{"type":"boolean"},
+            "restored":{"type":"boolean"},"left_in_front":{"type":"integer"},"longest_fronted_interval_ms":{"type":"integer"}},
+        "required":["attempted","restored","longest_fronted_interval_ms"]});
+    next
+}

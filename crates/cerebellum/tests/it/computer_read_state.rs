@@ -315,7 +315,7 @@ fn no_relay_for(conversation_key: &str) -> ConsentContext {
 }
 
 /// A minimal JPEG: start of image, one frame header, padding, end of image.
-fn jpeg(width: u16, height: u16, padding: usize) -> Vec<u8> {
+pub(super) fn jpeg(width: u16, height: u16, padding: usize) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xD8];
     bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
     bytes.extend_from_slice(&height.to_be_bytes());
@@ -329,7 +329,7 @@ fn jpeg(width: u16, height: u16, padding: usize) -> Vec<u8> {
 /// A backend holding one window of the fixture application, at (100, 50)
 /// points and 1000 by 600 points, captured at 2000 by 1200 pixels and scaled
 /// to the JPEG given.
-fn capturing(image: Vec<u8>) -> InMemoryCaptureBackend {
+pub(super) fn capturing(image: Vec<u8>) -> InMemoryCaptureBackend {
     let mut backend = InMemoryCaptureBackend::default();
     backend.set_windows(vec![EnumeratedWindow {
         window_id: "77".into(),
@@ -725,7 +725,52 @@ async fn tree_only_reads_do_not_probe_image_freshness() {
     assert!(facts.seen.lock().unwrap().is_empty());
 }
 
-fn recorded_read(storage: &cerebellum_core::journal::InMemoryJournalStorage) -> Value {
+#[tokio::test]
+async fn bring_to_front_is_boolean_and_inert_without_an_image_request() {
+    let management = granted_management().await;
+    let facts = Arc::new(FixtureFreshness {
+        repaints: false,
+        before: cerebellum::computer_capability::image_freshness::WindowVisibility::Covered,
+        after: cerebellum::computer_capability::image_freshness::WindowVisibility::Covered,
+        seen: Mutex::new(vec![]),
+    });
+    let storage = cerebellum_core::journal::InMemoryJournalStorage::new();
+    let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+        support::computer::audit_with_storage(storage.clone()),
+        ResultSchemaEnforcement::Withhold,
+    )
+    .with_permission_liveness(support::computer::live_permissions())
+    .with_app_state_source(FixtureSource::new(vec![chat_window()]))
+    .with_image_freshness_source(facts.clone());
+    let invalid = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "bring_to_front": "yes"}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(invalid["outcome"], "invalid_request");
+    assert_eq!(invalid["field"], "bring_to_front");
+    let tree = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "bring_to_front": true}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(tree["outcome"], "completed");
+    assert!(tree.get("image_unavailable").is_none());
+    assert!(facts.seen.lock().unwrap().is_empty());
+    let row = recorded_read(&storage);
+    assert!(row.get("image_decision").is_none());
+    assert!(row.get("image_fronting").is_none());
+}
+
+pub(super) fn recorded_read(storage: &cerebellum_core::journal::InMemoryJournalStorage) -> Value {
     let state = serde_json::to_value(storage.load().unwrap()).unwrap();
     let entries = state["entries"].as_object().unwrap();
     assert_eq!(
@@ -738,7 +783,7 @@ fn recorded_read(storage: &cerebellum_core::journal::InMemoryJournalStorage) -> 
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn assert_no_screen_text(value: &Value, sentinel: &str) {
+pub(super) fn assert_no_screen_text(value: &Value, sentinel: &str) {
     assert!(!value.to_string().contains(sentinel));
     match value {
         Value::Object(fields) => {
@@ -885,19 +930,18 @@ async fn image_and_empty_reads_use_the_same_single_summary_row() {
         let row = recorded_read(&storage);
         assert_eq!(row["phase"], "finalized");
         let result: Vec<u8> = serde_json::from_value(row["completed_result"].clone()).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&result).unwrap(),
-            json!({
-                "element_count": if unreadable {0} else {1},
-                // A window-only shell is incomplete even when its AX read
-                // succeeded; image capture does not populate its AX content.
-                "unreadable_subtrees": 1,
-                "image_returned": include_image,
-                "routes": {"public": 0, "skylight": 0},
-                "release_routes": {"public": 0, "skylight": 0},
-                "auth": "not_applicable",
-            })
-        );
+        let mut expected = json!({
+            "element_count": if unreadable {0} else {1},
+            "unreadable_subtrees": 1,
+            "image_returned": include_image,
+            "routes": {"public": 0, "skylight": 0},
+            "release_routes": {"public": 0, "skylight": 0},
+            "auth": "not_applicable",
+        });
+        if include_image {
+            expected["image_decision"] = json!("fully_visible");
+        }
+        assert_eq!(serde_json::from_slice::<Value>(&result).unwrap(), expected,);
     }
 }
 

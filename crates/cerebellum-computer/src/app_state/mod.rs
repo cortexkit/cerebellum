@@ -37,6 +37,13 @@ where
     pub now_ms: u64,
     pub summary: ReadStateSummary,
     pub finalized: bool,
+    pub image_evidence: &'a std::cell::RefCell<ImageReadEvidence>,
+}
+
+#[derive(Default)]
+pub struct ImageReadEvidence {
+    pub decision: Option<image::ImageDecision>,
+    pub fronting: Option<image::ImageFronting>,
 }
 
 /// Only counts and process identity cross the journal boundary; tree strings
@@ -137,11 +144,22 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
             .audit
             .commit_dispatched(reservation, &dispatch, b"app_grant".to_vec(), None)
             .map_err(|_| CustodyStepFailed)?;
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "element_count": self.summary.element_count,
             "unreadable_subtrees": self.summary.unreadable_subtrees,
             "image_returned": image_returned,
         });
+        // These rows already carry image_returned. The result and codec envelope
+        // are open JSON, so optional text-free facts do not change a closed format.
+        let evidence = self.image_evidence.borrow();
+        if let Some(decision) = evidence.decision {
+            result["image_decision"] = serde_json::json!(decision);
+        }
+        if let Some(fronting) = &evidence.fronting {
+            result["image_fronting"] = serde_json::json!(fronting);
+            result["longest_fronted_interval_ms"] =
+                serde_json::json!(fronting.longest_fronted_interval_ms);
+        }
         self.audit
             .finalize_dispatched(
                 token,

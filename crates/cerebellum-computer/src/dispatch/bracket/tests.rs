@@ -159,6 +159,18 @@ fn run(desk: &mut FakeDesk, units: usize) -> BracketReport {
     run_fronting_bracket(desk, &mut UserIdleEstimator::new(), plan(units), &|| false)
 }
 
+#[test]
+fn already_frontmost_units_still_report_their_bound_overrun() {
+    let mut desk = FakeDesk::new();
+    desk.set_frontmost(TARGET);
+    desk.unit_ms = 101;
+    let report = run(&mut desk, 1);
+    assert_eq!(report.units_posted, 1);
+    assert_eq!(report.restore, RestoreStatus::NotNeeded);
+    assert_eq!(report.longest_fronted_interval_ms, 101);
+    assert!(!report.held(100));
+}
+
 /// Sixty units at 4 ms each cannot fit one 100 ms interval, so the text is
 /// split into chunks; every interval the desk measured stays within the
 /// bound, every unit was posted while the target was in front, in order, and

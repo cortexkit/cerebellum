@@ -106,9 +106,9 @@ pub(crate) fn cursor_point_from_windows(
     None
 }
 
-/// The visibility rule selected, without adding runtime logging or wire fields.
+/// The deciding rule, suitable for a text-free image journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VisibilityRule {
+pub enum VisibilityRule {
     MissingData,
     TargetAbsent,
     TargetTransparent,

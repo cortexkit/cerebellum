@@ -260,6 +260,21 @@ pub struct VisionWindowFrame {
     pub captured_at_ms: u64,
 }
 
+/// One captured frame waiting for scaling and encoding after focus is restored.
+/// Native captures carry BGRA and an empty JPEG; synthetic fixtures may carry
+/// an already-prepared JPEG with no raw buffer. Neither buffer is journaled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingVisionWindowFrame {
+    pub frame: VisionWindowFrame,
+    pub bgra: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSingleWindowCapture {
+    pub window: EnumeratedWindow,
+    pub frame: PendingVisionWindowFrame,
+}
+
 /// The one window a single-window capture took, with its image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleWindowCapture {
@@ -487,6 +502,25 @@ pub trait CaptureBackend {
     ) -> Result<VisionWindowFrame, BackendError> {
         Err(BackendError::UnsupportedOnPlatform)
     }
+    /// Capture without scaling or encoding. Refuse rather than fall back to an
+    /// encoder inside the focus bracket when a backend has no split path.
+    fn capture_window_unencoded_for_vision(
+        &mut self,
+        _request: &WindowCaptureRequest,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
+        Err(BackendError::UnsupportedOnPlatform)
+    }
+    /// Finish a captured frame without taking another picture. Native backends
+    /// encode raw BGRA; the default only completes a prepared synthetic fixture.
+    fn encode_window_for_vision(
+        &mut self,
+        pending: PendingVisionWindowFrame,
+    ) -> Result<VisionWindowFrame, BackendError> {
+        if pending.bgra.is_some() {
+            return Err(BackendError::UnsupportedOnPlatform);
+        }
+        Ok(pending.frame)
+    }
     /// Begin teardown without waiting for the native stream to stop.
     fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError>;
     /// Poll teardown using elapsed monotonic time; this operation must not wait.
@@ -652,6 +686,63 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         &mut self,
         now_ms: u64,
     ) -> Result<SingleWindowCapture, SingleWindowCaptureError> {
+        let (window, request) = self.select_vision_window(now_ms)?;
+        let frame = self
+            .backend
+            .capture_window_for_vision(&request)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        self.verify_vision_owner(&frame)?;
+        self.state = CaptureSessionState::Active;
+        Ok(SingleWindowCapture { window, frame })
+    }
+
+    /// Capture and verify one window without encoding while the target is fronted.
+    pub fn capture_frontmost_window_unencoded_for_vision(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
+        let (window, request) = self.select_vision_window(now_ms)?;
+        let frame = self
+            .backend
+            .capture_window_unencoded_for_vision(&request)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        self.verify_vision_owner(&frame.frame)?;
+        self.state = CaptureSessionState::Active;
+        Ok(PendingSingleWindowCapture { window, frame })
+    }
+
+    /// Encode the verified pixels after restore, never recapturing the window.
+    pub fn encode_window_for_vision(
+        &mut self,
+        pending: PendingSingleWindowCapture,
+    ) -> Result<SingleWindowCapture, SingleWindowCaptureError> {
+        let frame = self
+            .backend
+            .encode_window_for_vision(pending.frame)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        self.verify_vision_owner(&frame)?;
+        Ok(SingleWindowCapture {
+            window: pending.window,
+            frame,
+        })
+    }
+
+    fn verify_vision_owner(
+        &self,
+        frame: &VisionWindowFrame,
+    ) -> Result<(), SingleWindowCaptureError> {
+        if !frame.owner_identity_verified || frame.owner_identity != self.target {
+            return Err(SingleWindowCaptureError::Capture(
+                CaptureError::CaptureScopeUnavailable,
+            ));
+        }
+        Ok(())
+    }
+
+    fn select_vision_window(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<(EnumeratedWindow, WindowCaptureRequest), SingleWindowCaptureError> {
         self.ensure_capture_permission(now_ms)
             .map_err(SingleWindowCaptureError::Capture)?;
         if matches!(
@@ -683,19 +774,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             captured_at_ms: now_ms,
             region: None,
         };
-        let frame = self
-            .backend
-            .capture_window_for_vision(&request)
-            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
-        if !frame.owner_identity_verified || frame.owner_identity != self.target {
-            // Never return pixels whose owner changed between enumeration and
-            // capture.
-            return Err(SingleWindowCaptureError::Capture(
-                CaptureError::CaptureScopeUnavailable,
-            ));
-        }
-        self.state = CaptureSessionState::Active;
-        Ok(SingleWindowCapture { window, frame })
+        Ok((window, request))
     }
 
     fn ensure_capture_permission(&mut self, now_ms: u64) -> Result<(), CaptureError> {
@@ -1057,6 +1136,15 @@ impl CaptureBackend for InMemoryCaptureBackend {
             jpeg,
             captured_at_ms: request.captured_at_ms,
         })
+    }
+
+    fn capture_window_unencoded_for_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
+        // Fixture bytes were prepared before the read, not encoded in its bracket.
+        self.capture_window_for_vision(request)
+            .map(|frame| PendingVisionWindowFrame { frame, bgra: None })
     }
 
     fn enumerate_windows(
