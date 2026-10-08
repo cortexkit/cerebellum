@@ -619,6 +619,9 @@ where
         self
     }
 
+    // Only a platform that builds a computer plane opens the durable store; on
+    // Linux nothing calls this outside tests.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn with_launch_history(
         mut self,
         history: crate::open_app_history::LaunchHistory,

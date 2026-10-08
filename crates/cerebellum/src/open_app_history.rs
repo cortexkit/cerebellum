@@ -13,12 +13,17 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const LAUNCH_HISTORY_FORMAT: DurableFormat = DurableFormat::new("open-app-launch-history", 1);
+// The durable path (file name, size cap, loader and production opener) is used
+// only where a computer plane is built: macOS and Windows. Linux builds have no
+// computer plane, so those items are reachable there only from tests.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 const FILE_NAME: &str = "open_app_launch_history.json";
 const MAX_APPS: usize = 200;
 const MAX_LAUNCHES: usize = 20;
 // Two minutes accommodates cold starts without letting stale or censored
 // timings hold an interactive request indefinitely. This is a TOTAL budget.
 const CEILING_MS: u64 = 120_000;
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static HEALTH: AtomicU8 = AtomicU8::new(0);
@@ -216,6 +221,7 @@ impl LaunchHistory {
         }))
     }
 
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn production() -> Self {
         match cerebellum_core::journal::journal_data_path(FILE_NAME) {
             Ok(path) => Self::open(path, true),
@@ -231,6 +237,7 @@ impl LaunchHistory {
         }
     }
 
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn open(path: PathBuf, production: bool) -> Self {
         let document = load(&path).ok();
         if production {
@@ -307,6 +314,7 @@ impl LaunchHistory {
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn load(path: &PathBuf) -> io::Result<Document> {
     let file = match File::open(path) {
         Ok(file) => file,
