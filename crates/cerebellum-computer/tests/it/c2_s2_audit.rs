@@ -18,8 +18,8 @@ use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalError,
-    JournalIdentity, LifecycleState, ObservabilityClass, Redactor, SeverityInputs,
-    SeverityRecord, ValidatedSeverityTaxonomy,
+    JournalIdentity, LifecycleState, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
+    ValidatedSeverityTaxonomy,
 };
 use serde_json::json;
 
