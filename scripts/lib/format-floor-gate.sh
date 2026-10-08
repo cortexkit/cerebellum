@@ -13,15 +13,15 @@
 # Usage:
 #   scripts/lib/format-floor-gate.sh <versions-out>
 #
-# Builds and runs the `format_versions` example from THIS tree. It prints the
-# highest version of each format the tree reads, taken from the constants its
-# readers check, and the path of each floor file, resolved by the same
-# data-home resolver the module uses -- so this script resolves no path of its
-# own, and the environment it runs in (XDG_DATA_HOME and the rest) decides
-# which floors it reads, exactly as it would for the module. Writes the
-# supported versions to <versions-out>; stage.sh copies them beside the staged
-# binary, so whoever places that binary can compare them with the floors on
-# the machine it lands on.
+# Runs the `format_versions` example from THIS tree. When FORMAT_VERSIONS_BIN
+# is unset, it builds and runs the example itself; test drivers can build it
+# once and pass its path. It prints the highest version of each format the tree
+# reads, taken from the constants its readers check, and the path of each floor
+# file, resolved by the same data-home resolver the module uses -- so this
+# script resolves no path of its own. XDG_DATA_HOME and the rest of the
+# environment decide which floors it reads, exactly as they do for the module.
+# It writes the supported versions to <versions-out>; stage.sh copies them beside
+# the staged binary, so whoever places it can compare versions with target floors.
 #
 # A missing floor file is floor zero for every format in that tree: nothing
 # that raises a floor has written there yet. A format named in a floor that
@@ -41,12 +41,22 @@ versions_out="$1"
 
 cd "$(dirname "$0")/../.."
 
-# Unfiltered: a build failure must reach the terminal with its own words.
-# `--locked` so the build cannot rewrite Cargo.lock on its way to an answer.
-if ! report="$(cargo run --quiet --locked -p cerebellum --example format_versions)"; then
-  echo "REFUSING: could not build or run the format_versions example," >&2
-  echo "so what this tree can read, or where its floors are, is unknown." >&2
-  exit 2
+# Each case invokes the binary with its own XDG_DATA_HOME. Caching its report
+# would check the first case's floor paths in every later case.
+if [ -n "${FORMAT_VERSIONS_BIN:-}" ]; then
+  if ! report="$("$FORMAT_VERSIONS_BIN")"; then
+    echo "REFUSING: could not run the format_versions example at $FORMAT_VERSIONS_BIN," >&2
+    echo "so what this tree can read, or where its floors are, is unknown." >&2
+    exit 2
+  fi
+else
+  # Unfiltered: a build failure must reach the terminal with its own words.
+  # `--locked` so the build cannot rewrite Cargo.lock on its way to an answer.
+  if ! report="$(cargo run --quiet --locked -p cerebellum --example format_versions)"; then
+    echo "REFUSING: could not build or run the format_versions example," >&2
+    echo "so what this tree can read, or where its floors are, is unknown." >&2
+    exit 2
+  fi
 fi
 
 python3 - "$versions_out" "$report" <<'PY'

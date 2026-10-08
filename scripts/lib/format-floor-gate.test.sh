@@ -11,6 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/format-floor-gate.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/format-floor-gate-test.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -27,12 +29,12 @@ new_data_home() {
   mkdir -p "$home/cortexkit/cerebellum/journal" "$home/cortexkit/cerebellum/browser"
 }
 
-# expect <case> <exit status> <data home> [text the output must contain]
+# expect <case> <exit status> <data home> [text the output must contain] [binary]
 expect() {
-  local name="$1" want="$2" home="$3" needle="${4:-}" got output
+  local name="$1" want="$2" home="$3" needle="${4:-}" binary="${5:-$FORMAT_VERSIONS_BIN}" got output
   checks=$((checks + 1))
   set +e
-  output="$(XDG_DATA_HOME="$home" "$GATE" "$TMP_DIR/versions.json" 2>&1)"
+  output="$(XDG_DATA_HOME="$home" FORMAT_VERSIONS_BIN="$binary" "$GATE" "$TMP_DIR/versions.json" 2>&1)"
   got=$?
   set -e
   if [ "$got" -ne "$want" ]; then
@@ -47,6 +49,24 @@ expect() {
     echo "ok   $name"
   fi
 }
+
+# Build once, but invoke the binary separately for each case. The report's
+# floor paths depend on XDG_DATA_HOME, which each case points at a fresh home.
+if [ -z "${FORMAT_VERSIONS_BIN:-}" ]; then
+  target_dir="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+  case "$target_dir" in
+    /*) ;;
+    *) target_dir="$REPO_ROOT/$target_dir" ;;
+  esac
+  target_prefix="${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}"
+  cargo build --quiet --locked --target-dir "$target_dir" -p cerebellum --example format_versions
+  FORMAT_VERSIONS_BIN="$target_dir/${target_prefix}debug/examples/format_versions"
+fi
+if [ ! -x "$FORMAT_VERSIONS_BIN" ]; then
+  echo "REFUSING: format_versions binary is not executable: $FORMAT_VERSIONS_BIN" >&2
+  exit 2
+fi
+export FORMAT_VERSIONS_BIN
 
 # Missing floor files are floor zero. The run also shows the floors were
 # located under the scratch data home by the module's resolver, and yields
