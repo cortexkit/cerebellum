@@ -100,15 +100,36 @@ if [ -z "$RID" ]; then
   if [ -z "$WATCH_SHA" ]; then
     WATCH_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
   fi
-  for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
+  # An API refusal (for example GitHub's per-minute secondary rate limit, which
+  # answers 403 while the hourly quota still shows plenty left) is not evidence
+  # that no run exists. Counting it against the attempt budget once turned a
+  # passing run into "no run appeared", and retrying every few seconds added to
+  # the shared limit that caused it. So a refused query backs off and does not
+  # use an attempt; only a successful empty answer does.
+  api_backoff_start="${WATCH_CI_API_BACKOFF:-30}"
+  api_backoff=$api_backoff_start
+  api_deadline=$(( $(date +%s) + ${WATCH_CI_API_PATIENCE:-1800} ))
+  attempts=0
+  while [ "$attempts" -lt "$RESOLVE_ATTEMPTS" ]; do
     # One push can start two runs of the gating workflow for the same sha (a
     # new branch's push), and concurrency cancels the older one at once. The
     # newest run is the one that tests; latching the first listed one read a
     # cancellation as the verdict.
-    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
+    if ! RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
       --json databaseId,headSha \
-      --jq "[.[] | select(.headSha==\"$WATCH_SHA\") | .databaseId] | max // empty")
+      --jq "[.[] | select(.headSha==\"$WATCH_SHA\") | .databaseId] | max // empty"); then
+      RID=""
+      if [ "$(date +%s)" -ge "$api_deadline" ]; then
+        echo "watch-ci: GitHub kept refusing the run lookup for $WATCH_SHA; the run may exist, so check it by hand" >&2
+        exit 2
+      fi
+      sleep "$api_backoff"
+      api_backoff=$(( api_backoff * 2 > 300 ? 300 : api_backoff * 2 ))
+      continue
+    fi
+    api_backoff=$api_backoff_start
     [ -n "$RID" ] && break
+    attempts=$(( attempts + 1 ))
     sleep "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then

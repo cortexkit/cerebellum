@@ -17,6 +17,12 @@ cat > "$scratch/bin/gh" <<'FAKE'
 state="$FAKE_STATE"
 count() { local n; n=$(( $(cat "$state/$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$state/$1"; echo "$n"; }
 case "$*" in
+  *"run list"*)
+    # Refuse the first LIST_FAILS lookups, as GitHub's secondary rate limit
+    # does, then report run 12345 for the watched sha.
+    n=$(count list)
+    [ "$n" -le "${LIST_FAILS:-0}" ] && exit 1
+    echo 12345 ;;
   *"--json status"*) echo completed ;;
   *"--json url"*) echo "https://example.invalid/run/1" ;;
   *"--json conclusion"*)
@@ -36,10 +42,12 @@ chmod +x "$scratch/bin/gh"
 run_case() {
   local name="$1" expected="$2"
   shift 2
+  local target="${WATCH_TARGET:-12345}"
   local state="$scratch/state-$name"
   mkdir -p "$state"
   env "$@" FAKE_STATE="$state" PATH="$scratch/bin:/usr/bin:/bin" REPO=owner/name \
-    WATCH_CI_POLL_SLEEP=0 "$root/scripts/watch-ci.sh" 12345 >"$scratch/$name.out" 2>&1
+    WATCH_CI_POLL_SLEEP=0 WATCH_CI_RESOLVE_SLEEP=0 WATCH_CI_API_BACKOFF=0 \
+    "$root/scripts/watch-ci.sh" "$target" >"$scratch/$name.out" 2>&1
   local status=$?
   if [ "$status" = "$expected" ]; then
     echo "ok $name"
@@ -58,5 +66,15 @@ run_case success 0 CONCLUSION=success FAILED_JOBS=""
 run_case failure 1 CONCLUSION=failure FAILED_JOBS="tests (linux)"
 # An advisory-only failure stays landable, read after one failed attempt.
 run_case advisory_only_after_retry 0 FAIL_FIRST=1 CONCLUSION=cancelled FAILED_JOBS=""
+
+# Resolving a run by sha: refused lookups are not "no run yet". Five refusals
+# against a budget of two attempts must still find the run and pass; counting
+# refusals as attempts reported "no run appeared" for a run that existed.
+head_sha=$(git -C "$root" rev-parse HEAD)
+WATCH_TARGET=$head_sha run_case refused_lookups_do_not_use_attempts 0 \
+  LIST_FAILS=5 WATCH_CI_RESOLVE_ATTEMPTS=2 CONCLUSION=success FAILED_JOBS=""
+# Control: refusals past the patience deadline end in a refusal, not a pass.
+WATCH_TARGET=$head_sha run_case refusals_past_patience_give_up 2 \
+  LIST_FAILS=1000 WATCH_CI_API_PATIENCE=0 CONCLUSION=success FAILED_JOBS=""
 
 [ "$failures" = 0 ]
