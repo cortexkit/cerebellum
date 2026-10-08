@@ -72,13 +72,9 @@ jobs:
   # "registration works where the expensive step does not happen", and keep
   # running the gate on macOS before trusting a registration-timing change.
   #
-  # Runners are Blacksmith rather than GitHub-hosted: these repos belong to a
-  # free-plan organization where GitHub bills private-repo Actions minutes and
-  # blocks jobs at the (zero) spending limit. Revert to ubuntu-latest if the
-  # repo becomes public.
   test:
     name: Test (ubuntu)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # A wedged test must surface as a fast red run rather than burning the
     # runner for the 6-hour Actions default. Healthy runs finish well under
     # this; the workspace test phase is the long pole at roughly 4 minutes cold.
