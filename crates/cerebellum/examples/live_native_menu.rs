@@ -1100,6 +1100,7 @@ mod macos_probe {
             agent_project_id: GRANTEE.to_string(),
             session_kind: SessionKind::Primary,
             origin: Default::default(),
+            computer_order: None,
         };
         let mut audit = cerebellum::computer_capability::production_audit()
             .map_err(|error| format!("production audit unavailable: {error}"))?;

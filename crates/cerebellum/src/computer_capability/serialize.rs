@@ -1,13 +1,14 @@
-//! FIFO execution for one conversation's reads and actions on one application.
+//! Message-ordered entry, then FIFO execution on one application.
 //!
 //! A reservation is polled once when it is issued, not first polled by the
 //! spawned request. Tokio's mutex queues on that first poll. The frame loop
-//! only reserves a conversation position. The spawned task resolves the app,
-//! reserves its app position, then releases the conversation lane before
-//! waiting for the app. Platform work can never hold the frame reader.
+//! registers a message index and reserves a conversation position if ready.
+//! The spawned task waits for its predecessor, resolves the app, reserves its
+//! app position, then releases the conversation lane before waiting for the
+//! app. Platform work can never hold the frame reader.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -19,14 +20,22 @@ use cerebellum_computer::app_state::source::HitScope;
 use cerebellum_computer::capture::CaptureBackend;
 use cerebellum_computer::platform::{PlatformDriver, SyntheticPoint};
 use cerebellum_core::clock::MonotonicClock;
-use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use cerebellum_core::journal::message_position_from_request_member;
+use cerebellum_core::journal::{
+    ComputerOrderRecord, ComputerOrdering, JournalStorage, Redactor, SeverityTaxonomy,
+};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
+use tokio::time::Instant;
 
 use super::{ComputerPlane, Servable, ServeContext, Served};
 use crate::computer_grants::ConsentRefusal;
 
 const RESOLUTION_LIMIT: Duration = Duration::from_secs(2);
+const GAP_LIMIT: Duration = Duration::from_millis(1500);
+const MESSAGE_RETENTION: Duration = Duration::from_secs(30);
+const MESSAGES_PER_CONVERSATION: usize = 128;
 
 type LockFuture = Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>;
 
@@ -104,6 +113,221 @@ impl QueuePosition {
 pub(super) struct Serializer {
     conversations: Arc<Registry>,
     registry: Arc<Registry>,
+    messages: Arc<Messages>,
+    #[cfg(test)]
+    entered: Mutex<Vec<ComputerOrderRecord>>,
+}
+
+#[derive(Default)]
+struct Messages(Mutex<HashMap<String, HashMap<String, Arc<Message>>>>);
+
+struct Message {
+    state: Mutex<MessageState>,
+    changed: Notify,
+}
+
+struct MessageState {
+    pending: BTreeSet<u32>,
+    entered: Option<u32>,
+    last_used: Instant,
+}
+
+/// The frame reader registers the index but never waits for a predecessor.
+/// Unpositioned calls and ready calls from other messages bypass a gap waiter.
+/// If they target the same app, they execute before that waiter's later calls:
+/// arrival order is the only ordering information available between messages.
+pub(crate) struct ConversationPosition {
+    queue: Option<QueuePosition>,
+    conversations: Arc<Registry>,
+    conversation: String,
+    message: Option<Arc<Message>>,
+    index: Option<u32>,
+    deadline: Instant,
+}
+
+impl Serializer {
+    fn arrive(
+        &self,
+        conversation: String,
+        position: Option<subc_protocol::tool_call::MessagePosition>,
+    ) -> ConversationPosition {
+        let now = Instant::now();
+        let index = position.as_ref().map(|position| position.index);
+        let mut ticket = ConversationPosition {
+            queue: None,
+            conversations: self.conversations.clone(),
+            conversation: conversation.clone(),
+            message: None,
+            index,
+            deadline: now + GAP_LIMIT,
+        };
+        if let Some(position) = position {
+            let mut conversations = self.messages.0.lock().unwrap_or_else(|e| e.into_inner());
+            let messages = conversations.entry(conversation.clone()).or_default();
+            if !messages.contains_key(&position.message_id)
+                && messages.len() < MESSAGES_PER_CONVERSATION
+            {
+                let message = Arc::new(Message {
+                    state: Mutex::new(MessageState {
+                        pending: BTreeSet::new(),
+                        entered: None,
+                        last_used: now,
+                    }),
+                    changed: Notify::new(),
+                });
+                messages.insert(position.message_id.clone(), message.clone());
+                // One expiry task per tracked message, not per call. A weak
+                // registry reference lets shutdown discard the cache immediately.
+                let registry = Arc::downgrade(&self.messages);
+                let key = conversation.clone();
+                let id = position.message_id.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let changed = message.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        let expiry = {
+                            let state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if state.pending.is_empty() {
+                                state.last_used + MESSAGE_RETENTION
+                            } else {
+                                Instant::now() + MESSAGE_RETENTION
+                            }
+                        };
+                        tokio::select! {
+                            _ = &mut changed => continue,
+                            _ = tokio::time::sleep_until(expiry) => {},
+                        }
+                        let Some(registry) = registry.upgrade() else {
+                            break;
+                        };
+                        let mut conversations =
+                            registry.0.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(messages) = conversations.get_mut(&key) else {
+                            break;
+                        };
+                        let state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.pending.is_empty()
+                            && state.last_used.elapsed() >= MESSAGE_RETENTION
+                        {
+                            messages.remove(&id);
+                            if messages.is_empty() {
+                                conversations.remove(&key);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+            if let Some(message) = messages.get(&position.message_id) {
+                let mut state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+                // Duplicate or late indices cannot undo entry. Keep their
+                // index for audit, but fall back to ordinary arrival ordering.
+                if state.entered.is_none_or(|entered| position.index > entered)
+                    && state.pending.insert(position.index)
+                {
+                    state.last_used = now;
+                    if position.index == 0 || state.entered == position.index.checked_sub(1) {
+                        ticket.queue = Some(
+                            self.conversations
+                                .reserve((conversation.clone(), String::new())),
+                        );
+                    }
+                    ticket.message = Some(message.clone());
+                    message.changed.notify_waiters();
+                }
+            }
+        }
+        if ticket.message.is_none() {
+            // At the message-cache cap, an untracked hint degrades to arrival
+            // order rather than allocating without a bound or refusing a call.
+            ticket.queue = Some(self.conversations.reserve((conversation, String::new())));
+        }
+        ticket
+    }
+}
+
+impl ConversationPosition {
+    async fn acquire(mut self) -> (LaneGuard, ComputerOrderRecord) {
+        let mut ordering = ComputerOrdering::Arrival;
+        if let Some(message) = &self.message {
+            let index = self.index.expect("positioned ticket");
+            ordering = ComputerOrdering::Position;
+            while self.queue.is_none() {
+                // Subscribe before inspecting the state so entry/cancellation
+                // cannot be lost between checking and beginning to wait.
+                let changed = message.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let wait_for_gap = {
+                    let state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let lowest = state.pending.first().copied() == Some(index);
+                    let predecessor_entered = index == 0 || state.entered == index.checked_sub(1);
+                    let gap_expired = Instant::now() >= self.deadline;
+                    if lowest && (predecessor_entered || gap_expired) {
+                        if !predecessor_entered {
+                            ordering = ComputerOrdering::SkippedGap;
+                        }
+                        self.queue = Some(
+                            self.conversations
+                                .reserve((self.conversation.clone(), String::new())),
+                        );
+                        false
+                    } else {
+                        // A lower arrived index must enter first, even if our
+                        // own gap deadline has expired. Only a missing index
+                        // gets the bounded wait; the window never starts at 0.
+                        lowest && !gap_expired
+                    }
+                };
+                if self.queue.is_some() {
+                    break;
+                }
+                if wait_for_gap {
+                    tokio::select! {
+                        _ = &mut changed => {},
+                        _ = tokio::time::sleep_until(self.deadline) => {},
+                    }
+                } else {
+                    changed.await;
+                }
+            }
+        }
+        let guard = self
+            .queue
+            .take()
+            .expect("ready conversation position")
+            .acquire()
+            .await;
+        if let Some(message) = self.message.take() {
+            let mut state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+            let index = self.index.expect("positioned ticket");
+            state.pending.remove(&index);
+            state.entered = Some(index);
+            state.last_used = Instant::now();
+            message.changed.notify_waiters();
+        }
+        (
+            guard,
+            ComputerOrderRecord {
+                message_index: self.index,
+                ordering,
+            },
+        )
+    }
+}
+
+impl Drop for ConversationPosition {
+    fn drop(&mut self) {
+        if let Some(message) = &self.message {
+            let mut state = message.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .pending
+                .remove(&self.index.expect("positioned ticket"));
+            state.last_used = Instant::now();
+            message.changed.notify_waiters();
+        }
+    }
 }
 
 impl Registry {
@@ -125,21 +349,24 @@ impl Registry {
 }
 
 tokio::task_local! {
-    static ARRIVAL: RefCell<Option<QueuePosition>>;
+    static ARRIVAL: RefCell<Option<ConversationPosition>>;
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) async fn scope<T>(arrival: Option<QueuePosition>, future: impl Future<Output = T>) -> T {
+pub(crate) async fn scope<T>(
+    arrival: Option<ConversationPosition>,
+    future: impl Future<Output = T>,
+) -> T {
     ARRIVAL.scope(RefCell::new(arrival), future).await
 }
 
-/// Reserve a conversation's FIFO position without resolving a target or
-/// querying the platform. Refused calls still use the normal reply handler.
+/// Register an arrival without resolving a target, waiting for a predecessor,
+/// or querying the platform. Refused calls still use the normal reply handler.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn arrive(
     frame: &subc_protocol::Frame,
     planes: &crate::Planes,
-) -> Option<QueuePosition> {
+) -> Option<ConversationPosition> {
     let body: Value = serde_json::from_slice(&frame.body).ok()?;
     let name = body.get("name")?.as_str()?;
     let arguments = body.get("arguments")?;
@@ -156,7 +383,8 @@ pub(crate) fn arrive(
     } else {
         (super::servable(name)?, arguments)
     };
-    if matches!(capability.0, Served::ListApps)
+    let position = message_position_from_request_member(body.get("origin"));
+    if (matches!(capability.0, Served::ListApps) && position.is_none())
         || valid_request(capability, arguments).is_err()
         || !planes
             .computer_admitted
@@ -187,8 +415,7 @@ pub(crate) fn arrive(
     Some(
         plane
             .serializer
-            .conversations
-            .reserve((facts.identity.conversation_key, String::new())),
+            .arrive(facts.identity.conversation_key, position),
     )
 }
 
@@ -204,23 +431,32 @@ where
         &self,
         capability: Servable,
         arguments: &Value,
-        context: &ServeContext<'_, C>,
+        context: &mut ServeContext<'_, C>,
     ) -> Result<Option<LaneGuard>, ConsentRefusal> {
-        if matches!(capability.0, Served::ListApps) || valid_request(capability, arguments).is_err()
-        {
+        if valid_request(capability, arguments).is_err() {
             return Ok(None);
         }
         let ticket = ARRIVAL
             .try_with(|arrival| arrival.borrow_mut().take())
             .ok()
             .flatten();
+        // An indexed inventory call still enters its message window, otherwise
+        // its successor would wait for an index we intentionally discarded.
+        // Legacy inventory calls retain their existing unserialized behavior.
+        if matches!(capability.0, Served::ListApps) && ticket.is_none() {
+            return Ok(None);
+        }
+        let cancel = context.cancel.clone();
+        let mut drain = context.consent.drain.clone();
         let enter = async {
             let ticket = ticket.unwrap_or_else(|| {
                 self.serializer
-                    .conversations
-                    .reserve((context.identity.conversation_key.clone(), String::new()))
+                    .arrive(context.identity.conversation_key.clone(), None)
             });
-            let conversation = ticket.acquire().await;
+            let (conversation, order) = ticket.acquire().await;
+            context.identity.computer_order = order.positioned();
+            #[cfg(test)]
+            self.serializer.entered.lock().unwrap().push(order);
             // Ordering is best-effort when resolution exceeds two seconds:
             // run this call unserialized rather than letting a wedged platform
             // query stall every other app in the conversation. Dropping the
@@ -242,10 +478,9 @@ where
             let ticket = app?;
             Some(ticket.acquire().await)
         };
-        let mut drain = context.consent.drain.clone();
         tokio::select! {
             biased;
-            _ = context.cancel.cancelled() => Err(ConsentRefusal::Cancelled),
+            _ = cancel.cancelled() => Err(ConsentRefusal::Cancelled),
             _ = async {
                 if drain.wait_for(|draining| *draining).await.is_err() {
                     std::future::pending::<()>().await;
@@ -499,6 +734,7 @@ mod tests {
     /// This makes wire correlation, not just task start order, observable.
     struct Desk {
         reads: AtomicUsize,
+        unreadable_reads: AtomicBool,
         events: mpsc::UnboundedSender<Event>,
         released: (Mutex<bool>, Condvar),
         hits: AtomicUsize,
@@ -686,11 +922,13 @@ mod tests {
             assert!(!timeout.timed_out(), "scripted desk was never released");
             drop(released);
             self.events.send(Event::End(number)).unwrap();
-            Err(if number == 1 {
-                AppStateReadError::Unreadable
-            } else {
-                AppStateReadError::TargetGone
-            })
+            Err(
+                if number == 1 || self.unreadable_reads.load(Ordering::SeqCst) {
+                    AppStateReadError::Unreadable
+                } else {
+                    AppStateReadError::TargetGone
+                },
+            )
         }
     }
 
@@ -727,6 +965,14 @@ mod tests {
                 "name": "computer_use", "arguments": {"action": "read_state", "target": app},
             }),
         )
+    }
+    fn positioned(corr: u64, message: &str, index: Value) -> Frame {
+        let mut body: Value = serde_json::from_slice(&request(7, corr, APP).body).unwrap();
+        body["origin"] = serde_json::json!({
+            "carrier": {"kind": "direct"}, "call_key": format!("call-{corr}"),
+            "message_position": {"message_id": message, "index": index},
+        });
+        frame(FrameType::Request, 7, corr, body)
     }
     fn open_request(channel: u16, corr: u64, app: &str) -> Frame {
         frame(
@@ -765,6 +1011,7 @@ mod tests {
         let (hit_started, hit_events) = mpsc::unbounded_channel();
         let desk = Arc::new(Desk {
             reads: AtomicUsize::new(0),
+            unreadable_reads: AtomicBool::new(false),
             events: events_tx,
             released: (Mutex::new(false), Condvar::new()),
             hits: AtomicUsize::new(0),
@@ -801,6 +1048,7 @@ mod tests {
         planes.computer_admitted = Arc::new(
             [
                 "computer.read_state",
+                "computer.list_apps",
                 "computer.open_app",
                 "computer.takeover_move",
                 "computer.takeover_scroll",
@@ -857,6 +1105,61 @@ mod tests {
         }
     }
     impl Rig {
+        async fn ordering_ready(&mut self) {
+            self.grant(7, APP).await;
+            self.desk.unreadable_reads.store(true, Ordering::SeqCst);
+            self.desk.release();
+            self.planes
+                .computer
+                .as_ref()
+                .unwrap()
+                .serializer
+                .entered
+                .lock()
+                .unwrap()
+                .clear();
+        }
+
+        fn entries(&self) -> Vec<ComputerOrderRecord> {
+            self.planes
+                .computer
+                .as_ref()
+                .unwrap()
+                .serializer
+                .entered
+                .lock()
+                .unwrap()
+                .clone()
+        }
+
+        async fn wait_entries(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while self.entries().len() < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ready calls enter without paying another message's gap");
+        }
+
+        async fn responses(&mut self, count: usize) -> Vec<u64> {
+            let mut correlations = Vec::new();
+            for _ in 0..count {
+                let reply = self.reply().await;
+                assert_eq!(reply.header.ty, FrameType::Response);
+                correlations.push(reply.header.corr);
+            }
+            correlations
+        }
+
+        async fn audit_rows(&self) -> Vec<Value> {
+            let plane = self.planes.computer.as_ref().unwrap();
+            let audit = plane.audit.lock().await;
+            serde_json::Deserializer::from_slice(&audit.journal().export_bytes())
+                .into_iter::<Value>()
+                .map(Result::unwrap)
+                .collect()
+        }
         fn block_hit(&self) -> ReleaseHit {
             *self.desk.hit_released.0.lock().unwrap() = false;
             ReleaseHit(self.desk.clone())
@@ -1023,6 +1326,292 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn message_indices_enter_in_model_order() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        for index in [2, 0, 3, 1] {
+            rig.send(positioned(
+                index + 1,
+                "one-message",
+                serde_json::json!(index),
+            ))
+            .await;
+        }
+        let mut replies = rig.responses(4).await;
+        replies.sort_unstable();
+        assert_eq!(replies, [1, 2, 3, 4]);
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .map(|entry| entry.message_index)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert!(rig
+            .entries()
+            .iter()
+            .all(|entry| entry.ordering == ComputerOrdering::Position));
+        let rows = rig.audit_rows().await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["identity"]["message_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row["identity"]["ordering"] == "position"));
+        assert!(!serde_json::to_string(&rows)
+            .unwrap()
+            .contains("one-message"));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn missing_predecessor_skips_after_bound_and_is_journaled() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        rig.send(positioned(1, "gap-message", serde_json::json!(0)))
+            .await;
+        rig.responses(1).await;
+        let start = Instant::now();
+        rig.send(positioned(2, "gap-message", serde_json::json!(2)))
+            .await;
+        rig.responses(1).await;
+        assert!(
+            start.elapsed() >= GAP_LIMIT,
+            "a missing predecessor must get its arrival window"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(rig.entries()[1].ordering, ComputerOrdering::SkippedGap);
+        let rows = rig.audit_rows().await;
+        assert_eq!(rows[1]["identity"]["message_index"], 2);
+        assert_eq!(rows[1]["identity"]["ordering"], "skipped_gap");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn unpositioned_calls_interleave_in_arrival_order() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        rig.send(positioned(1, "a", serde_json::json!(2))).await;
+        rig.send(request(7, 2, APP)).await;
+        rig.wait_entries(1).await;
+        rig.send(request(7, 3, APP)).await;
+        rig.wait_entries(2).await;
+        rig.send(positioned(4, "a", serde_json::json!(0))).await;
+        rig.wait_entries(3).await;
+        rig.send(positioned(5, "a", serde_json::json!(1))).await;
+        rig.responses(5).await;
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .map(|entry| entry.message_index)
+                .collect::<Vec<_>>(),
+            [None, None, Some(0), Some(1), Some(2)]
+        );
+        let rows = rig.audit_rows().await;
+        assert!(rows[0]["identity"].get("ordering").is_none());
+        assert!(rows[0]["identity"].get("message_index").is_none());
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn two_messages_bypass_each_others_gap_waiters() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        // A:2, U, A:0, B:0, A:1: only A's own indices wait for A.
+        rig.send(positioned(1, "a", serde_json::json!(2))).await;
+        rig.send(request(7, 2, APP)).await;
+        rig.wait_entries(1).await;
+        rig.send(positioned(3, "a", serde_json::json!(0))).await;
+        rig.wait_entries(2).await;
+        rig.send(positioned(4, "b", serde_json::json!(0))).await;
+        rig.wait_entries(3).await;
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .map(|entry| entry.message_index)
+                .collect::<Vec<_>>(),
+            [None, Some(0), Some(0)]
+        );
+        rig.send(positioned(5, "a", serde_json::json!(1))).await;
+        rig.responses(5).await;
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .map(|entry| entry.message_index)
+                .collect::<Vec<_>>(),
+            [None, Some(0), Some(0), Some(1), Some(2)]
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_predecessor_wait_is_prompt_and_successor_is_bounded() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        rig.send(positioned(1, "a", serde_json::json!(0))).await;
+        rig.responses(1).await;
+        rig.send(positioned(2, "a", serde_json::json!(2))).await;
+        let start = Instant::now();
+        rig.send(positioned(3, "a", serde_json::json!(3))).await;
+        rig.send(frame(FrameType::Cancel, 7, 2, serde_json::json!({})))
+            .await;
+        let cancelled = rig.fast_reply().await;
+        assert_eq!(cancelled.header.corr, 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cancelled.body).unwrap()["outcome"],
+            "cancelled"
+        );
+        assert_eq!(rig.responses(1).await, [3]);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            rig.entries()
+                .iter()
+                .map(|entry| entry.message_index)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(3)]
+        );
+        assert_eq!(rig.entries()[1].ordering, ComputerOrdering::SkippedGap);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_position_is_ignored_without_losing_attribution() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        let before = cerebellum_core::journal::message_position_invalid_count();
+        let cases = [
+            ("has space".to_string(), serde_json::json!(2)),
+            (String::new(), serde_json::json!(2)),
+            ("x".repeat(257), serde_json::json!(2)),
+            ("hidden\n".to_string(), serde_json::json!(2)),
+            ("non-ascii-é".to_string(), serde_json::json!(2)),
+            ("valid".to_string(), serde_json::json!(-1)),
+            ("valid".to_string(), serde_json::json!(0.5)),
+            ("valid".to_string(), serde_json::json!("2")),
+            ("valid".to_string(), serde_json::json!(u64::MAX)),
+            ("valid".to_string(), serde_json::json!(65536)),
+        ];
+        for (number, (message, index)) in cases.into_iter().enumerate() {
+            let corr = number as u64 + 1;
+            rig.send(positioned(corr, &message, index)).await;
+            assert_eq!(rig.fast_reply().await.header.corr, corr);
+        }
+        assert!(rig.entries().iter().all(|entry| *entry
+            == ComputerOrderRecord {
+                message_index: None,
+                ordering: ComputerOrdering::Arrival,
+            }));
+        assert!(cerebellum_core::journal::message_position_invalid_count() > before);
+        let rows = rig.audit_rows().await;
+        assert_eq!(rows.len(), 10);
+        assert!(rows
+            .iter()
+            .all(|row| row["identity"]["origin"]["status"] == "relayed"
+                && row["identity"].get("ordering").is_none()));
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn index_window_starts_at_lowest_arrival_not_zero() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        rig.send(positioned(1, "nonzero", serde_json::json!(7)))
+            .await;
+        rig.send(positioned(2, "nonzero", serde_json::json!(8)))
+            .await;
+        rig.responses(2).await;
+        assert_eq!(
+            rig.entries(),
+            [
+                ComputerOrderRecord {
+                    message_index: Some(7),
+                    ordering: ComputerOrdering::SkippedGap
+                },
+                ComputerOrderRecord {
+                    message_index: Some(8),
+                    ordering: ComputerOrdering::Position
+                },
+            ]
+        );
+        let mut inventory: Value =
+            serde_json::from_slice(&positioned(3, "nonzero", serde_json::json!(9)).body).unwrap();
+        inventory["arguments"] = serde_json::json!({"action": "list_apps"});
+        rig.send(frame(FrameType::Request, 7, 3, inventory)).await;
+        rig.send(positioned(4, "nonzero", serde_json::json!(10)))
+            .await;
+        // Inventory has no app lane, but must grant its index so the following
+        // read does not pay a spurious gap or lose its ordering attribution.
+        assert_eq!(rig.fast_reply().await.header.ty, FrameType::Response);
+        assert_eq!(rig.fast_reply().await.header.ty, FrameType::Response);
+        assert_eq!(rig.entries()[2].message_index, Some(9));
+        assert_eq!(rig.entries()[3].message_index, Some(10));
+        assert_eq!(rig.entries()[3].ordering, ComputerOrdering::Position);
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn drain_interrupts_message_predecessor_wait() {
+        let mut rig = rig(false, None);
+        rig.ordering_ready().await;
+        rig.send(positioned(1, "drain", serde_json::json!(2))).await;
+        rig.send(frame(
+            FrameType::Push,
+            0,
+            0,
+            serde_json::json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+        ))
+        .await;
+        let reply = rig.fast_reply().await;
+        assert_eq!(reply.header.corr, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&reply.body).unwrap()["outcome"],
+            "module_draining"
+        );
+        assert!(rig.entries().is_empty());
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn message_tracking_is_capped_with_arrival_fallback() {
+        let serializer = Serializer::default();
+        let mut tickets = Vec::new();
+        for index in 0..=MESSAGES_PER_CONVERSATION {
+            tickets.push(serializer.arrive(
+                "one".into(),
+                Some(subc_protocol::tool_call::MessagePosition::new(
+                    format!("m{index}"),
+                    2,
+                )),
+            ));
+        }
+        assert_eq!(
+            serializer.messages.0.lock().unwrap()["one"].len(),
+            MESSAGES_PER_CONVERSATION
+        );
+        let last = tickets.pop().unwrap();
+        let (_, order) = last.acquire().await;
+        assert_eq!(order.ordering, ComputerOrdering::Arrival);
+        assert_eq!(order.message_index, Some(2));
+        drop(tickets);
+        // Advance only the cache's idle timestamp, not wall time or desk input.
+        // The actual expiry task must notice and remove the conversation too.
+        for message in serializer.messages.0.lock().unwrap()["one"].values() {
+            message.state.lock().unwrap().last_used = Instant::now() - MESSAGE_RETENTION;
+            message.changed.notify_waiters();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !serializer.messages.0.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle message ids are forgotten after retention");
     }
 
     #[tokio::test]

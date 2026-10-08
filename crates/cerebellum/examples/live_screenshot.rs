@@ -99,6 +99,7 @@ fn main() {
                         agent_project_id: grantee.to_string(),
                         session_kind: SessionKind::Primary,
                         origin: Default::default(),
+                        computer_order: None,
                     },
                     management: &management,
                     consent,

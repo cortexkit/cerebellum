@@ -46,8 +46,9 @@ pub use late_events::{
     LateEventQueue, LateEventSequence,
 };
 pub use origin::{
-    origin_invalid_count, CallOriginRecord, OriginCarrier, ORIGIN_INVALID_MARKER,
-    ORIGIN_MODULE_ID_MAX_LEN,
+    message_position_from_request_member, message_position_invalid_count, origin_invalid_count,
+    CallOriginRecord, ComputerOrderRecord, ComputerOrdering, OriginCarrier, MESSAGE_INDEX_MAX,
+    ORIGIN_INVALID_MARKER, ORIGIN_MODULE_ID_MAX_LEN,
 };
 pub use redaction::{redact_then_truncate, RedactionUnavailable, Redactor};
 pub use refusal_ring::{
@@ -80,6 +81,12 @@ pub struct JournalIdentity {
     /// without one byte-identical to the previous journal schema.
     #[serde(default, skip_serializing_if = "CallOriginRecord::is_absent")]
     pub origin: CallOriginRecord,
+    /// Computer-call ordering, when the call traversed the conversation queue.
+    /// Carried with the identity into blocking audit writes, so it describes
+    /// this call rather than whichever task happens to write next. No opaque
+    /// model message identifier is persisted.
+    #[serde(default, skip_serializing_if = "ComputerOrderRecord::is_legacy")]
+    pub computer_order: Option<ComputerOrderRecord>,
     /// The request this obligation serves, marked when its dispatch is
     /// committed. Never persisted; a reloaded identity carries a detached one.
     #[serde(skip)]
@@ -1427,7 +1434,26 @@ where
         // Raise the entry format's floor before saving. Otherwise an entry
         // could reach disk in a version the floor does not record, and staging
         // would accept a build that cannot read it.
-        if let Some(format) = self.codec.entry_format() {
+        // The codec's default format protects legacy writes. A conditional
+        // newer format is floored only when an actual record carries it, not
+        // merely because this build can read or encode that version.
+        let versions = candidate
+            .reservations
+            .values()
+            .map(|record| record.provisional.codec_version.as_str())
+            .chain(
+                candidate
+                    .entries
+                    .values()
+                    .map(|record| record.codec_id.as_str()),
+            );
+        let format = self
+            .codec
+            .entry_format()
+            .into_iter()
+            .chain(versions.filter_map(|version| self.codec.entry_format_for(version)))
+            .max_by_key(|format| format.version);
+        if let Some(format) = format {
             self.raise_format_floor(format)?;
         }
         self.storage
@@ -1687,6 +1713,7 @@ mod tests {
             agent_project_id: "a".to_string(),
             session_kind: SessionKind::Primary,
             origin: CallOriginRecord::Absent,
+            computer_order: None,
         }
     }
 

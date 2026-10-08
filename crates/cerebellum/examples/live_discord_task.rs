@@ -1067,6 +1067,7 @@ mod macos_probe {
             agent_project_id: "live-probe".into(),
             session_kind: SessionKind::Primary,
             origin: Default::default(),
+            computer_order: None,
         }
     }
 

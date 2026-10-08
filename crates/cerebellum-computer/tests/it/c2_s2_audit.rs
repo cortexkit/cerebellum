@@ -18,8 +18,8 @@ use cerebellum_computer::platform::{AccessibilityElementName, ProcessGrant};
 use cerebellum_core::identity::SessionKind;
 use cerebellum_core::journal::{
     EffectClass, InMemoryJournalStorage, IsolationClass, JournalConfig, JournalError,
-    JournalIdentity, LifecycleState, ObservabilityClass, Redactor, SeverityInputs, SeverityRecord,
-    ValidatedSeverityTaxonomy,
+    JournalIdentity, LifecycleState, ObservabilityClass, Redactor, SeverityInputs,
+    SeverityRecord, ValidatedSeverityTaxonomy,
 };
 use serde_json::json;
 
@@ -115,6 +115,7 @@ fn identity() -> JournalIdentity {
         agent_project_id: "project-1".into(),
         session_kind: SessionKind::Primary,
         origin: Default::default(),
+        computer_order: None,
     }
 }
 
@@ -150,6 +151,283 @@ fn audit_with_redactor<R: Redactor>(
         custody,
     )
     .unwrap()
+}
+
+fn ordering_audit<S: cerebellum_core::journal::JournalStorage>(
+    storage: S,
+) -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, S> {
+    ComputerAudit::new(
+        TestRedactor,
+        taxonomy(),
+        JournalConfig {
+            journal_retention_bytes: 100_000,
+            journal_max_entry_bytes: 8_000,
+        },
+        storage,
+        CaptureCustody::new(
+            bounds(),
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+// Freeze the origin-era reader's identity fields rather than delegating to
+// today's identity type, which would silently accept today's new members.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V3EntryIdentity {
+    #[serde(rename = "principal")]
+    _principal: String,
+    #[serde(rename = "conversation_key")]
+    _conversation_key: String,
+    #[serde(rename = "agent_project_id")]
+    _agent_project_id: String,
+    #[serde(rename = "session_kind")]
+    _session_kind: serde_json::Value,
+    #[serde(default, rename = "origin")]
+    _origin: Option<serde_json::Value>,
+}
+
+fn v3_entry_reader(entry: &serde_json::Value) -> Result<(), String> {
+    if entry["codec_version"] != "ck-computer-journal/v3" {
+        return Err("unsupported computer entry version".into());
+    }
+    serde_json::from_value::<V3EntryIdentity>(entry["identity"].clone())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+struct OrderingDirectory(std::path::PathBuf);
+
+impl OrderingDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "cerebellum-ordering-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for OrderingDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Observe the real floor file at the storage boundary, before the candidate
+/// reaches the filesystem writer. The candidate's actual encoded version is
+/// inspected, not the codec's advertised ceiling or an expected-value helper.
+#[derive(Clone)]
+struct FloorBeforeOrderingRecord {
+    storage: cerebellum_core::journal::FilesystemJournalStorage,
+    floor: std::path::PathBuf,
+    observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl cerebellum_core::journal::JournalStorage for FloorBeforeOrderingRecord {
+    fn load(
+        &self,
+    ) -> Result<cerebellum_core::journal::DurableState, cerebellum_core::journal::StorageError>
+    {
+        self.storage.load()
+    }
+
+    fn save(
+        &self,
+        state: &cerebellum_core::journal::DurableState,
+    ) -> Result<(), cerebellum_core::journal::StorageError> {
+        let candidate = serde_json::to_value(state).unwrap();
+        let has_v4 = candidate["reservations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|record| record["provisional"]["codec_version"] == "ck-computer-journal/v4")
+            || candidate["entries"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|record| record["codec_id"] == "ck-computer-journal/v4");
+        if has_v4
+            && !self
+                .observed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            assert_eq!(
+                cerebellum_core::format_floor::read_floors(&self.floor)
+                    .unwrap()
+                    .get("computer-journal-entry"),
+                Some(&4),
+                "the first v4 computer record reached storage before its floor"
+            );
+            let old: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(self.storage.path()).unwrap()).unwrap();
+            assert_eq!(
+                old["schema_version"], 3,
+                "the observer did not precede the first v4 record"
+            );
+        }
+        self.storage.save(state)
+    }
+
+    fn raise_format(
+        &self,
+        format: cerebellum_core::format_floor::DurableFormat,
+    ) -> Result<(), cerebellum_core::journal::StorageError> {
+        self.storage.raise_format(format)
+    }
+}
+
+#[test]
+fn positioned_entries_use_v4_and_current_reader_accepts_v3_and_v4() {
+    use cerebellum_core::journal::{ComputerOrderRecord, ComputerOrdering};
+    let storage = InMemoryJournalStorage::new();
+    let mut audit = ordering_audit(storage.clone());
+    for order in [
+        None,
+        Some(ComputerOrdering::Position),
+        Some(ComputerOrdering::SkippedGap),
+    ] {
+        let mut identity = identity();
+        identity.computer_order = order.map(|ordering| ComputerOrderRecord {
+            message_index: Some(2),
+            ordering,
+        });
+        let handle = audit.reserve(identity, actuation_descriptor()).unwrap();
+        audit
+            .finalize_rejected(handle, b"fixture rejection".to_vec())
+            .unwrap();
+    }
+    let bytes = audit.journal().export_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&bytes)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["codec_version"], "ck-computer-journal/v3");
+    v3_entry_reader(&rows[0]).expect("the rollback reader reaches a legacy identity");
+    for (row, ordering) in rows[1..].iter().zip(["position", "skipped_gap"]) {
+        assert_eq!(row["codec_version"], "ck-computer-journal/v4");
+        assert_eq!(row["identity"]["message_index"], 2);
+        assert_eq!(row["identity"]["ordering"], ordering);
+        assert_eq!(
+            v3_entry_reader(row).unwrap_err(),
+            "unsupported computer entry version"
+        );
+        let mut retagged = row.clone();
+        retagged["codec_version"] = json!("ck-computer-journal/v3");
+        assert!(v3_entry_reader(&retagged)
+            .unwrap_err()
+            .contains("message_index"));
+    }
+    for row in &rows {
+        assert_eq!(
+            ComputerJournalCodec::decode_entry(&serde_json::to_vec(row).unwrap()).unwrap(),
+            *row
+        );
+    }
+    ordering_audit(storage)
+        .startup_reconcile(10)
+        .expect("the new startup reader accepts mixed v3/v4 entries");
+}
+
+#[test]
+fn ordinary_computer_calls_keep_v3_records_and_floors_without_startup_writes() {
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+    use cerebellum_core::journal::{
+        ComputerOrderRecord, ComputerOrdering, FilesystemJournalStorage,
+    };
+    let directory = OrderingDirectory::new();
+    let path = directory.0.join("computer.json");
+    let floor = directory.0.join("format-floor.json");
+    let storage = FilesystemJournalStorage::new(&path).with_format_floor(FormatFloor::at(&floor));
+    let mut audit = ordering_audit(storage.clone());
+    audit.startup_reconcile(10).unwrap();
+    assert!(!path.exists());
+    assert!(!floor.exists(), "startup raised a floor");
+    let handle = audit.reserve(identity(), actuation_descriptor()).unwrap();
+    audit
+        .finalize_rejected(handle, b"fixture rejection".to_vec())
+        .unwrap();
+    let old_floor = std::fs::read(&floor).unwrap();
+    let old_record = std::fs::read(&path).unwrap();
+    let mut audit = ordering_audit(storage);
+    audit.startup_reconcile(10).unwrap();
+    assert_eq!(std::fs::read(&floor).unwrap(), old_floor);
+    assert_eq!(std::fs::read(&path).unwrap(), old_record);
+    for message_index in [None, Some(2)] {
+        let mut identity = identity();
+        identity.computer_order = Some(ComputerOrderRecord {
+            message_index,
+            ordering: ComputerOrdering::Arrival,
+        });
+        let handle = audit.reserve(identity, actuation_descriptor()).unwrap();
+        audit
+            .finalize_rejected(handle, b"fixture rejection".to_vec())
+            .unwrap();
+        assert_eq!(std::fs::read(&floor).unwrap(), old_floor);
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(encoded["schema_version"], 3);
+        let rows = audit.journal().export_bytes();
+        for row in serde_json::Deserializer::from_slice(&rows).into_iter::<serde_json::Value>() {
+            let row = row.unwrap();
+            v3_entry_reader(&row).unwrap();
+            assert!(row["identity"].get("ordering").is_none());
+            assert!(row["identity"].get("message_index").is_none());
+        }
+    }
+    let floors = read_floors(&floor).unwrap();
+    assert_eq!(floors.get("audit-journal"), Some(&3));
+    assert_eq!(floors.get("computer-journal-entry"), Some(&3));
+}
+
+#[test]
+fn positioned_computer_record_raises_v4_floor_before_reaching_storage() {
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+    use cerebellum_core::journal::{
+        ComputerOrderRecord, ComputerOrdering, FilesystemJournalStorage,
+    };
+    let directory = OrderingDirectory::new();
+    let path = directory.0.join("computer.json");
+    let floor = directory.0.join("format-floor.json");
+    let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let storage = FloorBeforeOrderingRecord {
+        storage: FilesystemJournalStorage::new(&path).with_format_floor(FormatFloor::at(&floor)),
+        floor: floor.clone(),
+        observed: observed.clone(),
+    };
+    let mut audit = ordering_audit(storage);
+    let handle = audit.reserve(identity(), actuation_descriptor()).unwrap();
+    audit
+        .finalize_rejected(handle, b"fixture rejection".to_vec())
+        .unwrap();
+    let old_floor = std::fs::read(&floor).unwrap();
+    let mut identity = identity();
+    identity.computer_order = Some(ComputerOrderRecord {
+        message_index: Some(2),
+        ordering: ComputerOrdering::Position,
+    });
+    audit.reserve(identity, actuation_descriptor()).unwrap();
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        "the observer never reached a v4 candidate"
+    );
+    assert_ne!(std::fs::read(&floor).unwrap(), old_floor);
+    let floors = read_floors(&floor).unwrap();
+    assert_eq!(floors.get("computer-journal-entry"), Some(&4));
+    assert_eq!(floors.get("audit-journal"), Some(&4));
+    let encoded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(encoded["schema_version"], 4);
 }
 
 fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage> {
@@ -1357,7 +1635,7 @@ fn old_journal_fixture_reads_and_route_summary_round_trips_in_the_current_versio
     let recorded: RecordedActuationOutcome = serde_json::from_slice(&completed).unwrap();
     assert_eq!(recorded.routes, routes);
     assert_eq!(recorded.outcome, old_outcome.outcome);
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 4);
 }
 
 #[test]
@@ -1377,7 +1655,7 @@ fn v2_manual_accessibility_fixture_still_reads_under_the_v3_codec() {
     assert_eq!(dispatch["bundle_identity"], "com.example.target");
     // Written before identities could carry an origin: it has none.
     assert!(entry["identity"].get("origin").is_none());
-    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 3);
+    assert_eq!(cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT.version, 4);
 }
 
 /// Every phase of an entry names the caller behind a relayed call, and an

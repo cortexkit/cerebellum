@@ -186,6 +186,7 @@ fn main() -> ExitCode {
             agent_project_id: "drill".into(),
             session_kind: SessionKind::Primary,
             origin: Default::default(),
+            computer_order: None,
         };
         let sequence = match kind {
             "actuation" => {

@@ -281,10 +281,11 @@ pub struct ComputerJournalCodec {
 /// The version of the computer journal's entries, as the codec writes it and
 /// startup reconciliation reads it back.
 ///
-/// Version 3 added the optional `identity.origin` member: the caller behind a
-/// relayed call. Version 2 and older entries are still read; an entry without
-/// the member means the call named no origin.
-pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v3";
+/// Version 4 adds message indices and position/gap ordering to identities.
+/// Entries without positioned ordering still use version 3 (which added
+/// origin attribution). All earlier entry versions remain readable.
+pub const COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v4";
+const ORIGIN_COMPUTER_JOURNAL_CODEC_VERSION: &str = "ck-computer-journal/v3";
 
 /// The computer journal's entry format. Its floor is raised before entries are
 /// written, and staging refuses a build whose readers stop short of it.
@@ -312,7 +313,15 @@ impl ComputerJournalCodec {
     }
 
     fn encoded(&self, mut value: Value) -> Result<EncodedJournalState, JournalCodecError> {
-        if self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION {
+        let mut codec_version = self.codec_version.clone();
+        if self.writes_current_family() {
+            codec_version = if value["identity"]["message_index"].is_u64() {
+                COMPUTER_JOURNAL_CODEC_VERSION
+            } else {
+                ORIGIN_COMPUTER_JOURNAL_CODEC_VERSION
+            }
+            .to_string();
+            value["codec_version"] = json!(codec_version);
             if let Some(status) = AccessibilityReadScope::current() {
                 value["manual_accessibility"] = json!(status);
             }
@@ -324,8 +333,15 @@ impl ComputerJournalCodec {
         Ok(EncodedJournalState {
             accounted_serialized_size: durable_bytes.len() as u64,
             durable_bytes,
-            codec_version: self.codec_version.clone(),
+            codec_version,
         })
+    }
+
+    fn writes_current_family(&self) -> bool {
+        matches!(
+            self.codec_version.as_str(),
+            COMPUTER_JOURNAL_CODEC_VERSION | ORIGIN_COMPUTER_JOURNAL_CODEC_VERSION
+        )
     }
 
     fn identity(value: &JournalIdentity) -> Value {
@@ -339,6 +355,15 @@ impl ComputerJournalCodec {
         // call nobody relayed reads exactly as it did before the member existed.
         if !value.origin.is_absent() {
             identity["origin"] = json!(value.origin);
+        }
+        if let Some(order) = value
+            .computer_order
+            .and_then(cerebellum_core::journal::ComputerOrderRecord::positioned)
+        {
+            if let Some(index) = order.message_index {
+                identity["message_index"] = json!(index);
+            }
+            identity["ordering"] = json!(order.ordering);
         }
         identity
     }
@@ -414,7 +439,7 @@ impl PlaneJournalCodec for ComputerJournalCodec {
         });
         // Read summaries stay directly queryable without decoding opaque result
         // bytes. Copy only the closed numeric/Boolean fields, never tree text.
-        if self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION {
+        if self.writes_current_family() {
             if let Ok(summary) = serde_json::from_slice::<Value>(&input.completed_result) {
                 if summary["element_count"].is_u64()
                     && summary["unreadable_subtrees"].is_u64()
@@ -469,12 +494,35 @@ impl PlaneJournalCodec for ComputerJournalCodec {
         }))
     }
 
-    /// Floored only when writing the version startup reconciliation reads
-    /// back. A codec built with another version string (test fixtures) writes
-    /// entries that no reader in this module decodes, so there is no floor to
-    /// raise for them.
+    /// Ordinary calls retain the origin-era format and its existing floor.
+    /// Only a record actually encoded with ordering metadata raises version 4.
+    /// Arbitrary fixture codecs are not formats a module reader decodes.
     fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
-        (self.codec_version == COMPUTER_JOURNAL_CODEC_VERSION).then_some(COMPUTER_ENTRY_FORMAT)
+        self.writes_current_family()
+            .then_some(cerebellum_core::format_floor::DurableFormat::new(
+                COMPUTER_ENTRY_FORMAT.name,
+                3,
+            ))
+    }
+
+    fn entry_format_for(
+        &self,
+        codec_version: &str,
+    ) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        if !self.writes_current_family() {
+            return None;
+        }
+        let version = match codec_version {
+            "ck-computer-journal/v1" => 1,
+            "ck-computer-journal/v2" => 2,
+            ORIGIN_COMPUTER_JOURNAL_CODEC_VERSION => 3,
+            COMPUTER_JOURNAL_CODEC_VERSION => 4,
+            _ => return None,
+        };
+        Some(cerebellum_core::format_floor::DurableFormat::new(
+            COMPUTER_ENTRY_FORMAT.name,
+            version,
+        ))
     }
 }
 
@@ -1248,6 +1296,7 @@ pub fn journal_identity(
         agent_project_id: agent_project_id.into(),
         session_kind,
         origin: Default::default(),
+        computer_order: None,
     }
 }
 

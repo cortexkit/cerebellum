@@ -1523,6 +1523,7 @@ pub fn identity(
         agent_project_id: agent_project_id.into(),
         session_kind,
         origin: Default::default(),
+        computer_order: None,
     }
 }
 

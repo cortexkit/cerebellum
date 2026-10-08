@@ -5900,6 +5900,7 @@ async fn handle_tool_request(
                         agent_project_id: accepted_facts.identity.agent_project_id.clone(),
                         session_kind: accepted_facts.identity.session_kind,
                         origin: accepted_facts.identity.origin.clone(),
+                        computer_order: None,
                     },
                     management: &planes.management,
                     consent: consent_context(planes, &accepted_facts, writer, channel, epoch),
