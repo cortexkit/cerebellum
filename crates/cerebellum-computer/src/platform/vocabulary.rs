@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v18";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v19";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v18.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v19.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "49ffd007a34982ae3a938c1b439274b270935facff8977f953c82bceb2475f4f";
+    "695ce63f020973b79dd61e7fed23e52cf7aac58bf3650c4257abec4ca0245e33";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -115,7 +115,7 @@ pub struct ValidatedVocabulary {
 /// The one list other closed per-id tables are checked against: the
 /// declaration set, the dispatch rows and the grounding policy each name these
 /// ids and no others.
-pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 11] = [
+pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 12] = [
     "computer.read_state",
     "computer.press_element",
     "computer.press_point",
@@ -127,6 +127,7 @@ pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 11] = [
     "computer.takeover_scroll",
     "computer.wait",
     "computer.list_apps",
+    "computer.open_app",
 ];
 
 /// Rows whose target is an element named through the accessibility tree.
@@ -360,7 +361,8 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
     // decision here fails validation instead of inheriting a retry class.
     let expected_retry = match id {
         "computer.read_state" | "computer.wait" | "computer.list_apps" => "idempotent",
-        "computer.press_element"
+        "computer.open_app"
+        | "computer.press_element"
         | "computer.press_point"
         | "computer.write_text"
         | "computer.type"
@@ -514,7 +516,16 @@ fn validate_numeric_invariants(
         .get("deadline_ms")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if deadline == 0 || deadline > if id == "computer.wait" { 30_000 } else { 2_000 } {
+    if deadline == 0
+        || deadline
+            > if id == "computer.open_app" {
+                40_000
+            } else if id == "computer.wait" {
+                30_000
+            } else {
+                2_000
+            }
+    {
         return Err(VocabularyValidationError::NumericInvariant(format!(
             "{id}.effect_observation.deadline_ms"
         )));
@@ -1073,6 +1084,7 @@ mod tests {
             ("computer.takeover_scroll", keystroke),
             ("computer.wait", Vec::new()),
             ("computer.list_apps", Vec::new()),
+            ("computer.open_app", Vec::new()),
         ] {
             assert_eq!(
                 required_permission_services(id).expect("a frozen row"),

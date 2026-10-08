@@ -547,9 +547,10 @@ impl GroundingPolicy {
             }
             // The pointer rows name points in a returned image and never an
             // element, and a scroll names no location at all; reading state,
-            // waiting, listing applications and key chords aim at nothing.
+            // waiting, listing or opening applications and key chords aim at no element.
             "computer.read_state"
             | "computer.list_apps"
+            | "computer.open_app"
             | "computer.keys"
             | "computer.takeover_move"
             | "computer.takeover_drag"
@@ -570,6 +571,7 @@ impl GroundingPolicy {
             "computer.takeover_move" | "computer.takeover_drag" => Some(true),
             "computer.read_state"
             | "computer.list_apps"
+            | "computer.open_app"
             | "computer.press_element"
             | "computer.press_point"
             | "computer.write_text"
@@ -1514,6 +1516,7 @@ mod tests {
         for capability in [
             "computer.read_state",
             "computer.list_apps",
+            "computer.open_app",
             "computer.keys",
             "computer.takeover_move",
             "computer.takeover_drag",

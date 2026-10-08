@@ -353,6 +353,22 @@ where
                 .resolve_target_name(arguments.get("target")?.as_str()?)
                 .await
                 .ok(),
+            // The app has no process yet, so resolve it from the installed
+            // inventory. Its lane is the bundle identity that later calls on
+            // the running app resolve to, so they queue behind the launch.
+            Served::OpenApp => {
+                let target = super::open_app::parse_request(arguments).ok()?;
+                let source = self.app_state_source.clone();
+                tokio::task::spawn_blocking(move || {
+                    let listed = source.installed_apps(std::time::Duration::from_secs(1));
+                    super::open_app::resolve_installed(&target, &listed.apps)
+                        .ok()
+                        .map(|app| app.bundle_identity)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
         }
     }
 }
@@ -404,6 +420,7 @@ fn valid_request(capability: Servable, arguments: &Value) -> Result<(), Value> {
         Served::TakeoverMove | Served::TakeoverDrag | Served::TakeoverScroll => {
             super::takeover::parse_request(capability.capability(), arguments).map(|_| ())
         }
+        Served::OpenApp => super::open_app::parse_request(arguments).map(|_| ()),
         _ => super::parse_synthetic_request(capability.capability(), arguments).map(|_| ()),
     }
 }

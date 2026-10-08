@@ -51,6 +51,7 @@ pub enum ComputerCapability {
     TakeoverScroll,
     Wait,
     ListApps,
+    OpenApp,
     /// Retired; readable from the journal only.
     Click,
     /// Retired; readable from the journal only.
@@ -65,7 +66,7 @@ pub enum ComputerCapability {
 
 impl ComputerCapability {
     /// The capabilities the current vocabulary carries, in artifact order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ReadState,
         Self::PressElement,
         Self::PressPoint,
@@ -77,6 +78,7 @@ impl ComputerCapability {
         Self::TakeoverScroll,
         Self::Wait,
         Self::ListApps,
+        Self::OpenApp,
     ];
 
     /// Capabilities an earlier vocabulary served, kept only so journal
@@ -102,6 +104,7 @@ impl ComputerCapability {
             Self::TakeoverScroll => "computer.takeover_scroll",
             Self::Wait => "computer.wait",
             Self::ListApps => "computer.list_apps",
+            Self::OpenApp => "computer.open_app",
             Self::Click => "computer.click",
             Self::Scroll => "computer.scroll",
             Self::Move => "computer.move",
@@ -129,7 +132,8 @@ impl ComputerCapability {
         match self {
             Self::Drag | Self::TakeoverDrag => ActionKind::MutateDurable,
             Self::Screenshot | Self::Wait | Self::ReadState | Self::ListApps => ActionKind::Observe,
-            Self::Click
+            Self::OpenApp
+            | Self::Click
             | Self::Type
             | Self::Keys
             | Self::Scroll
@@ -895,9 +899,11 @@ impl AuditCapabilityGate {
             // Wait has no capture or redaction obligation, but it still needs a
             // durable journal obligation under the C2 fail-closed rule.
             ComputerCapability::Wait => self.journal_available && self.severity_available,
-            // Listing applications returns names and identities only, never
-            // pixels, so like wait it needs the journal and nothing more.
-            ComputerCapability::ListApps => self.journal_available && self.severity_available,
+            // Listing and opening applications return metadata only, never
+            // pixels, so like wait they need the journal and no image custody.
+            ComputerCapability::ListApps | ComputerCapability::OpenApp => {
+                self.journal_available && self.severity_available
+            }
             // Reading state can return an image, which passes through capture
             // custody and redaction exactly as a screenshot did.
             ComputerCapability::ReadState => self.ready(),
@@ -1167,7 +1173,8 @@ pub const fn recovery_entry_class(capability: ComputerCapability) -> ComputerRec
         ComputerCapability::Screenshot
         | ComputerCapability::Wait
         | ComputerCapability::ReadState
-        | ComputerCapability::ListApps => ComputerRecoveryEntryClass::Capture,
+        | ComputerCapability::ListApps
+        | ComputerCapability::OpenApp => ComputerRecoveryEntryClass::Capture,
         ComputerCapability::Click
         | ComputerCapability::Type
         | ComputerCapability::Keys

@@ -271,7 +271,7 @@ impl AppStateSource for MacAppStateSource {
     /// read is left out rather than guessed at, because the list is what a
     /// name given as a target is matched against.
     fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
-        let applications = cerebellum_macos::running_applications(RUNNING_APPS_TIMEOUT)
+        let applications = cerebellum_macos::workspace_running_applications()
             .map_err(|_| AppStateReadError::Unreadable)?;
         let frontmost = self.frontmost_pid();
         let mut apps: Vec<RunningApp> = applications
@@ -294,8 +294,71 @@ impl AppStateSource for MacAppStateSource {
         });
         Ok(apps)
     }
-}
+    fn installed_apps(&self, timeout: std::time::Duration) -> super::source::InstalledApps {
+        let listed = cerebellum_macos::installed_applications(timeout);
+        super::source::InstalledApps {
+            complete: listed.complete,
+            apps: listed
+                .apps
+                .into_iter()
+                .map(|app| super::source::InstalledApp {
+                    name: app.name,
+                    bundle_identity: app.bundle_identifier,
+                    path: app.path,
+                })
+                .collect(),
+        }
+    }
 
-/// How long the window server may take to list the running applications:
-/// the `computer.list_apps` row declares the same 1000 ms deadline.
-const RUNNING_APPS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+    fn bundle_signature(
+        &self,
+        app: &super::source::InstalledApp,
+    ) -> Result<super::source::BundleSignature, AppStateReadError> {
+        let timeout = std::time::Duration::from_secs(2);
+        let signature = cerebellum_macos::bundle_code_signing_identity(&app.path, timeout)
+            .map_err(|_| AppStateReadError::Unreadable)?;
+        let apple_anchored = matches!(
+            cerebellum_macos::bundle_code_satisfies_requirement(&app.path, "anchor apple", timeout),
+            Ok(cerebellum_macos::RequirementCheck::Satisfied)
+        );
+        Ok(super::source::BundleSignature {
+            signed: signature.signed,
+            ad_hoc: signature.ad_hoc,
+            team_id: signature.team_id,
+            designated_requirement: signature.designated_requirement,
+            apple_anchored,
+        })
+    }
+
+    fn bundle_satisfies(&self, app: &super::source::InstalledApp, requirement: &str) -> bool {
+        matches!(
+            cerebellum_macos::bundle_code_satisfies_requirement(
+                &app.path,
+                requirement,
+                std::time::Duration::from_secs(2)
+            ),
+            Ok(cerebellum_macos::RequirementCheck::Satisfied)
+        )
+    }
+
+    fn open_app(
+        &self,
+        app: &super::source::InstalledApp,
+        bounds: super::source::OpenAppBounds,
+    ) -> Result<super::source::OpenedApp, AppStateReadError> {
+        let opened = cerebellum_macos::open_application(
+            &app.path,
+            &app.bundle_identity,
+            bounds.activates,
+            bounds.process_timeout,
+            bounds.window_timeout,
+        )
+        .map_err(|_| AppStateReadError::Unreadable)?;
+        Ok(super::source::OpenedApp {
+            pid: opened.pid,
+            already_running: opened.already_running,
+            has_window: opened.has_window,
+            frontmost: opened.frontmost,
+        })
+    }
+}

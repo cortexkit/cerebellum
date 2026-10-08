@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v18.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v19.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -49,11 +49,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn vocabulary_has_exactly_eleven_rows_and_locked_digest() {
+fn vocabulary_has_exactly_twelve_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
     assert_eq!(validated.revision, COMPUTER_ACTION_VOCABULARY_REVISION);
     assert_eq!(validated.schema_id, "ck-computer-action-vocabulary/v2");
-    assert_eq!(validated.row_count, 11, "absolute row-count invariant");
+    assert_eq!(validated.row_count, 12, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
     assert_eq!(
         computed_vocabulary_sha256(),
@@ -331,7 +331,7 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         permissions: PermissionLivenessReport::default(),
         startup: driver.startup_probe().clone(),
     });
-    assert_eq!(declarations.len(), 11);
+    assert_eq!(declarations.len(), 12);
     assert_eq!(
         declarations
             .iter()
@@ -437,7 +437,7 @@ fn the_takeover_rows_are_the_only_observed_only_capabilities() {
         .iter()
         .map(|item| item.capability_id.as_str())
         .collect();
-    assert_eq!(ids.len(), 11);
+    assert_eq!(ids.len(), 12);
 }
 
 fn recreated_v9() -> Value {
@@ -755,7 +755,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v16_from_v15(&generated, historical_revision(16).as_str().unwrap());
     let generated =
         vocabulary_mint::v17_from_v16(&generated, historical_revision(17).as_str().unwrap());
-    let generated = vocabulary_mint::v18_from_v17(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v18_from_v17(&generated, historical_revision(18).as_str().unwrap());
+    let generated = vocabulary_mint::v19_from_v18(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -769,6 +771,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
             .map(|row| row["capability_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vocabulary_mint::V15_ROW_IDS
+            .into_iter()
+            .chain(["computer.open_app"])
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1238,7 +1243,7 @@ fn recreated_v16() -> Value {
 /// require `detail.reason`, `detail.grant` and `detail.grant_label` again for
 /// the consent-only detail object.
 fn recreated_v17() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v18();
     vocabulary["revision"] = historical_revision(17);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         if row["required_permission_services"]
@@ -1295,5 +1300,28 @@ fn v17_only_makes_the_changes_recreated_v16_undoes() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v16()).unwrap()),
         "c5e13e0f02eb666df554c7e2f73f86edcfee6f0b587c3b9cd09564856079cde5"
+    );
+}
+
+/// Rebuild the previous inventory row and remove only the new launch row.
+/// The pinned previous digest makes any unlisted change fail loudly.
+fn recreated_v18() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(18);
+    let rows = vocabulary["rows"].as_array_mut().unwrap();
+    assert_eq!(rows.pop().unwrap()["capability_id"], "computer.open_app");
+    let list = rows
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.list_apps")
+        .unwrap();
+    *list = serde_json::from_str(include_str!("../fixtures/v18_list_apps.json")).unwrap();
+    vocabulary
+}
+
+#[test]
+fn v19_only_makes_the_changes_recreated_v18_undoes() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v18()).unwrap()),
+        "49ffd007a34982ae3a938c1b439274b270935facff8977f953c82bceb2475f4f"
     );
 }
