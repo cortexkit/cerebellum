@@ -733,8 +733,27 @@ pub fn encode_ax_jsonl(
 ) -> Result<(String, bool), SnapshotError> {
     let mut output = String::new();
     let mut truncated = false;
+    let mut ancestors: Vec<&AxRecord> = Vec::new();
     for record in records {
         let line = record.canonical_line()?;
+        while ancestors
+            .last()
+            .is_some_and(|parent| parent.depth >= record.depth)
+        {
+            ancestors.pop();
+        }
+        // Inline boxes are layout fragments of text already named by their parent.
+        // Repeating them can exhaust the byte budget before any controls are shown.
+        let folded = record.role == "InlineTextBox"
+            || (record.role == "StaticText"
+                && record.value.is_none()
+                && ancestors
+                    .last()
+                    .is_some_and(|parent| !record.name.is_empty() && parent.name == record.name));
+        ancestors.push(record);
+        if folded {
+            continue;
+        }
         if output.len().saturating_add(line.len()) > max_bytes {
             truncated = true;
             break;
@@ -870,6 +889,63 @@ mod tests {
 
     fn id(seed: &str) -> String {
         new_snapshot_id(seed)
+    }
+
+    #[test]
+    fn ax_inline_fragments_cannot_exhaust_the_control_budget() {
+        let record = |depth, role: &str, name: &str| AxRecord {
+            depth,
+            role: role.into(),
+            name: name.into(),
+            value: None,
+            reference: None,
+        };
+        let mut records = vec![
+            record(0, "RootWebArea", "Local form"),
+            record(1, "StaticText", "Skip to content"),
+        ];
+        for _ in 0..100 {
+            for letter in "Skip to content".chars() {
+                records.push(record(2, "InlineTextBox", &letter.to_string()));
+            }
+        }
+        records.push(AxRecord {
+            reference: Some("e2".into()),
+            ..record(1, "checkbox", "Request authorization")
+        });
+        let (text, truncated) = encode_ax_jsonl(&records, 12000).unwrap();
+        assert!(!truncated);
+        assert!(text.contains("Request authorization"));
+        assert!(!text.contains("InlineTextBox"));
+        assert_eq!(text.lines().count(), 3);
+    }
+
+    #[test]
+    fn ax_repeated_static_text_folds_but_distinct_text_and_controls_remain() {
+        let record = |depth, role: &str, name: &str| AxRecord {
+            depth,
+            role: role.into(),
+            name: name.into(),
+            value: None,
+            reference: None,
+        };
+        let records = [
+            record(0, "RootWebArea", "Form"),
+            record(1, "button", "Save"),
+            record(2, "StaticText", "Save"),
+            record(3, "InlineTextBox", "S"),
+            record(2, "StaticText", "Details"),
+            record(1, "checkbox", "Save"),
+        ];
+        let (text, truncated) = encode_ax_jsonl(&records, 12000).unwrap();
+        assert!(!truncated);
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2]["name"], "Details");
+        assert_eq!(rows[3]["role"], "checkbox");
     }
 
     #[test]

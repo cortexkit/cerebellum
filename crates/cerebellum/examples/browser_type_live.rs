@@ -1,6 +1,10 @@
 //! Headless, loopback-only typing probe using BrowserPlane and the production
 //! CDP driver. The example supplies its own process adapter and launch arguments;
 //! it does not exercise ProductionProcess or ProductionLaunchService.
+//!
+//! `cargo run --locked -p cerebellum --example browser_type_live -- --click-fixture`
+//! checks styled checkbox clicks, scrolled point classification, replaced refs,
+//! and compact AX snapshots on a separate loopback form in headless Chrome.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -25,6 +29,7 @@ async fn main() {
     }
     let navigate_only = args.iter().any(|arg| arg == "--navigate-only");
     let headed = args.iter().any(|arg| arg == "--headed");
+    let click_fixture = args.iter().any(|arg| arg == "--click-fixture");
     let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
     for index in 1..=runs {
@@ -34,7 +39,15 @@ async fn main() {
             "Cold run {index}/{runs}; navigate wait={}",
             if no_settle { "none" } else { "settle" }
         );
-        if let Err(error) = probe::run(no_settle, navigate_only, headed, &mut outcomes).await {
+        if let Err(error) = probe::run(
+            no_settle,
+            navigate_only,
+            headed,
+            click_fixture,
+            &mut outcomes,
+        )
+        .await
+        {
             eprintln!("FAIL: {error}");
             failures += 1;
         }
@@ -82,6 +95,10 @@ mod probe {
     use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
     use tokio::sync::mpsc;
 
+    mod click_fixture {
+        include!("support/browser_click_fixture.rs");
+    }
+
     const TOP: &str = r#"<!doctype html><meta charset="utf-8"><title>Typing probe</title>
 <label>Plain<input id="plain" aria-label="Probe plain" value="existing"></label>
 <label>Textarea<textarea id="area" aria-label="Probe textarea">existing</textarea></label>
@@ -119,6 +136,8 @@ mod probe {
                     let request = String::from_utf8_lossy(&request[..count]);
                     let body = if request.starts_with("GET /frame ") {
                         CHILD
+                    } else if request.starts_with("GET /click ") {
+                        click_fixture::HTML
                     } else if request.starts_with("GET /away ") {
                         "<!doctype html><title>Away</title><p>Another document</p>"
                     } else {
@@ -237,6 +256,15 @@ mod probe {
         // Called only after a plane request completes. This client and the driver
         // never read the pipe concurrently; probe command ids use a separate range.
         fn evaluate(&self, expression: &str) -> Result<Value, String> {
+            self.command(
+                "Runtime.evaluate",
+                json!({"expression":expression,"returnByValue":true}),
+            )?
+            .pointer("/result/result/value")
+            .cloned()
+            .ok_or_else(|| "Runtime.evaluate returned no value".into())
+        }
+        fn command(&self, method: &str, params: Value) -> Result<Value, String> {
             let mut state = self.0.lock().map_err(|_| "pipe poisoned")?;
             let session = state
                 .main_session
@@ -244,7 +272,10 @@ mod probe {
                 .ok_or("no attached main-frame session")?;
             let id = state.next_probe_id;
             state.next_probe_id += 1;
-            let mut command = serde_json::to_vec(&json!({"id":id,"sessionId":session,"method":"Runtime.evaluate","params":{"expression":expression,"returnByValue":true}})).map_err(|e| e.to_string())?;
+            let mut command = serde_json::to_vec(
+                &json!({"id":id,"sessionId":session,"method":method,"params":params}),
+            )
+            .map_err(|e| e.to_string())?;
             command.push(0);
             state
                 .writer
@@ -264,16 +295,8 @@ mod probe {
                         let message: Value =
                             serde_json::from_slice(&frame[..end]).map_err(|e| e.to_string())?;
                         if message["id"].as_u64() == Some(id) {
-                            if message.get("error").is_some()
-                                || message.pointer("/result/exceptionDetails").is_some()
-                            {
-                                return Err("Runtime.evaluate failed".into());
-                            }
                             state.queued.extend(buffer.drain(..));
-                            return message
-                                .pointer("/result/result/value")
-                                .cloned()
-                                .ok_or_else(|| "Runtime.evaluate returned no value".into());
+                            return Ok(message);
                         }
                         // Keep late driver responses and events for its transport,
                         // including the suffix of a frame it already partially read.
@@ -387,6 +410,53 @@ mod probe {
         ) -> Result<BrowserClickOutcome, ClickDriveError> {
             self.driver.click_classified(
                 context, identity, epoch, origin, expected, deadline, dispatched,
+            )
+        }
+        fn screenshot(
+            &mut self,
+            context: &str,
+            epoch: u64,
+            deadline: u64,
+            full: bool,
+        ) -> Result<
+            cerebellum::browser::navigation::BrowserScreenshotObservation,
+            NavigationDriveError,
+        > {
+            self.driver.screenshot(context, epoch, deadline, full)
+        }
+        fn point_frame_document(&mut self) -> Option<FrameDocument> {
+            self.driver.point_frame_document()
+        }
+        fn classify_point(
+            &mut self,
+            context: &str,
+            position: cerebellum::browser_session::BrowserClickPosition,
+            epoch: u64,
+            origin: &str,
+            deadline: u64,
+        ) -> Result<
+            Result<
+                NonTypeClassificationRecord,
+                cerebellum::classification::ClassificationUnavailable,
+            >,
+            NavigationDriveError,
+        > {
+            self.driver
+                .classify_point(context, position, epoch, origin, deadline)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn click_point_classified(
+            &mut self,
+            context: &str,
+            position: cerebellum::browser_session::BrowserClickPosition,
+            epoch: u64,
+            origin: &str,
+            expected: &NonTypeClassificationRecord,
+            deadline: u64,
+            dispatched: &mut dyn FnMut(BrowserInputEvent),
+        ) -> Result<BrowserClickOutcome, ClickDriveError> {
+            self.driver.click_point_classified(
+                context, position, epoch, origin, expected, deadline, dispatched,
             )
         }
         fn type_classified(
@@ -575,6 +645,7 @@ mod probe {
         no_settle: bool,
         navigate_only: bool,
         headed: bool,
+        click_fixture: bool,
         outcomes: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(), String> {
         let page = Page::start()?;
@@ -673,15 +744,19 @@ mod probe {
             )])),
         );
         let focus = headed.then(|| FocusWatch::start(scratch.0.clone()));
-        let result = exercise(
-            &planes,
-            &pipe,
-            &page.origin(),
-            no_settle,
-            navigate_only,
-            outcomes,
-        )
-        .await;
+        let result = if click_fixture {
+            click_fixture::exercise(&planes, &pipe, &page.origin()).await
+        } else {
+            exercise(
+                &planes,
+                &pipe,
+                &page.origin(),
+                no_settle,
+                navigate_only,
+                outcomes,
+            )
+            .await
+        };
         let result = match (result, focus.map(FocusWatch::finish)) {
             (Ok(()), Some(Err(focus))) => Err(focus),
             (result, Some(Ok(report))) => {
@@ -700,6 +775,11 @@ mod probe {
                         command["method"].as_str(),
                         Some(
                             "DOM.enable"
+                                | "Accessibility.getChildAXNodes"
+                                | "DOM.getFlattenedDocument"
+                                | "DOM.getNodeForLocation"
+                                | "DOM.getContentQuads"
+                                | "DOM.scrollIntoViewIfNeeded"
                                 | "Runtime.enable"
                                 | "Network.enable"
                                 | "Page.getFrameTree"

@@ -520,7 +520,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .ok_or(NavigationDriveError::CdpFailure)?;
                 return Ok((identity, frame.clone(), local));
             };
-            let params = serde_json::json!({"x":hit_test_coordinate(local.x_css).map_err(|_| NavigationDriveError::CdpFailure)?,"y":hit_test_coordinate(local.y_css).map_err(|_| NavigationDriveError::CdpFailure)?,"includeUserAgentShadowDOM":true}).as_object().unwrap().clone();
+            let visual = self.read_css_visual_viewport(&child.session_id, deadline, clock)?;
+            let params = document_hit_params(local, visual)?;
             let hit = self.command(
                 "DOM.getNodeForLocation",
                 Some(params),
