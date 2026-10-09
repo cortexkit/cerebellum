@@ -49,6 +49,7 @@ pub mod profile_custody;
 pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
+mod tool_provider;
 pub mod wire;
 
 #[cfg(target_os = "macos")]
@@ -3288,6 +3289,16 @@ async fn handle_management_request(
     facts: &AcceptedBindFacts,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
+    handle_management_request_observed(frame, writer, facts, planes, None).await
+}
+
+async fn handle_management_request_observed(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    facts: &AcceptedBindFacts,
+    planes: &Planes,
+    call_key: Option<&str>,
+) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
@@ -3504,7 +3515,35 @@ async fn handle_management_request(
                 ).await,
             }
         } else {
-            present_browser_handoff(planes, &facts.identity, origin).await
+            let held = call_key.map(|key| {
+                let principal = journal::call_records::principal_label(facts.principal.as_ref());
+                let scope = facts
+                    .scope
+                    .as_ref()
+                    .map(journal::call_records::ScopeIdentity::from_stamp)
+                    .unwrap_or_else(|| journal::call_records::ScopeIdentity {
+                        owner: principal.clone(),
+                        reference: facts.identity.conversation_key.clone(),
+                        scope_epoch: 0,
+                    });
+                (principal, key.to_owned(), scope)
+            });
+            present_browser_handoff(planes, &facts.identity, origin, held).await
+        };
+        let reply = match planes.browser.finish_reply(method, reply) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!("the handoff reply violated its result schema: {error}"),
+                )
+                .await
+            }
         };
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
     }
@@ -4576,7 +4615,12 @@ async fn capture_browser_login(
     outcome.reply
 }
 
-async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, origin: &str) -> Value {
+async fn present_browser_handoff(
+    planes: &Planes,
+    identity: &RouteIdentity,
+    origin: &str,
+    held: Option<(String, String, journal::call_records::ScopeIdentity)>,
+) -> Value {
     let deadline_ms = planes
         .browser_config
         .as_ref()
@@ -4623,12 +4667,39 @@ async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, orig
         return json!({"outcome":"internal_failure"});
     }
 
+    if let Some((principal, key, scope)) = held.clone() {
+        let calls = Arc::clone(&planes.calls);
+        let conversation = identity.conversation_key.clone();
+        let origin = origin.to_owned();
+        let saved = tokio::task::spawn_blocking(move || {
+            calls.hold_handoff(
+                &principal,
+                &key,
+                &conversation,
+                scope,
+                &origin,
+                wall_clock_ms(),
+            )
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            let _ = planes
+                .sessions
+                .resume(&identity.conversation_key, planes.lease_clock.as_ref());
+            return json!({"outcome":"internal_failure"});
+        }
+    }
+
     let sessions = planes.sessions.clone();
     let browser = Arc::clone(&planes.browser);
     let clock = Arc::clone(&planes.lease_clock);
     let identity = identity.clone();
     let route_key = identity.conversation_key.clone();
     let generation = presented.generation;
+    let calls = Arc::clone(&planes.calls);
+    let pending = held
+        .as_ref()
+        .map(|(principal, key, _)| (principal.clone(), key.clone()));
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(
@@ -4647,21 +4718,48 @@ async fn present_browser_handoff(planes: &Planes, identity: &RouteIdentity, orig
                 )
             })
             .await;
-            match polled {
-                Ok(browser_session::HandoffPollResult::Open) => {}
+            let ending = match polled {
+                Ok(browser_session::HandoffPollResult::Open) => continue,
                 Ok(browser_session::HandoffPollResult::Closed(close)) => {
-                    let _ = browser.journal_handoff_closed(&identity, &close).await;
-                    break;
+                    if close.should_journal {
+                        let _ = browser.journal_handoff_closed(&identity, &close).await;
+                    }
+                    handoff_ending(close.outcome)
                 }
-                Ok(browser_session::HandoffPollResult::Gone) | Err(_) => break,
+                Ok(browser_session::HandoffPollResult::Gone) | Err(_) => {
+                    journal::call_records::HandoffEnding::HandoffInterrupted
+                }
+            };
+            if let Some((principal, key)) = pending.clone() {
+                let calls = Arc::clone(&calls);
+                let saved = tokio::task::spawn_blocking(move || {
+                    calls.finish_handoff(&principal, &key, ending, wall_clock_ms())
+                })
+                .await;
+                if !matches!(saved, Ok(Ok(()))) {
+                    continue;
+                }
             }
+            break;
         }
     });
 
-    json!({
-        "outcome":"presented",
-        "expires_in_ms":presented.expires_in_ms,
-    })
+    if held.is_some() {
+        json!({"outcome":"login_pending", "origin":origin, "expires_in_ms":presented.expires_in_ms})
+    } else {
+        json!({"outcome":"presented", "expires_in_ms":presented.expires_in_ms})
+    }
+}
+
+fn handoff_ending(
+    outcome: browser_session::HandoffOutcome,
+) -> journal::call_records::HandoffEnding {
+    use journal::call_records::HandoffEnding;
+    match outcome {
+        browser_session::HandoffOutcome::LoginObserved => HandoffEnding::LoginObserved,
+        browser_session::HandoffOutcome::Expired => HandoffEnding::HandoffExpired,
+        browser_session::HandoffOutcome::ClosedByCaller => HandoffEnding::ClosedByCaller,
+    }
 }
 
 #[doc(hidden)]
@@ -4670,18 +4768,26 @@ pub async fn present_browser_handoff_for_test(
     identity: &RouteIdentity,
     origin: &str,
 ) -> Value {
-    present_browser_handoff(planes, identity, origin).await
+    present_browser_handoff(planes, identity, origin, None).await
 }
 
 async fn resume_browser_handoff(planes: &Planes, identity: &RouteIdentity) -> Value {
-    let close = match planes
-        .sessions
-        .resume(&identity.conversation_key, planes.lease_clock.as_ref())
-    {
-        Ok(close) => close,
-        Err(browser_session::ResumeRefusal::NoHandoff) => {
+    let calls = Arc::clone(&planes.calls);
+    let sessions = planes.sessions.clone();
+    let clock = Arc::clone(&planes.lease_clock);
+    let conversation = identity.conversation_key.clone();
+    let resumed = tokio::task::spawn_blocking(move || {
+        calls.resume_handoff(&conversation, wall_clock_ms(), || {
+            sessions.resume(&conversation, clock.as_ref())
+        })
+    })
+    .await;
+    let close = match resumed {
+        Ok(Ok(close)) => close,
+        Ok(Err(browser_session::ResumeRefusal::NoHandoff)) => {
             return json!({"outcome":"no_handoff","remedy":"browser.present"})
         }
+        Err(_) => return json!({"outcome":"internal_failure"}),
     };
     if close.should_journal {
         let _ = planes
@@ -4964,6 +5070,21 @@ async fn handle_keyed_tool_request(
             .await
         }
     };
+    if tool_provider::is_operation(object.get("name").and_then(Value::as_str).unwrap_or("")) {
+        if call_key.is_some() {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "call_key",
+                "unknown_field",
+            )
+            .await;
+        }
+        return tool_provider::serve(&object, (ver, channel, epoch, corr), writer, planes).await;
+    }
     if object.get("name").and_then(Value::as_str) == Some(call_records::WITHDRAW_OPERATION) {
         // The key a withdrawal names is `arguments.call_key`. A second key on
         // the envelope would leave it unclear which call is meant.
@@ -5124,7 +5245,9 @@ async fn handle_keyed_tool_request(
     let (proxy, mut outgoing) = mpsc::channel::<Frame>(16);
     let mut pending = PendingSettlement {
         ticket: Some(ticket),
-        observation: CallObservation::new().with_origin(origin),
+        observation: CallObservation::new()
+            .with_origin(origin)
+            .with_key(call_key),
         unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
         request: (channel, epoch, corr),
     };
@@ -5183,6 +5306,7 @@ struct CallObservation {
     /// The request's `origin`, already validated, for the audit rows the call
     /// writes. Attribution only: admission reads the route's own facts.
     origin: cerebellum_core::journal::CallOriginRecord,
+    call_key: Option<String>,
 }
 
 impl CallObservation {
@@ -5191,6 +5315,7 @@ impl CallObservation {
             dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
             commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             origin: cerebellum_core::journal::CallOriginRecord::Absent,
+            call_key: None,
         }
     }
 
@@ -5202,6 +5327,11 @@ impl CallObservation {
     fn commit_point_follows(&self) {
         self.commit_point
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn with_key(mut self, key: String) -> Self {
+        self.call_key = Some(key);
+        self
     }
 }
 
@@ -5748,7 +5878,14 @@ async fn handle_tool_request(
             "params": params,
         }))
         .expect("flat management request serializes");
-        return handle_management_request(management_frame, writer, &accepted_facts, planes).await;
+        return handle_management_request_observed(
+            management_frame,
+            writer,
+            &accepted_facts,
+            planes,
+            call.call_key.as_deref(),
+        )
+        .await;
     }
     let (name, arguments) = match translated.as_ref() {
         Some(flat_tools::FlatDispatch::Computer {

@@ -19,7 +19,9 @@
 //! The durable file (`call_records.jsonl` beside the audit journal) holds only
 //! closed, text-free facts: principal, call_key, the scope identity (from the
 //! daemon's stamp on the call's route, see [`ScopeIdentity`]), the state, the outcome code, a
-//! refusal reason code, `effect_status`, `posts_returned` and timestamps. It
+//! refusal reason code, `effect_status`, `posts_returned` and timestamps. Login
+//! handoffs also keep a canonical origin, scope and closed settlement codes,
+//! never the observations used to recognize login. It
 //! never holds arguments, element ids, labels, typed text or reply bodies: a
 //! reply to a read or a typing call can carry screen text, and this directory is
 //! backed up. The full reply is held only in a bounded in-memory cache
@@ -65,15 +67,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType, Principal};
 
+mod late;
+pub use late::{HandoffEnding, HeldHandoff};
+
 /// The file name under the journal data home.
 pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 
 /// The file version this build writes, and the newest it reads.
 ///
-/// Version 2 added the optional `origin` member to each record: the caller
-/// behind a relayed call. A version 1 file is still read, and is rewritten
-/// under the current header when it is opened.
-pub const CALL_RECORD_VERSION: u64 = 2;
+/// Version 3 adds text-free login handoff state and acknowledgements. Older
+/// files are read without changing their format until the first write.
+pub const CALL_RECORD_VERSION: u64 = 3;
 
 /// The oldest file version this build reads.
 const OLDEST_READ_CALL_RECORD_VERSION: u64 = 1;
@@ -201,6 +205,8 @@ pub struct CallRecord {
     pub started_at_ms: u64,
     #[serde(default)]
     pub settled_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HeldHandoff>,
 }
 
 impl CallRecord {
@@ -632,6 +638,7 @@ struct Entry {
     reply: Option<CachedReply>,
     reply_bytes: usize,
     cached_at: Option<Instant>,
+    late_seq: Option<u64>,
 }
 
 impl Entry {
@@ -661,6 +668,9 @@ struct Inner {
     entries: HashMap<Key, Entry>,
     cached: VecDeque<Key>,
     cached_bytes: usize,
+    incarnation: String,
+    late_heads: HashMap<String, u64>,
+    handoffs: HashMap<String, Key>,
 }
 
 /// The call records of one module process.
@@ -766,6 +776,9 @@ impl CallRecords {
                 entries: HashMap::new(),
                 cached: VecDeque::new(),
                 cached_bytes: 0,
+                incarnation: late::incarnation(),
+                late_heads: HashMap::new(),
+                handoffs: HashMap::new(),
             }),
         }
     }
@@ -806,6 +819,9 @@ impl CallRecords {
             entries: HashMap::new(),
             cached: VecDeque::new(),
             cached_bytes: 0,
+            incarnation: late::incarnation(),
+            late_heads: HashMap::new(),
+            handoffs: HashMap::new(),
         };
         let line_count = records.len();
         let mut reconciled = false;
@@ -824,6 +840,7 @@ impl CallRecords {
                     reply: None,
                     reply_bytes: 0,
                     cached_at: None,
+                    late_seq: None,
                 },
             );
         }
@@ -833,6 +850,13 @@ impl CallRecords {
         };
         {
             let mut inner = records.lock();
+            // Resolve pending handoffs only after selecting the last journal
+            // row for each call key. An older pending row may be followed by
+            // a saved result or acknowledgement that must not be overwritten.
+            reconciled |= late::reconcile(&mut inner, now_ms);
+            if let Err(error) = records.bound_late(&mut inner, now_ms) {
+                inner.broken = Some(error);
+            }
             let dropped = Self::apply_retention(&mut inner, now_ms);
             if existed && !outdated && (reconciled || dropped || line_count != inner.entries.len())
             {
@@ -854,13 +878,17 @@ impl CallRecords {
         let before = inner.entries.len();
         let horizon = now_ms.saturating_sub(RETENTION.as_millis() as u64);
         inner.entries.retain(|_, entry| {
-            entry.record.state == CallState::Started || entry.record.last_written_ms() >= horizon
+            entry.record.state == CallState::Started
+                || late::unacked(&entry.record)
+                || entry.record.last_written_ms() >= horizon
         });
         if inner.entries.len() > MAX_RECORDS {
             let mut settled: Vec<(u64, Key)> = inner
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.record.state != CallState::Started)
+                .filter(|(_, entry)| {
+                    entry.record.state != CallState::Started && !late::unacked(&entry.record)
+                })
                 .map(|(key, entry)| (entry.record.last_written_ms(), key.clone()))
                 .collect();
             settled.sort();
@@ -1025,6 +1053,7 @@ impl CallRecords {
             origin,
             started_at_ms: now_ms,
             settled_at_ms: None,
+            handoff: None,
         };
         if let Err(error) = self.write(&mut inner, &record, now_ms) {
             return Begin::Unavailable(error);
@@ -1038,6 +1067,7 @@ impl CallRecords {
                 reply: None,
                 reply_bytes: 0,
                 cached_at: None,
+                late_seq: None,
             },
         );
         Begin::Execute(CallTicket { key })
@@ -1048,12 +1078,20 @@ impl CallRecords {
     ///
     /// A failed write leaves `started` on disk, which a later start reads as
     /// `unknown`: never re-run, only less informative.
-    pub fn settle(&self, ticket: CallTicket, settlement: Settlement, now_ms: u64) {
+    pub fn settle(&self, ticket: CallTicket, mut settlement: Settlement, now_ms: u64) {
         let mut guard = self.lock();
         let inner = &mut *guard;
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
+        if let Some(result) = late::settled_result(&entry.record) {
+            // A fast resume may settle before the initial held reply is cached.
+            // Preserve that ending instead of caching an already-obsolete hold.
+            settlement.state = CallState::Replied;
+            settlement.outcome = entry.record.outcome.clone();
+            settlement.reply.frame.body =
+                serde_json::to_vec(&result).expect("handoff result serializes");
+        }
         entry.record.state = settlement.state;
         entry.record.outcome = settlement.outcome;
         entry.record.refusal_reason = settlement.refusal_reason;
@@ -1293,16 +1331,16 @@ mod tests {
 
         let newer = InMemoryCallRecordStorage::new();
         newer
-            .replace(b"{\"format\":\"call-records\",\"version\":3}\n")
+            .replace(b"{\"format\":\"call-records\",\"version\":4}\n")
             .unwrap();
         let records = CallRecords::open(Box::new(newer.clone()), 0);
         assert!(matches!(
             records.begin("direct", "k", "c", 0),
-            Begin::Unavailable(CallRecordError::UnknownVersion(3))
+            Begin::Unavailable(CallRecordError::UnknownVersion(4))
         ));
         assert_eq!(
             newer.contents().unwrap(),
-            b"{\"format\":\"call-records\",\"version\":3}\n",
+            b"{\"format\":\"call-records\",\"version\":4}\n",
             "a newer build's file was overwritten"
         );
     }
@@ -1391,11 +1429,32 @@ mod tests {
         );
     }
 
-    /// The first record this build writes moves a version 1 file to version
-    /// 2: rewritten under the current header with every earlier record, then
-    /// the new one, and the floor raised to 2 before the write.
     #[test]
-    fn the_first_recorded_call_moves_a_version_1_file_to_version_2() {
+    fn a_version_2_file_is_not_upgraded_by_startup_or_a_late_pull() {
+        let (_scratch, path, floor) = v1_on_disk("v2-no-call");
+        let v2 = V1_FILE.replacen("\"version\":1", "\"version\":2", 1);
+        fs::write(&path, &v2).unwrap();
+        let records = open_on_disk(&path, &floor, 30);
+        let reply = records
+            .late_results(
+                "reserved:prefrontal-core",
+                &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+                40,
+            )
+            .unwrap();
+        assert!(reply.entries.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), v2);
+        assert!(
+            !floor.exists(),
+            "a read-only start prevented rollback to version 2"
+        );
+    }
+
+    /// The first recorded call rewrites the old records under a version 3
+    /// header, then appends the new record. Raising the floor before writing
+    /// prevents staging an older reader over data it cannot understand.
+    #[test]
+    fn the_first_recorded_call_moves_a_version_1_file_to_version_3() {
         let (_scratch, path, floor) = v1_on_disk("v1-one-call");
         let records = open_on_disk(&path, &floor, 30);
         let _ticket = executed(records.begin_attributed(
@@ -1412,7 +1471,7 @@ mod tests {
         let mut lines = written.lines();
         assert_eq!(
             lines.next(),
-            Some("{\"format\":\"call-records\",\"version\":2}"),
+            Some("{\"format\":\"call-records\",\"version\":3}"),
             "{written}"
         );
         let records: Vec<CallRecord> = lines
@@ -1438,7 +1497,7 @@ mod tests {
             Some((CallState::Started, CallOriginRecord::OriginInvalid))
         );
         let floors = cerebellum_core::format_floor::read_floors(&floor).unwrap();
-        assert_eq!(floors.get("call-records"), Some(&2));
+        assert_eq!(floors.get("call-records"), Some(&3));
     }
 
     #[test]

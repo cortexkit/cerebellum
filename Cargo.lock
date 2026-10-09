@@ -58,6 +58,7 @@ dependencies = [
  "cortexkit-resource-busy",
  "cortexkit-role-tool-provider",
  "cortexkit-test-support",
+ "getrandom",
  "serde",
  "serde_json",
  "sha2",

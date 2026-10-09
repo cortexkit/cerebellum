@@ -48,6 +48,9 @@ pub const BROWSER_STATUS: &str = "browser.status";
 /// Declares daemon-stamped scope admission support so route openers can discover it.
 pub const SCOPE_ADMISSION_CAPABILITY: &str = "cerebellum-scope-admission/v1";
 
+/// Lets route openers discover that keyed calls can settle after their reply.
+pub const LATE_RESULTS_CAPABILITY: &str = "late-results/v1";
+
 pub fn browser_wire_tools() -> Vec<Tool> {
     crate::browser::tool_definitions()
         .into_iter()
@@ -432,6 +435,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
             provides: vec![
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
+                LATE_RESULTS_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
