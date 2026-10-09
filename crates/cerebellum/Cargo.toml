@@ -48,6 +48,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
+# The tool-provider/v1 contract supplies the JSON types for results delivered
+# after a login handoff and the catalog schema validators used by our tests.
+# Pin both to one release so production replies and test checks cannot drift.
+cortexkit-role-tool-provider = "=0.5.2"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
@@ -73,13 +77,6 @@ subc-daemon = { workspace = true }
 # discarded before it exists. Both crates are already in the graph via subc-daemon.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-# The tool-provider/v1 contract's own flatness check, run on the flat tools'
-# schemas so they are held to the contract a host serving them enforces rather
-# than to a copy of it. Taken from crates.io at a fixed version, like the test
-# daemon, so this repo's lock moves when it chooses to absorb a release rather
-# than whenever commons publishes one. Its wire types share the exact registry
-# release selected by the workspace.
-cortexkit-role-tool-provider = "=0.5.0"
 cortexkit-test-support = "=0.1.2"
 
 # Examples carry their own tests, and cargo defaults an example target to
