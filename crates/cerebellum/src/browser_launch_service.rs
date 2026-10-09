@@ -4219,13 +4219,15 @@ mod orphan_recovery_tests {
         };
         use crate::elicit::AskOutcome;
         use crate::launch_recovery::{
-            ClearFailure, ClearRefusal, ProcessFact, ProcessTable, ProcessUsers, Unreadable,
+            ClearFailure, ClearRefusal, ProcessFact, ProcessTable, ProcessUsers,
+            SystemProcessTable, Unreadable,
         };
         use crate::management::{ClearSettlement, ManagementPlane, TargetResolver};
         use cerebellum_core::identity::{
             AcceptedBindFacts, RouteIdentity, RouteSurface, SessionKind,
         };
         use cerebellum_core::journal::InMemoryJournalStorage;
+        use std::collections::{HashMap, HashSet};
 
         struct NoTargets;
 
@@ -4257,9 +4259,88 @@ mod orphan_recovery_tests {
             }
         }
 
-        /// The real process table plus one planted process, whose users and
-        /// arguments read as the test says.
+        /// Read real process facts only for this test binary's descendants.
+        /// Unrelated host processes can temporarily hide their arguments during
+        /// exec, and must not decide tests about the processes spawned here.
+        struct ScopedTable<T = SystemProcessTable>(T);
+
+        impl ScopedTable {
+            fn system() -> Self {
+                Self(SystemProcessTable)
+            }
+        }
+
+        impl<T: ProcessTable> ProcessTable for ScopedTable<T> {
+            fn this_user(&self) -> Option<u32> {
+                self.0.this_user()
+            }
+
+            fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
+                // Parent pids do not require reading command lines. Keep forks
+                // as well as direct children, even when a shell has not execed.
+                let output = std::process::Command::new("/bin/ps")
+                    .args(["-A", "-o", "pid=,ppid="])
+                    .output()
+                    .map_err(|_| Unreadable)?;
+                if !output.status.success() {
+                    return Err(Unreadable);
+                }
+                let parents = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|line| {
+                        let mut fields = line.split_whitespace();
+                        let pid = fields
+                            .next()
+                            .ok_or(Unreadable)?
+                            .parse()
+                            .map_err(|_| Unreadable)?;
+                        let parent = fields
+                            .next()
+                            .ok_or(Unreadable)?
+                            .parse()
+                            .map_err(|_| Unreadable)?;
+                        Ok((pid, parent))
+                    })
+                    .collect::<Result<HashMap<u32, u32>, Unreadable>>()?;
+                let root = std::process::id();
+                let mut descendants = HashSet::from([root]);
+                loop {
+                    let before = descendants.len();
+                    for (pid, parent) in &parents {
+                        if descendants.contains(parent) {
+                            descendants.insert(*pid);
+                        }
+                    }
+                    if descendants.len() == before {
+                        break;
+                    }
+                }
+                let mut pids = self.0.process_ids()?;
+                pids.retain(|pid| *pid != root && descendants.contains(pid));
+                Ok(pids)
+            }
+
+            fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
+                self.0.users(pid)
+            }
+
+            fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
+                self.0.arguments(pid)
+            }
+
+            fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
+                self.0.executable(pid)
+            }
+
+            fn host_name(&self) -> Option<String> {
+                self.0.host_name()
+            }
+        }
+
+        /// The scoped real process table plus one planted process, whose users
+        /// and arguments read as the test says, even outside the descendant set.
         struct PlantedTable {
+            pid: u32,
             users: ProcessFact<ProcessUsers>,
             arguments: ProcessFact<Vec<OsString>>,
         }
@@ -4269,13 +4350,12 @@ mod orphan_recovery_tests {
 
         impl PlantedTable {
             fn this_user() -> u32 {
-                crate::launch_recovery::SystemProcessTable
-                    .this_user()
-                    .expect("this user")
+                ScopedTable::system().this_user().expect("this user")
             }
 
             fn run_by(uid: u32, arguments: ProcessFact<Vec<OsString>>) -> Self {
                 Self {
+                    pid: PLANTED_PID,
                     users: ProcessFact::Read(ProcessUsers { uid, zombie: false }),
                     arguments,
                 }
@@ -4288,33 +4368,33 @@ mod orphan_recovery_tests {
             }
 
             fn process_ids(&self) -> Result<Vec<u32>, Unreadable> {
-                let mut pids = crate::launch_recovery::SystemProcessTable.process_ids()?;
-                pids.push(PLANTED_PID);
+                let mut pids = ScopedTable::system().process_ids()?;
+                pids.push(self.pid);
                 Ok(pids)
             }
 
             fn users(&self, pid: u32) -> ProcessFact<ProcessUsers> {
-                if pid == PLANTED_PID {
+                if pid == self.pid {
                     self.users.clone()
                 } else {
-                    crate::launch_recovery::SystemProcessTable.users(pid)
+                    ScopedTable::system().users(pid)
                 }
             }
 
             fn arguments(&self, pid: u32) -> ProcessFact<Vec<OsString>> {
-                if pid == PLANTED_PID {
+                if pid == self.pid {
                     self.arguments.clone()
                 } else {
-                    crate::launch_recovery::SystemProcessTable.arguments(pid)
+                    ScopedTable::system().arguments(pid)
                 }
             }
 
             fn executable(&self, pid: u32) -> Result<Option<PathBuf>, Unreadable> {
-                crate::launch_recovery::SystemProcessTable.executable(pid)
+                ScopedTable::system().executable(pid)
             }
 
             fn host_name(&self) -> Option<String> {
-                crate::launch_recovery::SystemProcessTable.host_name()
+                ScopedTable::system().host_name()
             }
         }
 
@@ -4489,7 +4569,7 @@ mod orphan_recovery_tests {
         fn retained(reason: RecoveryPendingReason) -> Fixture {
             let profile_directory = TestRoot::new("clear-profile");
             let storage = InMemoryJournalStorage::new();
-            let service = ProductionLaunchService::open_with_recovery(
+            let mut service = ProductionLaunchService::open_with_recovery(
                 test_config(),
                 ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
                 |_, profile_root| {
@@ -4530,6 +4610,9 @@ mod orphan_recovery_tests {
                 .profile_root
                 .resolve()
                 .expect("scratch profile root");
+            Arc::get_mut(&mut service.recovery)
+                .expect("sole recovery owner")
+                .process_table = Arc::new(ScopedTable::system());
             let plane = ManagementPlane::new(Arc::new(NoTargets));
             assert!(plane
                 .launch_recovery_registry()
@@ -4599,14 +4682,13 @@ mod orphan_recovery_tests {
                 naming.push(directory);
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
-                    let namers: Vec<u32> = crate::launch_recovery::user_process_arguments(
-                        &crate::launch_recovery::SystemProcessTable,
-                    )
-                    .expect("read the process table")
-                    .into_iter()
-                    .filter(|(_, arguments)| arguments.contains(&naming))
-                    .map(|(pid, _)| pid)
-                    .collect();
+                    let namers: Vec<u32> =
+                        crate::launch_recovery::user_process_arguments(&ScopedTable::system())
+                            .expect("read the process table")
+                            .into_iter()
+                            .filter(|(_, arguments)| arguments.contains(&naming))
+                            .map(|(pid, _)| pid)
+                            .collect();
                     if namers.len() >= count {
                         return namers;
                     }
@@ -4663,7 +4745,7 @@ mod orphan_recovery_tests {
             // Wait until it is really sleeping: alive, and not killed at start.
             std::thread::sleep(Duration::from_millis(300));
             assert_eq!(
-                crate::launch_recovery::SystemProcessTable
+                ScopedTable::system()
                     .executable(child.id())
                     .expect("read the sleeper"),
                 Some(executable.canonicalize().expect("canonical sleeper path")),
@@ -4695,9 +4777,7 @@ mod orphan_recovery_tests {
         }
 
         fn this_host() -> String {
-            crate::launch_recovery::SystemProcessTable
-                .host_name()
-                .expect("host name")
+            ScopedTable::system().host_name().expect("host name")
         }
 
         #[test]
@@ -4754,6 +4834,37 @@ mod orphan_recovery_tests {
                 .open_launch_recovery_clear(PROJECT, Some(SEQUENCE + 1), true)
                 .await;
             assert_eq!(reply["reason"], "not_retained", "{reply}");
+        }
+
+        #[test]
+        fn an_unreadable_foreign_process_is_ignored_but_a_test_child_is_read() {
+            let directory = TestRoot::new("scoped-processes");
+            let namer = ProfileNamer::sleeping(&directory.0);
+            // PID 1 is outside this test binary's descendants. Model it
+            // as this user's process with unreadable arguments: an unscoped
+            // read cannot rule out a browser and must refuse the clear.
+            let foreign = PlantedTable {
+                pid: 1,
+                users: ProcessFact::Read(ProcessUsers {
+                    uid: PlantedTable::this_user(),
+                    zombie: false,
+                }),
+                arguments: ProcessFact::Unreadable,
+            };
+            assert!(crate::launch_recovery::user_process_arguments(&foreign).is_err());
+            let scoped = ScopedTable(foreign);
+            let processes = crate::launch_recovery::user_process_arguments(&scoped)
+                .expect("only owned processes are read");
+            assert!(!processes.iter().any(|(pid, _)| *pid == 1));
+            let arguments = &processes
+                .iter()
+                .find(|(pid, _)| *pid == namer.shell.id())
+                .expect("the test's shell is still read")
+                .1;
+            assert!(arguments.contains(&OsString::from(format!(
+                "--user-data-dir={}",
+                directory.0.display()
+            ))));
         }
 
         #[tokio::test]
@@ -4866,6 +4977,7 @@ mod orphan_recovery_tests {
         async fn a_clear_refuses_when_a_process_s_user_cannot_be_read() {
             for users in [ProcessFact::NotPermitted, ProcessFact::Unreadable] {
                 let fixture = retained_reading(PlantedTable {
+                    pid: PLANTED_PID,
                     users,
                     arguments: ProcessFact::NotPermitted,
                 });
