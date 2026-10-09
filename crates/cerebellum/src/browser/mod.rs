@@ -4315,6 +4315,26 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"required":["origin"],"additionalProperties":false}),
             result_schema: crate::login_import::reply_schema(browser_launch_result_schema()),
         },
+        BrowserToolDefinition {
+            name: crate::management::PRESENT,
+            description: "Hand the route-owned browser to the person for login.",
+            request_schema: json!({"type":"object","properties":{"origin":{"type":"string"}},"required":["origin"],"additionalProperties":false}),
+            result_schema: json!({"type":"object","required":["outcome"],"additionalProperties":false,"properties":{
+                "outcome":{"type":"string","enum":["presented","login_pending","login_observed","handoff_expired","handoff_interrupted","closed_by_caller","no_session","origin_mismatch","handoff_open","present_failed","internal_failure"]},
+                "origin":{"type":"string"},"expires_in_ms":{"type":"integer"},
+                "current_origin":{"type":"string"},"remedy":{"type":"string"},"error_text":{"type":"string"}
+            }}),
+        },
+        BrowserToolDefinition {
+            name: crate::management::RESUME,
+            description: "Take back a login handoff and report its ending.",
+            request_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            result_schema: json!({"type":"object","required":["outcome"],"additionalProperties":false,"properties":{
+                "outcome":{"type":"string","enum":["resumed","no_handoff","internal_failure"]},
+                "handoff":{"type":"string","enum":["login_observed","expired","closed_by_caller"]},
+                "origin":{"type":"string"},"remedy":{"type":"string"}
+            }}),
+        },
         // Served on the management surface and reached as the flat tool's
         // revoke_access action; listed for the same closed-schema boundary.
         BrowserToolDefinition {
@@ -4347,6 +4367,12 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
 pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
     browser_tool_definitions()
         .into_iter()
+        .filter(|definition| {
+            !matches!(
+                definition.name,
+                crate::management::PRESENT | crate::management::RESUME
+            )
+        })
         .filter(|definition| BrowserCapability::parse(definition.name).is_some())
         .map(|definition| {
             (

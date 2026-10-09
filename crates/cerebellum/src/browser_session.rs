@@ -2081,8 +2081,15 @@ impl BrowserSessions {
             let Ok(mut meta) = cell.meta() else {
                 return HandoffPollResult::Gone;
             };
-            let Some(HandoffState::Open(handoff)) = meta.handoff.as_ref() else {
-                return HandoffPollResult::Gone;
+            let handoff = match meta.handoff.as_ref() {
+                Some(HandoffState::Open(handoff)) => handoff,
+                Some(HandoffState::Closed(closed)) if closed.handoff.generation == generation => {
+                    // Another caller may have noticed the deadline first. The
+                    // poller still needs the handoff's closed result, but must
+                    // not journal that result twice.
+                    return HandoffPollResult::Closed(handoff_close(closed, false));
+                }
+                _ => return HandoffPollResult::Gone,
             };
             if handoff.generation != generation {
                 return HandoffPollResult::Gone;
