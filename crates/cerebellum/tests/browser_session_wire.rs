@@ -5383,6 +5383,34 @@ async fn allowed_keyed_navigation(
 }
 
 #[tokio::test]
+async fn keyed_call_consent_card_carries_the_dispatcher_key() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 801, "pf:card-link"),
+    )
+    .await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    assert_eq!(body(&question)["params"]["call_key"], "pf:card-link");
+    answer_browser(&planes, &tx, &question, "deny").await;
+    assert_eq!(consent_frame(&mut rx).await.header.corr, 801);
+}
+
+#[tokio::test]
+async fn unkeyed_call_consent_card_omits_call_key() {
+    let (planes, _launcher) = blocking_grant_fixture().await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let question = exchange(&planes, &tx, &mut rx, blocking_navigation(1)).await;
+    assert_eq!(question.header.ty, FrameType::Request);
+    assert!(body(&question)["params"].get("call_key").is_none());
+    answer_browser(&planes, &tx, &question, "deny").await;
+    assert_eq!(consent_frame(&mut rx).await.header.ty, FrameType::Response);
+}
+
+#[tokio::test]
 async fn a_resend_after_completion_returns_the_recorded_reply_without_executing() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);

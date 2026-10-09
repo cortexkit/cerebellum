@@ -22,6 +22,12 @@ use tokio::sync::{mpsc, oneshot};
 tokio::task_local! {
     // Detached pending replies have no route guard; inline asks inherit this scope.
     pub(crate) static ROUTE_GUARD: Arc<cerebellum_core::dispatch::InFlightGuard>;
+    /// The validated key identifying the tool call that initiated this request.
+    pub(crate) static CALL_KEY: String;
+}
+
+pub(crate) fn current_call_key() -> Option<String> {
+    CALL_KEY.try_with(Clone::clone).ok()
 }
 
 /// How a question ended.
@@ -143,8 +149,23 @@ impl Elicitor {
         writer: &mpsc::Sender<Frame>,
         channel: u16,
         epoch: u32,
+        body: Value,
+        deadline: Duration,
+    ) -> AskOutcome {
+        self.ask_for_call(writer, channel, epoch, body, deadline, current_call_key())
+            .await
+    }
+
+    /// A detached consent waiter captures its originating call's key before
+    /// spawning: Tokio task-local values are not inherited by spawned tasks.
+    pub(crate) async fn ask_for_call(
+        &self,
+        writer: &mpsc::Sender<Frame>,
+        channel: u16,
+        epoch: u32,
         mut body: Value,
         deadline: Duration,
+        call_key: Option<String>,
     ) -> AskOutcome {
         // Refuse to register or send any consent question on a flow route (see
         // `AcceptedBindFacts::flow_id`), including questions from detached
@@ -168,6 +189,11 @@ impl Elicitor {
         // by each question builder so the number on the wire is the number
         // the timeout below uses, not a copy that can drift.
         if let Some(params) = body.get_mut("params").and_then(Value::as_object_mut) {
+            // Prefrontal uses this link to avoid telling the agent to retry a
+            // call whose final reply already includes the person's answer.
+            if let Some(call_key) = call_key {
+                params.insert("call_key".to_string(), Value::String(call_key));
+            }
             let deadline_field = if params.get("kind").and_then(Value::as_str) == Some("consent") {
                 "expires_in_ms"
             } else {
