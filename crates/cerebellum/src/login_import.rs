@@ -505,7 +505,17 @@ pub(crate) fn import_question(
             )
         })
         .collect();
-    grants.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
+    let mut hand_off_step = format!("Call browser_use with action present for {origin}.");
+    if hand_off_step.chars().count() > 200 {
+        // When the origin makes the instruction exceed the display limit,
+        // refer to the origin recorded in the consent card's scope instead.
+        hand_off_step =
+            "Call browser_use with action present for the origin in this consent card's scope."
+                .to_string();
+    }
+    grants.push(
+        ConsentOption::grant("hand_off", "I'll sign in myself").with_next_step(hand_off_step),
+    );
     let mut facts: Vec<_> = presence
         .iter()
         .map(|b| {
@@ -515,6 +525,7 @@ pub(crate) fn import_question(
                     Some("different_keychain_item") => "can't be copied (different keychain)",
                     Some("session_only") if b.session_rows > 0 => "only a temporary login is saved",
                     Some("session_only") => "nothing saved",
+                    Some("os_protected") => "macOS protects this browser's data",
                     Some("unreadable") => "can't read saved logins",
                     Some("safari_transfer_unsupported") => "can't be copied from Safari",
                     _ if b.transfer == "available" => "login available",
@@ -628,10 +639,12 @@ fn discover_presence(
             .application_support
             .join(&source.data_directory)
             .join(COOKIES_RELATIVE_PATH);
-        if !store.exists() {
+        let Some(result) = read_existing_store(&store, |store| {
+            chromium_presence(&settings.sqlite_program, store, domains)
+        }) else {
             continue;
-        }
-        match chromium_presence(&settings.sqlite_program, &store, domains) {
+        };
+        match result {
             Ok((persistent_rows, session_rows)) => {
                 let (transfer, reason) = if persistent_rows == 0 {
                     ("unsupported", Some("session_only"))
@@ -649,19 +662,19 @@ fn discover_presence(
                     reason,
                 });
             }
-            Err(_) => presence.push(BrowserPresence {
+            Err(error) => presence.push(BrowserPresence {
                 browser: source.id.to_string(),
                 name: source.display_name.to_string(),
                 persistent_rows: 0,
                 session_rows: 0,
                 transfer: "unsupported",
-                reason: Some("unreadable"),
+                reason: Some(store_read_failure_reason(&error)),
             }),
         }
     }
 
-    if settings.safari_store.exists() {
-        match copied_safari_domains(&settings.safari_store) {
+    if let Some(result) = read_existing_store(&settings.safari_store, copied_safari_domains) {
+        match result {
             Ok(found) => {
                 let persistent_rows = found
                     .iter()
@@ -678,17 +691,38 @@ fn discover_presence(
                     });
                 }
             }
-            Err(_) => presence.push(BrowserPresence {
+            Err(error) => presence.push(BrowserPresence {
                 browser: "safari".to_string(),
                 name: "Safari".to_string(),
                 persistent_rows: 0,
                 session_rows: 0,
                 transfer: "unsupported",
-                reason: Some("unreadable"),
+                reason: Some(store_read_failure_reason(&error)),
             }),
         }
     }
     presence
+}
+
+fn read_existing_store<T>(
+    store: &Path,
+    read: impl FnOnce(&Path) -> io::Result<T>,
+) -> Option<io::Result<T>> {
+    // Path::exists hides permission errors as absence. A protected profile must
+    // remain visible in the card, even when macOS denies directory traversal.
+    match fs::metadata(store) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(error)),
+        Ok(_) => Some(read(store)),
+    }
+}
+
+fn store_read_failure_reason(error: &io::Error) -> &'static str {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        "os_protected"
+    } else {
+        "unreadable"
+    }
 }
 
 fn chromium_presence(
@@ -2249,7 +2283,93 @@ mod tests {
         assert_eq!(plan.presence().len(), 2);
         assert_eq!(plan.presence()[0].transfer, "available");
         assert_eq!(plan.presence()[1].reason, Some("unreadable"));
+        let card = plan.question("unreadable-card", "agent");
+        assert_eq!(
+            card["params"]["facts"][1]["value"],
+            "can't read saved logins"
+        );
         assert_eq!(plan.decide(Some("transfer:chrome")).outcome, "transferred");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_stores_are_os_protected_without_invoking_sqlite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new("os-protected");
+        let application_support = root.path().join("Application Support");
+        let browser = source("chrome", "Google Chrome", root.path());
+        let store = cookie_store(&application_support, &browser);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, b"fixture store").unwrap();
+        let safari_store = root.path().join("Safari.binarycookies");
+        fs::write(&safari_store, b"fixture store").unwrap();
+        let marker = root.path().join("sqlite-was-invoked");
+        let reader = root.path().join("sqlite-reader");
+        fs::write(
+            &reader,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&reader, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&safari_store, fs::Permissions::from_mode(0o000)).unwrap();
+        for path in [&store, &safari_store] {
+            assert_eq!(
+                fs::File::open(path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "fixture must exercise a real denied read, not just mode bits"
+            );
+        }
+
+        let settings = ImportSettings::for_test(
+            reader.clone(),
+            application_support,
+            safari_store,
+            vec![browser.clone()],
+        );
+        let prepare = |settings| {
+            let PreparedImport::Ready(plan) = prepare_import(
+                "https://x.com",
+                "project-1",
+                &browser.executable,
+                DurableProfileLocation {
+                    managed_root: root.path().join("managed"),
+                    profile_directory: root.path().join("managed/profile"),
+                },
+                settings,
+            ) else {
+                panic!("supported fixture browser");
+            };
+            plan
+        };
+        let plan = prepare(settings.clone());
+        assert_eq!(plan.presence().len(), 2);
+        for presence in plan.presence() {
+            assert_eq!(presence.reason, Some("os_protected"));
+            assert_eq!(presence.transfer, "unsupported");
+        }
+        let card = plan.question("protected-card", "agent");
+        for fact in card["params"]["facts"].as_array().unwrap().iter().take(2) {
+            assert_eq!(fact["value"], "macOS protects this browser's data");
+        }
+        assert!(!marker.exists(), "SQLite must not run on a denied store");
+
+        // A traversally denied directory must not hide an installed browser.
+        fs::set_permissions(store.parent().unwrap(), fs::Permissions::from_mode(0o000)).unwrap();
+        let plan = prepare(settings.clone());
+        fs::set_permissions(store.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(plan.presence()[0].reason, Some("os_protected"));
+        assert!(
+            !marker.exists(),
+            "SQLite must not run on a denied directory"
+        );
+
+        // The marker observes a real child invocation once the store is readable.
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = prepare(settings);
+        assert_eq!(plan.presence()[0].reason, Some("unreadable"));
+        assert!(marker.exists(), "the SQLite invocation control did not run");
     }
 
     #[test]

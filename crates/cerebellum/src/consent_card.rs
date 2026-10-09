@@ -26,12 +26,15 @@ pub(crate) struct ConsentOption {
     id: String,
     label: String,
     effect: Effect,
-    /// A sentence under the label saying what choosing it allows. Core's
-    /// option carries only `id`, `label`, `effect` and this, so anything else
-    /// an option means (a ceiling, a duration) is kept by the asker against
-    /// the option id rather than sent.
+    /// A sentence shown under the label explaining what choosing it allows.
+    /// The code asking for consent records the grant's ceiling and duration by
+    /// option id; display text does not decide what is authorized.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// What the agent should do after a late answer instead of retrying the
+    /// original call. Omitted when retrying that call is the right next step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -48,10 +51,15 @@ impl ConsentOption {
             label: label.into(),
             effect: Effect::Grant,
             detail: None,
+            next_step: None,
         }
     }
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+    pub fn with_next_step(mut self, next_step: impl Into<String>) -> Self {
+        self.next_step = Some(next_step.into());
         self
     }
     pub fn decline(id: impl Into<String>, label: impl Into<String>) -> DeclineOption {
@@ -248,7 +256,8 @@ const CORE_REQUIRED_KEYS: [&str; 11] = [
     "expires_in_ms",
 ];
 #[cfg(test)]
-const CORE_OPTIONAL_KEYS: [&str; 9] = [
+const CORE_OPTIONAL_KEYS: [&str; 10] = [
+    "call_key",
     "dedup_key",
     "scope",
     "duration",
@@ -314,9 +323,12 @@ fn core_decode_strings(value: &Value, keys: &[&str], optional: bool) -> Result<(
 /// mirrors `ConsentRequest::decode` (serde with `deny_unknown_fields` on every
 /// struct) and `ConsentRequest::validate`, in their order, from prefrontal's
 /// `crates/prefrontal-core-store/src/elicitation.rs` at commit
-/// d15391996594ce24ba53aa42fd1c31bb85922745. Refusal codes are core's, and
-/// each message contains core's wording; serde's own wording is only
-/// approximated (`unknown field `x``, `missing field `x``).
+/// d15391996594ce24ba53aa42fd1c31bb85922745. The mirror also accepts the optional
+/// `call_key` (link to a tool call) and option `next_step` (late-answer
+/// instruction) introduced by prefrontal main a59fa3ad1.
+/// Refusal codes are core's, and each message contains core's wording;
+/// serde's own wording is only approximated (`unknown field `x``,
+/// `missing field `x``).
 ///
 /// It is the only place that contract is written down in this crate. It is
 /// held to Prefrontal's published request vectors (see
@@ -348,6 +360,7 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
     core_decode_strings(
         params,
         &[
+            "call_key",
             "dedup_key",
             "args_digest",
             "session_ref",
@@ -367,9 +380,14 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
         return Err(core_invalid("invalid type: `options` is not a sequence"));
     };
     for option in options {
-        core_decode_struct(option, "an option", &["id", "label", "effect"], &["detail"])?;
+        core_decode_struct(
+            option,
+            "an option",
+            &["id", "label", "effect"],
+            &["detail", "next_step"],
+        )?;
         core_decode_strings(option, &["id", "label", "effect"], false)?;
-        core_decode_strings(option, &["detail"], true)?;
+        core_decode_strings(option, &["detail", "next_step"], true)?;
     }
     let target = &params["target"];
     core_decode_struct(target, "target", &["kind", "label"], &[])?;
@@ -501,6 +519,35 @@ mod tests {
     fn default_is_the_decline_not_a_grant() {
         let body = card(vec![ConsentOption::grant("allow", "Allow")]).render("default");
         assert_contract(&body, &["allow", "deny"], "deny");
+    }
+
+    #[test]
+    fn call_key_and_next_step_are_optional_strings_in_the_closed_card_schema() {
+        let body = card(vec![ConsentOption::grant("allow", "Allow").with_next_step(
+            "Call browser_use with action present for https://example.test.",
+        )])
+        .render("schema");
+        let mut params = body["params"].clone();
+        params["call_key"] = json!("pf:schema");
+        assert_eq!(core_verdict(&params), Ok(()));
+        params["call_key"] = json!(7);
+        assert!(core_verdict(&params)
+            .unwrap_err()
+            .message
+            .contains("call_key"));
+        params["call_key"] = json!("pf:schema");
+        params["options"][0]["next_step"] = json!(false);
+        assert!(core_verdict(&params)
+            .unwrap_err()
+            .message
+            .contains("next_step"));
+        params["options"][0]["next_step"] = Value::Null;
+        assert_eq!(core_verdict(&params), Ok(()));
+        params["options"][0]["unknown"] = json!("still refused");
+        assert!(core_verdict(&params)
+            .unwrap_err()
+            .message
+            .contains("unknown field"));
     }
 
     /// Prefrontal's consent request vectors, copied byte for byte from
@@ -662,11 +709,31 @@ mod every_card_kind {
     /// `expires_in_ms` that `Elicitor::ask` writes from `deadline` in place of
     /// the builder's.
     async fn as_sent(body: Value, deadline: Duration) -> Value {
+        let unkeyed = send_card(body.clone(), deadline, None).await;
+        assert!(
+            unkeyed.get("call_key").is_none(),
+            "a keyless card gained a key"
+        );
+        let mut keyed = send_card(body, deadline, Some("pf:card-contract".into())).await;
+        assert_eq!(keyed["call_key"], "pf:card-contract");
+        assert_core_accepts("a keyed card", &keyed);
+        keyed.as_object_mut().unwrap().remove("call_key");
+        assert_eq!(keyed, unkeyed, "the call key changed the rest of the card");
+        unkeyed
+    }
+
+    async fn send_card(body: Value, deadline: Duration, call_key: Option<String>) -> Value {
         let elicitor = Arc::new(Elicitor::new());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let asking = {
             let elicitor = Arc::clone(&elicitor);
-            tokio::spawn(async move { elicitor.ask(&tx, 1, 1, body, deadline).await })
+            tokio::spawn(async move {
+                let ask = elicitor.ask(&tx, 1, 1, body, deadline);
+                match call_key {
+                    Some(key) => crate::elicit::CALL_KEY.scope(key, ask).await,
+                    None => ask.await,
+                }
+            })
         };
         let frame = rx.recv().await.expect("the card is sent");
         asking.abort();
@@ -690,6 +757,16 @@ mod every_card_kind {
             params["requestedSchema"].is_object(),
             "{kind}: no requestedSchema"
         );
+        for option in params["options"].as_array().unwrap() {
+            if let Some(step) = option.get("next_step") {
+                let step = step.as_str().expect("next_step is plain text");
+                assert!(!step.trim().is_empty() && step.chars().count() <= 200);
+                assert!(
+                    !step.contains(['\n', '\r']),
+                    "next_step must be one sentence"
+                );
+            }
+        }
     }
 
     fn assert_card(kind: &str, params: &Value, urgency: &str, scope: Value) {
@@ -905,7 +982,36 @@ mod every_card_kind {
             let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
             assert_card(case, &params, "high", json!({"origin": "https://x.com"}));
             assert_login_card_life(case, &params);
+            for option in params["options"].as_array().unwrap() {
+                if option["id"] == "hand_off" {
+                    assert_eq!(
+                        option["next_step"],
+                        "Call browser_use with action present for https://x.com."
+                    );
+                } else {
+                    assert!(option.get("next_step").is_none());
+                }
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn login_import_hand_off_for_a_long_origin_keeps_a_bounded_next_step() {
+        let origin = format!(
+            "https://{}.{}.{}.test",
+            "a".repeat(60),
+            "b".repeat(60),
+            "c".repeat(60)
+        );
+        let body = crate::login_import::import_question("import-long", &origin, &origin[8..], &[]);
+        let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
+        let step = params["options"][0]["next_step"].as_str().unwrap();
+        assert_eq!(
+            step,
+            "Call browser_use with action present for the origin in this consent card's scope."
+        );
+        assert!(step.chars().count() <= 200);
+        assert_eq!(params["scope"]["origin"], origin);
     }
 
     #[tokio::test]

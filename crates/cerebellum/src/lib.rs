@@ -1504,6 +1504,7 @@ struct RouteCarrier {
     writer: mpsc::Sender<Frame>,
     channel: u16,
     epoch: u32,
+    call_key: Option<String>,
 }
 
 impl computer_grants::QuestionCarrier for RouteCarrier {
@@ -1515,9 +1516,10 @@ impl computer_grants::QuestionCarrier for RouteCarrier {
         let elicitor = Arc::clone(&self.elicitor);
         let writer = self.writer.clone();
         let (channel, epoch) = (self.channel, self.epoch);
+        let call_key = self.call_key.clone();
         Box::pin(async move {
             elicitor
-                .ask(&writer, channel, epoch, question, deadline)
+                .ask_for_call(&writer, channel, epoch, question, deadline, call_key)
                 .await
         })
     }
@@ -1543,6 +1545,7 @@ fn login_consent_request(
             writer: writer.clone(),
             channel,
             epoch,
+            call_key: elicit::current_call_key(),
         }),
         park_guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
     }
@@ -1572,6 +1575,7 @@ fn consent_context(
                 writer: writer.clone(),
                 channel,
                 epoch,
+                call_key: elicit::current_call_key(),
             }) as Arc<dyn computer_grants::QuestionCarrier>
         });
     let mut context = computer_grants::ConsentContext::new(
@@ -4123,9 +4127,17 @@ async fn handle_management_request(
         let elicitor = Arc::clone(&planes.elicitor);
         let management_plane = Arc::clone(&planes.management);
         let writer = writer.clone();
+        let call_key = elicit::current_call_key();
         tokio::spawn(async move {
             let outcome = elicitor
-                .ask(&writer, channel, epoch, question.body, question.deadline)
+                .ask_for_call(
+                    &writer,
+                    channel,
+                    epoch,
+                    question.body,
+                    question.deadline,
+                    call_key,
+                )
                 .await;
             // The whole ending is handed on, not just an answer or its absence:
             // the next request reports a question nobody was shown differently
@@ -5130,7 +5142,10 @@ async fn handle_keyed_tool_request(
     };
     let result = {
         let observation = pending.observation.clone();
-        let call = handle_tool_request(call, &proxy, planes, &observation);
+        let call = elicit::CALL_KEY.scope(
+            call_key,
+            handle_tool_request(call, &proxy, planes, &observation),
+        );
         tokio::pin!(call);
         loop {
             tokio::select! {
@@ -6138,6 +6153,7 @@ async fn serve_browser_with_consent(
     let mut drain = planes.drain_signal.subscribe();
     let routes = Arc::clone(&planes.routes);
     let (channel, epoch, _) = request;
+    let call_key = elicit::current_call_key();
     // Keep the question alive after the call's wait expires so a late approval
     // still creates the browser grant. Cancellation, route closure and shutdown
     // instead remove the pending question from the answer registry.
@@ -6148,7 +6164,7 @@ async fn serve_browser_with_consent(
             _ = cancel.cancelled() => Err("cancelled"),
             _ = routes.closed(channel, epoch) => Err("route_closed"),
             _ = drain.wait_for(|draining| *draining) => Err("draining"),
-            outcome = elicitor.ask(&writer, channel, epoch, question.body, question.deadline) => Ok(outcome),
+            outcome = elicitor.ask_for_call(&writer, channel, epoch, question.body, question.deadline, call_key) => Ok(outcome),
         };
         let settled = management
             .settle_browser_grant_outcome(&question.ask_id, ending.as_ref().ok())
