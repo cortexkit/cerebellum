@@ -695,22 +695,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .attachment
             .clone()
             .ok_or(NavigationDriveError::CdpFailure)?;
-        let mut params = Map::new();
-        params.insert(
-            "x".into(),
-            Value::from(
-                hit_test_coordinate(position.x_css)
-                    .map_err(|_| NavigationDriveError::CdpFailure)?,
-            ),
-        );
-        params.insert(
-            "y".into(),
-            Value::from(
-                hit_test_coordinate(position.y_css)
-                    .map_err(|_| NavigationDriveError::CdpFailure)?,
-            ),
-        );
-        params.insert("includeUserAgentShadowDOM".into(), Value::Bool(true));
+        let visual = self.read_css_visual_viewport(&attachment.session_id, deadline, clock)?;
+        let params = document_hit_params(position, visual)?;
         let response = self.command_response(
             "DOM.getNodeForLocation",
             Some(params),
@@ -988,19 +974,28 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .frame_attachment(identity)
             .map_err(ClickDriveError::Navigation)?;
         if attachment.context_key != context_key {
-            return Err(ClickDriveError::NoPosition);
+            return Err(unavailable_position("frame_context binding failed"));
         }
 
-        // Geometry follows the activated element, not an AX text node with no box.
-        let activated = if let Some(record) = revalidation
-            .and_then(|(_, _, record)| record)
-            .filter(|record| record.node_identity != record.activation_target_identity)
-        {
+        let requested_identity = identity;
+        let mut candidates = vec![(identity.clone(), "activation_content_quads")];
+        let mut label_geometry = false;
+        if let Some((epoch, origin, expected)) = revalidation {
+            let origin =
+                document_origin(origin).map_err(|_| ClickDriveError::ClassificationChanged)?;
+            let origin = origin.as_str();
             let nodes = self
                 .flattened_dom_nodes_before(&attachment, deadline, clock)
                 .map_err(ClickDriveError::Navigation)?
                 .map_err(|_| ClickDriveError::ClassificationChanged)?;
-            let node = nodes
+            // Detached refs have no live classification. Check membership before
+            // geometry so a removed input is not mistaken for a hidden input.
+            let actual = build_non_type_classification(&nodes, identity, epoch, origin)
+                .map_err(|_| ClickDriveError::ClassificationChanged)?;
+            if Some(&actual) != expected {
+                return Err(ClickDriveError::ClassificationChanged);
+            }
+            let activated = nodes
                 .iter()
                 .find(|node| {
                     NodeIdentityInput::new(
@@ -1011,55 +1006,135 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .identity()
                     .ok()
                     .as_ref()
-                        == Some(&record.activation_target_identity)
+                        == Some(&actual.activation_target_identity)
                 })
                 .ok_or(ClickDriveError::ClassificationChanged)?;
-            Some(BackendNodeIdentity {
-                backend_node_id: node.backend_node_id,
-                ..identity.clone()
-            })
-        } else {
-            None
-        };
-        let requested_identity = identity;
-        let identity = activated.as_ref().unwrap_or(identity);
-
-        // Resolve once before scrolling so a detached or geometry-less ref keeps
-        // the existing no-position refusal. The post-scroll fetch below is the
-        // only coordinate that may reach hit testing or input dispatch.
-        self.content_quad_position(
-            identity.backend_node_id,
-            &attachment.session_id,
-            deadline,
-            clock,
-        )?;
-
-        let mut scroll_params = Map::new();
-        scroll_params.insert(
-            "backendNodeId".into(),
-            Value::Number(identity.backend_node_id.into()),
-        );
-        let scroll = self
-            .command_response(
-                "DOM.scrollIntoViewIfNeeded",
-                Some(scroll_params),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                None,
-                clock,
-            )
-            .map_err(ClickDriveError::Navigation)?;
-        if scroll.error.is_some() {
-            return Err(ClickDriveError::NoPosition);
+            candidates[0].0.backend_node_id = activated.backend_node_id;
+            if activated.local_name == "input"
+                && activated.attributes.get("type").is_some_and(|t| {
+                    t.eq_ignore_ascii_case("checkbox") || t.eq_ignore_ascii_case("radio")
+                })
+            {
+                // A styled input can have no box, or be covered by its painted box.
+                // Its associated label is the surface a person actually clicks.
+                let mut ancestor = nodes
+                    .iter()
+                    .find(|node| node.backend_node_id == requested_identity.backend_node_id);
+                let mut requested_labels = HashSet::new();
+                let mut visited = HashSet::new();
+                while let Some(node) = ancestor {
+                    if !visited.insert(node.node_id) {
+                        break;
+                    }
+                    if node.local_name == "label" {
+                        requested_labels.insert(node.backend_node_id);
+                    }
+                    ancestor = node
+                        .parent_id
+                        .and_then(|parent| nodes.iter().find(|node| node.node_id == parent));
+                }
+                let mut labels = Vec::new();
+                for node in &nodes {
+                    let label_identity = BackendNodeIdentity {
+                        backend_node_id: node.backend_node_id,
+                        ..identity.clone()
+                    };
+                    if node.local_name == "label"
+                        && build_non_type_classification(&nodes, &label_identity, epoch, origin)
+                            .is_ok_and(|label| {
+                                label.activation_target_identity
+                                    == actual.activation_target_identity
+                            })
+                    {
+                        labels.push(label_identity);
+                    }
+                }
+                // Prefer the label containing the requested ref when a control
+                // has several labels, rather than moving to unrelated label text.
+                labels.sort_by_key(|label| !requested_labels.contains(&label.backend_node_id));
+                candidates.splice(
+                    0..0,
+                    labels
+                        .into_iter()
+                        .map(|label| (label, "label_content_quads")),
+                );
+            }
         }
-
-        let position = self.content_quad_position(
-            identity.backend_node_id,
-            &attachment.session_id,
-            deadline,
-            clock,
-        )?;
+        let mut failures = Vec::new();
+        let mut selected = None;
+        for (candidate, source) in candidates {
+            if let Err(error) = self.content_quad_position(
+                candidate.backend_node_id,
+                &attachment.session_id,
+                deadline,
+                clock,
+            ) {
+                if !matches!(error, ClickDriveError::NoPosition) {
+                    return Err(error);
+                }
+                failures.push(source);
+                continue;
+            }
+            let scroll = self
+                .command_response(
+                    "DOM.scrollIntoViewIfNeeded",
+                    Some(
+                        serde_json::json!({"backendNodeId":candidate.backend_node_id})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    deadline,
+                    None,
+                    None,
+                    clock,
+                )
+                .map_err(ClickDriveError::Navigation)?;
+            if scroll.error.is_some() {
+                failures.push(if source == "label_content_quads" {
+                    "label_scroll"
+                } else {
+                    "activation_scroll"
+                });
+                continue;
+            }
+            match self.content_quad_position(
+                candidate.backend_node_id,
+                &attachment.session_id,
+                deadline,
+                clock,
+            ) {
+                Ok(position) => {
+                    label_geometry = source == "label_content_quads";
+                    selected = Some((candidate, position));
+                    break;
+                }
+                Err(ClickDriveError::NoPosition) => failures.push(source),
+                Err(error) => return Err(error),
+            }
+        }
+        if selected.is_none() {
+            if let Some((epoch, origin, expected)) = revalidation {
+                let actual = self
+                    .classify_click_before(
+                        context_key,
+                        requested_identity,
+                        epoch,
+                        origin,
+                        deadline,
+                        clock,
+                    )
+                    .map_err(ClickDriveError::Navigation)?;
+                if actual.as_ref().ok() != expected {
+                    return Err(ClickDriveError::ClassificationChanged);
+                }
+            }
+        }
+        let (identity, position) = selected.ok_or_else(|| {
+            unavailable_position(&format!("position sources failed: {}", failures.join(", ")))
+        })?;
+        let identity = &identity;
         let root_session = self
             .attachment
             .as_ref()
@@ -1073,10 +1148,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             position
         };
-        let viewport = self
+        let visual = self
             .read_css_visual_viewport(&root_session, deadline, clock)
-            .map(|visual| visual.rect)
             .map_err(ClickDriveError::Navigation)?;
+        let viewport = visual.rect;
         match geometry::require_point_in_viewport(hit_position.x_css, hit_position.y_css, viewport)
         {
             Ok(()) => {}
@@ -1094,7 +1169,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 ))
             }
         }
-        let hit_params = serde_json::json!({"x":hit_test_coordinate(hit_position.x_css)?,"y":hit_test_coordinate(hit_position.y_css)?,"includeUserAgentShadowDOM":true}).as_object().unwrap().clone();
+        let hit_params =
+            document_hit_params(hit_position, visual).map_err(ClickDriveError::Navigation)?;
         let hit_response = self
             .command_response(
                 "DOM.getNodeForLocation",
@@ -1107,7 +1183,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             )
             .map_err(ClickDriveError::Navigation)?;
         if hit_response.error.is_some() {
-            return Err(ClickDriveError::NoPosition);
+            return Err(unavailable_position("document_hit_test failed"));
         }
         let hit_result = hit_response.result.ok_or(ClickDriveError::Navigation(
             NavigationDriveError::CdpFailure,
@@ -1142,7 +1218,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let hit_frame_id = observed.frame_id;
         let hit_backend_node_id = observed.backend_node_id;
         if hit_frame_id != identity.frame_id {
-            return Err(ClickDriveError::NoPosition);
+            return Err(unavailable_position("document_hit_frame mismatch"));
         }
         if hit_backend_node_id != identity.backend_node_id {
             let mut describe_params = Map::new();
@@ -1164,7 +1240,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 )
                 .map_err(ClickDriveError::Navigation)?;
             if describe_response.error.is_some() {
-                return Err(ClickDriveError::NoPosition);
+                return Err(unavailable_position("target_dom_read failed"));
             }
             let described = describe_response.result.ok_or(ClickDriveError::Navigation(
                 NavigationDriveError::CdpFailure,
@@ -1198,6 +1274,30 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     "hit_name":node.and_then(|node| node.pointer("/name/value")),
                     "hit_inside_target":false,
                 })));
+            }
+        }
+
+        if label_geometry {
+            let (epoch, origin, expected) =
+                revalidation.ok_or(ClickDriveError::ClassificationChanged)?;
+            let hit_identity = BackendNodeIdentity {
+                backend_node_id: hit_backend_node_id,
+                ..identity.clone()
+            };
+            let hit = self
+                .classify_click_before(context_key, &hit_identity, epoch, origin, deadline, clock)
+                .map_err(ClickDriveError::Navigation)?;
+            // A link or another control inside a label must not inherit the
+            // checkbox's authorization merely because its box contains the hit.
+            if hit
+                .as_ref()
+                .ok()
+                .map(|record| &record.activation_target_identity)
+                != expected.map(|record| &record.activation_target_identity)
+            {
+                return Err(ClickDriveError::Intercepted(
+                    serde_json::json!({"reason_code":"label_activation_mismatch","hit_backend_node_id":hit_backend_node_id,"hit_inside_target":true,"hit_role":null,"hit_name":null}),
+                ));
             }
         }
 
@@ -3300,6 +3400,25 @@ fn autocomplete_tokens(value: Option<&String>) -> Vec<String> {
         .collect()
 }
 
+fn unavailable_position(reason: &str) -> ClickDriveError {
+    ClickDriveError::Intercepted(
+        serde_json::json!({"reason_code":"click_position_unavailable","reason":reason,"hit_role":null,"hit_name":null,"hit_inside_target":null}),
+    )
+}
+
+// DOM hit testing takes document coordinates, unlike viewport-relative mouse
+// input. Without the scroll offset a readable below-fold page appears empty.
+fn document_hit_params(
+    position: BrowserClickPosition,
+    visual: CssVisualViewport,
+) -> Result<Map<String, Value>, NavigationDriveError> {
+    let x = position.x_css + visual.page_x.ok_or(NavigationDriveError::CdpFailure)?
+        - visual.rect.x_input_css;
+    let y = position.y_css + visual.page_y.ok_or(NavigationDriveError::CdpFailure)?
+        - visual.rect.y_input_css;
+    Ok(serde_json::json!({"x":hit_test_coordinate(x).map_err(|_| NavigationDriveError::CdpFailure)?,"y":hit_test_coordinate(y).map_err(|_| NavigationDriveError::CdpFailure)?,"includeUserAgentShadowDOM":true}).as_object().unwrap().clone())
+}
+
 fn hit_test_coordinate(value: f64) -> Result<i64, ClickDriveError> {
     let rounded = value.round();
     if !(0.0..=f64::from(i32::MAX)).contains(&rounded) {
@@ -4094,6 +4213,8 @@ mod tests {
             "cssVisualViewport": {
                 "offsetX": x,
                 "offsetY": y,
+                "pageX": x,
+                "pageY": y,
                 "clientWidth": width,
                 "clientHeight": height,
                 "scale": 1.0
@@ -5156,9 +5277,7 @@ mod tests {
         );
         let quad = json!({"quads":[[10,20,34,20,34,52,10,52]]});
         let mut results = Vec::new();
-        if backend != 42 {
-            results.extend([json!({}), github_link_document()]);
-        }
+        results.extend([json!({}), github_link_document()]);
         results.extend([
             quad.clone(), json!({}), quad, layout_metrics(0.0, 0.0, 1280.0, 713.0),
             json!({"backendNodeId":44,"frameId":"frame-main"}),
@@ -5202,6 +5321,7 @@ mod tests {
     #[test]
     fn github_point_on_text_dispatches_at_navigation_tier() {
         let results = [
+            layout_metrics(0.0, 0.0, 1280.0, 713.0),
             json!({"backendNodeId":44,"frameId":"frame-main"}),
             json!({}),
             github_link_document(),
@@ -5353,6 +5473,173 @@ mod tests {
         assert_eq!(hit["y"].as_f64(), input["y"].as_f64());
     }
 
+    fn checkbox_document() -> Value {
+        json!({"nodes":[
+            flattened_dom_node(1,None,10,"form",&[]),
+            flattened_dom_node(5,Some(1),21,"label",&["for","option"]),
+            flattened_dom_node(2,Some(1),20,"label",&[]),
+            flattened_dom_node(3,Some(2),42,"input",&["type","checkbox","id","option"]),
+            flattened_dom_node(4,Some(2),43,"span",&[])
+        ]})
+    }
+
+    #[test]
+    fn hidden_checkbox_uses_label_geometry() {
+        let document = checkbox_document();
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let record =
+            classify_flattened_document(document.as_object().unwrap(), &identity, 7, PAGE_URL)
+                .unwrap();
+        let quad = json!({"quads":[[10,20,210,20,210,52,10,52]]});
+        let results = [
+            json!({}),
+            document.clone(),
+            quad.clone(),
+            json!({}),
+            quad,
+            layout_metrics(0.0, 0.0, 1280.0, 713.0),
+            json!({"backendNodeId":43,"frameId":"frame-main"}),
+            json!({"node":{"backendNodeId":20,"children":[{"backendNodeId":42},{"backendNodeId":43}]}}),
+            json!({}),
+            document.clone(),
+            json!({}),
+            document,
+            json!({}),
+            json!({}),
+            json!({}),
+            json!({}),
+        ];
+        let mut driver = attached_driver(
+            results
+                .into_iter()
+                .enumerate()
+                .map(|(i, result)| json!({"id":i+1,"sessionId":"session-own","result":result})),
+        );
+        let mut events = Vec::new();
+        let result = driver.click_with_clock(
+            "route-own",
+            &identity,
+            1000,
+            &mut |event| events.push(event),
+            Some((7, PAGE_URL, Some(&record))),
+            &mut FakeClock::new(),
+        );
+        let geometry = driver
+            .pipe
+            .writes
+            .iter()
+            .find(|w| w["method"] == "DOM.getContentQuads")
+            .unwrap();
+        assert_eq!(geometry["params"]["backendNodeId"], 20);
+        result.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn gone_checkbox_is_stale_before_geometry() {
+        let document = checkbox_document();
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let record =
+            classify_flattened_document(document.as_object().unwrap(), &identity, 7, PAGE_URL)
+                .unwrap();
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"nodes":[flattened_dom_node(1,None,10,"form",&[])]}}),
+        ]);
+        let mut events = Vec::new();
+        let result = driver.click_with_clock(
+            "route-own",
+            &identity,
+            1000,
+            &mut |event| events.push(event),
+            Some((7, PAGE_URL, Some(&record))),
+            &mut FakeClock::new(),
+        );
+        assert_eq!(result, Err(ClickDriveError::ClassificationChanged));
+        assert!(events.is_empty());
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .all(|w| w["method"] != "DOM.getContentQuads"));
+    }
+
+    #[test]
+    fn scrolled_point_classification_uses_document_coordinates() {
+        let mut metrics = layout_metrics(2.0, 3.0, 1280.0, 713.0);
+        metrics["cssVisualViewport"]["pageX"] = json!(102.0);
+        metrics["cssVisualViewport"]["pageY"] = json!(5003.0);
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":metrics}),
+            json!({"id":2,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":checkbox_document()}),
+        ]);
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_secs(1);
+        let record = driver
+            .classify_point_before(
+                "route-own",
+                BrowserClickPosition {
+                    x_css: 22.0,
+                    y_css: 36.0,
+                },
+                7,
+                PAGE_URL,
+                deadline,
+                &mut clock,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.required_tier, 2);
+        assert_eq!(driver.pipe.writes[1]["method"], "DOM.getNodeForLocation");
+        assert_eq!(driver.pipe.writes[1]["params"]["x"], 122);
+        assert_eq!(driver.pipe.writes[1]["params"]["y"], 5036);
+    }
+
+    #[test]
+    fn hidden_checkbox_label_rejects_an_independent_link() {
+        let mut document = checkbox_document();
+        document["nodes"][4] = flattened_dom_node(4, Some(2), 43, "a", &["href", "/other"]);
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let record =
+            classify_flattened_document(document.as_object().unwrap(), &identity, 7, PAGE_URL)
+                .unwrap();
+        let quad = json!({"quads":[[10,20,210,20,210,52,10,52]]});
+        let results = [
+            json!({}),
+            document.clone(),
+            quad.clone(),
+            json!({}),
+            quad,
+            layout_metrics(0.0, 0.0, 1280.0, 713.0),
+            json!({"backendNodeId":43,"frameId":"frame-main"}),
+            json!({"node":{"backendNodeId":20,"children":[{"backendNodeId":42},{"backendNodeId":43}]}}),
+            json!({}),
+            document,
+        ];
+        let mut driver = attached_driver(
+            results
+                .into_iter()
+                .enumerate()
+                .map(|(i, result)| json!({"id":i+1,"sessionId":"session-own","result":result})),
+        );
+        let mut events = Vec::new();
+        let result = driver.click_with_clock(
+            "route-own",
+            &identity,
+            1000,
+            &mut |event| events.push(event),
+            Some((7, PAGE_URL, Some(&record))),
+            &mut FakeClock::new(),
+        );
+        let Err(ClickDriveError::Intercepted(detail)) = result else {
+            panic!("expected an intercepted link");
+        };
+        assert_eq!(detail["reason_code"], "label_activation_mismatch");
+        assert!(events.is_empty());
+    }
+
     #[test]
     fn click_dispatches_mouse_input_at_the_resolved_content_quad_center() {
         let quad = json!([[10.0, 20.0, 34.0, 20.0, 34.0, 52.0, 10.0, 52.0]]);
@@ -5486,7 +5773,14 @@ mod tests {
             &mut clock,
         );
 
-        assert_eq!(result, Err(ClickDriveError::NoPosition));
+        let Err(ClickDriveError::Intercepted(detail)) = result else {
+            panic!("expected a geometry refusal");
+        };
+        assert_eq!(detail["reason_code"], "click_position_unavailable");
+        assert_eq!(
+            detail["reason"],
+            "position sources failed: activation_content_quads"
+        );
         assert!(input_events.is_empty());
         assert_eq!(driver.pipe.writes.len(), 1);
         assert_eq!(driver.pipe.writes[0]["method"], "DOM.getContentQuads");
