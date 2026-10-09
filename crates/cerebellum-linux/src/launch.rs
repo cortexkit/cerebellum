@@ -263,6 +263,12 @@ impl Drop for ReleasedChild {
 /// module's stderr into a file that must stay empty unless this module itself
 /// printed, and a browser's own logging (which can carry page-derived text)
 /// would otherwise land there.
+///
+/// Before the initial stop, ignored application signal dispositions are reset
+/// and the application signal mask is cleared. Signals in libc's reserved
+/// real-time range below its runtime `SIGRTMIN()` are outside this contract:
+/// libc does not let applications inspect or reset them. Any other disposition
+/// query/reset failure aborts the child before the barrier and fails the spawn.
 pub fn spawn_barred(
     executable: &Path,
     arguments: &[OsString],
@@ -610,30 +616,11 @@ fn child_exec(
             libc::close(fd);
         }
         // Orphaned stopped groups receive SIGHUP then SIGCONT. execve resets caught
-        // dispositions but preserves ignored ones, so the ignored set is exactly what
-        // crosses into the target. Resetting it and clearing the mask makes the child
-        // start clean rather than inherit launcher-runtime signal behaviour.
-        let mut default_disposition: libc::sigaction = std::mem::zeroed();
-        default_disposition.sa_sigaction = libc::SIG_DFL;
-        if libc::sigemptyset(&mut default_disposition.sa_mask) != 0 {
-            libc::_exit(114);
-        }
-        for signal in 1..=real_time_max {
-            if signal == libc::SIGKILL
-                || signal == libc::SIGSTOP
-                || (signal > 32 && signal < real_time_min)
-            {
-                continue;
-            }
-            let mut current: libc::sigaction = std::mem::zeroed();
-            if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 {
-                continue;
-            }
-            if current.sa_sigaction == libc::SIG_IGN
-                && libc::sigaction(signal, &default_disposition, std::ptr::null_mut()) != 0
-            {
-                libc::_exit(113);
-            }
+        // dispositions but preserves ignored ones, so clear application ignores
+        // before the initial stop. libc's private real-time signals are excluded:
+        // its sigaction rejects them, and posix_spawn can leave one ignored.
+        if let Err(exit_code) = reset_ignored_signals(real_time_min, real_time_max) {
+            libc::_exit(exit_code);
         }
         let mut empty_mask: libc::sigset_t = std::mem::zeroed();
         if libc::sigemptyset(&mut empty_mask) != 0
@@ -646,6 +633,42 @@ fn child_exec(
         }
         libc::execve(executable, argv, envp);
         libc::_exit(112);
+    }
+}
+
+fn libc_reserved_signals(real_time_min: c_int) -> std::ops::Range<c_int> {
+    // Linux's highest traditional signal is SIGSYS on most architectures,
+    // SIGUSR2 on Alpha/SPARC, and SIGXFSZ on MIPS/PA-RISC. The gap before
+    // libc's runtime SIGRTMIN belongs to libc, not to application handlers.
+    let last_standard_signal = libc::SIGSYS.max(libc::SIGUSR2).max(libc::SIGXFSZ);
+    (last_standard_signal + 1)..real_time_min
+}
+
+fn reset_ignored_signals(real_time_min: c_int, real_time_max: c_int) -> Result<(), c_int> {
+    // SAFETY: sigaction and sigemptyset use stack-owned ABI values and are
+    // async-signal-safe, so this helper is also safe between fork and exec.
+    unsafe {
+        let mut default_disposition: libc::sigaction = std::mem::zeroed();
+        default_disposition.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut default_disposition.sa_mask) != 0 {
+            return Err(114);
+        }
+        let reserved = libc_reserved_signals(real_time_min);
+        for signal in 1..=real_time_max {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP || reserved.contains(&signal) {
+                continue;
+            }
+            let mut current: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 {
+                return Err(113);
+            }
+            if current.sa_sigaction == libc::SIG_IGN
+                && libc::sigaction(signal, &default_disposition, std::ptr::null_mut()) != 0
+            {
+                return Err(113);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1200,6 +1223,24 @@ mod tests {
         u64::from_str_radix(value.trim(), 16).expect("hex signal mask")
     }
 
+    fn print_signal_state(stage: &str, pid: u32) {
+        let ignored = proc_signal_mask(pid, "SigIgn:");
+        let blocked = proc_signal_mask(pid, "SigBlk:");
+        eprintln!("{stage}: pid={pid} SigIgn={ignored:#x} SigBlk={blocked:#x}");
+    }
+
+    fn application_signal_mask() -> u64 {
+        let reserved = libc_reserved_signals(libc::SIGRTMIN());
+        // The test inherits ignored SIGHUP, SIGUSR1, and SIGRTMIN. All three
+        // must remain checked: SIGRTMIN is the first application real-time
+        // signal, not one of libc's private signals below that boundary.
+        for signal in [libc::SIGHUP, libc::SIGUSR1, libc::SIGRTMIN()] {
+            assert!(!reserved.contains(&signal), "application signal {signal}");
+        }
+        let reserved_mask = reserved.fold(0_u64, |mask, signal| mask | (1_u64 << (signal - 1)));
+        !reserved_mask
+    }
+
     fn wait_for_target_death(report: &Path) {
         let pid: u32 = fs::read_to_string(report)
             .expect("helper wrote target pid")
@@ -1263,6 +1304,7 @@ mod tests {
     #[test]
     fn initial_barrier_clears_the_inherited_signal_environment() {
         let _lock = signal_state_lock();
+        print_signal_state("initial-barrier test start", std::process::id());
         let _signal_state = ignore_signals_and_block_sighup_and_sigterm();
         let report = std::env::temp_dir().join(format!(
             "cerebellum-linux-sighup-state-{}",
@@ -1287,15 +1329,17 @@ mod tests {
         };
         let ignored = proc_signal_mask(child.pid, "SigIgn:");
         let blocked = proc_signal_mask(child.pid, "SigBlk:");
+        print_signal_state("initial-barrier child", child.pid);
+        let application_mask = application_signal_mask();
         assert_eq!(
-            ignored,
+            ignored & application_mask,
             0,
-            "child retained ignored dispositions at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "child retained ignored application dispositions at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
         assert_eq!(
-            blocked,
+            blocked & application_mask,
             0,
-            "child retained an inherited signal mask at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "child retained an inherited application signal mask at the barrier (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
 
         drop(child);
@@ -1305,20 +1349,45 @@ mod tests {
     #[test]
     fn execd_image_does_not_inherit_the_launchers_signal_environment() {
         let _lock = signal_state_lock();
+        print_signal_state("exec-image test start", std::process::id());
         let _signal_state = ignore_signals_and_block_sighup_and_sigterm();
         let child = spawn_sleep();
         let ignored = proc_signal_mask(child.generation().pid, "SigIgn:");
         let blocked = proc_signal_mask(child.generation().pid, "SigBlk:");
+        print_signal_state("exec-stop child", child.generation().pid);
+        let application_mask = application_signal_mask();
         assert_eq!(
-            ignored,
+            ignored & application_mask,
             0,
-            "exec'd image retained ignored launch dispositions (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "exec'd image retained ignored application dispositions (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
         assert_eq!(
-            blocked,
+            blocked & application_mask,
             0,
-            "exec'd image retained the launcher's signal mask (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
+            "exec'd image retained the launcher's application signal mask (SigIgn={ignored:#x}, SigBlk={blocked:#x})"
         );
+    }
+
+    #[test]
+    fn a_non_reserved_disposition_query_failure_aborts_signal_reset() {
+        let _lock = signal_state_lock();
+        let real_time_min = libc::SIGRTMIN();
+        let invalid_signal = libc::SIGRTMAX() + 1;
+        // An out-of-range signal forces a real sigaction failure without
+        // changing a live process's dispositions or libc's private handlers.
+        // SAFETY: the child only runs the fork-safe reset helper and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork signal-reset helper");
+        if pid == 0 {
+            let exit_code = reset_ignored_signals(real_time_min, invalid_signal)
+                .err()
+                .unwrap_or(0);
+            // SAFETY: _exit terminates the forked helper without running destructors.
+            unsafe { libc::_exit(exit_code) };
+        }
+        let status = wait_for_status_spawn(pid, 0).expect("wait for signal-reset helper");
+        assert!(libc::WIFEXITED(status), "helper did not exit: {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 113, "query failure was skipped");
     }
 
     #[test]
