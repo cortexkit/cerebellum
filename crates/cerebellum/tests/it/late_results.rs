@@ -14,7 +14,7 @@ use cerebellum::browser_session::{
 };
 use cerebellum::journal::call_records::{CallRecords, FilesystemCallRecordStorage};
 use cerebellum::{BrowserConfig, JournalPersistence, Planes};
-use cerebellum_core::format_floor::FormatFloor;
+use cerebellum_core::format_floor::{read_floors, DurableFormat, FormatFloor};
 use cerebellum_core::health::HealthState;
 use cerebellum_core::identity::ProfileDisposition;
 use cortexkit_role_tool_provider::late_results::{
@@ -308,7 +308,103 @@ async fn observe_login(planes: &Planes, facts: &LoginFacts) -> LateResultsReply 
     .expect("the real handoff poller observes simulated login")
 }
 fn vector() -> Value {
-    serde_json::from_str(include_str!("fixtures/tool-provider-v1/late-results.json")).unwrap()
+    serde_json::from_str(include_str!(
+        "../fixtures/tool-provider-v1/late-results.json"
+    ))
+    .unwrap()
+}
+
+fn seed_version_2(scratch: &Scratch) {
+    std::fs::write(
+        scratch.0.join("call_records.jsonl"),
+        b"{\"format\":\"call-records\",\"version\":2}\n",
+    )
+    .unwrap();
+    FormatFloor::at(scratch.0.join("format-floor.json"))
+        .raise(DurableFormat::new("call-records", 2))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn first_keyed_present_upgrades_version_2_to_version_3() {
+    let scratch = Scratch::new();
+    seed_version_2(&scratch);
+    let (planes, _) = planes(&scratch, true);
+    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    assert_eq!(
+        present(&planes, Some("pf:first-handoff")).await["outcome"],
+        "login_pending"
+    );
+    let written = std::fs::read_to_string(scratch.0.join("call_records.jsonl")).unwrap();
+    assert_eq!(
+        written.lines().next(),
+        Some("{\"format\":\"call-records\",\"version\":3}")
+    );
+    assert!(written
+        .lines()
+        .skip(1)
+        .any(|line| serde_json::from_str::<Value>(line).unwrap()["handoff"].is_object()));
+    assert_eq!(
+        read_floors(&scratch.0.join("format-floor.json"))
+            .unwrap()
+            .get("call-records"),
+        Some(&3)
+    );
+    call(&planes, 9, "browser_use", json!({"action":"resume"})).await;
+    let ending = read(&planes, 9, None, None).await;
+    call(
+        &planes,
+        9,
+        "late_results.ack",
+        json!({"through":ending.cursor}),
+    )
+    .await;
+    let after_ack = std::fs::read_to_string(scratch.0.join("call_records.jsonl")).unwrap();
+    assert_eq!(
+        after_ack.lines().next(),
+        Some("{\"format\":\"call-records\",\"version\":3}")
+    );
+}
+
+#[tokio::test]
+async fn handoff_upgrade_raises_version_3_floor_before_writing() {
+    let scratch = Scratch::new();
+    seed_version_2(&scratch);
+    let (planes, _) = planes(&scratch, true);
+    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    let mut ordinary = json!({"name":"browser_use","arguments":{"action":"status"}});
+    ordinary["call_key"] = json!("pf:ordinary-before-handoff");
+    let response = exchange(&planes, frame(9, ordinary)).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let before = std::fs::read_to_string(scratch.0.join("call_records.jsonl")).unwrap();
+    assert_eq!(
+        before.lines().next(),
+        Some("{\"format\":\"call-records\",\"version\":2}")
+    );
+    assert_eq!(
+        read_floors(&scratch.0.join("format-floor.json"))
+            .unwrap()
+            .get("call-records"),
+        Some(&2)
+    );
+    // Storage already remembers that the minimum reader version was saved as
+    // 2. A handoff needs to save minimum reader 3 first. Making that metadata
+    // invalid must block the upgrade before any version 3 data is written.
+    std::fs::write(scratch.0.join("format-floor.json"), b"invalid-floor").unwrap();
+    assert_eq!(
+        present(&planes, Some("pf:floor-blocked-handoff")).await["outcome"],
+        "internal_failure"
+    );
+    let written = std::fs::read_to_string(scratch.0.join("call_records.jsonl")).unwrap();
+    assert_eq!(
+        written.lines().next(),
+        Some("{\"format\":\"call-records\",\"version\":2}")
+    );
+    assert!(
+        !written.contains("\"handoff\""),
+        "handoff data was written before the format floor could be raised"
+    );
+    assert!(read(&planes, 9, None, None).await.entries.is_empty());
 }
 
 #[tokio::test]

@@ -73,11 +73,14 @@ pub use late::{HandoffEnding, HeldHandoff};
 /// The file name under the journal data home.
 pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 
-/// The file version this build writes, and the newest it reads.
+/// The highest file version this build writes, and the newest it reads.
 ///
 /// Version 3 adds text-free login handoff state and acknowledgements. Older
-/// files are read without changing their format until the first write.
+/// files advance to version 3 only when a handoff is recorded; ordinary calls
+/// still use the version 2 format so placing a build does not close rollback.
 pub const CALL_RECORD_VERSION: u64 = 3;
+
+const ORDINARY_CALL_RECORD_VERSION: u64 = 2;
 
 /// The oldest file version this build reads.
 const OLDEST_READ_CALL_RECORD_VERSION: u64 = 1;
@@ -210,6 +213,14 @@ pub struct CallRecord {
 }
 
 impl CallRecord {
+    fn required_version(&self) -> u64 {
+        if self.handoff.is_some() {
+            CALL_RECORD_VERSION
+        } else {
+            ORDINARY_CALL_RECORD_VERSION
+        }
+    }
+
     fn last_written_ms(&self) -> u64 {
         self.settled_at_ms.unwrap_or(self.started_at_ms)
     }
@@ -254,13 +265,18 @@ impl std::fmt::Display for CallRecordError {
 }
 
 /// Where the durable file lives.
+///
+/// Filesystem storage records the minimum reader version in a format-floor
+/// file before writing data. Staging checks that file and rejects a build
+/// whose reader is too old; the bytes must never get ahead of that safeguard.
 pub trait CallRecordStorage: Send + Sync {
     /// The whole file, or `None` if it was never written.
     fn load(&self) -> Result<Option<Vec<u8>>, CallRecordError>;
-    /// Append bytes and sync them before returning.
-    fn append(&self, bytes: &[u8]) -> Result<(), CallRecordError>;
-    /// Replace the whole file atomically.
-    fn replace(&self, bytes: &[u8]) -> Result<(), CallRecordError>;
+    /// Append and sync bytes after recording `version` as the minimum reader.
+    /// `version` is the log header's version, not this build's reader maximum.
+    fn append(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError>;
+    /// Replace the file atomically after recording its minimum reader `version`.
+    fn replace(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError>;
 }
 
 /// The file held in memory. Clones share it, so opening a second
@@ -289,7 +305,7 @@ impl CallRecordStorage for InMemoryCallRecordStorage {
         Ok(self.contents())
     }
 
-    fn append(&self, bytes: &[u8]) -> Result<(), CallRecordError> {
+    fn append(&self, bytes: &[u8], _version: u64) -> Result<(), CallRecordError> {
         self.bytes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -298,7 +314,7 @@ impl CallRecordStorage for InMemoryCallRecordStorage {
         Ok(())
     }
 
-    fn replace(&self, bytes: &[u8]) -> Result<(), CallRecordError> {
+    fn replace(&self, bytes: &[u8], _version: u64) -> Result<(), CallRecordError> {
         *self.bytes.lock().unwrap_or_else(PoisonError::into_inner) = Some(bytes.to_vec());
         Ok(())
     }
@@ -332,11 +348,14 @@ impl FilesystemCallRecordStorage {
         &self.path
     }
 
-    fn raise_floor(&self) -> Result<(), CallRecordError> {
+    fn raise_floor(&self, version: u64) -> Result<(), CallRecordError> {
         // Before anything is written: a file in this format with no floor
         // naming it would let staging pass a build that cannot read it.
         self.floor
-            .raise(CALL_RECORD_FORMAT)
+            .raise(cerebellum_core::format_floor::DurableFormat::new(
+                CALL_RECORD_FORMAT.name,
+                version,
+            ))
             .map_err(|error| CallRecordError::WriteFailed(error.to_string()))
     }
 
@@ -362,16 +381,16 @@ impl CallRecordStorage for FilesystemCallRecordStorage {
         }
     }
 
-    fn append(&self, bytes: &[u8]) -> Result<(), CallRecordError> {
-        self.raise_floor()?;
+    fn append(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError> {
+        self.raise_floor(version)?;
         let failed = |error: std::io::Error| CallRecordError::WriteFailed(error.to_string());
         let mut file = cerebellum_core::private_fs::open_append(&self.path).map_err(failed)?;
         file.write_all(bytes).map_err(failed)?;
         file.sync_data().map_err(failed)
     }
 
-    fn replace(&self, bytes: &[u8]) -> Result<(), CallRecordError> {
-        self.raise_floor()?;
+    fn replace(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError> {
+        self.raise_floor(version)?;
         let failed = |error: std::io::Error| CallRecordError::WriteFailed(error.to_string());
         let directory = self.directory();
         cerebellum_core::private_fs::create_dir_all(&directory).map_err(failed)?;
@@ -660,10 +679,9 @@ struct Inner {
     /// refused rather than run unprotected.
     broken: Option<CallRecordError>,
     header_written: bool,
-    /// The file on disk was written by an older build, under an older
-    /// header. It is read as it stands and rewritten under the current header
-    /// only when this build first writes a record.
-    older_header: bool,
+    /// The header actually written, not the highest version this build reads.
+    /// It increases only when a record needs newer fields, and never decreases.
+    file_version: u64,
     appended_since_compaction: usize,
     entries: HashMap<Key, Entry>,
     cached: VecDeque<Key>,
@@ -687,10 +705,10 @@ impl std::fmt::Debug for CallRecords {
     }
 }
 
-fn header() -> Vec<u8> {
+fn header(version: u64) -> Vec<u8> {
     let mut line = serde_json::to_vec(&json!({
         "format": CALL_RECORD_FORMAT.name,
-        "version": CALL_RECORD_VERSION,
+        "version": version,
     }))
     .expect("the header serializes");
     line.push(b'\n');
@@ -771,7 +789,7 @@ impl CallRecords {
             inner: Mutex::new(Inner {
                 broken: Some(error),
                 header_written: false,
-                older_header: false,
+                file_version: ORDINARY_CALL_RECORD_VERSION,
                 appended_since_compaction: 0,
                 entries: HashMap::new(),
                 cached: VecDeque::new(),
@@ -790,21 +808,21 @@ impl CallRecords {
     /// If anything changed the file is rewritten at once, so the reconciled
     /// state is what the next start reads too.
     ///
-    /// A file from an older build is the exception: it is left exactly as it
-    /// is until this build writes a record. Any rewrite here would be in the
-    /// current format and raise its format floor, and a raised floor stops the
-    /// older build from being placed again, so merely starting this build
-    /// must not raise it. Leaving the file costs nothing: a reconciled record
-    /// is reconciled again on the next start, and one past retention is
-    /// dropped again.
+    /// Files with headers 1 or 2 are left unchanged until a record is written.
+    /// Ordinary writes keep version 2 (migrating v1 as before), which builds
+    /// with version 2 readers can still read. A handoff requires version 3:
+    /// its format floor records minimum reader 3, so staging rejects a build
+    /// that only reads version 2. Merely starting or polling must not prevent
+    /// returning to that compatible build. A crashed record can be reconciled
+    /// in memory again on the next start without rewriting the file.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
             Some(bytes) => parse_versioned(&bytes).map(Some),
         });
-        let (records, existed, outdated) = match loaded {
-            Ok(Some((version, records))) => (records, true, version < CALL_RECORD_VERSION),
-            Ok(None) => (Vec::new(), false, false),
+        let (records, existed, file_version) = match loaded {
+            Ok(Some((version, records))) => (records, true, version),
+            Ok(None) => (Vec::new(), false, ORDINARY_CALL_RECORD_VERSION),
             Err(error) => {
                 let mut broken = Self::broken(error);
                 broken.storage = storage;
@@ -814,7 +832,7 @@ impl CallRecords {
         let mut inner = Inner {
             broken: None,
             header_written: existed,
-            older_header: outdated,
+            file_version,
             appended_since_compaction: 0,
             entries: HashMap::new(),
             cached: VecDeque::new(),
@@ -858,9 +876,11 @@ impl CallRecords {
                 inner.broken = Some(error);
             }
             let dropped = Self::apply_retention(&mut inner, now_ms);
-            if existed && !outdated && (reconciled || dropped || line_count != inner.entries.len())
+            if existed
+                && file_version == CALL_RECORD_VERSION
+                && (reconciled || dropped || line_count != inner.entries.len())
             {
-                if let Err(error) = records.compact(&mut inner) {
+                if let Err(error) = records.compact(&mut inner, file_version) {
                     inner.broken = Some(error);
                 }
             }
@@ -907,8 +927,8 @@ impl CallRecords {
     }
 
     /// Rewrite the file as one line per kept record.
-    fn compact(&self, inner: &mut Inner) -> Result<(), CallRecordError> {
-        let mut bytes = header();
+    fn compact(&self, inner: &mut Inner, version: u64) -> Result<(), CallRecordError> {
+        let mut bytes = header(version);
         let mut records: Vec<&CallRecord> =
             inner.entries.values().map(|entry| &entry.record).collect();
         records.sort_by(|left, right| {
@@ -921,9 +941,9 @@ impl CallRecords {
         for record in records {
             bytes.extend(line(record)?);
         }
-        self.storage.replace(&bytes)?;
+        self.storage.replace(&bytes, version)?;
         inner.header_written = true;
-        inner.older_header = false;
+        inner.file_version = version;
         inner.appended_since_compaction = 0;
         Ok(())
     }
@@ -934,26 +954,27 @@ impl CallRecords {
         record: &CallRecord,
         now_ms: u64,
     ) -> Result<(), CallRecordError> {
+        let version = inner.file_version.max(record.required_version());
         if !inner.header_written {
-            let mut bytes = header();
+            let mut bytes = header(version);
             bytes.extend(line(record)?);
-            self.storage.replace(&bytes)?;
+            self.storage.replace(&bytes, version)?;
             inner.header_written = true;
+            inner.file_version = version;
             return Ok(());
         }
-        // The first record this build writes into an older build's file: the
-        // whole file is rewritten under the current header first, since a
-        // record that may carry newer members under an older header would read
-        // as corruption to the build that wrote the header, where the format
-        // floor (raised by this write) tells that build to stop by name.
-        if inner.older_header {
-            self.compact(inner)?;
+        // Upgrade only for fields the incoming record needs. An unnecessary
+        // version 3 header would record minimum reader 3 in the format floor,
+        // making staging reject an otherwise compatible version 2 build just
+        // because the relay puts a call key on every tool request.
+        if inner.file_version < version {
+            self.compact(inner, version)?;
         }
-        self.storage.append(&line(record)?)?;
+        self.storage.append(&line(record)?, inner.file_version)?;
         inner.appended_since_compaction += 1;
         if inner.appended_since_compaction >= MAX_RECORDS {
             Self::apply_retention(inner, now_ms);
-            self.compact(inner)?;
+            self.compact(inner, version)?;
         }
         Ok(())
     }
@@ -1321,9 +1342,10 @@ mod tests {
             .replace(
                 format!(
                     "{}{{\"principal\":\"dir",
-                    String::from_utf8(header()).unwrap()
+                    String::from_utf8(header(2)).unwrap()
                 )
                 .as_bytes(),
+                2,
             )
             .unwrap();
         let records = CallRecords::open(Box::new(storage), 0);
@@ -1331,7 +1353,7 @@ mod tests {
 
         let newer = InMemoryCallRecordStorage::new();
         newer
-            .replace(b"{\"format\":\"call-records\",\"version\":4}\n")
+            .replace(b"{\"format\":\"call-records\",\"version\":4}\n", 4)
             .unwrap();
         let records = CallRecords::open(Box::new(newer.clone()), 0);
         assert!(matches!(
@@ -1450,11 +1472,10 @@ mod tests {
         );
     }
 
-    /// The first recorded call rewrites the old records under a version 3
-    /// header, then appends the new record. Raising the floor before writing
-    /// prevents staging an older reader over data it cannot understand.
+    /// Ordinary calls write no handoff fields, preserving the version 2
+    /// encoding that builds with version 2 readers already understand.
     #[test]
-    fn the_first_recorded_call_moves_a_version_1_file_to_version_3() {
+    fn an_ordinary_call_moves_a_version_1_file_to_version_2() {
         let (_scratch, path, floor) = v1_on_disk("v1-one-call");
         let records = open_on_disk(&path, &floor, 30);
         let _ticket = executed(records.begin_attributed(
@@ -1471,7 +1492,7 @@ mod tests {
         let mut lines = written.lines();
         assert_eq!(
             lines.next(),
-            Some("{\"format\":\"call-records\",\"version\":3}"),
+            Some("{\"format\":\"call-records\",\"version\":2}"),
             "{written}"
         );
         let records: Vec<CallRecord> = lines
@@ -1497,7 +1518,55 @@ mod tests {
             Some((CallState::Started, CallOriginRecord::OriginInvalid))
         );
         let floors = cerebellum_core::format_floor::read_floors(&floor).unwrap();
-        assert_eq!(floors.get("call-records"), Some(&3));
+        assert_eq!(floors.get("call-records"), Some(&2));
+    }
+
+    #[test]
+    fn a_keyed_non_handoff_call_keeps_a_version_2_file_and_floor() {
+        let (_scratch, path, floor) = v1_on_disk("v2-ordinary-call");
+        let v2 = V1_FILE.replacen("\"version\":1", "\"version\":2", 1);
+        fs::write(&path, &v2).unwrap();
+        let records = open_on_disk(&path, &floor, 30);
+        let ticket = executed(records.begin_attributed(
+            "reserved:prefrontal-core",
+            "pf:ordinary",
+            "c",
+            None,
+            CallOriginRecord::OriginInvalid,
+            40,
+        ));
+        records.settle(
+            ticket,
+            Settlement::from_reply(&reply(json!({"outcome":"ok"})), ran()),
+            50,
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written.lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":2}")
+        );
+        assert!(
+            !written.contains("\"handoff\""),
+            "an ordinary call acquired handoff fields"
+        );
+        assert_eq!(
+            cerebellum_core::format_floor::read_floors(&floor)
+                .unwrap()
+                .get("call-records"),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn a_fresh_ordinary_call_starts_in_version_2() {
+        let storage = InMemoryCallRecordStorage::new();
+        let records = CallRecords::open(Box::new(storage.clone()), 0);
+        let _ticket = executed(records.begin("reserved:prefrontal-core", "pf:ordinary", "c", 10));
+        let written = String::from_utf8(storage.contents().unwrap()).unwrap();
+        assert_eq!(
+            written.lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":2}")
+        );
     }
 
     #[test]

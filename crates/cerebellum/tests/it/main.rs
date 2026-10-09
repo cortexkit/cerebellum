@@ -26,6 +26,7 @@ mod computer_takeover;
 mod consent_relay;
 mod crash_report_health;
 mod insulated_health;
+mod late_results;
 mod launch_outcome_vocabulary;
 mod no_runtime_output;
 mod once_dispatch_token_site;
