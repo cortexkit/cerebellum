@@ -5259,7 +5259,7 @@ async fn handle_keyed_tool_request(
         ticket: Some(ticket),
         observation: CallObservation::new()
             .with_origin(origin)
-            .with_key(call_key),
+            .with_key(call_key.clone()),
         unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
         request: (channel, epoch, corr),
     };
