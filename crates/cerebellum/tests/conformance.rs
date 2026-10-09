@@ -937,6 +937,38 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     daemon.stop();
 }
 
+/// Check the configuration actually loaded by the daemon, not a second call to
+/// the fence helper: forgetting an override must fail even if the operator has
+/// no browser configured and the registration tests happen to pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_daemon_fences_every_operator_directory() {
+    let (mut daemon, _) = start_live_daemon().await;
+    let config: Value = serde_json::from_slice(
+        &fs::read(daemon.directory.join("subc.jsonc")).expect("read loaded daemon configuration"),
+    )
+    .unwrap();
+    let environment = &config["modules"][MODULE_ID]["env"];
+    for variable in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+    ] {
+        let value = environment[variable]
+            .as_str()
+            .unwrap_or_else(|| panic!("daemon module environment must fence {variable}"));
+        let path = Path::new(value);
+        assert!(
+            path.starts_with(&daemon.directory) && path != daemon.directory && path.is_dir(),
+            "daemon module {variable} escapes scratch: {value}"
+        );
+    }
+    daemon.stop();
+}
+
 struct LiveDaemonGuard {
     task: Option<JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>>,
     directory: PathBuf,
@@ -1119,30 +1151,28 @@ async fn start_live_daemon_with_browser(
     // `create_dir`, not `create_dir_all`: a directory that already exists
     // belongs to another test's daemon, and is refused rather than shared.
     fs::create_dir(&directory).expect("create a live-daemon directory no other test holds");
-    let home = directory.join("home");
-    fs::create_dir_all(&home).expect("create isolated module home");
+    let module_env = support::fenced_module_env(&directory);
+    let config_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_CONFIG_HOME");
+    let data_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_DATA_HOME");
     let connection_file_path = directory.join("subc-connection.json");
     let binary = std::env::var_os("CARGO_BIN_EXE_ck-cerebellum")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
         });
-    let binary = support::ckdev_binary(binary, &directory);
+    let binary = cortexkit_test_support::ckdev_binary(binary);
     // Pay the first-exec cost of a freshly built binary before the registration
     // deadline starts.  macOS validates a newly written executable's signature on
     // its first exec and caches the result: measured 5-22s for the first run of a
     // fresh copy of this binary, and 0.00s for every run afterwards. Cargo
     // rebuilds ck-cerebellum, and the test daemon's first exec used to put that
     // validation inside the registration deadline. The test first gives the
-    // binary a ckdev name so this test process never launches a production-named
-    // image, while retaining the original inode when hard links are available.
+    // binary a content-addressed ckdev copy so this test process never launches
+    // a production-named image or a hard link to a concurrently rebuilt binary.
     // The module exits immediately without --subc, so this costs nothing once
     // the binary is already validated.
     let _ = tokio::process::Command::new(&binary)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .envs(cortexkit_test_support::fenced_subc_daemon_env(&directory))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1150,7 +1180,7 @@ async fn start_live_daemon_with_browser(
         .await;
 
     if browser {
-        let config_dir = home.join(".config").join("cortexkit");
+        let config_dir = config_home.join("cortexkit");
         fs::create_dir_all(&config_dir).expect("create isolated module config directory");
         // The executable need not exist: the parser requires an absolute path
         // and defers existence to launch time, and this test is about what the
@@ -1176,12 +1206,8 @@ async fn start_live_daemon_with_browser(
 
     // The daemon names the capture file `<module id>.stderr.log` inside this
     // directory, and it holds both of the child's output streams.
-    let capture_logs_dir = home
-        .join(".local")
-        .join("share")
-        .join("cortexkit")
-        .join("run")
-        .join("logs");
+    let run = data_home.join("cortexkit/run");
+    let capture_logs_dir = run.join("logs");
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
         &daemon_config_path,
@@ -1190,21 +1216,10 @@ async fn start_live_daemon_with_browser(
             "modules": {
                 MODULE_ID: {
                     "program": binary,
-                    // The daemon spawns the module with ITS environment plus
-                    // this block, so anything the runner sets leaks through
-                    // unless overridden here. The module resolves its config and
-                    // data homes by the daemon's ladder, XDG first; a runner that
-                    // sets XDG_CONFIG_HOME (GitHub's does) would otherwise send
-                    // the module to a directory this test never wrote, and
-                    // "browser unconfigured" would be true about the wrong tree.
-                    // Pin both XDG homes to the isolated home explicitly rather
-                    // than relying on their absence.
-                    "env": {
-                        "HOME": home,
-                        "XDG_CONFIG_HOME": home.join(".config"),
-                        "XDG_DATA_HOME": home.join(".local").join("share"),
-                        "XDG_RUNTIME_DIR": home.join("run"),
-                    },
+                    // The daemon inherits the runner's environment. Explicitly
+                    // fence every directory root so the child cannot discover
+                    // installed modules or configuration in the operator's homes.
+                    "env": module_env,
                     "reserved": true,
                 }
             }
@@ -1221,20 +1236,14 @@ async fn start_live_daemon_with_browser(
         // test binary, whose HOME is the real one. Without this the module's
         // stderr lands in the operator's live run dir; SUBC found
         // `cerebellum.stderr.log` there. Point it at the isolated home.
-        .with_live_children_record(home.join(".local/share/cortexkit/run/live-children.json"))
-        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
+        .with_live_children_record(run.join("live-children.json"))
+        .with_machine_id_path(data_home.join("cortexkit/machine-id"))
         .with_capture_logs_dir(&capture_logs_dir)
         // Same reason, one file over: the terminal journal also defaults into
         // the daemon's own run dir, where the live daemon appends every
         // module exit and `ck module terminals` reads them. A fixture module
         // that exits abnormally here must not land beside the real ones.
-        .with_terminal_journal_path(
-            home.join(".local")
-                .join("share")
-                .join("cortexkit")
-                .join("run")
-                .join("terminals.jsonl"),
-        );
+        .with_terminal_journal_path(run.join("terminals.jsonl"));
     let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
     let module_output = capture_logs_dir.join(format!("{MODULE_ID}.stderr.log"));
 

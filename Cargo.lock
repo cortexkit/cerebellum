@@ -57,6 +57,7 @@ dependencies = [
  "cerebellum-macos",
  "cortexkit-resource-busy",
  "cortexkit-role-tool-provider",
+ "cortexkit-test-support",
  "serde",
  "serde_json",
  "sha2",
@@ -190,6 +191,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cortexkit-test-support"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9929887ed416df1df4c65969f02ab6eeccaab4edc2e788d73cf252a4efd70f7"
+dependencies = [
+ "rustix",
+ "sha2",
+ "subc-os",
+ "tokio",
 ]
 
 [[package]]
