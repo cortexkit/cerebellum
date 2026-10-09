@@ -11,7 +11,8 @@
 # top-level-only check reports a clean tree while an undeclared module sits one
 # directory down. Each file's parent is the module that must declare it:
 # src/a.rs and src/a/mod.rs are declared by src/lib.rs; src/a/b.rs and
-# src/a/b/mod.rs are declared by src/a/mod.rs.
+# src/a/b/mod.rs are declared by src/a/mod.rs, or by src/a.rs when the crate
+# uses Rust's non-mod.rs layout for module `a`.
 #
 # Deliberately test-only modules belong in EXPECTED_UNWIRED below, so the
 # decision is recorded rather than inferred from an absence.
@@ -66,6 +67,11 @@ for crate_dir in crates/*/; do
       parent="$src/lib.rs"
     else
       parent="$src/$parent_dir/mod.rs"
+      # Rust also accepts src/a.rs as the parent of src/a/b.rs. Exactly one
+      # of the two may exist, or rustc refuses the crate.
+      if [ ! -f "$parent" ] && [ -f "$src/$parent_dir.rs" ]; then
+        parent="$src/$parent_dir.rs"
+      fi
     fi
 
     # A parent that does not exist is its own defect: the directory holds
@@ -76,7 +82,7 @@ for crate_dir in crates/*/; do
       continue
     fi
 
-    if grep -qE "^[[:space:]]*(pub )?mod ${module};" "$parent"; then
+    if grep -qE "^[[:space:]]*(pub(\([a-z]+\))? )?mod ${module};" "$parent"; then
       continue
     fi
 
