@@ -195,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-test-support"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9929887ed416df1df4c65969f02ab6eeccaab4edc2e788d73cf252a4efd70f7"
+checksum = "7e3a846ab7450b227ccbe0de1e9aefde1ec50fd299818a00c01246a7746e76f0"
 dependencies = [
  "rustix",
  "sha2",

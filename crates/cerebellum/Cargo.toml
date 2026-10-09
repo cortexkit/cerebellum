@@ -80,7 +80,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # than whenever commons publishes one. Its wire types share the exact registry
 # release selected by the workspace.
 cortexkit-role-tool-provider = "=0.5.0"
-cortexkit-test-support = "=0.1.1"
+cortexkit-test-support = "=0.1.2"
 
 # Examples carry their own tests, and cargo defaults an example target to
 # test = false -- so `cargo test --workspace` builds them and skips their
