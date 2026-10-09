@@ -32,7 +32,7 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use cerebellum::browser_session::{
     BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, LaunchedBrowser,
@@ -344,23 +344,14 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_the_daemon() {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
-        "cerebellum-scope-live-{}-{stamp}",
-        std::process::id()
-    ));
-    let home = directory.join("home");
-    fs::create_dir_all(&home).unwrap();
+    let directory = cortexkit_test_support::ScratchDir::new("cerebellum-scope-live");
+    let data = cortexkit_test_support::fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
     // Before anything reads them: the module in this process resolves its
     // data and config homes from these, and must not present a nonce of its
     // own.
-    std::env::set_var("HOME", &home);
-    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-    std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
-    std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+    for (name, path) in cortexkit_test_support::fenced_subc_daemon_env(directory.path()) {
+        std::env::set_var(name, path);
+    }
     std::env::remove_var("SUBC_LAUNCH_NONCE");
     std::env::remove_var("SUBC_LAUNCH_NONCE_FD");
 
@@ -369,6 +360,8 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     // descriptor 3 (named by SUBC_LAUNCH_NONCE_FD); there is no environment
     // copy, so the helper reads the pipe.
     let nonce_file = directory.join("owner-nonce");
+    let mut module_env = support::fenced_module_env(directory.path());
+    module_env.insert("NONCE_OUT".into(), nonce_file.clone());
     let connection_file_path = directory.join("subc-connection.json");
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
@@ -378,13 +371,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
             "modules": {
                 OWNER: {
                     "program": env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
-                    "env": {
-                        "HOME": home,
-                        "XDG_CONFIG_HOME": home.join(".config"),
-                        "XDG_DATA_HOME": home.join(".local/share"),
-                        "XDG_RUNTIME_DIR": home.join("run"),
-                        "NONCE_OUT": nonce_file,
-                    },
+                    "env": module_env,
                     "reserved": true,
                 }
             }
@@ -392,17 +379,13 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         .unwrap(),
     )
     .unwrap();
-    let run = home
-        .join(".local")
-        .join("share")
-        .join("cortexkit")
-        .join("run");
+    let run = data.join("cortexkit/run");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_privacy_trampoline(support::privacy_trampoline())
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
         .with_live_children_record(run.join("live-children.json"))
-        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
+        .with_machine_id_path(data.join("cortexkit/machine-id"))
         .with_capture_logs_dir(run.join("logs"))
         .with_terminal_journal_path(run.join("terminals.jsonl"))
         .with_scope_authority_owners(vec![OWNER.to_string()]);
@@ -591,5 +574,4 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
 
     module.abort();
     daemon.abort();
-    let _ = fs::remove_dir_all(&directory);
 }

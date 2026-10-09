@@ -3,13 +3,9 @@
 
 mod support;
 
+use cortexkit_test_support::{fenced_subc_env_dir, ScratchDir};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::scope::{ScopeAttributes, ScopeCarrier, ScopeKind, ScopeRecord, ScopeSelector};
 use subc_protocol::session::{ModuleControlRequestFromModule, ModuleControlResponseToModule};
@@ -26,7 +22,6 @@ use tokio::{
 const OWNER: &str = "prefrontal-core";
 const AGENT: &str = "flow-live-agent";
 const STARTUP: Duration = Duration::from_secs(60);
-static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn connect(connection: &subc_transport::ConnectionInfo) -> TcpStream {
     let endpoint = connection.endpoints.first().unwrap();
@@ -205,17 +200,17 @@ fn reserved(module_id: &str) -> Principal {
     }
 }
 
-fn module_binary(scratch_dir: &std::path::Path) -> PathBuf {
+fn module_binary() -> PathBuf {
     let binary = std::env::var_os("CEREBELLUM_FLOW_E2E_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ck-cerebellum")));
-    let binary = support::ckdev_binary(binary, scratch_dir);
+    let binary = cortexkit_test_support::ckdev_binary(binary);
     eprintln!("flow e2e binary: {}", binary.display());
     binary
 }
 
 struct Fixture {
-    directory: PathBuf,
+    directory: ScratchDir,
     computer_tools: Vec<String>,
     daemon: tokio::task::JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
     connection: subc_transport::ConnectionInfo,
@@ -227,34 +222,17 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.daemon.abort();
-        // Keep failed fixtures for diagnosis; the supervisor owns child cleanup.
-        if !std::thread::panicking() {
-            let _ = fs::remove_dir_all(&self.directory);
-        }
     }
 }
 
 impl Fixture {
     async fn start(carrier: &str, standing: bool) -> Self {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "cerebellum-flow-live-{}-{stamp}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&directory).unwrap();
-        let home = directory.join("home");
-        let data = home.join(".local/share");
-        let config = home.join(".config");
-        let runtime = home.join("run");
+        let directory = ScratchDir::new("cerebellum-flow-live");
+        let module_env = support::fenced_module_env(directory.path());
+        let data = fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
+        let config = fenced_subc_env_dir(directory.path(), "XDG_CONFIG_HOME");
         let run = data.join("cortexkit/run");
-        for path in [&home, &data, &config, &runtime, &run] {
-            fs::create_dir_all(path).unwrap();
-        }
         let browser_marker = directory.join("browser-launched");
         // An invalid executable is intentional: even the standing-grant control
         // must never start the operator's Chrome or open a real browser profile.
@@ -274,14 +252,22 @@ impl Fixture {
         let daemon_path = directory.join("subc.jsonc");
         let mut modules = serde_json::Map::new();
         for id in [OWNER, carrier] {
-            modules.insert(id.into(), json!({"program":env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
-                "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime,"NONCE_OUT":directory.join(format!("{id}-nonce"))}, "reserved":true}));
+            let mut helper_env = module_env.clone();
+            helper_env.insert("NONCE_OUT".into(), directory.join(format!("{id}-nonce")));
+            modules.insert(
+                id.into(),
+                json!({"program":env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
+                "env":helper_env, "reserved":true}),
+            );
         }
-        let module_binary = module_binary(&directory);
+        let module_binary = module_binary();
         // Launch the module directly: a shell that immediately execs another image
         // races the daemon's verification of the configured executable.
-        modules.insert("cerebellum".into(), json!({"program":module_binary,
-            "env":{"HOME":home,"XDG_DATA_HOME":data,"XDG_CONFIG_HOME":config,"XDG_RUNTIME_DIR":runtime}, "reserved":true}));
+        modules.insert(
+            "cerebellum".into(),
+            json!({"program":module_binary,
+            "env":module_env, "reserved":true}),
+        );
         fs::write(
             &daemon_path,
             serde_json::to_vec(&json!({"version":1,"modules":modules})).unwrap(),
@@ -423,8 +409,8 @@ impl Fixture {
     }
 
     fn journal(&self) -> PathBuf {
-        self.directory
-            .join("home/.local/share/cortexkit/cerebellum/journal/call_records.jsonl")
+        fenced_subc_env_dir(self.directory.path(), "XDG_DATA_HOME")
+            .join("cortexkit/cerebellum/journal/call_records.jsonl")
     }
 }
 

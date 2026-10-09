@@ -1183,20 +1183,13 @@ async fn the_operator_lists_and_revokes_an_agents_standing_access() {
 // The store
 // ---------------------------------------------------------------------------
 
-struct Scratch(std::path::PathBuf);
+struct Scratch(cortexkit_test_support::ScratchDir);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "cerebellum-standing-grants-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self(cortexkit_test_support::ScratchDir::new(&format!(
+            "cerebellum-standing-grants-{label}"
+        )))
     }
 
     fn storage(&self) -> FilesystemStandingGrantStorage {
@@ -1205,12 +1198,6 @@ impl Scratch {
                 self.0
                     .join(cerebellum_core::format_floor::FORMAT_FLOOR_FILE),
             ))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

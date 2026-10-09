@@ -11,10 +11,10 @@
 //! directory, which only a child process can do without redirecting every
 //! other test running beside it.
 
+use cortexkit_test_support::ScratchDir;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use cerebellum::computer_grants::{
     FilesystemGrantStorage, GrantStorage, GrantStoreError, GrantStoreState, InMemoryGrantStorage,
@@ -27,23 +27,11 @@ use cerebellum_core::journal::{
 };
 use serde_json::json;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-struct Scratch(PathBuf);
+struct Scratch(ScratchDir);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "cerebellum-format-floor-{label}-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self(ScratchDir::new(&format!("cerebellum-format-floor-{label}")))
     }
 
     fn path(&self) -> &Path {
@@ -59,12 +47,6 @@ impl Scratch {
         let blocker = self.0.join("not-a-directory");
         fs::write(&blocker, b"file").unwrap();
         blocker.join(FORMAT_FLOOR_FILE)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

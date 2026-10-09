@@ -26,7 +26,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use cerebellum::login_capture::vault::{self, ClaustrumVault, DepositEnd};
 use cerebellum::login_capture::{vault_wire, CookieHeader};
@@ -202,25 +202,18 @@ async fn deposit(vault: &ClaustrumVault) -> DepositEnd {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_nonce() {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
-        "cerebellum-vault-live-{}-{stamp}",
-        std::process::id()
-    ));
-    let home = directory.join("home");
-    fs::create_dir_all(&home).unwrap();
+    let directory = cortexkit_test_support::ScratchDir::new("cerebellum-vault-live");
+    let data = cortexkit_test_support::fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
     // Before the daemon starts: it resolves its homes from these.
-    std::env::set_var("HOME", &home);
-    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-    std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
-    std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+    for (name, path) in cortexkit_test_support::fenced_subc_daemon_env(directory.path()) {
+        std::env::set_var(name, path);
+    }
 
     // The daemon, with cerebellum configured as a helper that hands the test
     // its launch nonce.
     let nonce_file = directory.join("cerebellum-nonce");
+    let mut module_env = support::fenced_module_env(directory.path());
+    module_env.insert("NONCE_OUT".into(), nonce_file.clone());
     let connection_file_path = directory.join("subc-connection.json");
     let daemon_config_path = directory.join("subc.jsonc");
     fs::write(
@@ -233,13 +226,7 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
                     // The daemon passes the nonce only on a pipe at descriptor 3
                     // (named by SUBC_LAUNCH_NONCE_FD), never in the environment.
 
-                    "env": {
-                        "HOME": home,
-                        "XDG_CONFIG_HOME": home.join(".config"),
-                        "XDG_DATA_HOME": home.join(".local/share"),
-                        "XDG_RUNTIME_DIR": home.join("run"),
-                        "NONCE_OUT": nonce_file,
-                    },
+                    "env": module_env,
                     "reserved": true,
                 }
             }
@@ -247,17 +234,13 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
         .unwrap(),
     )
     .unwrap();
-    let run = home
-        .join(".local")
-        .join("share")
-        .join("cortexkit")
-        .join("run");
+    let run = data.join("cortexkit/run");
     let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file_path, 0)
         .with_privacy_trampoline(support::privacy_trampoline())
         .with_daemon_config_path(&daemon_config_path)
         .expect("load the daemon configuration")
         .with_live_children_record(run.join("live-children.json"))
-        .with_machine_id_path(home.join(".local/share/cortexkit/machine-id"))
+        .with_machine_id_path(data.join("cortexkit/machine-id"))
         .with_capture_logs_dir(run.join("logs"))
         .with_terminal_journal_path(run.join("terminals.jsonl"));
     let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
@@ -375,5 +358,4 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
     assert_eq!(seen.lock().unwrap().len(), calls_before);
 
     daemon.abort();
-    let _ = fs::remove_dir_all(&directory);
 }
