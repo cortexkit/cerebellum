@@ -13,6 +13,10 @@ default = []
 # Forwards to the substrate crate, which owns the observer now that identity
 # lives in cerebellum-core.
 test-observer = ["cerebellum-core/test-observer"]
+# Stock Chrome for Testing has an ad-hoc loader signature, not Google's
+# Developer ID. This weaker pin is for operator-approved browser tests only;
+# cerebellum-macos rejects the feature in signing-attested release builds.
+chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
 
 [[bin]]
 name = "ck-cerebellum"
@@ -38,6 +42,8 @@ path = "src/lib.rs"
 
 [dependencies]
 cortexkit-resource-busy = { workspace = true }
+cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
+cortexkit-paths = "=0.1.2"
 cerebellum-core = { path = "../cerebellum-core" }
 cerebellum-computer = { path = "../cerebellum-computer" }
 subc-protocol = { workspace = true }
@@ -59,6 +65,7 @@ tokio-util = { workspace = true }
 # SIGTERM runs the same bounded teardown EOF does and then re-raises itself.
 # Unix only: Windows has no SIGTERM, and keeps ending on EOF alone.
 [target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
 signal-hook = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
@@ -69,6 +76,7 @@ cerebellum-macos = { path = "../cerebellum-macos" }
 cerebellum-linux = { path = "../cerebellum-linux" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 subc-control = { workspace = true }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.
