@@ -48,9 +48,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
-# The tool-provider/v1 contract supplies the JSON types for results delivered
-# after a login handoff and the catalog schema validators used by our tests.
-# Pin both to one release so production replies and test checks cannot drift.
+# The tool-provider/v1 contract supplies catalog, pin and late-result types.
+# Pin cortexkit-role-tool-provider-conformance to the same release so its
+# catalog, schema-pin and late-result checks match the production wire types.
 cortexkit-role-tool-provider = "=0.6.0"
 getrandom = "=0.2.17"
 tokio = { workspace = true }
@@ -69,6 +69,8 @@ cerebellum-macos = { path = "../cerebellum-macos" }
 cerebellum-linux = { path = "../cerebellum-linux" }
 
 [dev-dependencies]
+async-trait = "0.1"
+cortexkit-role-tool-provider-conformance = "=0.6.0"
 subc-control = { workspace = true }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.

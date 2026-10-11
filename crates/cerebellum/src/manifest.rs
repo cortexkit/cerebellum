@@ -436,6 +436,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 LATE_RESULTS_CAPABILITY.to_string(),
+                cortexkit_role_tool_provider::PROVIDES.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),

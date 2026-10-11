@@ -429,23 +429,21 @@ async fn hello_manifest_declares_late_results_capability() {
         "HELLO does not declare late-result support: {capabilities:?}"
     );
     assert!(
-        !capabilities.contains(&json!("tool-provider/v1")),
-        "late results must not introduce a provider role claim"
+        capabilities.contains(&json!("tool-provider/v1")),
+        "HELLO must declare the catalog provider role"
     );
 }
 
 #[tokio::test]
-async fn catalog_and_role_ops_are_not_added() {
+async fn catalog_and_role_ops_are_served() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, false);
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
     for name in ["role.describe", "tool.catalog"] {
         let reply = exchange(&planes, frame(9, json!({"name":name,"arguments":{}}))).await;
-        assert_eq!(reply.header.ty, FrameType::Error);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&reply.body).unwrap()["code"],
-            "unknown_method"
-        );
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(body.is_object());
     }
 }
 
