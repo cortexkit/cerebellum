@@ -174,9 +174,13 @@ cancels active work and invalidates its handle.
 
 An isolated-world sentinel is injected only into group members. It reads no page
 text, URLs or field values, and persists between debugger attachments. Trusted
-key/pointer/wheel input increments the interaction epoch unless it matches the
+click/key/wheel/input/touch events increment the interaction epoch unless they match the
 one-shot, exact ticket for the currently dispatched agent input. Ambiguous,
-unmatched or expired events count as the person's input. Human activation and
+unmatched or expired events count as the person's input. Cursor movement alone
+(`pointermove`/`mousemove`) is not interaction and is neither observed nor attributed.
+Text-producing key events are intentionally not attributed: they count as the
+person's input. The browser adapter must type text with `Input.insertText` and use
+`Input.dispatchKeyEvent` only for non-text keys. Human activation and
 non-agent navigation also invalidate freshness; agent Page navigation is excluded.
 Missing observer/frame coverage and changed document identity invalidate input.
 

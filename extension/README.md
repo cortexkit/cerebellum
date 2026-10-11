@@ -84,12 +84,17 @@ Run from the repository root:
 
 ```sh
 node --version
-node --test extension/tests/*.test.mjs
+node extension/test-gate.mjs
 ```
 
-The harness uses only Node's built-ins and Chrome doubles: no network, real browser,
+The shared gate runs `node --test --test-reporter=tap` with its working directory
+set to `extension/tests/`, propagates any test failure, and refuses a missing or
+zero test count. It is a phase of
+`scripts/rust-test-gate.sh` and an explicit step of the Linux CI job, using the
+runner's existing Node. The harness uses only Node's built-ins and Chrome doubles: no network, real browser,
 operator profile, consent dialogs or durable journal. It tests membership races,
-route-bound handles, detached and mid-action human input, activation, worker loss,
+route-bound handles, detached and mid-action human input, click/activation (not
+cursor movement alone), worker loss,
 per-plan detachment, Cancel/chunks/reconnect, SHA-256 Runtime function-pin rejection and both popup
 paths. `node --check` on shipped JS modules supplies syntax checking; this plain-JS
 slice has no TypeScript package/typecheck. The Rust repository gate is still required

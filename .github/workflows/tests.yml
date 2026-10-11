@@ -93,9 +93,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # The six-phase gate is the same script every local change and every mason
-      # runs, so CI and the desk enforce one definition rather than two that
-      # drift.
+      - name: Extension tests (nonzero test count required)
+        run: node extension/test-gate.mjs
+
+      # CI and local contributors use the same verification script so their
+      # definitions cannot drift apart.
       - name: Rust test gate
         run: ./scripts/rust-test-gate.sh
 

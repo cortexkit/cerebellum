@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { test } from "node:test";
+import { setup } from "./harness.mjs";
+import { expectedEvents } from "../commands.mjs";
 
 const source = await readFile(new URL("../sentinel.js", import.meta.url), "utf8");
 function sentinel() {
@@ -64,4 +66,27 @@ test("sentinel withdrawal removes all page input observers", () => {
   assert.equal(s.listeners, 0);
   s.event({ type: "keydown", isTrusted: true });
   assert.equal(s.send("sample"), undefined);
+});
+
+
+test("trusted pointer and mouse movement do not change the tab interaction epoch", async () => {
+  const f = await setup();
+  const s = sentinel();
+  f.chrome.observations.set("2:0", s.send("sample"));
+  const epoch = await f.epochs.sample(2);
+  s.event({ type: "pointermove", isTrusted: true, clientX: 10, clientY: 20 });
+  s.event({ type: "mousemove", isTrusted: true, clientX: 10, clientY: 20 });
+  f.chrome.observations.set("2:0", s.send("sample"));
+  assert.equal(await f.epochs.sample(2), epoch);
+  assert.deepEqual(expectedEvents({ method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 10, y: 20 } }), []);
+});
+
+test("a trusted click still changes the tab interaction epoch", async () => {
+  const f = await setup();
+  const s = sentinel();
+  f.chrome.observations.set("2:0", s.send("sample"));
+  const epoch = await f.epochs.sample(2);
+  s.event({ type: "click", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
+  f.chrome.observations.set("2:0", s.send("sample"));
+  assert.equal(await f.epochs.sample(2), epoch + 1);
 });

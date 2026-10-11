@@ -66,7 +66,6 @@ export function expectedEvents(command) {
     const common = { clientX: p.x, clientY: p.y, button };
     if (p.type === "mousePressed") return [{ type: "pointerdown", ...common }, { type: "mousedown", ...common }];
     if (p.type === "mouseReleased") return [{ type: "pointerup", ...common }, { type: "mouseup", ...common }, { type: "click", ...common }];
-    if (p.type === "mouseMoved") return [{ type: "pointermove", ...common }, { type: "mousemove", ...common }];
     if (p.type === "mouseWheel") return [{ type: "wheel", clientX: p.x, clientY: p.y, deltaX: p.deltaX, deltaY: p.deltaY }];
   }
   if (command.method === "Input.dispatchKeyEvent" && ["rawKeyDown", "keyDown", "keyUp"].includes(p.type)) {

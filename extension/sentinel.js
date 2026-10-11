@@ -27,7 +27,7 @@
     sequence += 1;
     notify();
   };
-  const types = ["pointerdown", "pointerup", "pointermove", "mousedown", "mouseup", "mousemove", "click", "dblclick", "keydown", "keyup", "beforeinput", "input", "wheel", "touchstart", "touchend"];
+  const types = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup", "beforeinput", "input", "wheel", "touchstart", "touchend"];
   for (const type of types) addEventListener(type, observe, { capture: true, passive: true });
   const receive = (message, sender, reply) => {
     if (sender.id !== chrome.runtime.id || !message || message.kind !== "agent-sentinel") return;
