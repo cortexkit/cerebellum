@@ -16,9 +16,11 @@ pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod browser_launch_service;
+mod browser_queue;
 pub mod browser_session;
 pub mod browser_standing_grants;
 pub mod browser_type;
+mod call_queue;
 pub mod capability;
 pub mod cdp;
 pub mod classification;
@@ -2536,6 +2538,7 @@ pub struct Planes {
     route_test_handler: Option<RouteTestHandler>,
     pub health: Arc<HealthState>,
     cancellations: RequestCancellations,
+    browser_queue: Arc<call_queue::ConversationQueue>,
     draining: Arc<std::sync::atomic::AtomicBool>,
     /// The same drain, as a signal a waiting task can await: a call parked on
     /// a person's answer must stop at once when the module drains, not at the
@@ -2924,6 +2927,7 @@ impl Planes {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
+            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             elicitor: Arc::new(Elicitor::new()),
             capture,
             calls,
@@ -2953,6 +2957,7 @@ impl Clone for Planes {
             route_test_handler: self.route_test_handler.clone(),
             health: Arc::clone(&self.health),
             cancellations: self.cancellations.clone(),
+            browser_queue: self.browser_queue.clone(),
             draining: self.draining.clone(),
             drain_signal: Arc::clone(&self.drain_signal),
             drain_notice: self.drain_notice.clone(),
@@ -3193,6 +3198,7 @@ async fn handle_frame(
             ));
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let computer_arrival = computer_capability::computer_arrival(&frame, planes);
+            let browser_arrival = browser_queue::arrive(&frame, planes);
             let guard = planes.health.enter_request();
             let writer = writer.clone();
             let planes = planes.clone();
@@ -3202,14 +3208,14 @@ async fn handle_frame(
                     handler().await;
                 }
                 let _cancellation = cancellation;
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                let _ = computer_capability::serialized_call(
-                    computer_arrival,
+                let dispatch = browser_queue::scope(
+                    browser_arrival,
                     handle_route_request(frame, &writer, &planes),
-                )
-                .await;
+                );
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let _ = computer_capability::serialized_call(computer_arrival, dispatch).await;
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                let _ = handle_route_request(frame, &writer, &planes).await;
+                let _ = dispatch.await;
             }));
             Ok(true)
         }
@@ -3293,6 +3299,21 @@ async fn handle_management_request(
     facts: &AcceptedBindFacts,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
+    let _browser_guard = match browser_queue::enter(&frame, planes).await {
+        Ok(guard) => guard,
+        Err(outcome) => {
+            return send_route_error(
+                writer,
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                outcome,
+                "the queued browser call ended before authorization or execution",
+            )
+            .await;
+        }
+    };
     handle_management_request_observed(frame, writer, facts, planes, None).await
 }
 
@@ -5664,6 +5685,21 @@ async fn handle_tool_request(
     planes: &Planes,
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
+    let _browser_guard = match browser_queue::enter(&frame, planes).await {
+        Ok(guard) => guard,
+        Err(outcome) => {
+            return send_route_error(
+                writer,
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                outcome,
+                "the queued browser call ended before authorization or execution",
+            )
+            .await;
+        }
+    };
     let route_bindings = &planes.routes;
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -6210,8 +6246,8 @@ pub async fn handle_browser_consent_deadline_for_test(
 }
 
 /// Ask only after dispatch has returned its refusal and released its conversation
-/// lane and session operation guard. A person reading a question must not block
-/// another request or the session's idle sweep.
+/// lane and session operation guard. The outer call queue preserves browser
+/// order during consent, without holding CDP access or the session's idle sweep.
 async fn serve_browser_with_consent(
     planes: &Planes,
     facts: &AcceptedBindFacts,
@@ -8613,6 +8649,7 @@ mod tests {
 
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health,
@@ -8668,6 +8705,7 @@ mod tests {
 
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
@@ -9640,6 +9678,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
@@ -9709,6 +9748,7 @@ mod tests {
     pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),

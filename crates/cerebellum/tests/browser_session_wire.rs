@@ -45,6 +45,9 @@ mod consent_relay;
 #[path = "support/browser_stable_refs.rs"]
 mod stable_refs;
 
+#[path = "support/browser_queue.rs"]
+mod browser_queue;
+
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -5175,8 +5178,8 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
     .await
     .expect("status must not wait on consent");
     assert_eq!(status.header.ty, FrameType::Response);
-    // Status reads the session table; also probe the CDP serialization lane so
-    // future calls on this conversation cannot be stalled behind the question.
+    // Status reads the session table. The inner CDP lane is also released:
+    // consent holds only the outer call queue, not access needed by idle sweeps.
     let lane = tokio::time::timeout(
         Duration::from_secs(1),
         planes.browser.lane_for_test("test-session"),
