@@ -8,6 +8,7 @@
 pub mod extraction;
 pub mod geometry;
 pub mod navigation;
+mod refs;
 pub mod state_text;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -42,8 +43,7 @@ use crate::journal::{
 };
 use crate::snapshot_store::{
     self, AxRecord, BrowserSnapshotStore, CommittedDocument, DocumentEpoch, DocumentTransition,
-    SameDocumentChange, SnapshotError, SnapshotKind, StoredSnapshot, TextSnapshot, AX_SCHEMA,
-    DOM_SCHEMA, MAX_REFS,
+    SameDocumentChange, SnapshotError, SnapshotKind, TextSnapshot, AX_SCHEMA, DOM_SCHEMA, MAX_REFS,
 };
 use cerebellum_computer::platform::vocabulary::{
     CapabilityResultValidationError, CapabilityResultViolation,
@@ -328,6 +328,11 @@ impl BrowserError {
                 "poll browser.status until the session is ready, then retry the browser action"
             }
             Self::HumanInControl { .. } => "browser.resume",
+            Self::StaleSnapshot {
+                reason_code: "ref_from_older_snapshot",
+            } => {
+                "this ref came from an older snapshot without browser node identity; omit zoom to read the current outline"
+            }
             Self::StaleSnapshot { .. } => {
                 "call browser.snapshot again and use only its new snapshot_id and refs"
             }
@@ -1236,8 +1241,7 @@ struct ContextState {
     ended: bool,
     crashed: bool,
     next_snapshot_seed: u64,
-    /// The text snapshot most recently returned, whose refs a `zoom` names.
-    last_text_snapshot: Option<String>,
+    refs: refs::StableRefs,
 }
 impl ContextState {
     fn new(identity: RouteIdentity) -> Self {
@@ -1249,7 +1253,7 @@ impl ContextState {
             ended: false,
             crashed: false,
             next_snapshot_seed: 0,
-            last_text_snapshot: None,
+            refs: refs::StableRefs::default(),
         }
     }
     fn snapshot_id(&mut self, kind: SnapshotKind) -> String {
@@ -1263,48 +1267,40 @@ impl ContextState {
     }
 }
 
-/// The ref a zoom's element has in a fresh capture.
-///
-/// Refs are numbered per capture, so the same number can name a different
-/// element once the page has changed (a feed that loaded more posts above).
-/// The element is therefore found by the backend identity the previous
-/// snapshot recorded for the requested ref. Only a ref that snapshot never
-/// showed falls back to its number in this capture. `None` when the element
-/// is no longer on the page.
+/// A zoom must prove that the previously printed ref still names the same
+/// browser node in the same document. Unknown or removed nodes show the outline;
+/// missing identity evidence refuses rather than selecting by capture position.
 fn zoom_target(
     context: &ContextState,
     requested: &str,
-    records: &[AxRecord],
     refs: &[crate::snapshot_store::RefRecord],
-) -> Option<String> {
-    let previous = context
-        .last_text_snapshot
-        .as_deref()
-        .and_then(|id| context.snapshots.get(id))
-        .and_then(|snapshot| match snapshot {
-            StoredSnapshot::Text(snapshot) if snapshot.document_epoch == context.epoch.value() => {
-                snapshot
-                    .refs
-                    .iter()
-                    .find(|record| record.captured.reference == requested)
-            }
-            _ => None,
+    document: Option<&CommittedDocument>,
+) -> Result<Option<String>, BrowserError> {
+    let Some(shown) = context.refs.shown(requested) else {
+        return Ok(None);
+    };
+    if shown.epoch != context.epoch.value()
+        || matches!((&shown.document, document), (Some(old), Some(live)) if old.loader_id != live.loader_id)
+    {
+        return Err(BrowserError::StaleSnapshot {
+            reason_code: "document_or_target_changed",
         });
-    match previous {
-        Some(record) => {
-            let identity = record.backend_identity.as_ref()?;
-            refs.iter()
-                .find(|fresh| {
-                    fresh.backend_identity.as_ref() == Some(identity)
-                        && fresh.frame_document == record.frame_document
-                })
-                .map(|fresh| fresh.captured.reference.clone())
-        }
-        None => records
-            .iter()
-            .any(|record| record.reference.as_deref() == Some(requested))
-            .then(|| requested.to_string()),
     }
+    if shown.record.backend_identity.is_none() {
+        // Capture positions and role/name pairs can belong to replacement nodes.
+        // Without a browser identity, an older snapshot cannot prove this ref.
+        return Err(BrowserError::StaleSnapshot {
+            reason_code: "ref_from_older_snapshot",
+        });
+    }
+    Ok(refs
+        .iter()
+        .find(|fresh| {
+            context
+                .refs
+                .resolves(requested, fresh, context.epoch.value(), document)
+        })
+        .map(|fresh| fresh.captured.reference.clone()))
 }
 
 #[derive(Debug, Default)]
@@ -1775,26 +1771,25 @@ impl BrowserPlane {
     pub async fn open_context(&self, identity: RouteIdentity) -> Result<(), BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
         let mut state = self.state.lock().await;
-        // Only a successful launch opens a context, and a launch only succeeds
-        // when the conversation holds no live browser, so whatever context is
-        // still here belongs to a browser that is gone: one that was closed
-        // (marked ended), or one the idle or exit sweep tore down without the
-        // browser plane hearing about it (never marked ended). Keeping it would
-        // either refuse every read as no_session, or hand the new browser the
-        // old browser's snapshots, document epoch, page tracker and crash flag.
-        // The new browser gets a fresh context instead.
-        //
-        // The one value carried over is the snapshot-id counter. Snapshot ids
-        // are derived from the conversation key, the snapshot kind and this
-        // counter, so restarting it at zero would mint ids the caller may still
-        // hold from the previous browser, and a stale id would then address a
-        // snapshot of a different page.
+        // A successful launch replaces all state from the previous browser,
+        // even if its idle or crash teardown did not mark that state ended.
+        // Discard snapshots, document epochs, page tracking and crash flags so
+        // the new browser cannot inherit a previous page's observations.
+        // Snapshot and ref counters carry over without their old bindings:
+        // restarting either counter would mint names a caller may still hold,
+        // allowing a stale name to address a different page.
         let key = identity.conversation_key.clone();
         let next_snapshot_seed = state
             .contexts
             .get(&key)
             .map_or(0, |previous| previous.next_snapshot_seed);
+        let refs = state
+            .contexts
+            .get(&key)
+            .map(|previous| previous.refs.next_document())
+            .unwrap_or_default();
         let mut context = ContextState::new(identity);
+        context.refs = refs;
         context.next_snapshot_seed = next_snapshot_seed;
         state.contexts.insert(key.clone(), context);
         // Dialogs, downloads and policy rejections queued for the previous
@@ -1812,6 +1807,7 @@ impl BrowserPlane {
                 context.crashed = crashed;
                 context.snapshots.begin_teardown();
                 let _ = context.snapshots.complete_teardown();
+                context.refs.prune_shown(&context.snapshots);
             }
         }
         self.journal
@@ -2489,6 +2485,7 @@ impl BrowserPlane {
                 read_max_bytes,
                 true,
                 None,
+                &state_text::Filters::default(),
             )
             .await
         {
@@ -2520,7 +2517,10 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let object = self
-            .validate_request(args, &["mode", "max_bytes", "zoom"])
+            .validate_request(
+                args,
+                &["mode", "max_bytes", "zoom", "text_filter", "role_filter"],
+            )
             .await?;
         let kind = match object.get("mode") {
             None => SnapshotKind::Actionable,
@@ -2564,7 +2564,8 @@ impl BrowserPlane {
                 })
             }
         };
-        self.capture_snapshot(identity, kind, max_bytes, true, zoom.as_deref())
+        let filters = state_text::Filters::parse(object, kind)?;
+        self.capture_snapshot(identity, kind, max_bytes, true, zoom.as_deref(), &filters)
             .await
     }
 
@@ -2729,6 +2730,7 @@ impl BrowserPlane {
         max_bytes: usize,
         persist_journal: bool,
         zoom: Option<&str>,
+        filters: &state_text::Filters,
     ) -> Result<Value, BrowserError> {
         let document_epoch = {
             let state = self.state.lock().await;
@@ -2773,24 +2775,16 @@ impl BrowserPlane {
                 .get(&identity.conversation_key)
                 .and_then(|context| {
                     context
-                        .last_text_snapshot
-                        .as_ref()
-                        .and_then(|id| context.snapshots.get(id))
-                        .and_then(|snapshot| match snapshot {
-                            StoredSnapshot::Text(snapshot) => snapshot
-                                .refs
-                                .iter()
-                                .find(|reference| reference.captured.reference == requested)
-                                .and_then(|reference| reference.frame_document.clone()),
-                            _ => None,
-                        })
+                        .refs
+                        .shown(requested)
+                        .and_then(|reference| reference.record.frame_document.clone())
                 })
         } else {
             None
         };
         if zoom_frame
             .as_ref()
-            .is_some_and(|frame| !frames.contains(frame))
+            .is_some_and(|frame| !frames.iter().any(|live| live.same_document(frame)))
         {
             return Err(BrowserError::StaleSnapshot {
                 reason_code: "frame_document_changed",
@@ -2900,6 +2894,7 @@ impl BrowserPlane {
                 observation.refs,
                 &observation.facts,
                 zoom,
+                filters,
                 max_bytes,
                 kind != SnapshotKind::DomFull && observation.ax_truncated,
                 observation.refs_truncated,
@@ -2957,6 +2952,7 @@ impl BrowserPlane {
             refs,
             &no_facts,
             None,
+            &state_text::Filters::default(),
             max_bytes,
             false,
             false,
@@ -2975,8 +2971,8 @@ impl BrowserPlane {
         dom_text: Option<&str>,
         refs: Vec<crate::snapshot_store::RefRecord>,
         facts: &HashMap<String, state_text::NodeFacts>,
-        // The ref a zoom names, from the snapshot this context returned last.
         zoom: Option<&str>,
+        filters: &state_text::Filters,
         max_bytes: usize,
         content_incomplete: bool,
         refs_incomplete: bool,
@@ -2993,6 +2989,16 @@ impl BrowserPlane {
         if context.ended {
             return Err(BrowserError::NoSession);
         }
+        let mut records = records.to_vec();
+        let mut facts = facts.clone();
+        let mut refs = refs;
+        context.refs.assign(
+            &mut records,
+            &mut refs,
+            &mut facts,
+            context.epoch.value(),
+            source_document.as_ref(),
+        );
         let refs_truncated = refs.len() > MAX_REFS || refs_incomplete;
         let mut refs = refs.into_iter().take(MAX_REFS).collect::<Vec<_>>();
         let id = context.snapshot_id(mode);
@@ -3008,11 +3014,16 @@ impl BrowserPlane {
             });
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
-                let target =
-                    zoom.and_then(|requested| zoom_target(context, requested, records, &refs));
+                let target = match zoom {
+                    Some(requested) => {
+                        zoom_target(context, requested, &refs, source_document.as_ref())?
+                    }
+                    None => None,
+                };
                 let rendered = state_text::render(&state_text::RenderInput {
-                    records,
-                    facts,
+                    records: &records,
+                    facts: &facts,
+                    filters,
                     page_url: &source_origin,
                     snapshot_id: &id,
                     zoom: zoom.map(|requested| state_text::Zoom {
@@ -3031,7 +3042,7 @@ impl BrowserPlane {
                 )
             }
             SnapshotKind::Ax => {
-                let (content, truncated) = snapshot_store::encode_ax_jsonl(records, usize::MAX)
+                let (content, truncated) = snapshot_store::encode_ax_jsonl(&records, usize::MAX)
                     .map_err(map_snapshot_error)?;
                 (content, truncated, AX_SCHEMA, (0, 0))
             }
@@ -3071,7 +3082,15 @@ impl BrowserPlane {
             .snapshots
             .retain_text(snapshot)
             .map_err(map_snapshot_error)?;
-        context.last_text_snapshot = Some(id);
+        if let Some(snapshot_store::StoredSnapshot::Text(retained)) = context.snapshots.get(&id) {
+            context.refs.remember(
+                &retained.refs,
+                &id,
+                retained.document_epoch,
+                retained.source_document.as_ref(),
+            );
+        }
+        context.refs.prune_shown(&context.snapshots);
         // The outer reply owns the dispatch envelope: navigate embeds this
         // snapshot without a second context.
         reply
@@ -3273,7 +3292,7 @@ impl BrowserPlane {
         let object = self
             .validate_request(args, &["ref", "snapshot_id", "intent", "severity"])
             .await?;
-        let reference = required_string(object, "ref", 2, 5)?;
+        let reference = required_string(object, "ref", 2, 21)?;
         let snapshot_id = required_string(object, "snapshot_id", 32, 32)?;
         if !snapshot_store::valid_snapshot_id(snapshot_id) {
             return Err(BrowserError::InvalidRequest {
@@ -4073,6 +4092,7 @@ impl BrowserPlane {
             .snapshots
             .retain_screenshot(snapshot)
             .map_err(map_snapshot_error)?;
+        context.refs.prune_shown(&context.snapshots);
         Ok(result)
     }
 
@@ -4092,6 +4112,7 @@ impl BrowserPlane {
             .replace(transition)
             .map_err(map_snapshot_error)?;
         context.snapshots.invalidate_before(epoch);
+        context.refs.prune_shown(&context.snapshots);
         Ok(epoch)
     }
 
@@ -4236,13 +4257,13 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         BrowserToolDefinition {
             name: SNAPSHOT,
             description: "Read the page as plain text in state_text: an outline of its landmarks by default, main content first; zoom names one ref to print that element's whole subtree. Use ax or dom_full only when something is missing.",
-            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"zoom":{"type":"string","description":"A ref from the last snapshot; prints that element's whole subtree instead of the outline. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"text_filter":{"type":"string","maxLength":4096,"description":"Keep label/value matches beneath labelled ancestors. Default mode only."},"role_filter":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":16,"description":"Keep matching roles, case-insensitively (AXButton, Button or button). Default mode only."},"zoom":{"type":"string","description":"A previously printed ref; prints that element's whole subtree instead of the outline while it exists on the same page. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
             name: TYPE,
-            description: "Type into a ref from the latest snapshot; clear_first replaces its contents. Credential and payment fields require present instead.",
-            request_schema: json!({"type":"object","properties":{"ref":{"type":"string"},"text":{"type":"string","maxLength":10000},"clear_first":{"type":"boolean","default":false}},"required":["ref","text"],"additionalProperties":false}),
+            description: "Type into a previously printed ref; clear_first replaces its contents. Credential and payment fields require present instead.",
+            request_schema: json!({"type":"object","properties":{"ref":{"type":"string"},"snapshot_id":{"type":"string","description":"Optional retained snapshot that showed this ref; otherwise use its most recent shown snapshot."},"text":{"type":"string","maxLength":10000},"clear_first":{"type":"boolean","default":false}},"required":["ref","text"],"additionalProperties":false}),
             result_schema: reply_schema(json!({"characters_dispatched":integer_schema()}), &[]),
         },
         BrowserToolDefinition {
@@ -5705,11 +5726,57 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 
 #[cfg(test)]
 mod tests {
-    /// A zoom names a ref from the last snapshot; after the page grew above
-    /// that element its number in the fresh capture differs, and the element
-    /// is still the one zoomed.
+    #[tokio::test]
+    async fn stable_refs_reopening_a_context_does_not_recycle_names() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        let record = crate::snapshot_store::RefRecord {
+            frame_document: None,
+            captured: crate::snapshot_store::SnapshotRef::new("e1", "button", "Access", 0).unwrap(),
+            frame_path: vec!["frame".into()],
+            backend_identity: Some(
+                crate::snapshot_store::BackendNodeIdentity::new("target", "frame", 42).unwrap(),
+            ),
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        };
+        let records = [AxRecord {
+            depth: 0,
+            role: "button".into(),
+            name: "Access".into(),
+            value: None,
+            reference: Some("e1".into()),
+        }];
+        let mut names = Vec::new();
+        for loader in ["first", "second"] {
+            plane.open_context(identity.clone()).await.unwrap();
+            let snapshot = plane
+                .retain_text_snapshot(
+                    &identity,
+                    SnapshotKind::Ax,
+                    &records,
+                    None,
+                    vec![record.clone()],
+                    4096,
+                    Some(CommittedDocument::new("https://example.com", 1, loader)),
+                )
+                .await
+                .unwrap();
+            let row: Value =
+                serde_json::from_str(snapshot["state_text"].as_str().unwrap().trim()).unwrap();
+            names.push(row["ref"].as_str().unwrap().to_string());
+        }
+        assert_eq!(names, ["e1", "e2"]);
+        let state = plane.state.lock().await;
+        let context = state.contexts.get(&identity.conversation_key).unwrap();
+        assert!(context.refs.shown("e1").is_none());
+    }
+
+    /// A printed ref survives insertions but cannot fall back to a fresh node
+    /// occupying its old capture position after removal.
     #[test]
-    fn a_zoom_follows_its_element_when_the_page_renumbers() {
+    fn stable_refs_zoom_rejects_removed_identity() {
         let record = |reference: &str, backend: u64| crate::snapshot_store::RefRecord {
             frame_document: None,
             captured: crate::snapshot_store::SnapshotRef::new(reference, "article", "Post", 0)
@@ -5731,37 +5798,69 @@ mod tests {
             reference: Some(reference.into()),
         };
         let mut context = ContextState::new(identity());
-        // No earlier snapshot: the number is all there is to go on.
-        assert_eq!(
-            zoom_target(&context, "e5", &[ax("e5")], &[record("e5", 50)]),
-            Some("e5".into())
+        let doc = CommittedDocument::new("https://example.com/", 1, "loader");
+        let mut initial = vec![record("e5", 50)];
+        context.refs.assign(
+            &mut [ax("e5")],
+            &mut initial,
+            &mut HashMap::new(),
+            0,
+            Some(&doc),
         );
-        context
-            .snapshots
-            .retain_text(TextSnapshot {
-                snapshot_id: snapshot_store::new_snapshot_id("previous"),
-                kind: SnapshotKind::Actionable,
-                document_epoch: context.epoch.value(),
-                source_origin: "https://example.com/".into(),
-                source_document: None,
-                content_schema: snapshot_store::STATE_TEXT_SCHEMA,
-                content: "e5 article Post\n".into(),
-                truncated: false,
-                refs_truncated: false,
-                refs: vec![record("e5", 50)],
+        context.refs.remember(&initial, "previous", 0, Some(&doc));
+        let requested = initial[0].captured.reference.clone();
+        let mut fresh = vec![record("e5", 70), record("e6", 60), record("e7", 50)];
+        context.refs.assign(
+            &mut [ax("e5"), ax("e6"), ax("e7")],
+            &mut fresh,
+            &mut HashMap::new(),
+            0,
+            Some(&doc),
+        );
+        assert_eq!(fresh[2].captured.reference, requested);
+        assert_ne!(fresh[0].captured.reference, requested);
+        let mut recached = fresh.clone();
+        recached[2].captured.reference = "e99999".into();
+        assert_eq!(
+            zoom_target(&context, &requested, &recached, Some(&doc)).unwrap(),
+            Some("e99999".into())
+        );
+        assert_eq!(
+            zoom_target(&context, &requested, &fresh, Some(&doc)).unwrap(),
+            Some(requested.clone())
+        );
+        assert_eq!(
+            zoom_target(&context, &requested, &fresh[..2], Some(&doc)).unwrap(),
+            None
+        );
+        // Even a corrupted fresh capture must not resolve by number alone.
+        fresh[0].captured.reference = requested.clone();
+        assert_eq!(
+            zoom_target(&context, &requested, &fresh[..1], Some(&doc)).unwrap(),
+            None
+        );
+        assert_eq!(
+            zoom_target(&context, "e999", &fresh, Some(&doc)).unwrap(),
+            None
+        );
+        let changed = CommittedDocument::new("https://example.com/", 2, "new-loader");
+        assert!(matches!(
+            zoom_target(&context, &requested, &fresh, Some(&changed)),
+            Err(BrowserError::StaleSnapshot {
+                reason_code: "document_or_target_changed"
             })
-            .unwrap();
-        context.last_text_snapshot = Some(snapshot_store::new_snapshot_id("previous"));
-        // Two posts loaded above it: the same element is e7 now, and e5 is
-        // another post that must not be shown in its place.
-        let fresh = [record("e5", 70), record("e6", 60), record("e7", 50)];
-        let records = [ax("e5"), ax("e6"), ax("e7")];
-        assert_eq!(
-            zoom_target(&context, "e5", &records, &fresh),
-            Some("e7".into())
-        );
-        // Gone from the page: no element is substituted for it.
-        assert_eq!(zoom_target(&context, "e5", &records, &fresh[..2]), None);
+        ));
+        let mut identityless = initial.clone();
+        identityless[0].backend_identity = None;
+        context
+            .refs
+            .remember(&identityless, "previous", 0, Some(&doc));
+        assert!(matches!(
+            zoom_target(&context, &requested, &fresh, Some(&doc)),
+            Err(BrowserError::StaleSnapshot {
+                reason_code: "ref_from_older_snapshot"
+            })
+        ));
     }
 
     /// `max_bytes` bounds the page text in every mode, the reply's copy of a

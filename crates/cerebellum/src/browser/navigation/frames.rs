@@ -245,10 +245,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     ) -> Result<bool, NavigationDriveError> {
         self.active_frame = None;
         let live = self.frame_documents(context, deadline_ms)?;
-        if !live.contains(expected) {
+        let Some(current) = live.iter().find(|frame| frame.same_document(expected)) else {
             return Ok(false);
-        }
-        self.active_frame = Some(expected.clone());
+        };
+        self.active_frame = Some(current.clone());
         Ok(true)
     }
 
@@ -933,6 +933,58 @@ mod tests {
         assert_eq!(frames.len(), 3);
         (driver, frames)
     }
+    #[test]
+    fn stable_refs_frame_revision_also_moves_on_same_document_events() {
+        let (mut driver, _) = fixture();
+        let session = driver.attachment.as_ref().unwrap().session_id.clone();
+        for (method, params, expected) in [
+            (
+                "Page.navigatedWithinDocument",
+                json!({"frameId":"same","url":"http://127.0.0.1:9000/frame#fragment"}),
+                1,
+            ),
+            (
+                "Page.frameNavigated",
+                json!({"frame":{"id":"same","loaderId":"new-loader"}}),
+                2,
+            ),
+        ] {
+            let raw = json!({"method":method,"sessionId":session,"params":params});
+            driver.observe_frame_session(&CdpEvent {
+                method: method.into(),
+                params: raw["params"].as_object().cloned(),
+                session_id: Some(session.clone()),
+                raw,
+            });
+            assert_eq!(driver.frame_revisions["same"], expected);
+        }
+    }
+
+    #[test]
+    fn stable_refs_frame_url_change_keeps_loader_session_origin_binding() {
+        let (mut driver, frames) = fixture();
+        let mut previous = frames
+            .iter()
+            .find(|f| f.frame_id == "same")
+            .unwrap()
+            .clone();
+        previous.url.push_str("#old");
+        previous.navigation_revision += 10;
+        assert!(driver
+            .prepare_frame("isolated-fixture", &previous, 1000)
+            .unwrap());
+        assert_ne!(driver.active_frame.as_ref().unwrap().url, previous.url);
+        let mut different_origin = previous.clone();
+        different_origin.origin = "https://other.example".into();
+        assert!(!driver
+            .prepare_frame("isolated-fixture", &different_origin, 1000)
+            .unwrap());
+        previous.loader_id = "another-document".into();
+        assert!(!driver
+            .prepare_frame("isolated-fixture", &previous, 1000)
+            .unwrap());
+    }
+
     #[test]
     fn oopif_point_walk_classifies_and_dispatches_in_hit_frame() {
         let (mut driver, _) = fixture();
