@@ -294,7 +294,7 @@ impl Fixture {
             store
                 .record(
                     AGENT,
-                    StandingSubject::Origin("https://page.example".into()),
+                    StandingSubject::Origin("https://page.example:8443".into()),
                     2,
                     vec![],
                     None,
@@ -479,7 +479,9 @@ async fn call(client: &mut TcpStream, channel: u16, epoch: u32, name: &str, args
 }
 
 fn navigation() -> Value {
-    json!({"action":"navigate", "url":"https://page.example/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}})
+    // A non-default port keeps this origin outside the public-web baseline, so
+    // reaching it needs a granted site and the flow's missing grant decides.
+    json!({"action":"navigate", "url":"https://page.example:8443/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}})
 }
 
 #[tokio::test]
