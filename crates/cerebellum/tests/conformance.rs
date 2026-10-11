@@ -16,6 +16,8 @@
 #![cfg(test)]
 
 mod support;
+#[path = "conformance/tool_provider.rs"]
+mod tool_provider;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1651,11 +1653,11 @@ async fn one_reply(request: Value, admitted: Option<&[&str]>, channel: u16) -> F
 #[tokio::test]
 async fn every_retired_or_unserved_computer_name_gets_a_typed_refusal() {
     for (name, code) in [
-        ("computer.click", "unknown_method"),
-        ("computer.screenshot", "unknown_method"),
-        ("computer.move", "unknown_method"),
-        ("computer.drag", "unknown_method"),
-        ("computer.scroll", "unknown_method"),
+        ("computer.click", "unknown_tool"),
+        ("computer.screenshot", "unknown_tool"),
+        ("computer.move", "unknown_tool"),
+        ("computer.drag", "unknown_tool"),
+        ("computer.scroll", "unknown_tool"),
         ("computer.press_element", "capability_not_admitted"),
         ("computer.takeover_move", "capability_not_admitted"),
     ] {
