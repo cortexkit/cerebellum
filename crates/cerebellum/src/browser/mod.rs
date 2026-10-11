@@ -1272,10 +1272,9 @@ fn zoom_target(
 ) -> Option<String> {
     refs.iter()
         .find(|fresh| {
-            fresh.captured.reference == requested
-                && context
-                    .refs
-                    .resolves(requested, fresh, context.epoch.value(), document)
+            context
+                .refs
+                .resolves(requested, fresh, context.epoch.value(), document)
         })
         .map(|fresh| fresh.captured.reference.clone())
 }
@@ -1784,6 +1783,7 @@ impl BrowserPlane {
                 context.crashed = crashed;
                 context.snapshots.begin_teardown();
                 let _ = context.snapshots.complete_teardown();
+                context.refs.prune_shown(&context.snapshots);
             }
         }
         self.journal
@@ -3068,6 +3068,7 @@ impl BrowserPlane {
                 retained.source_document.as_ref(),
             );
         }
+        context.refs.prune_shown(&context.snapshots);
         // The outer reply owns the dispatch envelope: navigate embeds this
         // snapshot without a second context.
         reply
@@ -4069,6 +4070,7 @@ impl BrowserPlane {
             .snapshots
             .retain_screenshot(snapshot)
             .map_err(map_snapshot_error)?;
+        context.refs.prune_shown(&context.snapshots);
         Ok(result)
     }
 
@@ -4088,6 +4090,7 @@ impl BrowserPlane {
             .replace(transition)
             .map_err(map_snapshot_error)?;
         context.snapshots.invalidate_before(epoch);
+        context.refs.prune_shown(&context.snapshots);
         Ok(epoch)
     }
 
@@ -5794,6 +5797,12 @@ mod tests {
         );
         assert_eq!(fresh[2].captured.reference, requested);
         assert_ne!(fresh[0].captured.reference, requested);
+        let mut recached = fresh.clone();
+        recached[2].captured.reference = "e99999".into();
+        assert_eq!(
+            zoom_target(&context, &requested, &recached, Some(&doc)),
+            Some("e99999".into())
+        );
         assert_eq!(
             zoom_target(&context, &requested, &fresh, Some(&doc)),
             Some(requested.clone())

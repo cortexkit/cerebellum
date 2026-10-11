@@ -265,7 +265,7 @@ async fn stable_refs_wire_type_uses_named_older_snapshot_and_ledger() {
 }
 
 #[tokio::test]
-async fn stable_refs_wire_zoom_outlives_views_but_click_keeps_snapshot_binding() {
+async fn stable_refs_wire_old_refs_survive_views_but_not_snapshot_eviction() {
     let (planes, launcher, _) = fixture().await;
     let before = call(
         &planes,
@@ -274,6 +274,16 @@ async fn stable_refs_wire_zoom_outlives_views_but_click_keeps_snapshot_binding()
     )
     .await;
     let old = ref_named(&before, "Access: Permission 39");
+    let narrowed = call(
+        &planes,
+        "snapshot",
+        json!({"text_filter":"Permission 00","role_filter":["button"]}),
+    )
+    .await;
+    assert_eq!(narrowed["outcome"], "ok");
+    let retained_zoom = call(&planes, "snapshot", json!({"zoom":old})).await;
+    assert_eq!(retained_zoom["outcome"], "ok", "{retained_zoom}");
+    assert_eq!(ref_named(&retained_zoom, "Access: Permission 39"), old);
     for _ in 0..20 {
         let narrowed = call(
             &planes,
@@ -287,9 +297,16 @@ async fn stable_refs_wire_zoom_outlives_views_but_click_keeps_snapshot_binding()
     assert_eq!(stale["outcome"], "stale_snapshot", "{stale}");
     assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
     let zoom = call(&planes, "snapshot", json!({"zoom":old})).await;
-    assert_eq!(zoom["outcome"], "ok", "{zoom}");
-    assert_eq!(ref_named(&zoom, "Access: Permission 39"), old);
-    assert_eq!(click(&planes, &zoom, &old).await["outcome"], "ok");
+    assert_eq!(zoom["outcome"], "stale_snapshot", "{zoom}");
+    let fresh = call(
+        &planes,
+        "snapshot",
+        json!({"text_filter":"Permission 39","role_filter":["button"]}),
+    )
+    .await;
+    assert_eq!(fresh["outcome"], "ok", "{fresh}");
+    assert_eq!(ref_named(&fresh, "Access: Permission 39"), old);
+    assert_eq!(click(&planes, &fresh, &old).await["outcome"], "ok");
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::snapshot_store::{AxRecord, BackendNodeIdentity, CommittedDocument, RefRecord};
+use crate::snapshot_store::{
+    AxRecord, BackendNodeIdentity, BrowserSnapshotStore, CommittedDocument, RefRecord,
+};
 
 use super::state_text::NodeFacts;
 
@@ -49,8 +51,19 @@ fn key(record: &RefRecord, epoch: u64, document: Option<&CommittedDocument>) -> 
 #[derive(Debug, Default)]
 pub(super) struct StableRefs {
     next: u64,
-    names: HashMap<ElementKey, String>,
+    shown_sequence: u64,
+    names: HashMap<ElementKey, CachedName>,
+    name_recency: BTreeMap<(u64, u64), ElementKey>,
     shown: HashMap<String, ShownRef>,
+}
+
+const MAX_STABLE_IDENTITIES: usize = 20_000;
+
+#[derive(Debug)]
+struct CachedName {
+    reference: String,
+    last_shown: u64,
+    number: u64,
 }
 
 #[derive(Debug)]
@@ -68,6 +81,33 @@ impl StableRefs {
             ..Self::default()
         }
     }
+
+    fn cache_name(&mut self, identity: ElementKey, reference: String, last_shown: u64) {
+        if let Some(previous) = self.names.remove(&identity) {
+            self.name_recency
+                .remove(&(previous.last_shown, previous.number));
+        }
+        let number = reference[1..]
+            .parse()
+            .expect("allocated browser ref number");
+        self.name_recency
+            .insert((last_shown, number), identity.clone());
+        self.names.insert(
+            identity,
+            CachedName {
+                reference,
+                last_shown,
+                number,
+            },
+        );
+        while self.names.len() > MAX_STABLE_IDENTITIES {
+            let (_, oldest) = self
+                .name_recency
+                .pop_first()
+                .expect("cached name has a recency entry");
+            self.names.remove(&oldest);
+        }
+    }
     /// Capture order is only a temporary join key. Browser identity owns the
     /// public name, so inserting a sibling cannot move an existing reference.
     pub fn assign(
@@ -79,23 +119,35 @@ impl StableRefs {
         document: Option<&CommittedDocument>,
     ) {
         let mut rename = HashMap::new();
+        // Repeated AX records for one DOM node share a ref even if the global
+        // cache evicts its name before this capture finishes.
+        let mut captured_names = HashMap::new();
         for record in refs {
             let identity = key(record, epoch, document);
             let name = identity
                 .as_ref()
-                .and_then(|k| self.names.get(k))
-                .cloned()
+                .and_then(|k| {
+                    captured_names
+                        .get(k)
+                        .cloned()
+                        .or_else(|| self.names.get(k).map(|cached| cached.reference.clone()))
+                })
                 .unwrap_or_else(|| {
                     self.next = self
                         .next
                         .checked_add(1)
                         .expect("browser reference counter exhausted");
                     let name = format!("e{}", self.next);
-                    if let Some(identity) = identity {
-                        self.names.insert(identity, name.clone());
+                    if let Some(identity) = identity.clone() {
+                        // Prefer names the caller has actually seen over nodes
+                        // captured from the page but omitted from snapshot text.
+                        self.cache_name(identity, name.clone(), 0);
                     }
                     name
                 });
+            if let Some(identity) = identity {
+                captured_names.insert(identity, name.clone());
+            }
             rename.insert(record.captured.reference.clone(), name.clone());
             record.captured.reference = name;
         }
@@ -124,6 +176,17 @@ impl StableRefs {
         document: Option<&CommittedDocument>,
     ) {
         for record in refs {
+            if let Some(identity) = key(record, epoch, document) {
+                self.shown_sequence = self
+                    .shown_sequence
+                    .checked_add(1)
+                    .expect("browser shown-ref counter exhausted");
+                self.cache_name(
+                    identity,
+                    record.captured.reference.clone(),
+                    self.shown_sequence,
+                );
+            }
             self.shown.insert(
                 record.captured.reference.clone(),
                 ShownRef {
@@ -134,6 +197,14 @@ impl StableRefs {
                 },
             );
         }
+    }
+
+    /// Retained snapshots are the provenance for usable refs. Eviction also
+    /// releases their ledger entries, so a long-lived page cannot grow this
+    /// ledger by repeatedly showing new nodes in successive snapshots.
+    pub fn prune_shown(&mut self, snapshots: &BrowserSnapshotStore) {
+        self.shown
+            .retain(|_, shown| snapshots.get(&shown.snapshot_id).is_some());
     }
 
     pub fn shown(&self, reference: &str) -> Option<&ShownRef> {
@@ -205,6 +276,93 @@ mod tests {
             .target_id = "another-target".into();
         registry.assign(&mut [], &mut replaced_target, &mut HashMap::new(), 0, None);
         assert_ne!(replaced_target[0].captured.reference, old);
+    }
+
+    #[test]
+    fn stable_refs_shown_ledger_is_bounded_by_retained_snapshots() {
+        use crate::snapshot_store::{
+            new_snapshot_id, SnapshotKind, TextSnapshot, STATE_TEXT_SCHEMA,
+        };
+        let mut registry = StableRefs::default();
+        let mut snapshots = BrowserSnapshotStore::new(2).unwrap();
+        for backend in 1u64..=4 {
+            let mut refs = vec![record(backend, "loader")];
+            registry.assign(&mut [], &mut refs, &mut HashMap::new(), 0, None);
+            let id = new_snapshot_id(backend.to_le_bytes());
+            snapshots
+                .retain_text(TextSnapshot {
+                    snapshot_id: id.clone(),
+                    kind: SnapshotKind::Actionable,
+                    document_epoch: 0,
+                    source_origin: "https://frame.example".into(),
+                    source_document: None,
+                    content_schema: STATE_TEXT_SCHEMA,
+                    content: format!("{} button Access\n", refs[0].captured.reference),
+                    truncated: false,
+                    refs_truncated: false,
+                    refs: refs.clone(),
+                })
+                .unwrap();
+            registry.remember(&refs, &id, 0, None);
+            registry.prune_shown(&snapshots);
+            assert_eq!(
+                registry.shown.len(),
+                usize::try_from(backend.min(2)).unwrap()
+            );
+        }
+        assert!(registry.shown("e1").is_none());
+        assert!(registry.shown("e2").is_none());
+        assert!(registry.shown("e3").is_some());
+        assert!(registry.shown("e4").is_some());
+        snapshots.invalidate_before(1);
+        registry.prune_shown(&snapshots);
+        assert!(registry.shown.is_empty());
+    }
+
+    #[test]
+    fn stable_refs_name_cache_is_bounded_by_least_recently_shown_identity() {
+        let mut registry = StableRefs::default();
+        for backend in 1..=MAX_STABLE_IDENTITIES as u64 {
+            let mut refs = vec![record(backend, "loader")];
+            registry.assign(&mut [], &mut refs, &mut HashMap::new(), 0, None);
+            registry.remember(&refs, "snapshot", 0, None);
+        }
+        assert_eq!(registry.names.len(), MAX_STABLE_IDENTITIES);
+        assert_eq!(registry.name_recency.len(), MAX_STABLE_IDENTITIES);
+        let mut first = vec![record(1, "loader")];
+        registry.assign(&mut [], &mut first, &mut HashMap::new(), 0, None);
+        registry.remember(&first, "snapshot", 0, None);
+        assert_eq!(first[0].captured.reference, "e1");
+        // Observing a node without printing it must not refresh its shown age.
+        let mut second = vec![record(2, "loader")];
+        registry.assign(&mut [], &mut second, &mut HashMap::new(), 0, None);
+        let mut added = vec![
+            record(MAX_STABLE_IDENTITIES as u64 + 1, "loader"),
+            record(MAX_STABLE_IDENTITIES as u64 + 1, "loader"),
+        ];
+        added[1].captured.reference = "e2".into();
+        registry.assign(&mut [], &mut added, &mut HashMap::new(), 0, None);
+        assert_eq!(added[0].captured.reference, added[1].captured.reference);
+        assert_eq!(registry.names.len(), MAX_STABLE_IDENTITIES);
+        registry.remember(&added, "snapshot", 0, None);
+        assert_eq!(registry.names.len(), MAX_STABLE_IDENTITIES);
+        assert_eq!(registry.name_recency.len(), MAX_STABLE_IDENTITIES);
+        assert!(registry
+            .names
+            .contains_key(&key(&first[0], 0, None).unwrap()));
+        assert!(!registry
+            .names
+            .contains_key(&key(&second[0], 0, None).unwrap()));
+        registry.assign(&mut [], &mut second, &mut HashMap::new(), 0, None);
+        assert_eq!(
+            second[0].captured.reference,
+            format!("e{}", MAX_STABLE_IDENTITIES + 2)
+        );
+        assert_ne!(second[0].captured.reference, "e2");
+        assert_ne!(second[0].captured.reference, added[0].captured.reference);
+        registry.remember(&second, "snapshot", 0, None);
+        assert_eq!(registry.names.len(), MAX_STABLE_IDENTITIES);
+        assert_eq!(registry.name_recency.len(), MAX_STABLE_IDENTITIES);
     }
 
     #[test]
