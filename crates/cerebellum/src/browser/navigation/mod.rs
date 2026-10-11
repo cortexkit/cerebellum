@@ -1793,18 +1793,18 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             );
         }
         if mode == SnapshotKind::Screenshot {
-            return Err(NavigationDriveError::CdpFailure);
+            return Err(NavigationDriveError::CdpFailure.at_step("Accessibility.enable"));
         }
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Accessibility.enable"))?;
         self.ensure_attached(context_key, deadline, clock)?;
         let attachment = self
             .attachment
             .clone()
             .filter(|attachment| attachment.context_key == context_key)
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))?;
 
         let mut attachment = attachment;
         if let Some(frame) = &self.active_frame {
@@ -1831,7 +1831,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
-        let root = required_ax_node(&root_result, "node")?;
+        let root = required_ax_node(&root_result, "node")
+            .map_err(|error| error.at_step("Accessibility.getRootAXNode"))?;
         let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
         let mut observation = traverse_ax_tree(
@@ -1854,8 +1855,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     clock,
                 )?;
                 required_ax_nodes(&result)
+                    .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
             },
-        )?;
+        )
+        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
 
         // A bounded AX prefix must not start another unbounded DOM read on the
         // same oversized page. Refs remain observable, with explicitly unknown
@@ -1911,7 +1914,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
         if mode == SnapshotKind::DomFull && self.active_frame.is_some() {
-            let params = serde_json::json!({"backendNodeId":root_backend_id.ok_or(NavigationDriveError::CdpFailure)?}).as_object().unwrap().clone();
+            let params = serde_json::json!({"backendNodeId":root_backend_id.ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Accessibility.getRootAXNode"))?}).as_object().unwrap().clone();
             let outer = self.command(
                 "DOM.getOuterHTML",
                 Some(params),
@@ -1920,7 +1923,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 None,
                 clock,
             )?;
-            observation.dom_text = Some(required_result_string(&outer, "outerHTML")?);
+            observation.dom_text = Some(
+                required_result_string(&outer, "outerHTML")
+                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
+            );
         } else if mode == SnapshotKind::DomFull {
             let mut params = Map::new();
             params.insert("depth".into(), Value::Number(0.into()));
@@ -1939,7 +1945,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .and_then(|root| root.get("nodeId"))
                 .and_then(Value::as_u64)
                 .filter(|node_id| *node_id > 0)
-                .ok_or(NavigationDriveError::CdpFailure)?;
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getDocument"))?;
             let mut params = Map::new();
             params.insert("nodeId".into(), Value::Number(node_id.into()));
             let outer_html = self.command(
@@ -1950,7 +1956,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 None,
                 clock,
             )?;
-            observation.dom_text = Some(required_result_string(&outer_html, "outerHTML")?);
+            observation.dom_text = Some(
+                required_result_string(&outer_html, "outerHTML")
+                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
+            );
         }
 
         Ok(observation)
@@ -2256,12 +2265,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let deadline = clock
             .now()
             .checked_add(Duration::from_millis(deadline_ms))
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getNavigationHistory"))?;
         self.ensure_attached(context_key, deadline, clock)?;
         let attachment = self
             .attachment
             .clone()
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))?;
         let history = self.command(
             "Page.getNavigationHistory",
             None,
@@ -2278,7 +2287,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
-        committed_document_from(&history, &tree).ok_or(NavigationDriveError::CdpFailure)
+        // Validate the tree separately so an incomplete history is not blamed
+        // on the frame-tree command that happens to be read after it.
+        tree.get("frameTree")
+            .and_then(|tree| tree.get("frame"))
+            .and_then(|frame| frame.get("loaderId"))
+            .and_then(Value::as_str)
+            .filter(|loader| !loader.is_empty())
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
+        committed_document_from(&history, &tree)
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getNavigationHistory"))
     }
 
     fn navigate_with_clock<C: NavigationClock>(
@@ -2428,7 +2446,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             return if attachment.context_key == context_key {
                 Ok(())
             } else {
-                Err(NavigationDriveError::CdpFailure)
+                Err(NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))
             };
         }
 
@@ -2458,7 +2476,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
-        let target_id = required_result_string(&created, "targetId")?;
+        let target_id = required_result_string(&created, "targetId")
+            .map_err(|error| error.at_step("Target.createTarget"))?;
 
         let mut attach_params = Map::new();
         attach_params.insert("targetId".into(), Value::String(target_id.clone()));
@@ -2471,7 +2490,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
-        let session_id = required_result_string(&attached, "sessionId")?;
+        let session_id = required_result_string(&attached, "sessionId")
+            .map_err(|error| error.at_step("Target.attachToTarget"))?;
 
         self.identities
             .attach(Attachment {
@@ -2480,7 +2500,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 frame_ids: Vec::new(),
                 context_key: context_key.to_string(),
             })
-            .map_err(|_| NavigationDriveError::CdpFailure)?;
+            .map_err(|_| NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))?;
         self.attachment = Some(AttachedTarget {
             target_id,
             session_id,
@@ -2501,9 +2521,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let response =
             self.command_response(method, params, session_id, deadline, tracking, None, clock)?;
         if response.error.is_some() {
-            return Err(NavigationDriveError::CdpFailure);
+            return Err(NavigationDriveError::CdpFailure.at_step(method));
         }
-        response.result.ok_or(NavigationDriveError::CdpFailure)
+        response
+            .result
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step(method))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2520,6 +2542,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         self.command_response_inner(
             method, params, session_id, deadline, tracking, dispatched, None, clock,
         )
+        .map_err(|error| error.at_step(method))
     }
 
     #[allow(clippy::too_many_arguments)]
