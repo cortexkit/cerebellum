@@ -1582,6 +1582,36 @@ impl BrowserPlane {
             )
     }
 
+    /// Record user-target actions without page text, typed text, or URL paths.
+    /// Existing own-browser entries are deliberately unchanged.
+    pub(crate) async fn journal_user_browser(
+        &self,
+        identity: &RouteIdentity,
+        action: &str,
+        origin: Option<&str>,
+        outcome: &str,
+        input_dispatched: Option<bool>,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        journal
+            .store
+            .as_mut()
+            .expect("enabled journal opens a store")
+            .commit_user_browser(
+                journal_identity(identity),
+                action,
+                origin,
+                outcome,
+                input_dispatched,
+            )
+    }
+
     /// Record one login-import decision without cookie names or values.
     pub async fn journal_login_import(
         &self,
@@ -4574,6 +4604,7 @@ fn reply_schema(mut properties: Value, required: &[&str]) -> Value {
         .as_object_mut()
         .expect("browser result properties are objects");
     properties.insert("outcome".into(), browser_result_outcome_schema());
+    properties.insert("browser".into(), enum_schema(&["user"]));
     properties.insert("remedy".into(), string_schema());
     properties.insert("detail".into(), refusal_detail_schema());
     properties.insert("context".into(), context_result_schema());
@@ -4736,6 +4767,7 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
     outcomes.push("authorization_denied");
     outcomes.push("consent_unavailable");
     properties.insert("outcome".into(), enum_schema(&outcomes));
+    properties.insert("browser".into(), enum_schema(&["user"]));
     let detail = match properties.remove("detail") {
         Some(detail) => json!({"anyOf": [invalid_request_detail_result_schema(), detail]}),
         None => invalid_request_detail_result_schema(),
@@ -5285,6 +5317,9 @@ pub fn validate_browser_result(
     let schema = table.get(capability_id).ok_or_else(|| {
         CapabilityResultValidationError::UnknownCapability(capability_id.to_string())
     })?;
+    if result.get("browser") == Some(&json!("user")) {
+        return validate_user_browser_result(capability_id, result);
+    }
     let mut violations = Vec::new();
     collect_result_violations(schema, result, "$", &mut violations);
     violations.sort();
@@ -5293,6 +5328,50 @@ pub fn validate_browser_result(
     } else {
         Err(CapabilityResultValidationError::ReplyViolations {
             capability_id: capability_id.to_string(),
+            violations,
+        })
+    }
+}
+
+/// The extension target has tab-scoped results, not owned-process sessions.
+/// Keep its closed vocabulary separate so existing own replies remain fixed.
+pub(crate) fn validate_user_browser_result(
+    action: &str,
+    result: &Value,
+) -> Result<(), CapabilityResultValidationError> {
+    let mut schema = if matches!(action, "revoke_access" | crate::management::REVOKE_ACCESS) {
+        let mut schema = revoke_access_result_schema();
+        schema["properties"]["browser"] = enum_schema(&["user"]);
+        schema
+    } else {
+        closed_object(
+            json!({
+                "browser":enum_schema(&["user"]),
+                "outcome":enum_schema(&["ok","refused","closed","invalid_request","cancelled","outcome_unknown","authorization_denied"]),
+            "reason":string_schema(), "remedy":string_schema(),
+            "settled":boolean_schema(), "settlement_reason":string_schema(),
+                "input_dispatched":{"anyOf":[boolean_schema(),{"type":"null"}]},
+                "tab":string_schema(), "connected":boolean_schema(),
+                "connection_epoch":integer_schema(), "interaction_epoch":integer_schema(),
+                "tabs":{"type":"array","items":closed_object(json!({"tab":string_schema(),"claim":enum_schema(&["claimed_by_this_route","unclaimed_handed"]),"interaction_epoch":integer_schema()}), &["tab","claim","interaction_epoch"])},
+                "snapshot_id":string_schema(), "state_text":string_schema(),
+                "image_png_b64":string_schema(), "image_width_px":integer_schema(), "image_height_px":integer_schema(),
+                "popup_activated_briefly":boolean_schema(),
+                "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"])]}
+            }),
+            &["browser", "outcome"],
+        )
+    };
+    let embedded = schema.clone();
+    schema["properties"]["read_page"] = embedded;
+    let mut violations = Vec::new();
+    collect_result_violations(&schema, result, "$", &mut violations);
+    violations.sort();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CapabilityResultValidationError::ReplyViolations {
+            capability_id: format!("browser:user:{action}"),
             violations,
         })
     }

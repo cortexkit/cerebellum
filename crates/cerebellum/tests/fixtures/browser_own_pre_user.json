@@ -1,0 +1,7 @@
+[
+  "{\"outcome\":\"no_session\"}",
+  "{\"content_schema\":\"ck-browser-state-text/v1\",\"context\":{\"profile_disposition\":\"durable\",\"profile_name\":\"default\",\"profile_uuid\":null,\"session_kind_effective\":\"primary\"},\"document_epoch\":0,\"mode\":\"actionable\",\"omitted\":{\"source_origin\":false,\"state_text_bytes\":0,\"state_text_lines\":0},\"outcome\":\"ok\",\"refs_truncated\":false,\"snapshot_id\":\"16fed2cf7a8d053d3211a36a50264b06\",\"source_origin\":\"https://example.com/\",\"state_text\":\"example.com · snapshot 16fed2cf7a8d053d3211a36a50264b06\\ntext Golden page\\n\",\"truncated\":false}",
+  "{\"context\":{\"profile_disposition\":\"durable\",\"profile_name\":\"default\",\"profile_uuid\":null,\"session_kind_effective\":\"primary\"},\"detail\":{\"field\":\"url\",\"reason_code\":\"missing_field\"},\"outcome\":\"invalid_request\",\"remedy\":\"correct detail.field according to detail.reason_code, then resubmit the request\"}",
+  "{\"context\":{\"profile_disposition\":\"durable\",\"profile_name\":\"default\",\"profile_uuid\":null,\"session_kind_effective\":\"primary\"},\"detail\":{\"field\":\"unexpected\",\"reason_code\":\"unknown_field\"},\"outcome\":\"invalid_request\",\"remedy\":\"correct detail.field according to detail.reason_code, then resubmit the request\"}",
+  "{\"detail\":{\"field\":\"browser_session_id\",\"reason_code\":\"missing_field\"},\"outcome\":\"invalid_request\"}"
+]

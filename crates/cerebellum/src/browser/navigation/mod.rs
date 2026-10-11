@@ -3008,6 +3008,148 @@ fn current_history_url(history: &Map<String, Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Project an extension's bounded CDP capture through the same AX traversal,
+/// DOM classification and field-value withholding used by the pipe driver.
+/// The caller must authorize the frame before passing its content here.
+pub(crate) fn snapshot_from_capture(
+    ax_nodes: &[Value],
+    dom: &Map<String, Value>,
+    target: &str,
+    frame_id: &str,
+    document_epoch: u64,
+    document_url: &str,
+) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+    let nodes = ax_nodes
+        .iter()
+        .map(RawAxNode::from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut root = nodes
+        .first()
+        .cloned()
+        .ok_or(NavigationDriveError::CdpFailure)?;
+    if root
+        .frame_id
+        .as_deref()
+        .is_some_and(|frame| frame != frame_id)
+    {
+        return Err(NavigationDriveError::CdpFailure);
+    }
+    root.frame_id = Some(frame_id.into());
+    let mut observation = traverse_ax_tree(root, target, MAX_AX_NODES, MAX_AX_DEPTH, |id, _| {
+        let parent = nodes
+            .iter()
+            .find(|node| node.node_id == id)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        Ok(parent
+            .child_ids
+            .iter()
+            .filter_map(|id| nodes.iter().find(|node| &node.node_id == id).cloned())
+            .collect())
+    })?;
+    let projected = parse_flattened_dom_nodes(dom);
+    let origin = document_origin(document_url);
+    for reference in &mut observation.refs {
+        if let Some(identity) = reference.backend_identity.as_ref() {
+            reference.classification = match (&projected, &origin) {
+                (Ok(nodes), Ok(origin)) => {
+                    build_non_type_classification(nodes, identity, document_epoch, origin)
+                        .map(Box::new)
+                }
+                (Err(reason), _) | (_, Err(reason)) => Err(reason.clone()),
+            };
+        }
+    }
+    if let Ok(nodes) = projected {
+        collect_dom_facts(&mut observation, &nodes, Some(document_url));
+    }
+    Ok(observation)
+}
+
+/// Reuse the typing eligibility projection for extension-captured DOM nodes.
+pub(crate) fn type_target_from_capture(
+    dom: &Map<String, Value>,
+    identity: &BackendNodeIdentity,
+    record: &NonTypeClassificationRecord,
+) -> Result<crate::browser_type::TypeTarget, ClassificationUnavailable> {
+    let nodes = parse_flattened_dom_nodes(dom)?;
+    let node = nodes
+        .iter()
+        .find(|node| node.backend_node_id == identity.backend_node_id)
+        .ok_or(ClassificationUnavailable::NotCaptured)?;
+    let attrs = &node.attributes;
+    let input_type = attrs
+        .get("type")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "text".into());
+    let writable = node.local_name == "textarea"
+        || (node.local_name == "input"
+            && matches!(
+                input_type.as_str(),
+                "text" | "search" | "email" | "url" | "tel" | "password"
+            ));
+    let mut inert = attrs.contains_key("inert");
+    let mut editable = attrs.get("contenteditable").map(|value| value != "false");
+    let mut parent_id = node.parent_id;
+    let mut seen = HashSet::new();
+    while let Some(parent) = parent_id.and_then(|id| nodes.iter().find(|node| node.node_id == id)) {
+        if !seen.insert(parent.node_id) {
+            return Err(ClassificationUnavailable::NotCaptured);
+        }
+        inert |= parent.attributes.contains_key("inert");
+        if editable.is_none() {
+            editable = parent
+                .attributes
+                .get("contenteditable")
+                .map(|value| value != "false");
+        }
+        parent_id = parent.parent_id;
+    }
+    Ok(crate::browser_type::TypeTarget {
+        node_identity: record.node_identity.clone(),
+        document_epoch: record.document_epoch,
+        form_owner: record.form_owner.clone(),
+        autocomplete_tokens: record.target_autocomplete_tokens.clone(),
+        password: record.target_password,
+        writable_text_control: writable,
+        editable_region: editable.unwrap_or(false),
+        disabled: attrs.contains_key("disabled"),
+        readonly: attrs.contains_key("readonly"),
+        inert,
+        form_descendants: Vec::new(),
+        geometry: crate::browser_type::TypeGeometry::default(),
+    })
+}
+
+/// Identify an explicit new-tab link without activating it. Opening that URL
+/// through the extension avoids Chrome's foreground new-target disposition.
+pub(crate) fn new_tab_link_from_capture(
+    dom: &Map<String, Value>,
+    identity: &BackendNodeIdentity,
+    url: &str,
+) -> Option<String> {
+    let nodes = parse_flattened_dom_nodes(dom).ok()?;
+    let mut node = nodes
+        .iter()
+        .find(|node| node.backend_node_id == identity.backend_node_id)?;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(node.node_id) {
+            return None;
+        }
+        if matches!(node.local_name.as_str(), "a" | "area")
+            && node
+                .attributes
+                .get("target")
+                .is_some_and(|target| target.eq_ignore_ascii_case("_blank"))
+        {
+            return Some(state_text::resolve_href(node.attributes.get("href")?, url));
+        }
+        node = nodes
+            .iter()
+            .find(|parent| Some(parent.node_id) == node.parent_id)?;
+    }
+}
+
 fn parse_flattened_dom_nodes(
     result: &Map<String, Value>,
 ) -> Result<Vec<RawDomNode>, ClassificationUnavailable> {

@@ -342,6 +342,45 @@ impl JournalStore {
         self.commit_reserved_policy(handle, entry.export_line().into_bytes())
     }
 
+    /// User-target metadata is confined to this origin-only policy event. The
+    /// detail slot is readable by existing journal readers without changing own
+    /// browser entries or retaining extension/CDP payloads.
+    pub(crate) fn commit_user_browser(
+        &mut self,
+        identity: JournalIdentity,
+        action: &str,
+        origin: Option<&str>,
+        outcome: &str,
+        input_dispatched: Option<bool>,
+    ) -> Result<(), JournalError> {
+        let handle = self.reserve_policy_event(&identity)?;
+        let entry = JournalEntry {
+            format_version: FORMAT_VERSION.to_string(),
+            sequence: handle.sequence(),
+            phase: Phase::PolicyEvent,
+            identity: identity.clone(),
+            capability: None,
+            intent_redacted: None,
+            requested_severity: None,
+            effective_severity: None,
+            grant_decision: GrantDecision::not_reached(),
+            governing_observation: GoverningObservation::observation_not_required(),
+            action: None,
+            locator: None,
+            snapshot_ids: Vec::new(),
+            outcome: None,
+            payload: None,
+            detail: Some(
+                serde_json::json!({"browser":"user","action":action,"origin":origin,"outcome":outcome,"input_dispatched":input_dispatched}),
+            ),
+        };
+        self.commit_reserved_policy(handle, entry.export_line().into_bytes())?;
+        if outcome == "dispatch_committed" {
+            identity.witness.mark_committed();
+        }
+        Ok(())
+    }
+
     pub fn commit_login_import(
         &mut self,
         identity: JournalIdentity,

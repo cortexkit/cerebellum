@@ -187,6 +187,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     lane: tokio::sync::Mutex<()>,
+    target: crate::user_browser::UserBrowser,
 }
 
 #[derive(Clone)]
@@ -200,6 +201,14 @@ impl Default for UserBrowserBridge {
 
 impl UserBrowserBridge {
     pub fn new() -> Self {
+        Self::with_user_grants(Arc::new(
+            crate::browser_standing_grants::StandingBrowserGrants::in_memory(),
+        ))
+    }
+
+    pub(crate) fn with_user_grants(
+        grants: Arc<crate::browser_standing_grants::StandingBrowserGrants>,
+    ) -> Self {
         // Keep epochs exactly representable by JavaScript. A daemon restart and
         // each Chrome extension service-worker reconnect need distinct epochs
         // so neither can consume the previous connection's replies.
@@ -218,7 +227,28 @@ impl UserBrowserBridge {
                 calls: BTreeMap::new(),
             }),
             lane: tokio::sync::Mutex::new(()),
+            target: crate::user_browser::UserBrowser::new(grants),
         }))
+    }
+
+    pub(crate) fn target(&self) -> &crate::user_browser::UserBrowser {
+        &self.0.target
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_for_policy_test(&self) -> (u64, mpsc::Receiver<Message>) {
+        let (epoch, receiver, _) = self.connect().expect("isolated extension double connects");
+        (epoch, receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_for_policy_test(&self, message: Message) {
+        self.receive(message);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_for_policy_test(&self, epoch: u64) {
+        self.disconnect(epoch);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -253,6 +283,7 @@ impl UserBrowserBridge {
     }
 
     pub fn goodbye(&self, route: Route) {
+        self.0.target.end_route(route);
         let state = self.state();
         for (owner, cancel) in state.calls.values() {
             if *owner == route {
@@ -273,6 +304,7 @@ impl UserBrowserBridge {
     }
 
     pub fn shutdown(&self) {
+        self.0.target.disconnect();
         let mut state = self.state();
         state.stopped = true;
         for (_, cancel) in state.calls.values() {
@@ -307,6 +339,7 @@ impl UserBrowserBridge {
     fn disconnect(&self, epoch: u64) {
         let mut state = self.state();
         if state.connection.as_ref().map(|c| c.epoch) == Some(epoch) {
+            self.0.target.disconnect();
             if let Some(connection) = state.connection.take() {
                 connection.closed.send_replace(true);
             }

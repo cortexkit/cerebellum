@@ -35,7 +35,8 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
         RouteSurface::Tools => {
             let name = body.get("name")?.as_str()?;
             if name == crate::flat_tools::BROWSER_USE {
-                body.get("arguments")?.get("action")?.as_str()? != "status"
+                body["arguments"]["browser"].as_str() == Some("user")
+                    || body.get("arguments")?.get("action")?.as_str()? != "status"
             } else {
                 name.starts_with("browser.") && name != crate::browser_session::BROWSER_STATUS
             }

@@ -445,7 +445,7 @@ mod tests {
             // shared builder, so editing both advertisement paths cannot hide drift.
             let bytes = serde_json::to_vec(&json!({"name":definition.name,"description":definition.description,"input_schema":definition.input_schema})).unwrap();
             let frozen = match definition.name.as_str() {
-                "browser_use" => "e86350a02532d6e00a591e0c8f147c9d77442451d823d64b34739186a57dc882",
+                "browser_use" => "973700735439ff009914bc48f6826fa7e35a028f5bfac98555023bd150b795e8",
                 "computer_use" => {
                     "70c988de06bdcd72c67c2fbc2966c8ae2d6e6e791b9cf518acc9d695dd77dade"
                 }
