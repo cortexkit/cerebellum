@@ -364,6 +364,10 @@ pub enum NavigationDriveError {
     CdpStepFailure {
         method: String,
     },
+    /// Chrome could no longer resolve a node or frame named by an earlier read.
+    NodeUnavailable {
+        method: String,
+    },
     /// A command exhausted its budget, independently of protocol integrity.
     CommandDeadline {
         method: String,
@@ -3000,6 +3004,9 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
         NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
         NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
         NavigationDriveError::CdpStepFailure { method } => format!("browser CDP failure: {method}"),
+        NavigationDriveError::NodeUnavailable { method } => {
+            format!("browser node unavailable: {method}")
+        }
         NavigationDriveError::CommandDeadline {
             method,
             command_sent,

@@ -2520,7 +2520,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     ) -> Result<Map<String, Value>, NavigationDriveError> {
         let response =
             self.command_response(method, params, session_id, deadline, tracking, None, clock)?;
-        if response.error.is_some() {
+        if let Some(error) = response.error.as_ref() {
+            if cdp_node_disappeared(method, error) {
+                return Err(NavigationDriveError::NodeUnavailable {
+                    method: method.to_string(),
+                });
+            }
             return Err(NavigationDriveError::CdpFailure.at_step(method));
         }
         response
@@ -3761,6 +3766,9 @@ where
             return Err(NavigationDriveError::CdpFailure);
         }
         processed += 1;
+        let record_checkpoint = records.len();
+        let ref_checkpoint = refs.len();
+        let mut fallback_key = None;
         // Frame-aware snapshots collect each embedded document's own tree.
         // Ignore nodes explicitly tagged as another frame so that document's
         // content is collected once, under its own frame binding.
@@ -3801,6 +3809,7 @@ where
                     refs_truncated = true;
                 } else {
                     let key = (frame_path.clone(), role.clone(), name.clone());
+                    fallback_key = Some(key.clone());
                     let nth = fallback_counts.entry(key).or_insert(0);
                     let ref_name = format!("e{}", refs.len() + 1);
                     let captured = SnapshotRef::new(&ref_name, &role, &name, *nth)
@@ -3898,6 +3907,26 @@ where
             let fetched = match fetch_children(&node.node_id, frame_path.last().map(String::as_str))
             {
                 Ok(fetched) => fetched,
+                Err(NavigationDriveError::NodeUnavailable { .. }) => {
+                    // Virtualized lists can remove an AX node between reads.
+                    // Omit that vanished node and its children, but still visit
+                    // siblings already on the stack. Retrying a dead ID is futile.
+                    ax_truncated = true;
+                    refs_truncated = true;
+                    records.truncate(record_checkpoint);
+                    for reference in refs.drain(ref_checkpoint..) {
+                        facts.remove(&reference.captured.reference);
+                    }
+                    if let Some(key) = fallback_key {
+                        let count = fallback_counts.get_mut(&key).expect("allocated ref count");
+                        *count -= 1;
+                        if *count == 0 {
+                            fallback_counts.remove(&key);
+                        }
+                    }
+                    node_cache.clear();
+                    continue;
+                }
                 Err(NavigationDriveError::CommandDeadline { .. }) => {
                     // The already observed prefix is usable even when a large
                     // subtree exceeds the capture budget. Never claim it is complete.
@@ -3965,6 +3994,38 @@ where
         refs_truncated,
         facts,
     })
+}
+
+fn cdp_node_disappeared(method: &str, error: &Map<String, Value>) -> bool {
+    if !matches!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32602 | -32000)
+    ) {
+        return false;
+    }
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return false;
+    };
+    let message = message.trim().trim_end_matches('.').to_ascii_lowercase();
+    // Only these read commands can omit a vanished subtree. Unrelated errors,
+    // including invalid parameters and detached sessions, must still fail.
+    matches!(
+        method,
+        "Accessibility.getChildAXNodes" | "DOM.getFrameOwner"
+    ) && (matches!(
+        message.as_str(),
+        "invalid id"
+            | "no node with given id"
+            | "no node with given id found"
+            | "could not find node with given id"
+    ) || (method == "DOM.getFrameOwner"
+        && matches!(
+            message.as_str(),
+            "frame with the given id was not found"
+                | "no frame with given id"
+                | "no frame with given id found"
+                | "could not find frame with given id"
+        )))
 }
 
 fn cdp_error_text(error: Map<String, Value>) -> String {

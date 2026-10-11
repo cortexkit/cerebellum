@@ -292,6 +292,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .take()
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
         let before = self.frame_documents.clone();
+        let mut omitted_frames = HashSet::new();
         let result = (|| {
             let main = before
                 .iter()
@@ -310,6 +311,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 reference.frame_document = Some(main.clone());
             }
             for frame in before.iter().filter(|f| f.parent_id.is_some()) {
+                if frame
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| omitted_frames.contains(parent))
+                {
+                    omitted_frames.insert(frame.frame_id.clone());
+                    continue;
+                }
                 if observation.records.len() >= MAX_AX_NODES || observation.refs.len() >= MAX_REFS {
                     observation.ax_truncated = true;
                     observation.refs_truncated = true;
@@ -332,14 +341,23 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_object()
                     .unwrap()
                     .clone();
-                let owner = self.command(
+                let owner = match self.command(
                     "DOM.getFrameOwner",
                     Some(params),
                     Some(parent.session_id.clone()),
                     deadline,
                     None,
                     clock,
-                )?;
+                ) {
+                    Ok(owner) => owner,
+                    Err(NavigationDriveError::NodeUnavailable { .. }) => {
+                        observation.ax_truncated = true;
+                        observation.refs_truncated = true;
+                        omitted_frames.insert(frame.frame_id.clone());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let backend = owner
                     .get("backendNodeId")
                     .and_then(Value::as_u64)
@@ -353,17 +371,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         })
                     })
                     .map(|r| r.captured.reference.clone());
-                let owner_index = owner_ref
-                    .as_ref()
-                    .and_then(|r| {
-                        observation
-                            .records
-                            .iter()
-                            .position(|n| n.reference.as_ref() == Some(r))
-                    })
-                    // Hidden or replaced iframe owners may have no AX ref even
-                    // when Chrome successfully returns their DOM identity.
-                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getFrameOwner"))?;
+                let owner_index = owner_ref.as_ref().and_then(|r| {
+                    observation
+                        .records
+                        .iter()
+                        .position(|n| n.reference.as_ref() == Some(r))
+                });
+                let Some(owner_index) = owner_index else {
+                    // A hidden or replaced iframe has no visible owner to insert
+                    // its content under. Skip its subtree rather than lose the page.
+                    observation.ax_truncated = true;
+                    observation.refs_truncated = true;
+                    omitted_frames.insert(frame.frame_id.clone());
+                    continue;
+                };
                 let depth = observation.records[owner_index].depth + 1;
                 if !allowed.contains(frame) {
                     continue;
@@ -452,8 +473,31 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             // Re-read browser identities, not just URLs: a frame can navigate
             // away and back to its original origin while a read is in flight.
             let after = self.frame_documents(context, deadline_ms)?;
-            if before != after {
-                let changed = before.iter().find(|frame| !after.contains(frame));
+            // No content was read from omitted frames. Their disappearance or
+            // navigation cannot invalidate content from the retained documents.
+            // Descendants of an omitted frame are also outside this observation.
+            while let Some(frame) = after.iter().find(|frame| {
+                !omitted_frames.contains(&frame.frame_id)
+                    && frame
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|parent| omitted_frames.contains(parent))
+            }) {
+                omitted_frames.insert(frame.frame_id.clone());
+            }
+            let retained_before: Vec<_> = before
+                .iter()
+                .filter(|frame| !omitted_frames.contains(&frame.frame_id))
+                .collect();
+            let retained_after: Vec<_> = after
+                .iter()
+                .filter(|frame| !omitted_frames.contains(&frame.frame_id))
+                .collect();
+            if retained_before != retained_after {
+                let changed = retained_before
+                    .iter()
+                    .copied()
+                    .find(|frame| !retained_after.contains(frame));
                 let authorized_origin = changed
                     .map(|frame| frame.origin.clone())
                     .unwrap_or_else(|| main.origin.clone());

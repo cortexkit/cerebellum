@@ -2901,7 +2901,9 @@ impl BrowserPlane {
                 zoom,
                 filters,
                 max_bytes,
-                kind != SnapshotKind::DomFull && observation.ax_truncated,
+                // Omitted AX subtrees or embedded documents make the
+                // observation partial even when DOM-full text was requested.
+                observation.ax_truncated,
                 observation.refs_truncated,
                 Some(source_document),
             )
@@ -5672,7 +5674,8 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
             step: method,
             command_sent,
         },
-        crate::browser_session::NavigationDriveError::CdpStepFailure { method } => {
+        crate::browser_session::NavigationDriveError::CdpStepFailure { method }
+        | crate::browser_session::NavigationDriveError::NodeUnavailable { method } => {
             BrowserError::CdpStepFailure { step: method }
         }
         crate::browser_session::NavigationDriveError::CdpFailure

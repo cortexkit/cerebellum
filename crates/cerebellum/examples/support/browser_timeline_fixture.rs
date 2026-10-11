@@ -29,6 +29,14 @@ async fn snapshots(planes: &Planes, corr: &mut u64, pipe: &Pipe, name: &str) -> 
             json!({"mode":mode,"max_bytes":5000}),
         )
         .await?;
+        if name == "hidden_oopifs" {
+            check_ok(&reply)?;
+            if reply["truncated"] != true || reply["refs_truncated"] != true {
+                return Err(format!(
+                    "hidden iframe omission was not reported as partial: {reply}"
+                ));
+            }
+        }
         {
             let state = pipe.0.lock().unwrap();
             let mut groups = std::collections::BTreeMap::<&str, (usize, u128, u128)>::new();
