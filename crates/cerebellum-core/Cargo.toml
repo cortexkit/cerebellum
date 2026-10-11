@@ -23,3 +23,9 @@ cortexkit-store-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+cortexkit-lease = "=0.1.3"
+
+[target.'cfg(windows)'.dev-dependencies]
+cortexkit-lease = { version = "=0.1.3", features = ["test-support"] }

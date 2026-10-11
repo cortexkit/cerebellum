@@ -321,15 +321,7 @@ impl Owner {
 }
 
 fn scope_record() -> ScopeRecord {
-    ScopeRecord {
-        scope_ref: SCOPE_REF.into(),
-        scope_epoch: 1,
-        kind: ScopeKind::Head,
-        parent: None,
-        child_owners: Vec::new(),
-        carriers: Vec::new(),
-        attributes: Default::default(),
-    }
+    ScopeRecord::new(SCOPE_REF, 1, ScopeKind::Head)
 }
 
 async fn eventually(what: &str, mut done: impl FnMut() -> bool) {

@@ -147,22 +147,16 @@ impl Owner {
     }
 
     async fn sync(&mut self, carrier: &str) {
-        let record = ScopeRecord {
-            scope_ref: "flow-live".into(),
-            scope_epoch: 1,
-            kind: ScopeKind::Head,
-            parent: None,
-            child_owners: vec![],
-            carriers: vec![ScopeCarrier {
-                principal: reserved(carrier),
-                targets: Some(vec!["cerebellum".into()]),
-            }],
-            attributes: ScopeAttributes {
-                agent_id: Some(AGENT.into()),
-                delegates: true,
-                flow_id: Some("flow-live-1".into()),
-            },
-        };
+        let record = ScopeRecord::new("flow-live", 1, ScopeKind::Head)
+            .with_carriers(vec![
+                ScopeCarrier::new(reserved(carrier)).with_targets(Some(vec!["cerebellum".into()]))
+            ])
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_agent_id(Some(AGENT.into()))
+                    .with_delegates(true)
+                    .with_flow_id(Some("flow-live-1".into())),
+            );
         let frame = Frame::build(
             FrameType::Request,
             cerebellum::control_flags(),

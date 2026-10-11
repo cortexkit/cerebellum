@@ -93,6 +93,7 @@ dependencies = [
 name = "cerebellum-core"
 version = "0.1.0"
 dependencies = [
+ "cortexkit-lease",
  "cortexkit-store-types",
  "serde",
  "serde_json",
@@ -146,6 +147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-lease"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a0fc0f64f4fa68109464728f7c4d2afd5b676ff8d11d1e99cd2d022f6bc02a1"
+dependencies = [
+ "fs2",
+ "windows-sys",
+]
+
+[[package]]
 name = "cortexkit-log"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -174,9 +185,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d3a631807c4f69a1f055e7e1eed592c7b4b28a47157b1d1ecbd65dfe15cc175"
+checksum = "bcfc2eca335b15c7ca03961405f4bdfa04bbe2afe7fa4f9dca4174dedab29511"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -254,6 +265,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -781,9 +802,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cb088c665dcce2507c7e480087b2d0235caa5e9adbfb2277545022869b909de"
+checksum = "d8074e9632f5ad9a79dcb292abfda670c89f87fb5bb655d72ce09e5bd20e5baf"
 dependencies = [
  "serde",
  "serde_json",
@@ -792,9 +813,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.15"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad767db0912568ec4e7b9b875b4b2d21faf10d7eb447b710c17743283a0ccdd7"
+checksum = "9b70f64ea94693be87fdf2878f1c022db11db1bf87bc0c00a2c1d7a78a472509"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -865,9 +886,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.29.4"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "690bf351aca00d04ee2a491571b645948173568cfd5e0493c44f91771e536440"
+checksum = "6bd344068abd716d996c0b0adb897085d14b19e648951564256028a44498e780"
 dependencies = [
  "serde",
  "serde_json",
@@ -875,9 +896,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1edb5dfb8ff70b1f585c2d13337dbabab75a06a20531eedfba31ceee3a565047"
+checksum = "f59d2c657e7fdcd9edb16d0eaaa660a169841b0211c6ef6e4a7ea0c9614759ac"
 dependencies = [
  "getrandom",
  "hmac",
@@ -1067,6 +1088,28 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"

@@ -51,7 +51,7 @@ socket2 = { workspace = true }
 # The tool-provider/v1 contract supplies the JSON types for results delivered
 # after a login handoff and the catalog schema validators used by our tests.
 # Pin both to one release so production replies and test checks cannot drift.
-cortexkit-role-tool-provider = "=0.5.2"
+cortexkit-role-tool-provider = "=0.6.0"
 getrandom = "=0.2.17"
 tokio = { workspace = true }
 tokio-util = { workspace = true }

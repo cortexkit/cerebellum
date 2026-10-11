@@ -7219,11 +7219,9 @@ mod tests {
                 kind: subc_protocol::scope::ScopeKind::Head,
                 parent: None,
                 parent_state: None,
-                attributes: subc_protocol::scope::ScopeAttributes {
-                    agent_id: Some("pj-agent".into()),
-                    delegates,
-                    flow_id: None,
-                },
+                attributes: subc_protocol::scope::ScopeAttributes::new()
+                    .with_agent_id(Some("pj-agent".into()))
+                    .with_delegates(delegates),
                 owner_authorized: true,
             };
             let facts =
@@ -12042,11 +12040,10 @@ mod relayed_computer_call_tests {
             kind: subc_protocol::scope::ScopeKind::Head,
             parent: None,
             parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes {
-                agent_id: Some("test-project".into()),
-                delegates: true,
-                flow_id: Some("flow-computer".into()),
-            },
+            attributes: subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("test-project".into()))
+                .with_delegates(true)
+                .with_flow_id(Some("flow-computer".into())),
             owner_authorized: true,
         };
         let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
@@ -12419,11 +12416,10 @@ mod relayed_computer_call_tests {
                 kind: subc_protocol::scope::ScopeKind::Head,
                 parent: None,
                 parent_state: None,
-                attributes: subc_protocol::scope::ScopeAttributes {
-                    agent_id: Some("test-project".into()),
-                    delegates: true,
-                    flow_id: flow_id.clone(),
-                },
+                attributes: subc_protocol::scope::ScopeAttributes::new()
+                    .with_agent_id(Some("test-project".into()))
+                    .with_delegates(true)
+                    .with_flow_id(flow_id.clone()),
                 owner_authorized: true,
             };
             let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
