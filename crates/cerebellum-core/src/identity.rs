@@ -888,11 +888,9 @@ mod tests {
             kind: subc_protocol::scope::ScopeKind::Ephemeral,
             parent: None,
             parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes {
-                agent_id: Some("pj-agent".into()),
-                delegates: true,
-                flow_id: None,
-            },
+            attributes: subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("pj-agent".into()))
+                .with_delegates(true),
             owner_authorized: true,
         };
         let accepted = AcceptedBindFacts::from_bind(
@@ -923,11 +921,10 @@ mod tests {
             kind: subc_protocol::scope::ScopeKind::Head,
             parent: None,
             parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes {
-                agent_id: Some("pj-agent".into()),
-                delegates: true,
-                flow_id: Some("flow".into()),
-            },
+            attributes: subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("pj-agent".into()))
+                .with_delegates(true)
+                .with_flow_id(Some("flow".into())),
             owner_authorized: true,
         };
         let accepted = AcceptedBindFacts::from_bind(
