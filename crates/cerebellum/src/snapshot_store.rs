@@ -141,6 +141,18 @@ pub struct FrameDocument {
     pub origin: String,
 }
 
+impl FrameDocument {
+    /// URL and event revision can change on pushState or a fragment navigation.
+    /// The loader, session and origin fence the document an input can reach.
+    pub fn same_document(&self, other: &Self) -> bool {
+        self.frame_id == other.frame_id
+            && self.parent_id == other.parent_id
+            && self.session_id == other.session_id
+            && self.loader_id == other.loader_id
+            && self.origin == other.origin
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefRecord {
     pub frame_document: Option<FrameDocument>,
@@ -717,10 +729,7 @@ pub fn valid_ref(value: &str) -> bool {
     let Some(number) = value.strip_prefix('e') else {
         return false;
     };
-    number
-        .parse::<u64>()
-        .ok()
-        .is_some_and(|number| (1..=MAX_REFS as u64).contains(&number))
+    number.parse::<u64>().ok().is_some_and(|number| number > 0)
 }
 pub fn new_snapshot_id(seed: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(seed.as_ref());

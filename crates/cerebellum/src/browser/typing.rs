@@ -18,9 +18,9 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<Value, BrowserError> {
         let object = self
-            .validate_request(args, &["ref", "text", "clear_first"])
+            .validate_request(args, &["ref", "snapshot_id", "text", "clear_first"])
             .await?;
-        let reference = required_string(object, "ref", 2, 5)?;
+        let reference = required_string(object, "ref", 2, 21)?;
         if !snapshot_store::valid_ref(reference) {
             return Err(BrowserError::InvalidRequest {
                 field: "ref".into(),
@@ -61,13 +61,25 @@ impl BrowserPlane {
                 .get_mut(&identity.conversation_key)
                 .filter(|context| !context.ended)
                 .ok_or(BrowserError::NoSession)?;
-            let snapshot_id =
-                context
-                    .last_text_snapshot
-                    .clone()
+            let snapshot_id = match object.get("snapshot_id") {
+                Some(_) => {
+                    let id = required_string(object, "snapshot_id", 32, 32)?;
+                    if !snapshot_store::valid_snapshot_id(id) {
+                        return Err(BrowserError::InvalidRequest {
+                            field: "snapshot_id".into(),
+                            reason_code: "unsupported_value",
+                        });
+                    }
+                    id.to_string()
+                }
+                None => context
+                    .refs
+                    .shown(reference)
+                    .map(|shown| shown.snapshot_id.clone())
                     .ok_or(BrowserError::StaleSnapshot {
                         reason_code: "not_retained",
-                    })?;
+                    })?,
+            };
             let snapshot = context
                 .snapshots
                 .pin_text(&snapshot_id, context.epoch.value())

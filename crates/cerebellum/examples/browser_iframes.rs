@@ -347,6 +347,7 @@ print('cross-origin and opaque-frame pixels:', counts)
             .ok_or("missing iframe owner ref")?;
         let zoom = cerebellum::browser::state_text::render(
             &cerebellum::browser::state_text::RenderInput {
+                filters: &cerebellum::browser::state_text::Filters::default(),
                 records: &snapshot.records,
                 facts: &snapshot.facts,
                 page_url: url,

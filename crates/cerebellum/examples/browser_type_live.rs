@@ -9,6 +9,9 @@
 //! `--busy-fixture` measures per-command latency on a local event drawer with
 //! 20,000 DOM rows, streaming updates and a blocked renderer, then checks that
 //! idle snapshots and text-row clicks still work on the same connection.
+//!
+//! `--stable-refs` checks a 40-dropdown loopback page and compares the bytes
+//! read for four choices using full-region snapshots versus narrow filters.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -34,6 +37,7 @@ async fn main() {
     let navigate_only = args.iter().any(|arg| arg == "--navigate-only");
     let headed = args.iter().any(|arg| arg == "--headed");
     let click_fixture = args.iter().any(|arg| arg == "--click-fixture");
+    let stable_refs = args.iter().any(|arg| arg == "--stable-refs");
     let busy_fixture = args.iter().any(|arg| arg == "--busy-fixture");
     let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
@@ -50,6 +54,7 @@ async fn main() {
             headed,
             click_fixture,
             busy_fixture,
+            stable_refs,
             &mut outcomes,
         )
         .await
@@ -104,6 +109,9 @@ mod probe {
     mod click_fixture {
         include!("support/browser_click_fixture.rs");
     }
+    mod dropdown_fixture {
+        include!("support/browser_dropdown_fixture.rs");
+    }
     mod busy_fixture {
         include!("support/browser_busy_fixture.rs");
     }
@@ -149,6 +157,10 @@ mod probe {
                         click_fixture::HTML
                     } else if request.starts_with("GET /busy ") {
                         busy_fixture::HTML
+                    } else if request.starts_with("GET /ref-frame") {
+                        dropdown_fixture::CHILD
+                    } else if request.starts_with("GET /dropdowns ") {
+                        dropdown_fixture::HTML
                     } else if request.starts_with("GET /away ") {
                         "<!doctype html><title>Away</title><p>Another document</p>"
                     } else {
@@ -698,6 +710,7 @@ mod probe {
         headed: bool,
         click_fixture: bool,
         busy_fixture: bool,
+        stable_refs: bool,
         outcomes: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(), String> {
         let page = Page::start()?;
@@ -798,7 +811,9 @@ mod probe {
             )])),
         );
         let focus = headed.then(|| FocusWatch::start(scratch.0.clone()));
-        let result = if busy_fixture {
+        let result = if stable_refs {
+            dropdown_fixture::exercise(&planes, &pipe, &page.origin()).await
+        } else if busy_fixture {
             busy_fixture::exercise(&planes, &pipe, &page.origin()).await
         } else if click_fixture {
             click_fixture::exercise(&planes, &pipe, &page.origin()).await

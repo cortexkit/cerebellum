@@ -42,6 +42,9 @@ use tokio::sync::mpsc;
 #[path = "../examples/support/consent_relay.rs"]
 mod consent_relay;
 
+#[path = "support/browser_stable_refs.rs"]
+mod stable_refs;
+
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -433,6 +436,7 @@ struct RecordingLauncher {
     /// authorization and its return. Consumed by the next capture.
     moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     effects: Arc<Mutex<Vec<&'static str>>>,
+    dropdowns: Option<Arc<Mutex<stable_refs::Dropdowns>>>,
     frame_fixture: Option<Arc<Mutex<FrameFixture>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -466,6 +470,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 page: self.page.clone(),
                 moves_during_capture: Arc::clone(&self.moves_during_capture),
                 clicked: false,
+                dropdowns: self.dropdowns.clone(),
                 frame_fixture: self.frame_fixture.clone(),
                 hazardous_target: self.hazardous_target,
                 cross_site_link_target: self.cross_site_link_target,
@@ -528,6 +533,7 @@ struct RecordingProcess {
     page: CommittedPage,
     moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
     clicked: bool,
+    dropdowns: Option<Arc<Mutex<stable_refs::Dropdowns>>>,
     frame_fixture: Option<Arc<Mutex<FrameFixture>>>,
     hazardous_target: bool,
     cross_site_link_target: bool,
@@ -581,10 +587,13 @@ impl OwnedBrowserProcess for RecordingProcess {
         expected: &cerebellum::snapshot_store::FrameDocument,
         _: u64,
     ) -> Result<bool, NavigationDriveError> {
-        Ok(self
-            .frame_fixture
-            .as_ref()
-            .is_some_and(|f| f.lock().unwrap().documents.contains(expected)))
+        Ok(self.frame_fixture.as_ref().is_some_and(|f| {
+            f.lock()
+                .unwrap()
+                .documents
+                .iter()
+                .any(|live| live.same_document(expected))
+        }))
     }
 
     fn classify_point(
@@ -708,6 +717,12 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.effects.lock().unwrap().push("snapshot");
+        if let Some(dropdowns) = &self.dropdowns {
+            return Ok(dropdowns
+                .lock()
+                .unwrap()
+                .observation(document_epoch, current_origin));
+        }
         let mut observation = snapshot_observation(
             self.clicked,
             self.hazardous_target,
@@ -806,13 +821,19 @@ impl OwnedBrowserProcess for RecordingProcess {
     fn click_classified(
         &mut self,
         _: &str,
-        _: &BackendNodeIdentity,
-        _: u64,
-        _: &str,
-        _: Option<&cerebellum::classification::NonTypeClassificationRecord>,
+        identity: &BackendNodeIdentity,
+        epoch: u64,
+        origin: &str,
+        expected: Option<&cerebellum::classification::NonTypeClassificationRecord>,
         _: u64,
         input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        if let Some(dropdowns) = &self.dropdowns {
+            dropdowns
+                .lock()
+                .unwrap()
+                .click(identity, epoch, origin, expected)?;
+        }
         let position = BrowserClickPosition {
             x_css: 12.0,
             y_css: 24.0,
@@ -826,6 +847,21 @@ impl OwnedBrowserProcess for RecordingProcess {
             position,
             navigation: ClickNavigation::NoneObserved { window_ms: 100 },
         })
+    }
+
+    fn type_classified(
+        &mut self,
+        _: &str,
+        target: &cerebellum::browser_type::TypeDispatch,
+        text: &str,
+        _: bool,
+        _: u64,
+    ) -> Result<cerebellum::browser_type::BrowserTypeResult, NavigationDriveError> {
+        let dropdowns = self
+            .dropdowns
+            .as_ref()
+            .ok_or(NavigationDriveError::Unavailable)?;
+        Ok(dropdowns.lock().unwrap().type_text(target, text))
     }
 
     fn generation_matches(&self) -> bool {

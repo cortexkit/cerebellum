@@ -5250,6 +5250,62 @@ mod tests {
     }
 
     #[test]
+    fn stable_refs_click_reclassifies_new_credential_hazard() {
+        let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
+        let document = |password| {
+            json!({"nodes":[
+                flattened_dom_node(1, None, 10, "html", &[]),
+                flattened_dom_node(2, Some(1), 20, "form", &[]),
+                flattened_dom_node(3, Some(2), 30, "input", &["type", if password {"password"} else {"text"}]),
+                flattened_dom_node(4, Some(2), 42, "button", &["type", "submit"]),
+            ]})
+        };
+        let initial = classify_flattened_document(
+            document(false).as_object().unwrap(),
+            &identity,
+            7,
+            "https://login.example",
+        )
+        .unwrap();
+        assert!(!initial.credential);
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":document(true)}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
+            json!({"id":6,"sessionId":"session-own","result":layout_metrics(0.0, 0.0, 1280.0, 713.0)}),
+            json!({"id":7,"sessionId":"session-own","result":{"backendNodeId":42,"frameId":"frame-main"}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":document(true)}),
+            json!({"id":10,"sessionId":"session-own","result":{}}),
+            json!({"id":11,"sessionId":"session-own","result":{}}),
+            json!({"id":12,"sessionId":"session-own","result":{}}),
+            json!({"id":13,"sessionId":"session-own","result":{}}),
+        ]);
+        let mut events = Vec::new();
+        let result = driver.click_with_clock(
+            "route-own",
+            &identity,
+            1000,
+            &mut |event| events.push(event),
+            Some((7, "https://login.example", Some(&initial))),
+            &mut FakeClock::new(),
+        );
+        assert_eq!(result, Err(ClickDriveError::ClassificationChanged));
+        assert!(events.is_empty());
+        assert_eq!(
+            driver
+                .pipe
+                .writes
+                .iter()
+                .filter(|write| write["method"] == "DOM.getFlattenedDocument")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn final_classification_revalidation_refuses_before_input() {
         let initial_nodes = json!({"nodes":[
             flattened_dom_node(1, None, 10, "html", &[]),
@@ -5263,9 +5319,13 @@ mod tests {
             flattened_dom_node(3, Some(2), 30, "input", &["type", "text"]),
             flattened_dom_node(4, Some(2), 42, "button", &["type", "submit"]),
         ]});
+        // Both live reads receive complete DOM records. The second changes a
+        // password input to an ordinary text input after click coordinates are
+        // calculated. Classification immediately before mouse input must reject
+        // that changed form rather than reuse the earlier authorization record.
         let mut driver = attached_driver([
             json!({"id":1,"sessionId":"session-own","result":{}}),
-            json!({"id":2,"sessionId":"session-own","result":initial_nodes}),
+            json!({"id":2,"sessionId":"session-own","result":initial_nodes.clone()}),
             json!({"id":3,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{"quads":[[10.0,20.0,34.0,20.0,34.0,52.0,10.0,52.0]]}}),
@@ -5276,17 +5336,13 @@ mod tests {
         ]);
         let identity = BackendNodeIdentity::new("target-own", "frame-main", 42).unwrap();
         let mut clock = FakeClock::new();
-        let initial = driver
-            .classify_click_for_test(
-                "route-own",
-                &identity,
-                7,
-                "https://login.example",
-                1_000,
-                &mut clock,
-            )
-            .unwrap()
-            .unwrap();
+        let initial = classify_flattened_document(
+            initial_nodes.as_object().unwrap(),
+            &identity,
+            7,
+            "https://login.example",
+        )
+        .unwrap();
         assert!(initial.credential);
         let mut input_events = Vec::new();
         let result = driver.click_with_clock(
@@ -6138,6 +6194,7 @@ mod tests {
         max_bytes: usize,
     ) -> state_text::RenderedState {
         state_text::render(&state_text::RenderInput {
+            filters: &state_text::Filters::default(),
             records: &observation.records,
             facts: &observation.facts,
             page_url: url,

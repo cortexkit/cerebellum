@@ -106,8 +106,67 @@ pub struct RenderInput<'a> {
     pub page_url: &'a str,
     pub snapshot_id: &'a str,
     pub zoom: Option<Zoom<'a>>,
+    pub filters: &'a Filters,
     /// The most bytes the rendered text may have.
     pub max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct Filters {
+    pub text: Option<String>,
+    pub roles: Vec<String>,
+}
+
+impl Filters {
+    pub(super) fn parse(
+        object: &serde_json::Map<String, serde_json::Value>,
+        kind: crate::snapshot_store::SnapshotKind,
+    ) -> Result<Self, super::BrowserError> {
+        let invalid = |field: &str, reason_code| super::BrowserError::InvalidRequest {
+            field: field.into(),
+            reason_code,
+        };
+        if kind != crate::snapshot_store::SnapshotKind::Actionable {
+            for field in ["text_filter", "role_filter"] {
+                if object.contains_key(field) {
+                    return Err(invalid(field, "unsupported_value"));
+                }
+            }
+        }
+        let text = match object.get("text_filter") {
+            None => None,
+            Some(serde_json::Value::String(text)) if text.chars().count() <= 4096 => {
+                Some(text.clone())
+            }
+            Some(serde_json::Value::String(_)) => {
+                return Err(invalid("text_filter", "out_of_range"))
+            }
+            Some(_) => return Err(invalid("text_filter", "wrong_type")),
+        };
+        let roles = match object.get("role_filter") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(roles)) if !roles.is_empty() && roles.len() <= 16 => {
+                roles
+                    .iter()
+                    .map(|role| {
+                        role.as_str()
+                            .filter(|role| !role.is_empty() && role.len() <= 128)
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid("role_filter", "wrong_type"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Some(serde_json::Value::Array(_)) => {
+                return Err(invalid("role_filter", "out_of_range"))
+            }
+            Some(_) => return Err(invalid("role_filter", "wrong_type")),
+        };
+        Ok(Self { text, roles })
+    }
+
+    fn narrows(&self) -> bool {
+        self.text.is_some() || !self.roles.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +211,11 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
                     None => header.push_str(zoom.requested),
                 }
                 let mut lines = Vec::new();
-                tree.full_lines(target, 0, &mut lines);
+                if input.filters.narrows() {
+                    tree.filtered_lines(target, 0, input.filters, &mut lines);
+                } else {
+                    tree.full_lines(target, 0, &mut lines);
+                }
                 lines
             }
             None => {
@@ -163,8 +226,16 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
                 tree.outline_lines()
             }
         },
+        None if input.filters.narrows() => {
+            let mut lines = Vec::new();
+            tree.filtered_lines(0, 0, input.filters, &mut lines);
+            lines
+        }
         None => tree.outline_lines(),
     };
+    if input.filters.narrows() && lines.is_empty() {
+        header.push_str("\nNo matches for the requested filters.");
+    }
     fit(header, header_refs, lines, &tree, input.max_bytes)
 }
 
@@ -602,20 +673,7 @@ impl<'a> Tree<'a> {
             text.push(' ');
             text.push_str(&cap_chars(name.clone(), name_chars));
         }
-        let value = self.records[node].and_then(|record| record.value.as_deref());
-        let shown_value = if role == "link" {
-            facts
-                .and_then(|facts| facts.url.as_deref())
-                .and_then(short_url)
-        } else if is_text_field(role) {
-            // Print the value only when the field's DOM was read and shows it
-            // is not a credential or payment field.
-            value.filter(|_| credential == Some(false)).map(one_line)
-        } else if is_value_control(role) {
-            value.map(one_line)
-        } else {
-            None
-        };
+        let shown_value = self.shown_value(node);
         if let Some(value) = shown_value.filter(|value| !value.is_empty()) {
             text.push_str(", Value: ");
             text.push_str(&cap_chars(value, NAME_CHARS));
@@ -631,6 +689,28 @@ impl<'a> Tree<'a> {
             }
         }
         text
+    }
+
+    fn shown_value(&self, node: usize) -> Option<String> {
+        let role = self.role(node);
+        let facts = self.facts(node);
+        let value = self.records[node].and_then(|record| record.value.as_deref());
+        if role == "link" {
+            facts
+                .and_then(|facts| facts.url.as_deref())
+                .and_then(short_url)
+        } else if is_text_field(role) {
+            // Reveal a field's value only when its DOM facts establish that it
+            // is neither a credential nor a payment field. Text filtering uses
+            // the same redaction so it cannot confirm a hidden value.
+            value
+                .filter(|_| facts.and_then(|facts| facts.credential) == Some(false))
+                .map(one_line)
+        } else if is_value_control(role) {
+            value.map(one_line)
+        } else {
+            None
+        }
     }
 
     fn name_chars(&self, node: usize) -> usize {
@@ -661,6 +741,54 @@ impl<'a> Tree<'a> {
         for &kid in &self.kids[node] {
             self.full_lines(kid, depth + 1, out);
         }
+    }
+
+    /// Match only the label and the value the line can reveal. Walking the
+    /// collapsed tree keeps inner editors from becoming a secret-value oracle.
+    fn filtered_lines(
+        &self,
+        node: usize,
+        depth: usize,
+        filters: &Filters,
+        out: &mut Vec<Line>,
+    ) -> bool {
+        let role = self.role(node);
+        let role_match = filters.roles.is_empty()
+            || filters.roles.iter().any(|wanted| {
+                let wanted = wanted.trim();
+                wanted
+                    .strip_prefix("AX")
+                    .unwrap_or(wanted)
+                    .eq_ignore_ascii_case(role)
+                    || wanted.eq_ignore_ascii_case(display_role(role))
+            });
+        let line = self.element_text(node, self.name_chars(node));
+        let text_match = filters.text.as_ref().is_none_or(|wanted| {
+            let wanted = wanted.to_lowercase();
+            cap_chars(self.names[node].clone(), self.name_chars(node))
+                .to_lowercase()
+                .contains(&wanted)
+                || self.shown_value(node).is_some_and(|value| {
+                    cap_chars(value, NAME_CHARS)
+                        .to_lowercase()
+                        .contains(&wanted)
+                })
+        });
+        let matched = role_match && text_match;
+        let labelled = !self.names[node].is_empty();
+        let start = out.len();
+        if matched || labelled {
+            out.push(self.line(node, depth, line));
+        }
+        let mut below = false;
+        for &kid in &self.kids[node] {
+            below |=
+                self.filtered_lines(kid, depth + usize::from(matched || labelled), filters, out);
+        }
+        if !matched && !below {
+            out.truncate(start);
+        }
+        matched || below
     }
 
     /// The element and everything below it with repeated siblings folded:
@@ -989,6 +1117,37 @@ fn cut_report(lines: &[Line], keep: &[bool], tree: &Tree<'_>, max_bytes: usize) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn stable_refs_filters_cannot_match_withheld_field_values() {
+        let records = vec![
+            record(0, "textbox", "Password", Some("e1")),
+            record(1, "StaticText", "hidden-secret", Some("e2")),
+        ];
+        let mut fields = records.clone();
+        fields[0].value = Some("hidden-secret".into());
+        let facts = HashMap::from([(
+            "e1".into(),
+            NodeFacts {
+                credential: Some(true),
+                ..NodeFacts::default()
+            },
+        )]);
+        let filtered = render(&RenderInput {
+            records: &fields,
+            facts: &facts,
+            page_url: "https://example.com",
+            snapshot_id: "0123456789abcdef0123456789abcdef",
+            zoom: None,
+            filters: &Filters {
+                text: Some("hidden-secret".into()),
+                roles: Vec::new(),
+            },
+            max_bytes: 4096,
+        });
+        assert!(filtered.text.contains("No matches"), "{}", filtered.text);
+        assert!(!filtered.text.contains("hidden-secret"));
+    }
+
     fn record(depth: i64, role: &str, name: &str, reference: Option<&str>) -> AxRecord {
         AxRecord {
             depth,
@@ -1001,6 +1160,7 @@ mod tests {
 
     fn render_plain(records: &[AxRecord], facts: &HashMap<String, NodeFacts>) -> RenderedState {
         render(&RenderInput {
+            filters: &Filters::default(),
             records,
             facts,
             page_url: "https://example.com/page?q=1#top",
@@ -1098,6 +1258,7 @@ mod tests {
         records.push(record(1, "main", "", Some("e50")));
         records.push(record(2, "heading", "Main heading", Some("e51")));
         let state = render(&RenderInput {
+            filters: &Filters::default(),
             records: &records,
             facts: &HashMap::new(),
             page_url: "https://example.com/",
@@ -1140,6 +1301,7 @@ mod tests {
             )
         );
         let cut = render(&RenderInput {
+            filters: &Filters::default(),
             records: &records,
             facts: &HashMap::new(),
             page_url: "https://example.com/",
