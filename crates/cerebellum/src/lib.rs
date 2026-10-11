@@ -52,6 +52,7 @@ pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod tool_provider;
+pub mod user_browser_bridge;
 pub mod wire;
 
 #[cfg(target_os = "macos")]
@@ -739,11 +740,7 @@ fn serialize_manifest_with_computer_plane_configured(
         else {
             return serde_json::to_value(manifest).expect("module manifest serializes");
         };
-        let browser_tools = manifest::browser_control_tools()
-            .into_iter()
-            .chain(manifest::browser_wire_tools())
-            .filter(|tool| dispatchable_tool_with_browser(&tool.name, true).is_some())
-            .collect::<Vec<_>>();
+        let browser_tools = tool_provider::browser_tools();
         let admitted_names = browser_tools
             .iter()
             .map(|tool| tool.name.clone())
@@ -1623,7 +1620,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
-    conclude(run(config, |_| {}).await)
+    conclude(run(config, |_| {}, true).await)
 }
 
 /// [`run_entry`] with the configuration supplied here instead of read from the
@@ -1645,7 +1642,7 @@ pub async fn run_entry_prepared_for_test(
         agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
-    conclude(run(config, prepare).await)
+    conclude(run(config, prepare, false).await)
 }
 
 /// How a module run ended, which decides how the process exits.
@@ -1699,6 +1696,7 @@ struct ShutdownTeardown(Arc<ShutdownTeardownState>);
 
 struct ShutdownTeardownState {
     cursor: Option<computer_capability::cursor::Coordinator>,
+    user_browser: user_browser_bridge::UserBrowserBridge,
     sessions: browser_session::BrowserSessions,
     browser: Option<BrowserConfig>,
     idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1722,10 +1720,12 @@ impl ShutdownTeardown {
         browser: Option<BrowserConfig>,
         idle_enforcer: Option<tokio::task::JoinHandle<()>>,
         cursor: Option<computer_capability::cursor::Coordinator>,
+        user_browser: user_browser_bridge::UserBrowserBridge,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
             cursor,
+            user_browser,
             sessions,
             browser,
             idle_enforcer: std::sync::Mutex::new(idle_enforcer),
@@ -1741,6 +1741,7 @@ impl ShutdownTeardown {
             .started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            self.0.user_browser.shutdown();
             if let Some(cursor) = &self.0.cursor {
                 cursor.shutdown();
             }
@@ -1809,7 +1810,13 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleEnding {
+async fn run(
+    config: ModuleConfig,
+    prepare: impl FnOnce(&mut Planes),
+    enable_user_bridge: bool,
+) -> ModuleEnding {
+    #[cfg(not(target_os = "macos"))]
+    let _ = enable_user_bridge;
     // Listening starts before the connection is made, so a SIGTERM that
     // arrives while connecting is held until the module can act on it rather
     // than ending the process with no teardown.
@@ -1842,6 +1849,15 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
             config.module_id.clone(),
         )));
     prepare(&mut planes);
+    // Test entry points never bind the operator's runtime socket. Failure to
+    // bind the extension listener leaves the Chrome extension disconnected;
+    // the daemon-owned browser and browser_use advertisement are unaffected.
+    #[cfg(target_os = "macos")]
+    let _user_browser_listener = if enable_user_bridge && browser_config.is_some() {
+        user_browser_bridge::BridgeListener::bind(planes.user_browser.clone()).ok()
+    } else {
+        None
+    };
     if let Some(cursor) = planes_cursor(&planes) {
         cursor.enable(config.agent_cursor);
     }
@@ -1899,6 +1915,7 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
         browser_config.clone(),
         idle_enforcer,
         planes_cursor(&planes),
+        planes.user_browser.clone(),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -2027,6 +2044,7 @@ where
         browser_config.cloned(),
         idle_enforcer,
         planes_cursor(&planes),
+        planes.user_browser.clone(),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
 }
@@ -2549,6 +2567,7 @@ pub struct Planes {
     pub browser: Arc<BrowserPlane>,
     pub browser_config: Option<BrowserConfig>,
     pub sessions: browser_session::BrowserSessions,
+    pub user_browser: user_browser_bridge::UserBrowserBridge,
     pub lease_clock: Arc<cerebellum_core::clock::SystemClock>,
     pub launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>>,
     pub management: Arc<ManagementPlane>,
@@ -2862,6 +2881,7 @@ impl Planes {
             browser,
             browser_config,
             sessions,
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock,
             launch_service,
             management,
@@ -2965,6 +2985,7 @@ impl Clone for Planes {
             browser: Arc::clone(&self.browser),
             browser_config: self.browser_config.clone(),
             sessions: self.sessions.clone(),
+            user_browser: self.user_browser.clone(),
             lease_clock: Arc::clone(&self.lease_clock),
             launch_service: self.launch_service.clone(),
             management: Arc::clone(&self.management),
@@ -3076,6 +3097,10 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            planes.user_browser.goodbye(user_browser_bridge::Route {
+                channel: frame.header.channel,
+                epoch: frame.header.epoch,
+            });
             planes
                 .elicitor
                 .forget_route(frame.header.channel, frame.header.epoch);
@@ -5087,32 +5112,35 @@ async fn handle_keyed_tool_request(
     let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(&frame.body) else {
         return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
     };
+    if object.contains_key("schema_pin") {
+        if let Err(error) = tool_provider::check_tool_call(&object, planes) {
+            return tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await;
+        }
+    }
     let call_key = match object.remove("call_key") {
         None => None,
         Some(Value::String(key)) if call_records::valid_call_key(&key) => Some(key),
         Some(_) => {
-            return send_invalid_request_response(
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::invalid_request(
+                    "call_key",
+                    "expected 1..256 printable non-space ASCII bytes",
+                ),
+                (ver, channel, epoch, corr),
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "call_key",
-                "wrong_type",
             )
             .await
         }
     };
     if tool_provider::is_operation(object.get("name").and_then(Value::as_str).unwrap_or("")) {
         if call_key.is_some() {
-            return send_invalid_request_response(
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::invalid_request(
+                    "call_key",
+                    "provider operations take no envelope call key",
+                ),
+                (ver, channel, epoch, corr),
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "call_key",
-                "unknown_field",
             )
             .await;
         }
@@ -5122,14 +5150,13 @@ async fn handle_keyed_tool_request(
         // The key a withdrawal names is `arguments.call_key`. A second key on
         // the envelope would leave it unclear which call is meant.
         if call_key.is_some() {
-            return send_invalid_request_response(
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::invalid_request(
+                    "call_key",
+                    "withdrawal names arguments.call_key only",
+                ),
+                (ver, channel, epoch, corr),
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "call_key",
-                "unknown_field",
             )
             .await;
         }
@@ -5451,20 +5478,17 @@ async fn forward_recording_reply(
 }
 
 /// `tool.withdraw {call_key, scope?, carrier?}`: what became of a recorded
-/// call, and, for one that only asked a person, the question closed so it can
-/// never act.
+/// call, and, for one that only asked a person, a guarantee that its action
+/// will never run. The question may still record a grant for a future call.
 ///
-/// The answer is read from the record, so it is the same for every repeat and
-/// for every caller permitted to ask. Two callers are permitted:
-/// - the principal that raised the call (its carrier), as always;
-/// - the owner of the session scope the call was recorded under, when the
-///   daemon's stamp on the owner's own route says the owner is authorized
-///   (`owner_authorized`), the route's principal is that owner, the call was
-///   recorded under the same `(owner, ref, scope_epoch)`, and the request names
-///   the carrier in `arguments.carrier`. The lookup stays exact on
-///   `(carrier, call_key)`: a key is never matched on its own.
-///
-/// Everyone else is refused `withdraw_not_permitted`.
+/// The answer is read from the record, so every permitted repeat gets the
+/// same bytes. A carrier looks up only its own key; an authorized scope owner
+/// may name another carrier. Every found record must match the route's scope.
+/// An absent explicit carrier record answers `unknown_call`; an owner with no
+/// own record must name a carrier. Neither reveals another carrier's keys.
+/// Caller/scope mismatches are contract route
+/// errors, and the daemon's `owner_authorized` stamp remains required when an
+/// owner acts for another carrier.
 async fn handle_tool_withdraw(
     object: &serde_json::Map<String, Value>,
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
@@ -5477,7 +5501,12 @@ async fn handle_tool_withdraw(
     let checked = (|| {
         if let Some(field) = object
             .keys()
-            .filter(|field| !matches!(field.as_str(), "name" | "arguments" | "progress_token"))
+            .filter(|field| {
+                !matches!(
+                    field.as_str(),
+                    "name" | "arguments" | "progress_token" | "tool_call_id"
+                )
+            })
             .min()
         {
             return Err((field.clone(), "unknown_field"));
@@ -5531,8 +5560,12 @@ async fn handle_tool_withdraw(
     let (call_key, named_scope, carrier) = match checked {
         Ok(checked) => checked,
         Err((field, reason)) => {
-            return send_invalid_request_response(writer, ver, channel, epoch, corr, &field, reason)
-                .await
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::invalid_request(&field, reason),
+                (ver, channel, epoch, corr),
+                writer,
+            )
+            .await
         }
     };
     let Some(facts) = planes.routes.get(channel, epoch) else {
@@ -5548,90 +5581,63 @@ async fn handle_tool_withdraw(
         .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
-    let stamped = facts.scope.as_ref().map(ScopeIdentity::from_stamp);
-    // A scope named in the request must be the one the daemon stamped on this
-    // route. A mismatch is refused rather than resolved by preferring either:
-    // the caller and the daemon disagree about which session this is. A route
-    // opened without a scope has no stamp to compare with, and is answered as
-    // it was before scopes.
-    if let (Some(named), Some(stamped)) = (named_scope.as_ref(), stamped.as_ref()) {
-        if named != stamped {
-            return send_invalid_request_response(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "arguments.scope",
-                "unsupported_value",
-            )
-            .await;
-        }
-    }
-    // The caller is its route's scope owner when the stamp names the route's
-    // own principal as the owner. Whether that owner may act for its scope is
-    // the daemon's `owner_authorized`, and nothing cerebellum keeps.
-    let owner_stamp = facts
-        .scope
-        .as_ref()
-        .filter(|stamp| facts.principal.as_ref() == Some(&stamp.owner));
-    let lookup = match carrier.as_deref() {
-        // Naming another principal's call is the owner's arm and nobody else's.
-        Some(carrier) if carrier != principal => match owner_stamp {
-            Some(stamp) if stamp.owner_authorized => {
-                let scope = ScopeIdentity::from_stamp(stamp);
-                match planes.calls.lookup_exact(carrier, &call_key) {
-                    // Recorded under this owner's scope at this epoch: the
-                    // owner gets exactly the answer the carrier would.
-                    Lookup::Own(snapshot) if snapshot.scope.as_ref() == Some(&scope) => {
-                        Lookup::Own(snapshot)
-                    }
-                    // Recorded under no scope, another scope, or an earlier
-                    // session under the same ref: not this owner's call.
-                    Lookup::Own(_) | Lookup::OtherPrincipal => Lookup::OtherPrincipal,
-                    other => other,
-                }
-            }
-            // The owner, but the daemon does not authorize it to act for its
-            // scope.
-            Some(_) => Lookup::OtherPrincipal,
-            // A carrier may name only itself.
-            None => {
-                return send_invalid_request_response(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "arguments.carrier",
-                    "unsupported_value",
-                )
-                .await
-            }
-        },
-        // The caller's own call, which is today's rule and needs no scope.
-        named_self => match planes.calls.lookup(&principal, &call_key) {
-            Lookup::Own(snapshot) => Lookup::Own(snapshot),
-            // An authorized owner asking about a call it did not raise must
-            // say whose it is: the lookup is exact on the carrier, so without
-            // one there is nothing to look up.
-            _ if named_self.is_none()
-                && owner_stamp.is_some_and(|stamp| stamp.owner_authorized) =>
-            {
-                return send_invalid_request_response(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "arguments.carrier",
-                    "missing_field",
-                )
-                .await
-            }
-            other => other,
-        },
+    use cortexkit_role_tool_provider::scope::ScopeIdentity as WireScope;
+    use cortexkit_role_tool_provider::withdraw::{
+        check_record_scope, resolve_carrier, CallerProblem, CarrierResolution, WithdrawArguments,
     };
+    let to_wire = |scope: &ScopeIdentity| WireScope {
+        owner: scope.owner.clone(),
+        scope_ref: scope.reference.clone(),
+        scope_epoch: scope.scope_epoch,
+    };
+    let stamped = facts.scope.as_ref().map(ScopeIdentity::from_stamp);
+    let wire_stamp = stamped.as_ref().map(to_wire);
+    let mut arguments = WithdrawArguments::new(&call_key);
+    arguments.scope = named_scope.as_ref().map(to_wire);
+    arguments.carrier = carrier;
+    let resolution = match resolve_carrier(&principal, wire_stamp.as_ref(), &arguments) {
+        Ok(resolution) => resolution,
+        Err(problem) => {
+            return tool_provider::send_error(problem.error(), (ver, channel, epoch, corr), writer)
+                .await;
+        }
+    };
+    let (carrier, owner_as_carrier) = match resolution {
+        CarrierResolution::Carrier(carrier) => (carrier, false),
+        CarrierResolution::OwnerAsCarrier(carrier) => (carrier, true),
+    };
+    // The contract resolves the carrier; the daemon still decides whether a
+    // scope owner may act for somebody else. A claimed owner is not authority.
+    if carrier != principal
+        && !facts
+            .scope
+            .as_ref()
+            .is_some_and(|stamp| stamp.owner_authorized)
+    {
+        return tool_provider::send_error(
+            CallerProblem::NotPermitted.error(),
+            (ver, channel, epoch, corr),
+            writer,
+        )
+        .await;
+    }
+    // Never search other principals' keys: even a refusal would disclose that
+    // another carrier has a record with this opaque key.
+    let lookup = planes.calls.lookup_exact(&carrier, &call_key);
+    if let Lookup::Own(snapshot) = &lookup {
+        let record_scope = snapshot.scope.as_ref().map(to_wire);
+        if let Err(problem) = check_record_scope(record_scope.as_ref(), wire_stamp.as_ref()) {
+            return tool_provider::send_error(problem.error(), (ver, channel, epoch, corr), writer)
+                .await;
+        }
+    } else if owner_as_carrier && matches!(lookup, Lookup::Unknown | Lookup::OtherPrincipal) {
+        return tool_provider::send_error(
+            CallerProblem::CarrierRequired.error(),
+            (ver, channel, epoch, corr),
+            writer,
+        )
+        .await;
+    }
     match lookup {
         Lookup::Own(snapshot) => {
             let answer = call_records::withdraw_answer(&snapshot);
@@ -5737,7 +5743,13 @@ async fn handle_tool_request(
         .filter(|field| {
             !matches!(
                 field.as_str(),
-                "name" | "arguments" | "progress_token" | "origin" | "preset"
+                "name"
+                    | "arguments"
+                    | "progress_token"
+                    | "origin"
+                    | "preset"
+                    | "schema_pin"
+                    | "tool_call_id"
             )
         })
         .min()
@@ -5802,16 +5814,38 @@ async fn handle_tool_request(
         .await;
     };
 
+    if object.contains_key("schema_pin") {
+        if let Err(error) = tool_provider::check_tool_call(object, planes) {
+            return tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await;
+        }
+    }
+
     // Route admission is completed before decoding capability arguments.
     // Admitted routes may proceed to their handlers; denied routes perform no
     // reservation, context lookup, grant lookup, or CDP work.
     let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some());
     let Some(capability_name) = known_capability else {
+        if name == flat_tools::BROWSER_USE {
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::tool_disabled(name),
+                (ver, channel, epoch, corr),
+                writer,
+            )
+            .await;
+        }
         // Say WHICH kind of unavailable. A caller who named something this build
         // withholds and a caller who named something invented both arrive here,
         // and only one of them can do anything about it.
         let withheld = capability_withheld(name, planes.browser_config.is_some())
             .unwrap_or(CapabilityWithheld::Unknown);
+        if matches!(withheld, CapabilityWithheld::Unknown) {
+            return tool_provider::send_error(
+                cortexkit_role_tool_provider::errors::unknown_tool(name),
+                (ver, channel, epoch, corr),
+                writer,
+            )
+            .await;
+        }
         return send_route_error(
             writer,
             ver,
@@ -5860,6 +5894,9 @@ async fn handle_tool_request(
             &accepted_facts,
         )
         .await;
+    }
+    if let Err(error) = tool_provider::check_tool_call(object, planes) {
+        return tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await;
     }
     if !accepted_facts.allows_capability(capability_name) {
         return send_route_error(
@@ -7375,33 +7412,50 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn withheld_actions_are_refused_by_the_adapter_too() {
-        let request = json!({
-            "name": flat_tools::COMPUTER_USE,
-            "arguments": {
-                "action": "keys",
-                "keys": ["s"],
-                "target": "com.example.Editor"
+        let keys_frame = || {
+            let request = json!({
+                "name": flat_tools::COMPUTER_USE,
+                "arguments": {
+                    "action": "keys",
+                    "keys": ["s"],
+                    "target": "com.example.Editor"
+                }
+            });
+            Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap()
+        };
+        let refusal = |admitted: &'static [&'static str]| {
+            let frame = keys_frame();
+            async move {
+                let (tx, mut rx) = mpsc::channel(1);
+                let health = Arc::new(HealthState::new());
+                handle_tool_request_for_test_admitting(frame, &tx, &health, admitted)
+                    .await
+                    .unwrap();
+                let reply = rx.recv().await.expect("one refusal");
+                assert_eq!(reply.header.ty, FrameType::Error);
+                serde_json::from_slice::<ErrorBody>(&reply.body)
+                    .unwrap()
+                    .code
             }
-        });
-        let frame = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            99,
-            serde_json::to_vec(&request).unwrap(),
-        )
-        .unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
-        let health = Arc::new(HealthState::new());
-        handle_tool_request_for_test_admitting(frame, &tx, &health, &[])
-            .await
-            .unwrap();
-        let reply = rx.recv().await.expect("one refusal");
-        assert_eq!(reply.header.ty, FrameType::Error);
-        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(error.code, "capability_not_admitted");
+        };
+        // With some computer action admitted the tool is served, so the one
+        // withheld action is refused by name at the adapter.
+        assert_eq!(
+            refusal(&["computer.read_state"]).await,
+            "capability_not_admitted"
+        );
+        // With nothing admitted the catalog omits computer_use entirely, and
+        // tool-provider/v1 refuses a call to an omitted tool as disabled.
+        assert_eq!(refusal(&[]).await, "tool_disabled");
     }
 
     #[cfg(target_os = "macos")]
@@ -8657,6 +8711,7 @@ mod tests {
             browser,
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -8713,6 +8768,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -9686,6 +9742,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -9756,6 +9813,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),

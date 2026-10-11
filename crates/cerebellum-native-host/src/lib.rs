@@ -9,10 +9,6 @@ pub mod browsers;
 mod framing;
 #[cfg(target_os = "macos")]
 mod macos;
-// Temporary local stand-in until the concurrently developed
-// cerebellum-bridge-protocol crate supplies these types and the socket codec.
-#[cfg(any(target_os = "macos", test))]
-mod protocol;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod relay;
 

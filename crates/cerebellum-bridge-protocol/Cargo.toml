@@ -1,0 +1,15 @@
+[package]
+name = "cerebellum-bridge-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Small shared socket contract for cerebellum and its Chrome native host"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+base64 = "0.22"

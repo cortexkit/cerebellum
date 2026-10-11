@@ -1,7 +1,8 @@
 use crate::framing::{read_native_frame, write_native_frame};
-use crate::protocol::{
-    invalid_data, read_socket_frame, write_socket_frame, Frame, HostHello, ParentAttestation,
-    RelayFrame, PROTOCOL,
+use cerebellum_bridge_protocol::{
+    read_frame as read_socket_control_frame, read_raw_relay,
+    write_frame as write_socket_control_frame, write_raw_relay, Frame, ParentAttestation,
+    PROTOCOL_VERSION,
 };
 use serde_json::value::RawValue;
 use std::io::{self, Read, Write};
@@ -30,17 +31,17 @@ pub(crate) fn establish_session(
     socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     check_server(&socket)?;
-    write_socket_frame(
+    write_socket_control_frame(
         &mut socket,
-        &Frame::HostHello(HostHello {
-            protocol: PROTOCOL,
+        &Frame::HostHello {
+            protocol: PROTOCOL_VERSION,
             extension_origin,
             parent,
-        }),
+        },
     )?;
-    let epoch = match read_socket_frame(&mut socket)? {
-        Some(Frame::HostAccepted(accepted)) if accepted.protocol == PROTOCOL => accepted.epoch,
-        Some(Frame::HostRefused(_)) => {
+    let epoch = match read_socket_control_frame(&mut socket)? {
+        Frame::HostAccepted { protocol, epoch } if protocol == PROTOCOL_VERSION => epoch,
+        Frame::HostRefused { .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "bridge refused host",
@@ -83,29 +84,25 @@ fn relay_from_chrome(input: &mut impl Read, socket: &mut impl Write) -> io::Resu
     while let Some(message) = read_native_frame(input)? {
         let message = String::from_utf8(message).map_err(invalid_data)?;
         let message = RawValue::from_string(message).map_err(invalid_data)?;
-        write_socket_frame(socket, &Frame::Relay(RelayFrame { message }))?;
+        write_raw_relay(socket, &message)?;
     }
     Ok(())
 }
 
 fn relay_to_chrome(socket: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-    while let Some(frame) = read_socket_frame(socket)? {
-        match frame {
-            Frame::Relay(frame) => write_native_frame(output, frame.message.get().as_bytes())?,
-            _ => {
-                return Err(invalid_data(
-                    "only relay frames are allowed after acceptance",
-                ))
-            }
-        }
+    while let Some(message) = read_raw_relay(socket)? {
+        write_native_frame(output, message.get().as_bytes())?;
     }
     Ok(())
+}
+
+fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{HostAccepted, HostRefused};
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -167,24 +164,29 @@ mod tests {
     fn hello_attests_parent_and_origin_once_before_acceptance() {
         let (host, mut server) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            let Frame::HostHello(hello) = read_socket_frame(&mut server).unwrap().unwrap() else {
+            let Frame::HostHello {
+                protocol,
+                extension_origin,
+                parent: attested_parent,
+            } = read_socket_control_frame(&mut server).unwrap()
+            else {
                 panic!("expected hello");
             };
-            assert_eq!(hello.protocol, 1);
-            assert_eq!(hello.extension_origin, origin());
-            assert_eq!(hello.parent, parent().unwrap());
-            write_socket_frame(
+            assert_eq!(protocol, 1);
+            assert_eq!(extension_origin, origin());
+            assert_eq!(attested_parent, parent().unwrap());
+            write_socket_control_frame(
                 &mut server,
-                &Frame::HostAccepted(HostAccepted {
+                &Frame::HostAccepted {
                     protocol: 1,
                     epoch: 23,
-                }),
+                },
             )
             .unwrap();
             server
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
-            assert!(read_socket_frame(&mut server).unwrap().is_none());
+            assert!(read_raw_relay(&mut server).unwrap().is_none());
         });
         let (socket, epoch) = establish_session(origin(), parent, || Ok(host), |_| Ok(())).unwrap();
         assert_eq!(epoch, 23);
@@ -195,24 +197,24 @@ mod tests {
     #[test]
     fn refusal_wrong_protocol_and_early_relay_never_start_relaying() {
         for reply in [
-            Frame::HostRefused(HostRefused {
+            Frame::HostRefused {
                 reason: "wrong_origin".into(),
-            }),
-            Frame::HostAccepted(HostAccepted {
+            },
+            Frame::HostAccepted {
                 protocol: 2,
                 epoch: 3,
-            }),
-            Frame::Relay(RelayFrame {
-                message: RawValue::from_string("{}".into()).unwrap(),
-            }),
+            },
+            Frame::Relay {
+                message: serde_json::json!({}),
+            },
         ] {
             let (host, mut server) = UnixStream::pair().unwrap();
             let server = std::thread::spawn(move || {
                 assert!(matches!(
-                    read_socket_frame(&mut server).unwrap(),
-                    Some(Frame::HostHello(_))
+                    read_socket_control_frame(&mut server).unwrap(),
+                    Frame::HostHello { .. }
                 ));
-                write_socket_frame(&mut server, &reply).unwrap();
+                write_socket_control_frame(&mut server, &reply).unwrap();
                 let mut bytes = Vec::new();
                 server.read_to_end(&mut bytes).unwrap();
                 assert!(bytes.is_empty());
@@ -236,10 +238,8 @@ mod tests {
         relay_from_chrome(&mut Cursor::new(&chrome_wire), &mut socket_wire).unwrap();
         let mut decoded = &socket_wire[..];
         for expected in messages {
-            let Some(Frame::Relay(frame)) = read_socket_frame(&mut decoded).unwrap() else {
-                panic!("expected relay");
-            };
-            assert_eq!(frame.message.get(), expected);
+            let message = read_raw_relay(&mut decoded).unwrap().unwrap();
+            assert_eq!(message.get(), expected);
         }
         assert!(decoded.is_empty());
         let mut output = Vec::new();
@@ -254,12 +254,12 @@ mod tests {
         let mut socket_wire = Vec::new();
         assert!(relay_from_chrome(&mut &chrome_wire[..], &mut socket_wire).is_err());
         assert!(socket_wire.is_empty());
-        write_socket_frame(
+        write_socket_control_frame(
             &mut socket_wire,
-            &Frame::HostAccepted(HostAccepted {
+            &Frame::HostAccepted {
                 protocol: 1,
                 epoch: 3,
-            }),
+            },
         )
         .unwrap();
         let mut output = Vec::new();
@@ -278,15 +278,11 @@ mod tests {
         let relay_thread =
             std::thread::spawn(move || relay(host, chrome_input, &mut chrome_output));
         write_native_frame(&mut chrome_writer, br#"{"content":"input"}"#).unwrap();
-        let Frame::Relay(frame) = read_socket_frame(&mut server).unwrap().unwrap() else {
-            panic!("expected relay");
-        };
-        assert_eq!(frame.message.get(), r#"{"content":"input"}"#);
-        write_socket_frame(
+        let message = read_raw_relay(&mut server).unwrap().unwrap();
+        assert_eq!(message.get(), r#"{"content":"input"}"#);
+        write_raw_relay(
             &mut server,
-            &Frame::Relay(RelayFrame {
-                message: RawValue::from_string(r#"{"content":"output"}"#.into()).unwrap(),
-            }),
+            &RawValue::from_string(r#"{"content":"output"}"#.into()).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -296,5 +292,51 @@ mod tests {
         drop(server);
         relay_thread.join().unwrap().unwrap();
         drop(chrome_writer);
+    }
+
+    #[test]
+    fn shared_host_hello_decodes_through_the_host_control_path() {
+        let hello = Frame::HostHello {
+            protocol: PROTOCOL_VERSION,
+            extension_origin: origin(),
+            parent: parent().unwrap(),
+        };
+        let wire = cerebellum_bridge_protocol::encode(&hello).unwrap();
+        assert_eq!(read_socket_control_frame(&mut &wire[..]).unwrap(), hello);
+    }
+
+    #[test]
+    fn host_accepted_encoding_is_readable_by_the_shared_codec() {
+        let accepted = Frame::HostAccepted {
+            protocol: PROTOCOL_VERSION,
+            epoch: 23,
+        };
+        let mut wire = Vec::new();
+        write_socket_control_frame(&mut wire, &accepted).unwrap();
+        assert_eq!(
+            cerebellum_bridge_protocol::read_frame(&mut &wire[..]).unwrap(),
+            accepted
+        );
+    }
+
+    #[test]
+    fn shared_relay_and_host_stdio_paths_interoperate_both_directions() {
+        let message = serde_json::json!({"opaque": [1, "λ", true, null]});
+        let shared_frame = Frame::Relay {
+            message: message.clone(),
+        };
+        let shared_wire = cerebellum_bridge_protocol::encode(&shared_frame).unwrap();
+        let mut chrome_wire = Vec::new();
+        relay_to_chrome(&mut &shared_wire[..], &mut chrome_wire).unwrap();
+        let chrome_message = read_native_frame(&mut &chrome_wire[..]).unwrap().unwrap();
+        assert_eq!(chrome_message, serde_json::to_vec(&message).unwrap());
+
+        let mut host_wire = Vec::new();
+        relay_from_chrome(&mut &chrome_wire[..], &mut host_wire).unwrap();
+        assert_eq!(host_wire, shared_wire);
+        assert_eq!(
+            cerebellum_bridge_protocol::read_frame(&mut &host_wire[..]).unwrap(),
+            shared_frame
+        );
     }
 }

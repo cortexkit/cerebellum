@@ -46,10 +46,10 @@ server requirement is fixed: identifier `ck-cerebellum`, Apple generic anchor,
 and certificate leaf Team ID `5R5846NBPW`. No frame or environment variable can
 change it.
 
-`src/protocol.rs` is an explicitly temporary **local stand-in** for the concurrently
-developed `cerebellum-bridge-protocol` workspace crate. Replace it with that crate's
-types and codec during integration; the host crate cannot depend on an absent
-path. It implements the host and cerebellum socket protocol contract:
+The host uses `cerebellum-bridge-protocol` for socket framing, control frames,
+signing constants and raw relay codecs. Its raw relay API and the bridge's
+Value-based frame API share the same wire envelope; interoperability tests cover
+both directions. The socket protocol is:
 
 - socket frames: big-endian u32 byte length, UTF-8 JSON, maximum body 16 MiB;
 - `host_hello`: protocol 1, Chrome's argv[1] extension origin, checked parent

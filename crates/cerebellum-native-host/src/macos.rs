@@ -1,5 +1,5 @@
-use crate::protocol::{ParentAttestation, CEREBELLUM_REQUIREMENT};
 use crate::relay::{establish_session, relay};
+use cerebellum_bridge_protocol::{ParentAttestation, CEREBELLUM_REQUIREMENT};
 use cerebellum_macos::{parent_satisfies_chrome_requirement, peer_satisfies_requirement};
 use std::ffi::c_int;
 use std::io;

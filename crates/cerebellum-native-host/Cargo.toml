@@ -16,7 +16,7 @@ default = []
 chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
 
 [dependencies]
-serde = { workspace = true }
+cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 serde_json = { workspace = true, features = ["raw_value"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
