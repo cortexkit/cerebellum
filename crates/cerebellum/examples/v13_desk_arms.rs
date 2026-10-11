@@ -868,6 +868,7 @@ mod desk {
             ] {
                 let request = ModuleControlRequest::RouteBind {
                     role_versions: None,
+                    call_mode: None,
                     route_channel: channel,
                     epoch: 1,
                     target,

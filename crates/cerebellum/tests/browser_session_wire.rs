@@ -133,6 +133,7 @@ const MANAGEMENT_EPOCH: u32 = 1;
 async fn bind_management_route(planes: &Planes) {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: MANAGEMENT_CHANNEL,
         epoch: MANAGEMENT_EPOCH,
         target: RouteTarget::ManagementSurface {
@@ -2013,6 +2014,7 @@ async fn bind_tool_route_with_facts(planes: &Planes, admission_facts: Value) {
 async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -4781,6 +4783,7 @@ async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<Re
     launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -5417,6 +5420,7 @@ fn body(frame: &Frame) -> Value {
 async fn bind_second_principal(planes: &Planes) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 10,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -5907,18 +5911,16 @@ const SCOPE_OWNER: &str = "reserved:prefrontal-core";
 const SCOPE_CARRIER: &str = "reserved:broca";
 
 fn scope_stamp(scope_epoch: u64, owner_authorized: bool) -> subc_protocol::scope::ScopeStamp {
-    subc_protocol::scope::ScopeStamp {
-        owner: Principal::Reserved {
+    subc_protocol::scope::ScopeStamp::new(
+        Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: "s-1".into(),
+        "s-1",
         scope_epoch,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: subc_protocol::scope::ScopeAttributes::default(),
-        owner_authorized,
-    }
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_attributes(subc_protocol::scope::ScopeAttributes::default())
+    .with_owner_authorized(owner_authorized)
 }
 
 /// Bind route `channel`/3 for the fixture's conversation under `principal`,
@@ -5931,6 +5933,7 @@ async fn bind_route(
 ) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -6937,6 +6940,7 @@ async fn bind_reply(
 ) -> Frame {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -7846,6 +7850,7 @@ mod resource_busy_wire {
     async fn bind(planes: &Planes, channel: u16, conversation: &str) {
         let control = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel: channel,
             epoch: 3,
             target: RouteTarget::ToolProvider {
@@ -7961,6 +7966,7 @@ mod resource_busy_wire {
             };
             let bind = ModuleControlRequest::RouteBind {
                 role_versions: None,
+                call_mode: None,
                 route_channel: channel,
                 epoch: 3,
                 target: RouteTarget::ToolProvider {
@@ -8083,6 +8089,7 @@ async fn bind_admission_stamp(
 ) -> Frame {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -8528,6 +8535,7 @@ async fn bind_flow_wire_reply(
 ) -> Frame {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target,

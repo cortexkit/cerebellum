@@ -182,6 +182,7 @@ async fn bind(
 ) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {

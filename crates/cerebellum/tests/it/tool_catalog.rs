@@ -65,6 +65,7 @@ async fn bind_with_scope(
 ) {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -307,18 +308,16 @@ async fn another_principals_key_is_an_unknown_call() {
 #[tokio::test]
 async fn withdrawal_checks_the_carriers_own_record_scope() {
     let planes = planes(true);
-    let scope = subc_protocol::scope::ScopeStamp {
-        owner: Principal::Reserved {
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: "scope-one".into(),
-        scope_epoch: 1,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: subc_protocol::scope::ScopeAttributes::default(),
-        owner_authorized: true,
-    };
+        "scope-one",
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_attributes(subc_protocol::scope::ScopeAttributes::default())
+    .with_owner_authorized(true);
     bind_with_scope(&planes, 9, "broca", Some(scope.clone())).await;
     let result = exchange(
         &planes,

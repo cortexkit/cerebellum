@@ -82,6 +82,7 @@ impl Harness for Subject {
         let channel = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
         let bind = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel: channel,
             epoch: 3,
             target: RouteTarget::ToolProvider {
@@ -93,19 +94,16 @@ impl Harness for Subject {
             admission_facts: Some(
                 json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
             ),
-            scope: stamp
-                .scope
-                .as_ref()
-                .map(|scope| subc_protocol::scope::ScopeStamp {
-                    owner: principal(&scope.owner),
-                    scope_ref: scope.scope_ref.clone(),
-                    scope_epoch: scope.scope_epoch,
-                    kind: subc_protocol::scope::ScopeKind::Head,
-                    parent: None,
-                    parent_state: None,
-                    attributes: subc_protocol::scope::ScopeAttributes::default(),
-                    owner_authorized: true,
-                }),
+            scope: stamp.scope.as_ref().map(|scope| {
+                subc_protocol::scope::ScopeStamp::new(
+                    principal(&scope.owner),
+                    scope.scope_ref.clone(),
+                    scope.scope_epoch,
+                    subc_protocol::scope::ScopeKind::Head,
+                )
+                .with_attributes(subc_protocol::scope::ScopeAttributes::default())
+                .with_owner_authorized(true)
+            }),
         };
         let (tx, mut rx) = mpsc::channel(8);
         cerebellum::handle_frame_for_test(

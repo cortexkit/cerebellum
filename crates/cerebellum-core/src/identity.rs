@@ -881,18 +881,18 @@ mod tests {
         let core = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
-        let stamp = subc_protocol::scope::ScopeStamp {
-            owner: core.clone(),
-            scope_ref: "ephemeral".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Ephemeral,
-            parent: None,
-            parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes::new()
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            core.clone(),
+            "ephemeral",
+            1,
+            subc_protocol::scope::ScopeKind::Ephemeral,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
                 .with_agent_id(Some("pj-agent".into()))
                 .with_delegates(true),
-            owner_authorized: true,
-        };
+        )
+        .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
             &bind_identity("/caller/project", "conversation"),
             Some(core),
@@ -914,19 +914,19 @@ mod tests {
         let core = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
-        let stamp = subc_protocol::scope::ScopeStamp {
-            owner: core.clone(),
-            scope_ref: "flow-head".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes::new()
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            core.clone(),
+            "flow-head",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
                 .with_agent_id(Some("pj-agent".into()))
                 .with_delegates(true)
                 .with_flow_id(Some("flow".into())),
-            owner_authorized: true,
-        };
+        )
+        .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
             &bind_identity("/caller/project", "conversation"),
             Some(core),

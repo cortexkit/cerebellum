@@ -5229,6 +5229,7 @@ async fn handle_control_request(
             scope,
             // Cerebellum declares no versioned roles today.
             role_versions: _,
+            call_mode: _,
         } => {
             // Refuse non-first-party principals at bind; the only exception is a
             // Basal route that passes `flow_carrier_admitted`. The subc-mcp gateway
@@ -7840,18 +7841,18 @@ mod tests {
             module_id: "cerebellum".into(),
         };
         for delegates in [false, true] {
-            let scope = subc_protocol::scope::ScopeStamp {
-                owner: core.clone(),
-                scope_ref: "head".into(),
-                scope_epoch: 1,
-                kind: subc_protocol::scope::ScopeKind::Head,
-                parent: None,
-                parent_state: None,
-                attributes: subc_protocol::scope::ScopeAttributes::new()
+            let scope = subc_protocol::scope::ScopeStamp::new(
+                core.clone(),
+                "head",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_attributes(
+                subc_protocol::scope::ScopeAttributes::new()
                     .with_agent_id(Some("pj-agent".into()))
                     .with_delegates(delegates),
-                owner_authorized: true,
-            };
+            )
+            .with_owner_authorized(true);
             let facts =
                 AcceptedBindFacts::from_bind(&bind, Some(core.clone()), None, None, &target)
                     .with_scope(Some(scope));
@@ -12772,21 +12773,22 @@ mod relayed_computer_call_tests {
         rx: &mut mpsc::Receiver<Frame>,
         target: subc_protocol::RouteTarget,
     ) {
-        let stamp = subc_protocol::scope::ScopeStamp {
-            owner: session_caller_principal_for_test().unwrap(),
-            scope_ref: "flow-head".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes::new()
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            session_caller_principal_for_test().unwrap(),
+            "flow-head",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
                 .with_agent_id(Some("test-project".into()))
                 .with_delegates(true)
                 .with_flow_id(Some("flow-computer".into())),
-            owner_authorized: true,
-        };
+        )
+        .with_owner_authorized(true);
         let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel: CHANNEL,
             epoch: EPOCH,
             target,
@@ -13148,21 +13150,22 @@ mod relayed_computer_call_tests {
         let planes = planes_with_source(&storage, Arc::new(CountReads(reads.clone())));
         let (tx, mut rx) = mpsc::channel(8);
         for flow_id in [Some("flow-1".to_string()), None] {
-            let stamp = subc_protocol::scope::ScopeStamp {
-                owner: session_caller_principal_for_test().unwrap(),
-                scope_ref: "head".into(),
-                scope_epoch: 1,
-                kind: subc_protocol::scope::ScopeKind::Head,
-                parent: None,
-                parent_state: None,
-                attributes: subc_protocol::scope::ScopeAttributes::new()
+            let stamp = subc_protocol::scope::ScopeStamp::new(
+                session_caller_principal_for_test().unwrap(),
+                "head",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_attributes(
+                subc_protocol::scope::ScopeAttributes::new()
                     .with_agent_id(Some("test-project".into()))
                     .with_delegates(true)
                     .with_flow_id(flow_id.clone()),
-                owner_authorized: true,
-            };
+            )
+            .with_owner_authorized(true);
             let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
                 role_versions: None,
+                call_mode: None,
                 route_channel: CHANNEL,
                 epoch: EPOCH,
                 target: subc_protocol::RouteTarget::ToolProvider {

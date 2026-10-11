@@ -123,6 +123,7 @@ async fn first_party_route_bind_is_acked() {
 
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -167,6 +168,7 @@ async fn ineligible_principal_receives_transport_rejection() {
 
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -253,6 +255,7 @@ async fn absent_principal_is_rejected() {
 
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 42,
         epoch: 7,
         target: RouteTarget::ToolProvider {
@@ -669,6 +672,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
 
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -748,6 +752,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let route_bindings = std::sync::Arc::new(cerebellum::RouteBindings::new());
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 10,
         epoch: 4,
         target: RouteTarget::ToolProvider {
