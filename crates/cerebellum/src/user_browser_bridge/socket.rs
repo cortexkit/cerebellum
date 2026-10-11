@@ -1,0 +1,318 @@
+use super::*;
+use cerebellum_bridge_protocol::{
+    checked_length, decode_body, encode, Frame, ParentAttestation, EXTENSION_ORIGIN,
+    PROTOCOL_VERSION,
+};
+use std::io;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+
+type VerifyPeer = Arc<dyn Fn(&std::os::unix::net::UnixStream) -> Result<(), Reason> + Send + Sync>;
+
+/// Owns the private socket and its accept loop. Dropping it stops the listener
+/// and connection; it never sends signals to Chrome or closes any browser tab.
+pub struct BridgeListener {
+    bridge: UserBrowserBridge,
+    task: tokio::task::JoinHandle<()>,
+    path: PathBuf,
+    inode: u64,
+    device: u64,
+}
+
+impl BridgeListener {
+    #[cfg(target_os = "macos")]
+    pub fn bind(bridge: UserBrowserBridge) -> io::Result<Self> {
+        let path = cortexkit_paths::cortexkit_run_dir()
+            .map_err(io::Error::other)?
+            .join("cerebellum/user-browser.sock");
+        Self::bind_at(bridge, path, Arc::new(verify_signed_host))
+    }
+
+    fn bind_at(bridge: UserBrowserBridge, path: PathBuf, verifier: VerifyPeer) -> io::Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no parent"))?;
+        cerebellum_core::private_fs::create_dir_all(parent)?;
+        let directory = std::fs::symlink_metadata(parent)?;
+        if !directory.is_dir()
+            || directory.uid() != current_uid()
+            || directory.mode() & 0o777 != 0o700
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bridge directory must be owned by the current user with mode 0700",
+            ));
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_socket() || metadata.uid() != current_uid() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "existing bridge path is not an owned socket",
+                ));
+            }
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "a bridge server is already listening",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(&path)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let instance = bridge.clone();
+        let task = tokio::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(8));
+            let mut peers = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break; };
+                        let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
+                        let bridge = instance.clone();
+                        let verifier = verifier.clone();
+                        peers.spawn(async move {
+                            let _slot = slot;
+                            serve_peer(bridge, stream, verifier).await;
+                        });
+                    }
+                    _ = peers.join_next(), if !peers.is_empty() => {},
+                }
+            }
+        });
+        Ok(Self {
+            bridge,
+            task,
+            path,
+            inode: metadata.ino(),
+            device: metadata.dev(),
+        })
+    }
+}
+
+impl Drop for BridgeListener {
+    fn drop(&mut self) {
+        self.bridge.shutdown();
+        self.task.abort();
+        // Do not remove a path another process substituted after this bind.
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            if metadata.ino() == self.inode && metadata.dev() == self.device {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+fn current_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signed_host(stream: &std::os::unix::net::UnixStream) -> Result<(), Reason> {
+    cerebellum_macos::peer_satisfies_requirement(
+        stream,
+        cerebellum_bridge_protocol::HOST_REQUIREMENT,
+        HOST_HELLO_DEADLINE,
+    )
+    .map(|_| ())
+    .map_err(|_| Reason::UnsignedPeer)
+}
+
+fn valid_parent(parent: &ParentAttestation) -> bool {
+    if parent.pid == 0 || parent.start_time_micros == 0 {
+        return false;
+    }
+    match (&parent.team_id, &parent.probe_cdhash) {
+        (Some(team), None) => team == "EQHXZ8M8AV",
+        #[cfg(feature = "chrome-for-testing-parent-probe")]
+        (None, Some(hash)) => hash == "8f2a5ce4af6d1cd71fe66113dd809e4d106c3106",
+        _ => false,
+    }
+}
+
+async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier: VerifyPeer) {
+    if stream
+        .peer_cred()
+        .map_or(true, |credentials| credentials.uid() != current_uid())
+    {
+        refuse(&mut stream, Reason::WrongUser).await;
+        return;
+    }
+    // Running-code checks can block. Keep the runtime available for Cancel and
+    // phase deadlines while the bounded signing operation runs elsewhere.
+    let Ok(raw) = stream.into_std() else {
+        return;
+    };
+    let checked = tokio::task::spawn_blocking(move || {
+        let verdict = verifier(&raw);
+        (raw, verdict)
+    })
+    .await;
+    let Ok((raw, verdict)) = checked else {
+        return;
+    };
+    let Ok(mut stream) = UnixStream::from_std(raw) else {
+        return;
+    };
+    if let Err(reason) = verdict {
+        refuse(&mut stream, reason).await;
+        return;
+    }
+    let hello = tokio::time::timeout(HOST_HELLO_DEADLINE, read_frame(&mut stream)).await;
+    let reason = match hello {
+        Ok(Ok(Frame::HostHello {
+            protocol,
+            extension_origin,
+            parent,
+        })) => {
+            if protocol != PROTOCOL_VERSION {
+                Some(Reason::ProtocolMismatch)
+            } else if extension_origin != EXTENSION_ORIGIN {
+                Some(Reason::ExtensionOriginMismatch)
+            } else if !valid_parent(&parent) {
+                Some(Reason::ParentAttestationInvalid)
+            } else {
+                None
+            }
+        }
+        _ => Some(Reason::ProtocolError),
+    };
+    if let Some(reason) = reason {
+        refuse(&mut stream, reason).await;
+        return;
+    }
+    let (epoch, mut outgoing, mut closed) = match bridge.connect() {
+        Ok(connection) => connection,
+        Err(reason) => {
+            refuse(&mut stream, reason).await;
+            return;
+        }
+    };
+    let _connection = DisconnectOnDrop {
+        bridge: bridge.clone(),
+        epoch,
+    };
+    if write_frame(
+        &mut stream,
+        &Frame::HostAccepted {
+            protocol: PROTOCOL_VERSION,
+            epoch,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    let (mut reader, mut writer) = stream.into_split();
+    let receiving = bridge.clone();
+    let read_task = tokio::spawn(async move {
+        while let Ok(Frame::Relay { message }) = read_frame(&mut reader).await {
+            if serde_json::to_vec(&message).map_or(true, |bytes| bytes.len() > MAX_MESSAGE_BYTES) {
+                break;
+            }
+            let Ok(message) = serde_json::from_value::<Message>(message) else {
+                break;
+            };
+            receiving.receive(message);
+        }
+        receiving.disconnect(epoch);
+    });
+    let _reader = AbortOnDrop(read_task);
+    let writing = async {
+        while let Some(message) = outgoing.recv().await {
+            if !bridge.should_send(&message) {
+                continue;
+            }
+            let Ok(value) = serde_json::to_value(message) else {
+                break;
+            };
+            if write_frame(&mut writer, &Frame::Relay { message: value })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = wait_closed(&mut closed) => {},
+        _ = writing => {},
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+struct DisconnectOnDrop {
+    bridge: UserBrowserBridge,
+    epoch: u64,
+}
+impl Drop for DisconnectOnDrop {
+    fn drop(&mut self) {
+        self.bridge.disconnect(self.epoch);
+    }
+}
+
+async fn refuse(stream: &mut UnixStream, reason: Reason) {
+    let reason = serde_json::to_value(reason)
+        .expect("reason serializes")
+        .as_str()
+        .expect("reason is a string")
+        .to_owned();
+    let _ = write_frame(stream, &Frame::HostRefused { reason }).await;
+}
+
+pub(super) async fn read_frame(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> io::Result<Frame> {
+    let mut prefix = [0; 4];
+    reader.read_exact(&mut prefix).await?;
+    let mut body = vec![0; checked_length(prefix)?];
+    reader.read_exact(&mut body).await?;
+    decode_body(&body)
+}
+
+pub(super) async fn write_frame(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &Frame,
+) -> io::Result<()> {
+    let bytes = encode(frame)?;
+    tokio::time::timeout(WRITE_DEADLINE, writer.write_all(&bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge write deadline"))?
+}
+
+#[cfg(test)]
+pub(super) fn test_listener(
+    bridge: UserBrowserBridge,
+    path: &Path,
+    signed: bool,
+) -> io::Result<BridgeListener> {
+    let verifier: VerifyPeer = if signed {
+        Arc::new(|_| Ok(()))
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            Arc::new(verify_signed_host)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Arc::new(|_| Err(Reason::UnsignedPeer))
+        }
+    };
+    BridgeListener::bind_at(bridge, path.to_path_buf(), verifier)
+}

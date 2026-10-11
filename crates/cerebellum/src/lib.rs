@@ -52,6 +52,7 @@ pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod tool_provider;
+pub mod user_browser_bridge;
 pub mod wire;
 
 #[cfg(target_os = "macos")]
@@ -1619,7 +1620,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
-    conclude(run(config, |_| {}).await)
+    conclude(run(config, |_| {}, true).await)
 }
 
 /// [`run_entry`] with the configuration supplied here instead of read from the
@@ -1641,7 +1642,7 @@ pub async fn run_entry_prepared_for_test(
         agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
-    conclude(run(config, prepare).await)
+    conclude(run(config, prepare, false).await)
 }
 
 /// How a module run ended, which decides how the process exits.
@@ -1695,6 +1696,7 @@ struct ShutdownTeardown(Arc<ShutdownTeardownState>);
 
 struct ShutdownTeardownState {
     cursor: Option<computer_capability::cursor::Coordinator>,
+    user_browser: user_browser_bridge::UserBrowserBridge,
     sessions: browser_session::BrowserSessions,
     browser: Option<BrowserConfig>,
     idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1718,10 +1720,12 @@ impl ShutdownTeardown {
         browser: Option<BrowserConfig>,
         idle_enforcer: Option<tokio::task::JoinHandle<()>>,
         cursor: Option<computer_capability::cursor::Coordinator>,
+        user_browser: user_browser_bridge::UserBrowserBridge,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
             cursor,
+            user_browser,
             sessions,
             browser,
             idle_enforcer: std::sync::Mutex::new(idle_enforcer),
@@ -1737,6 +1741,7 @@ impl ShutdownTeardown {
             .started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            self.0.user_browser.shutdown();
             if let Some(cursor) = &self.0.cursor {
                 cursor.shutdown();
             }
@@ -1805,7 +1810,13 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleEnding {
+async fn run(
+    config: ModuleConfig,
+    prepare: impl FnOnce(&mut Planes),
+    enable_user_bridge: bool,
+) -> ModuleEnding {
+    #[cfg(not(target_os = "macos"))]
+    let _ = enable_user_bridge;
     // Listening starts before the connection is made, so a SIGTERM that
     // arrives while connecting is held until the module can act on it rather
     // than ending the process with no teardown.
@@ -1838,6 +1849,15 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
             config.module_id.clone(),
         )));
     prepare(&mut planes);
+    // Test entry points never bind the operator's runtime socket. Failure to
+    // bind the extension listener leaves the Chrome extension disconnected;
+    // the daemon-owned browser and browser_use advertisement are unaffected.
+    #[cfg(target_os = "macos")]
+    let _user_browser_listener = if enable_user_bridge && browser_config.is_some() {
+        user_browser_bridge::BridgeListener::bind(planes.user_browser.clone()).ok()
+    } else {
+        None
+    };
     if let Some(cursor) = planes_cursor(&planes) {
         cursor.enable(config.agent_cursor);
     }
@@ -1895,6 +1915,7 @@ async fn run(config: ModuleConfig, prepare: impl FnOnce(&mut Planes)) -> ModuleE
         browser_config.clone(),
         idle_enforcer,
         planes_cursor(&planes),
+        planes.user_browser.clone(),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -2023,6 +2044,7 @@ where
         browser_config.cloned(),
         idle_enforcer,
         planes_cursor(&planes),
+        planes.user_browser.clone(),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
 }
@@ -2545,6 +2567,7 @@ pub struct Planes {
     pub browser: Arc<BrowserPlane>,
     pub browser_config: Option<BrowserConfig>,
     pub sessions: browser_session::BrowserSessions,
+    pub user_browser: user_browser_bridge::UserBrowserBridge,
     pub lease_clock: Arc<cerebellum_core::clock::SystemClock>,
     pub launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>>,
     pub management: Arc<ManagementPlane>,
@@ -2858,6 +2881,7 @@ impl Planes {
             browser,
             browser_config,
             sessions,
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock,
             launch_service,
             management,
@@ -2961,6 +2985,7 @@ impl Clone for Planes {
             browser: Arc::clone(&self.browser),
             browser_config: self.browser_config.clone(),
             sessions: self.sessions.clone(),
+            user_browser: self.user_browser.clone(),
             lease_clock: Arc::clone(&self.lease_clock),
             launch_service: self.launch_service.clone(),
             management: Arc::clone(&self.management),
@@ -3072,6 +3097,10 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            planes.user_browser.goodbye(user_browser_bridge::Route {
+                channel: frame.header.channel,
+                epoch: frame.header.epoch,
+            });
             planes
                 .elicitor
                 .forget_route(frame.header.channel, frame.header.epoch);
@@ -8682,6 +8711,7 @@ mod tests {
             browser,
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -8738,6 +8768,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -9711,6 +9742,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
@@ -9781,6 +9813,7 @@ mod tests {
             browser: Arc::new(BrowserPlane::new()),
             browser_config: None,
             sessions: browser_session::BrowserSessions::default(),
+            user_browser: user_browser_bridge::UserBrowserBridge::new(),
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
