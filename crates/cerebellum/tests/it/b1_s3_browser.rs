@@ -45,6 +45,9 @@ use cerebellum::{BrowserConfig, RouteIdentity};
 use cerebellum_core::clock::SystemClock;
 use serde_json::{json, Value};
 
+#[path = "browser_busy_dispatch.rs"]
+mod busy_dispatch;
+
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 fn identity() -> RouteIdentity {

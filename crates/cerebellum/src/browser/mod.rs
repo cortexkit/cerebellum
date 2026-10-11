@@ -258,6 +258,10 @@ pub enum BrowserError {
     TypeNotReady {
         reason_code: &'static str,
     },
+    CommandTimeout {
+        step: String,
+        command_sent: bool,
+    },
     BrowserCrashed,
     Internal {
         reason_code: JournalReasonCode,
@@ -294,6 +298,7 @@ impl BrowserError {
             Self::NotSettled { .. } => "not_settled",
             Self::NavigateNotReady { .. } => "navigate_not_ready",
             Self::TypeNotReady { .. } => "type_not_ready",
+            Self::CommandTimeout { .. } => "command_timeout",
             Self::BrowserCrashed => "browser_crashed",
             Self::Internal { .. } => "internal_error",
             Self::SessionStateUnavailable => "internal_failure",
@@ -311,6 +316,7 @@ impl BrowserError {
             Self::NavigateNotReady { navigation_sent: false, .. } => "the setup step in detail.reason_code did not become ready before the deadline; Page.navigate was not sent; retry navigation when the browser is ready",
             Self::NavigateNotReady { navigation_sent: true, .. } => "Page.navigate was sent but its response did not arrive before the deadline; navigation may have completed; snapshot first to inspect the current page, then retry only if needed",
             Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
+            Self::CommandTimeout { .. } => "the CDP step in detail.step exceeded its deadline; let the page settle, then retry snapshot; inspect the page before retrying input because earlier input may have reached it",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }
@@ -419,6 +425,9 @@ impl BrowserError {
                 navigation_sent,
             } => json!({"reason_code":reason_code,"navigation_sent":navigation_sent}),
             Self::TypeNotReady { reason_code } => json!({"reason_code":reason_code}),
+            Self::CommandTimeout { step, command_sent } => {
+                json!({"reason_code":"command_deadline_expired","step":step,"command_sent":command_sent})
+            }
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::PageChangedSinceSnapshot {
                 snapshot_origin,
@@ -1970,13 +1979,15 @@ impl BrowserPlane {
         {
             return;
         }
+        let outcome = journal_outcome(error);
+        let detail = journal_refusal_detail(error);
         if committed {
             let mut state = self.state.lock().await;
             Self::record_invocation_outcome(
                 &mut state,
                 &identity.conversation_key,
                 capability,
-                Outcome::InternalError,
+                outcome,
             );
             Self::op(
                 &mut state,
@@ -1994,17 +2005,11 @@ impl BrowserPlane {
                         profile_uuid: None,
                         profile_name: None,
                     },
-                    CompletedResult {
-                        outcome: Outcome::InternalError,
-                        detail: error
-                            .detail()
-                            .unwrap_or_else(|| json!({"reason_code":"internal_failure"})),
-                    },
+                    CompletedResult { outcome, detail },
                 );
             }
             journal.release_terminal_invocations(&identity.conversation_key);
         } else {
-            let outcome = journal_outcome(error);
             let mut state = self.state.lock().await;
             Self::record_invocation_outcome(
                 &mut state,
@@ -2022,15 +2027,7 @@ impl BrowserPlane {
             if let Some((store, invocation)) =
                 journal.active_invocation_mut(&identity.conversation_key, capability)
             {
-                let _ = invocation.finalize_rejected(
-                    store,
-                    rejection_material(
-                        outcome,
-                        error
-                            .detail()
-                            .unwrap_or_else(|| json!({"reason_code":"internal_failure"})),
-                    ),
-                );
+                let _ = invocation.finalize_rejected(store, rejection_material(outcome, detail));
             }
             journal.release_terminal_invocations(&identity.conversation_key);
         }
@@ -2831,7 +2828,14 @@ impl BrowserPlane {
             // Read which document the page shows once the capture has
             // returned, on the same admitted operation, so nothing this module
             // issues can sit between the capture and this check.
-            let live_after = session_operation.committed_document(&route_key, deadline_ms);
+            // A failed capture returns no page content. Do not spend a second
+            // deadline checking its document while the renderer is still busy.
+            let live_after = match &result {
+                Err(
+                    error @ crate::browser_session::NavigationDriveError::CommandDeadline { .. },
+                ) => Err(error.clone()),
+                _ => session_operation.committed_document(&route_key, deadline_ms),
+            };
             (session_operation, result, live_after)
         })
         .await
@@ -3499,36 +3503,14 @@ impl BrowserPlane {
                 return Err(BrowserError::Intercepted(detail));
             }
             Err(crate::browser_session::ClickDriveError::NoPosition) => {
-                self.finalize(
-                    identity,
-                    BrowserCapability::Click,
-                    Outcome::StaleSnapshot,
-                    json!({}),
-                )
-                .await?;
                 return Err(BrowserError::ElementIntercepted);
             }
             Err(crate::browser_session::ClickDriveError::ClassificationChanged) => {
-                self.finalize(
-                    identity,
-                    BrowserCapability::Click,
-                    Outcome::StaleSnapshot,
-                    json!({"reason_code":"classification_changed"}),
-                )
-                .await?;
                 return Err(BrowserError::StaleSnapshot {
                     reason_code: "classification_changed",
                 });
             }
             Err(crate::browser_session::ClickDriveError::OutsideViewportAfterScroll(refusal)) => {
-                let detail = viewport_refusal_detail("outside_viewport_after_scroll", refusal);
-                self.finalize(
-                    identity,
-                    BrowserCapability::Click,
-                    Outcome::StaleSnapshot,
-                    detail,
-                )
-                .await?;
                 return Err(BrowserError::OutsideViewportAfterScroll { refusal });
             }
             Err(crate::browser_session::ClickDriveError::Navigation(error)) => {
@@ -3949,14 +3931,6 @@ impl BrowserPlane {
         let mut response = match drive_result {
             Ok(outcome) => self.click_reply(identity, outcome).await,
             Err(crate::browser_session::ClickDriveError::OutsideViewportAfterScroll(refusal)) => {
-                let detail = viewport_refusal_detail("point_outside_viewport", refusal);
-                self.finalize(
-                    identity,
-                    BrowserCapability::ClickPoint,
-                    Outcome::StaleSnapshot,
-                    detail,
-                )
-                .await?;
                 return Err(BrowserError::PointOutsideViewport { refusal });
             }
             Err(crate::browser_session::ClickDriveError::Intercepted(detail)) => {
@@ -4450,6 +4424,8 @@ fn refusal_detail_schema() -> Value {
             "decision":string_schema(),
             "reason_code":string_schema(),
             "navigation_sent":boolean_schema(),
+            "step":string_schema(),
+            "command_sent":boolean_schema(),
             "reason":string_schema(),
             "grant":string_schema(),
             "grant_label":string_schema(),
@@ -4558,6 +4534,7 @@ fn browser_result_outcome_schema() -> Value {
         "not_settled",
         "type_not_ready",
         "navigate_not_ready",
+        "command_timeout",
         "browser_crashed",
         "internal_error",
         "internal_failure"
@@ -5565,6 +5542,17 @@ fn origin_from_url(url: &str) -> String {
         authority.to_ascii_lowercase()
     )
 }
+/// Durable refusal details describe the decision, not the page under the mouse.
+/// Accessible names can contain private page text and must not enter the journal.
+fn journal_refusal_detail(error: &BrowserError) -> Value {
+    let mut detail = error.detail().unwrap_or_else(|| json!({}));
+    if let Some(object) = detail.as_object_mut() {
+        object.remove("hit_name");
+        object.insert("outcome".into(), json!(error.outcome()));
+    }
+    detail
+}
+
 fn journal_outcome(error: &BrowserError) -> Outcome {
     match error {
         BrowserError::InvalidRequest { .. } | BrowserError::SeverityBelowFloor { .. } => {
@@ -5579,12 +5567,14 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         BrowserError::StaleSnapshot { .. }
         | BrowserError::PageChangedSinceSnapshot { .. }
         | BrowserError::RefNotFound { .. }
-        | BrowserError::RefAmbiguous { .. }
-        | BrowserError::ClassificationUnavailable(_)
+        | BrowserError::RefAmbiguous { .. } => Outcome::StaleSnapshot,
+        BrowserError::ClassificationUnavailable(_)
         | BrowserError::Intercepted(_)
         | BrowserError::ElementIntercepted
         | BrowserError::OutsideViewportAfterScroll { .. }
-        | BrowserError::PointOutsideViewport { .. } => Outcome::StaleSnapshot,
+        | BrowserError::PointOutsideViewport { .. }
+        | BrowserError::InvalidCoordinates { .. }
+        | BrowserError::ImageTooLarge { .. } => Outcome::InvalidRequest,
         BrowserError::NoSession
         | BrowserError::BrowserLaunchPending
         | BrowserError::HumanInControl { .. }
@@ -5593,12 +5583,10 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
         | BrowserError::NavigationFailed { .. }
-        | BrowserError::NavigationPolicyRejected { .. }
-        | BrowserError::InvalidCoordinates { .. }
-        | BrowserError::ImageTooLarge { .. } => Outcome::InternalError,
-        BrowserError::TypeNotReady { .. } | BrowserError::NavigateNotReady { .. } => {
-            Outcome::Denied
-        }
+        | BrowserError::NavigationPolicyRejected { .. } => Outcome::InternalError,
+        BrowserError::CommandTimeout { .. }
+        | BrowserError::TypeNotReady { .. }
+        | BrowserError::NavigateNotReady { .. } => Outcome::InvalidRequest,
     }
 }
 /// One journal capability per browser capability, with no collapsing.
@@ -5650,8 +5638,14 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
                 reason_code: JournalReasonCode::ConnectorFailure,
             }
         }
+        crate::browser_session::NavigationDriveError::CommandDeadline {
+            method,
+            command_sent,
+        } => BrowserError::CommandTimeout {
+            step: method,
+            command_sent,
+        },
         crate::browser_session::NavigationDriveError::CdpFailure
-        | crate::browser_session::NavigationDriveError::CommandDeadline { .. }
         | crate::browser_session::NavigationDriveError::CommandFailed { .. } => {
             BrowserError::Internal {
                 reason_code: JournalReasonCode::CdpFailure,

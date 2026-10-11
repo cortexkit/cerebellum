@@ -980,6 +980,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let requested_identity = identity;
         let mut candidates = vec![(identity.clone(), "activation_content_quads")];
         let mut label_geometry = false;
+        let mut text_geometry = false;
         if let Some((epoch, origin, expected)) = revalidation {
             let origin =
                 document_origin(origin).map_err(|_| ClickDriveError::ClassificationChanged)?;
@@ -1010,6 +1011,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 })
                 .ok_or(ClickDriveError::ClassificationChanged)?;
             candidates[0].0.backend_node_id = activated.backend_node_id;
+            text_geometry = nodes
+                .iter()
+                .find(|node| node.backend_node_id == requested_identity.backend_node_id)
+                .is_some_and(|node| node.local_name.starts_with('#'));
             if activated.local_name == "input"
                 && activated.attributes.get("type").is_some_and(|t| {
                     t.eq_ignore_ascii_case("checkbox") || t.eq_ignore_ascii_case("radio")
@@ -1277,7 +1282,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
-        if label_geometry {
+        if label_geometry || text_geometry {
             let (epoch, origin, expected) =
                 revalidation.ok_or(ClickDriveError::ClassificationChanged)?;
             let hit_identity = BackendNodeIdentity {
@@ -1287,8 +1292,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             let hit = self
                 .classify_click_before(context_key, &hit_identity, epoch, origin, deadline, clock)
                 .map_err(ClickDriveError::Navigation)?;
-            // A link or another control inside a label must not inherit the
-            // checkbox's authorization merely because its box contains the hit.
+            // Ancestor geometry can land on an independent link or control.
+            // Containment alone cannot lend it the requested ref's permission.
             if hit
                 .as_ref()
                 .ok()
@@ -1296,7 +1301,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 != expected.map(|record| &record.activation_target_identity)
             {
                 return Err(ClickDriveError::Intercepted(
-                    serde_json::json!({"reason_code":"label_activation_mismatch","hit_backend_node_id":hit_backend_node_id,"hit_inside_target":true,"hit_role":null,"hit_name":null}),
+                    serde_json::json!({"reason_code":if label_geometry {"label_activation_mismatch"} else {"text_ancestor_activation_mismatch"},"hit_backend_node_id":hit_backend_node_id,"hit_inside_target":true,"hit_role":null,"hit_name":null}),
                 ));
             }
         }
@@ -1852,7 +1857,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             },
         )?;
 
-        let snapshot_dom = if classification_context.is_some() || mode == SnapshotKind::Actionable {
+        // A bounded AX prefix must not start another unbounded DOM read on the
+        // same oversized page. Refs remain observable, with explicitly unknown
+        // classification and withheld field values rather than weaker permission.
+        let snapshot_dom = if observation.ax_truncated {
+            Some(Err(ClassificationUnavailable::NotCaptured))
+        } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
             Some(
                 self.flattened_dom_nodes_before(&attachment, deadline, clock)
                     .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
@@ -2581,6 +2591,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 return Ok(response);
             }
             if clock.now() >= deadline {
+                // A read deadline is not a disconnected browser. Retire the
+                // request so a late reply cannot occupy the next call's state.
+                self.transport.abandon_command(command_id);
                 return Err(NavigationDriveError::CommandDeadline {
                     method: method.to_string(),
                     command_sent: true,
@@ -2667,6 +2680,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .transport
                     .take_response(&frame)
                     .map_err(|_| NavigationDriveError::CdpFailure)?;
+                if response.abandoned {
+                    continue;
+                }
                 if Some(response.id) == expected_response_id {
                     matched = Some(response);
                 } else {
@@ -3160,9 +3176,26 @@ fn build_non_type_classification(
         frame_id: &target_identity.frame_id,
         current_origin,
     };
-    let target = context.element(target_index, true);
+    // Text has no independent hit-test surface: Chrome returns an element at
+    // its coordinates. Classify that element (including any link, label or
+    // submit boundary), but retain the original node identity for ref validation.
+    let mut element_index = target_index;
+    let mut seen = HashSet::new();
+    while nodes[element_index].local_name.starts_with('#') {
+        if !seen.insert(element_index) {
+            return Err(ClassificationUnavailable::ComposedParentCycle {
+                node_id: nodes[element_index].node_id,
+            });
+        }
+        element_index = context.composed_parent(element_index).ok_or(
+            ClassificationUnavailable::TargetNotInDocument {
+                backend_node_id: target_identity.backend_node_id,
+            },
+        )?;
+    }
+    let target = context.element(element_index, true);
     let mut input = NonTypeClassificationInput::new(document_epoch, target, current_origin);
-    let mut current = target_index;
+    let mut current = element_index;
     let mut visited = HashSet::from([current]);
     while let Some(parent) = context.composed_parent(current) {
         if !visited.insert(parent) {
@@ -3173,7 +3206,14 @@ fn build_non_type_classification(
         input.composed_ancestors.push(context.element(parent, true));
         current = parent;
     }
-    classification::classify_click(&input).map_err(ClassificationUnavailable::ClassifierRejected)
+    let mut record = classification::classify_click(&input)
+        .map_err(ClassificationUnavailable::ClassifierRejected)?;
+    record.node_identity = context.identity(target_index).identity().map_err(|_| {
+        ClassificationUnavailable::TargetNotInDocument {
+            backend_node_id: target_identity.backend_node_id,
+        }
+    })?;
+    Ok(record)
 }
 
 struct DomClassificationContext<'a> {
@@ -3797,6 +3837,14 @@ where
         if child_ids.is_empty() {
             continue;
         }
+        if child_ids.len() > MAX_AX_NODES {
+            // CDP cannot limit getChildAXNodes to selected child ids. Asking
+            // for a fanout larger than the whole snapshot bound makes Chrome
+            // serialize a huge response even though we would discard most of it.
+            ax_truncated = true;
+            refs_truncated = true;
+            continue;
+        }
         if pending.depth >= max_depth {
             ax_truncated = true;
             refs_truncated = true;
@@ -3824,7 +3872,18 @@ where
             // children first ensures cache pressure can never make a declared edge
             // disappear or turn a complete traversal into a protocol failure.
             node_cache.retain(|node_id, _| selected_ids.contains(node_id));
-            let fetched = fetch_children(&node.node_id, frame_path.last().map(String::as_str))?;
+            let fetched = match fetch_children(&node.node_id, frame_path.last().map(String::as_str))
+            {
+                Ok(fetched) => fetched,
+                Err(NavigationDriveError::CommandDeadline { .. }) => {
+                    // The already observed prefix is usable even when a large
+                    // subtree exceeds the capture budget. Never claim it is complete.
+                    ax_truncated = true;
+                    refs_truncated = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let mut ordered = fetched
                 .iter()
                 .filter(|child| selected_ids.contains(&child.node_id))
@@ -4130,6 +4189,52 @@ mod tests {
             context_key: "route-own".into(),
         });
         driver
+    }
+
+    #[test]
+    fn abandoned_snapshot_reply_leaves_no_pending_handler_or_detached_session() {
+        let mut driver = attached_driver([]);
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(10);
+        let result = driver.command(
+            "Accessibility.getRootAXNode",
+            None,
+            Some("session-own".into()),
+            deadline,
+            None,
+            &mut clock,
+        );
+        assert!(matches!(
+            result,
+            Err(NavigationDriveError::CommandDeadline {
+                command_sent: true,
+                ..
+            })
+        ));
+        assert_eq!(driver.transport.pending_len(), 0);
+        let frames = FakePipe::with_frames([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{}}),
+        ]);
+        driver.pipe.reads = frames.reads;
+        let deadline = clock.now() + Duration::from_millis(10);
+        driver
+            .command(
+                "Accessibility.enable",
+                None,
+                Some("session-own".into()),
+                deadline,
+                None,
+                &mut clock,
+            )
+            .unwrap();
+        assert_eq!(driver.transport.pending_len(), 0);
+        assert!(driver.pending_responses.is_empty());
+        assert!(!driver.transport.is_closed());
+        assert_eq!(
+            driver.attachment.as_ref().unwrap().session_id,
+            "session-own"
+        );
     }
 
     fn event(method: &str, params: Value) -> CdpEvent {
@@ -5282,7 +5387,17 @@ mod tests {
             quad.clone(), json!({}), quad, layout_metrics(0.0, 0.0, 1280.0, 713.0),
             json!({"backendNodeId":44,"frameId":"frame-main"}),
             json!({"node":{"backendNodeId":42,"children":[{"backendNodeId":43,"children":[{"backendNodeId":44}]}]}}),
-            json!({}), github_link_document(), json!({}), json!({}), json!({}), json!({})
+        ]);
+        if backend == 44 {
+            results.extend([json!({}), github_link_document()]);
+        }
+        results.extend([
+            json!({}),
+            github_link_document(),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!({}),
         ]);
         let mut driver = attached_driver(results.into_iter().enumerate().map(
             |(index, result)| json!({"id":index+1,"sessionId":"session-own","result":result}),
