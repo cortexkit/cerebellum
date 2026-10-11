@@ -56,6 +56,8 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
 
 /// Only spawned call tasks await tickets. Dropping the acquire future on cancel
 /// removes a queued position without authorizing or running the browser action.
+/// Report interruption as a route error: browser actions have different frozen
+/// result vocabularies, and not all of them have a cancelled result outcome.
 pub(crate) async fn enter(
     frame: &Frame,
     planes: &Planes,
@@ -75,7 +77,7 @@ pub(crate) async fn enter(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err("cancelled"),
-        _ = drain.wait_for(|draining| *draining) => Err("draining"),
+        _ = drain.wait_for(|draining| *draining) => Err("module_draining"),
         (guard, _) = ticket.acquire() => Ok(Some(guard)),
     }
 }

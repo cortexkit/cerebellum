@@ -56,6 +56,19 @@ async fn replies(rx: &mut mpsc::Receiver<Frame>, count: usize) -> Vec<Frame> {
     replies
 }
 
+async fn cancelled(rx: &mut mpsc::Receiver<Frame>) -> Frame {
+    loop {
+        let frame = consent_frame(rx).await;
+        if frame.header.ty == FrameType::Cancel {
+            continue;
+        }
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(error.code, "cancelled");
+        return frame;
+    }
+}
+
 #[tokio::test]
 async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
     let (planes, launcher) = blocking_grant_fixture().await;
@@ -106,9 +119,8 @@ async fn browser_queue_cancelled_queued_call_never_runs() {
     cancel.header.ty = FrameType::Cancel;
     cancel.body.clear();
     send(&planes, &tx, cancel).await;
-    let cancelled = consent_frame(&mut rx).await;
+    let cancelled = cancelled(&mut rx).await;
     assert_eq!(cancelled.header.corr, 802);
-    assert_eq!(body(&cancelled)["outcome"], "cancelled");
     held(&mut rx).await;
     answer_browser(&planes, &tx, &question, "allow_conversation").await;
     let results = replies(&mut rx, 2).await;
@@ -300,9 +312,8 @@ async fn browser_queue_goodbye_removes_queued_call() {
     goodbye.header.ty = FrameType::Goodbye;
     goodbye.body.clear();
     send(&planes, &tx, goodbye).await;
-    let cancelled = replies(&mut rx, 1).await;
-    assert_eq!(cancelled[0].header.corr, 802);
-    assert_eq!(body(&cancelled[0])["outcome"], "cancelled");
+    let cancelled = cancelled(&mut rx).await;
+    assert_eq!(cancelled.header.corr, 802);
     assert!(!launcher.effects.lock().unwrap().contains(&"screenshot"));
     let mut launch = call(803, "launch", json!({}));
     launch.header.channel = 10;

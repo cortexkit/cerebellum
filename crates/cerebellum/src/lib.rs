@@ -3302,13 +3302,14 @@ async fn handle_management_request(
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
         Err(outcome) => {
-            return send_tool_response(
+            return send_route_error(
                 writer,
                 frame.header.ver,
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                json!({"outcome": outcome, "context": null, "session": null}),
+                outcome,
+                "the queued browser call ended before authorization or execution",
             )
             .await;
         }
@@ -5687,13 +5688,14 @@ async fn handle_tool_request(
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
         Err(outcome) => {
-            return send_tool_response(
+            return send_route_error(
                 writer,
                 frame.header.ver,
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                json!({"outcome": outcome, "context": null, "session": null}),
+                outcome,
+                "the queued browser call ended before authorization or execution",
             )
             .await;
         }
