@@ -8831,7 +8831,7 @@ impl TypePage {
     }
 }
 
-async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) {
+async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>, String) {
     let committed = CommittedPage::default();
     let commands = Arc::new(Mutex::new(Vec::new()));
     let mut planes = Planes::with_browser_config_journaling(
@@ -8867,16 +8867,17 @@ async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<S
     launch_at(&planes, &committed, CLICK_PAGE_ORIGIN).await;
     let snapshot = body(&invoke(&planes, 900, "browser.snapshot", json!({"mode":"ax"})).await);
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    (planes, committed, commands)
+    let reference = first_ref(&snapshot);
+    (planes, committed, commands, reference)
 }
 
-async fn type_wire(planes: &Planes, text: &str, clear_first: bool) -> Value {
+async fn type_wire(planes: &Planes, reference: &str, text: &str, clear_first: bool) -> Value {
     body(
         &invoke(
             planes,
             901,
             "browser_use",
-            json!({"action":"type","ref":"e1","text":text,"clear_first":clear_first}),
+            json!({"action":"type","ref":reference,"text":text,"clear_first":clear_first}),
         )
         .await,
     )
@@ -8886,13 +8887,13 @@ async fn type_wire(planes: &Planes, text: &str, clear_first: bool) -> Value {
 async fn wire_type_plain_field_dispatches_characters() {
     let page = TypePage::default();
     let value = page.value.clone();
-    let (planes, _, commands) = type_fixture(page).await;
+    let (planes, _, commands, reference) = type_fixture(page).await;
     let reply = body(
         &invoke(
             &planes,
             901,
             "browser.type",
-            json!({"ref":"e1","text":"hello 🦀"}),
+            json!({"ref":reference,"text":"hello 🦀"}),
         )
         .await,
     );
@@ -8909,9 +8910,9 @@ async fn wire_type_clear_first_replaces_value() {
     let page = TypePage::default();
     let value = page.value.clone();
     *value.lock().unwrap() = "previous".into();
-    let (planes, _, _) = type_fixture(page).await;
+    let (planes, _, _, reference) = type_fixture(page).await;
     assert_eq!(
-        type_wire(&planes, "replacement", true).await["outcome"],
+        type_wire(&planes, &reference, "replacement", true).await["outcome"],
         "ok"
     );
     assert_eq!(*value.lock().unwrap(), "replacement");
@@ -8932,9 +8933,9 @@ async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
             frame_origin: Some("https://payments.example".into()),
             ..Default::default()
         };
-        let (planes, _, commands) = type_fixture(page).await;
+        let (planes, _, commands, reference) = type_fixture(page).await;
         let before = planes.browser.journal_export_for_test().await;
-        let reply = type_wire(&planes, "secret", false).await;
+        let reply = type_wire(&planes, &reference, "secret", false).await;
         assert_eq!(
             reply["detail"]["reason_code"], "credential_input_unsupported",
             "{reply}"
@@ -8951,12 +8952,12 @@ async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
 
 #[tokio::test]
 async fn wire_type_ungranted_frame_names_its_origin() {
-    let (planes, _, commands) = type_fixture(TypePage {
+    let (planes, _, commands, reference) = type_fixture(TypePage {
         frame_origin: Some("https://ungranted.example".into()),
         ..Default::default()
     })
     .await;
-    let reply = type_wire(&planes, "hello", false).await;
+    let reply = type_wire(&planes, &reference, "hello", false).await;
     assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
     assert!(
         reply.to_string().contains("https://ungranted.example"),
@@ -8971,9 +8972,9 @@ async fn wire_type_ungranted_frame_names_its_origin() {
 
 #[tokio::test]
 async fn wire_type_stale_document_refuses_before_input() {
-    let (planes, page, commands) = type_fixture(TypePage::default()).await;
+    let (planes, page, commands, reference) = type_fixture(TypePage::default()).await;
     page.commit("https://example.com/different-document");
-    let reply = type_wire(&planes, "hello", false).await;
+    let reply = type_wire(&planes, &reference, "hello", false).await;
     assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
     assert!(!commands
         .lock()
@@ -8984,19 +8985,19 @@ async fn wire_type_stale_document_refuses_before_input() {
 
 #[tokio::test]
 async fn wire_type_missing_text_is_refused_by_name() {
-    let (planes, _, _) = type_fixture(TypePage::default()).await;
+    let (planes, _, _, reference) = type_fixture(TypePage::default()).await;
     let reply = body(
         &invoke(
             &planes,
             902,
             "browser_use",
-            json!({"action":"type","ref":"e1"}),
+            json!({"action":"type","ref":reference}),
         )
         .await,
     );
     assert_eq!(reply["outcome"], "invalid_request", "{reply}");
     assert_eq!(reply["detail"]["field"], "text", "{reply}");
-    let granular = body(&invoke(&planes, 904, "browser.type", json!({"ref":"e1"})).await);
+    let granular = body(&invoke(&planes, 904, "browser.type", json!({"ref":reference})).await);
     assert_eq!(granular["detail"]["field"], "text", "{granular}");
 }
 
@@ -9009,7 +9010,7 @@ async fn wire_type_planted_secret_absent_from_all_records() {
     const SECRET: &str = "PLANTED-BROWSER-TYPE-SECRET-7f3c1e";
     let page = TypePage::default();
     let value = page.value.clone();
-    let (mut planes, _, _) = type_fixture(page).await;
+    let (mut planes, _, _, reference) = type_fixture(page).await;
     let storage = with_readable_call_records(&mut planes);
     let (tx, mut rx) = mpsc::channel(8);
     let reply = exchange(
@@ -9020,7 +9021,7 @@ async fn wire_type_planted_secret_absent_from_all_records() {
             9,
             903,
             "browser_use",
-            json!({"action":"type","ref":"e1","text":SECRET}),
+            json!({"action":"type","ref":reference,"text":SECRET}),
             "pf:type-secret",
         ),
     )
@@ -9053,8 +9054,8 @@ async fn wire_type_append_moves_caret_to_end() {
     let page = TypePage::default();
     let value = page.value.clone();
     *value.lock().unwrap() = "existing".into();
-    let (planes, _, _) = type_fixture(page).await;
-    let reply = type_wire(&planes, " suffix", false).await;
+    let (planes, _, _, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, " suffix", false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(*value.lock().unwrap(), "existing suffix");
 }
@@ -9067,8 +9068,8 @@ async fn wire_type_clear_verifies_empty_before_insert() {
     };
     let value = page.value.clone();
     *value.lock().unwrap() = "existing".into();
-    let (planes, _, commands) = type_fixture(page).await;
-    let reply = type_wire(&planes, "replacement", true).await;
+    let (planes, _, commands, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, "replacement", true).await;
     assert_eq!(reply["outcome"], "type_not_ready", "{reply}");
     assert_eq!(*value.lock().unwrap(), "existing");
     assert!(!commands
@@ -9080,12 +9081,12 @@ async fn wire_type_clear_verifies_empty_before_insert() {
 
 #[tokio::test]
 async fn wire_type_focus_failure_is_retryable_not_internal() {
-    let (planes, _, commands) = type_fixture(TypePage {
+    let (planes, _, commands, reference) = type_fixture(TypePage {
         fail_focus: true,
         ..Default::default()
     })
     .await;
-    let reply = type_wire(&planes, "hello", false).await;
+    let reply = type_wire(&planes, &reference, "hello", false).await;
     assert_eq!(reply["outcome"], "type_not_ready", "{reply}");
     assert_eq!(
         reply["detail"]["reason_code"], "type_focus_not_ready",
@@ -9105,8 +9106,8 @@ async fn wire_type_initializes_runtime_before_resolving_cold_target() {
         ..Default::default()
     };
     let value = page.value.clone();
-    let (planes, _, commands) = type_fixture(page).await;
-    let reply = type_wire(&planes, "cold text", false).await;
+    let (planes, _, commands, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, "cold text", false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(*value.lock().unwrap(), "cold text");
     let commands = commands.lock().unwrap();
@@ -9128,8 +9129,8 @@ async fn wire_type_emulates_focus_before_setting_append_caret() {
     assert!(!*page.has_focus.lock().unwrap());
     let value = page.value.clone();
     *value.lock().unwrap() = "existing".into();
-    let (planes, _, _) = type_fixture(page).await;
-    let reply = type_wire(&planes, " suffix", false).await;
+    let (planes, _, _, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, " suffix", false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(*value.lock().unwrap(), "existing suffix");
 }
@@ -9138,9 +9139,15 @@ async fn wire_type_emulates_focus_before_setting_append_caret() {
 async fn wire_type_emulates_focus_once_per_attached_session() {
     let page = TypePage::default();
     let has_focus = page.has_focus.clone();
-    let (planes, _, commands) = type_fixture(page).await;
-    assert_eq!(type_wire(&planes, "first", false).await["outcome"], "ok");
-    assert_eq!(type_wire(&planes, "second", false).await["outcome"], "ok");
+    let (planes, _, commands, reference) = type_fixture(page).await;
+    assert_eq!(
+        type_wire(&planes, &reference, "first", false).await["outcome"],
+        "ok"
+    );
+    assert_eq!(
+        type_wire(&planes, &reference, "second", false).await["outcome"],
+        "ok"
+    );
     assert!(*has_focus.lock().unwrap());
     assert_eq!(
         commands

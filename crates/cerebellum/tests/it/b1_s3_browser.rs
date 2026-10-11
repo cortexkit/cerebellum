@@ -2043,8 +2043,18 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         .expect("the outline reply matches its declared schema");
     assert_eq!(outline["outcome"], "ok", "{outline}");
     let text = outline["state_text"].as_str().unwrap();
+    let article = text
+        .lines()
+        .find(|line| line.contains("article Ada posted"))
+        .expect("the outline names the folded post");
+    let article_ref = article.split_whitespace().next().unwrap();
+    let main_position = text.find(" main").expect("the outline names main content");
+    let article_position = text.find(article).unwrap();
+    let navigation_position = text
+        .find(" navigation Primary")
+        .expect("the outline names navigation");
     assert!(
-        text.find("e41 article Ada posted") < text.find("e2 navigation Primary"),
+        main_position < article_position && article_position < navigation_position,
         "main content is listed before the navigation: {text}"
     );
     assert!(
@@ -2053,12 +2063,17 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
     );
 
     let zoomed = plane
-        .serve(&route, BrowserCapability::Snapshot, &json!({"zoom": "e41"}))
+        .serve(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"zoom": article_ref}),
+        )
         .await
         .expect("the zoom reply matches its declared schema");
+    assert_eq!(zoomed["outcome"], "ok", "{zoomed}");
     let text = zoomed["state_text"].as_str().unwrap();
-    assert!(text.contains(" · zoom e41\n"), "{text}");
-    assert!(text.contains("e42 text the first post text"), "{text}");
+    assert!(text.contains(&format!(" · zoom {article_ref}\n")), "{text}");
+    assert!(text.contains(" text the first post text"), "{text}");
     assert!(!text.contains("Section 1"), "{text}");
     let reference = text
         .lines()
@@ -2082,12 +2097,17 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
 
     // A ref the outline never printed is not usable for a click.
+    assert!(!outline["state_text"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .any(|word| word == reference));
     let unprinted = plane
         .serve(
             &route,
             BrowserCapability::Click,
             &json!({
-                "ref": "e43",
+                "ref": reference,
                 "snapshot_id": outline["snapshot_id"],
                 "intent": "like the post",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2097,7 +2117,7 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         .unwrap();
     assert_eq!(unprinted["outcome"], "ref_not_found", "{unprinted}");
 
-    // A zoom on an element no longer on the page says so and shows the outline.
+    // An unknown ref cannot select a node; the reply says so and shows the outline.
     let missing = plane
         .serve(
             &route,
@@ -2106,20 +2126,75 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         )
         .await
         .unwrap();
+    assert_eq!(missing["outcome"], "ok", "{missing}");
     let text = missing["state_text"].as_str().unwrap();
     assert!(
         text.contains("\nzoom e999: no such element on the page now; showing the outline\n"),
         "{text}"
     );
+    assert!(text.contains("article Ada posted"), "{text}");
+    assert!(text.contains(" navigation Primary"), "{text}");
     let invalid = plane
         .serve(
             &route,
             BrowserCapability::Snapshot,
-            &json!({"zoom": "e41", "mode": "ax"}),
+            &json!({"zoom": article_ref, "mode": "ax"}),
         )
         .await
         .unwrap();
     assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
+}
+
+#[tokio::test]
+async fn zoom_without_backend_identity_names_the_older_snapshot_without_retargeting() {
+    use cerebellum::computer_capability::ResultSchemaEnforcement;
+    let route = identity();
+    let mut observation = snapshot_observation(vec![AxRecord {
+        depth: 0,
+        role: "button".into(),
+        name: "Save profile".into(),
+        value: None,
+        reference: Some("e1".into()),
+    }]);
+    // Production omits refs for AX nodes without DOM backing. A supplied
+    // observation can still lack identity, and its capture ordinal is not proof
+    // that the next snapshot contains the same node.
+    observation.refs[0].backend_identity = None;
+    let plane = plane_with_process(&route, Box::new(SnapshotProcess { observation }), 1_000)
+        .with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+
+    let outline = plane
+        .serve(&route, BrowserCapability::Snapshot, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(outline["outcome"], "ok", "{outline}");
+    let reference = outline["state_text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|line| line.ends_with("button Save profile"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap();
+    let zoomed = plane
+        .serve(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"zoom": reference}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(zoomed["outcome"], "stale_snapshot", "{zoomed}");
+    assert_eq!(
+        zoomed["detail"]["reason_code"], "ref_from_older_snapshot",
+        "{zoomed}"
+    );
+    assert!(zoomed["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("older snapshot without browser node identity"));
+    assert!(zoomed.get("state_text").is_none(), "{zoomed}");
 }
 
 #[tokio::test]
@@ -2284,10 +2359,16 @@ async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply(
     let page = &result["read_page"];
     assert_eq!(page["outcome"], "ok", "{result}");
     // The landing page's text sits at the top of the navigation reply.
+    let text = result["state_text"].as_str().unwrap();
+    let reference = text
+        .lines()
+        .find(|line| line.trim_end().ends_with("button Save profile"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap();
     assert_eq!(
-        result["state_text"].as_str().unwrap(),
+        text,
         format!(
-            "Structured fixture · requested.example/page · snapshot {}\ne2 button Save profile\n",
+            "Structured fixture · requested.example/page · snapshot {}\n{reference} button Save profile\n",
             page["snapshot_id"].as_str().unwrap()
         ),
         "{result}"
@@ -2312,7 +2393,7 @@ async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply(
             &route,
             BrowserCapability::Click,
             &json!({
-                "ref": "e2",
+                "ref": reference,
                 "snapshot_id": snapshot_id,
                 "intent": "use the reference returned by read_page",
                 "severity": {"tier": 2, "credential": false, "financial": false}

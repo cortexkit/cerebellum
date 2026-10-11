@@ -70,8 +70,8 @@ struct CachedName {
 pub(super) struct ShownRef {
     pub record: RefRecord,
     pub snapshot_id: String,
-    epoch: u64,
-    document: Option<CommittedDocument>,
+    pub(super) epoch: u64,
+    pub(super) document: Option<CommittedDocument>,
 }
 
 impl StableRefs {

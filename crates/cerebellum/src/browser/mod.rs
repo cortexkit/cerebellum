@@ -328,6 +328,11 @@ impl BrowserError {
                 "poll browser.status until the session is ready, then retry the browser action"
             }
             Self::HumanInControl { .. } => "browser.resume",
+            Self::StaleSnapshot {
+                reason_code: "ref_from_older_snapshot",
+            } => {
+                "this ref came from an older snapshot without browser node identity; omit zoom to read the current outline"
+            }
             Self::StaleSnapshot { .. } => {
                 "call browser.snapshot again and use only its new snapshot_id and refs"
             }
@@ -1263,20 +1268,39 @@ impl ContextState {
 }
 
 /// A zoom must prove that the previously printed ref still names the same
-/// browser node in the same document. A number alone is never a fallback.
+/// browser node in the same document. Unknown or removed nodes show the outline;
+/// missing identity evidence refuses rather than selecting by capture position.
 fn zoom_target(
     context: &ContextState,
     requested: &str,
     refs: &[crate::snapshot_store::RefRecord],
     document: Option<&CommittedDocument>,
-) -> Option<String> {
-    refs.iter()
+) -> Result<Option<String>, BrowserError> {
+    let Some(shown) = context.refs.shown(requested) else {
+        return Ok(None);
+    };
+    if shown.epoch != context.epoch.value()
+        || matches!((&shown.document, document), (Some(old), Some(live)) if old.loader_id != live.loader_id)
+    {
+        return Err(BrowserError::StaleSnapshot {
+            reason_code: "document_or_target_changed",
+        });
+    }
+    if shown.record.backend_identity.is_none() {
+        // Capture positions and role/name pairs can belong to replacement nodes.
+        // Without a browser identity, an older snapshot cannot prove this ref.
+        return Err(BrowserError::StaleSnapshot {
+            reason_code: "ref_from_older_snapshot",
+        });
+    }
+    Ok(refs
+        .iter()
         .find(|fresh| {
             context
                 .refs
                 .resolves(requested, fresh, context.epoch.value(), document)
         })
-        .map(|fresh| fresh.captured.reference.clone())
+        .map(|fresh| fresh.captured.reference.clone()))
 }
 
 #[derive(Debug, Default)]
@@ -2990,14 +3014,12 @@ impl BrowserPlane {
             });
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
-                let target = zoom.and_then(|requested| {
-                    zoom_target(context, requested, &refs, source_document.as_ref())
-                });
-                if zoom.is_some() && target.is_none() {
-                    return Err(BrowserError::StaleSnapshot {
-                        reason_code: "document_or_target_changed",
-                    });
-                }
+                let target = match zoom {
+                    Some(requested) => {
+                        zoom_target(context, requested, &refs, source_document.as_ref())?
+                    }
+                    None => None,
+                };
                 let rendered = state_text::render(&state_text::RenderInput {
                     records: &records,
                     facts: &facts,
@@ -5800,23 +5822,45 @@ mod tests {
         let mut recached = fresh.clone();
         recached[2].captured.reference = "e99999".into();
         assert_eq!(
-            zoom_target(&context, &requested, &recached, Some(&doc)),
+            zoom_target(&context, &requested, &recached, Some(&doc)).unwrap(),
             Some("e99999".into())
         );
         assert_eq!(
-            zoom_target(&context, &requested, &fresh, Some(&doc)),
+            zoom_target(&context, &requested, &fresh, Some(&doc)).unwrap(),
             Some(requested.clone())
         );
         assert_eq!(
-            zoom_target(&context, &requested, &fresh[..2], Some(&doc)),
+            zoom_target(&context, &requested, &fresh[..2], Some(&doc)).unwrap(),
             None
         );
         // Even a corrupted fresh capture must not resolve by number alone.
         fresh[0].captured.reference = requested.clone();
         assert_eq!(
-            zoom_target(&context, &requested, &fresh[..1], Some(&doc)),
+            zoom_target(&context, &requested, &fresh[..1], Some(&doc)).unwrap(),
             None
         );
+        assert_eq!(
+            zoom_target(&context, "e999", &fresh, Some(&doc)).unwrap(),
+            None
+        );
+        let changed = CommittedDocument::new("https://example.com/", 2, "new-loader");
+        assert!(matches!(
+            zoom_target(&context, &requested, &fresh, Some(&changed)),
+            Err(BrowserError::StaleSnapshot {
+                reason_code: "document_or_target_changed"
+            })
+        ));
+        let mut identityless = initial.clone();
+        identityless[0].backend_identity = None;
+        context
+            .refs
+            .remember(&identityless, "previous", 0, Some(&doc));
+        assert!(matches!(
+            zoom_target(&context, &requested, &fresh, Some(&doc)),
+            Err(BrowserError::StaleSnapshot {
+                reason_code: "ref_from_older_snapshot"
+            })
+        ));
     }
 
     /// `max_bytes` bounds the page text in every mode, the reply's copy of a
