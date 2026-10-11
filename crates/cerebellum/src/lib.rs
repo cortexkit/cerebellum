@@ -7383,33 +7383,50 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn withheld_actions_are_refused_by_the_adapter_too() {
-        let request = json!({
-            "name": flat_tools::COMPUTER_USE,
-            "arguments": {
-                "action": "keys",
-                "keys": ["s"],
-                "target": "com.example.Editor"
+        let keys_frame = || {
+            let request = json!({
+                "name": flat_tools::COMPUTER_USE,
+                "arguments": {
+                    "action": "keys",
+                    "keys": ["s"],
+                    "target": "com.example.Editor"
+                }
+            });
+            Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap()
+        };
+        let refusal = |admitted: &'static [&'static str]| {
+            let frame = keys_frame();
+            async move {
+                let (tx, mut rx) = mpsc::channel(1);
+                let health = Arc::new(HealthState::new());
+                handle_tool_request_for_test_admitting(frame, &tx, &health, admitted)
+                    .await
+                    .unwrap();
+                let reply = rx.recv().await.expect("one refusal");
+                assert_eq!(reply.header.ty, FrameType::Error);
+                serde_json::from_slice::<ErrorBody>(&reply.body)
+                    .unwrap()
+                    .code
             }
-        });
-        let frame = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            99,
-            serde_json::to_vec(&request).unwrap(),
-        )
-        .unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
-        let health = Arc::new(HealthState::new());
-        handle_tool_request_for_test_admitting(frame, &tx, &health, &[])
-            .await
-            .unwrap();
-        let reply = rx.recv().await.expect("one refusal");
-        assert_eq!(reply.header.ty, FrameType::Error);
-        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(error.code, "capability_not_admitted");
+        };
+        // With some computer action admitted the tool is served, so the one
+        // withheld action is refused by name at the adapter.
+        assert_eq!(
+            refusal(&["computer.read_state"]).await,
+            "capability_not_admitted"
+        );
+        // With nothing admitted the catalog omits computer_use entirely, and
+        // tool-provider/v1 refuses a call to an omitted tool as disabled.
+        assert_eq!(refusal(&[]).await, "tool_disabled");
     }
 
     #[cfg(target_os = "macos")]
