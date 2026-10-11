@@ -10,7 +10,7 @@ fn navigation() -> Frame {
     call(
         801,
         "navigate",
-        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
     )
 }
 
@@ -72,8 +72,8 @@ async fn cancelled(rx: &mut mpsc::Receiver<Frame>) -> Frame {
 #[tokio::test]
 async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    grant_browser(&planes, "https://landed.example", vec![]).await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    grant_browser(&planes, "https://landed.example:8443", vec![]).await;
     // A click sent before the new snapshot returns can only name the old
     // snapshot. After navigation it must refuse that ref, never click the old page.
     let old = invoke_existing(&planes, 800, "browser.snapshot", json!({})).await;
@@ -99,7 +99,7 @@ async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
     let snapshot = body(&results[1]);
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     assert_eq!(
-        snapshot["source_origin"], "https://landed.example/final",
+        snapshot["source_origin"], "https://landed.example:8443/final",
         "{snapshot}"
     );
     let click = body(&results[2]);
@@ -110,7 +110,7 @@ async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
 #[tokio::test]
 async fn browser_queue_cancelled_queued_call_never_runs() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://landed.example", vec![]).await;
+    grant_browser(&planes, "https://landed.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     let question = begin(&planes, &tx, &mut rx).await;
     send(&planes, &tx, call(802, "screenshot", json!({}))).await;
@@ -135,7 +135,7 @@ async fn browser_queue_cancelled_queued_call_never_runs() {
 #[tokio::test]
 async fn browser_queue_cancelled_head_releases_successor() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     begin(&planes, &tx, &mut rx).await;
     send(&planes, &tx, call(802, "snapshot", json!({}))).await;
@@ -157,7 +157,7 @@ async fn browser_queue_cancelled_head_releases_successor() {
 #[tokio::test]
 async fn browser_queue_refused_head_releases_successor() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     let question = begin(&planes, &tx, &mut rx).await;
     send(&planes, &tx, call(802, "snapshot", json!({}))).await;
@@ -247,7 +247,7 @@ async fn browser_queue_another_conversation_launches_while_held() {
 #[tokio::test]
 async fn browser_queue_frame_reader_serves_other_route() {
     let (planes, _) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     bind(&planes, &tx, &mut rx, 10, "other-conversation").await;
     let question = begin(&planes, &tx, &mut rx).await;
@@ -276,7 +276,7 @@ fn positioned(mut frame: Frame, index: u32) -> Frame {
 #[tokio::test]
 async fn browser_queue_model_order_beats_reversed_arrival() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    grant_browser(&planes, "https://landed.example", vec![]).await;
+    grant_browser(&planes, "https://landed.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     send(
         &planes,

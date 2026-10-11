@@ -1812,16 +1812,10 @@ async fn navigation_without_an_open_session_is_refused_at_the_wire() {
     let response = rx.recv().await.expect("a response frame");
     let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
-    // Authorization is answered BEFORE session state, so this is what a caller
-    // without a grant receives regardless of whether a session exists. That
-    // order is deliberate and predates this test: telling an unauthorized
-    // caller whether a browser session is open answers a question they have no
-    // standing to ask.
-    //
-    // The no_session refusal itself is asserted in b1_s3_browser.rs, where a
-    // grant can be installed so the request reaches the session check.
-    assert_eq!(body["outcome"], "authorization_denied", "{body}");
-    assert_eq!(body["detail"]["reason"], "no_grant", "{body}");
+    // Public observation is authorized by the baseline even without a stored
+    // grant, so this request must reach the ready-session check.
+    assert_eq!(body["outcome"], "no_session", "{body}");
+    assert_eq!(body["detail"]["reason_code"], "no_session", "{body}");
     assert!(body.get("url_final").is_none(), "{body}");
 }
 

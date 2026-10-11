@@ -104,7 +104,14 @@ fn identity_entry(
     material: EntryMaterial,
 ) -> JournalEntry {
     JournalEntry {
-        format_version: FORMAT_VERSION.to_string(),
+        format_version: if material.grant_decision.reason.as_deref()
+            == Some(crate::authorization::PUBLIC_WEB_BASELINE)
+        {
+            super::BASELINE_FORMAT_VERSION
+        } else {
+            FORMAT_VERSION
+        }
+        .to_string(),
         sequence,
         phase,
         identity: identity.clone(),

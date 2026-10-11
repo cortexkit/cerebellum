@@ -9,11 +9,12 @@
 //! standing grant store.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerebellum::authorization::HazardClass;
-use cerebellum::browser::navigation::BrowserScreenshotObservation;
+use cerebellum::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
 use cerebellum::browser::Tracker;
 use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
 use cerebellum::browser_session::{
@@ -31,7 +32,10 @@ use cerebellum::classification::{
     NonTypeClassificationInput, NonTypeClassificationRecord, TargetKind,
 };
 use cerebellum::coordinate::{TransformInputs, ViewportObservation};
-use cerebellum::snapshot_store::CommittedDocument;
+use cerebellum::snapshot_store::{
+    AxRecord, BackendNodeIdentity, CommittedDocument, FrameDocument, RefRecord, SnapshotKind,
+    SnapshotRef,
+};
 use cerebellum::{BrowserConfig, JournalPersistence, Planes};
 use cerebellum_core::health::HealthState;
 use serde_json::{json, Value};
@@ -77,6 +81,9 @@ struct Browser {
     redirects: Arc<Mutex<BTreeMap<String, String>>>,
     /// Every navigation and click that reached the browser.
     effects: Arc<Mutex<Vec<String>>>,
+    login_step: Arc<AtomicUsize>,
+    frames: Arc<Mutex<Vec<FrameDocument>>>,
+    readable_frames: Arc<Mutex<Vec<FrameDocument>>>,
 }
 
 impl Browser {
@@ -124,6 +131,221 @@ impl BrowserSessionLauncher for Browser {
 struct Process(Browser);
 
 impl OwnedBrowserProcess for Process {
+    fn frame_documents(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<Vec<FrameDocument>, NavigationDriveError> {
+        Ok(self.0.frames.lock().unwrap().clone())
+    }
+
+    fn set_read_frames(&mut self, frames: Vec<FrameDocument>) -> Result<(), NavigationDriveError> {
+        *self.0.readable_frames.lock().unwrap() = frames;
+        Ok(())
+    }
+    fn snapshot_classified(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        epoch: u64,
+        origin: &str,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let origin = canonical_origin_from_url(origin).unwrap();
+        let targets = [
+            (
+                "Button",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 42),
+                    TargetKind::Button,
+                )
+                .input_type("button"),
+            ),
+            (
+                "Link",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 43),
+                    TargetKind::Anchor,
+                )
+                .destination("https://other.example/page"),
+            ),
+            (
+                "Text",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 44),
+                    TargetKind::Input,
+                )
+                .input_type("text"),
+            ),
+            (
+                "Submit",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 45),
+                    TargetKind::Button,
+                )
+                .form_owner(NodeIdentityInput::new("target", "frame-main", 7)),
+            ),
+            (
+                "Password",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 46),
+                    TargetKind::Input,
+                )
+                .input_type("password")
+                .password(true),
+            ),
+            (
+                "Payment",
+                ElementClassificationInput::new(
+                    NodeIdentityInput::new("target", "frame-main", 47),
+                    TargetKind::Input,
+                )
+                .input_type("text")
+                .autocomplete(["cc-number"]),
+            ),
+        ];
+        let mut observation = BrowserSnapshotObservation {
+            records: vec![],
+            dom_text: Some("<main>Public page</main>".into()),
+            refs: vec![],
+            ax_truncated: false,
+            refs_truncated: false,
+            facts: Default::default(),
+        };
+        for (index, (name, target)) in targets.into_iter().enumerate() {
+            let reference = format!("e{}", index + 1);
+            let classification =
+                classify_click(&NonTypeClassificationInput::new(epoch, target, &origin)).unwrap();
+            observation.records.push(AxRecord {
+                depth: 0,
+                role: "button".into(),
+                name: name.into(),
+                value: None,
+                reference: Some(reference.clone()),
+            });
+            observation.refs.push(RefRecord {
+                frame_document: None,
+                captured: SnapshotRef::new(&reference, "button", name, 0).unwrap(),
+                frame_path: vec!["frame-main".into()],
+                backend_identity: Some(
+                    BackendNodeIdentity::new("target", "frame-main", 42 + index as u64).unwrap(),
+                ),
+                raw_role: Some("button".into()),
+                raw_name: Some(name.into()),
+                classification: Ok(Box::new(classification)),
+            });
+        }
+        for frame in self
+            .0
+            .readable_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.parent_id.is_some())
+        {
+            let name = match frame.frame_id.as_str() {
+                "frame-private" => "Local admin secret",
+                "frame-nested" => "Nested public child",
+                _ => "Public embedded text",
+            };
+            let reference = format!("e{}", observation.refs.len() + 1);
+            let backend = match frame.frame_id.as_str() {
+                "frame-private" => 142,
+                "frame-nested" => 143,
+                _ => 144,
+            };
+            let target = ElementClassificationInput::new(
+                NodeIdentityInput::new("target", &frame.frame_id, backend),
+                TargetKind::Button,
+            )
+            .input_type("button");
+            let record = classify_click(&NonTypeClassificationInput::new(
+                epoch,
+                target,
+                &frame.origin,
+            ))
+            .unwrap();
+            observation.records.push(AxRecord {
+                depth: 0,
+                role: "button".into(),
+                name: name.into(),
+                value: None,
+                reference: Some(reference.clone()),
+            });
+            observation.refs.push(RefRecord {
+                frame_document: Some(frame.clone()),
+                captured: SnapshotRef::new(&reference, "button", name, 0).unwrap(),
+                frame_path: vec!["frame-main".into(), frame.frame_id.clone()],
+                backend_identity: Some(
+                    BackendNodeIdentity::new("target", &frame.frame_id, backend).unwrap(),
+                ),
+                raw_role: Some("button".into()),
+                raw_name: Some(name.into()),
+                classification: Ok(Box::new(record)),
+            });
+            observation
+                .dom_text
+                .as_mut()
+                .unwrap()
+                .push_str(&format!("<div>{name}</div>"));
+        }
+        Ok(observation)
+    }
+
+    fn click_classified(
+        &mut self,
+        _: &str,
+        _: &BackendNodeIdentity,
+        _: u64,
+        _: &str,
+        _: Option<&NonTypeClassificationRecord>,
+        _: u64,
+        input: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.0.effects.lock().unwrap().push("click".into());
+        let position = BrowserClickPosition {
+            x_css: 1.0,
+            y_css: 1.0,
+        };
+        input(BrowserInputEvent::Press(position));
+        input(BrowserInputEvent::Release(position));
+        Ok(BrowserClickOutcome::Clicked {
+            position,
+            navigation: ClickNavigation::NoneObserved { window_ms: 100 },
+        })
+    }
+
+    fn type_classified(
+        &mut self,
+        _: &str,
+        _: &cerebellum::browser_type::TypeDispatch,
+        _: &str,
+        _: bool,
+        _: u64,
+    ) -> Result<cerebellum::browser_type::BrowserTypeResult, NavigationDriveError> {
+        self.0.effects.lock().unwrap().push("type".into());
+        Ok(cerebellum::browser_type::BrowserTypeResult::Ok)
+    }
+
+    fn present(&mut self, _: &str, _: u64) -> Result<(), NavigationDriveError> {
+        self.0.login_step.store(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn cookie_names_for_origin(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: u64,
+    ) -> Result<std::collections::BTreeSet<String>, NavigationDriveError> {
+        Ok(if self.0.login_step.load(Ordering::SeqCst) >= 2 {
+            ["session".to_string()].into()
+        } else {
+            Default::default()
+        })
+    }
+    fn has_credential_field(&mut self, _: &str, _: u64) -> Result<bool, NavigationDriveError> {
+        Ok(self.0.login_step.swap(2, Ordering::SeqCst) == 1)
+    }
     fn committed_document(
         &mut self,
         _: &str,
@@ -288,6 +510,7 @@ struct Fixture {
     store: Arc<StandingBrowserGrants>,
     clock: ManualWallClock,
     next_channel: u16,
+    signed_in: Arc<cerebellum::browser_signed_in::SignedInDomains>,
 }
 
 impl Fixture {
@@ -298,12 +521,23 @@ impl Fixture {
     }
 
     fn with_store(store: Arc<StandingBrowserGrants>, clock: ManualWallClock) -> Self {
+        Self::with_login_store(store, clock, None)
+    }
+
+    fn with_login_store(
+        store: Arc<StandingBrowserGrants>,
+        clock: ManualWallClock,
+        signed_in: Option<Arc<cerebellum::browser_signed_in::SignedInDomains>>,
+    ) -> Self {
+        let signed_in = signed_in
+            .unwrap_or_else(|| Arc::new(cerebellum::browser_signed_in::SignedInDomains::default()));
         let browser = Browser::default();
-        let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
+        let mut planes = Planes::with_browser_state(
             Arc::new(HealthState::new()),
             Some(config()),
             JournalPersistence::Isolated,
             Some(Arc::clone(&store)),
+            Some(Arc::clone(&signed_in)),
         );
         planes.launch_service = Some(Arc::new(browser.clone()));
         Self {
@@ -312,6 +546,7 @@ impl Fixture {
             store,
             clock,
             next_channel: 20,
+            signed_in,
         }
     }
 
@@ -352,6 +587,11 @@ impl Fixture {
         if let Some(agent) = session.agent {
             facts["agentProjectId"] = json!(agent);
         }
+        let identity = cerebellum_core::identity::RouteIdentity::from_accepted_bind(
+            &BindIdentity::new("/test/project", "test", session.conversation.to_string()),
+            &cerebellum::session_caller_principal_for_test(),
+            Some(&facts),
+        );
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
             route_channel: channel,
@@ -395,7 +635,25 @@ impl Fixture {
         let route = Route {
             channel,
             next_corr: Arc::new(Mutex::new(100)),
+            identity,
         };
+        if let Some(agent) = session.agent.filter(|_| !management) {
+            let profile = if session.kind == "primary" {
+                "default".to_string()
+            } else {
+                format!("disposable:{}", session.conversation)
+            };
+            if !self.signed_in.contains_profile(agent, &profile) {
+                self.signed_in
+                    .initialize_profile(
+                        agent,
+                        &profile,
+                        &format!("fixture-{agent}-{profile}"),
+                        true,
+                    )
+                    .unwrap();
+            }
+        }
         // A browser session is launched only for an attested agent; an
         // unattested route is refused at launch, so it is left without one.
         if !management && session.agent.is_some() {
@@ -474,8 +732,10 @@ impl Fixture {
             .expect("the request completes")
     }
 
+    // Declare reversible-change severity (tier 3), above the public-browsing
+    // ceiling, so these probes must use an explicit site grant.
     async fn navigate(&self, route: &Route, url: &str) -> Value {
-        self.call(route, "browser.navigate", navigation(url, 2))
+        self.call(route, "browser.navigate", navigation(url, 3))
             .await
     }
 }
@@ -509,6 +769,7 @@ impl<'a> Session<'a> {
 struct Route {
     channel: u16,
     next_corr: Arc<Mutex<u64>>,
+    identity: cerebellum_core::identity::RouteIdentity,
 }
 
 fn navigation(url: &str, tier: u8) -> Value {
@@ -577,7 +838,7 @@ async fn each_answered_option_mints_exactly_its_row() {
             .call_answering(
                 &route,
                 "browser.navigate",
-                navigation(&format!("{PUBLIC}/"), 2),
+                navigation(&format!("{PUBLIC}/"), 3),
                 json!({"decision": id, "elicitation_id": consent_ref}),
                 |question| offered.push(option_ids(question)),
             )
@@ -615,7 +876,7 @@ async fn each_answered_option_mints_exactly_its_row() {
                 assert_eq!(rows.len(), 1, "{id}: {rows:?}");
                 let row = &rows[0];
                 assert_eq!(row.agent_id, AGENT);
-                assert_eq!(row.max_level, 2, "{id}");
+                assert_eq!(row.max_level, 3, "{id}");
                 assert!(row.hazards.is_empty(), "{id}");
                 assert_eq!(row.consent_ref, consent_ref);
                 assert_eq!(row.granted_at_ms, now);
@@ -655,7 +916,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
             "primary, public, ordinary",
             Session::primary("c-full", AGENT).asking(),
             "https://news.example/",
-            2,
+            3,
             ALL_OPTIONS.to_vec(),
         ),
         (
@@ -669,14 +930,14 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
             "private address",
             Session::primary("c-private", AGENT).asking(),
             "http://10.0.0.5/",
-            2,
+            3,
             no_all_sites.clone(),
         ),
         (
             "loopback",
             Session::primary("c-loopback", AGENT).asking(),
             "http://127.0.0.1:8080/",
-            2,
+            3,
             no_all_sites,
         ),
         (
@@ -686,7 +947,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
                 ..Session::primary("c-worker", AGENT).asking()
             },
             "https://news.example/",
-            2,
+            3,
             conversation_only.clone(),
         ),
     ];
@@ -766,7 +1027,7 @@ async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other()
         .call_answering(
             &first,
             "browser.navigate",
-            navigation(&format!("{PUBLIC}/"), 2),
+            navigation(&format!("{PUBLIC}/"), 3),
             json!({"decision": "allow_origin_always", "elicitation_id": "el_origin"}),
             |_| {},
         )
@@ -799,15 +1060,20 @@ async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other()
 #[tokio::test]
 async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 2, &[]);
+    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
     let route = fixture.route(Session::primary("c-all", AGENT)).await;
-    for public in ["https://news.example/", "https://shop.example:8443/item"] {
+    for public in ["https://news.example/", "https://shop.example/item"] {
         assert_authorized(&fixture.navigate(&route, public).await, public);
     }
     // A read commits its decision, which re-checks the standing row.
     let captured = fixture.call(&route, "browser.screenshot", json!({})).await;
     assert_eq!(captured["outcome"], "ok", "{captured}");
     for local in [
+        "https://shop.example:8443/item",
+        "https://1.1.1.1/",
+        "http://1.1.1.1/",
+        "https://office.local/",
+        "https://office.internal/",
         "http://127.0.0.1:8080/",
         "http://10.0.0.5/",
         "http://192.168.1.1/",
@@ -815,6 +1081,18 @@ async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     ] {
         assert_refused(&fixture.navigate(&route, local).await, local);
     }
+    fixture.seed(
+        AGENT,
+        StandingSubject::Origin("https://shop.example:8443".into()),
+        3,
+        &[],
+    );
+    assert_authorized(
+        &fixture
+            .navigate(&route, "https://shop.example:8443/item")
+            .await,
+        "an exact service-port grant",
+    );
 }
 
 fn assert_hazard_refused(reply: &Value, what: &str) {
@@ -933,7 +1211,7 @@ async fn the_ten_minute_all_sites_row_expires() {
         .call_answering(
             &asking,
             "browser.navigate",
-            navigation(&format!("{PUBLIC}/"), 2),
+            navigation(&format!("{PUBLIC}/"), 3),
             json!({"decision": "allow_all_sites_10m", "elicitation_id": "el_short"}),
             |_| {},
         )
@@ -1034,15 +1312,15 @@ async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
 #[tokio::test]
 async fn revoke_access_removes_the_calling_agents_rows_only() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 2, &[]);
+    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
     fixture.seed(
         AGENT,
         StandingSubject::Origin("https://docs.example".into()),
-        2,
+        3,
         &[],
     );
-    fixture.seed(AGENT, StandingSubject::AllSites, 2, &[]);
-    fixture.seed(OTHER_AGENT, StandingSubject::Origin(PUBLIC.into()), 2, &[]);
+    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(OTHER_AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
     let route = fixture.route(Session::primary("c-revoke", AGENT)).await;
 
     let one = fixture
@@ -1102,7 +1380,7 @@ async fn revoke_access_removes_the_calling_agents_rows_only() {
 #[tokio::test]
 async fn the_operator_lists_and_revokes_an_agents_standing_access() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 2, &[]);
+    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
     fixture.seed(
         AGENT,
         StandingSubject::Origin("https://docs.example".into()),
@@ -1110,7 +1388,7 @@ async fn the_operator_lists_and_revokes_an_agents_standing_access() {
         &[HazardClass::CredentialFormSubmit],
     );
     fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
-    fixture.seed(OTHER_AGENT, StandingSubject::AllSites, 2, &[]);
+    fixture.seed(OTHER_AGENT, StandingSubject::AllSites, 3, &[]);
     let desk = fixture.management_route().await;
 
     let listed = fixture
@@ -1210,7 +1488,7 @@ async fn replacing_an_origin_row_keeps_the_old_consent_as_revoked_history() {
     let store = store_over(storage, &clock);
     let subject = StandingSubject::Origin(PUBLIC.into());
     store
-        .record(AGENT, subject.clone(), 2, vec![], None, "el_first")
+        .record(AGENT, subject.clone(), 3, vec![], None, "el_first")
         .unwrap();
     clock.advance_ms(18_000);
     store
@@ -1255,7 +1533,7 @@ async fn a_standing_row_survives_a_module_restart() {
             .call_answering(
                 &route,
                 "browser.navigate",
-                navigation(&format!("{PUBLIC}/"), 2),
+                navigation(&format!("{PUBLIC}/"), 3),
                 json!({"decision": "allow_origin_always", "elicitation_id": "el_restart"}),
                 |_| {},
             )
@@ -1282,7 +1560,7 @@ async fn a_row_bound_to_another_machine_grants_nothing() {
         .record(
             AGENT,
             StandingSubject::AllSites,
-            2,
+            3,
             Vec::new(),
             None,
             "el_elsewhere",
@@ -1319,7 +1597,7 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
         .call_answering(
             &route,
             "browser.navigate",
-            navigation(&format!("{PUBLIC}/"), 2),
+            navigation(&format!("{PUBLIC}/"), 3),
             json!({"decision": "deny"}),
             |question| offered.push(option_ids(question)),
         )
@@ -1345,7 +1623,7 @@ async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
         .call_answering(
             &route,
             "browser.navigate",
-            navigation("https://manager.eu.ovhcloud.com/", 2),
+            navigation("https://manager.eu.ovhcloud.com/", 3),
             json!({"decision": "allow_origin_always", "elicitation_id":"el_domain"}),
             |question| {
                 assert!(question
@@ -1363,7 +1641,7 @@ async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
         .call(
             &route,
             "browser.navigate",
-            navigation("https://auth.eu.ovhcloud.com/", 2),
+            navigation("https://auth.eu.ovhcloud.com/", 3),
         )
         .await;
     assert_authorized(&reply, "sibling");
@@ -1384,7 +1662,7 @@ async fn suffix_localhost_and_ip_cards_remain_host_only() {
             .call_answering(
                 &route,
                 "browser.navigate",
-                navigation(&format!("{origin}/"), 2),
+                navigation(&format!("{origin}/"), 3),
                 json!({"decision":"deny"}),
                 |question| {
                     let text = question.to_string();
@@ -1402,7 +1680,7 @@ async fn domain_rows_never_cover_http() {
     fixture.seed(
         AGENT,
         StandingSubject::Domain("ovhcloud.com".into()),
-        2,
+        3,
         &[],
     );
     let route = fixture.route(Session::primary("c-http", AGENT)).await;
@@ -1410,7 +1688,7 @@ async fn domain_rows_never_cover_http() {
         .call(
             &route,
             "browser.navigate",
-            navigation("http://auth.ovhcloud.com/", 2),
+            navigation("http://auth.ovhcloud.com/", 3),
         )
         .await;
     assert_refused(&reply, "http");
@@ -1422,7 +1700,7 @@ async fn domain_rows_never_cover_sibling_domains() {
     fixture.seed(
         AGENT,
         StandingSubject::Domain("ovhcloud.com".into()),
-        2,
+        3,
         &[],
     );
     let route = fixture.route(Session::primary("c-sibling", AGENT)).await;
@@ -1430,7 +1708,7 @@ async fn domain_rows_never_cover_sibling_domains() {
         .call(
             &route,
             "browser.navigate",
-            navigation("https://notovhcloud.com/", 2),
+            navigation("https://notovhcloud.com/", 3),
         )
         .await;
     assert_refused(&reply, "sibling domain");
@@ -1464,7 +1742,7 @@ async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
     fixture.seed(
         AGENT,
         StandingSubject::Domain("ovhcloud.com".into()),
-        2,
+        3,
         &[],
     );
     let route = fixture.route(Session::primary("c-withdraw", AGENT)).await;
@@ -1476,4 +1754,511 @@ async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
         )
         .await;
     assert_eq!(revoked["revoked"], 1, "{revoked}");
+}
+
+// ---------------------------------------------------------------------------
+// Public browsing without stored grants
+// ---------------------------------------------------------------------------
+
+fn named_ref(snapshot: &Value, name: &str) -> String {
+    snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|row| row["name"] == name)
+        .unwrap()["ref"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn public_snapshot(fixture: &Fixture, route: &Route, origin: &str) -> Value {
+    let navigated = fixture
+        .call(
+            route,
+            "browser.navigate",
+            navigation(&format!("{origin}/"), 1),
+        )
+        .await;
+    assert_authorized(&navigated, "baseline navigation");
+    let snapshot = fixture
+        .call(route, "browser.snapshot", json!({"mode":"ax"}))
+        .await;
+    assert_authorized(&snapshot, "baseline snapshot");
+    snapshot
+}
+
+async fn observed_fixture_login(
+    fixture: &Fixture,
+    route: &Route,
+    conversation: &str,
+    origin: &str,
+) {
+    let presented = fixture
+        .call(
+            route,
+            "browser_use",
+            json!({"action":"present","origin":origin}),
+        )
+        .await;
+    assert_eq!(presented["outcome"], "presented", "{presented}");
+    use cerebellum::browser_session::{HandoffOutcome, HandoffPollResult};
+    let sessions = &fixture.planes.sessions;
+    assert!(matches!(
+        sessions.poll_handoff(conversation, 1, 100, fixture.planes.lease_clock.as_ref()),
+        HandoffPollResult::Open
+    ));
+    let closed = sessions.poll_handoff(conversation, 1, 100, fixture.planes.lease_clock.as_ref());
+    assert!(
+        matches!(closed, HandoffPollResult::Closed(ref close) if close.outcome == HandoffOutcome::LoginObserved),
+        "{closed:?}"
+    );
+    if let HandoffPollResult::Closed(close) = &closed {
+        fixture
+            .planes
+            .browser
+            .journal_handoff_closed(&route.identity, close)
+            .await
+            .unwrap();
+    }
+    let resumed = fixture
+        .call(route, "browser_use", json!({"action":"resume"}))
+        .await;
+    assert_eq!(resumed["handoff"], "login_observed", "{resumed}");
+}
+
+#[tokio::test]
+async fn baseline_public_reads_and_ordinary_clicks_need_no_card() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-reads", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
+    assert_authorized(
+        &fixture.call(&route, "browser.screenshot", json!({})).await,
+        "baseline screenshot",
+    );
+    for name in ["Button", "Link"] {
+        let clicked = fixture.call(&route, "browser.click", json!({"ref":named_ref(&snapshot, name),"snapshot_id":snapshot["snapshot_id"],"intent":"follow an ordinary control","severity":{"tier":2,"credential":false,"financial":false}})).await;
+        assert_authorized(&clicked, name);
+    }
+    assert_eq!(fixture.planes.management.browser_grant_count().await, 0);
+    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert_eq!(
+        fixture
+            .browser
+            .effects()
+            .iter()
+            .filter(|effect| effect.as_str() == "click")
+            .count(),
+        2
+    );
+    let export = fixture.planes.browser.journal_export_for_test().await;
+    let rows: Vec<Value> = export
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row.get("grant_decision").is_some())
+        .collect();
+    assert_eq!(rows.len(), 5, "{export}");
+    for row in rows {
+        assert_eq!(
+            row["grant_decision"],
+            json!({"outcome":"allowed","reason":"public_web_baseline"}),
+            "{row}"
+        );
+        assert_eq!(row["format_version"], "ck-browser-journal/v8");
+    }
+}
+
+#[tokio::test]
+async fn baseline_form_submit_still_asks() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-submit", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
+    let mut cards = Vec::new();
+    let submitted = fixture.call_answering(&route, "browser.click", json!({"ref":named_ref(&snapshot,"Submit"),"snapshot_id":snapshot["snapshot_id"],"intent":"submit the form","severity":{"tier":2,"credential":false,"financial":false}}), json!({"decision":"deny"}), |question| cards.push(question.clone())).await;
+    assert_refused(&submitted, "form submission");
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert!(!fixture
+        .browser
+        .effects()
+        .iter()
+        .any(|effect| effect == "click"));
+}
+
+#[tokio::test]
+async fn baseline_signed_in_typing_still_asks() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-type", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
+    let arguments = json!({"ref":named_ref(&snapshot,"Text"),"snapshot_id":snapshot["snapshot_id"],"text":"hello"});
+    assert_authorized(
+        &fixture
+            .call(&route, "browser.type", arguments.clone())
+            .await,
+        "never-signed-in typing",
+    );
+    observed_fixture_login(&fixture, &route, "c-baseline-type", PUBLIC).await;
+    let sibling = public_snapshot(&fixture, &route, "https://account.news.example").await;
+    let mut cards = Vec::new();
+    let typed = fixture.call_answering(&route, "browser.type", json!({"ref":named_ref(&sibling,"Text"),"snapshot_id":sibling["snapshot_id"],"text":"hello again"}), json!({"decision":"deny"}), |question| cards.push(question.clone())).await;
+    assert_refused(&typed, "signed-in typing on a sibling");
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(
+        fixture
+            .browser
+            .effects()
+            .iter()
+            .filter(|effect| effect.as_str() == "type")
+            .count(),
+        1
+    );
+    // An observed login belongs to one agent's browser profile, not every
+    // agent sharing this machine.
+    let worker = fixture
+        .route(Session {
+            kind: "subagent",
+            ..Session::primary("c-baseline-worker", AGENT).asking()
+        })
+        .await;
+    let worker_snapshot = public_snapshot(&fixture, &worker, PUBLIC).await;
+    assert_eq!(
+        worker_snapshot["context"]["profile_disposition"],
+        "disposable"
+    );
+    assert_authorized(&fixture.call(&worker, "browser.type", json!({"ref":named_ref(&worker_snapshot,"Text"),"snapshot_id":worker_snapshot["snapshot_id"],"text":"a separate disposable profile"})).await,"unsigned disposable profile");
+    let other = fixture
+        .route(Session::primary("c-baseline-other", OTHER_AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &other, PUBLIC).await;
+    assert_authorized(&fixture.call(&other,"browser.type",json!({"ref":named_ref(&snapshot,"Text"),"snapshot_id":snapshot["snapshot_id"],"text":"another profile"})).await,"another profile's typing");
+}
+
+#[tokio::test]
+async fn baseline_local_services_still_ask() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-local", AGENT).asking())
+        .await;
+    for url in [
+        "http://localhost/",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "https://news.example:8443/",
+        "http://1.1.1.1/",
+        "https://1.1.1.1/",
+        "http://printer.local/",
+        "https://service.internal/",
+    ] {
+        let mut cards = Vec::new();
+        let reply = fixture
+            .call_answering(
+                &route,
+                "browser.navigate",
+                navigation(url, 1),
+                json!({"decision":"deny"}),
+                |question| cards.push(question.clone()),
+            )
+            .await;
+        assert_refused(&reply, url);
+        assert_eq!(cards.len(), 1, "{url}: {cards:?}");
+    }
+    assert!(fixture.browser.effects().is_empty());
+}
+
+#[tokio::test]
+async fn baseline_credential_and_payment_typing_remain_hard_refused() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-sensitive", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
+    for name in ["Password", "Payment"] {
+        let reply = fixture.call(&route,"browser.type",json!({"ref":named_ref(&snapshot,name),"snapshot_id":snapshot["snapshot_id"],"text":"sensitive"})).await;
+        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+        assert_eq!(
+            reply["detail"]["reason_code"], "credential_input_unsupported",
+            "{reply}"
+        );
+    }
+    assert!(!fixture
+        .browser
+        .effects()
+        .iter()
+        .any(|effect| effect == "type"));
+}
+
+#[tokio::test]
+async fn baseline_login_record_survives_plane_restart() {
+    let scratch = cortexkit_test_support::ScratchDir::new("baseline-login-restart");
+    let path = scratch.join("browser/signed-in-domains.json");
+    let floor_path = scratch.join("browser/format-floor.json");
+    let clock = ManualWallClock::at(1_700_000_000_000);
+    let store = store_over(InMemoryStandingGrantStorage::new(), &clock);
+    let signed_in = Arc::new(
+        cerebellum::browser_signed_in::SignedInDomains::open(path.clone())
+            .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(&floor_path)),
+    );
+    assert!(!path.exists());
+    assert!(!floor_path.exists());
+    {
+        let mut fixture =
+            Fixture::with_login_store(Arc::clone(&store), clock.clone(), Some(signed_in));
+        let route = fixture
+            .route(Session::primary("c-login-before", AGENT).asking())
+            .await;
+        let creation = std::fs::read(&path).unwrap();
+        public_snapshot(&fixture, &route, PUBLIC).await;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            creation,
+            "reading must not write login state"
+        );
+        observed_fixture_login(&fixture, &route, "c-login-before", PUBLIC).await;
+        assert!(path.exists());
+    }
+    let bytes = std::fs::read_to_string(&path).unwrap();
+    let state: Value = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(
+        state,
+        json!({"version":1,"profiles":{AGENT:{"default":{"domains":["news.example"],"signed_in_coverage":"complete","profile_uuid":"fixture-pj-standing-agent-default"}}}})
+    );
+    assert!(!bytes.contains("https://"));
+    assert!(!bytes.contains("session"));
+    assert_eq!(
+        cerebellum_core::format_floor::read_floors(&floor_path).unwrap()
+            ["browser-signed-in-domains"],
+        1
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    let mut restarted = Fixture::with_login_store(
+        store,
+        clock,
+        Some(Arc::new(
+            cerebellum::browser_signed_in::SignedInDomains::open(path),
+        )),
+    );
+    let route = restarted
+        .route(Session::primary("c-login-after", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&restarted, &route, PUBLIC).await;
+    let mut cards = Vec::new();
+    let reply = restarted.call_answering(&route,"browser.type",json!({"ref":named_ref(&snapshot,"Text"),"snapshot_id":snapshot["snapshot_id"],"text":"after restart"}),json!({"decision":"deny"}),|question| cards.push(question.clone())).await;
+    assert_refused(&reply, "restarted signed-in profile");
+    assert_eq!(cards.len(), 1);
+}
+
+#[tokio::test]
+async fn baseline_would_ask_answers_yes_for_public_browsing() {
+    let mut fixture = Fixture::new();
+    fixture
+        .signed_in
+        .initialize_profile(AGENT, "default", "new-install-profile", true)
+        .unwrap();
+    let operator = fixture.management_route().await;
+    let reply = fixture.operate(&operator,"grants.would_ask",json!({"agent_id":AGENT,"flow_id":"public-reader","items":[{"tool":"browser_use","target":PUBLIC,"level":1},{"tool":"browser_use","target":PUBLIC,"level":2},{"tool":"browser_use","target":PUBLIC,"level":4},{"tool":"browser_use","target":"http://localhost","level":1}]})).await;
+    assert_eq!(reply["items"][0]["verdict"], "yes", "{reply}");
+    assert_eq!(reply["items"][0]["reason"], "public_web_baseline");
+    assert_eq!(reply["items"][1]["verdict"], "yes");
+    assert_eq!(reply["items"][2]["verdict"], "would_ask");
+    assert_eq!(reply["items"][3]["verdict"], "would_ask");
+}
+
+#[tokio::test]
+async fn baseline_sensitive_clicks_ask_but_observation_stays_free() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-sensitive-click", AGENT).asking())
+        .await;
+    let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
+    assert_authorized(
+        &fixture.call(&route, "browser.screenshot", json!({})).await,
+        "observing sensitive fields",
+    );
+    for name in ["Password", "Payment"] {
+        let mut cards = Vec::new();
+        let reply = fixture.call_answering(&route,"browser.click",json!({"ref":named_ref(&snapshot,name),"snapshot_id":snapshot["snapshot_id"],"intent":"focus a sensitive field","severity":{"tier":2,"credential":false,"financial":false}}),json!({"decision":"deny"}),|question| cards.push(question.clone())).await;
+        assert_refused(&reply, name);
+        assert_eq!(cards.len(), 1, "{name}: {cards:?}");
+    }
+    assert!(!fixture
+        .browser
+        .effects()
+        .iter()
+        .any(|effect| effect == "click"));
+}
+
+#[tokio::test]
+async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permission() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-baseline-frames", AGENT).asking())
+        .await;
+    let frame = |id: &str, parent: Option<&str>, origin: &str| FrameDocument {
+        navigation_revision: 0,
+        frame_id: id.into(),
+        parent_id: parent.map(str::to_string),
+        session_id: format!("session-{id}"),
+        loader_id: format!("loader-{id}"),
+        url: if parent.is_none() {
+            format!("{origin}/")
+        } else {
+            format!("{origin}/frame")
+        },
+        origin: origin.into(),
+    };
+    *fixture.browser.frames.lock().unwrap() = vec![
+        frame("frame-main", None, PUBLIC),
+        frame("frame-private", Some("frame-main"), "http://127.0.0.1"),
+        frame(
+            "frame-nested",
+            Some("frame-private"),
+            "https://nested.example",
+        ),
+        frame("frame-public", Some("frame-main"), "https://widget.example"),
+    ];
+    assert_authorized(
+        &fixture
+            .call(
+                &route,
+                "browser.navigate",
+                navigation(&format!("{PUBLIC}/"), 1),
+            )
+            .await,
+        "public parent",
+    );
+    for mode in ["actionable", "ax", "dom_full"] {
+        let snapshot = fixture
+            .call(&route, "browser.snapshot", json!({"mode":mode}))
+            .await;
+        assert_authorized(&snapshot, "baseline framed snapshot");
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(!text.contains("Local admin secret"), "{snapshot}");
+        assert!(!text.contains("Nested public child"), "{snapshot}");
+        assert!(text.contains("Public embedded text"), "{snapshot}");
+        assert!(
+            text.contains("embedded frame") && text.contains("needs site permission"),
+            "{snapshot}"
+        );
+        assert_eq!(snapshot["truncated"], true, "{snapshot}");
+        let readable = fixture.browser.readable_frames.lock().unwrap();
+        assert_eq!(readable.len(), 2);
+        assert!(!readable
+            .iter()
+            .any(|frame| frame.frame_id == "frame-private" || frame.frame_id == "frame-nested"));
+        if mode == "ax" {
+            assert_eq!(
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter(|row| row["ref"].is_string())
+                    .count(),
+                7
+            );
+        }
+    }
+    let mut cards = Vec::new();
+    fixture
+        .call_answering(
+            &route,
+            "browser_use",
+            json!({"action":"open_grant","origins":[PUBLIC],"hazards":[]}),
+            json!({"decision":"allow_conversation"}),
+            |question| cards.push(question.clone()),
+        )
+        .await;
+    assert_eq!(cards.len(), 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.planes.management.browser_grant_count().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.planes.management.browser_grant_count().await, 1);
+    for mode in ["actionable", "ax", "dom_full"] {
+        let snapshot = fixture
+            .call(&route, "browser.snapshot", json!({"mode":mode}))
+            .await;
+        assert_authorized(&snapshot, "person-granted framed snapshot");
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(
+            text.contains("Local admin secret") && text.contains("Nested public child"),
+            "{snapshot}"
+        );
+        assert!(!text.contains("needs site permission"), "{snapshot}");
+        assert_eq!(snapshot["truncated"], false, "{snapshot}");
+        if mode == "ax" {
+            assert!(!named_ref(&snapshot, "Local admin secret").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() {
+    let mut fixture = Fixture::new();
+    let route = fixture
+        .route(Session::primary("c-legacy-history", AGENT).asking())
+        .await;
+    public_snapshot(&fixture, &route, "https://seen.example").await;
+    observed_fixture_login(&fixture, &route, "c-legacy-history", "https://seen.example").await;
+    fixture
+        .planes
+        .browser
+        .journal_login_import(
+            &route.identity,
+            "https://imported.example",
+            "transferred",
+            Some("chrome"),
+            1,
+        )
+        .await
+        .unwrap();
+    let export = fixture.planes.browser.journal_export_for_test().await;
+    let evidence = cerebellum::browser_signed_in::LoginJournalEvidence::from_export(
+        &export,
+        AGENT,
+        "default",
+        "legacy-profile",
+    );
+    assert_eq!(
+        evidence.domains,
+        ["seen.example".to_string(), "imported.example".to_string()].into()
+    );
+    // A first registry lookup after an upgrade identifies an existing profile,
+    // but the untimed journal cannot prove that all of its sign-ins are retained.
+    fixture
+        .signed_in
+        .initialize_profile(AGENT, "default", "legacy-profile", false)
+        .unwrap();
+    for origin in ["https://seen.example", "https://never-signed.example"] {
+        let snapshot = public_snapshot(&fixture, &route, origin).await;
+        let mut cards = Vec::new();
+        let reply = fixture.call_answering(&route,"browser.type",json!({"ref":named_ref(&snapshot,"Text"),"snapshot_id":snapshot["snapshot_id"],"text":"legacy profile"}),json!({"decision":"deny"}),|question|cards.push(question.clone())).await;
+        assert_refused(&reply, "incomplete legacy typing");
+        assert_eq!(cards.len(), 1);
+        assert_authorized(&fixture.call(&route,"browser.click",json!({"ref":named_ref(&snapshot,"Button"),"snapshot_id":snapshot["snapshot_id"],"intent":"ordinary click","severity":{"tier":2,"credential":false,"financial":false}})).await,"legacy ordinary click");
+    }
+    assert!(fixture
+        .signed_in
+        .is_signed_in(AGENT, "default", "https://any-other.example"));
 }

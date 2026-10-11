@@ -2585,13 +2585,27 @@ pub enum PreparedKind {
 
 /// The exact profile directory selected by preparation. The registry UUID stays
 /// private; launch custody needs only the disposition and canonical delete target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PreparedProfileAttempt {
     disposition: ProfileDisposition,
     directory: PathBuf,
+    freshly_created: bool,
 }
 
+impl PartialEq for PreparedProfileAttempt {
+    fn eq(&self, other: &Self) -> bool {
+        // New-directory status controls login-history coverage, not the identity
+        // checked at custody release: that remains the selected directory and
+        // whether it is a durable or disposable profile.
+        self.disposition == other.disposition && self.directory == other.directory
+    }
+}
+impl Eq for PreparedProfileAttempt {}
+
 impl PreparedProfileAttempt {
+    pub const fn freshly_created(&self) -> bool {
+        self.freshly_created
+    }
     pub const fn disposition(&self) -> ProfileDisposition {
         self.disposition
     }
@@ -2610,6 +2624,7 @@ struct PreparedState {
     conversation_key: String,
     project_id: String,
     kind: PreparedKind,
+    freshly_created: bool,
     profile_uuid: Option<String>,
     profile_name: Option<String>,
     terminal: Option<AbortSignal>,
@@ -2870,6 +2885,7 @@ impl ProfileLifecycle {
                     conversation_key: conversation.clone(),
                     project_id: context.agent_project_id().to_string(),
                     kind: PreparedKind::Reuse,
+                    freshly_created: false,
                     profile_uuid: Some(existing_uuid),
                     profile_name: existing_name,
                     terminal: None,
@@ -2905,6 +2921,7 @@ impl ProfileLifecycle {
                         conversation_key: conversation,
                         project_id: context.agent_project_id().to_string(),
                         kind: PreparedKind::Creating(ProfileKind::Disposable),
+                        freshly_created: true,
                         profile_uuid: Some(uuid),
                         profile_name: None,
                         terminal: None,
@@ -2987,6 +3004,7 @@ impl ProfileLifecycle {
                 )
             }
         };
+        let mut freshly_created = false;
         let record = match resolution {
             DurableResolution::Untrustworthy(reason) => return self.closed_untrusted_root(reason),
             DurableResolution::Unavailable => {
@@ -3009,7 +3027,10 @@ impl ProfileLifecycle {
                     });
                 }
                 match self.registry.create_durable_record(context) {
-                    Ok(record) => record,
+                    Ok(record) => {
+                        freshly_created = true;
+                        record
+                    }
                     Err(RegistryError::Untrustworthy(reason)) => {
                         return self.closed_untrusted_root(reason)
                     }
@@ -3068,6 +3089,7 @@ impl ProfileLifecycle {
                 conversation_key: conversation,
                 project_id: context.agent_project_id().to_string(),
                 kind: PreparedKind::Creating(ProfileKind::Durable),
+                freshly_created,
                 profile_uuid: Some(record.profile_uuid),
                 profile_name: Some("default".to_string()),
                 terminal: None,
@@ -3178,6 +3200,7 @@ impl ProfileLifecycle {
                 ProfileKind::Disposable => ProfileDisposition::Disposable,
             },
             directory,
+            freshly_created: state.freshly_created,
         })
     }
 
@@ -3672,6 +3695,7 @@ impl ProfileLifecycle {
                 ProfileKind::Disposable => ProfileDisposition::Disposable,
             },
             directory,
+            freshly_created: false,
         })
     }
 

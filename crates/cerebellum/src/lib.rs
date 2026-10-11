@@ -18,6 +18,7 @@ pub mod browser_launch_readiness;
 pub mod browser_launch_service;
 mod browser_queue;
 pub mod browser_session;
+pub mod browser_signed_in;
 pub mod browser_standing_grants;
 pub mod browser_type;
 mod call_queue;
@@ -2744,6 +2745,18 @@ impl Planes {
         journal: JournalPersistence,
         standing: Option<Arc<browser_standing_grants::StandingBrowserGrants>>,
     ) -> Self {
+        Self::with_browser_state(health, browser_config, journal, standing, None)
+    }
+
+    /// Build browser and permission services sharing the signed-in domain store;
+    /// fixtures can reopen a private file without resolving the operator's data home.
+    pub fn with_browser_state(
+        health: Arc<HealthState>,
+        browser_config: Option<BrowserConfig>,
+        journal: JournalPersistence,
+        standing: Option<Arc<browser_standing_grants::StandingBrowserGrants>>,
+        signed_in: Option<Arc<browser_signed_in::SignedInDomains>>,
+    ) -> Self {
         // The launch service picks its process launcher per platform and has
         // done since the Linux barrier landed. This wiring stayed macOS-only,
         // which left a merged Linux launcher unreachable and the refusal
@@ -2788,13 +2801,20 @@ impl Planes {
                 None => browser_standing_grants::StandingBrowserGrants::in_memory(),
             })
         });
+        let signed_in = signed_in.unwrap_or_else(|| {
+            Arc::new(match journal {
+                JournalPersistence::Durable => browser_signed_in::SignedInDomains::production(),
+                JournalPersistence::Isolated => browser_signed_in::SignedInDomains::default(),
+            })
+        });
         let management = Arc::new(
             ManagementPlane::with_computer_grants(
                 Arc::new(management::PlatformResolver::new()),
                 computer_grants,
             )
             .with_isolated_storage(journal == JournalPersistence::Isolated)
-            .with_standing_browser_grants(standing),
+            .with_standing_browser_grants(standing)
+            .with_signed_in_domains(Arc::clone(&signed_in)),
         );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
@@ -2815,14 +2835,16 @@ impl Planes {
                             config,
                             journal,
                             &management.launch_recovery_registry(),
-                        ),
+                        )
+                        .with_signed_in_domains(Arc::clone(&signed_in)),
                     );
                     capture.set_launcher(service.clone());
                     service as Arc<dyn browser_session::BrowserSessionLauncher>
                 });
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let launch_service = None;
-        let sessions = browser_session::BrowserSessions::default();
+        let sessions =
+            browser_session::BrowserSessions::default().with_signed_in_domains(signed_in);
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
         let browser_grants = management.browser_grants();
         let browser = if let Some(config) = browser_config.as_ref() {
@@ -4380,9 +4402,9 @@ async fn import_browser_login(
         );
         return journal_login_import_result(planes, &facts.identity, result).await;
     }
-    let location = match planes
+    let (location, profile_uuid) = match planes
         .management
-        .durable_login_profile_location(&facts.identity.agent_project_id)
+        .durable_login_profile_identity(&facts.identity.agent_project_id)
     {
         Ok(Some(location)) => location,
         Ok(None) => {
@@ -4402,6 +4424,10 @@ async fn import_browser_login(
             return journal_login_import_result(planes, &facts.identity, result).await;
         }
     };
+    planes
+        .browser
+        .register_existing_profile(&facts.identity, &profile_uuid)
+        .await;
     let Some(launch_executable) = planes
         .browser_config
         .as_ref()
@@ -4593,6 +4619,15 @@ async fn journal_login_import_result(
     identity: &RouteIdentity,
     result: login_import::ImportResult,
 ) -> Value {
+    if result.outcome == "transferred"
+        && planes
+            .browser
+            .record_signed_in(&identity.agent_project_id, &result.origin)
+            .await
+            .is_err()
+    {
+        return json!({"outcome":"internal_failure","reason":"signed_in_domains_unavailable"});
+    }
     if planes
         .browser
         .journal_login_import(
@@ -4683,8 +4718,10 @@ async fn present_browser_handoff(
         .browser_config
         .as_ref()
         .map_or(30_000, |config| config.navigation_settle_deadline_ms);
-    let presented = planes.sessions.present(
+    let presented = planes.sessions.present_for_profile(
         &identity.conversation_key,
+        &identity.agent_project_id,
+        &browser_signed_in::SignedInDomains::profile_name(identity),
         origin,
         deadline_ms,
         planes.lease_clock.as_ref(),
@@ -8022,15 +8059,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn browser_without_a_standing_row_would_ask() {
+        async fn browser_without_a_standing_row_uses_public_baseline() {
             let reply = query(&planes(), json!({"flow_id":"flow:test","agent_id":"owner","items":[{"tool":"browser_use","target":"https://example.com","level":1}]})).await;
-            assert_eq!(reply["items"][0]["verdict"], "would_ask");
-            assert_eq!(reply["items"][0]["reason"], "no_standing_grant");
+            assert_eq!(reply["items"][0]["verdict"], "yes");
+            assert_eq!(reply["items"][0]["reason"], "public_web_baseline");
         }
 
-        /// The install check answers browser items from the agent's standing
-        /// site grants: covered at or below the row's level, `level_above_grant`
-        /// above it, and nothing for another agent or another origin.
+        /// Public reads use the baseline across agents and origins; a requested
+        /// tier above the baseline still needs a sufficient standing site grant.
         #[tokio::test]
         async fn browser_answers_from_standing_site_grants() {
             let planes = planes_with_standing_origin_row(2);
@@ -8048,13 +8084,13 @@ mod tests {
                 reply,
                 json!({"items":[
                     {"tool":"browser_use","target":"https://example.com","verdict":"yes","reason":"standing_grant"},
-                    {"tool":"browser_use","target":"https://example.com","verdict":"yes","reason":"standing_grant"},
+                    {"tool":"browser_use","target":"https://example.com","verdict":"yes","reason":"public_web_baseline"},
                     {"tool":"browser_use","target":"https://example.com","verdict":"would_ask","reason":"level_above_grant"},
-                    {"tool":"browser_use","target":"https://example.org","verdict":"would_ask","reason":"no_standing_grant"}
+                    {"tool":"browser_use","target":"https://example.org","verdict":"yes","reason":"public_web_baseline"}
                 ]})
             );
             let other = query(&planes, json!({"flow_id":"flow:test","agent_id":"other","items":[{"tool":"browser_use","target":"https://example.com","level":1}]})).await;
-            assert_eq!(other["items"][0]["reason"], "no_standing_grant");
+            assert_eq!(other["items"][0]["reason"], "public_web_baseline");
         }
 
         #[tokio::test]
@@ -12647,5 +12683,47 @@ mod relayed_computer_call_tests {
         for row in &rows {
             assert!(row["identity"].get("origin").is_none(), "{row}");
         }
+    }
+}
+
+#[cfg(test)]
+mod browser_login_fact_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_successful_imports_record_a_signed_in_domain() {
+        let signed_in = Arc::new(browser_signed_in::SignedInDomains::default());
+        signed_in
+            .initialize_profile("agent", "default", "new-agent-profile", true)
+            .unwrap();
+        signed_in
+            .initialize_profile("other-agent", "default", "new-other-profile", true)
+            .unwrap();
+        let planes = Planes::with_browser_state(
+            Arc::new(HealthState::new()),
+            None,
+            JournalPersistence::Isolated,
+            None,
+            Some(Arc::clone(&signed_in)),
+        );
+        let bind = subc_protocol::BindIdentity::new("/test/project", "test", "import-facts");
+        let mut identity = RouteIdentity::from_bind(&bind, &None);
+        identity.agent_project_id = "agent".into();
+        for ending in ["denied", "hand_off", "transfer_failed"] {
+            let result =
+                login_import::ImportResult::refusal("https://login.example.com", ending, "retry");
+            let reply = journal_login_import_result(&planes, &identity, result).await;
+            assert_eq!(reply["outcome"], ending);
+            assert!(!signed_in.is_signed_in("agent", "default", "https://account.example.com"));
+        }
+        let mut imported =
+            login_import::ImportResult::refusal("https://login.example.com", "transferred", "");
+        imported.remedy = None;
+        imported.browser = Some("chrome".into());
+        imported.rows = 1;
+        let reply = journal_login_import_result(&planes, &identity, imported).await;
+        assert_eq!(reply["outcome"], "transferred");
+        assert!(signed_in.is_signed_in("agent", "default", "https://account.example.com"));
+        assert!(!signed_in.is_signed_in("other-agent", "default", "https://account.example.com"));
     }
 }

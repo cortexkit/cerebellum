@@ -328,6 +328,7 @@ pub struct CdpNavigationDriver<IO> {
     active_frame: Option<crate::snapshot_store::FrameDocument>,
     point_frame: Option<crate::snapshot_store::FrameDocument>,
     point_target: Option<(String, BrowserClickPosition)>,
+    downloads_denied: bool,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -356,6 +357,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             active_frame: None,
             point_frame: None,
             point_target: None,
+            downloads_denied: false,
         }
     }
 
@@ -1978,6 +1980,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         if let Some(target_id) = self.unclosed_verification_target.clone() {
             self.close_verification_target(&target_id, clock)?;
         }
+        self.ensure_downloads_denied(deadline, clock)?;
         let mut create_params = Map::new();
         create_params.insert("url".into(), Value::String("about:blank".into()));
         create_params.insert("background".into(), Value::Bool(true));
@@ -2378,6 +2381,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Some((context_key, tracker)),
             clock,
         )?;
+        if navigate_result.get("isDownload").and_then(Value::as_bool) == Some(true)
+            && self.downloads_denied
+        {
+            tracker.download_blocked = true;
+            tracker.token("download_blocked");
+        }
+        if tracker.download_blocked {
+            return Ok(());
+        }
         if let Some(error_text) = navigate_result
             .get("errorText")
             .and_then(Value::as_str)
@@ -2409,7 +2421,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     ) -> Result<(), NavigationDriveError> {
         while clock.now() < deadline {
             self.read_turn(None, Some((context_key, tracker)), clock.now())?;
-            if tracker.poll_settlement(clock.now()) || ended(tracker) {
+            if tracker.download_blocked || tracker.poll_settlement(clock.now()) || ended(tracker) {
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(clock.now());
@@ -2449,6 +2461,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 Err(NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))
             };
         }
+
+        self.ensure_downloads_denied(deadline, clock)?;
 
         // A dedicated target makes ownership explicit. Selecting an arbitrary
         // pre-existing tab would let one route drive a page whose custody was
@@ -2506,6 +2520,33 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             session_id,
             context_key: context_key.to_string(),
         });
+        Ok(())
+    }
+
+    fn ensure_downloads_denied<C: NavigationClock>(
+        &mut self,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
+        if !self.downloads_denied {
+            // Downloads are not an admitted capability. Deny them on the root
+            // session before any page opens, including login verification tabs.
+            // All owned targets use Chrome's default browser context.
+            self.command(
+                "Browser.setDownloadBehavior",
+                Some(
+                    serde_json::json!({"behavior":"deny","eventsEnabled":true})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                None,
+                deadline,
+                None,
+                clock,
+            )?;
+            self.downloads_denied = true;
+        }
         Ok(())
     }
 
@@ -2777,6 +2818,27 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let Some(attachment) = self.attachment.as_ref() else {
             return;
         };
+        if event.method == "Browser.downloadWillBegin"
+            && self.downloads_denied
+            && attachment.context_key == context_key
+        {
+            let frame = event
+                .params
+                .as_ref()
+                .and_then(|params| params.get("frameId"))
+                .and_then(Value::as_str);
+            if frame.is_some_and(|frame| {
+                frame == attachment.target_id
+                    || self
+                        .frame_documents
+                        .iter()
+                        .any(|document| document.frame_id == frame)
+            }) {
+                tracker.download_blocked = true;
+                tracker.token("download_blocked");
+            }
+            return;
+        }
         let Some(session_id) = event.session_id.as_deref() else {
             return;
         };
@@ -4256,6 +4318,20 @@ mod tests {
         )
     }
 
+    fn driver_with_download_denial(
+        frames: impl IntoIterator<Item = Value>,
+    ) -> CdpNavigationDriver<FakePipe> {
+        let replies = std::iter::once(json!({"id":1,"result":{}})).chain(frames.into_iter().map(
+            |mut frame| {
+                if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                    frame["id"] = json!(id + 1);
+                }
+                frame
+            },
+        ));
+        driver(replies)
+    }
+
     fn attached_driver(frames: impl IntoIterator<Item = Value>) -> CdpNavigationDriver<FakePipe> {
         let mut driver = driver(frames);
         driver
@@ -5096,15 +5172,15 @@ mod tests {
             );
         }
 
-        // A classified cross-origin link still requires tier 4, because
-        // activating it leaves the origin the grant was asked for.
+        // Public cross-origin links are reading; the destination is authorized
+        // separately, while local destinations still require a site grant.
         let cross = classify("cross");
         assert!(hazards(&cross).is_empty(), "{cross:?}");
         assert_eq!(
             cross.activation_destination_origin.as_deref(),
             Some("https://cross-origin.invalid")
         );
-        assert_eq!(required(&cross), Severity::new(4, false, false));
+        assert_eq!(required(&cross), Severity::new(1, false, false));
 
         let submit = classify("submit");
         assert!(submit.activation_invokes_form_submit);
@@ -5120,19 +5196,13 @@ mod tests {
         let html = flattened_dom_node(1, None, 10, "html", &[]);
         let below_floor = json!({"tier": 1, "credential": false, "financial": false});
 
-        // A classified cross-origin link: its computed requirement (tier 4)
-        // differs from both the floor (2) and the unclassified maximum, so
-        // only the value authorization computed matches.
+        // This private-address link needs tier 4 although ordinary clicks need
+        // tier 2. The refusal must report its classified severity and flags,
+        // rather than a generic click minimum or unknown-target worst case.
         let refs = snapshot_refs(
             dom_frames(json!([
                 html,
-                flattened_dom_node(
-                    2,
-                    Some(1),
-                    60,
-                    "a",
-                    &["href", "https://elsewhere.example/x"]
-                ),
+                flattened_dom_node(2, Some(1), 60, "a", &["href", "http://10.0.0.5/x"]),
             ])),
             Some((7, PAGE_URL)),
         );
@@ -7101,7 +7171,7 @@ mod tests {
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
         ];
-        let mut driver = driver(frames);
+        let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();
         driver
             .navigate_for_test(
@@ -7123,6 +7193,7 @@ mod tests {
         assert_eq!(
             methods,
             [
+                "Browser.setDownloadBehavior",
                 "Target.createTarget",
                 "Target.attachToTarget",
                 "Page.enable",
@@ -7147,7 +7218,7 @@ mod tests {
             json!({"method":"Network.loadingFinished","sessionId":"session-own","params":{}}),
             json!({"method":"Page.loadEventFired","sessionId":"session-own","params":{}}),
         ];
-        let mut driver = driver(frames);
+        let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();
         tracker.token("navigation_started");
         driver
@@ -7182,7 +7253,7 @@ mod tests {
             json!({"id":5,"sessionId":"session-own","result":{}}),
             json!({"method":"Page.loadEventFired","sessionId":"session-own","params":{}}),
         ];
-        let mut driver = driver(frames);
+        let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();
         tracker.token("navigation_started");
         let mut clock = FakeClock::new();
@@ -7210,7 +7281,7 @@ mod tests {
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
         ];
-        let mut driver = driver(frames);
+        let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();
         driver
             .navigate_for_test(
@@ -7504,6 +7575,7 @@ mod verification_tests {
         assert_eq!(
             methods(&driver),
             [
+                "Browser.setDownloadBehavior",
                 "Target.createTarget",
                 "Target.attachToTarget",
                 "Page.enable",
@@ -7515,10 +7587,10 @@ mod verification_tests {
                 "Target.closeTarget",
             ]
         );
-        let created = &driver.pipe.writes[0]["params"];
+        let created = &driver.pipe.writes[1]["params"];
         assert_eq!(created["background"], true, "{created}");
         assert_eq!(created["url"], "about:blank");
-        assert_eq!(driver.pipe.writes[8]["params"]["targetId"], TAB);
+        assert_eq!(driver.pipe.writes[9]["params"]["targetId"], TAB);
         for write in &driver.pipe.writes {
             assert_ne!(
                 write.get("sessionId").and_then(Value::as_str),

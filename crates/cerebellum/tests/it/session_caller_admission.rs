@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 /// grant belongs to.
 const CONVERSATION: &str = "conversation-with-a-grant";
 const GRANTED_ORIGIN: &str = "https://granted.example";
-const UNGRANTED_ORIGIN: &str = "https://ungranted.example";
+const UNGRANTED_ORIGIN: &str = "http://localhost:8080";
 const CHANNEL: u16 = 9;
 const EPOCH: u32 = 3;
 
@@ -246,8 +246,8 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
     let body: Value = serde_json::from_slice(&granted[0].body).unwrap();
     assert_eq!(body["outcome"], "no_session", "{body}");
 
-    // The contrast that makes `no_session` evidence of the grant: for a site
-    // with no grant, the same caller is asked about it rather than let through.
+    // The local-service contrast proves the grant gate ran: public sites can
+    // pass on the baseline, but an ungranted local service must ask.
     let ungranted = frames_for(&planes, navigate(2, UNGRANTED_ORIGIN)).await;
     assert!(
         ungranted

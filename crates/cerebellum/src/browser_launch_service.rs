@@ -116,6 +116,7 @@ pub struct ProductionLaunchService {
     /// them. Built before this service exists, so a launch never sees a
     /// partial set.
     recovery: Arc<RecoveryClearState>,
+    signed_in: Option<Arc<crate::browser_signed_in::SignedInDomains>>,
 }
 
 /// Where a launch service keeps profile state: the profile registry, the
@@ -204,6 +205,13 @@ struct HeldLaunchProfile {
 }
 
 impl ProductionLaunchService {
+    pub fn with_signed_in_domains(
+        mut self,
+        signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    ) -> Self {
+        self.signed_in = Some(signed_in);
+        self
+    }
     /// Open and recover the launch journal before returning a service that can be
     /// published to request handlers. Keeping recovery synchronous here means no
     /// caller can obtain the service while an orphan still contends with a fresh
@@ -308,6 +316,7 @@ impl ProductionLaunchService {
             startup_failure,
             profile_root,
             recovery,
+            signed_in: None,
         }
     }
 
@@ -558,6 +567,11 @@ impl ProductionLaunchService {
             bound.acquire_and_prepare(key, &invocation, &reservation, &context)
         })
         .map_err(|outcome| self.recovery.name_recovery_hold(outcome).as_json())?;
+        let freshly_created = prepared.attempt().freshly_created();
+        let profile_name = match prepared.attempt().disposition() {
+            crate::profile::ProfileDisposition::Durable => "default".to_string(),
+            _ => format!("disposable:{}", context.conversation_key()),
+        };
         let opened = bound
             .launch_prepared(prepared, &commitment)
             .map_err(|outcome| outcome.as_json())?;
@@ -575,6 +589,18 @@ impl ProductionLaunchService {
                 "rollback": "rollback_opened",
             }));
         };
+
+        if let Some(signed_in) = &self.signed_in {
+            // A new empty profile has no earlier login events that could be
+            // missing. If recording its history coverage fails, typing still
+            // needs a grant while observation remains available.
+            let _ = signed_in.initialize_profile(
+                context.agent_project_id(),
+                &profile_name,
+                &profile_uuid,
+                freshly_created,
+            );
+        }
 
         let crash_dumps_directory = profile_directory.join("crash-dumps");
         let arguments = browser_launch_arguments(&profile_directory, &crash_dumps_directory);

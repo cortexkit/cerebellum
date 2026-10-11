@@ -652,8 +652,9 @@ mod tests {
         let refusal = validate_browser_config_at_load(&config).expect_err("wrapper pin refused");
         let text = refusal.to_string();
         assert!(text.contains("is not final"), "unexpected refusal: {text}");
+        let final_image = std::fs::canonicalize("/bin/sleep").expect("resolve fixture binary");
         assert!(
-            text.contains("/bin/sleep"),
+            text.contains(final_image.to_str().expect("fixture binary path is UTF-8")),
             "missing final image path: {text}"
         );
         assert!(

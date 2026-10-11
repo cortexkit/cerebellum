@@ -29,12 +29,19 @@ struct FixturePipe {
     large_fanout: bool,
     hit_backend: u64,
     commands: Arc<Mutex<Vec<Value>>>,
+    attachment: Option<AttachmentResponse>,
     fault: Option<SnapshotFault>,
     hidden_owner: bool,
     child_session: bool,
     churn_siblings: bool,
     keep_hidden_frame: bool,
     main_loader_changed: bool,
+    private_frames: bool,
+}
+
+struct AttachmentResponse {
+    downloads: std::path::PathBuf,
+    denied: bool,
 }
 
 fn dom() -> Value {
@@ -65,8 +72,27 @@ impl CdpPipeIo for FixturePipe {
         self.commands.lock().unwrap().push(command.clone());
         let method = command["method"].as_str().unwrap();
         let result = match method {
+            "Browser.setDownloadBehavior" => {
+                assert!(
+                    command.get("sessionId").is_none(),
+                    "download policy belongs to the browser session"
+                );
+                if let Some(attachment) = self.attachment.as_mut() {
+                    attachment.denied = command["params"]["behavior"] == "deny";
+                }
+                json!({})
+            }
             "Target.createTarget" => json!({"targetId":"target-own"}),
             "Target.attachToTarget" => json!({"sessionId":"session-own"}),
+            "Page.navigate" if self.attachment.is_some() => {
+                let attachment = self.attachment.as_ref().unwrap();
+                if !attachment.denied {
+                    std::fs::write(attachment.downloads.join("report.txt"), "fixture payload")
+                        .unwrap();
+                }
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"navigation-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+                json!({"frameId":"target-own","isDownload":true,"errorText":"net::ERR_ABORTED"})
+            }
             "Accessibility.getRootAXNode" => {
                 json!({"node":ax(1,1,"RootWebArea","Events",if self.churn_siblings { &[2,4] } else { &[2] })})
             }
@@ -96,13 +122,28 @@ impl CdpPipeIo for FixturePipe {
             "Accessibility.getChildAXNodes" => {
                 json!({"nodes":[ax(3,43,"StaticText","Event row",&[])]})
             }
-            "DOM.getFlattenedDocument" => dom(),
+            "DOM.getFlattenedDocument" => {
+                let mut document = dom();
+                if self.attachment.is_some() {
+                    document["nodes"][1]["localName"] = json!("a");
+                    document["nodes"][1]["nodeName"] = json!("A");
+                    document["nodes"][1]["attributes"] =
+                        json!(["href", "https://requested.example/attachment"]);
+                }
+                document
+            }
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),
             "Page.getFrameTree" => {
                 let mut tree = json!({"frameTree":{"frame":{"id":"frame-main","loaderId":if self.main_loader_changed { "loader-new" } else { "loader-page" },"url":"https://requested.example/page","securityOrigin":"https://requested.example"}}});
                 if self.hidden_owner {
                     tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"frame-child","loaderId":"child-loader","url":"https://embedded.example/frame","securityOrigin":"https://embedded.example"},"childFrames":[{"frame":{"id":"frame-grandchild","loaderId":"grandchild-loader","url":"https://nested.example/frame","securityOrigin":"https://nested.example"}}]}]);
+                    if self.private_frames {
+                        tree["frameTree"]["childFrames"][0]["frame"]["url"] =
+                            json!("http://127.0.0.1/admin");
+                        tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"] =
+                            json!("http://127.0.0.1");
+                    }
                 }
                 tree
             }
@@ -193,6 +234,18 @@ impl CdpPipeIo for FixturePipe {
         if let Some(held) = self.held.take() {
             self.queue(held);
         }
+        if method == "Input.dispatchMouseEvent" && command["params"]["type"] == "mouseReleased" {
+            if let Some(attachment) = self.attachment.as_ref() {
+                // The browser double models an attachment response at the disk
+                // boundary: without Chrome's deny policy it saves the payload.
+                if !attachment.denied {
+                    std::fs::write(attachment.downloads.join("report.txt"), "fixture payload")
+                        .unwrap();
+                }
+                self.queue(json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"requestId":"attachment","frameId":"target-own","type":"Document","response":{"status":200,"statusText":"OK","headers":{"Content-Disposition":"attachment; filename=report.txt"}}}}));
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"fixture-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+            }
+        }
         if self.block_once == Some(method) {
             self.block_once = None;
             self.held = Some(response);
@@ -223,6 +276,16 @@ struct FixtureProcess {
 }
 
 impl OwnedBrowserProcess for FixtureProcess {
+    fn navigate(
+        &mut self,
+        context: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver.navigate(context, url, wait, deadline, tracker)
+    }
     fn committed_document(
         &mut self,
         context: &str,
@@ -321,13 +384,15 @@ async fn fixture_with_fault(
         large_fanout: block_once == Some("large_fanout"),
         hit_backend,
         commands: commands.clone(),
+        attachment: None,
         fault,
         hidden_owner,
         child_session: fault.is_some_and(|fault| matches!(fault.kind, SnapshotFaultKind::Detach)),
         churn_siblings: fault
             .is_some_and(|fault| matches!(fault.kind, SnapshotFaultKind::Gone { .. })),
-        keep_hidden_frame: fault.is_none() && hidden_owner,
+        keep_hidden_frame: hidden_owner && (fault.is_none() || block_once == Some("private_frame")),
         main_loader_changed: false,
+        private_frames: block_once == Some("private_frame"),
     };
     let process = FixtureProcess {
         driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
@@ -559,6 +624,95 @@ async fn busy_snapshot_large_fanout_is_partial_without_requesting_the_huge_subtr
     );
 }
 
+#[tokio::test]
+async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_relaunch() {
+    let scratch = cortexkit_test_support::ScratchDir::new("browser-attachment-deny");
+    for launch in 0..2 {
+        let downloads = scratch.join(format!("profile-{launch}/Downloads"));
+        cerebellum_core::private_fs::create_dir_all(&downloads).unwrap();
+        let route = identity();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let pipe = FixturePipe {
+            reads: VecDeque::new(),
+            held: None,
+            block_once: None,
+            large_fanout: false,
+            hit_backend: 42,
+            commands: Arc::clone(&commands),
+            attachment: Some(AttachmentResponse {
+                downloads: downloads.clone(),
+                denied: false,
+            }),
+            fault: None,
+            hidden_owner: false,
+            child_session: false,
+            churn_siblings: false,
+            keep_hidden_frame: false,
+            main_loader_changed: false,
+            private_frames: false,
+        };
+        let process = FixtureProcess {
+            driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
+            read_document: false,
+            read_frames: false,
+            refusal: None,
+        };
+        let plane = plane_with_process(&route, Box::new(process), 150)
+            .with_grants_installed(GrantStore::default().with_public_web_baseline(Arc::new(
+                cerebellum::browser_signed_in::SignedInDomains::default(),
+            )))
+            .with_result_schema_enforcement(
+                cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+            );
+        plane.open_context(route.clone()).await.unwrap();
+        let snapshot = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        let reply = click_text(&plane, &route, &snapshot).await;
+        assert_eq!(
+            std::fs::read_dir(&downloads).unwrap().count(),
+            0,
+            "an attachment wrote into {}",
+            downloads.display()
+        );
+        assert_eq!(reply["outcome"], "unsupported_download", "{reply}");
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("download was blocked"));
+        assert!(reply["lifecycle"]["events"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("download_blocked")));
+        cerebellum::browser::validate_browser_result("browser.click", &reply).unwrap();
+        let navigated = plane.serve(&route, BrowserCapability::Navigate, &json!({"url":"https://requested.example/attachment","intent":"read an attachment URL","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}})).await.unwrap();
+        assert_eq!(navigated["outcome"], "unsupported_download", "{navigated}");
+        assert!(navigated["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("download was blocked"));
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 0);
+        let commands = commands.lock().unwrap();
+        let deny = commands
+            .iter()
+            .position(|command| command["method"] == "Browser.setDownloadBehavior")
+            .unwrap();
+        let target = commands
+            .iter()
+            .position(|command| command["method"] == "Target.createTarget")
+            .unwrap();
+        assert!(
+            deny < target,
+            "download denial must precede opening any owned target"
+        );
+        assert_eq!(
+            commands[deny]["params"],
+            json!({"behavior":"deny","eventsEnabled":true})
+        );
+    }
+}
 async fn assert_snapshot_step_and_recovery(
     fault: Option<SnapshotFault>,
     hidden_owner: bool,
@@ -1024,5 +1178,67 @@ async fn snapshot_disappearance_classifier_does_not_swallow_other_errors() {
             "ax",
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_private_frame_omission_preserves_busy_page_partial_snapshots() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let (plane, route, commands) = fixture_with_fault(
+            Some("private_frame"),
+            42,
+            None,
+            Some(SnapshotFault {
+                method: "Accessibility.getChildAXNodes",
+                kind: SnapshotFaultKind::Gone {
+                    message: "Invalid ID",
+                    code: -32602,
+                },
+            }),
+            true,
+            true,
+        )
+        .await;
+        let plane = plane.with_grants_installed(GrantStore::default().with_public_web_baseline(
+            Arc::new(cerebellum::browser_signed_in::SignedInDomains::default()),
+        ));
+        let snapshot = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode": mode}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["refs_truncated"], true);
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(text.contains("needs site permission"), "{snapshot}");
+        if mode != "dom_full" {
+            assert!(text.contains("Surviving sibling"), "{snapshot}");
+            assert!(!text.contains("Vanished row") && !text.contains("Event row"));
+        }
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command["method"] == "Accessibility.getRootAXNode")
+                .count(),
+            1,
+            "an omitted child document was captured"
+        );
+        let recovered = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode": mode}))
+            .await
+            .unwrap();
+        assert_eq!(recovered["outcome"], "ok", "{recovered}");
+        assert!(recovered["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("needs site permission"));
+        if mode != "dom_full" {
+            assert!(recovered["state_text"]
+                .as_str()
+                .unwrap()
+                .contains("Event row"));
+        }
     }
 }
