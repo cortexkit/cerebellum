@@ -5,6 +5,10 @@
 //! `cargo run --locked -p cerebellum --example browser_type_live -- --click-fixture`
 //! checks styled checkbox clicks, scrolled point classification, replaced refs,
 //! and compact AX snapshots on a separate loopback form in headless Chrome.
+//!
+//! `--busy-fixture` measures per-command latency on a local event drawer with
+//! 20,000 DOM rows, streaming updates and a blocked renderer, then checks that
+//! idle snapshots and text-row clicks still work on the same connection.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -30,6 +34,7 @@ async fn main() {
     let navigate_only = args.iter().any(|arg| arg == "--navigate-only");
     let headed = args.iter().any(|arg| arg == "--headed");
     let click_fixture = args.iter().any(|arg| arg == "--click-fixture");
+    let busy_fixture = args.iter().any(|arg| arg == "--busy-fixture");
     let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
     for index in 1..=runs {
@@ -44,6 +49,7 @@ async fn main() {
             navigate_only,
             headed,
             click_fixture,
+            busy_fixture,
             &mut outcomes,
         )
         .await
@@ -98,6 +104,9 @@ mod probe {
     mod click_fixture {
         include!("support/browser_click_fixture.rs");
     }
+    mod busy_fixture {
+        include!("support/browser_busy_fixture.rs");
+    }
 
     const TOP: &str = r#"<!doctype html><meta charset="utf-8"><title>Typing probe</title>
 <label>Plain<input id="plain" aria-label="Probe plain" value="existing"></label>
@@ -138,6 +147,8 @@ mod probe {
                         CHILD
                     } else if request.starts_with("GET /click ") {
                         click_fixture::HTML
+                    } else if request.starts_with("GET /busy ") {
+                        busy_fixture::HTML
                     } else if request.starts_with("GET /away ") {
                         "<!doctype html><title>Away</title><p>Another document</p>"
                     } else {
@@ -197,6 +208,8 @@ mod probe {
         queued: std::collections::VecDeque<u8>,
         trace: std::collections::HashMap<u64, Value>,
         history: Vec<(Value, Value)>,
+        issued_at: std::collections::HashMap<u64, Instant>,
+        timings: Vec<(String, u128)>,
     }
     #[derive(Clone)]
     struct Pipe(Arc<Mutex<PipeState>>);
@@ -208,7 +221,9 @@ mod probe {
             if command["method"] == "Input.insertText" {
                 command["params"]["text"] = json!("<redacted>");
             }
-            state.trace.insert(command["id"].as_u64().unwrap(), command);
+            let id = command["id"].as_u64().unwrap();
+            state.trace.insert(id, command);
+            state.issued_at.insert(id, Instant::now());
             state.writer.write_all(bytes)
         }
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<PipeRead> {
@@ -233,6 +248,14 @@ mod probe {
                                 .as_u64()
                                 .and_then(|id| state.trace.remove(&id))
                             {
+                                if let Some(start) =
+                                    state.issued_at.remove(&response["id"].as_u64().unwrap())
+                                {
+                                    state.timings.push((
+                                        command["method"].as_str().unwrap().to_string(),
+                                        start.elapsed().as_millis(),
+                                    ));
+                                }
                                 state.history.push((command, response.clone()));
                             }
                             if state.main_session.is_none() {
@@ -265,6 +288,14 @@ mod probe {
             .ok_or_else(|| "Runtime.evaluate returned no value".into())
         }
         fn command(&self, method: &str, params: Value) -> Result<Value, String> {
+            self.command_with_timeout(method, params, Duration::from_secs(10))
+        }
+        fn command_with_timeout(
+            &self,
+            method: &str,
+            params: Value,
+            timeout: Duration,
+        ) -> Result<Value, String> {
             let mut state = self.0.lock().map_err(|_| "pipe poisoned")?;
             let session = state
                 .main_session
@@ -286,7 +317,7 @@ mod probe {
                 .set_nonblocking(false)
                 .map_err(|e| e.to_string())?;
             let result = (|| {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + timeout;
                 let mut buffer = state.observed.clone();
                 let mut prefix_already_delivered = buffer.len();
                 loop {
@@ -312,7 +343,18 @@ mod probe {
                         .set_read_timeout(Some(remaining))
                         .map_err(|e| e.to_string())?;
                     let mut chunk = [0u8; 65536];
-                    let count = state.reader.read(&mut chunk).map_err(|e| e.to_string())?;
+                    let count = match state.reader.read(&mut chunk) {
+                        Ok(count) => count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
                     if count == 0 {
                         return Err("Chrome closed the readback pipe".into());
                     }
@@ -372,15 +414,24 @@ mod probe {
             origin: &str,
             deadline: u64,
         ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-            self.driver
-                .snapshot_classified(context, mode, epoch, origin, deadline)
+            let result = self
+                .driver
+                .snapshot_classified(context, mode, epoch, origin, deadline);
+            if let Err(error) = &result {
+                eprintln!("SNAPSHOT DRIVER ERROR: {error:?}");
+            }
+            result
         }
         fn frame_documents(
             &mut self,
             context: &str,
             deadline: u64,
         ) -> Result<Vec<FrameDocument>, NavigationDriveError> {
-            self.driver.frame_documents(context, deadline)
+            let result = self.driver.frame_documents(context, deadline);
+            if let Err(error) = &result {
+                eprintln!("FRAME DRIVER ERROR: {error:?}");
+            }
+            result
         }
         fn set_read_frames(
             &mut self,
@@ -646,6 +697,7 @@ mod probe {
         navigate_only: bool,
         headed: bool,
         click_fixture: bool,
+        busy_fixture: bool,
         outcomes: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(), String> {
         let page = Page::start()?;
@@ -697,6 +749,8 @@ mod probe {
             queued: Default::default(),
             trace: Default::default(),
             history: Vec::new(),
+            issued_at: Default::default(),
+            timings: Vec::new(),
         })));
         let config = BrowserConfig {
             executable_path: None,
@@ -744,7 +798,9 @@ mod probe {
             )])),
         );
         let focus = headed.then(|| FocusWatch::start(scratch.0.clone()));
-        let result = if click_fixture {
+        let result = if busy_fixture {
+            busy_fixture::exercise(&planes, &pipe, &page.origin()).await
+        } else if click_fixture {
             click_fixture::exercise(&planes, &pipe, &page.origin()).await
         } else {
             exercise(

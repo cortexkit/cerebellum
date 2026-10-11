@@ -130,6 +130,8 @@ pub struct CdpResponse {
     pub session_id: Option<String>,
     pub result: Option<Map<String, Value>>,
     pub error: Option<Map<String, Value>>,
+    /// A validated late response to a command whose caller stopped waiting.
+    pub abandoned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,10 +256,16 @@ impl IdentityMap {
 pub struct CdpTransport {
     next_id: u64,
     pending: BTreeMap<u64, Pending>,
-    completed: BTreeMap<u64, ()>,
+    completed: BTreeMap<u64, Completion>,
     events: VecDeque<CdpEvent>,
     event_limit: usize,
     closed: bool,
+}
+
+#[derive(Debug)]
+enum Completion {
+    Received,
+    Abandoned { session_id: Option<String> },
 }
 
 impl Default for CdpTransport {
@@ -289,6 +297,18 @@ impl CdpTransport {
     }
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+    /// Stop waiting without closing the connection. Retain correlation and
+    /// session identity so only this request's late response can be discarded.
+    pub fn abandon_command(&mut self, id: u64) {
+        if let Some(pending) = self.pending.remove(&id) {
+            self.completed.insert(
+                id,
+                Completion::Abandoned {
+                    session_id: pending.command.session_id,
+                },
+            );
+        }
     }
     pub fn queued_event_len(&self) -> usize {
         self.events.len()
@@ -393,15 +413,21 @@ impl CdpTransport {
         if id == 0 || id > MAX_SAFE_INTEGER {
             return Err(CdpError::ProtocolFailure("cdp response id is out of range"));
         }
-        if self.completed.contains_key(&id) {
-            return Err(CdpError::DuplicateResponseId(id));
-        }
-        let pending = self
-            .pending
-            .get(&id)
-            .ok_or(CdpError::UnknownResponseId(id))?;
+        let (expected_session, abandoned) = match self.completed.get(&id) {
+            Some(Completion::Received) => return Err(CdpError::DuplicateResponseId(id)),
+            Some(Completion::Abandoned { session_id }) => (session_id, true),
+            None => (
+                &self
+                    .pending
+                    .get(&id)
+                    .ok_or(CdpError::UnknownResponseId(id))?
+                    .command
+                    .session_id,
+                false,
+            ),
+        };
         let session_id = parse_optional_string(object.get("sessionId"))?;
-        if session_id != pending.command.session_id {
+        if &session_id != expected_session {
             return Err(CdpError::SessionMismatch);
         }
         let result = match object.get("result") {
@@ -420,12 +446,13 @@ impl CdpTransport {
             ));
         }
         self.pending.remove(&id);
-        self.completed.insert(id, ());
+        self.completed.insert(id, Completion::Received);
         Ok(CdpResponse {
             id,
             session_id,
             result,
             error,
+            abandoned,
         })
     }
 
@@ -670,5 +697,50 @@ mod tests {
             parse_json_message(&[0xff]),
             Err(CdpError::InvalidUtf8)
         ));
+    }
+    #[test]
+    fn abandoned_commands_release_capacity_and_validate_late_replies() {
+        let mut transport = CdpTransport::new();
+        let now = Instant::now();
+        let command = transport
+            .issue_command(
+                "Accessibility.getRootAXNode",
+                None,
+                Some("page".into()),
+                now,
+            )
+            .unwrap();
+        transport.abandon_command(command.id);
+        assert_eq!(transport.pending_len(), 0);
+        assert!(!transport.is_closed());
+        assert!(transport.expire(now + COMMAND_TIMEOUT).is_empty());
+        let wrong_session = serde_json::to_vec(
+            &serde_json::json!({"id":command.id,"sessionId":"other","result":{}}),
+        )
+        .unwrap();
+        assert_eq!(
+            transport.take_response(&wrong_session),
+            Err(CdpError::SessionMismatch)
+        );
+        // Use a fresh transport because a session mismatch correctly closes it.
+        let mut transport = CdpTransport::new();
+        let command = transport
+            .issue_command(
+                "Accessibility.getRootAXNode",
+                None,
+                Some("page".into()),
+                now,
+            )
+            .unwrap();
+        transport.abandon_command(command.id);
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"id":command.id,"sessionId":"page","result":{}}),
+        )
+        .unwrap();
+        assert!(transport.take_response(&bytes).unwrap().abandoned);
+        assert_eq!(
+            transport.take_response(&bytes),
+            Err(CdpError::DuplicateResponseId(command.id))
+        );
     }
 }
