@@ -12,7 +12,7 @@
 //! Lengths above [`MAX_FRAME_BYTES`] are rejected before allocating the body.
 //! The host relays `message` without interpreting the extension protocol;
 //! extension messages carry their own invocation id and server-assigned epoch.
-//! Chrome native messaging has a different, little-endian length prefix and a
+//! Chrome native messaging has a different, native-endian length prefix and a
 //! 1 MiB host-to-extension cap: this socket codec is NOT that stdio codec.
 //!
 //! The server socket is `cortexkit_run_dir()/cerebellum/user-browser.sock`,
@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::io::{self, Read, Write};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -65,6 +66,47 @@ pub enum Frame {
 /// depending on an async runtime in the native host's protocol crate.
 pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(frame).map_err(invalid_data)?;
+    encode_body(body)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RelayTag {
+    Relay,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelay<Message> {
+    #[serde(rename = "type")]
+    tag: RelayTag,
+    message: Message,
+}
+
+/// Encode the same relay envelope as [`Frame::Relay`] without converting its
+/// message into a Value. A transport can preserve number precision, key order
+/// and internal whitespace while leaving action interpretation to the server.
+pub fn encode_raw_relay(message: &RawValue) -> io::Result<Vec<u8>> {
+    let body = serde_json::to_vec(&RawRelay {
+        tag: RelayTag::Relay,
+        message,
+    })
+    .map_err(invalid_data)?;
+    encode_body(body)
+}
+
+/// Decode only a relay envelope, retaining the original JSON value bytes.
+/// Control frames and unknown envelope fields are refused. Unlike an internally
+/// tagged enum, this direct struct decoder does not buffer the message as Value.
+pub fn decode_raw_relay_body(body: &[u8]) -> io::Result<Box<RawValue>> {
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(invalid_data("socket frame exceeds 16 MiB"));
+    }
+    let relay: RawRelay<Box<RawValue>> = serde_json::from_slice(body).map_err(invalid_data)?;
+    Ok(relay.message)
+}
+
+fn encode_body(body: Vec<u8>) -> io::Result<Vec<u8>> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(invalid_data("socket frame exceeds 16 MiB"));
     }
@@ -90,15 +132,43 @@ pub fn checked_length(prefix: [u8; 4]) -> io::Result<usize> {
 }
 
 pub fn read_frame(reader: &mut impl Read) -> io::Result<Frame> {
+    let body = read_body(reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing socket frame"))?;
+    decode_body(&body)
+}
+
+/// Read one raw relay, returning None only for EOF between complete frames.
+/// Truncated prefixes and bodies remain errors rather than clean disconnects.
+pub fn read_raw_relay(reader: &mut impl Read) -> io::Result<Option<Box<RawValue>>> {
+    read_body(reader)?
+        .map(|body| decode_raw_relay_body(&body))
+        .transpose()
+}
+
+fn read_body(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut prefix = [0; 4];
-    reader.read_exact(&mut prefix)?;
+    loop {
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    reader.read_exact(&mut prefix[1..])?;
     let mut body = vec![0; checked_length(prefix)?];
     reader.read_exact(&mut body)?;
-    decode_body(&body)
+    Ok(Some(body))
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> io::Result<()> {
     writer.write_all(&encode(frame)?)?;
+    writer.flush()
+}
+
+/// Write a bounded raw relay with the shared socket length prefix.
+pub fn write_raw_relay(writer: &mut impl Write, message: &RawValue) -> io::Result<()> {
+    writer.write_all(&encode_raw_relay(message)?)?;
     writer.flush()
 }
 
@@ -156,5 +226,91 @@ mod tests {
         );
         assert!(decode_body(br#"{"type":"host_hello","protocol":1,"extension_origin":"x","parent":{"pid":1,"start_time_micros":2,"team_id":null,"probe_cdhash":null,"extra":true}}"#).is_err());
         assert!(read_frame(&mut [0, 0, 0, 2, b'{'].as_slice()).is_err());
+    }
+
+    #[test]
+    fn raw_and_value_relay_codecs_are_wire_compatible() {
+        for message in [
+            serde_json::json!({"opaque": [1, "λ", true, null]}),
+            serde_json::json!([1.5, 18446744073709551615_u64]),
+            serde_json::json!("text"),
+            serde_json::json!(null),
+        ] {
+            let raw = RawValue::from_string(serde_json::to_string(&message).unwrap()).unwrap();
+            let frame = Frame::Relay { message };
+            let raw_wire = encode_raw_relay(&raw).unwrap();
+            let value_wire = encode(&frame).unwrap();
+            assert_eq!(raw_wire, value_wire);
+            assert_eq!(read_frame(&mut raw_wire.as_slice()).unwrap(), frame);
+            assert_eq!(
+                read_raw_relay(&mut value_wire.as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .get(),
+                raw.get()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_relay_preserves_precision_order_and_internal_whitespace() {
+        let source = r#"{ "z": 1.234567890123456789, "a": [true, null], "text": "café" }"#;
+        let raw = RawValue::from_string(source.into()).unwrap();
+        let wire = encode_raw_relay(&raw).unwrap();
+        let envelope = format!(r#"{{"type":"relay","message":{source}}}"#);
+        assert_eq!(&wire[..4], &(envelope.len() as u32).to_be_bytes());
+        assert_eq!(&wire[4..], envelope.as_bytes());
+        assert_eq!(decode_raw_relay_body(&wire[4..]).unwrap().get(), source);
+    }
+
+    #[test]
+    fn raw_relay_refuses_unknown_fields_and_control_frames() {
+        for body in [
+            br#"{"type":"relay","message":{},"extra":true}"#.as_slice(),
+            br#"{"type":"relay","type":"relay","message":{}}"#.as_slice(),
+            br#"{"type":"host_accepted","protocol":1,"epoch":2}"#.as_slice(),
+            br#"{"type":"relay"}"#.as_slice(),
+            br#"{"type":"relay","message":not_json}"#.as_slice(),
+        ] {
+            assert_eq!(
+                decode_raw_relay_body(body).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn raw_relay_eof_truncation_and_size_limits_match_socket_framing() {
+        assert!(read_raw_relay(&mut [].as_slice()).unwrap().is_none());
+        assert_eq!(
+            read_frame(&mut [].as_slice()).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        for bytes in [vec![0], vec![0, 0, 0], vec![0, 0, 0, 2, b'{']] {
+            assert_eq!(
+                read_raw_relay(&mut bytes.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        let prefix = ((MAX_FRAME_BYTES + 1) as u32).to_be_bytes();
+        assert_eq!(
+            read_raw_relay(&mut prefix.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let oversized_json = format!("\"{}\"", "x".repeat(MAX_FRAME_BYTES));
+        let raw = RawValue::from_string(oversized_json).unwrap();
+        assert_eq!(
+            encode_raw_relay(&raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_raw_relay_body(raw.get().as_bytes())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut output = Vec::new();
+        assert!(write_raw_relay(&mut output, &raw).is_err());
+        assert!(output.is_empty());
     }
 }

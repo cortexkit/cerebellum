@@ -8,7 +8,7 @@ description = "Small shared socket contract for cerebellum and its Chrome native
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [dev-dependencies]
 sha2 = { workspace = true }

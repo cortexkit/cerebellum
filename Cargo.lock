@@ -157,6 +157,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerebellum-native-host"
+version = "0.1.0"
+dependencies = [
+ "cerebellum-bridge-protocol",
+ "cerebellum-core",
+ "cerebellum-macos",
+ "cortexkit-paths",
+ "cortexkit-test-support",
+ "serde_json",
+]
+
+[[package]]
 name = "cerebellum-windows"
 version = "0.1.0"
 dependencies = [
