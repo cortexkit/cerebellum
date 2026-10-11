@@ -10,6 +10,9 @@
 //! 20,000 DOM rows, streaming updates and a blocked renderer, then checks that
 //! idle snapshots and text-row clicks still work on the same connection.
 //!
+//! `--timeline-fixture` measures snapshots with a virtualized list, a service
+//! worker, a large DOM and site-isolated loopback iframes, including frame churn.
+//!
 //! `--stable-refs` checks a 40-dropdown loopback page and compares the bytes
 //! read for four choices using full-region snapshots versus narrow filters.
 
@@ -38,7 +41,9 @@ async fn main() {
     let headed = args.iter().any(|arg| arg == "--headed");
     let click_fixture = args.iter().any(|arg| arg == "--click-fixture");
     let stable_refs = args.iter().any(|arg| arg == "--stable-refs");
-    let busy_fixture = args.iter().any(|arg| arg == "--busy-fixture");
+    let busy_fixture = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--busy-fixture" | "--timeline-fixture"));
     let mut outcomes = std::collections::BTreeMap::new();
     let mut failures = 0;
     for index in 1..=runs {
@@ -115,6 +120,9 @@ mod probe {
     mod busy_fixture {
         include!("support/browser_busy_fixture.rs");
     }
+    mod timeline_fixture {
+        include!("support/browser_timeline_fixture.rs");
+    }
 
     const TOP: &str = r#"<!doctype html><meta charset="utf-8"><title>Typing probe</title>
 <label>Plain<input id="plain" aria-label="Probe plain" value="existing"></label>
@@ -151,22 +159,31 @@ mod probe {
                     let mut request = [0u8; 4096];
                     let count = stream.read(&mut request).unwrap_or(0);
                     let request = String::from_utf8_lossy(&request[..count]);
-                    let body = if request.starts_with("GET /frame ") {
-                        CHILD
-                    } else if request.starts_with("GET /click ") {
-                        click_fixture::HTML
-                    } else if request.starts_with("GET /busy ") {
-                        busy_fixture::HTML
-                    } else if request.starts_with("GET /ref-frame") {
-                        dropdown_fixture::CHILD
-                    } else if request.starts_with("GET /dropdowns ") {
-                        dropdown_fixture::HTML
-                    } else if request.starts_with("GET /away ") {
-                        "<!doctype html><title>Away</title><p>Another document</p>"
+                    let (body, content_type) = if request.starts_with("GET /timeline-worker.js ") {
+                        (timeline_fixture::WORKER, "application/javascript")
+                    } else if request.starts_with("GET /timeline-frame") {
+                        (timeline_fixture::CHILD, "text/html; charset=utf-8")
+                    } else if request.starts_with("GET /timeline ") {
+                        (timeline_fixture::HTML, "text/html; charset=utf-8")
                     } else {
-                        TOP
+                        let body = if request.starts_with("GET /frame ") {
+                            CHILD
+                        } else if request.starts_with("GET /click ") {
+                            click_fixture::HTML
+                        } else if request.starts_with("GET /busy ") {
+                            busy_fixture::HTML
+                        } else if request.starts_with("GET /ref-frame") {
+                            dropdown_fixture::CHILD
+                        } else if request.starts_with("GET /dropdowns ") {
+                            dropdown_fixture::HTML
+                        } else if request.starts_with("GET /away ") {
+                            "<!doctype html><title>Away</title><p>Another document</p>"
+                        } else {
+                            TOP
+                        };
+                        (body, "text/html; charset=utf-8")
                     };
-                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     let _ = stream.write_all(response.as_bytes());
                 }
             });
@@ -727,7 +744,7 @@ mod probe {
         } else {
             "--headless=new"
         };
-        let args: Vec<OsString> = [
+        let mut args: Vec<OsString> = [
             first_arg.to_string(),
             "--remote-debugging-pipe".into(),
             "--no-first-run".into(),
@@ -738,6 +755,9 @@ mod probe {
         .into_iter()
         .map(OsString::from)
         .collect();
+        if std::env::args().any(|arg| arg == "--timeline-fixture") {
+            args.push(OsString::from("--site-per-process"));
+        }
         let (child_commands, writer) = UnixStream::pair().map_err(|e| e.to_string())?;
         let (reader, child_responses) = UnixStream::pair().map_err(|e| e.to_string())?;
         let child = cerebellum_macos::spawn_barred(
@@ -814,7 +834,11 @@ mod probe {
         let result = if stable_refs {
             dropdown_fixture::exercise(&planes, &pipe, &page.origin()).await
         } else if busy_fixture {
-            busy_fixture::exercise(&planes, &pipe, &page.origin()).await
+            if std::env::args().any(|arg| arg == "--timeline-fixture") {
+                timeline_fixture::exercise(&planes, &pipe, &page.origin()).await
+            } else {
+                busy_fixture::exercise(&planes, &pipe, &page.origin()).await
+            }
         } else if click_fixture {
             click_fixture::exercise(&planes, &pipe, &page.origin()).await
         } else {
