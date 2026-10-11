@@ -637,7 +637,9 @@ pub fn withdraw_answer(snapshot: &CallSnapshot) -> Value {
         // call to run later, so it is guaranteed never to run.
         CallState::Asked => json!({"answer": "withdrawn"}),
         CallState::Replied => match snapshot.reply.as_ref().and_then(CachedReply::result) {
-            Some(result) => json!({"answer": "completed", "result": result}),
+            Some(result) => {
+                json!({"answer": "completed", "result": result, "result_retained": true})
+            }
             None => json!({
                 "answer": "completed",
                 "outcome": snapshot.outcome,

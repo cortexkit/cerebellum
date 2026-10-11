@@ -13,7 +13,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let attachment = self
             .attachment
             .clone()
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))?;
         self.configure_frame_session(&attachment.session_id, deadline, &mut clock)?;
         let tree = self.command(
             "Page.getFrameTree",
@@ -26,11 +26,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let mut documents = Vec::new();
         self.collect_frame_documents(
             tree.get("frameTree")
-                .ok_or(NavigationDriveError::CdpFailure)?,
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?,
             None,
             &attachment.session_id,
             &mut documents,
-        )?;
+        )
+        .map_err(|error| error.at_step("Page.getFrameTree"))?;
         // Page.getFrameTree on the parent can omit descendants of an OOPIF.
         let mut queried = HashSet::new();
         // Configuring a child recursively auto-attaches its own OOPIFs. Drain
@@ -47,7 +48,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 break;
             };
             if queried.len() >= 128 {
-                return Err(NavigationDriveError::CdpFailure);
+                return Err(NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"));
             }
             self.configure_frame_session(&session, deadline, &mut clock)?;
             queried.insert(session.clone());
@@ -61,16 +62,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             )?;
             let root = tree
                 .get("frameTree")
-                .ok_or(NavigationDriveError::CdpFailure)?;
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
             let id = root
                 .pointer("/frame/id")
                 .and_then(Value::as_str)
-                .ok_or(NavigationDriveError::CdpFailure)?;
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
             let parent = documents
                 .iter()
                 .find(|d| d.frame_id == id)
                 .and_then(|d| d.parent_id.clone());
-            self.collect_frame_documents(root, parent.as_deref(), &session, &mut documents)?;
+            self.collect_frame_documents(root, parent.as_deref(), &session, &mut documents)
+                .map_err(|error| error.at_step("Page.getFrameTree"))?;
         }
         let ancestry = documents.clone();
         documents.sort_by_key(|d| {
@@ -288,13 +290,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let allowed = self
             .read_frames
             .take()
-            .ok_or(NavigationDriveError::CdpFailure)?;
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
         let before = self.frame_documents.clone();
+        let mut omitted_frames = HashSet::new();
         let result = (|| {
             let main = before
                 .iter()
                 .find(|f| f.parent_id.is_none())
-                .ok_or(NavigationDriveError::CdpFailure)?;
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
             self.active_frame = Some(main.clone());
             let epoch = classification.map(|c| c.0);
             let mut observation = self.snapshot_with_clock(
@@ -308,6 +311,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 reference.frame_document = Some(main.clone());
             }
             for frame in before.iter().filter(|f| f.parent_id.is_some()) {
+                if frame
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| omitted_frames.contains(parent))
+                {
+                    omitted_frames.insert(frame.frame_id.clone());
+                    continue;
+                }
                 let readable = allowed.contains(frame);
                 if readable
                     && (observation.records.len() >= MAX_AX_NODES
@@ -322,30 +333,40 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_ref()
                     .is_some_and(|id| !allowed.iter().any(|p| &p.frame_id == id))
                 {
+                    omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 }
                 let parent = frame
                     .parent_id
                     .as_ref()
                     .and_then(|id| before.iter().find(|f| &f.frame_id == id))
-                    .ok_or(NavigationDriveError::CdpFailure)?;
+                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
                 let deadline = clock.now() + Duration::from_millis(deadline_ms);
                 let params = serde_json::json!({"frameId":frame.frame_id})
                     .as_object()
                     .unwrap()
                     .clone();
-                let owner = self.command(
+                let owner = match self.command(
                     "DOM.getFrameOwner",
                     Some(params),
                     Some(parent.session_id.clone()),
                     deadline,
                     None,
                     clock,
-                )?;
+                ) {
+                    Ok(owner) => owner,
+                    Err(NavigationDriveError::NodeUnavailable { .. }) => {
+                        observation.ax_truncated = true;
+                        observation.refs_truncated = true;
+                        omitted_frames.insert(frame.frame_id.clone());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let backend = owner
                     .get("backendNodeId")
                     .and_then(Value::as_u64)
-                    .ok_or(NavigationDriveError::CdpFailure)?;
+                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getFrameOwner"))?;
                 let owner_ref = observation
                     .refs
                     .iter()
@@ -369,17 +390,23 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         }
                         observation.facts.remove(&owner_ref);
                     }
+                    omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 }
-                let owner_index = owner_ref
-                    .as_ref()
-                    .and_then(|r| {
-                        observation
-                            .records
-                            .iter()
-                            .position(|n| n.reference.as_ref() == Some(r))
-                    })
-                    .ok_or(NavigationDriveError::CdpFailure)?;
+                let owner_index = owner_ref.as_ref().and_then(|r| {
+                    observation
+                        .records
+                        .iter()
+                        .position(|n| n.reference.as_ref() == Some(r))
+                });
+                let Some(owner_index) = owner_index else {
+                    // A hidden or replaced iframe has no visible owner to insert
+                    // its content under. Skip its subtree rather than lose the page.
+                    observation.ax_truncated = true;
+                    observation.refs_truncated = true;
+                    omitted_frames.insert(frame.frame_id.clone());
+                    continue;
+                };
                 let depth = observation.records[owner_index].depth + 1;
                 self.active_frame = Some(frame.clone());
                 let mut child = self.snapshot_with_clock(
@@ -436,7 +463,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     if let Some(reference) = &mut record.reference {
                         *reference = names
                             .get(reference)
-                            .ok_or(NavigationDriveError::CdpFailure)?
+                            .ok_or_else(|| {
+                                NavigationDriveError::CdpFailure
+                                    .at_step("Accessibility.getChildAXNodes")
+                            })?
                             .clone();
                     }
                 }
@@ -462,8 +492,31 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             // Re-read browser identities, not just URLs: a frame can navigate
             // away and back to its original origin while a read is in flight.
             let after = self.frame_documents(context, deadline_ms)?;
-            if before != after {
-                let changed = before.iter().find(|frame| !after.contains(frame));
+            // No content was read from omitted frames. Their disappearance or
+            // navigation cannot invalidate content from the retained documents.
+            // Descendants of an omitted frame are also outside this observation.
+            while let Some(frame) = after.iter().find(|frame| {
+                !omitted_frames.contains(&frame.frame_id)
+                    && frame
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|parent| omitted_frames.contains(parent))
+            }) {
+                omitted_frames.insert(frame.frame_id.clone());
+            }
+            let retained_before: Vec<_> = before
+                .iter()
+                .filter(|frame| !omitted_frames.contains(&frame.frame_id))
+                .collect();
+            let retained_after: Vec<_> = after
+                .iter()
+                .filter(|frame| !omitted_frames.contains(&frame.frame_id))
+                .collect();
+            if retained_before != retained_after {
+                let changed = retained_before
+                    .iter()
+                    .copied()
+                    .find(|frame| !retained_after.contains(frame));
                 let authorized_origin = changed
                     .map(|frame| frame.origin.clone())
                     .unwrap_or_else(|| main.origin.clone());

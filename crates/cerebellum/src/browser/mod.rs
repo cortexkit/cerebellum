@@ -262,6 +262,9 @@ pub enum BrowserError {
         step: String,
         command_sent: bool,
     },
+    CdpStepFailure {
+        step: String,
+    },
     BrowserCrashed,
     Internal {
         reason_code: JournalReasonCode,
@@ -300,7 +303,7 @@ impl BrowserError {
             Self::TypeNotReady { .. } => "type_not_ready",
             Self::CommandTimeout { .. } => "command_timeout",
             Self::BrowserCrashed => "browser_crashed",
-            Self::Internal { .. } => "internal_error",
+            Self::Internal { .. } | Self::CdpStepFailure { .. } => "internal_error",
             Self::SessionStateUnavailable => "internal_failure",
         }
     }
@@ -317,6 +320,7 @@ impl BrowserError {
             Self::NavigateNotReady { navigation_sent: true, .. } => "Page.navigate was sent but its response did not arrive before the deadline; navigation may have completed; snapshot first to inspect the current page, then retry only if needed",
             Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
             Self::CommandTimeout { .. } => "the CDP step in detail.step exceeded its deadline; let the page settle, then retry snapshot; inspect the page before retrying input because earlier input may have reached it",
+            Self::CdpStepFailure { .. } => "the CDP step in detail.step could not supply a valid response; let the page settle, then retry snapshot; if it persists, report detail.reason_code and detail.step; do not assume earlier input completed",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }
@@ -433,6 +437,7 @@ impl BrowserError {
             Self::CommandTimeout { step, command_sent } => {
                 json!({"reason_code":"command_deadline_expired","step":step,"command_sent":command_sent})
             }
+            Self::CdpStepFailure { step } => json!({"reason_code":"cdp_failure","step":step}),
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::PageChangedSinceSnapshot {
                 snapshot_origin,
@@ -3041,7 +3046,9 @@ impl BrowserPlane {
                 zoom,
                 filters,
                 max_bytes,
-                frames_omitted > 0 || (kind != SnapshotKind::DomFull && observation.ax_truncated),
+                // Omitted AX subtrees or embedded documents make the
+                // observation partial even when DOM-full text was requested.
+                frames_omitted > 0 || observation.ax_truncated,
                 observation.refs_truncated,
                 Some(source_document),
             )
@@ -5770,6 +5777,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::BrowserLaunchPending
         | BrowserError::HumanInControl { .. }
         | BrowserError::Internal { .. }
+        | BrowserError::CdpStepFailure { .. }
         | BrowserError::SessionStateUnavailable
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
@@ -5836,6 +5844,10 @@ fn map_navigation_drive_error(error: crate::browser_session::NavigationDriveErro
             step: method,
             command_sent,
         },
+        crate::browser_session::NavigationDriveError::CdpStepFailure { method }
+        | crate::browser_session::NavigationDriveError::NodeUnavailable { method } => {
+            BrowserError::CdpStepFailure { step: method }
+        }
         crate::browser_session::NavigationDriveError::CdpFailure
         | crate::browser_session::NavigationDriveError::CommandFailed { .. } => {
             BrowserError::Internal {

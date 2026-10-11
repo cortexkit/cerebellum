@@ -45,6 +45,9 @@ mod consent_relay;
 #[path = "support/browser_stable_refs.rs"]
 mod stable_refs;
 
+#[path = "support/browser_queue.rs"]
+mod browser_queue;
+
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -1025,11 +1028,11 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
     }
 
-    // A name this build genuinely does not have stays unknown_method, which is
-    // the contrast that makes the distinction worth drawing at all.
+    // An invented name returns unknown_tool, unlike a known capability that
+    // this build withholds as capability_not_admitted.
     let invented = invoke(&planes, 18, "browser.teleport", json!({})).await;
     let invented: Value = serde_json::from_slice(&invented.body).unwrap();
-    assert_eq!(invented["code"], "unknown_method", "{invented}");
+    assert_eq!(invented["code"], "unknown_tool", "{invented}");
 
     // browser.screenshot is admitted, so it must REACH the handler rather than
     // be refused by name. With no grant installed it is refused by its
@@ -5176,8 +5179,8 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
     .await
     .expect("status must not wait on consent");
     assert_eq!(status.header.ty, FrameType::Response);
-    // Status reads the session table; also probe the CDP serialization lane so
-    // future calls on this conversation cannot be stalled behind the question.
+    // Status reads the session table. The inner CDP lane is also released:
+    // consent holds only the outer call queue, not access needed by idle sweeps.
     let lane = tokio::time::timeout(
         Duration::from_secs(1),
         planes.browser.lane_for_test("test-session"),
@@ -5532,7 +5535,7 @@ async fn the_same_call_key_from_two_principals_is_two_records() {
     let mine = withdraw(&planes, &tx, &mut rx, 9, 804, "shared-key").await;
     assert_eq!(
         body(&mine),
-        json!({"answer": "completed", "result": body(&first)})
+        json!({"answer": "completed", "result": body(&first), "result_retained": true})
     );
     let theirs = withdraw(&planes, &tx, &mut rx, 10, 805, "shared-key").await;
     assert_eq!(
@@ -5567,7 +5570,7 @@ async fn withdrawing_a_completed_call_answers_its_result_identically_on_every_re
     assert_eq!(first.header.ty, FrameType::Response);
     assert_eq!(
         body(&first),
-        json!({"answer": "completed", "result": body(&reply)})
+        json!({"answer": "completed", "result": body(&reply), "result_retained": true})
     );
     let repeat = withdraw(&planes, &tx, &mut rx, 9, 811, "pf:done").await;
     assert_eq!(repeat.body, first.body, "a repeat answered differently");
@@ -5681,13 +5684,14 @@ async fn withdrawing_an_unknown_key_is_unknown_call() {
 }
 
 #[tokio::test]
-async fn a_third_principal_is_refused_withdrawal() {
+async fn a_third_principal_learns_nothing_about_another_carriers_key() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_second_principal(&planes).await;
     let (tx, mut rx) = mpsc::channel(8);
     allowed_keyed_navigation(&planes, &tx, &mut rx, "pf:not-yours").await;
     let refused = withdraw(&planes, &tx, &mut rx, 10, 818, "pf:not-yours").await;
-    assert_eq!(error_code(&refused), "withdraw_not_permitted");
+    assert_eq!(refused.header.ty, FrameType::Response);
+    assert_eq!(body(&refused), json!({"answer":"unknown_call"}));
 }
 
 #[tokio::test]
@@ -5714,7 +5718,8 @@ async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() 
         )
         .unwrap();
         let reply = exchange(&planes, &tx, &mut rx, frame).await;
-        assert_eq!(body(&reply)["outcome"], "invalid_request");
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(body(&reply)["code"], "invalid_request");
         assert_eq!(body(&reply)["detail"]["field"], "call_key");
     }
     let doubled = Frame::build_with_version(
@@ -6143,7 +6148,7 @@ async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
 }
 
 #[tokio::test]
-async fn an_owner_withdraw_without_a_carrier_is_an_invalid_request() {
+async fn an_owner_withdraw_without_a_carrier_is_carrier_required() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
         &planes,
@@ -6153,13 +6158,11 @@ async fn an_owner_withdraw_without_a_carrier_is_an_invalid_request() {
     )
     .await;
     let refused = withdraw(&planes, &tx, &mut rx, 11, 803, "br:1").await;
-    assert_eq!(body(&refused)["outcome"], "invalid_request");
-    assert_eq!(body(&refused)["detail"]["field"], "arguments.carrier");
-    assert_eq!(body(&refused)["detail"]["reason_code"], "missing_field");
+    assert_eq!(error_code(&refused), "withdraw_carrier_required");
 }
 
 #[tokio::test]
-async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
+async fn a_carrier_naming_another_carrier_is_carrier_mismatch() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(&planes, 13, reserved("aft"), Some(scope_stamp(4, true))).await;
     let refused = exchange(
@@ -6173,8 +6176,7 @@ async fn a_carrier_naming_another_carrier_is_an_invalid_request() {
         ),
     )
     .await;
-    assert_eq!(body(&refused)["outcome"], "invalid_request");
-    assert_eq!(body(&refused)["detail"]["field"], "arguments.carrier");
+    assert_eq!(error_code(&refused), "withdraw_carrier_mismatch");
     // The carrier itself naming its own label is its ordinary withdraw.
     let own = exchange(
         &planes,
@@ -6300,8 +6302,7 @@ async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
             ),
         )
         .await;
-        assert_eq!(body(&refused)["outcome"], "invalid_request", "{scope}");
-        assert_eq!(body(&refused)["detail"]["field"], "arguments.scope");
+        assert_eq!(error_code(&refused), "withdraw_scope_mismatch", "{scope}");
     }
 }
 

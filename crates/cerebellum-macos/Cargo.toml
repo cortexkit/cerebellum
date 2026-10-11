@@ -7,8 +7,12 @@ publish = false
 description = "Raw macOS framework readings for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
 
 [features]
+default = []
 # Exposes permission-skip helpers only when a dependent test target opts in.
 test-support = []
+# Acceptance probes only. release-build.sh binds the signing-topology revision,
+# which makes compilation reject this weaker parent identity in shipped builds.
+chrome-for-testing-parent-probe = []
 
 [lib]
 name = "cerebellum_macos"

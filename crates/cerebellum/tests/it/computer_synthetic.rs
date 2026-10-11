@@ -2029,7 +2029,7 @@ async fn a_keyed_type_resent_with_the_same_key_types_once_and_replays_the_reply(
     assert_eq!(record.state, CallState::Replied);
     assert_eq!(
         withdraw_answer(&record),
-        json!({"answer": "completed", "result": reply})
+        json!({"answer": "completed", "result": reply, "result_retained": true})
     );
 }
 

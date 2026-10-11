@@ -362,6 +362,14 @@ pub enum NavigationDriveError {
     StateUnavailable,
     ConnectorFailure,
     CdpFailure,
+    /// Protocol or response-shape failure attributed to the command being read.
+    CdpStepFailure {
+        method: String,
+    },
+    /// Chrome could no longer resolve a node or frame named by an earlier read.
+    NodeUnavailable {
+        method: String,
+    },
     /// A command exhausted its budget, independently of protocol integrity.
     CommandDeadline {
         method: String,
@@ -381,6 +389,19 @@ pub enum NavigationDriveError {
     NavigationFailed {
         error_text: String,
     },
+}
+
+impl NavigationDriveError {
+    pub(crate) fn at_step(self, method: &str) -> Self {
+        match self {
+            Self::CdpFailure | Self::CommandFailed { .. } => Self::CdpStepFailure {
+                method: method.to_string(),
+            },
+            // Keep the command name already attached to an error, and do not
+            // convert a deadline error into a protocol failure.
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3017,6 +3038,10 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
         NavigationDriveError::StateUnavailable => "browser session state unavailable".to_string(),
         NavigationDriveError::ConnectorFailure => "browser connector failure".to_string(),
         NavigationDriveError::CdpFailure => "browser CDP failure".to_string(),
+        NavigationDriveError::CdpStepFailure { method } => format!("browser CDP failure: {method}"),
+        NavigationDriveError::NodeUnavailable { method } => {
+            format!("browser node unavailable: {method}")
+        }
         NavigationDriveError::CommandDeadline {
             method,
             command_sent,

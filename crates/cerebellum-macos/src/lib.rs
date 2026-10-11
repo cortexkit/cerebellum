@@ -23,6 +23,15 @@
 //!
 //! Read anything added here as code that no continuous build can check.
 
+// release-build.sh sets CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION for the
+// compiler, even when its caller forwards feature flags. Those shipped builds
+// must exclude the probe's ad-hoc parent identity, which does not seal libraries.
+#[cfg(feature = "chrome-for-testing-parent-probe")]
+const _: () = assert!(
+    option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION").is_none(),
+    "chrome-for-testing-parent-probe is forbidden in attested release builds"
+);
+
 // The accessibility traversal is compiled for unit tests on every host, so its
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]
@@ -62,6 +71,8 @@ mod cursor_schedule;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{run_agent_cursor, OverlayEvent};
+#[cfg(target_os = "macos")]
+mod peer_attestation;
 #[cfg(target_os = "macos")]
 mod process_table;
 #[cfg(any(test, feature = "test-support"))]
@@ -155,6 +166,15 @@ pub use macos::{
 };
 #[cfg(any(target_os = "macos", test))]
 pub use manual_accessibility::{ManualAccessibility, ManualAccessibilityScope};
+#[cfg(target_os = "macos")]
+pub use peer_attestation::{
+    local_socket_peer_pid, parent_satisfies_chrome_requirement, peer_satisfies_requirement,
+    ProcessRequirementError, CHROME_PARENT_REQUIREMENT,
+};
+#[cfg(all(target_os = "macos", feature = "chrome-for-testing-parent-probe"))]
+pub use peer_attestation::{
+    parent_satisfies_chrome_for_testing_probe_requirement, CHROME_FOR_TESTING_PARENT_PROBE_VERSION,
+};
 #[cfg(target_os = "macos")]
 pub use process_table::{
     all_process_ids, host_name, process_arguments, process_executable_path, ProcessArguments,

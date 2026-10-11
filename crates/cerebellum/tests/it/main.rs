@@ -38,3 +38,5 @@ mod session_caller_admission;
 mod support;
 
 mod browser_focus;
+
+mod tool_catalog;

@@ -3,6 +3,25 @@ use std::sync::Mutex;
 
 const PRIVATE_NAME: &str = "private event payload not for durable storage";
 
+#[derive(Clone, Copy)]
+enum SnapshotFaultKind {
+    Error,
+    MissingResult,
+    BadResult,
+    MissingChild,
+    Gone { message: &'static str, code: i64 },
+    GoneAndNavigate,
+    Malformed,
+    WrongSession,
+    Detach,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotFault {
+    method: &'static str,
+    kind: SnapshotFaultKind,
+}
+
 struct FixturePipe {
     reads: VecDeque<Vec<u8>>,
     held: Option<Value>,
@@ -11,6 +30,13 @@ struct FixturePipe {
     hit_backend: u64,
     commands: Arc<Mutex<Vec<Value>>>,
     attachment: Option<AttachmentResponse>,
+    fault: Option<SnapshotFault>,
+    hidden_owner: bool,
+    child_session: bool,
+    churn_siblings: bool,
+    keep_hidden_frame: bool,
+    main_loader_changed: bool,
+    private_frames: bool,
 }
 
 struct AttachmentResponse {
@@ -67,14 +93,31 @@ impl CdpPipeIo for FixturePipe {
                 self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"navigation-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
                 json!({"frameId":"target-own","isDownload":true,"errorText":"net::ERR_ABORTED"})
             }
-            "Accessibility.getRootAXNode" => json!({"node":ax(1,1,"RootWebArea","Events",&[2])}),
+            "Accessibility.getRootAXNode" => {
+                json!({"node":ax(1,1,"RootWebArea","Events",if self.churn_siblings { &[2,4] } else { &[2] })})
+            }
             "Accessibility.getChildAXNodes" if command["params"]["id"] == "1" => {
                 let children = if self.large_fanout {
                     (100..20_100).collect::<Vec<_>>()
                 } else {
                     vec![3]
                 };
-                json!({"nodes":[ax(2,42,"generic","",&children)]})
+                let mut nodes = vec![ax(
+                    2,
+                    42,
+                    "generic",
+                    if self.churn_siblings {
+                        "Vanished row"
+                    } else {
+                        ""
+                    },
+                    &children,
+                )];
+                if self.churn_siblings {
+                    nodes[0]["properties"] = json!([{"name":"disabled","value":{"value":true}}]);
+                    nodes.push(ax(4, 99, "button", "Surviving sibling", &[]));
+                }
+                json!({"nodes":nodes})
             }
             "Accessibility.getChildAXNodes" => {
                 json!({"nodes":[ax(3,43,"StaticText","Event row",&[])]})
@@ -92,7 +135,30 @@ impl CdpPipeIo for FixturePipe {
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),
             "Page.getFrameTree" => {
-                json!({"frameTree":{"frame":{"id":"frame-main","loaderId":"loader-page","url":"https://requested.example/page","securityOrigin":"https://requested.example"}}})
+                let mut tree = json!({"frameTree":{"frame":{"id":"frame-main","loaderId":if self.main_loader_changed { "loader-new" } else { "loader-page" },"url":"https://requested.example/page","securityOrigin":"https://requested.example"}}});
+                if self.hidden_owner {
+                    tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"frame-child","loaderId":"child-loader","url":"https://embedded.example/frame","securityOrigin":"https://embedded.example"},"childFrames":[{"frame":{"id":"frame-grandchild","loaderId":"grandchild-loader","url":"https://nested.example/frame","securityOrigin":"https://nested.example"}}]}]);
+                    if self.private_frames {
+                        tree["frameTree"]["childFrames"][0]["frame"]["url"] =
+                            json!("http://127.0.0.1/admin");
+                        tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"] =
+                            json!("http://127.0.0.1");
+                    }
+                }
+                tree
+            }
+            "DOM.getFrameOwner" => {
+                if !self.keep_hidden_frame {
+                    self.hidden_owner = false;
+                }
+                json!({"backendNodeId":777})
+            }
+            "Target.setAutoAttach" => {
+                if self.child_session {
+                    self.child_session = false;
+                    self.queue(json!({"method":"Target.attachedToTarget","sessionId":"session-own","params":{"sessionId":"session-child","targetInfo":{"type":"iframe","targetId":"frame-child"}}}));
+                }
+                json!({})
             }
             "Page.getNavigationHistory" => {
                 json!({"currentIndex":0,"entries":[{"id":1,"url":"https://requested.example/page"}]})
@@ -121,6 +187,49 @@ impl CdpPipeIo for FixturePipe {
         let mut response = json!({"id":command["id"],"result":result});
         if let Some(session) = command.get("sessionId") {
             response["sessionId"] = session.clone();
+        }
+        if self.fault.is_some_and(|fault| {
+            fault.method == method
+                && (!matches!(fault.kind, SnapshotFaultKind::Gone { .. })
+                    || method != "Accessibility.getChildAXNodes"
+                    || command["params"]["id"] == "2")
+                && (!matches!(fault.kind, SnapshotFaultKind::Detach)
+                    || command["sessionId"] == "session-child")
+        }) {
+            let fault = self.fault.take().unwrap();
+            match fault.kind {
+                SnapshotFaultKind::Error => {
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] =
+                        json!({"code":-32602,"message":format!("Invalid ID {PRIVATE_NAME}")});
+                }
+                SnapshotFaultKind::MissingResult => {
+                    response.as_object_mut().unwrap().remove("result");
+                }
+                SnapshotFaultKind::BadResult => response["result"] = json!({}),
+                SnapshotFaultKind::MissingChild => response["result"] = json!({"nodes":[]}),
+                SnapshotFaultKind::Gone { message, code } => {
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] = json!({"code":code,"message":message});
+                }
+                SnapshotFaultKind::GoneAndNavigate => {
+                    self.main_loader_changed = true;
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] =
+                        json!({"code":-32000,"message":"Frame with the given id was not found."});
+                }
+                SnapshotFaultKind::WrongSession => response["sessionId"] = json!("wrong-session"),
+                SnapshotFaultKind::Malformed => {
+                    self.reads.push_back(b"{invalid-json}\0".to_vec());
+                    return Ok(());
+                }
+                SnapshotFaultKind::Detach => {
+                    self.queue(json!({"method":"Target.detachedFromTarget","sessionId":"session-own","params":{"sessionId":"session-child","targetId":"frame-child"}}));
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] =
+                        json!({"code":-32001,"message":"Session with given id not found."});
+                }
+            }
         }
         if let Some(held) = self.held.take() {
             self.queue(held);
@@ -162,6 +271,7 @@ impl CdpPipeIo for FixturePipe {
 struct FixtureProcess {
     driver: CdpNavigationDriver<FixturePipe>,
     read_document: bool,
+    read_frames: bool,
     refusal: Option<ClickDriveError>,
 }
 
@@ -197,6 +307,24 @@ impl OwnedBrowserProcess for FixtureProcess {
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         self.driver
             .snapshot_classified(context, kind, epoch, origin, deadline)
+    }
+    fn frame_documents(
+        &mut self,
+        context: &str,
+        deadline: u64,
+    ) -> Result<Vec<cerebellum::snapshot_store::FrameDocument>, NavigationDriveError> {
+        if self.read_frames {
+            self.driver.frame_documents(context, deadline)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    fn set_read_frames(
+        &mut self,
+        frames: Vec<cerebellum::snapshot_store::FrameDocument>,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver.set_read_frames(frames);
+        Ok(())
     }
     fn click_classified(
         &mut self,
@@ -236,6 +364,17 @@ async fn fixture(
     hit_backend: u64,
     refusal: Option<ClickDriveError>,
 ) -> (BrowserPlane, RouteIdentity, Arc<Mutex<Vec<Value>>>) {
+    fixture_with_fault(block_once, hit_backend, refusal, None, false, false).await
+}
+
+async fn fixture_with_fault(
+    block_once: Option<&'static str>,
+    hit_backend: u64,
+    refusal: Option<ClickDriveError>,
+    fault: Option<SnapshotFault>,
+    hidden_owner: bool,
+    read_frames: bool,
+) -> (BrowserPlane, RouteIdentity, Arc<Mutex<Vec<Value>>>) {
     let route = identity();
     let commands = Arc::new(Mutex::new(Vec::new()));
     let pipe = FixturePipe {
@@ -246,10 +385,19 @@ async fn fixture(
         hit_backend,
         commands: commands.clone(),
         attachment: None,
+        fault,
+        hidden_owner,
+        child_session: fault.is_some_and(|fault| matches!(fault.kind, SnapshotFaultKind::Detach)),
+        churn_siblings: fault
+            .is_some_and(|fault| matches!(fault.kind, SnapshotFaultKind::Gone { .. })),
+        keep_hidden_frame: hidden_owner && (fault.is_none() || block_once == Some("private_frame")),
+        main_loader_changed: false,
+        private_frames: block_once == Some("private_frame"),
     };
     let process = FixtureProcess {
         driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
-        read_document: block_once == Some("Page.getFrameTree"),
+        read_document: block_once == Some("Page.getFrameTree") || read_frames,
+        read_frames,
         refusal,
     };
     let plane = plane_with_process(&route, Box::new(process), 150)
@@ -495,10 +643,18 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
                 downloads: downloads.clone(),
                 denied: false,
             }),
+            fault: None,
+            hidden_owner: false,
+            child_session: false,
+            churn_siblings: false,
+            keep_hidden_frame: false,
+            main_loader_changed: false,
+            private_frames: false,
         };
         let process = FixtureProcess {
             driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
             read_document: false,
+            read_frames: false,
             refusal: None,
         };
         let plane = plane_with_process(&route, Box::new(process), 150)
@@ -555,5 +711,534 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
             commands[deny]["params"],
             json!({"behavior":"deny","eventsEnabled":true})
         );
+    }
+}
+async fn assert_snapshot_step_and_recovery(
+    fault: Option<SnapshotFault>,
+    hidden_owner: bool,
+    read_frames: bool,
+    step: &str,
+    mode: &str,
+) {
+    let (plane, route, _) =
+        fixture_with_fault(None, 42, None, fault, hidden_owner, read_frames).await;
+    let request = json!({"mode":mode});
+    let refused = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &request)
+        .await;
+    assert_eq!(refused["outcome"], "internal_error", "{step}: {refused}");
+    assert_eq!(refused["detail"]["reason_code"], "cdp_failure", "{refused}");
+    assert_eq!(refused["detail"]["step"], step, "{refused}");
+    assert!(refused["remedy"].as_str().unwrap().contains("detail.step"));
+    assert!(
+        refused.get("state_text").is_none(),
+        "failed capture leaked content: {refused}"
+    );
+    let export = plane.journal_export_for_test().await;
+    assert!(
+        !export.contains(PRIVATE_NAME),
+        "CDP error text leaked to journal: {export}"
+    );
+    if let Some(entry) = export
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|e| e["capability"] == "browser.snapshot")
+    {
+        assert_eq!(entry["outcome"], "internal_error", "{entry}");
+        assert_eq!(entry["detail"]["step"], step, "{entry}");
+    }
+    let recovered = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &request)
+        .await;
+    if fault.is_some_and(|fault| {
+        matches!(
+            fault.kind,
+            SnapshotFaultKind::MissingResult | SnapshotFaultKind::WrongSession
+        )
+    }) {
+        // A malformed envelope or a reply from another session closes the
+        // transport deliberately; naming its next command must not reconnect it.
+        assert_eq!(recovered["outcome"], "internal_error", "{recovered}");
+        assert_eq!(recovered["detail"]["reason_code"], "cdp_failure");
+        assert!(
+            recovered["detail"]["step"].as_str().is_some(),
+            "{recovered}"
+        );
+    } else {
+        assert_eq!(
+            recovered["outcome"], "ok",
+            "recovery after {step}: {recovered}"
+        );
+        assert!(recovered["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Event row"));
+    }
+}
+
+#[tokio::test]
+async fn snapshot_cdp_response_error_names_step_and_recovers() {
+    for step in [
+        "Target.createTarget",
+        "Target.attachToTarget",
+        "Target.setAutoAttach",
+        "Page.enable",
+        "Page.getNavigationHistory",
+        "Page.getFrameTree",
+        "Accessibility.enable",
+        "Accessibility.getRootAXNode",
+        "Accessibility.getChildAXNodes",
+        "DOM.getFrameOwner",
+        "DOM.getDocument",
+        "DOM.getOuterHTML",
+    ] {
+        let frames = matches!(
+            step,
+            "Target.setAutoAttach"
+                | "Page.enable"
+                | "Page.getNavigationHistory"
+                | "Page.getFrameTree"
+                | "DOM.getFrameOwner"
+        );
+        assert_snapshot_step_and_recovery(
+            Some(SnapshotFault {
+                method: step,
+                kind: SnapshotFaultKind::Error,
+            }),
+            step == "DOM.getFrameOwner",
+            frames,
+            step,
+            if step.starts_with("DOM.") {
+                "dom_full"
+            } else {
+                "ax"
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn snapshot_incomplete_cdp_results_name_the_producing_method() {
+    for kind in [
+        SnapshotFaultKind::MissingResult,
+        SnapshotFaultKind::BadResult,
+    ] {
+        for step in [
+            "Target.createTarget",
+            "Target.attachToTarget",
+            "Page.getNavigationHistory",
+            "Page.getFrameTree",
+            "Accessibility.getRootAXNode",
+            "Accessibility.getChildAXNodes",
+            "DOM.getFrameOwner",
+            "DOM.getDocument",
+            "DOM.getOuterHTML",
+        ] {
+            let frames = matches!(
+                step,
+                "Page.getNavigationHistory" | "Page.getFrameTree" | "DOM.getFrameOwner"
+            );
+            assert_snapshot_step_and_recovery(
+                Some(SnapshotFault { method: step, kind }),
+                step == "DOM.getFrameOwner",
+                frames,
+                step,
+                if step.starts_with("DOM.") {
+                    "dom_full"
+                } else {
+                    "ax"
+                },
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_protocol_decode_and_session_mismatch_name_the_waiting_method() {
+    for kind in [
+        SnapshotFaultKind::Malformed,
+        SnapshotFaultKind::WrongSession,
+    ] {
+        assert_snapshot_step_and_recovery(
+            Some(SnapshotFault {
+                method: "Accessibility.getRootAXNode",
+                kind,
+            }),
+            false,
+            false,
+            "Accessibility.getRootAXNode",
+            "ax",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn snapshot_hidden_iframe_owner_is_omitted_in_a_partial_observation() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let (plane, route, commands) = fixture_with_fault(None, 42, None, None, true, true).await;
+        let snapshot = plane
+            .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":mode}))
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], true, "{snapshot}");
+        assert_eq!(snapshot["refs_truncated"], true);
+        assert!(snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Event row"));
+        let commands = commands.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["method"] == "DOM.getFrameOwner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["method"] == "Accessibility.getRootAXNode")
+                .count(),
+            1,
+            "hidden child frame was captured"
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_detaching_child_session_names_page_enable() {
+    assert_snapshot_step_and_recovery(
+        Some(SnapshotFault {
+            method: "Page.enable",
+            kind: SnapshotFaultKind::Detach,
+        }),
+        false,
+        true,
+        "Page.enable",
+        "ax",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_cdp_failure_journal_keeps_step_without_error_text() {
+    let (plane, route, _) = fixture_with_fault(
+        None,
+        42,
+        None,
+        Some(SnapshotFault {
+            method: "Accessibility.getChildAXNodes",
+            kind: SnapshotFaultKind::Error,
+        }),
+        false,
+        false,
+    )
+    .await;
+    let refused = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+        .await;
+    assert_eq!(
+        refused["detail"]["step"], "Accessibility.getChildAXNodes",
+        "{refused}"
+    );
+    let export = plane.journal_export_for_test().await;
+    let entry = export
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|e| e["capability"] == "browser.snapshot")
+        .expect("dispatched snapshot must have a terminal journal entry");
+    assert_eq!(entry["outcome"], "internal_error");
+    assert_eq!(entry["detail"]["reason_code"], "cdp_failure");
+    assert_eq!(entry["detail"]["step"], "Accessibility.getChildAXNodes");
+    assert!(!export.contains(PRIVATE_NAME));
+}
+
+#[tokio::test]
+async fn snapshot_ax_declared_child_missing_names_get_child_ax_nodes() {
+    assert_snapshot_step_and_recovery(
+        Some(SnapshotFault {
+            method: "Accessibility.getChildAXNodes",
+            kind: SnapshotFaultKind::MissingChild,
+        }),
+        false,
+        false,
+        "Accessibility.getChildAXNodes",
+        "ax",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_dom_classification_error_keeps_observation_usable() {
+    for step in ["DOM.enable", "DOM.getFlattenedDocument"] {
+        let (plane, route, _) = fixture_with_fault(
+            None,
+            42,
+            None,
+            Some(SnapshotFault {
+                method: step,
+                kind: SnapshotFaultKind::Error,
+            }),
+            false,
+            false,
+        )
+        .await;
+        for _ in 0..2 {
+            let snapshot = plane
+                .dispatch(
+                    &route,
+                    BrowserCapability::Snapshot,
+                    &json!({"mode":"actionable"}),
+                )
+                .await;
+            assert_eq!(snapshot["outcome"], "ok", "{step}: {snapshot}");
+            assert!(snapshot["state_text"]
+                .as_str()
+                .unwrap()
+                .contains("Event row"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_disappearing_ax_node_omits_only_its_subtree_and_continues() {
+    for (message, code) in [
+        ("Invalid ID", -32602),
+        ("No node with given id found", -32000),
+        ("No node with given id", -32000),
+    ] {
+        for mode in ["actionable", "ax", "dom_full"] {
+            let (plane, route, commands) = fixture_with_fault(
+                None,
+                42,
+                None,
+                Some(SnapshotFault {
+                    method: "Accessibility.getChildAXNodes",
+                    kind: SnapshotFaultKind::Gone { message, code },
+                }),
+                false,
+                false,
+            )
+            .await;
+            let snapshot = plane
+                .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":mode}))
+                .await;
+            assert_eq!(snapshot["outcome"], "ok", "{message}/{mode}: {snapshot}");
+            assert_eq!(snapshot["truncated"], true, "{snapshot}");
+            assert_eq!(snapshot["refs_truncated"], true);
+            if mode != "dom_full" {
+                let text = snapshot["state_text"].as_str().unwrap();
+                assert!(text.contains("Events"));
+                assert!(
+                    text.contains("Surviving sibling"),
+                    "siblings were discarded: {text}"
+                );
+                assert!(
+                    !text.contains("Vanished row"),
+                    "vanished node retained: {text}"
+                );
+                assert!(
+                    !text.contains("Event row"),
+                    "vanished descendants retained: {text}"
+                );
+                assert!(
+                    !text.contains("disabled"),
+                    "vanished node facts leaked onto the surviving ref: {text}"
+                );
+            }
+            {
+                let commands = commands.lock().unwrap();
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(
+                            |command| command["method"] == "Accessibility.getChildAXNodes"
+                                && command["params"]["id"] == "2"
+                        )
+                        .count(),
+                    1,
+                    "unbounded or futile retry of vanished node"
+                );
+                assert!(
+                    !commands
+                        .iter()
+                        .any(|command| command["method"] == "DOM.getFlattenedDocument"),
+                    "partial AX read started an unbounded DOM classification read"
+                );
+            }
+            let recovered = plane
+                .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":mode}))
+                .await;
+            assert_eq!(recovered["outcome"], "ok", "{recovered}");
+            assert_eq!(recovered["truncated"], false, "{recovered}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_vanished_frame_owner_is_omitted_even_when_frame_detaches() {
+    for message in [
+        "Frame with the given id was not found.",
+        "No node with given id found",
+        "Invalid ID",
+    ] {
+        let (plane, route, commands) = fixture_with_fault(
+            None,
+            42,
+            None,
+            Some(SnapshotFault {
+                method: "DOM.getFrameOwner",
+                kind: SnapshotFaultKind::Gone {
+                    message,
+                    code: -32000,
+                },
+            }),
+            true,
+            true,
+        )
+        .await;
+        let snapshot = plane
+            .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{message}: {snapshot}");
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["refs_truncated"], true);
+        assert!(snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Surviving sibling"));
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command["method"] == "DOM.getFrameOwner")
+                .count(),
+            1
+        );
+        let recovered = plane
+            .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+            .await;
+        assert_eq!(recovered["outcome"], "ok", "{recovered}");
+        assert_eq!(recovered["truncated"], false);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_omitted_frame_does_not_hide_navigation_of_a_retained_document() {
+    let (plane, route, _) = fixture_with_fault(
+        None,
+        42,
+        None,
+        Some(SnapshotFault {
+            method: "DOM.getFrameOwner",
+            kind: SnapshotFaultKind::GoneAndNavigate,
+        }),
+        true,
+        true,
+    )
+    .await;
+    let refused = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+        .await;
+    assert_eq!(
+        refused["outcome"], "page_navigated_during_read",
+        "{refused}"
+    );
+    assert!(refused.get("state_text").is_none());
+}
+
+#[tokio::test]
+async fn snapshot_disappearance_classifier_does_not_swallow_other_errors() {
+    for (step, message, code) in [
+        (
+            "Accessibility.getChildAXNodes",
+            "Invalid parameters",
+            -32602,
+        ),
+        ("Accessibility.getChildAXNodes", "Invalid ID", -32603),
+        ("Accessibility.getRootAXNode", "Invalid ID", -32602),
+        (
+            "DOM.getFrameOwner",
+            "Session with given id not found.",
+            -32000,
+        ),
+    ] {
+        assert_snapshot_step_and_recovery(
+            Some(SnapshotFault {
+                method: step,
+                kind: SnapshotFaultKind::Gone { message, code },
+            }),
+            step == "DOM.getFrameOwner",
+            step == "DOM.getFrameOwner",
+            step,
+            "ax",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_private_frame_omission_preserves_busy_page_partial_snapshots() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let (plane, route, commands) = fixture_with_fault(
+            Some("private_frame"),
+            42,
+            None,
+            Some(SnapshotFault {
+                method: "Accessibility.getChildAXNodes",
+                kind: SnapshotFaultKind::Gone {
+                    message: "Invalid ID",
+                    code: -32602,
+                },
+            }),
+            true,
+            true,
+        )
+        .await;
+        let plane = plane.with_grants_installed(GrantStore::default().with_public_web_baseline(
+            Arc::new(cerebellum::browser_signed_in::SignedInDomains::default()),
+        ));
+        let snapshot = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode": mode}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["refs_truncated"], true);
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(text.contains("needs site permission"), "{snapshot}");
+        if mode != "dom_full" {
+            assert!(text.contains("Surviving sibling"), "{snapshot}");
+            assert!(!text.contains("Vanished row") && !text.contains("Event row"));
+        }
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command["method"] == "Accessibility.getRootAXNode")
+                .count(),
+            1,
+            "an omitted child document was captured"
+        );
+        let recovered = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode": mode}))
+            .await
+            .unwrap();
+        assert_eq!(recovered["outcome"], "ok", "{recovered}");
+        assert!(recovered["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("needs site permission"));
+        if mode != "dom_full" {
+            assert!(recovered["state_text"]
+                .as_str()
+                .unwrap()
+                .contains("Event row"));
+        }
     }
 }

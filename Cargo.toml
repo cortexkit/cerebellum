@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "crates/cerebellum",
+    "crates/cerebellum-bridge-protocol",
     "crates/cerebellum-core",
     "crates/cerebellum-computer",
     "crates/cerebellum-linux",
     "crates/cerebellum-macos",
+    "crates/cerebellum-native-host",
     "crates/cerebellum-windows",
 ]
 
