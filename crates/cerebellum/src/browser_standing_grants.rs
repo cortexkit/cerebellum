@@ -946,16 +946,10 @@ fn domain_covers(domain: &str, origin: &str) -> bool {
                 .is_some_and(|prefix| prefix.ends_with('.')))
 }
 
-/// Whether `origin` is a public website an all-sites grant may cover.
-///
-/// Refused: anything that is not a canonical http(s) origin (which includes
-/// `null` and `file:`), `localhost` and its subdomains, and an address literal
-/// the network address policy classifies at all (loopback, private-use,
-/// link-local, metadata and the rest of its restricted ranges). A host whose
-/// last label is numeric is read as an address, as a browser reads it; one
-/// that does not parse as a plain address is refused rather than guessed at.
-/// Any other host name is public here; the connector still applies the same
-/// address policy to whatever the name resolves to.
+/// Public-web access excludes raw addresses and service ports because those
+/// often name local or development services rather than public websites. An
+/// exact per-site grant can still cover them. DNS resolution remains subject
+/// to the connector's restricted-address policy.
 pub fn origin_is_public(origin: &str) -> bool {
     let Some(canonical) = canonical_grant_origin(origin) else {
         return false;
@@ -963,33 +957,27 @@ pub fn origin_is_public(origin: &str) -> bool {
     let Some((_, authority)) = canonical.split_once("://") else {
         return false;
     };
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((host, _)) => host,
-            None => return false,
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host)
-    };
-    let host = host.trim_end_matches('.');
-    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+    // Canonicalization removes the scheme's default port. Any remaining colon
+    // is an unusual port or an IPv6 literal, neither covered by public access.
+    if authority.contains(':') || authority.starts_with('[') {
         return false;
     }
-    let looks_numeric = authority.starts_with('[')
-        || host.rsplit('.').next().is_some_and(|label| {
-            label.bytes().all(|byte| byte.is_ascii_digit())
-                || label.starts_with("0x")
-                || label.starts_with("0X")
-        });
-    if !looks_numeric {
-        return true;
-    }
-    let Ok(address) = host.parse::<IpAddr>() else {
+    let host = authority.trim_end_matches('.');
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "local"
+        || host.ends_with(".local")
+        || host == "internal"
+        || host.ends_with(".internal")
+    {
         return false;
-    };
-    crate::network::address_policy::fixture().is_ok_and(|policy| policy.allows(address))
+    }
+    !host.rsplit('.').next().is_some_and(|label| {
+        label.bytes().all(|byte| byte.is_ascii_digit())
+            || label.starts_with("0x")
+            || label.starts_with("0X")
+    })
 }
 
 #[cfg(test)]
@@ -1048,15 +1036,15 @@ mod tests {
 
     #[test]
     fn public_origins_are_told_apart_from_local_and_private_ones() {
-        for public in [
-            "https://example.com",
-            "https://example.com:8443",
-            "http://93.184.216.34",
-            "https://[2606:2800:220:1:248:1893:25c8:1946]",
-        ] {
+        for public in ["https://example.com", "http://example.com"] {
             assert!(origin_is_public(public), "{public} should be public");
         }
         for local in [
+            "https://example.com:8443",
+            "http://93.184.216.34",
+            "https://[2606:2800:220:1:248:1893:25c8:1946]",
+            "https://device.local",
+            "https://office.internal",
             "null",
             "file:///etc/passwd",
             "http://localhost",

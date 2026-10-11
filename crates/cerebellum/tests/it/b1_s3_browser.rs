@@ -403,10 +403,21 @@ struct ScreenshotPipe {
     reads: VecDeque<Vec<u8>>,
 }
 
+fn download_denied_replies(frames: impl IntoIterator<Item = Value>) -> Vec<Value> {
+    std::iter::once(json!({"id":1,"result":{}}))
+        .chain(frames.into_iter().map(|mut frame| {
+            if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                frame["id"] = json!(id + 1);
+            }
+            frame
+        }))
+        .collect()
+}
+
 impl ScreenshotPipe {
     fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
         Self {
-            reads: frames
+            reads: download_denied_replies(frames)
                 .into_iter()
                 .map(|frame| {
                     let mut bytes = serde_json::to_vec(&frame).unwrap();
@@ -612,7 +623,7 @@ struct RecordingClickPointPipe {
 
 impl RecordingClickPointPipe {
     fn new(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
-        let reads = [
+        let reads = download_denied_replies([
             json!({"id":1,"result":{"targetId":"target-own"}}),
             json!({"id":2,"result":{"sessionId":"session-own"}}),
             json!({"id":3,"sessionId":"session-own","result":{
@@ -635,7 +646,7 @@ impl RecordingClickPointPipe {
             json!({"id":5,"sessionId":"session-own","result":{}}),
             json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"id":7,"sessionId":"session-own","result":{}}),
-        ]
+        ])
         .into_iter()
         .map(|frame| {
             let mut bytes = serde_json::to_vec(&frame).unwrap();
@@ -753,7 +764,7 @@ struct NavigationPipe {
 impl NavigationPipe {
     fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
         Self {
-            reads: frames
+            reads: download_denied_replies(frames)
                 .into_iter()
                 .map(|frame| {
                     let mut bytes = serde_json::to_vec(&frame).unwrap();
@@ -884,6 +895,7 @@ impl CdpPipeIo for DialogClickPointPipe {
         let id = command["id"].as_u64().unwrap();
         let method = command["method"].as_str().unwrap();
         match method {
+            "Browser.setDownloadBehavior" => self.queue(json!({"id":id,"result":{}})),
             "Target.createTarget" => {
                 self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
             }
@@ -1404,6 +1416,7 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
     assert_eq!(
         methods,
         [
+            "Browser.setDownloadBehavior",
             "Target.createTarget",
             "Target.attachToTarget",
             "Page.getLayoutMetrics",
@@ -1413,12 +1426,12 @@ async fn click_point_handler_dispatches_press_then_release_to_the_cdp_driver() {
             "Input.dispatchMouseEvent",
         ]
     );
-    assert_eq!(commands[5]["params"]["type"], "mousePressed");
-    assert_eq!(commands[5]["params"]["x"], 60.0);
-    assert_eq!(commands[5]["params"]["y"], 45.0);
-    assert_eq!(commands[6]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[6]["params"]["type"], "mousePressed");
     assert_eq!(commands[6]["params"]["x"], 60.0);
     assert_eq!(commands[6]["params"]["y"], 45.0);
+    assert_eq!(commands[7]["params"]["type"], "mouseReleased");
+    assert_eq!(commands[7]["params"]["x"], 60.0);
+    assert_eq!(commands[7]["params"]["y"], 45.0);
     assert_eq!(
         plane
             .snapshot_pin_count_for_test(&route, &snapshot_id)
@@ -3187,23 +3200,8 @@ async fn a_stale_text_snapshot_refuses_before_any_input_is_dispatched() {
     );
 }
 
-/// The plane production builds runs its authorization gate.
-///
-/// `BrowserPlane` derives `Default`, so a `bool` field the derive is left to
-/// fill is `false`. Both production constructors reach that default -- `new()`
-/// directly, and `with_session_gate` through `..Self::default()` -- while only
-/// `with_grants` sets the flag, and nothing outside tests calls it.
-///
-/// That is not a dormant fixture setting. `browser.navigate` becomes
-/// wire-dispatchable as soon as a browser is configured, so a flag reading
-/// `false` means navigation is served with its grant check skipped rather than
-/// refused for want of a grant -- the opposite of the fail-closed posture the
-/// empty grant store is there to provide.
-///
-/// Asserted behaviourally rather than by reading the field, because the field
-/// is private and what matters is what a request receives. An empty grant store
-/// can cover nothing, so a plane whose gate runs must refuse this request; a
-/// plane whose gate is skipped proceeds past it.
+/// Production constructors must still authorize local services. Public browsing
+/// has an implicit baseline, so a public URL would not prove this gate ran.
 #[tokio::test]
 async fn the_plane_production_builds_runs_its_authorization_gate() {
     let plane = BrowserPlane::new();
@@ -3215,7 +3213,7 @@ async fn the_plane_production_builds_runs_its_authorization_gate() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://example.test/",
+                "url": "http://localhost:8080/",
                 "intent": "probe whether the grant gate runs",
                 "wait": "none",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -3232,14 +3230,7 @@ async fn the_plane_production_builds_runs_its_authorization_gate() {
     );
     assert!(
         body.contains("authorization") || body.contains("grant"),
-        "A navigate through the PRODUCTION constructor was not refused by the \
-         authorization gate, so the gate did not run.\n\n\
-         BrowserPlane derives Default and `authorization_enabled` is a bool the \
-         derive sets to FALSE. `new()` and `with_session_gate` both reach that \
-         default; only `with_grants`, which nothing outside tests calls, sets it \
-         true. browser.navigate IS wire-dispatchable once a browser is \
-         configured, so this serves navigation with no grant check at all.\n\n\
-         Outcome was: {body}"
+        "production navigation bypassed local-service authorization: {body}"
     );
 }
 

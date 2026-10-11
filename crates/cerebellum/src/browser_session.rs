@@ -182,6 +182,8 @@ impl HandoffOutcome {
 struct Handoff {
     generation: u64,
     origin: String,
+    profile: String,
+    profile_name: String,
     opened_at: MonoInstant,
     expires_at: MonoInstant,
     opening_cookie_names: BTreeSet<String>,
@@ -1311,6 +1313,7 @@ pub struct BrowserSessions {
     registry: Arc<(Mutex<Registry>, Condvar)>,
     /// L3.
     shutdown: Arc<Mutex<ShutdownSide>>,
+    signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
 }
 
 #[derive(Debug)]
@@ -1662,6 +1665,13 @@ fn close_open_handoff(
 }
 
 impl BrowserSessions {
+    pub fn with_signed_in_domains(
+        mut self,
+        signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    ) -> Self {
+        self.signed_in = signed_in;
+        self
+    }
     fn registry(&self) -> LockAttempt<'_, Registry> {
         take_lock(&self.registry.0, lock_scope::Kind::Registry)
     }
@@ -1943,6 +1953,18 @@ impl BrowserSessions {
         deadline_ms: u64,
         clock: &C,
     ) -> Result<PresentedHandoff, PresentRefusal> {
+        self.present_for_profile(route_key, route_key, "default", origin, deadline_ms, clock)
+    }
+
+    pub fn present_for_profile<C: MonotonicClock>(
+        &self,
+        route_key: &str,
+        profile: &str,
+        profile_name: &str,
+        origin: &str,
+        deadline_ms: u64,
+        clock: &C,
+    ) -> Result<PresentedHandoff, PresentRefusal> {
         let cell = self
             .active_cell(route_key)
             .ok()
@@ -1996,6 +2018,8 @@ impl BrowserSessions {
         meta.handoff = Some(HandoffState::Open(Handoff {
             generation,
             origin: origin.to_string(),
+            profile: profile.to_string(),
+            profile_name: profile_name.to_string(),
             opened_at,
             expires_at,
             opening_cookie_names,
@@ -2166,6 +2190,17 @@ impl BrowserSessions {
             handoff.cookie_names_added = cookie_names_added;
         }
         let result = if observed {
+            // Record the login before releasing human control, so a racing type
+            // cannot slip through the signed-out baseline after login completes.
+            if let Some(HandoffState::Open(handoff)) = meta.handoff.as_ref() {
+                if self
+                    .signed_in
+                    .record(&handoff.profile, &handoff.profile_name, &origin)
+                    .is_err()
+                {
+                    return HandoffPollResult::Open;
+                }
+            }
             close_open_handoff(&mut meta.handoff, HandoffOutcome::LoginObserved)
                 .map_or(HandoffPollResult::Gone, HandoffPollResult::Closed)
         } else {

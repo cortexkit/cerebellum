@@ -242,13 +242,13 @@ fn snapshot_observation(
     let authority = rest.split(['/', '?', '#']).next().unwrap();
     let origin = format!("{scheme}://{authority}");
     let mut target = if cross_site_link {
-        // A link whose destination is another site: classification requires
-        // a higher tier for it than for an ordinary same-site click.
+        // A link into a local service keeps the elevated tier and explicit
+        // destination consent even though ordinary public links are reading.
         ElementClassificationInput::new(
             NodeIdentityInput::new("target", "frame-main", 42),
             TargetKind::Anchor,
         )
-        .destination("https://www.iana.org/domains/example")
+        .destination("http://127.0.0.1:8080/domains/example")
     } else {
         ElementClassificationInput::new(
             NodeIdentityInput::new("target", "frame-main", 42),
@@ -701,8 +701,8 @@ impl OwnedBrowserProcess for RecordingProcess {
     ) -> Result<(), NavigationDriveError> {
         self.effects.lock().unwrap().push("navigate");
         let now = std::time::Instant::now();
-        self.page.commit("https://landed.example/final");
-        tracker.url_final = Some("https://landed.example/final".into());
+        self.page.commit("https://landed.example:8443/final");
+        tracker.url_final = Some("https://landed.example:8443/final".into());
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(cerebellum::browser::QUIET_MS));
         Ok(())
@@ -1003,7 +1003,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
         11,
         "browser.navigate",
         json!({
-            "url": "https://requested.example/",
+            "url": "https://requested.example:8443/",
             "intent": "follow the redirect",
             "wait": "settle",
             "severity": {"tier": 2, "credential": false, "financial": false}
@@ -1011,20 +1011,8 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     )
     .await;
     let navigated: Value = serde_json::from_slice(&navigated.body).unwrap();
-    // Refused for want of a grant, which is what a caller gets today: nothing in
-    // production mints an ActionGrant, so the store this plane is built with is
-    // empty and covers nothing. The capability is wired and unreachable until
-    // consent has a path, and that is the intended order rather than a gap.
-    //
-    // This assertion previously read "ok". It passed because the authorization
-    // gate was governed by a bool that `derive(Default)` set to false, so wire
-    // navigation was SERVED with no grant check at all -- the test was
-    // recording the bypass rather than the policy.
-    //
-    // The successful-navigation behaviour it used to cover is asserted in
-    // b1_s3_browser.rs, where a grant can be installed directly:
-    // navigation_reports_the_browser_landing_url_instead_of_the_request makes
-    // the same url_final assertion against a plane that holds authority.
+    // A non-default port requires an explicit site grant. Public DNS sites on
+    // the standard HTTP(S) ports can be navigated without asking a person.
     assert_eq!(navigated["outcome"], "authorization_denied", "{navigated}");
     assert_eq!(navigated["detail"]["reason"], "no_grant", "{navigated}");
 
@@ -1147,7 +1135,7 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let no_grant = invoke(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
     let no_grant: Value = serde_json::from_slice(&no_grant.body).unwrap();
@@ -1196,11 +1184,11 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     planes.launch_service = Some(launcher.clone());
     grant_browser(
         &planes,
-        "https://page.example",
+        "https://page.example:8443",
         vec![HazardClass::CredentialFormSubmit],
     )
     .await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let before = invoke(&planes, 30, "browser.snapshot", json!({"mode": "ax"})).await;
     let before: Value = serde_json::from_slice(&before.body).unwrap();
@@ -1257,11 +1245,11 @@ async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
     planes.launch_service = Some(launcher.clone());
     grant_browser(
         &planes,
-        "https://page.example",
+        "https://page.example:8443",
         vec![HazardClass::CredentialFormSubmit],
     )
     .await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let snapshot = invoke(&planes, 30, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -1317,10 +1305,10 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
             1,
             "test-session",
             Severity::new(OBSERVE, false, false),
-            ["https://page.example"],
+            ["https://page.example:8443"],
         )])),
     );
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let snapshot = invoke(&planes, 40, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -1375,10 +1363,10 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     open_grant_and_allow(
         &planes,
         60,
-        json!({"origins": ["https://page.example"], "hazards": []}),
+        json!({"origins": ["https://page.example:8443"], "hazards": []}),
     )
     .await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let snapshot = invoke(&planes, 61, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -1410,12 +1398,12 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
         "{refused}"
     );
     assert_eq!(
-        refused["detail"]["attempted_origin"], "https://page.example",
+        refused["detail"]["attempted_origin"], "https://page.example:8443",
         "{refused}"
     );
     assert_eq!(
         refused["detail"]["grant_request"],
-        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": []}),
+        json!({"origins": ["https://page.example:8443"], "severity_tier": 4, "hazards": []}),
         "{refused}"
     );
     assert_eq!(
@@ -1436,7 +1424,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     assert_eq!(landing["outcome"], "authorization_denied", "{landing}");
     assert_eq!(
         landing["detail"]["attempted_origin"],
-        "https://www.iana.org"
+        "http://127.0.0.1:8080"
     );
     open_grant_and_allow(&planes, 65, landing["detail"]["grant_request"].clone()).await;
     let clicked = invoke_existing(&planes, 66, "browser.click", click).await;
@@ -1462,14 +1450,14 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
     );
     planes.launch_service = Some(launcher.clone());
     bind_management_route(&planes).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let refused = invoke_existing(&planes, 70, "browser.snapshot", json!({})).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(refused["detail"]["reason"], "no_grant", "{refused}");
     assert_eq!(
-        refused["detail"]["attempted_origin"], "https://page.example",
+        refused["detail"]["attempted_origin"], "https://page.example:8443",
         "{refused}"
     );
     assert_eq!(
@@ -1479,7 +1467,7 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
     );
     assert_eq!(
         refused["detail"]["grant_request"],
-        json!({"origins": ["https://page.example"], "severity_tier": 2, "hazards": []}),
+        json!({"origins": ["https://page.example:8443"], "severity_tier": 2, "hazards": []}),
         "{refused}"
     );
     assert!(launcher.effects.lock().unwrap().is_empty());
@@ -1639,7 +1627,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
         1,
         "test-session",
         Severity::new(OBSERVE, false, false),
-        ["https://page.example"],
+        ["https://page.example:8443"],
     );
 
     let planes = planes_with_installed_grants(
@@ -1655,7 +1643,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
             ),
         ],
     );
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let clicked = click_cross_site_link(&planes, 80).await;
     assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
     assert_eq!(clicked["detail"]["reason"], "origin_scope", "{clicked}");
@@ -1678,7 +1666,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
             ),
         ],
     );
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let clicked = click_cross_site_link(&planes, 90).await;
     assert_eq!(
         clicked["detail"]["reason"], "grant_severity_insufficient",
@@ -1686,7 +1674,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
     );
     assert_eq!(
         clicked["detail"]["grant_request"],
-        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": []}),
+        json!({"origins": ["https://page.example:8443"], "severity_tier": 4, "hazards": []}),
         "{clicked}"
     );
 }
@@ -1714,11 +1702,11 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
             1,
             "test-session",
             Severity::new(4, true, true),
-            ["https://page.example"],
+            ["https://page.example:8443"],
         )
         .with_disclosed_hazards([HazardClass::FinancialFormSubmit])])),
     );
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
 
     let snapshot = invoke(&planes, 50, "browser.snapshot", json!({})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -1745,7 +1733,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
     // that admits this click names the credential hazard it lacks.
     assert_eq!(
         clicked["detail"]["grant_request"],
-        json!({"origins": ["https://page.example"], "severity_tier": 4, "hazards": ["credential_form_submit"]}),
+        json!({"origins": ["https://page.example:8443"], "severity_tier": 4, "hazards": ["credential_form_submit"]}),
         "{clicked}"
     );
     assert_eq!(
@@ -2645,7 +2633,7 @@ async fn present_with_opaque_origin_does_not_front_browser() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
 
     let (tx, mut rx) = mpsc::channel(4);
     cerebellum::handle_tool_request_for_test_with_existing_planes(
@@ -2680,12 +2668,12 @@ async fn present_fronts_then_marks_human_in_control() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
 
     let presented = cerebellum::present_browser_handoff_for_test(
         &planes,
         &route_identity(),
-        "https://landed.example",
+        "https://landed.example:8443",
     )
     .await;
     assert_eq!(
@@ -2703,7 +2691,10 @@ async fn present_fronts_then_marks_human_in_control() {
     let blocked: Value = serde_json::from_slice(&blocked.body).unwrap();
     assert_eq!(blocked["outcome"], "human_in_control", "{blocked}");
     assert_eq!(blocked["remedy"], "browser.resume", "{blocked}");
-    assert_eq!(blocked["origin"], "https://landed.example", "{blocked}");
+    assert_eq!(
+        blocked["origin"], "https://landed.example:8443",
+        "{blocked}"
+    );
     assert!(blocked["expires_in_ms"].as_u64().unwrap() <= 600_000);
     assert_eq!(planes.browser.operation_log().await, operations_before);
     assert_eq!(
@@ -2724,12 +2715,12 @@ async fn present_that_cannot_front_is_refused_not_presented() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
 
     let reply = cerebellum::present_browser_handoff_for_test(
         &planes,
         &route_identity(),
-        "https://landed.example",
+        "https://landed.example:8443",
     )
     .await;
     assert_eq!(reply["outcome"], "present_failed", "{reply}");
@@ -2759,12 +2750,15 @@ async fn resume_closes_by_caller_and_reports_it() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
     let route = route_identity();
 
-    let presented =
-        cerebellum::present_browser_handoff_for_test(&planes, &route, "https://landed.example")
-            .await;
+    let presented = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route,
+        "https://landed.example:8443",
+    )
+    .await;
     assert_eq!(presented["outcome"], "presented", "{presented}");
     let resumed = cerebellum::resume_browser_handoff_for_test(&planes, &route).await;
     assert_eq!(
@@ -2772,7 +2766,7 @@ async fn resume_closes_by_caller_and_reports_it() {
         json!({
             "outcome":"resumed",
             "handoff":"closed_by_caller",
-            "origin":"https://landed.example",
+            "origin":"https://landed.example:8443",
         })
     );
     let no_handoff = cerebellum::resume_browser_handoff_for_test(&planes, &route).await;
@@ -2794,12 +2788,15 @@ async fn cookie_values_never_leave_the_driver() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://landed.example").await;
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
     let route = route_identity();
 
-    let presented =
-        cerebellum::present_browser_handoff_for_test(&planes, &route, "https://landed.example")
-            .await;
+    let presented = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route,
+        "https://landed.example:8443",
+    )
+    .await;
     assert_eq!(presented["outcome"], "presented", "{presented}");
     tokio::time::timeout(Duration::from_secs(6), async {
         loop {
@@ -2920,8 +2917,8 @@ async fn poisoned_session_lock_refuses_a_browser_action_through_the_wire() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://page.example").await;
-    grant_browser(&planes, "https://page.example", Vec::new()).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
+    grant_browser(&planes, "https://page.example:8443", Vec::new()).await;
     planes.sessions.poison_for_test();
 
     let refused = response_body(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
@@ -3084,14 +3081,14 @@ fn recording_planes(launcher: &Arc<RecordingLauncher>) -> Planes {
 async fn a_browser_relaunched_after_close_serves_snapshots() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
-    grant_browser(&planes, "https://page.example", Vec::new()).await;
+    grant_browser(&planes, "https://page.example:8443", Vec::new()).await;
 
-    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example:8443").await;
     let before_close = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(before_close["outcome"], "ok", "{before_close}");
     close_session(&planes, 3, &first).await;
 
-    let second = launch_session_at(&planes, &launcher.page, 4, "https://page.example").await;
+    let second = launch_session_at(&planes, &launcher.page, 4, "https://page.example:8443").await;
     assert_ne!(first, second);
     let relaunched = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(relaunched["outcome"], "ok", "{relaunched}");
@@ -3113,7 +3110,7 @@ async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
     grant_browser(&planes, "https://requested.example", Vec::new()).await;
-    grant_browser(&planes, "https://landed.example", Vec::new()).await;
+    grant_browser(&planes, "https://landed.example:8443", Vec::new()).await;
 
     let first = launch_session_at(&planes, &launcher.page, 1, "https://requested.example").await;
     close_session(&planes, 2, &first).await;
@@ -3152,12 +3149,12 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
     let planes = recording_planes(&launcher);
     grant_browser(
         &planes,
-        "https://page.example",
+        "https://page.example:8443",
         vec![HazardClass::CredentialFormSubmit],
     )
     .await;
 
-    launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
+    launch_session_at(&planes, &launcher.page, 1, "https://page.example:8443").await;
     let old = response_body(&planes, 2, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(old["outcome"], "ok", "{old}");
 
@@ -3167,7 +3164,7 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
     assert_ne!(status["outcome"], "ready", "{status}");
     *launcher.exited.lock().unwrap() = false;
 
-    launch_session_at(&planes, &launcher.page, 4, "https://page.example").await;
+    launch_session_at(&planes, &launcher.page, 4, "https://page.example:8443").await;
     let fresh = response_body(&planes, 5, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(fresh["outcome"], "ok", "{fresh}");
     assert_ne!(fresh["snapshot_id"], old["snapshot_id"]);
@@ -3203,9 +3200,9 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
 async fn a_closed_browser_without_relaunch_still_refuses_snapshots() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
-    grant_browser(&planes, "https://page.example", Vec::new()).await;
+    grant_browser(&planes, "https://page.example:8443", Vec::new()).await;
 
-    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://page.example:8443").await;
     close_session(&planes, 2, &first).await;
     let refused = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(refused["outcome"], "no_session", "{refused}");
@@ -3300,7 +3297,7 @@ fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
             document_request(
                 "doc-1",
                 MAIN_FRAME,
-                "https://www.iana.org/domains/example",
+                "https://www.iana.org:8443/domains/example",
                 Some(301),
             ),
             document_request(
@@ -3312,13 +3309,13 @@ fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
             document_request(
                 "doc-1",
                 MAIN_FRAME,
-                "https://www.iana.org/help/example-domains",
+                "https://www.iana.org:8443/help/example-domains",
                 Some(307),
             ),
             document_response(
                 "doc-1",
                 MAIN_FRAME,
-                "https://www.iana.org/help/example-domains",
+                "https://www.iana.org:8443/help/example-domains",
                 200,
             ),
             session_event(
@@ -3326,8 +3323,8 @@ fn events_after_release(scenario: ClickScenario) -> Vec<Value> {
                 json!({"frame":{
                     "id":MAIN_FRAME,
                     "loaderId":"loader-2",
-                    "url":"https://www.iana.org/help/example-domains",
-                    "securityOrigin":"https://www.iana.org",
+                    "url":"https://www.iana.org:8443/help/example-domains",
+                    "securityOrigin":"https://www.iana.org:8443",
                     "mimeType":"text/html"
                 },"type":"Navigation"}),
             ),
@@ -3397,6 +3394,7 @@ impl CdpPipeIo for ChromeLikePipe {
             return Ok(());
         }
         match command["method"].as_str().unwrap() {
+            "Browser.setDownloadBehavior" => self.queue(json!({"id":id,"result":{}})),
             "Page.navigate" => {
                 self.page.commit(command["params"]["url"].as_str().unwrap());
                 self.reply(id, json!({"frameId":MAIN_FRAME}));
@@ -3955,7 +3953,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     assert_eq!(clicked["navigation"], "main_frame", "{clicked}");
     assert_eq!(
-        clicked["url_final"], "https://www.iana.org/help/example-domains",
+        clicked["url_final"], "https://www.iana.org:8443/help/example-domains",
         "{clicked}"
     );
     assert_eq!(
@@ -3965,7 +3963,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     );
     assert_eq!(clicked["http_status"], 200, "{clicked}");
     assert_eq!(
-        clicked["landing_origin"], "https://www.iana.org",
+        clicked["landing_origin"], "https://www.iana.org:8443",
         "{clicked}"
     );
     assert_eq!(clicked["landing_origin_granted"], false, "{clicked}");
@@ -3977,7 +3975,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(
-        refused["detail"]["attempted_origin"], "https://www.iana.org",
+        refused["detail"]["attempted_origin"], "https://www.iana.org:8443",
         "{refused}"
     );
 }
@@ -4036,7 +4034,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     assert_eq!(
-        clicked["landing_origin"], "https://www.iana.org",
+        clicked["landing_origin"], "https://www.iana.org:8443",
         "{clicked}"
     );
     assert_eq!(clicked["landing_origin_granted"], false, "{clicked}");
@@ -4049,7 +4047,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(refused["detail"]["reason"], "origin_scope", "{refused}");
     assert_eq!(
-        refused["detail"]["attempted_origin"], "https://www.iana.org",
+        refused["detail"]["attempted_origin"], "https://www.iana.org:8443",
         "{refused}"
     );
     assert_eq!(
@@ -4064,7 +4062,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     );
     assert_eq!(
         refused["detail"]["grant_request"],
-        json!({"origins": ["https://www.iana.org"], "severity_tier": 2, "hazards": []}),
+        json!({"origins": ["https://www.iana.org:8443"], "severity_tier": 2, "hazards": []}),
         "{refused}"
     );
     assert_eq!(
@@ -4084,7 +4082,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     let read_again: Value = serde_json::from_slice(&read_again.body).unwrap();
     assert_eq!(read_again["outcome"], "ok", "{read_again}");
     assert_eq!(
-        read_again["source_origin"], "https://www.iana.org/help/example-domains",
+        read_again["source_origin"], "https://www.iana.org:8443/help/example-domains",
         "{read_again}"
     );
 }
@@ -4093,13 +4091,13 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
 async fn a_click_landing_on_a_granted_origin_says_it_can_be_read() {
     let (_, clicked, _) = click_link(
         ClickScenario::CrossOriginRedirect,
-        &[CLICK_PAGE_ORIGIN, "https://www.iana.org"],
+        &[CLICK_PAGE_ORIGIN, "https://www.iana.org:8443"],
     )
     .await;
 
     assert_eq!(clicked["navigation"], "main_frame", "{clicked}");
     assert_eq!(
-        clicked["landing_origin"], "https://www.iana.org",
+        clicked["landing_origin"], "https://www.iana.org:8443",
         "{clicked}"
     );
     assert_eq!(clicked["landing_origin_granted"], true, "{clicked}");
@@ -4197,23 +4195,23 @@ fn assert_no_page_content(reply: &Value) {
     }
 }
 
-/// Launch, grant navigation to `https://requested.example` plus a read grant
-/// for each of `readable`, and navigate there. The double lands on
-/// `https://landed.example/final`, which is also what the tracker records.
+/// Use service-port origins so these read-scope probes exercise site grants,
+/// not implicit public browsing. The navigation double redirects to the
+/// landing page, and each origin in `readable` gets its own read grant.
 async fn navigated_to_landed(readable: &[&str]) -> (Arc<RecordingLauncher>, Planes) {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
-    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    grant_browser(&planes, "https://requested.example:8443", Vec::new()).await;
     for origin in readable {
         grant_browser(&planes, origin, Vec::new()).await;
     }
-    launch_session_at(&planes, &launcher.page, 1, "https://requested.example").await;
+    launch_session_at(&planes, &launcher.page, 1, "https://requested.example:8443").await;
     let navigated = response_body(
         &planes,
         2,
         "browser.navigate",
         json!({
-            "url": "https://requested.example/",
+            "url": "https://requested.example:8443/",
             "intent": "open the page the reads are about",
             "wait": "settle",
             "severity": {"tier": 1, "credential": false, "financial": false}
@@ -4222,7 +4220,7 @@ async fn navigated_to_landed(readable: &[&str]) -> (Arc<RecordingLauncher>, Plan
     .await;
     assert_eq!(navigated["outcome"], "ok", "{navigated}");
     assert_eq!(
-        navigated["url_final"], "https://landed.example/final",
+        navigated["url_final"], "https://landed.example:8443/final",
         "{navigated}"
     );
     (launcher, planes)
@@ -4254,14 +4252,14 @@ async fn refusal_records(planes: &Planes) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapshot_in_both_modes() {
-    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
     // The same read succeeds while the page stays where it was navigated, so
     // the refusals below come from the move and not from a plane refusing
     // everything.
     let before = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(before["outcome"], "ok", "{before}");
 
-    launcher.page.commit("https://attacker.example/moved");
+    launcher.page.commit("https://attacker.example:8443/moved");
 
     for (corr, mode) in [(4, "ax"), (5, "dom_full")] {
         let refused = response_body(&planes, corr, "browser.snapshot", json!({"mode": mode})).await;
@@ -4270,7 +4268,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
             "{mode}: {refused}"
         );
         assert_eq!(
-            refused["detail"]["attempted_origin"], "https://attacker.example",
+            refused["detail"]["attempted_origin"], "https://attacker.example:8443",
             "{mode}: {refused}"
         );
         assert_no_page_content(&refused);
@@ -4288,7 +4286,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
         launcher.effects.lock().unwrap()
     );
     let moved = (
-        "https://attacker.example/moved".to_string(),
+        "https://attacker.example:8443/moved".to_string(),
         "origin_scope".to_string(),
     );
     assert_eq!(refusal_records(&planes).await, [moved.clone(), moved]);
@@ -4296,16 +4294,16 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
 
 #[tokio::test]
 async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screenshot() {
-    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
     let before = response_body(&planes, 3, "browser.screenshot", json!({})).await;
     assert_eq!(before["outcome"], "ok", "{before}");
 
-    launcher.page.commit("https://attacker.example/moved");
+    launcher.page.commit("https://attacker.example:8443/moved");
 
     let refused = response_body(&planes, 4, "browser.screenshot", json!({})).await;
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(
-        refused["detail"]["attempted_origin"], "https://attacker.example",
+        refused["detail"]["attempted_origin"], "https://attacker.example:8443",
         "{refused}"
     );
     assert_no_page_content(&refused);
@@ -4325,27 +4323,27 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screen
 
 #[tokio::test]
 async fn a_snapshot_that_fails_because_the_page_moved_reports_the_move() {
-    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
     *launcher.moves_during_capture.lock().unwrap() = vec![
-        PageMove::Commit("https://attacker.example/mid-read"),
+        PageMove::Commit("https://attacker.example:8443/mid-read"),
         PageMove::CaptureFails,
     ];
     let moved = response_body(&planes, 3, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(moved["outcome"], "page_navigated_during_read", "{moved}");
     assert_eq!(
-        moved["detail"]["authorized_origin"], "https://landed.example",
+        moved["detail"]["authorized_origin"], "https://landed.example:8443",
         "{moved}"
     );
     assert_eq!(
-        moved["detail"]["live_origin"], "https://attacker.example",
+        moved["detail"]["live_origin"], "https://attacker.example:8443",
         "{moved}"
     );
     assert_no_page_content(&moved);
 
     // A capture that fails while the page stays where it was authorized has
     // no move to report, so it is still the module's own failure.
-    launcher.page.commit("https://landed.example/final");
+    launcher.page.commit("https://landed.example:8443/final");
     *launcher.moves_during_capture.lock().unwrap() = vec![PageMove::CaptureFails];
     let failed = response_body(&planes, 4, "browser.snapshot", json!({"mode": "ax"})).await;
     assert_eq!(failed["outcome"], "internal_error", "{failed}");
@@ -4355,16 +4353,16 @@ async fn a_snapshot_that_fails_because_the_page_moved_reports_the_move() {
 
 #[tokio::test]
 async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
-    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
     for (corr, tool, arguments) in [
         (3, "browser.snapshot", json!({"mode": "ax"})),
         (5, "browser.snapshot", json!({"mode": "dom_full"})),
         (7, "browser.screenshot", json!({})),
     ] {
-        launcher.page.commit("https://landed.example/final");
+        launcher.page.commit("https://landed.example:8443/final");
         *launcher.moves_during_capture.lock().unwrap() =
-            vec![PageMove::Commit("https://attacker.example/mid-read")];
+            vec![PageMove::Commit("https://attacker.example:8443/mid-read")];
 
         let refused = response_body(&planes, corr, tool, arguments.clone()).await;
         assert_eq!(
@@ -4372,11 +4370,11 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
             "{tool} {arguments}: {refused}"
         );
         assert_eq!(
-            refused["detail"]["authorized_origin"], "https://landed.example",
+            refused["detail"]["authorized_origin"], "https://landed.example:8443",
             "{refused}"
         );
         assert_eq!(
-            refused["detail"]["live_origin"], "https://attacker.example",
+            refused["detail"]["live_origin"], "https://attacker.example:8443",
             "{refused}"
         );
         assert_no_page_content(&refused);
@@ -4390,9 +4388,9 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
 
     // The same race inside navigate's read_page: the navigation itself is
     // reported, and the embedded read is withheld.
-    launcher.page.commit("https://landed.example/final");
+    launcher.page.commit("https://landed.example:8443/final");
     *launcher.moves_during_capture.lock().unwrap() =
-        vec![PageMove::Commit("https://attacker.example/mid-read")];
+        vec![PageMove::Commit("https://attacker.example:8443/mid-read")];
     let navigated = response_body(
         &planes,
         9,
@@ -4418,7 +4416,7 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
         records
             .iter()
             .filter(
-                |(addressing, reason)| addressing == "https://attacker.example/mid-read"
+                |(addressing, reason)| addressing == "https://attacker.example:8443/mid-read"
                     && reason == "page_navigated_during_read"
             )
             .count(),
@@ -4429,13 +4427,13 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
 
 #[tokio::test]
 async fn a_page_that_stays_put_reads_as_before() {
-    let (_launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (_launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
     for (corr, mode) in [(3, "ax"), (4, "dom_full")] {
         let read = response_body(&planes, corr, "browser.snapshot", json!({"mode": mode})).await;
         assert_eq!(read["outcome"], "ok", "{mode}: {read}");
         assert_eq!(
-            read["source_origin"], "https://landed.example/final",
+            read["source_origin"], "https://landed.example:8443/final",
             "{read}"
         );
     }
@@ -4453,7 +4451,7 @@ async fn a_page_that_stays_put_reads_as_before() {
         "{screenshot}"
     );
     assert_eq!(
-        screenshot["source_origin"], "https://landed.example/final",
+        screenshot["source_origin"], "https://landed.example:8443/final",
         "{screenshot}"
     );
     assert!(refusal_records(&planes).await.is_empty());
@@ -4482,7 +4480,7 @@ async fn a_read_authorizes_against_the_live_origin_when_the_tracker_is_stale() {
 
 #[tokio::test]
 async fn a_round_trip_through_another_origin_during_a_read_discards_the_capture() {
-    let (launcher, planes) = navigated_to_landed(&["https://landed.example"]).await;
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
     // Out and straight back by a new navigation, and out and back by history
     // traversal. Either way the page is on the authorized origin at both ends
@@ -4491,11 +4489,11 @@ async fn a_round_trip_through_another_origin_during_a_read_discards_the_capture(
     let mut corr = 3;
     for moves in [
         vec![
-            PageMove::Commit("https://attacker.example/mid-read"),
-            PageMove::Commit("https://landed.example/final"),
+            PageMove::Commit("https://attacker.example:8443/mid-read"),
+            PageMove::Commit("https://landed.example:8443/final"),
         ],
         vec![
-            PageMove::Commit("https://attacker.example/mid-read"),
+            PageMove::Commit("https://attacker.example:8443/mid-read"),
             PageMove::Back,
         ],
     ] {
@@ -4512,11 +4510,11 @@ async fn a_round_trip_through_another_origin_during_a_read_discards_the_capture(
                 "{tool} {arguments}: {refused}"
             );
             assert_eq!(
-                refused["detail"]["authorized_origin"], "https://landed.example",
+                refused["detail"]["authorized_origin"], "https://landed.example:8443",
                 "{refused}"
             );
             assert_eq!(
-                refused["detail"]["live_origin"], "https://landed.example",
+                refused["detail"]["live_origin"], "https://landed.example:8443",
                 "{refused}"
             );
             assert_no_page_content(&refused);
@@ -4661,7 +4659,7 @@ async fn an_action_on_a_snapshot_of_a_page_that_has_since_moved_dispatches_no_in
 
     // The page replaces itself with another site's document. The tracker
     // never hears of it, so both retained captures still look current.
-    page.commit("https://attacker.example/moved");
+    page.commit("https://attacker.example:8443/moved");
 
     let clicked = click_ref(&planes, 102, &snapshot).await;
     let pointed = click_screenshot_point(&planes, 103, &screenshot).await;
@@ -4676,7 +4674,7 @@ async fn an_action_on_a_snapshot_of_a_page_that_has_since_moved_dispatches_no_in
             "{refused}"
         );
         assert_eq!(
-            refused["detail"]["live_origin"], "https://attacker.example",
+            refused["detail"]["live_origin"], "https://attacker.example:8443",
             "{refused}"
         );
     }
@@ -4736,7 +4734,7 @@ async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<Re
         }),
     );
     planes.launch_service = Some(launcher.clone());
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
         route_channel: 9,
@@ -4771,6 +4769,9 @@ async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<Re
 }
 
 fn blocking_navigation(tier: u8) -> Frame {
+    // Public reading no longer exercises consent, so these requests declare
+    // reversible-change severity while preserving invalid and actuation cases.
+    let tier = if tier == 1 { 3 } else { tier };
     request(
         801,
         "browser.navigate",
@@ -4824,11 +4825,11 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     assert_eq!(p["kind"], "consent");
     // The navigation is held open on the answer, so the phone alerts loudly.
     assert_eq!(p["urgency"], "high");
-    // No hazard was disclosed and navigation asks for no higher tier, so the
-    // ceiling is tier 2, the floor every browser grant is minted at.
+    // The card must cover the declared reversible-change severity, above
+    // the public-browsing baseline, without inventing a form hazard.
     assert_eq!(
         p["scope"],
-        json!({"origins": ["https://requested.example"], "tier": 2})
+        json!({"origins": ["https://requested.example"], "tier": 3})
     );
     assert_eq!(
         p["target"],
@@ -5305,7 +5306,7 @@ fn keyed_navigation(channel: u16, corr: u64, call_key: &str) -> Frame {
         channel,
         corr,
         "browser.navigate",
-        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
         call_key,
     )
 }
@@ -5784,7 +5785,7 @@ async fn typed_text_never_reaches_the_call_records() {
             9,
             801,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
             "pf:secret-1",
         ),
     )
@@ -6047,7 +6048,7 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
             12,
             801,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
             "pf:scoped-1",
         ),
     )
@@ -6910,7 +6911,7 @@ fn relayed_navigation(
 ) -> Frame {
     let mut request = json!({
         "name": "browser.navigate",
-        "arguments": {"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}},
+        "arguments": {"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}},
     });
     if let Some(call_key) = call_key {
         request["call_key"] = call_key.into();
@@ -7821,7 +7822,7 @@ async fn seed_scope_standing_grant(planes: &Planes) {
         .record(
             "pj-scope-agent",
             cerebellum::browser_standing_grants::StandingSubject::Origin(
-                "https://page.example".into(),
+                "https://page.example:8443".into(),
             ),
             cerebellum::authorization::COMPOSE,
             vec![],
@@ -7886,7 +7887,7 @@ async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
         &planes,
         2,
         "browser.navigate",
-        json!({"url":"https://page.example/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
+        json!({"url":"https://page.example:8443/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
     )
     .await;
     let body: Value = serde_json::from_slice(&navigated.body).unwrap();
@@ -7933,7 +7934,7 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
         &planes,
         2,
         "browser.navigate",
-        json!({"url":"https://page.example/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
+        json!({"url":"https://page.example:8443/page", "intent":"read the page", "severity":{"tier":2,"credential":false,"financial":false}}),
     )
     .await;
     let body: Value = serde_json::from_slice(&navigated.body).unwrap();
@@ -8177,7 +8178,7 @@ async fn flow_owner_standing_grant_navigates_without_elicitation() {
         Some(("pj-scope-agent".into(), "default".into()))
     );
     assert_eq!(accepted.flow_id.as_deref(), Some("flow-7"));
-    let reply = flow_wire_call(&planes, 3, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let reply = flow_wire_call(&planes, 3, json!({"action":"navigate","url":"https://page.example:8443/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(*launcher.launches.lock().unwrap(), 1);
 }
@@ -8185,9 +8186,9 @@ async fn flow_owner_standing_grant_navigates_without_elicitation() {
 #[tokio::test]
 async fn flow_missing_browser_grant_refuses_before_launch_or_navigation() {
     let (planes, launcher) = flow_planes();
-    grant_browser(&planes, "https://page.example", vec![]).await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
     bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
-    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example:8443/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     assert_eq!(reply["detail"]["reason"], "unattended_flow");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
@@ -8215,7 +8216,7 @@ async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
             (2, json!({"action":"launch"})),
             (
                 3,
-                json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
+                json!({"action":"navigate","url":"https://page.example:8443/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
             ),
         ] {
             assert_eq!(
@@ -8242,7 +8243,7 @@ async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
             (2, json!({"action":"launch"})),
             (
                 3,
-                json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
+                json!({"action":"navigate","url":"https://page.example:8443/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
             ),
         ] {
             let reply = flow_wire_call(&planes, corr, action).await;
@@ -8263,19 +8264,19 @@ async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
     for (corr, action) in [
         (
             2,
-            json!({"action":"import_login","origin":"https://page.example"}),
+            json!({"action":"import_login","origin":"https://page.example:8443"}),
         ),
         (
             3,
-            json!({"action":"capture_login","credential_domain":"page.example","account":"me","fetch_url":"https://page.example/api","login_url":"https://page.example/login"}),
+            json!({"action":"capture_login","credential_domain":"page.example","account":"me","fetch_url":"https://page.example:8443/api","login_url":"https://page.example:8443/login"}),
         ),
         (
             4,
-            json!({"action":"open_grant","origins":["https://page.example"],"hazards":[]}),
+            json!({"action":"open_grant","origins":["https://page.example:8443"],"hazards":[]}),
         ),
         (
             5,
-            json!({"action":"present","origin":"https://page.example"}),
+            json!({"action":"present","origin":"https://page.example:8443"}),
         ),
     ] {
         let reply = flow_wire_call(&planes, corr, action).await;
@@ -8543,8 +8544,8 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
                 parent_id: None,
                 session_id: "main-session".into(),
                 loader_id: "main-loader".into(),
-                url: "https://page.example/page".into(),
-                origin: "https://page.example".into(),
+                url: "https://page.example:8443/page".into(),
+                origin: "https://page.example:8443".into(),
             },
             FrameDocument {
                 navigation_revision: 0,
@@ -8552,8 +8553,8 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
                 parent_id: Some("frame-main".into()),
                 session_id: "payment-session".into(),
                 loader_id: "payment-loader".into(),
-                url: "https://payment.example/frame".into(),
-                origin: "https://payment.example".into(),
+                url: "https://payment.example:8443/frame".into(),
+                origin: "https://payment.example:8443".into(),
             },
         ],
     }))
@@ -8572,8 +8573,8 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     for mode in ["actionable", "ax"] {
         let snapshot = invoke(&planes, 900, "browser.snapshot", json!({"mode":mode})).await;
         let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
@@ -8585,11 +8586,11 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
         assert_eq!(click["outcome"], "authorization_denied", "{click}");
         assert_eq!(
             click["detail"]["attempted_origin"],
-            "https://payment.example"
+            "https://payment.example:8443"
         );
         assert_eq!(
             click["detail"]["grant_request"],
-            json!({"origins":["https://payment.example"],"severity_tier":2,"hazards":[]})
+            json!({"origins":["https://payment.example:8443"],"severity_tier":2,"hazards":[]})
         );
         assert!(click["remedy"]
             .as_str()
@@ -8619,11 +8620,11 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
     assert_eq!(point["outcome"], "authorization_denied", "{point}");
     assert_eq!(
         point["detail"]["attempted_origin"],
-        "https://payment.example"
+        "https://payment.example:8443"
     );
     assert_eq!(
         point["detail"]["grant_request"]["origins"],
-        json!(["https://payment.example"])
+        json!(["https://payment.example:8443"])
     );
     assert!(point["remedy"]
         .as_str()
@@ -8645,12 +8646,13 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    grant_browser(&planes, "https://payment.example", vec![]).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    grant_browser(&planes, "https://payment.example:8443", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     // Inject a ref naming another origin to exercise action authorization
     // independently of the top page's coverage of embedded reads.
-    fixture.lock().unwrap().action_origin_override = Some("https://other-frame.example".into());
+    fixture.lock().unwrap().action_origin_override =
+        Some("https://other-frame.example:8443".into());
     let snapshot = invoke(&planes, 910, "browser.snapshot", json!({"mode":"ax"})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     let reply = invoke(&planes, 911, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"exercise the frame authorization boundary","severity":{"tier":2,"credential":false,"financial":false}})).await;
@@ -8658,7 +8660,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
     assert_eq!(
         reply["detail"]["attempted_origin"],
-        "https://other-frame.example"
+        "https://other-frame.example:8443"
     );
     let screenshot = invoke(&planes, 912, "browser.screenshot", json!({})).await;
     let screenshot: Value = serde_json::from_slice(&screenshot.body).unwrap();
@@ -8667,7 +8669,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     assert_eq!(point["outcome"], "authorization_denied", "{point}");
     assert_eq!(
         point["detail"]["attempted_origin"],
-        "https://other-frame.example"
+        "https://other-frame.example:8443"
     );
     assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
 }
@@ -8685,9 +8687,9 @@ async fn navigated_frame_ref_is_stale_before_mouse_input() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    grant_browser(&planes, "https://payment.example", vec![]).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    grant_browser(&planes, "https://payment.example:8443", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let snapshot = invoke(&planes, 920, "browser.snapshot", json!({"mode":"ax"})).await;
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     fixture.lock().unwrap().documents[1].loader_id = "navigated-loader".into();
@@ -8752,9 +8754,9 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
             cerebellum::JournalPersistence::Isolated,
         );
         planes.launch_service = Some(launcher.clone());
-        grant_browser(&planes, "https://page.example", vec![]).await;
-        grant_browser(&planes, "https://payment.example", vec![]).await;
-        launch_at(&planes, &launcher.page, "https://page.example").await;
+        grant_browser(&planes, "https://page.example:8443", vec![]).await;
+        grant_browser(&planes, "https://payment.example:8443", vec![]).await;
+        launch_at(&planes, &launcher.page, "https://page.example:8443").await;
         let snapshot = invoke(&planes, 930, "browser.snapshot", json!({"mode":"ax"})).await;
         let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
         let screenshot = invoke(&planes, 931, "browser.screenshot", json!({})).await;
@@ -8769,7 +8771,7 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
             assert_eq!(reply["detail"]["missing_hazard"], missing_hazard);
             assert_eq!(
                 reply["detail"]["attempted_origin"],
-                "https://payment.example"
+                "https://payment.example:8443"
             );
             assert_eq!(
                 reply["detail"]["required"]["financial"], financial,
@@ -8798,8 +8800,8 @@ async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let image = invoke(&planes, 990, "browser.screenshot", json!({})).await;
     let image: Value = serde_json::from_slice(&image.body).unwrap();
     assert_eq!(image["outcome"], "ok", "{image}");
@@ -9295,17 +9297,17 @@ async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Val
 async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     let (planes, launcher) = flow_planes();
     bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
-    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":3,"credential":false,"financial":false}})).await;
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     let token = reply["detail"]["grant"].as_str().unwrap();
     let label = reply["detail"]["grant_label"].as_str().unwrap();
     assert_eq!(
         decode_missing_grant(token),
-        json!({"tool":"browser_use","subject":{"domain":"page.example"},"level":2})
+        json!({"tool":"browser_use","subject":{"domain":"page.example"},"level":3})
     );
     assert_eq!(
         label,
-        "browser access to page.example up to clicking ordinary links and buttons"
+        "browser access to page.example up to filling in forms and other changes that can be undone"
     );
     bind_flow_wire_target(
         &planes,
@@ -9343,7 +9345,7 @@ async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
         .record(
             "pj-scope-agent",
             cerebellum::browser_standing_grants::StandingSubject::Domain("page.example".into()),
-            2,
+            3,
             vec![],
             None,
             "permission-restored",
@@ -9401,4 +9403,78 @@ async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     assert!(!journal.contains(token), "token leaked into journal");
     assert!(!journal.contains(label), "label leaked into journal");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn only_profile_creation_marks_signed_in_coverage_complete() {
+    use cerebellum_core::identity::{
+        AcceptedBindFacts, ProfileDisposition, RouteSurface, SessionKind,
+    };
+    let scratch = cortexkit_test_support::ScratchDir::new("profile-sign-in-coverage");
+    let signed_in = Arc::new(cerebellum::browser_signed_in::SignedInDomains::open(
+        scratch.join("signed-in-domains.json"),
+    ));
+    let mut browser_config = config();
+    browser_config.executable_path = Some(std::env::current_exe().unwrap());
+    browser_config.expected_identity = Some("test.identity".into());
+    let service = cerebellum::browser_launch_service::ProductionLaunchService::open(
+        browser_config,
+        cerebellum::JournalPersistence::Isolated,
+    );
+    let mut accepted = AcceptedBindFacts {
+        identity: RouteIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
+            conversation_key: "coverage-legacy".into(),
+            agent_project_id: "legacy-agent".into(),
+            session_kind: SessionKind::Primary,
+            profile_disposition: ProfileDisposition::Durable,
+            project_root: "/tmp".into(),
+            origin: Default::default(),
+        },
+        principal: Some(subc_protocol::Principal::Direct),
+        agent_project_id_attested: true,
+        acts_as_agent: true,
+        session_kind_attested: true,
+        control_operations: vec![],
+        effective_capability_scope: None,
+        flow_id: None,
+        consumer_capabilities: vec![],
+        surface: RouteSurface::Tools,
+        scope: None,
+    };
+    let legacy = service
+        .take_and_return_profile_custody(&accepted, "before-coverage-tracking")
+        .unwrap();
+    let service = service.with_signed_in_domains(Arc::clone(&signed_in));
+    assert_eq!(
+        service
+            .take_and_return_profile_custody(&accepted, "existing-profile")
+            .unwrap(),
+        legacy
+    );
+    assert!(signed_in.is_signed_in("legacy-agent", "default", "https://never-signed.example"));
+    accepted.identity.conversation_key = "coverage-fresh".into();
+    accepted.identity.agent_project_id = "fresh-agent".into();
+    let fresh = service
+        .take_and_return_profile_custody(&accepted, "new-profile")
+        .unwrap();
+    assert_ne!(fresh, legacy);
+    assert!(!signed_in.is_signed_in("fresh-agent", "default", "https://never-signed.example"));
+    signed_in
+        .record("fresh-agent", "default", "https://seen.example")
+        .unwrap();
+    assert_eq!(
+        service
+            .take_and_return_profile_custody(&accepted, "reopen-fresh-profile")
+            .unwrap(),
+        fresh
+    );
+    assert!(signed_in.is_signed_in("fresh-agent", "default", "https://seen.example"));
+    assert!(!signed_in.is_signed_in("fresh-agent", "default", "https://never-signed.example"));
+    let persisted = cerebellum::browser_signed_in::SignedInDomains::open(
+        scratch.join("signed-in-domains.json"),
+    );
+    assert!(persisted.is_signed_in("legacy-agent", "default", "https://never-signed.example"));
+    assert!(!persisted.is_signed_in("fresh-agent", "default", "https://never-signed.example"));
 }

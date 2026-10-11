@@ -694,7 +694,12 @@ fn navigate_reply(tracker: &Tracker, should_settle: bool) -> Value {
         "loaded": loaded,
         "settled": loaded && tracker.settled,
     });
-    if should_settle && !loaded {
+    if tracker.download_blocked {
+        response["outcome"] = json!("unsupported_download");
+        response["remedy"] = json!(
+            "the download was blocked; choose an in-page action that does not start a download"
+        );
+    } else if should_settle && !loaded {
         response["outcome"] = json!("not_settled");
         let pending = if tracker.url_final.is_none() {
             "main document has not committed"
@@ -808,6 +813,7 @@ pub struct MainFrameResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tracker {
+    pub download_blocked: bool,
     pub url_final: Option<String>,
     pub main_frame_response: Option<MainFrameResponse>,
     pub lifecycle: Vec<String>,
@@ -979,7 +985,7 @@ impl Tracker {
     /// Whether the main frame has begun, or already committed, a navigation
     /// to another document.
     pub fn main_frame_navigation_observed(&self) -> bool {
-        self.main_frame_navigation_requested || self.url_final.is_some()
+        self.download_blocked || self.main_frame_navigation_requested || self.url_final.is_some()
     }
     pub fn same_document_url(&self) -> Option<&str> {
         self.main_frame_same_document_url.as_deref()
@@ -1243,6 +1249,35 @@ struct ContextState {
     next_snapshot_seed: u64,
     refs: refs::StableRefs,
 }
+
+fn public_read_frames(
+    frames: &[snapshot_store::FrameDocument],
+) -> Vec<snapshot_store::FrameDocument> {
+    let mut readable = frames
+        .iter()
+        .filter(|frame| frame.parent_id.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    loop {
+        let before = readable.len();
+        for frame in frames {
+            if frame
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent| readable.iter().any(|allowed| &allowed.frame_id == parent))
+                && crate::browser_standing_grants::origin_is_public(&frame.origin)
+                && !readable
+                    .iter()
+                    .any(|allowed| allowed.frame_id == frame.frame_id)
+            {
+                readable.push(frame.clone());
+            }
+        }
+        if readable.len() == before {
+            return readable;
+        }
+    }
+}
 impl ContextState {
     fn new(identity: RouteIdentity) -> Self {
         Self {
@@ -1351,6 +1386,7 @@ impl BrowserJournalMode {
 struct BrowserJournalState {
     store: Option<JournalStore>,
     invocations: HashMap<String, Vec<JournalInvocation>>,
+    authorization: HashMap<String, GrantDecision>,
 }
 
 impl BrowserJournalState {
@@ -1381,7 +1417,6 @@ impl BrowserJournalState {
     }
 }
 
-#[derive(Default)]
 pub struct BrowserPlane {
     state: Arc<Mutex<BrowserState>>,
     lanes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -1398,7 +1433,81 @@ pub struct BrowserPlane {
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
 }
 
+impl Default for BrowserPlane {
+    fn default() -> Self {
+        Self::with_grants(GrantStore::default().with_public_web_baseline(Arc::new(
+            crate::browser_signed_in::SignedInDomains::default(),
+        )))
+    }
+}
+
 impl BrowserPlane {
+    pub(crate) async fn register_existing_profile(&self, identity: &RouteIdentity, uuid: &str) {
+        let signed_in = self.grants.lock().await.signed_in_domains().cloned();
+        if let Some(signed_in) = signed_in {
+            let _ = signed_in.initialize_profile(
+                &identity.agent_project_id,
+                &crate::browser_signed_in::SignedInDomains::profile_name(identity),
+                uuid,
+                false,
+            );
+        }
+        self.seed_legacy_profile(identity).await;
+    }
+
+    async fn seed_legacy_profile(&self, identity: &RouteIdentity) {
+        let signed_in = self.grants.lock().await.signed_in_domains().cloned();
+        let Some(signed_in) = signed_in else {
+            return;
+        };
+        let profile = crate::browser_signed_in::SignedInDomains::profile_name(identity);
+        let Some(uuid) = signed_in.needs_legacy_seed(&identity.agent_project_id, &profile) else {
+            return;
+        };
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            let Ok(store) = self.journal_mode.open_store() else {
+                return;
+            };
+            journal.store = store;
+        }
+        let export = journal
+            .store
+            .as_ref()
+            .map(|store| store.export())
+            .unwrap_or_default();
+        drop(journal);
+        let evidence = crate::browser_signed_in::LoginJournalEvidence::from_export(
+            &export,
+            &identity.agent_project_id,
+            &profile,
+            &uuid,
+        );
+        let _ = signed_in.seed_legacy(&identity.agent_project_id, &profile, &uuid, evidence);
+    }
+    async fn remember_authorization(
+        &self,
+        identity: &RouteIdentity,
+        decision: &crate::authorization::AuthorizationDecision,
+    ) {
+        self.journal.lock().await.authorization.insert(
+            identity.conversation_key.clone(),
+            GrantDecision {
+                outcome: crate::journal::GrantOutcome::Allowed,
+                reason: decision
+                    .is_public_web_baseline()
+                    .then(|| crate::authorization::PUBLIC_WEB_BASELINE.to_string()),
+            },
+        );
+    }
+
+    pub async fn record_signed_in(&self, profile: &str, origin: &str) -> Result<(), String> {
+        let grants = self.grants.lock().await;
+        grants
+            .signed_in_domains()
+            .ok_or("signed-in domains unavailable")?
+            .record(profile, "default", origin)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -1450,7 +1559,7 @@ impl BrowserPlane {
     ) -> Self {
         Self {
             session_gate: Some((sessions, clock, navigation_settle_deadline_ms)),
-            ..Self::default()
+            ..Self::new()
         }
     }
 
@@ -1874,6 +1983,12 @@ impl BrowserPlane {
         // for direct first-party callers because it serializes all CDP operations
         // for a conversation and prevents concurrent invocations from interleaving them.
         let _lane = self.lane(&identity.conversation_key).await;
+        self.journal
+            .lock()
+            .await
+            .authorization
+            .remove(&identity.conversation_key);
+        self.seed_legacy_profile(identity).await;
         if let Some((sessions, clock, _)) = &self.session_gate {
             if let Some(handoff) =
                 sessions.human_in_control(&identity.conversation_key, clock.as_ref())
@@ -2191,6 +2306,10 @@ impl BrowserPlane {
     ) -> Result<(), BrowserError> {
         if self.journal_mode.is_enabled() {
             let mut journal = self.journal.lock().await;
+            let grant_decision = journal
+                .authorization
+                .remove(&identity.conversation_key)
+                .unwrap_or_else(GrantDecision::not_reached);
             if let Some((store, invocation)) =
                 journal.active_invocation_mut(&identity.conversation_key, capability)
             {
@@ -2201,7 +2320,7 @@ impl BrowserPlane {
                             intent_redacted: None,
                             requested_severity: None,
                             effective_severity: None,
-                            grant_decision: GrantDecision::not_reached(),
+                            grant_decision,
                             action: journal_action(invocation.capability),
                             locator: None,
                             snapshot_ids: Vec::new(),
@@ -2364,7 +2483,8 @@ impl BrowserPlane {
         }
         {
             let origin = origin_from_url(url);
-            self.grants
+            let decision = self
+                .grants
                 .lock()
                 .await
                 .authorize(
@@ -2377,6 +2497,7 @@ impl BrowserPlane {
                     &origin,
                 )
                 .map_err(map_authorization_error)?;
+            self.remember_authorization(identity, &decision).await;
         }
         if scheme != "http" && scheme != "https" {
             return Err(BrowserError::NavigationPolicyRejected {
@@ -2448,6 +2569,8 @@ impl BrowserPlane {
         let mut response = navigate_reply(&tracker, should_settle);
         let outcome = if response["outcome"] == "ok" {
             Outcome::Success
+        } else if response["outcome"] == "unsupported_download" {
+            Outcome::Denied
         } else {
             Outcome::InternalError
         };
@@ -2635,7 +2758,7 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
         live_url: &str,
-    ) -> Result<(), BrowserError> {
+    ) -> Result<bool, BrowserError> {
         let origin = origin_from_url(live_url);
         let grants = self.grants.lock().await;
         let request = if capability == BrowserCapability::Screenshot {
@@ -2654,7 +2777,8 @@ impl BrowserPlane {
         let (error, reason) = match grants.authorize(request, &origin) {
             Ok(decision) => {
                 if grants.commit(&decision).is_ok() {
-                    return Ok(());
+                    self.remember_authorization(identity, &decision).await;
+                    return Ok(decision.is_public_web_baseline());
                 }
                 (
                     BrowserError::AuthorizationDenied { reason: "no_grant" },
@@ -2755,7 +2879,8 @@ impl BrowserPlane {
         let (mut session_operation, source_document) = self
             .read_live_document(identity, session_operation, deadline_ms)
             .await?;
-        self.authorize_read(identity, BrowserCapability::Snapshot, &source_document.url)
+        let baseline_read = self
+            .authorize_read(identity, BrowserCapability::Snapshot, &source_document.url)
             .await?;
         let route = identity.conversation_key.clone();
         let (operation, frames) = tokio::task::spawn_blocking(move || {
@@ -2790,11 +2915,17 @@ impl BrowserPlane {
                 reason_code: "frame_document_changed",
             });
         }
-        // The top document's read grant covers its embedded documents, including
-        // opaque frames. Frame-origin grants remain mandatory for actions.
+        // A person's top-page grant retains inherited frame access. Implicit
+        // public browsing is not approval to read embedded local/private content.
+        let readable_frames = if baseline_read {
+            public_read_frames(&frames)
+        } else {
+            frames.clone()
+        };
+        let frames_omitted = frames.len().saturating_sub(readable_frames.len());
         if !frames.is_empty() {
             session_operation
-                .set_read_frames(frames.clone())
+                .set_read_frames(readable_frames)
                 .map_err(map_navigation_drive_error)?;
         }
         self.reserve_journal(identity, BrowserCapability::Snapshot, persist_journal)
@@ -2838,7 +2969,7 @@ impl BrowserPlane {
         })?;
         let (session_operation, drive_result, live_after) = driven;
         session_operation.finish();
-        let observation = match drive_result {
+        let mut observation = match drive_result {
             Ok(observation) => observation,
             Err(error) => {
                 // A capture fails when the page commits another document
@@ -2885,6 +3016,20 @@ impl BrowserPlane {
             live_after,
         )
         .await?;
+        if frames_omitted > 0 {
+            let note = "embedded frame from a local, private or opaque origin omitted; it needs site permission";
+            observation.records.push(AxRecord {
+                depth: 0,
+                role: "StaticText".into(),
+                name: note.into(),
+                value: None,
+                reference: None,
+            });
+            observation
+                .dom_text
+                .get_or_insert_with(String::new)
+                .push_str(&format!("\n<!-- {note} -->\n"));
+        }
         let (result, ref_count) = self
             .retain_text_snapshot_inner(
                 identity,
@@ -2896,7 +3041,7 @@ impl BrowserPlane {
                 zoom,
                 filters,
                 max_bytes,
-                kind != SnapshotKind::DomFull && observation.ax_truncated,
+                frames_omitted > 0 || (kind != SnapshotKind::DomFull && observation.ax_truncated),
                 observation.refs_truncated,
                 Some(source_document),
             )
@@ -3202,6 +3347,11 @@ impl BrowserPlane {
                 }
                 json!({"outcome":"ok","navigation":"same_document","url_final":url})
             }
+            ClickNavigation::MainFrame(tracker) if tracker.download_blocked => {
+                let mut response = navigate_reply(&tracker, false);
+                response["navigation"] = json!("not_committed");
+                response
+            }
             ClickNavigation::MainFrame(tracker) if tracker.navigation_ended_without_commit() => {
                 // The page the click started from is still the one shown.
                 json!({
@@ -3419,6 +3569,12 @@ impl BrowserPlane {
             return Err(error);
         }
 
+        self.remember_authorization(
+            identity,
+            authorization.as_ref().expect("authorization succeeded"),
+        )
+        .await;
+
         let reservation = self.reserve(identity, BrowserCapability::Click).await;
         let mut session_operation = match reservation {
             Ok(Some(operation)) => operation,
@@ -3540,7 +3696,11 @@ impl BrowserPlane {
         self.finalize(
             identity,
             BrowserCapability::Click,
-            Outcome::Success,
+            if response["outcome"] == "unsupported_download" {
+                Outcome::Denied
+            } else {
+                Outcome::Success
+            },
             response.clone(),
         )
         .await?;
@@ -3796,11 +3956,7 @@ impl BrowserPlane {
                 return Err(error);
             }
         };
-        if let Err(error) = self.commit(identity, BrowserCapability::ClickPoint).await {
-            session_operation.finish();
-            self.unpin_snapshot(identity, snapshot_id).await;
-            return Err(error);
-        }
+
         {
             let mut state = self.state.lock().await;
             Self::op(
@@ -3887,6 +4043,16 @@ impl BrowserPlane {
             self.unpin_snapshot(identity, snapshot_id).await;
             return Err(map_authorization_error(error));
         }
+        self.remember_authorization(
+            identity,
+            authorization.as_ref().expect("authorization succeeded"),
+        )
+        .await;
+        if let Err(error) = self.commit(identity, BrowserCapability::ClickPoint).await {
+            session_operation.finish();
+            self.unpin_snapshot(identity, snapshot_id).await;
+            return Err(error);
+        }
         let activated_element = json!({"identity":classification.activation_target_identity,"kind":classification.target_kind});
         let state = Arc::clone(&self.state);
         let route_key = identity.conversation_key.clone();
@@ -3972,7 +4138,11 @@ impl BrowserPlane {
         self.finalize(
             identity,
             BrowserCapability::ClickPoint,
-            Outcome::Success,
+            if response["outcome"] == "unsupported_download" {
+                Outcome::Denied
+            } else {
+                Outcome::Success
+            },
             response.clone(),
         )
         .await?;

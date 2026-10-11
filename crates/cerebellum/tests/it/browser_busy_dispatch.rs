@@ -10,6 +10,12 @@ struct FixturePipe {
     large_fanout: bool,
     hit_backend: u64,
     commands: Arc<Mutex<Vec<Value>>>,
+    attachment: Option<AttachmentResponse>,
+}
+
+struct AttachmentResponse {
+    downloads: std::path::PathBuf,
+    denied: bool,
 }
 
 fn dom() -> Value {
@@ -40,8 +46,27 @@ impl CdpPipeIo for FixturePipe {
         self.commands.lock().unwrap().push(command.clone());
         let method = command["method"].as_str().unwrap();
         let result = match method {
+            "Browser.setDownloadBehavior" => {
+                assert!(
+                    command.get("sessionId").is_none(),
+                    "download policy belongs to the browser session"
+                );
+                if let Some(attachment) = self.attachment.as_mut() {
+                    attachment.denied = command["params"]["behavior"] == "deny";
+                }
+                json!({})
+            }
             "Target.createTarget" => json!({"targetId":"target-own"}),
             "Target.attachToTarget" => json!({"sessionId":"session-own"}),
+            "Page.navigate" if self.attachment.is_some() => {
+                let attachment = self.attachment.as_ref().unwrap();
+                if !attachment.denied {
+                    std::fs::write(attachment.downloads.join("report.txt"), "fixture payload")
+                        .unwrap();
+                }
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"navigation-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+                json!({"frameId":"target-own","isDownload":true,"errorText":"net::ERR_ABORTED"})
+            }
             "Accessibility.getRootAXNode" => json!({"node":ax(1,1,"RootWebArea","Events",&[2])}),
             "Accessibility.getChildAXNodes" if command["params"]["id"] == "1" => {
                 let children = if self.large_fanout {
@@ -54,7 +79,16 @@ impl CdpPipeIo for FixturePipe {
             "Accessibility.getChildAXNodes" => {
                 json!({"nodes":[ax(3,43,"StaticText","Event row",&[])]})
             }
-            "DOM.getFlattenedDocument" => dom(),
+            "DOM.getFlattenedDocument" => {
+                let mut document = dom();
+                if self.attachment.is_some() {
+                    document["nodes"][1]["localName"] = json!("a");
+                    document["nodes"][1]["nodeName"] = json!("A");
+                    document["nodes"][1]["attributes"] =
+                        json!(["href", "https://requested.example/attachment"]);
+                }
+                document
+            }
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),
             "Page.getFrameTree" => {
@@ -91,6 +125,18 @@ impl CdpPipeIo for FixturePipe {
         if let Some(held) = self.held.take() {
             self.queue(held);
         }
+        if method == "Input.dispatchMouseEvent" && command["params"]["type"] == "mouseReleased" {
+            if let Some(attachment) = self.attachment.as_ref() {
+                // The browser double models an attachment response at the disk
+                // boundary: without Chrome's deny policy it saves the payload.
+                if !attachment.denied {
+                    std::fs::write(attachment.downloads.join("report.txt"), "fixture payload")
+                        .unwrap();
+                }
+                self.queue(json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"requestId":"attachment","frameId":"target-own","type":"Document","response":{"status":200,"statusText":"OK","headers":{"Content-Disposition":"attachment; filename=report.txt"}}}}));
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"fixture-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+            }
+        }
         if self.block_once == Some(method) {
             self.block_once = None;
             self.held = Some(response);
@@ -120,6 +166,16 @@ struct FixtureProcess {
 }
 
 impl OwnedBrowserProcess for FixtureProcess {
+    fn navigate(
+        &mut self,
+        context: &str,
+        url: &str,
+        wait: NavigationWait,
+        deadline: u64,
+        tracker: &mut Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver.navigate(context, url, wait, deadline, tracker)
+    }
     fn committed_document(
         &mut self,
         context: &str,
@@ -189,6 +245,7 @@ async fn fixture(
         large_fanout: block_once == Some("large_fanout"),
         hit_backend,
         commands: commands.clone(),
+        attachment: None,
     };
     let process = FixtureProcess {
         driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
@@ -417,4 +474,86 @@ async fn busy_snapshot_large_fanout_is_partial_without_requesting_the_huge_subtr
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_relaunch() {
+    let scratch = cortexkit_test_support::ScratchDir::new("browser-attachment-deny");
+    for launch in 0..2 {
+        let downloads = scratch.join(format!("profile-{launch}/Downloads"));
+        cerebellum_core::private_fs::create_dir_all(&downloads).unwrap();
+        let route = identity();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let pipe = FixturePipe {
+            reads: VecDeque::new(),
+            held: None,
+            block_once: None,
+            large_fanout: false,
+            hit_backend: 42,
+            commands: Arc::clone(&commands),
+            attachment: Some(AttachmentResponse {
+                downloads: downloads.clone(),
+                denied: false,
+            }),
+        };
+        let process = FixtureProcess {
+            driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
+            read_document: false,
+            refusal: None,
+        };
+        let plane = plane_with_process(&route, Box::new(process), 150)
+            .with_grants_installed(GrantStore::default().with_public_web_baseline(Arc::new(
+                cerebellum::browser_signed_in::SignedInDomains::default(),
+            )))
+            .with_result_schema_enforcement(
+                cerebellum::computer_capability::ResultSchemaEnforcement::Withhold,
+            );
+        plane.open_context(route.clone()).await.unwrap();
+        let snapshot = plane
+            .serve(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        let reply = click_text(&plane, &route, &snapshot).await;
+        assert_eq!(
+            std::fs::read_dir(&downloads).unwrap().count(),
+            0,
+            "an attachment wrote into {}",
+            downloads.display()
+        );
+        assert_eq!(reply["outcome"], "unsupported_download", "{reply}");
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("download was blocked"));
+        assert!(reply["lifecycle"]["events"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("download_blocked")));
+        cerebellum::browser::validate_browser_result("browser.click", &reply).unwrap();
+        let navigated = plane.serve(&route, BrowserCapability::Navigate, &json!({"url":"https://requested.example/attachment","intent":"read an attachment URL","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}})).await.unwrap();
+        assert_eq!(navigated["outcome"], "unsupported_download", "{navigated}");
+        assert!(navigated["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("download was blocked"));
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 0);
+        let commands = commands.lock().unwrap();
+        let deny = commands
+            .iter()
+            .position(|command| command["method"] == "Browser.setDownloadBehavior")
+            .unwrap();
+        let target = commands
+            .iter()
+            .position(|command| command["method"] == "Target.createTarget")
+            .unwrap();
+        assert!(
+            deny < target,
+            "download denial must precede opening any owned target"
+        );
+        assert_eq!(
+            commands[deny]["params"],
+            json!({"behavior":"deny","eventsEnabled":true})
+        );
+    }
 }

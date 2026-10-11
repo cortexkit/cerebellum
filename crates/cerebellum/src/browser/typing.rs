@@ -150,6 +150,7 @@ impl BrowserPlane {
         text: &str,
         clear_first: bool,
     ) -> Result<Value, BrowserError> {
+        let profile_name = crate::browser_signed_in::SignedInDomains::profile_name(identity);
         {
             let grants = self.grants.lock().await;
             // Typing changes page state, so it needs at least tier 2, the same
@@ -160,16 +161,19 @@ impl BrowserPlane {
                 false,
                 false,
             );
-            let request = AuthorizationRequest::click(
+            let mut request = AuthorizationRequest::click(
                 &identity.conversation_key,
                 severity,
                 snapshot_id,
                 &identity.agent_project_id,
                 &dispatch.classification,
             );
+            request.action = crate::authorization::Action::Type;
+            request.signed_in_profile = &profile_name;
             let decision = grants
                 .authorize(request, &origin_from_url(&origin))
                 .map_err(map_authorization_error)?;
+            self.remember_authorization(identity, &decision).await;
             grants.commit(&decision).map_err(|_| {
                 map_authorization_error(crate::authorization::AuthorizationError::NoGrant)
             })?;

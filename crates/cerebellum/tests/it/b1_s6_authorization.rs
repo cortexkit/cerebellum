@@ -151,7 +151,7 @@ fn activation_target_derivation_covers_composed_descendants_labels_and_disabled_
 #[test]
 fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
     let anchor = ElementClassificationInput::new(identity(30), TargetKind::Anchor)
-        .destination("https://pay.test/submit");
+        .destination("http://10.0.0.5/submit");
     let record = classify_click(&NonTypeClassificationInput::new(
         1,
         anchor,
@@ -162,7 +162,7 @@ fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
 
     let mut grants = GrantStore::new([
         grant("z", &["https://shop.test"]),
-        grant("a", &["https://pay.test"]),
+        grant("a", &["http://10.0.0.5"]),
     ]);
     let decision = grants
         .authorize(
@@ -173,18 +173,18 @@ fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
                 "bind",
                 &record,
             ),
-            "https://pay.test",
+            "http://10.0.0.5",
         )
         .unwrap();
     assert_eq!(decision.grant_id(), "a");
     let commitment = grants.commit(&decision).unwrap();
     grants.revoke("a").unwrap();
-    assert!(commitment.evaluate_origin_scope("https://pay.test").is_ok());
+    assert!(commitment.evaluate_origin_scope("http://10.0.0.5").is_ok());
     assert_eq!(
         commitment.evaluate_origin_scope("https://shop.test"),
         Err(AuthorizationDeniedDetail::OriginScope {
             attempted_origin: "https://shop.test".to_string(),
-            granted_origins: vec!["https://pay.test".to_string()],
+            granted_origins: vec!["http://10.0.0.5".to_string()],
         })
     );
 }

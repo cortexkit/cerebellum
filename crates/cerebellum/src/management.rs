@@ -354,6 +354,7 @@ pub struct ManagementPlane {
     /// Standing per-agent browser rows; the same store `browser_grants`
     /// consults.
     standing_browser_grants: Arc<StandingBrowserGrants>,
+    signed_in_domains: Arc<crate::browser_signed_in::SignedInDomains>,
     pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
     isolated_storage: bool,
@@ -639,14 +640,18 @@ impl ManagementPlane {
         computer_grants: Arc<ComputerGrants>,
     ) -> Self {
         let standing_browser_grants = Arc::new(StandingBrowserGrants::in_memory());
+        let signed_in_domains = Arc::new(crate::browser_signed_in::SignedInDomains::default());
         Self {
             computer_grants,
             app_state_sessions: Arc::new(AppStateSessions::new()),
             resolver,
             browser_grants: Arc::new(Mutex::new(
-                GrantStore::default().with_standing_grants(Arc::clone(&standing_browser_grants)),
+                GrantStore::default()
+                    .with_standing_grants(Arc::clone(&standing_browser_grants))
+                    .with_public_web_baseline(Arc::clone(&signed_in_domains)),
             )),
             standing_browser_grants,
+            signed_in_domains,
             pending_browser_grants: Mutex::new(BTreeMap::new()),
             profile_lifecycle: None,
             isolated_storage: false,
@@ -659,7 +664,8 @@ impl ManagementPlane {
         }
     }
 
-    /// A flow outlives a conversation, so only durable per-agent grants count.
+    /// Install-time flow checks count implicit public browsing and durable
+    /// permissions, but not conversation grants: a flow can outlive its conversation.
     pub(crate) fn would_ask(&self, request: &WouldAskRequest) -> Value {
         let items: Vec<Value> = request
             .items
@@ -675,7 +681,7 @@ impl ManagementPlane {
                         grant["subject"]["origin"].as_str().map(str::to_owned).unwrap_or_else(|| format!("https://{}", grant["subject"]["domain"].as_str().unwrap()))
                     } else { grant["target"].as_str().unwrap().to_owned() };
                     let (verdict, reason) = if tool == "browser_use" {
-                        browser_token_grant_answer(&self.standing_browser_grants, &request.agent_id, grant, &target)
+                        browser_token_grant_answer(&self.standing_browser_grants, &self.signed_in_domains, &request.agent_id, grant, &target)
                     } else if self.computer_grants.has_exact_standing_app_grant(&request.agent_id, &target, grant["signer"].as_str().unwrap()) {
                         ("yes", "standing_grant")
                     } else { ("would_ask", "no_standing_grant") };
@@ -696,6 +702,7 @@ impl ManagementPlane {
                 } else if item.tool == "browser_use" {
                     browser_standing_grant_answer(
                         &self.standing_browser_grants,
+                        &self.signed_in_domains,
                         &request.agent_id,
                         target,
                         item.level,
@@ -722,7 +729,9 @@ impl ManagementPlane {
     /// plane, before the browser grants are shared.
     pub fn with_standing_browser_grants(mut self, standing: Arc<StandingBrowserGrants>) -> Self {
         self.browser_grants = Arc::new(Mutex::new(
-            GrantStore::default().with_standing_grants(Arc::clone(&standing)),
+            GrantStore::default()
+                .with_standing_grants(Arc::clone(&standing))
+                .with_public_web_baseline(Arc::clone(&self.signed_in_domains)),
         ));
         self.standing_browser_grants = standing;
         self
@@ -731,6 +740,21 @@ impl ManagementPlane {
     /// The standing per-agent browser rows.
     pub fn standing_browser_grants(&self) -> &Arc<StandingBrowserGrants> {
         &self.standing_browser_grants
+    }
+
+    /// The browser and permission planes must consult the same login history.
+    /// Attach this store before handing the shared grants to the browser plane.
+    pub fn with_signed_in_domains(
+        mut self,
+        signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    ) -> Self {
+        self.browser_grants = Arc::new(Mutex::new(
+            GrantStore::default()
+                .with_standing_grants(Arc::clone(&self.standing_browser_grants))
+                .with_public_web_baseline(Arc::clone(&signed_in)),
+        ));
+        self.signed_in_domains = signed_in;
+        self
     }
 
     /// The computer plane's grants.
@@ -1339,6 +1363,14 @@ impl ManagementPlane {
         &self,
         project_id: &str,
     ) -> Result<Option<crate::login_import::DurableProfileLocation>, &'static str> {
+        self.durable_login_profile_identity(project_id)
+            .map(|value| value.map(|(location, _)| location))
+    }
+
+    pub(crate) fn durable_login_profile_identity(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(crate::login_import::DurableProfileLocation, String)>, &'static str> {
         let lifecycle = self.profile_lifecycle_for_rebind()?;
         let registry = lifecycle.registry();
         let resolution = registry
@@ -1350,10 +1382,13 @@ impl ManagementPlane {
                     .root()
                     .open_target(Path::new(&record.target))
                     .map_err(|_| "profile_registry_unavailable")?;
-                Ok(Some(crate::login_import::DurableProfileLocation {
-                    managed_root: registry.root().canonical_path().to_path_buf(),
-                    profile_directory: profile.canonical_path().to_path_buf(),
-                }))
+                Ok(Some((
+                    crate::login_import::DurableProfileLocation {
+                        managed_root: registry.root().canonical_path().to_path_buf(),
+                        profile_directory: profile.canonical_path().to_path_buf(),
+                    },
+                    record.profile_uuid,
+                )))
             }
             crate::profile::DurableResolution::AffirmativeAbsence
             | crate::profile::DurableResolution::Unavailable => Ok(None),
@@ -2215,16 +2250,28 @@ fn new_launch_recovery_clear_ask_id(incarnation: &str) -> String {
 /// `browser_standing_grants_unavailable` rather than reading as no grant.
 fn browser_standing_grant_answer(
     standing: &StandingBrowserGrants,
+    signed_in: &crate::browser_signed_in::SignedInDomains,
     agent: &str,
     origin: &str,
     level: Option<u64>,
 ) -> (&'static str, &'static str) {
-    if standing.store_error().is_some() {
-        return ("would_ask", "browser_standing_grants_unavailable");
-    }
     let level = level
         .and_then(|level| u8::try_from(level).ok())
         .unwrap_or(crate::authorization::OBSERVE);
+    // Install checks name a tier, not an action. At the typing tier, conservatively
+    // require consent on signed-in domains; read-only flows remain unattended.
+    if crate::authorization::public_web_baseline_covers(
+        origin,
+        crate::authorization::Severity::new(level, false, false),
+        &BTreeSet::new(),
+    ) && (level == crate::authorization::OBSERVE
+        || !signed_in.is_signed_in(agent, "default", origin))
+    {
+        return ("yes", crate::authorization::PUBLIC_WEB_BASELINE);
+    }
+    if standing.store_error().is_some() {
+        return ("would_ask", "browser_standing_grants_unavailable");
+    }
     let now = standing.now_ms();
     let none = BTreeSet::new();
     if standing_browser_grant_covers(standing, agent, origin, level, &none, now) {
@@ -2245,12 +2292,24 @@ fn browser_standing_grant_answer(
 
 fn browser_token_grant_answer(
     standing: &StandingBrowserGrants,
+    signed_in: &crate::browser_signed_in::SignedInDomains,
     agent: &str,
     grant: &Value,
     origin: &str,
 ) -> (&'static str, &'static str) {
     if grant["subject"].get("domain").is_none() {
-        return browser_standing_grant_answer(standing, agent, origin, grant["level"].as_u64());
+        return browser_standing_grant_answer(
+            standing,
+            signed_in,
+            agent,
+            origin,
+            grant["level"].as_u64(),
+        );
+    }
+    let baseline =
+        browser_standing_grant_answer(standing, signed_in, agent, origin, grant["level"].as_u64());
+    if baseline.1 == crate::authorization::PUBLIC_WEB_BASELINE {
+        return baseline;
     }
     if standing.store_error().is_some() {
         return ("would_ask", "browser_standing_grants_unavailable");
@@ -2399,7 +2458,7 @@ pub(crate) fn would_ask_result_schema() -> Value {
                 "tool":{"type":"string","enum":["browser_use","computer_use","unknown"]},
                 "target":{"type":"string"},
                 "verdict":{"type":"string","enum":["yes","no","would_ask","invalid_grant"]},
-                "reason":{"type":"string","enum":["standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target","invalid_grant"]},
+                "reason":{"type":"string","enum":["public_web_baseline","standing_grant","no_standing_grant","level_above_grant","app_signer_not_eligible_for_always","browser_standing_grants_unavailable","invalid_target","invalid_grant"]},
                 "field":{"type":"string"}
             }
         }}

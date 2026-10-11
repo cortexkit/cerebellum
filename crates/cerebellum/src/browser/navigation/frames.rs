@@ -308,10 +308,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 reference.frame_document = Some(main.clone());
             }
             for frame in before.iter().filter(|f| f.parent_id.is_some()) {
-                if observation.records.len() >= MAX_AX_NODES || observation.refs.len() >= MAX_REFS {
+                let readable = allowed.contains(frame);
+                if readable
+                    && (observation.records.len() >= MAX_AX_NODES
+                        || observation.refs.len() >= MAX_REFS)
+                {
                     observation.ax_truncated = true;
                     observation.refs_truncated = true;
-                    break;
+                    continue;
                 }
                 if frame
                     .parent_id
@@ -351,6 +355,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         })
                     })
                     .map(|r| r.captured.reference.clone());
+                if !readable {
+                    // A withheld document must not leave an actionable iframe
+                    // owner pointing into it, even when the owner is in the parent.
+                    if let Some(owner_ref) = owner_ref {
+                        observation
+                            .refs
+                            .retain(|r| r.captured.reference != owner_ref);
+                        for record in &mut observation.records {
+                            if record.reference.as_deref() == Some(&owner_ref) {
+                                record.reference = None;
+                            }
+                        }
+                        observation.facts.remove(&owner_ref);
+                    }
+                    continue;
+                }
                 let owner_index = owner_ref
                     .as_ref()
                     .and_then(|r| {
@@ -361,9 +381,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     })
                     .ok_or(NavigationDriveError::CdpFailure)?;
                 let depth = observation.records[owner_index].depth + 1;
-                if !allowed.contains(frame) {
-                    continue;
-                }
                 self.active_frame = Some(frame.clone());
                 let mut child = self.snapshot_with_clock(
                     context,
@@ -1142,6 +1159,41 @@ mod tests {
             .map(|r| &r.captured.reference)
             .collect();
         assert_eq!(references.len(), observation.refs.len());
+    }
+
+    #[test]
+    fn withheld_frames_leave_neither_owner_refs_nor_child_contents() {
+        let (mut driver, frames) = fixture();
+        driver.set_read_frames(
+            frames
+                .into_iter()
+                .filter(|frame| frame.parent_id.is_none())
+                .collect(),
+        );
+        let observation = driver
+            .snapshot_classified(
+                "isolated-fixture",
+                SnapshotKind::Ax,
+                7,
+                "http://127.0.0.1:9000/",
+                1000,
+            )
+            .unwrap();
+        for name in ["Same button", "Card number", "Pay"] {
+            assert!(!observation.records.iter().any(|record| record.name == name));
+        }
+        for name in ["Same frame", "Payment frame"] {
+            let owner = observation
+                .records
+                .iter()
+                .find(|record| record.name == name)
+                .unwrap();
+            assert!(owner.reference.is_none(), "{owner:?}");
+        }
+        assert!(!observation.refs.iter().any(|reference| reference
+            .backend_identity
+            .as_ref()
+            .is_some_and(|identity| matches!(identity.backend_node_id, 10 | 11))));
     }
     #[test]
     fn top_page_capture_plan_includes_cross_origin_content() {
