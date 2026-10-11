@@ -3068,6 +3068,7 @@ mod executable_identity_launch_tests {
             consumer_capabilities: Vec::new(),
             surface: RouteSurface::Tools,
             scope: None,
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
             flow_id: None,
         }
     }
@@ -4547,6 +4548,7 @@ mod orphan_recovery_tests {
                 consumer_capabilities: Vec::new(),
                 surface: RouteSurface::Tools,
                 scope: None,
+                call_mode: subc_protocol::call_mode::CallMode::Classic,
                 flow_id: None,
             }
         }

@@ -207,7 +207,8 @@ async fn call(planes: &Planes, channel: u16, name: &str, arguments: Value) -> Va
         "{}",
         String::from_utf8_lossy(&reply.body)
     );
-    serde_json::from_slice(&reply.body).unwrap()
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    reply.get("structuredContent").cloned().unwrap_or(reply)
 }
 async fn bind(planes: &Planes, channel: u16, principal: Principal, management: bool) {
     let bind = ModuleControlRequest::RouteBind {
@@ -256,7 +257,8 @@ async fn present(planes: &Planes, key: Option<&str>) -> Value {
         "{}",
         String::from_utf8_lossy(&reply.body)
     );
-    serde_json::from_slice(&reply.body).unwrap()
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    reply.get("structuredContent").cloned().unwrap_or(reply)
 }
 async fn read(
     planes: &Planes,

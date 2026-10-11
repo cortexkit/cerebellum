@@ -498,12 +498,13 @@ impl Settlement {
             frame: frame.clone(),
         };
         let is_error = frame.header.ty == FrameType::Error;
+        let structured = body.get("structuredContent").unwrap_or(&body);
         let outcome = if is_error {
             code(body.get("code"))
         } else {
-            code(body.get("outcome"))
+            code(structured.get("outcome"))
         };
-        let effect_status = code(body.get("effect_status"));
+        let effect_status = code(structured.get("effect_status"));
         let indeterminate = is_error
             || outcome.as_deref() == Some("dispatch_outcome_unknown")
             || effect_status.as_deref() == Some("effect_indeterminate");

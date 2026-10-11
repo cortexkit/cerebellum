@@ -109,7 +109,8 @@ pub async fn elicit_and_answer_waiting(
             reply = Some(body);
         }
         if let Some(reply) = reply.as_ref() {
-            if reply["outcome"] != "consent_pending" || answered {
+            let structured = reply.get("structuredContent").unwrap_or(reply);
+            if structured["outcome"] != "consent_pending" || answered {
                 break;
             }
         }

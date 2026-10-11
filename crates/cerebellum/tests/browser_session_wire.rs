@@ -2629,6 +2629,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
         flow_id: None,
         consumer_capabilities: Vec::new(),
         surface: RouteSurface::Tools,
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
     };
     // It must succeed: a refusal before the registry opened would also leave

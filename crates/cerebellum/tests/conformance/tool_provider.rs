@@ -230,7 +230,12 @@ impl ToolProviderSubject for Subject {
 async fn tool_provider_role_conforms_on_production_handler() {
     let root = live_daemon_directory(0);
     let report = run_suite(&Subject, &root).await.unwrap();
-    println!("{}", report.render());
+    let report_text = report.render();
+    println!("{report_text}");
+    // Both tools serve every known mode, so no production tool can be a
+    // restricted-mode probe. Unknown bind modes have separate handler tests.
+    assert!(report_text.contains("SKIP call_mode_matches_catalog"));
+    assert!(report_text.contains("PASS tool_result_content_v1_valid"));
     // The catalog serves no system-prompt text. Session actions admit only
     // reserved:prefrontal-core, whereas the suite's held-action cases need both
     // a scope owner and a distinct carrier to raise approval-gated actions.

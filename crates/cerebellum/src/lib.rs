@@ -23,6 +23,8 @@ pub mod browser_signed_in;
 pub mod browser_standing_grants;
 pub mod browser_type;
 pub mod budgets;
+#[cfg(test)]
+mod call_mode_tests;
 mod call_queue;
 mod call_record_supervisor;
 pub mod capability;
@@ -64,6 +66,7 @@ pub mod snapshot_store;
 mod terminal_arbiter;
 mod tool_provider;
 mod user_browser;
+mod tool_result;
 pub mod user_browser_bridge;
 pub mod wire;
 
@@ -1429,6 +1432,11 @@ async fn scope_epoch_admits_bind(
     else {
         return Ok(true);
     };
+    // Run scopes borrow their bind's head conversation. Their epochs must not
+    // revoke that conversation's grants or browser when a run is replaced.
+    if stamp.attributes.run_id.is_some() {
+        return Ok(true);
+    }
     match planes.scopes.note_bind(&stamp, &identity.session) {
         scope_watch::BindEpoch::Current => Ok(true),
         scope_watch::BindEpoch::Advanced {
@@ -1684,6 +1692,7 @@ fn consent_context(
         context.park_limit = limit;
     }
     context.unattended = facts.flow_id.is_some();
+    context.agent_run = facts.call_mode == subc_protocol::call_mode::CallMode::Codemode;
     if context.unattended {
         context.caller.conversation_key.clear();
     }
@@ -3306,6 +3315,10 @@ async fn handle_frame(
                 let conversation_key = &facts.identity.conversation_key;
                 let last_route = !planes.routes.carries_conversation(conversation_key);
                 match facts.scope.as_ref() {
+                    _ if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode => {
+                        // A run borrows the head conversation's browser and grants.
+                        // Ending the run cancels its calls, not the head session.
+                    }
                     None => {
                         // A conversation's computer grants end with its last
                         // route: another route may still carry the same
@@ -3545,11 +3558,40 @@ async fn handle_route_request(
         let _ = planes.consent_drain.run(&planes.consent, &live).await;
     }
 
+    let dispatch = dispatch_bound_route(frame, writer, planes, &facts);
+    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode {
+        let cancel = planes.cancellations.get((channel, epoch, corr));
+        tokio::select! {
+            biased;
+            _ = planes.routes.closed(channel, epoch) => Ok(()),
+            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending().await } } => {
+                if planes.routes.get(channel, epoch).is_none() { return Ok(()); }
+                send_route_error(writer, ver, channel, epoch, corr, "cancelled", "the agent run call was cancelled").await
+            }
+            result = dispatch => result,
+        }
+    } else {
+        dispatch.await
+    }
+}
+
+async fn dispatch_bound_route(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
     match facts.surface {
         // Boxed for the same stack-frame reason as the route worker's handler.
         RouteSurface::Tools => Box::pin(handle_keyed_tool_request(frame, writer, planes)).await,
         RouteSurface::Management => {
-            Box::pin(handle_management_request(frame, writer, &facts, planes)).await
+            Box::pin(handle_management_request(frame, writer, facts, planes)).await
         }
         // A route bound to a surface this module does not advertise. Refused
         // with the surface named rather than served as one of the others, which
@@ -3662,6 +3704,27 @@ async fn handle_management_request_observed(
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.
     // A flow route never gets them, even when acting for its owner.
+    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+        && matches!(
+            method,
+            management::OPEN_GRANT
+                | management::IMPORT_LOGIN
+                | management::CAPTURE_LOGIN
+                | management::PRESENT
+                | management::CLEAR_LAUNCH_RECOVERY
+                | management::REBIND_PROFILE_ROOT
+        )
+    {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            agent_run_consent_refusal(),
+        )
+        .await;
+    }
     if facts.flow_id.is_some() && is_operator_operation(method) {
         return send_tool_response(
             writer,
@@ -5229,7 +5292,7 @@ async fn handle_control_request(
             scope,
             // Cerebellum declares no versioned roles today.
             role_versions: _,
-            call_mode: _,
+            call_mode,
         } => {
             // Refuse non-first-party principals at bind; the only exception is a
             // Basal route that passes `flow_carrier_admitted`. The subc-mcp gateway
@@ -5284,7 +5347,7 @@ async fn handle_control_request(
 
             // Retain only facts from the accepted bind. Data-plane frames inherit
             // these facts by (channel, epoch); request bodies cannot replace them.
-            let accepted_facts = AcceptedBindFacts::from_bind(
+            let mut accepted_facts = AcceptedBindFacts::from_bind(
                 &identity,
                 principal.clone(),
                 admission_facts.as_ref(),
@@ -5295,13 +5358,16 @@ async fn handle_control_request(
             // delegation. Retaining it also lets call records name the scope
             // and lets its owner withdraw calls when the scope is revoked.
             .with_scope(scope);
+            accepted_facts.call_mode =
+                call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic);
             elicitor.set_unattended(
                 route_channel,
                 epoch,
-                accepted_facts
-                    .scope
-                    .as_ref()
-                    .is_some_and(|stamp| stamp.attributes.flow_id.is_some()),
+                accepted_facts.call_mode != subc_protocol::call_mode::CallMode::Classic
+                    || accepted_facts
+                        .scope
+                        .as_ref()
+                        .is_some_and(|stamp| stamp.attributes.flow_id.is_some()),
             );
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
@@ -5441,6 +5507,43 @@ fn wall_clock_ms() -> u64 {
 /// operation on the same route, so it takes the tool envelope, never the
 /// management one.
 async fn handle_keyed_tool_request(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+) -> Result<(), ModuleError> {
+    let object = serde_json::from_slice::<Value>(&frame.body).ok();
+    let name = object.as_ref().and_then(|value| value["name"].as_str());
+    if let (Some(name), Some(facts)) = (
+        name,
+        planes.routes.get(frame.header.channel, frame.header.epoch),
+    ) {
+        if let Err(error) = tool_provider::check_call_mode(name, &facts.call_mode, planes) {
+            return tool_provider::send_error(
+                error,
+                (
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                ),
+                writer,
+            )
+            .await;
+        }
+    }
+    let content_v1 = matches!(
+        name,
+        Some(flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE)
+    );
+    tool_result::CONTENT_V1
+        .scope(
+            content_v1,
+            handle_keyed_tool_request_inner(frame, writer, planes),
+        )
+        .await
+}
+
+async fn handle_keyed_tool_request_inner(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
@@ -5811,7 +5914,8 @@ struct PendingSettlement {
 /// Return true for replies sent by `handle_tool_request` before dispatch or
 /// for a provider resource-busy refusal; neither case dispatched the tool.
 fn refused_before_dispatch(reply: &Frame) -> bool {
-    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    let envelope: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    let body = envelope.get("structuredContent").unwrap_or(&envelope);
     match reply.header.ty {
         // The envelope and argument checks answer in the reply body.
         FrameType::Response => {
@@ -5828,7 +5932,10 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
                 && matches!(
                     body["detail"]["reason"].as_str(),
                     Some(
-                        "flow_carrier_not_admitted" | "unattended_flow" | "takeover_not_for_flows"
+                        "flow_carrier_not_admitted"
+                            | "unattended_flow"
+                            | "takeover_not_for_flows"
+                            | "agent_run"
                     )
                 ))
         }
@@ -6538,6 +6645,22 @@ async fn handle_tool_request_inner(
         )
         .await;
     }
+    if accepted_facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+        && matches!(
+            name,
+            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+        )
+    {
+        return send_tool_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            agent_run_consent_refusal(),
+        )
+        .await;
+    }
     if browser_session::CONTROL_TOOLS.contains(&name) {
         // The admission refusal is a reply of this capability like any other,
         // so it goes through the same boundary. A refusal returned from above
@@ -6828,6 +6951,12 @@ async fn serve_browser_with_consent(
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
+    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode {
+        reply["outcome"] = json!("consent_unavailable");
+        reply["detail"]["reason"] = json!("agent_run");
+        reply["remedy"] = agent_run_consent_refusal()["remedy"].clone();
+        return planes.browser.finish_reply(capability.name(), reply);
+    }
     if facts.flow_id.is_some() {
         let detail = management::browser_missing_grant(
             scope["origins"][0].as_str().expect("grant request origin"),
@@ -7180,6 +7309,11 @@ fn flow_consent_refusal(reason: &str) -> Value {
         "remedy": "an unattended flow cannot ask a person; configure its owner's standing grants"})
 }
 
+fn agent_run_consent_refusal() -> Value {
+    json!({"outcome":"consent_unavailable", "reason":"agent_run", "detail":{"reason":"agent_run"},
+        "remedy":"an agent run cannot ask a person; configure standing grants in an attended session"})
+}
+
 /// A scope stamp carrying `flow_id` marks a flow (see `AcceptedBindFacts::flow_id`).
 /// Only a route that passes `flow_carrier_admitted` may act for it; every other
 /// route carrying such a stamp is refused before capability dispatch.
@@ -7233,7 +7367,14 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
+    let body = if tool_result::CONTENT_V1
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        tool_result::encode(body)?
+    } else {
+        serde_json::to_vec(&body).map_err(ModuleError::Json)?
+    };
     let response = Frame::build_with_version(
         ver,
         FrameType::Response,
