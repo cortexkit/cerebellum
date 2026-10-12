@@ -6197,20 +6197,26 @@ async fn a_close_behind_a_running_navigation_waits_for_it_and_closes_gracefully(
         "the close did not wait for the navigation ahead of it"
     );
     drop(hold);
-    let navigated = consent_frame(&mut rx).await;
-    assert_eq!(
-        navigated.header.corr, 801,
-        "the close overtook the navigation"
-    );
+    // The two replies may reach the writer in either order, since each is
+    // forwarded after its own call-record settlement.
+    let (first, second) = (consent_frame(&mut rx).await, consent_frame(&mut rx).await);
+    let (navigated, closed) = if first.header.corr == 801 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!((navigated.header.corr, closed.header.corr), (801, 802));
     assert_eq!(body(&navigated)["outcome"], "ok", "{}", body(&navigated));
-    let closed = consent_frame(&mut rx).await;
-    assert_eq!(closed.header.corr, 802);
     let closed = body(&closed);
     assert_eq!(
         closed,
         json!({"outcome": "closed", "browser_session_id": session})
     );
-    assert!(launcher.effects.lock().unwrap().contains(&"cleanup"));
+    let effects = launcher.effects.lock().unwrap().clone();
+    assert!(
+        effects.contains(&"graceful") && effects.contains(&"cleanup"),
+        "{effects:?}"
+    );
 }
 
 #[tokio::test]

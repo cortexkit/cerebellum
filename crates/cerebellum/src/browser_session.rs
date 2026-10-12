@@ -6496,10 +6496,11 @@ mod tests {
         let session =
             establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
                 browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-                // Three commands of 30 ms each under a 40 ms cap: each is in
-                // bound, while their 90 ms total exceeds cap plus slack.
+                // Four commands of 25 ms each under a 50 ms cap: each stays
+                // well within its cap, while their 100 ms total exceeds the
+                // cap plus the 20 ms slack.
                 browser.in_bound_commands =
-                    Some((3, Duration::from_millis(40), Duration::from_millis(30)));
+                    Some((4, Duration::from_millis(50), Duration::from_millis(25)));
             });
         let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
         else {
