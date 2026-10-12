@@ -32,8 +32,10 @@ pub mod route;
 pub mod subject;
 pub mod wire;
 
-#[cfg(test)]
-mod double;
+#[doc(hidden)]
+pub mod double;
+#[doc(hidden)]
+pub use double::{vector, Reply, ScriptedCingulate};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

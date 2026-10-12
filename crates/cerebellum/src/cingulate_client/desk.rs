@@ -762,6 +762,9 @@ impl DeskSession<'_> {
             // Being asked to is a defect on this side.
             return InCall::Settled(Ending::DeliveryFailed);
         };
+        if let Some(terminal) = crate::terminal_arbiter::TerminalArbiter::current() {
+            terminal.set_step(crate::terminal_arbiter::CallStep::Consent);
+        }
         let read = match self.wait_on(elicitation_id, park, cancelled).await {
             Woke::Read(read) => read,
             Woke::Cancelled(LetGo::Detach) => {
@@ -816,6 +819,9 @@ impl DeskSession<'_> {
         let Some(card) = self.desk.raised(elicitation_id) else {
             return InCall::Settled(Ending::DeliveryFailed);
         };
+        if let Some(terminal) = crate::terminal_arbiter::TerminalArbiter::current() {
+            terminal.set_step(crate::terminal_arbiter::CallStep::Consent);
+        }
         let unanswered = match self.wait_on(elicitation_id, wait, cancelled).await {
             Woke::Read(Ok(record)) => match Ending::of_record(&record, &card) {
                 Some(ending @ (Ending::Granted { .. } | Ending::Declined { .. })) => {

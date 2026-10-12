@@ -339,7 +339,6 @@ pub(crate) async fn run_arbitrated_route(
                 if terminal_frame(&out, request) {
                     if !terminal.complete(out.clone()) { terminal.preserve_stop_refusal(out); }
                 } else {
-                    if out.header.ty == FrameType::Request { terminal.set_step(CallStep::Consent); }
                     if !matches!(tokio::time::timeout_at(envelope_end.min(connection_end), send(&writer, out)).await, Ok(Ok(()))) {
                         outgoing.close();
                         terminal.stop(TerminalCause::Deadline);
@@ -487,8 +486,8 @@ pub(crate) async fn run_arbitrated_route(
     drop(guard);
     drop(cancellation);
     // Keep the route future and its lane leases alive until it really ends.
-    // Background consent questions may still send frames, but never a second
-    // terminal for this request.
+    // A detached worker's terminal reply has already been chosen, so any
+    // later terminal it produces must be discarded.
     let detached = (!finished).then(|| planes.health.enter_detached_worker());
     tokio::spawn(async move {
         let mut detached = detached;

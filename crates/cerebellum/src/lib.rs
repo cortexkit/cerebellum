@@ -33,6 +33,7 @@ pub mod computer_capability;
 pub mod computer_grants;
 pub mod connector_evidence;
 mod consent_card;
+pub mod consent_drain;
 #[cfg(test)]
 mod content_named_fixture;
 pub mod coordinate;
@@ -1866,7 +1867,19 @@ async fn run(
         BrowserSurface::Available(browser) => Some(browser.clone()),
         BrowserSurface::NotConfigured | BrowserSurface::Refused(_) => None,
     };
-    let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone());
+    let registry: Arc<dyn cingulate_client::desk::RegistryStore> =
+        match cingulate_client::desk::FileRegistryStore::production() {
+            Ok(store) => Arc::new(store),
+            Err(error) => Arc::new(consent_drain::UnavailableRegistry(error)),
+        };
+    let mut planes = Planes::with_browser_config(Arc::clone(&health_state), browser_config.clone())
+        .with_cingulate(
+            Arc::new(cingulate_client::route::DaemonCingulate::supervised(
+                config.connection_file_path.clone(),
+                config.module_id.clone(),
+            )),
+            registry,
+        );
     // Captures deposit into the vault over a connection of their own, opened
     // with the same connection file as this one. Set before `prepare`, so a
     // test can put its own vault in its place.
@@ -2607,6 +2620,12 @@ pub struct Planes {
     pub lease_clock: Arc<cerebellum_core::clock::SystemClock>,
     pub launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>>,
     pub management: Arc<ManagementPlane>,
+    /// Cards cerebellum raised and whether their answers have been acted on;
+    /// the registry is shared by routes and persisted by the configured store.
+    pub consent: Arc<cingulate_client::desk::ConsentDesk>,
+    /// Serializes answer-feed reads per session and calls each flow's adapter
+    /// to elect one caller to store the answer's permission or approval.
+    pub consent_drain: Arc<consent_drain::ConsentDrain>,
     /// The computer plane or the single typed reason it was withheld.
     ///
     /// Keeping the outcome in one field prevents availability and its diagnostic
@@ -2723,6 +2742,32 @@ impl cerebellum_core::journal::JournalStorage for PlaneJournalStorage {
 }
 
 impl Planes {
+    /// Configure how agent calls open Cingulate routes and persist the cards
+    /// cerebellum raised, so a later call can apply their answers.
+    pub fn with_cingulate(
+        mut self,
+        opener: Arc<dyn cingulate_client::route::CingulateOpener>,
+        store: Arc<dyn cingulate_client::desk::RegistryStore>,
+    ) -> Self {
+        self.consent = Arc::new(cingulate_client::desk::ConsentDesk::with_store(
+            opener, store,
+        ));
+        self
+    }
+
+    /// Build isolated planes over a scripted consent service and a private
+    /// registry. No journal or grant store is opened under the operator's home.
+    #[doc(hidden)]
+    pub fn with_cingulate_for_test(
+        health: Arc<HealthState>,
+        browser_config: Option<BrowserConfig>,
+        opener: Arc<dyn cingulate_client::route::CingulateOpener>,
+        store: Arc<dyn cingulate_client::desk::RegistryStore>,
+    ) -> Self {
+        Self::with_browser_config_journaling(health, browser_config, JournalPersistence::Isolated)
+            .with_cingulate(opener, store)
+    }
+
     /// A browser config with every deadline short and no executable, for
     /// tests. A running module builds through `with_browser_config` with the
     /// config it loaded, `None` when the file names no browser.
@@ -2955,6 +3000,10 @@ impl Planes {
             lease_clock,
             launch_service,
             management,
+            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
+                consent_drain::UnconfiguredCingulate,
+            ))),
+            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: computer_capability::computer_audit(journal).map(|audit| {
                 // One idle estimator for the plane's lifetime: it exists to
@@ -3061,6 +3110,8 @@ impl Clone for Planes {
             lease_clock: Arc::clone(&self.lease_clock),
             launch_service: self.launch_service.clone(),
             management: Arc::clone(&self.management),
+            consent: Arc::clone(&self.consent),
+            consent_drain: Arc::clone(&self.consent_drain),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: self.computer.clone(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3426,6 +3477,12 @@ async fn handle_route_request(
              been bound",
         )
         .await;
+    }
+
+    if let Ok(live) = consent_drain::live_call(&frame, &facts, planes) {
+        // A failed drain is retried on a later call; it must not replace this
+        // call's ordinary reply with a consent refusal.
+        let _ = planes.consent_drain.run(&planes.consent, &live).await;
     }
 
     match facts.surface {
@@ -9062,6 +9119,10 @@ mod tests {
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
+            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
+                consent_drain::UnconfiguredCingulate,
+            ))),
+            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9121,6 +9182,10 @@ mod tests {
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
+            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
+                consent_drain::UnconfiguredCingulate,
+            ))),
+            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10097,6 +10162,10 @@ mod tests {
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
+            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
+                consent_drain::UnconfiguredCingulate,
+            ))),
+            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
@@ -10170,6 +10239,10 @@ mod tests {
             lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
             launch_service: None,
             management: test_management_plane(),
+            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
+                consent_drain::UnconfiguredCingulate,
+            ))),
+            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
