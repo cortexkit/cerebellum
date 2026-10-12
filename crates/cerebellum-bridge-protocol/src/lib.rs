@@ -87,12 +87,22 @@ struct RawRelay<Message> {
 /// message into a Value. A transport can preserve number precision, key order
 /// and internal whitespace while leaving action interpretation to the server.
 pub fn encode_raw_relay(message: &RawValue) -> io::Result<Vec<u8>> {
+    encode_body(raw_relay_body(message)?)
+}
+
+/// The relay envelope's JSON body without the socket length prefix. The native
+/// host hands this exact object to Chrome, whose stdio framing differs from the
+/// socket's, so the extension receives the same `{type:"relay",message}` frame.
+pub fn raw_relay_body(message: &RawValue) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(&RawRelay {
         tag: RelayTag::Relay,
         message,
     })
     .map_err(invalid_data)?;
-    encode_body(body)
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(invalid_data("socket frame exceeds 16 MiB"));
+    }
+    Ok(body)
 }
 
 /// Decode only a relay envelope, retaining the original JSON value bytes.

@@ -1,4 +1,4 @@
-use crate::relay::{establish_session, relay};
+use crate::relay::{establish_session, relay, RelayEnd};
 use cerebellum_bridge_protocol::{ParentAttestation, CEREBELLUM_REQUIREMENT};
 use cerebellum_macos::{parent_satisfies_chrome_requirement, peer_satisfies_requirement};
 use std::ffi::c_int;
@@ -15,11 +15,21 @@ extern "C" {
 }
 
 pub(crate) fn run() -> io::Result<()> {
+    let ended = session();
+    #[cfg(feature = "chrome-for-testing-parent-probe")]
+    record_probe_exit(&match &ended {
+        Ok(end) => end.to_string(),
+        Err(error) => format!("session setup failed: {error}"),
+    });
+    ended?.into_result()
+}
+
+fn session() -> io::Result<RelayEnd> {
     let origin = std::env::args_os()
         .nth(1)
         .and_then(|origin| origin.into_string().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing extension origin"))?;
-    let (socket, _epoch) = establish_session(
+    let (socket, epoch) = establish_session(
         origin,
         check_parent,
         || {
@@ -30,7 +40,37 @@ pub(crate) fn run() -> io::Result<()> {
         },
         check_server,
     )?;
-    relay(socket, io::stdin(), &mut io::stdout().lock())
+    Ok(relay(socket, epoch, io::stdin(), &mut io::stdout().lock()))
+}
+
+/// Name of the exit record, beside the bridge socket in the private
+/// `cerebellum` run directory. The live probe reads this same file name from
+/// its scratch tree (`user_browser_probe.rs`, `HOST_EXIT_LOG`).
+#[cfg(feature = "chrome-for-testing-parent-probe")]
+const PROBE_EXIT_LOG: &str = "native-host-exit.log";
+
+/// Development probe builds only: append why this host process ended, because
+/// a shipped host is silent (stdout carries native-messaging frames, and Chrome
+/// discards stderr) and the probe otherwise cannot tell which side closed the
+/// port. The probe runs with a scratch XDG_DATA_HOME, so this lands in its
+/// scratch directory next to the scratch socket. Failures are ignored: the
+/// record is evidence for a person, never part of the relay.
+#[cfg(feature = "chrome-for-testing-parent-probe")]
+fn record_probe_exit(reason: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(run) = cortexkit_paths::cortexkit_run_dir() else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(run.join("cerebellum").join(PROBE_EXIT_LOG))
+    else {
+        return;
+    };
+    let _ = writeln!(file, "native host pid {}: {reason}", std::process::id());
 }
 
 fn check_parent() -> io::Result<ParentAttestation> {

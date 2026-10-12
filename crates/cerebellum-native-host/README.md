@@ -1,8 +1,8 @@
 # Chrome native messaging host
 
 `ck-cerebellum-native-host` is a macOS-only, silent transport. It has no action
-policy and does not log, print, create directories, install manifests, or read a
-Chrome profile. It connects only after verifying its parent's running-code
+policy and, in shipped builds, does not log, print, create directories, install
+manifests, or read a Chrome profile. It connects only after verifying its parent's running-code
 signature and process generation as Chrome, authenticates
 the socket server using its kernel peer pid and process generation, sends one
 parent attestation, and waits for acceptance before reading Chrome messages.
@@ -59,6 +59,13 @@ both directions. The socket protocol is:
   refuse;
 - Chrome stdio: native-endian u32 byte length, maximum host-to-Chrome message
   1 MiB. Incoming allocation is also bounded by the socket's 16 MiB limit.
+- Chrome sees the socket's own frame objects (see `extension/PROTOCOL.md`): the
+  host first forwards `host_accepted` with the epoch it received, then passes
+  `{type:"relay", message}` envelopes through whole in both directions. The
+  extension ignores a port until `host_accepted` arrives and closes it on any
+  frame without that envelope, and the host refuses anything from Chrome that is
+  not a relay envelope. `extension/tests/native-host-wire.json` holds the frames
+  both sides' tests check.
 
 The relay keeps the JSON value as `serde_json::value::RawValue`: it validates JSON
 syntax but never interprets action fields or converts numbers. Value bytes,
@@ -67,6 +74,12 @@ outside the value belongs to the envelope, not the action content. Chunking,
 invocation ids, epochs, Cancel and replay policy belong to the bridge/extension.
 The handshake and socket writes have fixed deadlines; the accepted idle port has
 no read timeout. Disconnecting the bridge exits without waiting on blocked stdin.
+
+Only a `chrome-for-testing-parent-probe` build records anything: when it exits
+it appends one line naming why (EOF from Chrome, EOF from the socket, a framing
+or read error, a write error, or a failed session setup) to
+`native-host-exit.log` beside the bridge socket. The live probe runs it with a
+scratch data directory and prints that file after a failed check.
 
 Tests use scratch sockets or socket pairs, never a live Chrome profile, journal,
 or browser. A macOS unsigned-listener test retains real kernel peer/signature
