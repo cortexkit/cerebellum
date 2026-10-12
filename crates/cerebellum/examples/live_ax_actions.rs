@@ -103,19 +103,18 @@ mod macos_probe {
                     1,
                 ))))),
                 guard: Arc::new(timing.enter(&clock)),
-                stamp: ScopeStamp {
-                    owner: Principal::Reserved {
+                stamp: ScopeStamp::new(
+                    Principal::Reserved {
                         module_id: "prefrontal-core".into(),
                     },
-                    scope_ref: identity().conversation_key,
-                    scope_epoch: 1,
-                    kind: ScopeKind::Ephemeral,
-                    parent: None,
-                    parent_state: None,
-                    attributes: ScopeAttributes::new()
-                        .with_agent_id(Some(identity().agent_project_id)),
-                    owner_authorized: true,
-                },
+                    identity().conversation_key,
+                    1,
+                    ScopeKind::Ephemeral,
+                )
+                .with_attributes(
+                    ScopeAttributes::new().with_agent_id(Some(identity().agent_project_id)),
+                )
+                .with_owner_authorized(true),
             }
         }
     }

@@ -146,20 +146,20 @@ impl Drop for CardService {
 }
 
 pub(crate) fn stamp(agent: &str) -> ScopeStamp {
-    ScopeStamp {
-        owner: Principal::Reserved {
+    ScopeStamp::new(
+        Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: "card-tests".into(),
-        scope_epoch: 1,
-        kind: ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: ScopeAttributes::new()
+        "card-tests",
+        1,
+        ScopeKind::Head,
+    )
+    .with_attributes(
+        ScopeAttributes::new()
             .with_agent_id(Some(agent.into()))
             .with_delegates(true),
-        owner_authorized: true,
-    }
+    )
+    .with_owner_authorized(true)
 }
 
 impl CingulateOpener for Arc<CardService> {
