@@ -362,7 +362,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
             "version": 1,
             "modules": {
                 OWNER: {
-                    "program": env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
+                    "program": support::nonce_holder(),
                     "env": module_env,
                     "reserved": true,
                 }

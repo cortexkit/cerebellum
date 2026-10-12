@@ -199,6 +199,7 @@ fn module_binary() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ck-cerebellum")));
     let binary = cortexkit_test_support::ckdev_binary(binary);
+    let binary = support::daemon_binary("ck-cerebellum", binary);
     eprintln!("flow e2e binary: {}", binary.display());
     binary
 }
@@ -250,7 +251,7 @@ impl Fixture {
             helper_env.insert("NONCE_OUT".into(), directory.join(format!("{id}-nonce")));
             modules.insert(
                 id.into(),
-                json!({"program":env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
+                json!({"program":support::nonce_holder(),
                 "env":helper_env, "reserved":true}),
             );
         }

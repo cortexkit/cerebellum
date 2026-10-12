@@ -222,7 +222,7 @@ async fn the_deposit_route_is_stamped_reserved_cerebellum_only_with_the_launch_n
             "version": 1,
             "modules": {
                 CEREBELLUM: {
-                    "program": env!("CARGO_BIN_EXE_cerebellum-test-nonce-holder"),
+                    "program": support::nonce_holder(),
                     // The daemon passes the nonce only on a pipe at descriptor 3
                     // (named by SUBC_LAUNCH_NONCE_FD), never in the environment.
 
