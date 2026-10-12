@@ -111,19 +111,20 @@ fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {
 /// (deadline, unknown-dispatch, busy-target and capacity replies) requires
 /// beside `outcome`.
 fn declared_by_a_session_schema(word: &str) -> bool {
-    [json!({"outcome": word}), json!({"outcome": word, "detail": {}})]
+    [
+        json!({"outcome": word}),
+        json!({"outcome": word, "detail": {}}),
+    ]
+    .iter()
+    .any(|reply| {
+        [
+            cerebellum::browser_session::BROWSER_LAUNCH,
+            cerebellum::browser_session::BROWSER_STATUS,
+            cerebellum::browser_session::BROWSER_CLOSE,
+        ]
         .iter()
-        .any(|reply| {
-            [
-                cerebellum::browser_session::BROWSER_LAUNCH,
-                cerebellum::browser_session::BROWSER_STATUS,
-                cerebellum::browser_session::BROWSER_CLOSE,
-            ]
-            .iter()
-            .any(|capability| {
-                cerebellum::browser::validate_browser_result(capability, reply).is_ok()
-            })
-        })
+        .any(|capability| cerebellum::browser::validate_browser_result(capability, reply).is_ok())
+    })
 }
 
 /// Every `"outcome": "<word>"` literal on one line, spacing tolerated.
