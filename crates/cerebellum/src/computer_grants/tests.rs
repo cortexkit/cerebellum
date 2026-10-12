@@ -1417,6 +1417,8 @@ async fn a_route_open_that_outlasts_the_call_returns_not_live() {
 
 /// A scoped test route may ask whether its session remains live after unbinding.
 /// Answer that control request separately from the computer call's reply.
+// Its callers are macOS-only computer tests, so other hosts never use it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn scope_reply(question: &Frame) -> Option<Frame> {
     let body: Value = serde_json::from_slice(&question.body).ok()?;
     if question.header.ty != FrameType::Request
