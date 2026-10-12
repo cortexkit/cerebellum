@@ -36,6 +36,7 @@ mod content_named_fixture;
 pub mod coordinate;
 pub mod custody;
 pub mod durable_formats;
+mod egress;
 pub mod elicit;
 pub mod flat_tools;
 pub mod journal;
@@ -54,6 +55,7 @@ pub mod profile_custody;
 pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
+mod terminal_arbiter;
 mod tool_provider;
 mod user_browser;
 pub mod user_browser_bridge;
@@ -87,7 +89,9 @@ use subc_protocol::{
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -130,11 +134,41 @@ use cerebellum_core::principal::{
     principal_label, SESSION_CALLER_NOT_ADMITTED, SESSION_CALLER_NOT_ADMITTED_REMEDY,
 };
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
+use egress::{drain_writer, request_id, ConnectionDeadlines};
+use terminal_arbiter::run_arbitrated_route;
+pub use terminal_arbiter::{
+    CallStep, DispatchGate, HeldState, TerminalArbiter, TerminalCause, CALL_TERMINAL,
+};
 pub use wire::{build_error_frame, control_flags};
 
 const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = budgets::EGRESS_BUFFER;
+
+fn route_limits(frame: &Frame, planes: &Planes) -> (u64, u64) {
+    let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+    if planes
+        .routes
+        .get(frame.header.channel, frame.header.epoch)
+        .is_some_and(|facts| facts.surface == RouteSurface::Management)
+    {
+        if let Some(limits) = budgets::MANAGEMENT_LIMITS
+            .iter()
+            .find(|limits| body["method"] == limits.method)
+        {
+            return (limits.envelope_ms, limits.reply_max_ms);
+        }
+    }
+    if body["name"] == flat_tools::COMPUTER_USE {
+        (
+            budgets::COMPUTER_ENVELOPE_MS,
+            budgets::COMPUTER_REPLY_MAX_MS,
+        )
+    } else {
+        (budgets::BROWSER_ENVELOPE_MS, budgets::BROWSER_REPLY_MAX_MS)
+    }
+}
+
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_RETRIES: u32 = 4;
@@ -2198,7 +2232,8 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let mut writer = tokio::spawn(drain_writer(write_half, rx));
+    let deadlines = Arc::clone(&planes.egress_deadlines);
+    let mut writer = tokio::spawn(drain_writer(write_half, rx, Arc::clone(&deadlines)));
     let mut loop_task = Box::pin(module_loop(read_half, tx.clone(), config, planes));
 
     let loop_result = tokio::select! {
@@ -2210,11 +2245,23 @@ where
         writer_result = &mut writer => {
             return report_writer_first(normalize_writer_task_result(writer_result));
         }
+        _ = deadlines.expired() => {
+            writer.abort();
+            let _ = writer.await;
+            return Err(ModuleError::Message("terminal delivery deadline exceeded".into()));
+        }
     };
 
     drop(loop_task);
     drop(tx);
-    let writer_result = normalize_writer_task_result(writer.await);
+    let writer_result = tokio::select! {
+        result = &mut writer => normalize_writer_task_result(result),
+        _ = deadlines.expired() => {
+            writer.abort();
+            let _ = writer.await;
+            Err(ModuleError::Message("terminal delivery deadline exceeded".into()))
+        }
+    };
     reconcile_connection_results(loop_result, writer_result)
 }
 
@@ -2357,32 +2404,6 @@ where
     }
 }
 
-async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), ModuleError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut writer = BufWriter::new(write_half);
-    while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame)
-            .await
-            .map_err(|e| ModuleError::Message(e.to_string()))?;
-        while let Ok(frame) = rx.try_recv() {
-            write_frame(&mut writer, &frame)
-                .await
-                .map_err(|e| ModuleError::Message(e.to_string()))?;
-        }
-        writer
-            .flush()
-            .await
-            .map_err(|e| ModuleError::Message(e.to_string()))?;
-    }
-    writer
-        .flush()
-        .await
-        .map_err(|e| ModuleError::Message(e.to_string()))?;
-    Ok(())
-}
-
 async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
@@ -2450,6 +2471,7 @@ pub struct CancelHandle(Arc<CancelSignal>);
 pub struct CancelSignal {
     cancelled: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    terminal: std::sync::Mutex<Option<std::sync::Weak<TerminalArbiter>>>,
 }
 
 impl CancelHandle {
@@ -2460,10 +2482,23 @@ impl CancelHandle {
         Self::pending()
     }
     pub fn cancel(&self) {
+        self.stop_terminal(TerminalCause::Cancelled);
         self.0
             .cancelled
             .store(true, std::sync::atomic::Ordering::Release);
         self.0.notify.notify_waiters();
+    }
+    fn stop_terminal(&self, cause: TerminalCause) {
+        if let Some(terminal) = self
+            .0
+            .terminal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            terminal.stop(cause);
+        }
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(std::sync::atomic::Ordering::Acquire)
@@ -2512,8 +2547,15 @@ impl RequestCancellations {
     fn cancel_route(&self, channel: u16, epoch: u32) {
         for ((c, e, _), handle) in self.0.lock().unwrap().iter() {
             if (*c, *e) == (channel, epoch) {
+                handle.stop_terminal(TerminalCause::RouteClosed);
                 handle.cancel();
             }
+        }
+    }
+
+    fn stop_all(&self, cause: TerminalCause) {
+        for handle in self.0.lock().unwrap().values() {
+            handle.stop_terminal(cause);
         }
     }
 }
@@ -2585,6 +2627,7 @@ pub struct Planes {
     /// Shared by keyed admissions and settlements on both tool planes. A timed
     /// out blocking write keeps its permit until the write actually ends.
     call_record_workers: Arc<CallRecordWorkers>,
+    egress_deadlines: Arc<ConnectionDeadlines>,
     /// Session scopes whose routes closed and whose end is not yet settled,
     /// and this module's channel-0 questions to the daemon about them.
     pub scopes: Arc<scope_watch::ScopeRevocation>,
@@ -2970,6 +3013,7 @@ impl Planes {
             capture,
             calls,
             call_record_workers: Arc::new(CallRecordWorkers::default()),
+            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         }
     }
@@ -3016,6 +3060,7 @@ impl Clone for Planes {
             capture: Arc::clone(&self.capture),
             calls: Arc::clone(&self.calls),
             call_record_workers: Arc::clone(&self.call_record_workers),
+            egress_deadlines: Arc::clone(&self.egress_deadlines),
             scopes: Arc::clone(&self.scopes),
         }
     }
@@ -3104,6 +3149,7 @@ async fn handle_frame(
                         .draining
                         .store(true, std::sync::atomic::Ordering::Release);
                     planes.drain_signal.send_replace(true);
+                    planes.cancellations.stop_all(TerminalCause::Draining);
                     planes.elicitor.cancel_where(|_, _| true).await;
                     // Spend the drain window flushing profiles, not waiting for the
                     // deadline. It is only an upper bound, never a scheduled start.
@@ -3208,6 +3254,15 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request => {
+            if writer.is_closed() {
+                return Ok(true);
+            }
+            let arrived = tokio::time::Instant::now();
+            let (envelope_ms, reply_ms) = route_limits(&frame, planes);
+            let connection_end = arrived + Duration::from_millis(reply_ms);
+            planes
+                .egress_deadlines
+                .arm(request_id(&frame), connection_end);
             if planes.draining.load(std::sync::atomic::Ordering::Acquire) {
                 let (reason, deadline_ms) =
                     planes.drain_notice.get().expect("drain notice published");
@@ -3245,24 +3300,66 @@ async fn handle_frame(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let computer_arrival = computer_capability::computer_arrival(&frame, planes);
             let browser_arrival = browser_queue::arrive(&frame, planes);
-            let guard = planes.health.enter_request();
+            let guard = Arc::new(planes.health.enter_request());
             let writer = writer.clone();
             let planes = planes.clone();
-            tokio::spawn(elicit::ROUTE_GUARD.scope(Arc::new(guard), async move {
+            let terminal = Arc::new(TerminalArbiter::new(frame.clone()));
+            *cancellation.handle.0.terminal.lock().unwrap() = Some(Arc::downgrade(&terminal));
+            let (proxy, outgoing) = mpsc::channel(16);
+            let worker_planes = planes.clone();
+            let worker = async move {
+                let planes = worker_planes;
                 #[cfg(test)]
                 if let Some(handler) = &planes.route_test_handler {
                     handler().await;
                 }
-                let _cancellation = cancellation;
+                if let Some(terminal) =
+                    TerminalArbiter::current().filter(|terminal| terminal.gate.stopped())
+                {
+                    let cancelled_before_queue = {
+                        let state = terminal.state.lock().unwrap();
+                        !state.possibly_dispatched
+                            && matches!(
+                                state.cause,
+                                Some(TerminalCause::Cancelled | TerminalCause::RouteClosed)
+                            )
+                    };
+                    if browser_arrival.is_some() && cancelled_before_queue {
+                        let refusal = browser_queue::QueueRefusal::Cancelled;
+                        return send_route_error(
+                            &proxy,
+                            frame.header.ver,
+                            frame.header.channel,
+                            frame.header.epoch,
+                            frame.header.corr,
+                            refusal.code(),
+                            refusal.remedy(),
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
                 let dispatch = browser_queue::scope(
                     browser_arrival,
-                    handle_route_request(frame, &writer, &planes),
+                    handle_route_request(frame, &proxy, &planes),
                 );
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
-                let _ = computer_capability::serialized_call(computer_arrival, dispatch).await;
+                let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                let _ = dispatch.await;
-            }));
+                let result = dispatch.await;
+                result
+            };
+            tokio::spawn(run_arbitrated_route(
+                worker,
+                outgoing,
+                writer,
+                planes,
+                cancellation,
+                guard,
+                terminal,
+                arrived + Duration::from_millis(envelope_ms),
+                connection_end,
+            ));
             Ok(true)
         }
         _ => Ok(true),
@@ -3345,6 +3442,9 @@ async fn handle_management_request(
     facts: &AcceptedBindFacts,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
+    if let Some(terminal) = TerminalArbiter::current() {
+        terminal.set_step(CallStep::Queue);
+    }
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
         Err(outcome) => {
@@ -3360,7 +3460,12 @@ async fn handle_management_request(
             .await;
         }
     };
-    handle_management_request_observed(frame, writer, facts, planes, None).await
+    let mut facts = facts.clone();
+    if let Some(terminal) = TerminalArbiter::current() {
+        terminal.set_step(CallStep::Preflight);
+        facts.identity.witness = terminal.witness.clone();
+    }
+    handle_management_request_observed(frame, writer, &facts, planes, None).await
 }
 
 async fn handle_management_request_observed(
@@ -5023,10 +5128,26 @@ async fn handle_control_request(
             // atomics stamped by the dispatch path. It never blocks on a lock
             // and never forms its own opinion (Health-Path-Rule-v2).
             let report = with_process_gauges(health_state.report());
-            match call_record_workers {
+            let mut report = match call_record_workers {
                 Some(workers) => workers.health_report(report),
                 None => report,
+            };
+            if let ModuleControlResponse::HealthCheck {
+                metrics: Some(Value::Object(metrics)),
+                ..
+            } = &mut report
+            {
+                let records = metrics
+                    .get("detachedCallRecordWorkers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let workers = metrics
+                    .get("detachedWorkers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                metrics.insert("detachedWorkers".into(), json!(workers + records));
             }
+            report
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -5324,6 +5445,55 @@ async fn handle_keyed_tool_request(
         }
     };
 
+    if let Some(terminal) = TerminalArbiter::current() {
+        let observation = CallObservation::new()
+            .with_origin(origin)
+            .with_key(call_key.clone());
+        let mut pending = Some(PendingSettlement {
+            ticket: Some(ticket),
+            observation: observation.clone(),
+            unattributed_at_start: cerebellum_core::dispatch_witness::unattributed_commit_count(),
+            request: (channel, epoch, corr),
+        });
+        let late = {
+            let mut state = terminal.state.lock().unwrap();
+            if let Some(chosen) = &state.chosen {
+                Some(chosen.clone())
+            } else {
+                state.settlement = pending.take();
+                None
+            }
+        };
+        if let Some(reply) = late {
+            // Admission can finish after the terminal has already taken its
+            // suffix. Settle that ticket to the chosen reply, never execute it.
+            let evidence = journal::call_records::DispatchEvidence {
+                gate_dispatched: false,
+                committed: false,
+                commit_point: false,
+                unattributed_commit: false,
+                refused_before_dispatch: refused_before_dispatch(&reply),
+            };
+            let settlement = journal::call_records::Settlement::from_reply(&reply, evidence);
+            let calls = Arc::clone(&planes.calls);
+            let ticket = pending
+                .expect("late admission")
+                .ticket
+                .expect("admitted ticket");
+            settle_call_record(planes, move || {
+                calls.settle(ticket, settlement, wall_clock_ms())
+            })
+            .await;
+            return Ok(());
+        }
+        return elicit::CALL_KEY
+            .scope(
+                call_key,
+                handle_tool_request(call, writer, planes, &observation),
+            )
+            .await;
+    }
+
     // The call writes its frames into this channel rather than the route's, so
     // its terminal reply can be recorded before it is forwarded when the write
     // finishes within the settlement budget. Every other frame (a consent
@@ -5389,6 +5559,7 @@ async fn handle_keyed_tool_request(
 /// site lost its request's witness.
 #[derive(Clone)]
 struct CallObservation {
+    terminal: Option<std::sync::Weak<TerminalArbiter>>,
     /// Marked at a plane's dispatch commitment for this request.
     dispatch: cerebellum_core::dispatch_witness::DispatchWitness,
     /// Records whether an external mutation began before the terminal reply was
@@ -5406,12 +5577,20 @@ struct CallObservation {
 
 impl CallObservation {
     fn new() -> Self {
+        let terminal = TerminalArbiter::current();
         Self {
-            dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
-            gate_dispatched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dispatch: terminal
+                .as_ref()
+                .map(|t| t.witness.clone())
+                .unwrap_or_else(cerebellum_core::dispatch_witness::DispatchWitness::armed),
+            gate_dispatched: terminal
+                .as_ref()
+                .map(|t| Arc::clone(&t.gate_dispatched))
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false))),
             commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             origin: cerebellum_core::journal::CallOriginRecord::Absent,
             call_key: None,
+            terminal: terminal.as_ref().map(Arc::downgrade),
         }
     }
 
@@ -5499,7 +5678,17 @@ async fn forward_recording_reply(
                     .observation
                     .gate_dispatched
                     .load(std::sync::atomic::Ordering::SeqCst),
-                committed: pending.observation.dispatch.committed(),
+                committed: pending
+                    .observation
+                    .terminal
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .map(|terminal| {
+                        terminal
+                            .witness_committed
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .unwrap_or_else(|| pending.observation.dispatch.committed()),
                 commit_point: pending
                     .observation
                     .commit_point
@@ -5784,6 +5973,9 @@ async fn handle_tool_request_inner(
     planes: &Planes,
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
+    if let Some(terminal) = TerminalArbiter::current() {
+        terminal.set_step(CallStep::Queue);
+    }
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
         Err(outcome) => {
@@ -5800,6 +5992,9 @@ async fn handle_tool_request_inner(
         }
     };
     let route_bindings = &planes.routes;
+    if let Some(terminal) = TerminalArbiter::current() {
+        terminal.set_step(CallStep::Preflight);
+    }
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
@@ -8864,6 +9059,7 @@ mod tests {
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
+            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -8922,6 +9118,7 @@ mod tests {
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
+            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -9898,6 +10095,7 @@ mod tests {
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
+            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(
@@ -9970,6 +10168,7 @@ mod tests {
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
+            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(
@@ -11157,7 +11356,7 @@ mod drain_tests {
     }
 
     #[tokio::test]
-    async fn draining_refuses_new_requests_and_lets_in_flight_finish() {
+    async fn draining_refuses_new_requests_and_stops_in_flight() {
         let mut planes = super::tests::management_bound_planes(1, 1);
         let (tx, mut rx) = mpsc::channel(8);
         let release = hold(&mut planes);
@@ -11183,7 +11382,7 @@ mod drain_tests {
         assert_eq!(reply.header.channel, 1);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
-        assert_eq!(body["outcome"], "not_running");
+        assert_eq!(body["outcome"], "module_draining");
         await_count(&planes, 0).await;
     }
 
