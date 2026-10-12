@@ -33,15 +33,16 @@ tree_before_build="$(git status --porcelain)"
 # nobody can signal, so that case is reclaimed rather than blocking a machine
 # on a corpse -- but a LIVE holder is refused by name, because waiting silently
 # is how the eight-hour version began.
-# Resolved rather than assumed to be "$repo_root/.git": IN A GIT WORKTREE THAT
-# PATH IS A FILE, not a directory, so mkdir under it fails with "Not a
-# directory" and the gate refuses to start. Every mason runs in a worktree, so
-# the first version of this lock broke the gate for every worker while working
-# perfectly here -- they fell back to running the phases by hand, which is
-# honest and is not the gate. `--git-dir` resolves to the real directory in
-# both layouts, and it is per-checkout in both, which is what the lock wants:
-# a worktree has its own target directory, so it may hold its own gate.
-GATE_LOCK="$(git -C "$repo_root" rev-parse --git-dir)/gate.lock"
+# The lock lives in the target directory the gate builds into, because that
+# target directory and its test leases are what two runs would fight over: a
+# worktree, or a CARGO_TARGET_DIR of its own, may hold its own gate. It is not
+# kept under the git directory, because a remote build runner mounts git
+# metadata read-only (a remote job never writes the repository's .git) and the
+# gate could not take its lock there; the target directory is writable on every
+# host that can build.
+gate_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+mkdir -p "$gate_target_dir"
+GATE_LOCK="$gate_target_dir/rust-test-gate.lock"
 
 acquire_gate_lock() {
   if mkdir "$GATE_LOCK" 2>/dev/null; then
