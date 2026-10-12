@@ -6170,6 +6170,131 @@ async fn a_close_of_a_quarantined_session_bypasses_the_lane_the_stuck_worker_hol
 }
 
 #[tokio::test]
+async fn a_call_with_no_blocking_worker_free_is_refused_before_dispatch() {
+    let (mut planes, launcher) = blocking_grant_fixture().await;
+    let storage = with_readable_call_records(&mut planes);
+    planes.sessions = planes.sessions.clone().with_blocking_workers_for_test(0);
+    let (tx, mut rx) = mpsc::channel(8);
+    let refused = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        keyed_navigation(9, 801, "pf:capacity"),
+    )
+    .await;
+    assert_eq!(refused.header.ty, FrameType::Response, "{}", body(&refused));
+    let refusal = body(&refused);
+    assert_eq!(
+        refusal["outcome"], "blocking_capacity_exhausted",
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["detail"],
+        json!({"dispatched": false, "step": "queue", "call": "browser.navigate"})
+    );
+    let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
+    let record: Value = serde_json::from_str(stored.lines().last().unwrap()).unwrap();
+    assert_eq!(record["state"], "refused", "{stored}");
+    assert!(!launcher.effects.lock().unwrap().contains(&"navigate"));
+    assert!(planes.browser.result_schema_findings().is_empty());
+    // Status takes no permit, so it still answers with the pool exhausted.
+    let status = body(&invoke_existing(&planes, 802, "browser.status", json!({})).await);
+    assert_eq!(status["outcome"], "ready", "{status}");
+}
+
+/// Bind route `channel`/3 for a second conversation, `other-session`, so its
+/// calls share no lane with the fixture's conversation. It may close, so a
+/// close of a session it does not have is a call that takes permits and
+/// answers at once.
+async fn bind_other_conversation(planes: &Planes, channel: u16) {
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        route_channel: channel,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "other-session"),
+        principal: cerebellum::session_caller_principal_for_test(),
+        consumer_capabilities: Some(vec!["elicitation".into()]),
+        admission_facts: Some(
+            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
+        ),
+        scope: None,
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        900 + u64::from(channel),
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+}
+
+#[tokio::test]
+async fn a_stuck_worker_keeps_its_permits_until_it_ends() {
+    let (mut planes, launcher) = blocking_grant_fixture().await;
+    // One pair: the stuck call's work and release permits.
+    planes.sessions = planes.sessions.clone().with_blocking_workers_for_test(2);
+    bind_other_conversation(&planes, 12).await;
+    let hold = launcher.navigate_hold.hold();
+    let (tx, mut rx) = mpsc::channel(8);
+    let stuck = keyed_navigation(9, 801, "pf:stuck");
+    let question = exchange(&planes, &tx, &mut rx, stuck.clone()).await;
+    assert_eq!(question.header.ty, FrameType::Request, "a consent question");
+    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    effect_seen(&launcher, "navigate").await;
+    cerebellum::handle_frame_for_test(cancel_of(&stuck), &tx, &planes)
+        .await
+        .unwrap();
+
+    // Another conversation has its own lane, but no permit is left while the
+    // cancelled call's worker is still inside the browser.
+    let other_close = |corr: u64| {
+        keyed_on(
+            12,
+            corr,
+            "browser.close",
+            json!({"browser_session_id": "no-such-session"}),
+            &format!("pf:other-{corr}"),
+        )
+    };
+    cerebellum::handle_frame_for_test(other_close(802), &tx, &planes)
+        .await
+        .unwrap();
+    let refused = body(&frame_for(&mut rx, 802).await);
+    assert_eq!(
+        refused["outcome"], "blocking_capacity_exhausted",
+        "{refused}"
+    );
+
+    drop(hold);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for corr in 803.. {
+            cerebellum::handle_frame_for_test(other_close(corr), &tx, &planes)
+                .await
+                .unwrap();
+            let reply = body(&frame_for(&mut rx, corr).await);
+            if reply["outcome"] != "blocking_capacity_exhausted" {
+                assert_eq!(reply["outcome"], "browser_session_not_found", "{reply}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the permits outlived the worker that held them");
+}
+
+#[tokio::test]
 async fn a_close_behind_a_running_navigation_waits_for_it_and_closes_gracefully() {
     let (planes, launcher) = blocking_grant_fixture().await;
     close_route(&planes).await;

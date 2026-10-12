@@ -36,16 +36,30 @@ const QUEUE_WAIT_LIMIT: Duration = crate::computer_grants::CONSENT_PARK_LIMIT
     .saturating_add(Duration::from_millis(crate::open_app_history::CEILING_MS))
     .saturating_add(RESOLUTION_LIMIT);
 
-#[derive(Default)]
 pub(super) struct Serializer {
     conversations: ConversationQueue,
     registry: Arc<Registry>,
     /// The plane's blocking-worker capacity.
-    pub(super) permits: super::quarantine::PermitPool,
+    pub(super) permits: crate::blocking_permits::PermitPool,
     /// Workers still running after their call was answered, by application.
     pub(super) quarantine: Arc<super::quarantine::ExecutionQuarantine>,
     #[cfg(test)]
     entered: std::sync::Mutex<Vec<cerebellum_core::journal::ComputerOrderRecord>>,
+}
+
+impl Default for Serializer {
+    fn default() -> Self {
+        Self {
+            conversations: ConversationQueue::default(),
+            registry: Arc::default(),
+            permits: crate::blocking_permits::PermitPool::new(
+                crate::budgets::MAX_BLOCKING_WORKERS_COMPUTER,
+            ),
+            quarantine: Arc::default(),
+            #[cfg(test)]
+            entered: std::sync::Mutex::default(),
+        }
+    }
 }
 
 impl Serializer {

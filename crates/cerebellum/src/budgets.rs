@@ -72,7 +72,12 @@ pub const IN_FLIGHT_MARGIN_MS: u64 = 5_000;
 // The bound exists to cap the threads stuck applications can hold, not to
 // serialize healthy ones; no budget or reply formula depends on it.
 pub const MAX_BLOCKING_WORKERS_COMPUTER: usize = 8;
-pub const MAX_BLOCKING_WORKERS_BROWSER: usize = 2;
+// A browser call holds the same two permits from the moment it acquires its
+// conversation's lane. Each conversation drives its own session, so before
+// permits existed calls in different conversations ran in parallel; 8 keeps
+// four of them running at once. The closing of a session in execution
+// quarantine uses a control permit kept outside this pool.
+pub const MAX_BLOCKING_WORKERS_BROWSER: usize = 8;
 pub const MAX_CALL_RECORD_WORKERS: usize = 2;
 
 pub const EGRESS_BUFFER: usize = 64;

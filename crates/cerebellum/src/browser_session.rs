@@ -994,6 +994,34 @@ impl Drop for ControlPermitHeld {
     }
 }
 
+/// The browser plane's pool of `MAX_BLOCKING_WORKERS_BROWSER` permits.
+#[derive(Clone)]
+struct BrowserPermits(Arc<crate::blocking_permits::PermitPool>);
+
+impl Default for BrowserPermits {
+    fn default() -> Self {
+        Self(Arc::new(crate::blocking_permits::PermitPool::new(
+            crate::budgets::MAX_BLOCKING_WORKERS_BROWSER,
+        )))
+    }
+}
+
+/// What a module shutdown left behind when its plan ran out: never a clean
+/// stop while any of these is non-empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Sessions whose browser could not be confirmed stopped, so their
+    /// profile custody stays held for the next start's launch recovery.
+    pub custody_held: Vec<String>,
+    /// Browser operations still running when the plan ended: workers stuck
+    /// inside a driver call. A call's worker is counted in health by its
+    /// detached route future; this counts every one, whatever started it.
+    pub operations_running: usize,
+    /// Teardowns still running when the plan ended. Each is counted as a
+    /// detached worker in health until it really ends.
+    pub teardowns_running: usize,
+}
+
 /// The time a CDP command may run past its own cap before the write backstop
 /// acts. A field, defaulting to `WRITE_BACKSTOP_SLACK`, so tests can shorten it.
 #[derive(Clone, Copy)]
@@ -1568,6 +1596,11 @@ pub struct BrowserSessions {
     signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
     control_permit: ControlPermit,
     backstop_slack: BackstopSlack,
+    /// The browser plane's blocking-worker pool, shared by every clone.
+    permits: BrowserPermits,
+    /// Where a shutdown teardown that outlives its plan is counted as a
+    /// detached worker until it really ends. Unset where no health is kept.
+    health: Option<Arc<cerebellum_core::health::HealthState>>,
 }
 
 #[derive(Debug)]
@@ -2618,6 +2651,25 @@ impl BrowserSessions {
         released && cell.watch.held().is_empty()
     }
 
+    /// Count teardowns that outlive a shutdown in `health`.
+    pub fn with_health(mut self, health: Arc<cerebellum_core::health::HealthState>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// A call's work and release permits from the browser plane's pool, or
+    /// `None` when every pair is held.
+    pub(crate) fn try_call_permits(&self) -> Option<crate::blocking_permits::CallPermits> {
+        self.permits.0.try_call()
+    }
+
+    /// Size the blocking-worker pool, so tests can exhaust it.
+    #[doc(hidden)]
+    pub fn with_blocking_workers_for_test(mut self, size: usize) -> Self {
+        self.permits = BrowserPermits(Arc::new(crate::blocking_permits::PermitPool::new(size)));
+        self
+    }
+
     /// Shorten the write backstop's slack, so tests need not wait out the
     /// production one.
     #[doc(hidden)]
@@ -3042,14 +3094,18 @@ impl BrowserSessions {
     /// ending, SIGTERM) comes here, and they share one deadline fixed by the
     /// first of them, so a later caller joins the teardown already running
     /// rather than granting itself a fresh budget.
-    pub fn teardown_all(&self, config: &BrowserConfig) {
-        self.teardown_all_within(config, ShutdownBudget::PRODUCTION);
+    pub fn teardown_all(&self, config: &BrowserConfig) -> ShutdownReport {
+        self.teardown_all_within(config, ShutdownBudget::PRODUCTION)
     }
 
     /// [`Self::teardown_all`] under an explicit budget, so tests can observe
     /// the bound without sleeping for the production one.
     #[doc(hidden)]
-    pub fn teardown_all_within(&self, config: &BrowserConfig, budget: ShutdownBudget) {
+    pub fn teardown_all_within(
+        &self,
+        config: &BrowserConfig,
+        budget: ShutdownBudget,
+    ) -> ShutdownReport {
         let plan = *self
             .side()
             .plan
@@ -3071,11 +3127,33 @@ impl BrowserSessions {
         let grace = configured_grace(config);
         // One thread per session, so the time taken is the slowest session's,
         // not the sum over sessions.
-        std::thread::scope(|scope| {
-            for cell in cells {
-                scope.spawn(move || self.shutdown_cell(&cell, grace, &plan));
-            }
+        let teardowns_running = std::thread::scope(|scope| {
+            let shutdowns: Vec<_> = cells
+                .iter()
+                .map(|cell| scope.spawn(move || self.shutdown_cell(cell, grace, &plan)))
+                .collect();
+            shutdowns
+                .into_iter()
+                .map(|shutdown| {
+                    shutdown
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .filter(|left_running| *left_running)
+                .count()
         });
+        let mut report = ShutdownReport {
+            teardowns_running,
+            ..ShutdownReport::default()
+        };
+        for cell in &cells {
+            let meta = recovered(cell.meta());
+            if meta.lifecycle == Lifecycle::CustodyHeld {
+                report.custody_held.push(cell.browser_session_id.clone());
+            }
+            report.operations_running += meta.pending_operations;
+        }
+        report
     }
 
     /// Tear one session down inside the shutdown plan.
@@ -3086,13 +3164,14 @@ impl BrowserSessions {
     /// `graceful_until`; and the kill, reap and after-reap cleanup run in the
     /// reserve that follows, ending at `deadline`. A browser that cannot be
     /// reached or finished in that time keeps its profile custody held (see
-    /// [`Lifecycle::CustodyHeld`]).
-    fn shutdown_cell(&self, cell: &Arc<SessionCell>, grace: Duration, plan: &ShutdownPlan) {
+    /// [`Lifecycle::CustodyHeld`]). Returns whether a teardown thread it
+    /// started is still running when the plan ends.
+    fn shutdown_cell(&self, cell: &Arc<SessionCell>, grace: Duration, plan: &ShutdownPlan) -> bool {
         let in_flight_at_cap = {
             let mut meta = recovered(cell.meta());
             loop {
                 if meta.lifecycle.is_settled() {
-                    return;
+                    return false;
                 }
                 let now = Instant::now();
                 if meta.lifecycle == Lifecycle::Launching {
@@ -3100,7 +3179,7 @@ impl BrowserSessions {
                     // browser, the session (already terminal) is torn down
                     // here like any other.
                     if now >= plan.deadline {
-                        return;
+                        return false;
                     }
                     meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
                     continue;
@@ -3135,12 +3214,12 @@ impl BrowserSessions {
             // or there is none. The browser may still be alive with its
             // profile open, so custody must not be released under it.
             self.hold_custody(cell, Lifecycle::Ready);
-            return;
+            return false;
         };
         let Some(process) = driver.take() else {
             drop(driver);
             self.join_other_teardown(cell, plan);
-            return;
+            return false;
         };
         let (terminal_outcome, cleanup) = {
             let mut meta = recovered(cell.meta());
@@ -3166,7 +3245,7 @@ impl BrowserSessions {
                 grace,
             },
             plan,
-        );
+        )
     }
 
     /// Another terminalizer owns this session's process. Join it without
@@ -3207,16 +3286,32 @@ impl BrowserSessions {
     /// cleanup does filesystem and journal work. If they overrun, custody is
     /// left held rather than letting the shutdown wait past its budget; the
     /// thread carries on, and if it does finish, it retires the session then.
-    fn teardown_within(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown, plan: &ShutdownPlan) {
+    fn teardown_within(
+        &self,
+        cell: &Arc<SessionCell>,
+        owned: OwnedTeardown,
+        plan: &ShutdownPlan,
+    ) -> bool {
         let slot = Arc::new(Mutex::new(Some(owned)));
+        // Whether the thread has ended, and the health count it then drops.
+        // One lock covers both, so a count handed over as the thread ends is
+        // either dropped by the thread or never handed over.
+        let reaper: Arc<Mutex<Reaper>> = Arc::default();
         let run = {
             let sessions = self.clone();
             let cell = Arc::clone(cell);
             let slot = Arc::clone(&slot);
+            let reaper = Arc::clone(&reaper);
             move || {
                 if let Some(owned) = recover_poisoned(slot.lock()).take() {
                     sessions.run_owned_teardown(&cell, owned);
                 }
+                let counted = {
+                    let mut reaper = recover_poisoned(reaper.lock());
+                    reaper.ended = true;
+                    reaper.counted.take()
+                };
+                drop(counted);
             }
         };
         if std::thread::Builder::new()
@@ -3229,13 +3324,13 @@ impl BrowserSessions {
             if let Some(owned) = recover_poisoned(slot.lock()).take() {
                 self.run_owned_teardown(cell, owned);
             }
-            return;
+            return false;
         }
         {
             let mut meta = recovered(cell.meta());
             loop {
                 if meta.lifecycle.is_settled() {
-                    return;
+                    return false;
                 }
                 let now = Instant::now();
                 if now >= plan.deadline {
@@ -3245,6 +3340,17 @@ impl BrowserSessions {
             }
         }
         self.hold_custody(cell, Lifecycle::TeardownOwned);
+        // The thread carries on past the plan: count it as a detached worker
+        // until it ends, so health does not read as a clean stop meanwhile.
+        let mut reaper = recover_poisoned(reaper.lock());
+        if reaper.ended {
+            return false;
+        }
+        reaper.counted = self
+            .health
+            .as_ref()
+            .map(|health| health.enter_detached_worker());
+        true
     }
 
     fn run_owned_teardown(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown) {
@@ -3466,6 +3572,13 @@ impl BrowserSessions {
         });
         self.retire(cell, process, cleanup, outcome);
     }
+}
+
+/// A shutdown teardown thread's end, as its waiter sees it.
+#[derive(Default)]
+struct Reaper {
+    ended: bool,
+    counted: Option<cerebellum_core::health::DetachedWorkerGuard>,
 }
 
 /// What the shutdown teardown thread takes over from `shutdown_cell`.
@@ -4802,7 +4915,9 @@ mod tests {
         sessions.poison_for_test();
 
         let tearing_down = sessions.clone();
-        finishes_within(move || tearing_down.teardown_all(&config()));
+        finishes_within(move || {
+            tearing_down.teardown_all(&config());
+        });
         for (process, cleanup) in [(first, first_cleanup), (second, second_cleanup)] {
             assert_eq!(
                 process.lock().unwrap().as_slice(),
@@ -6764,5 +6879,71 @@ mod tests {
         assert!(call.recv_timeout(PROMPTLY).unwrap());
         assert!(sessions.retry_held_release("route", 10));
         assert!(!sessions.held_input_unconfirmed("route"));
+    }
+
+    #[test]
+    fn shutdown_reports_a_teardown_that_outlives_its_plan_and_counts_it_in_health() {
+        let health = Arc::new(cerebellum_core::health::HealthState::new());
+        let sessions = BrowserSessions::default().with_health(Arc::clone(&health));
+        let clock = FakeClock::new();
+        let cleanup_gate = Arc::new(Gate::default());
+        let session = establish_test_browser(
+            &sessions,
+            "route",
+            &clock,
+            Arc::clone(&cleanup_gate),
+            |_| {},
+        );
+
+        let report = sessions.teardown_all_within(&config(), short_budget());
+        assert_eq!(
+            report,
+            ShutdownReport {
+                custody_held: vec![session.id.clone()],
+                operations_running: 0,
+                teardowns_running: 1,
+            },
+            "a teardown still running was reported as a clean stop"
+        );
+        assert_eq!(health.detached_workers(), 1);
+
+        cleanup_gate.open();
+        let deadline = Instant::now() + PROMPTLY;
+        while health.detached_workers() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the late teardown stayed counted"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.released(), 1);
+    }
+
+    #[test]
+    fn shutdown_reports_a_stuck_operation_and_a_clean_stop_reports_nothing() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (session, call_gate, call) =
+            stuck_call_on(&sessions, "stuck", &clock, None, Gate::opened());
+        let _idle = establish_test_browser(&sessions, "idle", &clock, Gate::opened(), |_| {});
+
+        let report = sessions.teardown_all_within(&config(), short_budget());
+        assert_eq!(
+            report,
+            ShutdownReport {
+                custody_held: vec![session.id.clone()],
+                operations_running: 1,
+                teardowns_running: 0,
+            }
+        );
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+
+        let clean = BrowserSessions::default();
+        let _closed = establish_test_browser(&clean, "route", &clock, Gate::opened(), |_| {});
+        assert_eq!(
+            clean.teardown_all_within(&config(), short_budget()),
+            ShutdownReport::default()
+        );
     }
 }

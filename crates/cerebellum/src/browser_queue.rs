@@ -51,6 +51,12 @@ pub(crate) enum QueueRefusal {
         /// The stuck action, or the refused input call.
         call: String,
     },
+    /// Every work and release permit of the browser plane is held, possibly
+    /// by stuck workers. Nothing was dispatched for the call.
+    CapacityExhausted {
+        /// The browser capability whose result vocabulary the reply uses.
+        capability: &'static str,
+    },
 }
 
 impl QueueRefusal {
@@ -60,6 +66,7 @@ impl QueueRefusal {
             Self::Draining => "module_draining",
             Self::WaitExpired => "queue_wait_expired",
             Self::TargetBusy { .. } => "target_busy",
+            Self::CapacityExhausted { .. } => "blocking_capacity_exhausted",
         }
     }
 
@@ -68,6 +75,7 @@ impl QueueRefusal {
             Self::WaitExpired => "an earlier action in this conversation is still running; nothing was dispatched for this call; retry",
             Self::TargetBusy { reason: Some(_), .. } => crate::browser_session::HELD_INPUT_REMEDY,
             Self::TargetBusy { reason: None, .. } => "a browser operation on this session is still running after its call ended; nothing was dispatched for this call; retry later, or close the session",
+            Self::CapacityExhausted { .. } => "every browser worker is busy, some possibly stuck; nothing was dispatched for this call; retry shortly",
             _ => "the queued browser call ended before authorization or execution",
         }
     }
@@ -75,6 +83,16 @@ impl QueueRefusal {
     /// The capability and Response body of a refusal that is answered as a
     /// result of that capability rather than as a route error.
     pub(crate) fn response_body(&self) -> Option<(&'static str, Value)> {
+        if let Self::CapacityExhausted { capability } = self {
+            return Some((
+                capability,
+                json!({
+                    "outcome": "blocking_capacity_exhausted",
+                    "detail": {"dispatched": false, "step": "queue", "call": capability},
+                    "remedy": self.remedy(),
+                }),
+            ));
+        }
         let Self::TargetBusy {
             capability,
             step,
@@ -96,11 +114,14 @@ impl QueueRefusal {
     }
 }
 
-/// A call that drives the conversation's own browser session.
+/// A call on the browser plane that runs blocking work for its conversation.
 #[derive(Clone)]
 struct SessionCall {
     route_key: String,
     capability: &'static str,
+    /// Drives the conversation's own browser session, so execution
+    /// quarantine of that session applies to it.
+    drives_session: bool,
     /// Sends input to the page, so held-input quarantine applies to it.
     input: bool,
     /// For a close, the session it names.
@@ -110,22 +131,42 @@ struct SessionCall {
 /// Capabilities that drive the session's browser. Other calls that share
 /// the lane (launch, grants, the person's own browser) are not refused for a
 /// quarantined session.
-fn session_capability(name: &str) -> Option<&'static str> {
-    [
-        crate::browser::NAVIGATE,
-        crate::browser::SNAPSHOT,
-        crate::browser::CLICK,
-        crate::browser::TYPE,
-        crate::browser::SCREENSHOT,
-        crate::browser::CLICK_POINT,
-        crate::browser::WAIT_FOR,
-        crate::browser_session::BROWSER_CLOSE,
-        crate::management::PRESENT,
-        crate::management::RESUME,
-        crate::management::IMPORT_LOGIN,
-    ]
-    .into_iter()
-    .find(|capability| *capability == name)
+const SESSION_CAPABILITIES: [&str; 11] = [
+    crate::browser::NAVIGATE,
+    crate::browser::SNAPSHOT,
+    crate::browser::CLICK,
+    crate::browser::TYPE,
+    crate::browser::SCREENSHOT,
+    crate::browser::CLICK_POINT,
+    crate::browser::WAIT_FOR,
+    crate::browser_session::BROWSER_CLOSE,
+    crate::management::PRESENT,
+    crate::management::RESUME,
+    crate::management::IMPORT_LOGIN,
+];
+
+/// Capabilities that run blocking browser work without driving the
+/// session: a launch, and a login capture in a throwaway browser. Like the
+/// session capabilities they take a permit pair at lane acquisition. Calls on
+/// the person's own browser and grant management run no blocking browser
+/// work and take none.
+const LAUNCHING_CAPABILITIES: [&str; 2] = [
+    crate::browser_session::BROWSER_LAUNCH,
+    crate::management::CAPTURE_LOGIN,
+];
+
+/// The capability `name` names, and whether it drives the session.
+fn plane_capability(name: &str) -> Option<(&'static str, bool)> {
+    SESSION_CAPABILITIES
+        .into_iter()
+        .find(|capability| *capability == name)
+        .map(|capability| (capability, true))
+        .or_else(|| {
+            LAUNCHING_CAPABILITIES
+                .into_iter()
+                .find(|capability| *capability == name)
+                .map(|capability| (capability, false))
+        })
 }
 
 fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
@@ -133,7 +174,7 @@ fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
         .routes
         .get(frame.header.channel, frame.header.epoch)?;
     let body: Value = serde_json::from_slice(&frame.body).ok()?;
-    let (capability, arguments) = match facts.surface {
+    let ((capability, drives_session), arguments) = match facts.surface {
         RouteSurface::Tools => {
             let name = body.get("name")?.as_str()?;
             let arguments = body.get("arguments").cloned().unwrap_or(Value::Null);
@@ -147,15 +188,16 @@ fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
                         "present" => Some(crate::management::PRESENT),
                         "resume" => Some(crate::management::RESUME),
                         "import_login" => Some(crate::management::IMPORT_LOGIN),
+                        "capture_login" => Some(crate::management::CAPTURE_LOGIN),
                         _ => None,
                     })?;
-                (session_capability(capability)?, arguments)
+                (plane_capability(capability)?, arguments)
             } else {
-                (session_capability(name)?, arguments)
+                (plane_capability(name)?, arguments)
             }
         }
         RouteSurface::Management => (
-            session_capability(body.get("method")?.as_str()?)?,
+            plane_capability(body.get("method")?.as_str()?)?,
             body.get("params").cloned().unwrap_or(Value::Null),
         ),
         RouteSurface::Unsupported => return None,
@@ -163,6 +205,7 @@ fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
     Some(SessionCall {
         route_key: facts.identity.conversation_key.clone(),
         capability,
+        drives_session,
         input: [
             crate::browser::CLICK,
             crate::browser::TYPE,
@@ -184,6 +227,9 @@ enum Quarantined {
 }
 
 fn execution_quarantine(call: &SessionCall, planes: &Planes) -> Option<Quarantined> {
+    if !call.drives_session {
+        return None;
+    }
     let quarantine = planes.sessions.execution_quarantine(&call.route_key)?;
     Some(
         if call.close_session.as_deref() == Some(quarantine.browser_session_id.as_str()) {
@@ -261,7 +307,7 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
 pub(crate) async fn enter(
     frame: &Frame,
     planes: &Planes,
-) -> Result<Option<LaneGuard>, QueueRefusal> {
+) -> Result<Option<BrowserLane>, QueueRefusal> {
     let Some(ticket) = ARRIVAL
         .try_with(|arrival| arrival.borrow_mut().take())
         .ok()
@@ -290,6 +336,21 @@ pub(crate) async fn enter(
     else {
         return Ok(None);
     };
+    // Taken at lane acquisition, after the queue wait, so a call waiting in
+    // the queue holds none. No permit is taken later in the call, so this is
+    // the only place capacity can refuse it, always before dispatch.
+    let permits = match &call {
+        Some(call) => Some(planes.sessions.try_call_permits().ok_or(
+            QueueRefusal::CapacityExhausted {
+                capability: call.capability,
+            },
+        )?),
+        None => None,
+    };
+    let lane = BrowserLane {
+        _guard: guard,
+        _permits: permits,
+    };
     if let Some(call) = call.filter(|call| call.input) {
         if !release_held_input(&call, planes).await {
             return Err(QueueRefusal::TargetBusy {
@@ -300,7 +361,16 @@ pub(crate) async fn enter(
             });
         }
     }
-    Ok(Some(guard))
+    Ok(Some(lane))
+}
+
+/// What a browser call holds once it reaches its execution lane: the lane,
+/// and, for a call that runs blocking browser work, its work and release
+/// permits. Both are kept until the call's route future ends, which a call
+/// detached by its terminal decision outlives only until its worker ends.
+pub(crate) struct BrowserLane {
+    _guard: LaneGuard,
+    _permits: Option<crate::blocking_permits::CallPermits>,
 }
 
 /// With the lane held, so no earlier call of this conversation is running,
@@ -435,7 +505,7 @@ mod tests {
             crate::browser::CLICK_POINT,
             crate::browser_session::BROWSER_CLOSE,
         ] {
-            assert_eq!(session_capability(capability), Some(capability));
+            assert_eq!(plane_capability(capability), Some((capability, true)));
             for reason in [None, Some(crate::browser_session::HELD_INPUT_UNCONFIRMED)] {
                 let refusal = QueueRefusal::TargetBusy {
                     capability,
@@ -463,9 +533,33 @@ mod tests {
         }
         assert!(QueueRefusal::WaitExpired.response_body().is_none());
         assert_eq!(
-            session_capability(crate::browser_session::BROWSER_LAUNCH),
-            None
+            plane_capability(crate::browser_session::BROWSER_LAUNCH),
+            Some((crate::browser_session::BROWSER_LAUNCH, false)),
+            "a launch takes permits but is not refused for a quarantined session"
         );
+    }
+
+    #[test]
+    fn capacity_refusals_are_results_of_every_capability_that_takes_permits() {
+        for capability in SESSION_CAPABILITIES
+            .into_iter()
+            .chain(LAUNCHING_CAPABILITIES)
+        {
+            let refusal = QueueRefusal::CapacityExhausted { capability };
+            assert_eq!(refusal.code(), "blocking_capacity_exhausted");
+            let (named, body) = refusal.response_body().unwrap();
+            assert_eq!(named, capability);
+            assert_eq!(
+                body["detail"],
+                json!({"dispatched": false, "step": "queue", "call": capability})
+            );
+            assert!(body["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was dispatched"));
+            crate::browser::validate_browser_result(capability, &body)
+                .unwrap_or_else(|error| panic!("{capability}: {error} in {body}"));
+        }
     }
 
     #[tokio::test(start_paused = true)]

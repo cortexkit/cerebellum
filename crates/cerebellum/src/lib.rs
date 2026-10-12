@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod authorization;
+mod blocking_permits;
 pub mod browser;
 pub mod browser_config;
 pub mod browser_crash_reports;
@@ -2882,8 +2883,9 @@ impl Planes {
                 });
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let launch_service = None;
-        let sessions =
-            browser_session::BrowserSessions::default().with_signed_in_domains(signed_in);
+        let sessions = browser_session::BrowserSessions::default()
+            .with_signed_in_domains(signed_in)
+            .with_health(Arc::clone(&health));
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
         let browser_grants = management.browser_grants();
         let browser = if let Some(config) = browser_config.as_ref() {
