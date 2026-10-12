@@ -151,12 +151,15 @@ where
         if context.cancel.is_cancelled() {
             return json!({"outcome":"cancelled"});
         }
+        let work = super::quarantine::CallWork::current();
         let token = {
             use cerebellum_computer::audit::{
                 ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
             };
             use cerebellum_computer::grounding::ContainmentRung;
-            let mut audit = self.audit.lock().await;
+            // A short lock for the journal steps only; it is released before
+            // the launch below.
+            let mut audit = cerebellum_computer::audit::lock_audit(&self.audit);
             let capability = ComputerCapability::OpenApp;
             // A new process has no pid yet; do not claim pid containment for
             // the LaunchServices request that creates it.
@@ -167,6 +170,13 @@ where
                 Ok(reservation) => reservation,
                 Err(_) => return read_audit_unavailable_reply(),
             };
+            // The computer gate point for a launch: once the call has been
+            // answered, no application is opened.
+            if !work.begin_mutation() {
+                let _ = audit
+                    .finalize_rejected(reservation, br#"{"outcome":"dispatch_stopped"}"#.to_vec());
+                return super::quarantine::stopped_before_dispatch_reply();
+            }
             let dispatch =
                 TypedCaptureDispatch::new(capability, rung, ObservationState::HumanUnobserved)
                     .dispatch_material(capability.capability_id().as_bytes().to_vec());
@@ -184,7 +194,9 @@ where
             .unwrap_or_default();
         let attempted = Arc::new(AtomicBool::new(false));
         let launch_started = attempted.clone();
+        let launch_work = work.clone();
         let opened = tokio::task::spawn_blocking(move || {
+            let _ax = launch_work.bound_ax();
             if let Some(url) = url.as_deref() {
                 // Consent can outlive a bundle update. Re-read the declarations
                 // immediately before dispatch, just as the signer is rechecked.
@@ -258,10 +270,7 @@ where
         // Only app and outcome go into the journal: no path, window content,
         // request text, pid or frontmost state is copied there.
         let summary = json!({"app":{"name":app.name,"bundle_identity":app.bundle_identity},"outcome":reply["outcome"]});
-        if self
-            .audit
-            .lock()
-            .await
+        if cerebellum_computer::audit::lock_audit(&self.audit)
             .finalize_dispatched(
                 token,
                 serde_json::to_vec(&summary).expect("JSON summary"),

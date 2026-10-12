@@ -64,6 +64,8 @@ pub(crate) fn post_call_made(
             refusal,
             held_state,
         } => Some(*posts_returned > 0 || failed_call(refusal) || released(held_state)),
+        // Stopped at the gate before the intent was committed: no post call.
+        DispatchError::DispatchStopped => Some(false),
         _ => None,
     };
     match bracket {

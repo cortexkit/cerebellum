@@ -114,7 +114,12 @@ fn require_trust() -> Result<(), AxElementActionError> {
 fn bound_messages(element: CfTypeRef) {
     // SAFETY: the element is retained by the caller for the call; the timeout
     // applies to messages this process sends and changes nothing in the target.
-    unsafe { AXUIElementSetMessagingTimeout(element, MESSAGING_TIMEOUT_SECONDS) };
+    unsafe {
+        AXUIElementSetMessagingTimeout(
+            element,
+            crate::ax_budget::messaging_timeout_seconds(MESSAGING_TIMEOUT_SECONDS),
+        )
+    };
 }
 
 fn copy(element: CfTypeRef, name: &'static str) -> Result<Option<CFRetained<CFType>>, i32> {
@@ -239,7 +244,10 @@ pub fn enable_manual_accessibility(pid: u32) -> crate::ManualAccessibility {
     // SAFETY: all references remain alive for the call. A short messaging
     // timeout keeps an unresponsive renderer from extending the read retry.
     let code = unsafe {
-        AXUIElementSetMessagingTimeout(element.as_ptr(), 0.05);
+        AXUIElementSetMessagingTimeout(
+            element.as_ptr(),
+            crate::ax_budget::messaging_timeout_seconds(0.05),
+        );
         AXUIElementSetAttributeValue(
             element.as_ptr(),
             CFRetained::as_ptr(&attribute).as_ptr().cast(),

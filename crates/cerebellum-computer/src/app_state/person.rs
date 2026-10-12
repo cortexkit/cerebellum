@@ -184,6 +184,13 @@ pub struct Posting {
     start: Instant,
 }
 
+impl Posting {
+    /// When the interval began; the key `end_posting_at` closes it by.
+    pub fn start(&self) -> Instant {
+        self.start
+    }
+}
+
 impl OwnInputLedger {
     pub fn new() -> Self {
         Self::default()
@@ -215,16 +222,32 @@ impl OwnInputLedger {
 
     /// Note that a post has ended, however it ended.
     pub fn end_posting(&self, posting: Posting) {
+        self.end_posting_at(posting.start);
+    }
+
+    /// Close the interval that began at `start`, if it is still open.
+    ///
+    /// For a post whose call reached its terminal decision while the post
+    /// was still blocked: the interval is closed at the terminal, so later
+    /// input on other applications is not taken for this module's own. A
+    /// second close, including the worker's own `end_posting` when it
+    /// finally returns, changes nothing.
+    pub fn end_posting_at(&self, start: Instant) {
         let mut state = self.lock();
         let end = Instant::now();
         if let Some(entry) = state
             .posts
             .iter_mut()
             .rev()
-            .find(|entry| entry.0 == posting.start && entry.1.is_none())
+            .find(|entry| entry.0 == start && entry.1.is_none())
         {
             entry.1 = Some(end);
         }
+    }
+
+    /// Whether any posting interval is still open.
+    pub fn has_open_posting(&self) -> bool {
+        self.lock().posts.iter().any(|(_, end)| end.is_none())
     }
 
     /// The latest input not explained by this module's posting intervals.

@@ -305,7 +305,9 @@ fn require_app_grant(
 /// the caller to change a request that was right.
 fn refusal_reply(refusal: &DispatchError) -> Value {
     match refusal {
-        DispatchError::Cancelled { .. } => super::synthetic_dispatch_refusal(refusal),
+        DispatchError::Cancelled { .. } | DispatchError::DispatchStopped => {
+            super::synthetic_dispatch_refusal(refusal)
+        }
         DispatchError::IdleGateRefused(IdleGateRefusal::BelowThreshold {
             threshold_ms,
             user_idle_ms,
@@ -458,6 +460,18 @@ where
             }
         }
         let admission = takeover.admission().clone();
+        let work = super::quarantine::CallWork::current();
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &target) {
+            admission.decorate(&mut busy);
+            return busy;
+        }
+        if let Err(mut unconfirmed) = self
+            .confirm_held_input_released(capability.capability_id(), management, &work)
+            .await
+        {
+            admission.decorate(&mut unconfirmed);
+            return unconfirmed;
+        }
         let mut reply = self
             .dispatch_takeover(
                 capability,
@@ -605,6 +619,7 @@ where
                 element: AccessibilityElementName::Identifier(target.bundle_identity.clone()),
             },
         );
+        let held_press = super::held_input::HeldPress::global(&target, &action);
         let request = DispatchRequest::new(
             row,
             DispatchMode::Observed,
@@ -616,9 +631,24 @@ where
         .with_synthetic(action)
         .with_once_dispatch_token(token);
 
+        // Reserved here under a short lock; the worker commits and finalizes
+        // through the token, so no audit lock is held across the posts.
+        let work = super::quarantine::CallWork::current();
+        let mut audit =
+            cerebellum_computer::audit::AuditToken::new(self.audit.clone(), work.gate());
+        if cerebellum_computer::dispatch::reserve_actuation_ahead(
+            &mut audit,
+            identity.clone(),
+            &request,
+        )
+        .is_err()
+        {
+            return refusal_reply(&DispatchError::AuditUnavailable);
+        }
+        let ticket = self.track_held_input(held_press, &work);
+
         // Posting blocks for as long as the sequence takes. Run it off the
         // runtime so a cancel frame can still be read and set the signal.
-        let audit = self.audit.clone();
         let make_driver = self.make_synthetic_driver.clone();
         // The pointer events posted here reach the platform's input count
         // like the person's do; noting them keeps a later element or
@@ -626,14 +656,16 @@ where
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
         let dispatched = tokio::task::spawn_blocking(move || {
-            let mut audit = audit.blocking_lock();
+            let _ax = work.bound_ax();
             let cancelled = || cancel.is_cancelled();
             let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
             let posting = own_input.begin_posting(
                 cerebellum_computer::app_state::person::last_input_instant(input_source.as_ref()),
             );
+            work.publish_posting(&own_input, &posting);
             let dispatched = dispatcher.dispatch(&mut audit, identity, request);
             own_input.end_posting(posting);
+            super::settle_held_input(ticket, &dispatched, make_driver.as_ref());
             dispatched
         })
         .await

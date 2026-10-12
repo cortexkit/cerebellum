@@ -224,6 +224,10 @@ pub enum ElementActionError {
     Unsupported,
     /// The application answered with some other failure.
     Failed,
+    /// The message was sent but the application did not complete its answer
+    /// in time, so the action may or may not have happened. Never a refusal
+    /// that is safe to retry.
+    Indeterminate,
     /// This platform has no implementation.
     UnsupportedOnPlatform,
 }

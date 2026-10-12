@@ -31,6 +31,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     plan: &ImageReadPlan,
     evidence: &std::cell::RefCell<ImageReadEvidence>,
     after_fronting: &mut dyn FnMut(),
+    gate: &dyn cerebellum_computer::dispatch::MutationGate,
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     let now_ms = plan.now_ms;
     if !plan.bring_to_front {
@@ -57,10 +58,15 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
+    // Bringing the target forward changes which application has the person's
+    // focus, so it is a mutation: the call's gate must still be open.
+    if !gate.begin_mutation() {
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
     let bracket = driver.read_fronted(
         grant,
         bound,
-        &|| plan.cancel.as_ref().is_some_and(|c| c.is_cancelled()),
+        &|| plan.cancel.as_ref().is_some_and(|c| c.is_cancelled()) || gate.stopped(),
         &mut || {
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

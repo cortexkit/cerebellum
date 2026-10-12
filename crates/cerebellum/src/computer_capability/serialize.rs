@@ -23,9 +23,7 @@ use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
 use serde_json::Value;
 
 use super::{ComputerPlane, Servable, ServeContext, Served};
-use crate::call_queue::{
-    ConversationPosition, ConversationQueue, LaneGuard, QueuePosition, Registry,
-};
+use crate::call_queue::{ConversationPosition, ConversationQueue, LaneGuard, Registry};
 use crate::computer_grants::ConsentRefusal;
 
 const RESOLUTION_LIMIT: Duration = Duration::from_secs(2);
@@ -42,6 +40,10 @@ const QUEUE_WAIT_LIMIT: Duration = crate::computer_grants::CONSENT_PARK_LIMIT
 pub(super) struct Serializer {
     conversations: ConversationQueue,
     registry: Arc<Registry>,
+    /// The plane's blocking-worker capacity.
+    pub(super) permits: super::quarantine::PermitPool,
+    /// Workers still running after their call was answered, by application.
+    pub(super) quarantine: Arc<super::quarantine::ExecutionQuarantine>,
     #[cfg(test)]
     entered: std::sync::Mutex<Vec<cerebellum_core::journal::ComputerOrderRecord>>,
 }
@@ -58,6 +60,42 @@ impl Serializer {
 
 tokio::task_local! {
     static ARRIVAL: RefCell<Option<ConversationPosition>>;
+}
+
+/// How often a call waiting for its application's lane checks whether a
+/// stuck worker now holds that application, so it is refused promptly rather
+/// than queued behind a worker that may never return.
+const QUARANTINE_POLL: Duration = Duration::from_millis(50);
+
+/// A call that has reached its execution lane: the lane, when the call is
+/// serialized, and the application it resolved to, when resolution finished.
+pub(super) struct Admitted {
+    pub(super) lane: Option<LaneGuard>,
+    pub(super) app: Option<String>,
+}
+
+impl Admitted {
+    fn unserialized() -> Self {
+        Self {
+            lane: None,
+            app: None,
+        }
+    }
+}
+
+/// Why a call was refused before reaching its execution lane.
+pub(super) enum QueueRefusal {
+    Consent(ConsentRefusal),
+    /// A worker still running past its call's answer holds the application.
+    Busy(&'static str),
+    /// No blocking-worker permit was free for the target-resolution query.
+    CapacityExhausted,
+}
+
+impl From<ConsentRefusal> for QueueRefusal {
+    fn from(refusal: ConsentRefusal) -> Self {
+        Self::Consent(refusal)
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -140,9 +178,9 @@ where
         capability: Servable,
         arguments: &Value,
         context: &mut ServeContext<'_, C>,
-    ) -> Result<Option<LaneGuard>, ConsentRefusal> {
+    ) -> Result<Admitted, QueueRefusal> {
         if valid_request(capability, arguments).is_err() {
-            return Ok(None);
+            return Ok(Admitted::unserialized());
         }
         let ticket = ARRIVAL
             .try_with(|arrival| arrival.borrow_mut().take())
@@ -152,7 +190,7 @@ where
         // its successor would wait for an index we intentionally discarded.
         // Legacy inventory calls retain their existing unserialized behavior.
         if matches!(capability.0, Served::ListApps) && ticket.is_none() {
-            return Ok(None);
+            return Ok(Admitted::unserialized());
         }
         let cancel = context.cancel.clone();
         let drain = context.consent.drain.clone();
@@ -166,45 +204,66 @@ where
             context.identity.computer_order = order.positioned();
             #[cfg(test)]
             self.serializer.entered.lock().unwrap().push(order);
+            // A resolution that may query the platform takes a work permit of
+            // its own, held by the query until it really ends. With none free
+            // nothing is spawned and the call is refused before dispatch.
+            let hold = if resolution_may_block(capability) {
+                match self.serializer.permits.try_resolution() {
+                    Some(permit) => Some(permit),
+                    None => return Err(QueueRefusal::CapacityExhausted),
+                }
+            } else {
+                None
+            };
             // Ordering is best-effort when resolution exceeds two seconds:
             // run this call unserialized rather than letting a wedged platform
             // query stall every other app in the conversation. Dropping the
             // await cannot stop a running blocking query, but that query owns
-            // neither lane and cannot reserve an app lock after the timeout.
+            // neither lane, keeps its own permit, and cannot reserve an app
+            // lock after the timeout.
             let app = tokio::time::timeout(
                 RESOLUTION_LIMIT,
-                self.reserve_app(
+                self.serialization_app(
                     capability,
                     arguments,
                     &context.identity.conversation_key,
                     context.management,
+                    hold,
                 ),
             )
             .await
             .ok()
             .flatten();
             drop(conversation);
-            let ticket = app?;
-            Some(ticket.acquire().await)
+            let Some(app) = app else {
+                return Ok(Admitted::unserialized());
+            };
+            let busy = || self.serializer.quarantine.busy(None, None, Some(&app));
+            if let Some(stuck) = busy() {
+                return Err(QueueRefusal::Busy(stuck));
+            }
+            let ticket = self.serializer.registry.reserve((
+                context.identity.conversation_key.clone(),
+                app.to_lowercase(),
+            ));
+            let acquire = ticket.acquire();
+            tokio::pin!(acquire);
+            let lane = loop {
+                tokio::select! {
+                    lane = &mut acquire => break lane,
+                    _ = tokio::time::sleep(QUARANTINE_POLL) => {
+                        if let Some(stuck) = busy() {
+                            return Err(QueueRefusal::Busy(stuck));
+                        }
+                    }
+                }
+            };
+            Ok(Admitted {
+                lane: Some(lane),
+                app: Some(app),
+            })
         };
-        wait_for_lane(deadline, enter, cancel, drain).await
-    }
-
-    async fn reserve_app(
-        &self,
-        capability: Servable,
-        arguments: &Value,
-        conversation: &str,
-        management: &Arc<crate::management::ManagementPlane>,
-    ) -> Option<QueuePosition> {
-        let app = self
-            .serialization_app(capability, arguments, conversation, management)
-            .await?;
-        Some(
-            self.serializer
-                .registry
-                .reserve((conversation.to_string(), app.to_lowercase())),
-        )
+        wait_for_lane(deadline, enter, cancel, drain).await?
     }
 
     async fn serialization_app(
@@ -213,6 +272,7 @@ where
         arguments: &Value,
         conversation: &str,
         management: &Arc<crate::management::ManagementPlane>,
+        hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Option<String> {
         let sessions = management.app_state_sessions();
         match capability.0 {
@@ -256,6 +316,7 @@ where
                 let source = self.app_state_source.clone();
                 let management = management.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _permit = hold;
                     let current = management.resolve_process(&image.bundle_identity).ok()?;
                     if current.pid != image.pid
                         || current.process_generation_evidence != image.process_generation
@@ -285,11 +346,11 @@ where
                 .flatten()
             }
             Served::Wait => {
-                self.resolve_target_name_or_installed(arguments.get("app")?.as_str()?)
+                self.resolve_target_name_or_installed(arguments.get("app")?.as_str()?, hold)
                     .await
             }
             Served::ReadState | Served::Type | Served::Keys | Served::TakeoverScroll => {
-                self.resolve_target_name_or_installed(arguments.get("target")?.as_str()?)
+                self.resolve_target_name_or_installed(arguments.get("target")?.as_str()?, hold)
                     .await
             }
             // The app has no process yet, so resolve it from the installed
@@ -299,6 +360,7 @@ where
                 let target = super::open_app::parse_request(arguments).ok()?;
                 let source = self.app_state_source.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _permit = hold;
                     let listed = source.installed_apps(std::time::Duration::from_secs(1));
                     super::open_app::resolve_installed(&target.target, &listed.apps)
                         .ok()
@@ -311,14 +373,19 @@ where
         }
     }
 
-    async fn resolve_target_name_or_installed(&self, target: &str) -> Option<String> {
-        if let Ok(bundle_identity) = self.resolve_target_name(target).await {
+    async fn resolve_target_name_or_installed(
+        &self,
+        target: &str,
+        hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Option<String> {
+        if let Ok(bundle_identity) = self.resolve_target_name_holding(target, hold.clone()).await {
             return Some(bundle_identity);
         }
 
         let source = self.app_state_source.clone();
         let target = target.to_owned();
         tokio::task::spawn_blocking(move || {
+            let _permit = hold;
             let listed = source.installed_apps(std::time::Duration::from_secs(1));
             super::open_app::resolve_installed(&target, &listed.apps)
                 .ok()
@@ -330,12 +397,12 @@ where
     }
 }
 
-async fn wait_for_lane(
+async fn wait_for_lane<T>(
     deadline: tokio::time::Instant,
-    enter: impl Future<Output = Option<LaneGuard>>,
+    enter: impl Future<Output = T>,
     cancel: crate::CancelHandle,
     mut drain: tokio::sync::watch::Receiver<bool>,
-) -> Result<Option<LaneGuard>, ConsentRefusal> {
+) -> Result<T, ConsentRefusal> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(ConsentRefusal::Cancelled),
@@ -349,11 +416,45 @@ async fn wait_for_lane(
     }
 }
 
+/// Whether resolving this capability's target may query the platform, and so
+/// needs a blocking-worker permit of its own.
+fn resolution_may_block(capability: Servable) -> bool {
+    !matches!(
+        capability.0,
+        Served::ListApps | Served::PressElement | Served::WriteText | Served::PressPoint
+    )
+}
+
+/// A refusal decided before the call's action could start, in the envelope
+/// its row requires.
+pub(super) fn refused_in_queue(capability: Servable, reply: Value) -> Value {
+    if matches!(capability.0, Served::Type | Served::Keys) {
+        super::synthetic_wire_envelope(super::keystrokes::refused_before_posting(reply))
+    } else {
+        reply
+    }
+}
+
 pub(super) fn queued_refusal(
     capability: Servable,
     arguments: &Value,
-    refusal: ConsentRefusal,
+    refusal: impl Into<QueueRefusal>,
 ) -> Value {
+    let refusal = match refusal.into() {
+        QueueRefusal::Consent(refusal) => refusal,
+        QueueRefusal::Busy(stuck) => {
+            return refused_in_queue(
+                capability,
+                super::quarantine::target_busy_reply(stuck, "queue"),
+            )
+        }
+        QueueRefusal::CapacityExhausted => {
+            return refused_in_queue(
+                capability,
+                super::quarantine::capacity_exhausted_reply("queue", "target resolution"),
+            )
+        }
+    };
     let reply = if refusal == ConsentRefusal::Cancelled {
         match capability.0 {
             Served::Wait => super::cancelled_before_polling_reply(
@@ -378,11 +479,7 @@ pub(super) fn queued_refusal(
     } else {
         refusal.reply(None)
     };
-    if matches!(capability.0, Served::Type | Served::Keys) {
-        super::synthetic_wire_envelope(super::keystrokes::refused_before_posting(reply))
-    } else {
-        reply
-    }
+    refused_in_queue(capability, reply)
 }
 
 fn valid_request(capability: Servable, arguments: &Value) -> Result<(), Value> {
@@ -878,7 +975,7 @@ mod tests {
 
         async fn audit_rows(&self) -> Vec<Value> {
             let plane = self.planes.computer.as_ref().unwrap();
-            let audit = plane.audit.lock().await;
+            let audit = cerebellum_computer::audit::lock_audit(&plane.audit);
             serde_json::Deserializer::from_slice(&audit.journal().export_bytes())
                 .into_iter::<Value>()
                 .map(Result::unwrap)

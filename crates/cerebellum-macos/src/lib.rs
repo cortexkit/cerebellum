@@ -32,6 +32,8 @@ const _: () = assert!(
     "chrome-for-testing-parent-probe is forbidden in attested release builds"
 );
 
+// Pure Rust, so its tests run on every host.
+pub mod ax_budget;
 // The accessibility traversal is compiled for unit tests on every host, so its
 // input-bound checks run even where the macOS framework APIs are unavailable.
 #[cfg(any(target_os = "macos", test))]

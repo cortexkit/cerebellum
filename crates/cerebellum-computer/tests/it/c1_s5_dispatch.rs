@@ -2034,3 +2034,249 @@ fn a_cancelled_dispatch_is_finalized_as_cancelled() {
         }
     );
 }
+
+/// A gate the test closes: shut from the start, or once `after` posts have
+/// returned, standing in for a call's terminal decision.
+struct TestGate {
+    posts: Arc<std::sync::atomic::AtomicUsize>,
+    after: usize,
+}
+
+impl cerebellum_computer::dispatch::MutationGate for TestGate {
+    fn begin_mutation(&self) -> bool {
+        !self.stopped()
+    }
+
+    fn stopped(&self) -> bool {
+        self.posts.load(std::sync::atomic::Ordering::SeqCst) >= self.after
+    }
+}
+
+fn typing_request(text: &str) -> DispatchRequest {
+    DispatchRequest::new(
+        FrozenDispatchRow::for_capability("computer.type").unwrap(),
+        DispatchMode::Background,
+        target(),
+        ExpectedPostCondition::new(
+            "effect-v1",
+            PostCondition::ElementEnabledIs {
+                element: AccessibilityElementName::identifier("element-1"),
+                expected: true,
+            },
+        ),
+        background_attendance(),
+        0,
+    )
+    .with_synthetic(SyntheticAction::type_text(text))
+}
+
+#[test]
+fn a_stopped_gate_commits_no_intent_and_reaches_no_platform_post() {
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver = RecordingDriver {
+        cancellation_posts: Some(posts.clone()),
+        ..RecordingDriver::default()
+    };
+    let shared = Arc::new(Mutex::new(audit()));
+    let gate = Arc::new(TestGate {
+        posts: posts.clone(),
+        after: 0,
+    });
+    let mut token = cerebellum_computer::audit::AuditToken::new(shared.clone(), gate);
+    let request = typing_request("abcde");
+    cerebellum_computer::dispatch::reserve_actuation_ahead(&mut token, audit_identity(), &request)
+        .unwrap();
+    let mut dispatcher = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    );
+    let refusal = dispatcher
+        .dispatch(&mut token, audit_identity(), request)
+        .unwrap_err();
+    assert_eq!(refusal, DispatchError::DispatchStopped);
+    assert_eq!(
+        dispatcher.driver().per_pid_calls,
+        0,
+        "no platform call after stop"
+    );
+    assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let audit = shared.lock().unwrap();
+    assert_eq!(
+        audit.journal().next_sequence(),
+        2,
+        "the reservation made ahead was the dispatch's own, not a second entry"
+    );
+    assert_eq!(
+        audit.read_obligation_audit(1).unwrap().lifecycle,
+        LifecycleState::Rejected,
+        "the entry reserved ahead is closed as an action that never ran"
+    );
+    assert_eq!(audit.journal().unfinalized_dispatch_count(), 0);
+}
+
+#[test]
+fn a_stop_between_posts_lets_no_later_post_run() {
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver = RecordingDriver {
+        cancellation_posts: Some(posts.clone()),
+        ..RecordingDriver::default()
+    };
+    let shared = Arc::new(Mutex::new(audit()));
+    let gate = Arc::new(TestGate {
+        posts: posts.clone(),
+        after: 1,
+    });
+    let mut token = cerebellum_computer::audit::AuditToken::new(shared.clone(), gate);
+    let refusal = Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    )
+    .dispatch(&mut token, audit_identity(), typing_request("abcde"))
+    .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            DispatchError::Cancelled {
+                posts_returned: 1,
+                ..
+            }
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        posts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the post in flight at the stop returned; no ordinary post followed it"
+    );
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .journal()
+            .unfinalized_dispatch_count(),
+        0
+    );
+}
+
+#[test]
+fn the_token_holds_the_audit_lock_only_for_journal_steps() {
+    let shared = Arc::new(Mutex::new(audit()));
+    let probe = shared.clone();
+    let lock_free_during_post = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct LockProbe {
+        inner: RecordingDriver,
+        audit: Arc<
+            Mutex<ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJournalStorage>>,
+        >,
+        seen_free: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl PlatformDriver for LockProbe {
+        fn capability_declarations(
+            &self,
+            context: &CapabilityAdvertisementContext,
+        ) -> Vec<CapabilityDeclaration> {
+            self.inner.capability_declarations(context)
+        }
+        fn read_accessibility_tree(
+            &mut self,
+            request: AccessibilityTreeRequest,
+        ) -> Result<AccessibilityTreeResult, DriverError> {
+            self.inner.read_accessibility_tree(request)
+        }
+        fn resolve_element(
+            &mut self,
+            request: ElementResolutionRequest,
+        ) -> Result<ElementResolutionResult, DriverError> {
+            self.inner.resolve_element(request)
+        }
+        fn dispatch_semantic(
+            &mut self,
+            request: SemanticDispatchRequest,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            self.inner.dispatch_semantic(request)
+        }
+        fn dispatch_per_pid(
+            &mut self,
+            request: SyntheticDispatchRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            // Another application's journaling must be able to proceed while
+            // this post is in flight.
+            self.seen_free.store(
+                self.audit.try_lock().is_ok(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.inner.dispatch_per_pid(request, cancelled)
+        }
+        fn dispatch_global(
+            &mut self,
+            request: GlobalDispatchRequest,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<cerebellum_computer::platform::DispatchResult, DriverError> {
+            self.inner.dispatch_global(request, cancelled)
+        }
+        fn query_focus(
+            &mut self,
+            request: FocusQueryRequest,
+        ) -> Result<FocusQueryResult, DriverError> {
+            self.inner.query_focus(request)
+        }
+        fn fronting_snapshot(
+            &mut self,
+            target: &ProcessGrant,
+        ) -> Result<FrontingSnapshot, DriverError> {
+            self.inner.fronting_snapshot(target)
+        }
+        fn input_observer_liveness(&self) -> InputObserverLiveness {
+            self.inner.input_observer_liveness()
+        }
+        fn observe_input(
+            &mut self,
+            request: InputObservationRequest,
+        ) -> Result<InputObservationResult, DriverError> {
+            self.inner.observe_input(request)
+        }
+        fn observe_effect(
+            &mut self,
+            request: EffectObservationRequest,
+        ) -> Result<EffectObservationResult, DriverError> {
+            self.inner.observe_effect(request)
+        }
+        fn verify_attendance(
+            &mut self,
+            request: AttendancePreconditionRequest,
+        ) -> Result<AttendancePreconditionResult, DriverError> {
+            self.inner.verify_attendance(request)
+        }
+    }
+    let driver = LockProbe {
+        inner: RecordingDriver {
+            cancellation_posts: None,
+            ..RecordingDriver::default()
+        },
+        audit: probe,
+        seen_free: lock_free_during_post.clone(),
+    };
+    let mut token = cerebellum_computer::audit::AuditToken::new(
+        shared.clone(),
+        Arc::new(cerebellum_computer::dispatch::OpenGate),
+    );
+    Dispatcher::new(
+        driver,
+        &cerebellum_computer::platform::process_event::never_cancelled,
+    )
+    .dispatch(&mut token, audit_identity(), typing_request("ab"))
+    .expect("the open gate admits the post");
+    assert!(
+        lock_free_during_post.load(std::sync::atomic::Ordering::SeqCst),
+        "the audit lock was held across the platform post"
+    );
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .journal()
+            .unfinalized_dispatch_count(),
+        0
+    );
+}

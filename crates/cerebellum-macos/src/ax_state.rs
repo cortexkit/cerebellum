@@ -300,7 +300,12 @@ impl Reader {
         };
         // SAFETY: the element is retained; the timeout applies to messages
         // this process sends about it and changes nothing in the target.
-        unsafe { AXUIElementSetMessagingTimeout(element.as_ptr(), seconds) };
+        unsafe {
+            AXUIElementSetMessagingTimeout(
+                element.as_ptr(),
+                crate::ax_budget::messaging_timeout_seconds(seconds),
+            )
+        };
         let mut values: CfTypeRef = std::ptr::null();
         // SAFETY: element and the attribute-name array are retained for the
         // call, and `values` is writable storage for one returned reference.
@@ -524,10 +529,17 @@ pub fn read_app_state_with_menus(
     let application = unsafe { owned(AXUIElementCreateApplication(pid)) }
         .map(AxRetainedElement)
         .ok_or(AxAppStateError::Unreadable { ax_error: 0 })?;
-    let deadline = Instant::now() + bounds.timeout;
+    // The whole read, not just each message, ends by the calling worker's
+    // remaining work budget.
+    let deadline = Instant::now() + crate::ax_budget::messaging_timeout(bounds.timeout);
     // SAFETY: as in `Reader::read`: the timeout applies to this element's
     // messages and changes nothing in the target.
-    unsafe { AXUIElementSetMessagingTimeout(application.as_ptr(), bounds.timeout.as_secs_f32()) };
+    unsafe {
+        AXUIElementSetMessagingTimeout(
+            application.as_ptr(),
+            crate::ax_budget::messaging_timeout(bounds.timeout).as_secs_f32(),
+        )
+    };
 
     let mut tops = match copy_attribute(&application, "AXChildren") {
         Ok(children) => elements_of(children),
