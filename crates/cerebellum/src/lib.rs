@@ -23,6 +23,7 @@ pub mod browser_standing_grants;
 pub mod browser_type;
 pub mod budgets;
 mod call_queue;
+mod call_record_supervisor;
 pub mod capability;
 pub mod cdp;
 pub mod classification;
@@ -71,6 +72,9 @@ use serde_json::Value;
 
 pub use cerebellum_computer as computer;
 
+use crate::call_record_supervisor::{
+    begin_call_record, call_record_unavailable, settle_call_record, CallRecordWorkers,
+};
 use crate::elicit::{Elicitor, SharedElicitor};
 use crate::management::ManagementPlane;
 use cerebellum_core::identity::RouteSurface;
@@ -2578,6 +2582,9 @@ pub struct Planes {
     /// One record per call that arrived with a `call_key`, so a resend is
     /// answered from it instead of running again.
     pub calls: Arc<journal::call_records::CallRecords>,
+    /// Shared by keyed admissions and settlements on both tool planes. A timed
+    /// out blocking write keeps its permit until the write actually ends.
+    call_record_workers: Arc<CallRecordWorkers>,
     /// Session scopes whose routes closed and whose end is not yet settled,
     /// and this module's channel-0 questions to the daemon about them.
     pub scopes: Arc<scope_watch::ScopeRevocation>,
@@ -2962,6 +2969,7 @@ impl Planes {
             elicitor: Arc::new(Elicitor::new()),
             capture,
             calls,
+            call_record_workers: Arc::new(CallRecordWorkers::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         }
     }
@@ -3007,6 +3015,7 @@ impl Clone for Planes {
             elicitor: Arc::clone(&self.elicitor),
             capture: Arc::clone(&self.capture),
             calls: Arc::clone(&self.calls),
+            call_record_workers: Arc::clone(&self.call_record_workers),
             scopes: Arc::clone(&self.scopes),
         }
     }
@@ -3192,6 +3201,7 @@ async fn handle_frame(
                     &planes.health,
                     &planes.routes,
                     &planes.elicitor,
+                    Some(&planes.call_record_workers),
                 )
                 .await?;
             }
@@ -4897,6 +4907,7 @@ async fn handle_control_request(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
     elicitor: &elicit::Elicitor,
+    call_record_workers: Option<&CallRecordWorkers>,
 ) -> Result<(), ModuleError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
@@ -5011,7 +5022,11 @@ async fn handle_control_request(
             // Insulated health-v2 lane: the report is a mechanical mapper over
             // atomics stamped by the dispatch path. It never blocks on a lock
             // and never forms its own opinion (Health-Path-Rule-v2).
-            with_process_gauges(health_state.report())
+            let report = with_process_gauges(health_state.report());
+            match call_record_workers {
+                Some(workers) => workers.health_report(report),
+                None => report,
+            }
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -5219,9 +5234,8 @@ async fn handle_keyed_tool_request(
         .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
-    // The call's record is synced to disk before the call may proceed. The write and
-    // its fsync run on the blocking pool, not on this runtime thread, and the
-    // call waits for them.
+    // Only an admission completed within its budget can authorize execution.
+    // The worker keeps its permit through any late refusal write.
     let begun = {
         let calls = Arc::clone(&planes.calls);
         let conversation_key = facts.identity.conversation_key.clone();
@@ -5234,7 +5248,7 @@ async fn handle_keyed_tool_request(
         // Stored on a new record only; the record is still found by the
         // route's principal and the call key alone.
         let origin = origin.clone();
-        tokio::task::spawn_blocking(move || {
+        begin_call_record(planes, (ver, channel, epoch, corr), move || {
             calls.begin_attributed(
                 &principal,
                 &call_key,
@@ -5245,11 +5259,6 @@ async fn handle_keyed_tool_request(
             )
         })
         .await
-        .unwrap_or_else(|error| {
-            Begin::Unavailable(call_records::CallRecordError::WriteFailed(format!(
-                "the record task did not finish: {error}"
-            )))
-        })
     };
     // A previous call result must not bypass current route admission. Preserve
     // that historical record, but do not expose its reply through a flow route.
@@ -5307,27 +5316,18 @@ async fn handle_keyed_tool_request(
             .await;
         }
         Begin::Unavailable(error) => {
-            return send_route_error(
+            return send(
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "call_record_unavailable",
-                &format!(
-                    "this call carries a call_key, and no record of it can be kept ({error}), so \
-                     it was not run: a resend could not be told apart from a new call. Send it \
-                     without a call_key to run it unprotected"
-                ),
+                call_record_unavailable((ver, channel, epoch, corr), &error),
             )
             .await;
         }
     };
 
     // The call writes its frames into this channel rather than the route's, so
-    // its terminal reply can be recorded before it is forwarded: a resend that
-    // follows the reply must find it. Every other frame (a consent question,
-    // say) is forwarded untouched.
+    // its terminal reply can be recorded before it is forwarded when the write
+    // finishes within the settlement budget. Every other frame (a consent
+    // question, say) is forwarded untouched.
     let (proxy, mut outgoing) = mpsc::channel::<Frame>(16);
     let mut pending = PendingSettlement {
         ticket: Some(ticket),
@@ -5362,8 +5362,10 @@ async fn handle_keyed_tool_request(
     // The call may have acted, which is what the record now says.
     if let Some(ticket) = pending.ticket.take() {
         let calls = Arc::clone(&planes.calls);
-        let _ = tokio::task::spawn_blocking(move || calls.settle_unknown(ticket, wall_clock_ms()))
-            .await;
+        settle_call_record(planes, move || {
+            calls.settle_unknown(ticket, wall_clock_ms())
+        })
+        .await;
     }
     // A task the call started (a consent question still waiting for its answer)
     // can hold a clone of the channel past the call. Keep forwarding for it.
@@ -5389,6 +5391,10 @@ async fn handle_keyed_tool_request(
 struct CallObservation {
     /// Marked at a plane's dispatch commitment for this request.
     dispatch: cerebellum_core::dispatch_witness::DispatchWitness,
+    /// Records whether an external mutation began before the terminal reply was
+    /// chosen. Unlike `dispatch`, this covers the interval before the mutation's
+    /// audit commitment marks the request's witness.
+    gate_dispatched: Arc<std::sync::atomic::AtomicBool>,
     /// Set just before the request is handed to a plane every one of whose
     /// dispatches passes a commitment that marks `dispatch`.
     commit_point: Arc<std::sync::atomic::AtomicBool>,
@@ -5402,6 +5408,7 @@ impl CallObservation {
     fn new() -> Self {
         Self {
             dispatch: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
+            gate_dispatched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commit_point: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             origin: cerebellum_core::journal::CallOriginRecord::Absent,
             call_key: None,
@@ -5441,7 +5448,13 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
         FrameType::Response => {
             matches!(
                 body["outcome"].as_str(),
-                Some("invalid_request" | "resource_busy")
+                Some(
+                    "invalid_request"
+                        | "resource_busy"
+                        | "action_deadline_exceeded"
+                        | "target_busy"
+                        | "blocking_capacity_exhausted"
+                )
             ) || (body["outcome"] == "consent_unavailable"
                 && matches!(
                     body["detail"]["reason"].as_str(),
@@ -5456,6 +5469,7 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
                 "route_not_bound",
                 "capability_denied",
                 "computer_plane_unavailable",
+                "call_record_unavailable",
                 "request_not_interruptible",
                 cerebellum_core::principal::SESSION_CALLER_NOT_ADMITTED,
                 CapabilityWithheld::Unknown.reason_code(),
@@ -5468,8 +5482,8 @@ fn refused_before_dispatch(reply: &Frame) -> bool {
     }
 }
 
-/// Forward one frame of a keyed call, recording the call's reply first when
-/// this frame is that reply.
+/// Forward one frame of a keyed call. For its terminal reply, wait for the
+/// record only within the settlement budget; a late write keeps that reply.
 async fn forward_recording_reply(
     out: Frame,
     pending: &mut PendingSettlement,
@@ -5481,6 +5495,10 @@ async fn forward_recording_reply(
     if is_reply {
         if let Some(ticket) = pending.ticket.take() {
             let evidence = journal::call_records::DispatchEvidence {
+                gate_dispatched: pending
+                    .observation
+                    .gate_dispatched
+                    .load(std::sync::atomic::Ordering::SeqCst),
                 committed: pending.observation.dispatch.committed(),
                 commit_point: pending
                     .observation
@@ -5490,11 +5508,11 @@ async fn forward_recording_reply(
                     != pending.unattributed_at_start,
                 refused_before_dispatch: refused_before_dispatch(&out),
             };
-            // The call's record is written before its reply is forwarded, on
-            // the blocking pool.
+            // Freeze the evidence and reply before detaching the write, so late
+            // worker completion cannot replace the terminal settlement.
             let calls = Arc::clone(&planes.calls);
             let settlement = journal::call_records::Settlement::from_reply(&out, evidence);
-            let _ = tokio::task::spawn_blocking(move || {
+            settle_call_record(planes, move || {
                 calls.settle(ticket, settlement, wall_clock_ms())
             })
             .await;
@@ -7073,6 +7091,7 @@ pub async fn handle_control_request_for_test(
         health_state,
         &route_bindings,
         &elicit::Elicitor::new(),
+        None,
     )
     .await
 }
@@ -7089,6 +7108,7 @@ pub async fn handle_control_request_for_test_with_bindings(
         health_state,
         route_bindings,
         &elicit::Elicitor::new(),
+        None,
     )
     .await
 }
@@ -8843,6 +8863,7 @@ mod tests {
             elicitor: Arc::clone(&elicitor),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            call_record_workers: Arc::new(CallRecordWorkers::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -8900,6 +8921,7 @@ mod tests {
             elicitor: Arc::clone(&elicitor),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            call_record_workers: Arc::new(CallRecordWorkers::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         let keep_going = handle_frame(answer, &writer_tx, &planes)
@@ -9875,6 +9897,7 @@ mod tests {
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            call_record_workers: Arc::new(CallRecordWorkers::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(
@@ -9946,6 +9969,7 @@ mod tests {
             elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
+            call_record_workers: Arc::new(CallRecordWorkers::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
         planes.routes.insert(

@@ -466,6 +466,10 @@ pub struct Settlement {
 /// `refused` is a double execution. Everything ambiguous settles as unknown.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DispatchEvidence {
+    /// The terminal arbiter observed the dispatch gate's sticky dispatch bit.
+    /// It can be set before the witness is committed, so either bit rules out
+    /// proof that the call never dispatched.
+    pub gate_dispatched: bool,
     /// The request's witness was marked at a plane's dispatch commitment.
     pub committed: bool,
     /// The call reached a plane every one of whose dispatches passes a
@@ -503,7 +507,8 @@ impl Settlement {
         let indeterminate = is_error
             || outcome.as_deref() == Some("dispatch_outcome_unknown")
             || effect_status.as_deref() == Some("effect_indeterminate");
-        let never_dispatched = !evidence.committed
+        let never_dispatched = !evidence.gate_dispatched
+            && !evidence.committed
             && !evidence.unattributed_commit
             && (evidence.refused_before_dispatch || evidence.commit_point);
         let state = if evidence.committed {
@@ -549,6 +554,21 @@ impl Settlement {
             ask_id,
             reply,
         }
+    }
+
+    /// An admission that finished after its caller stopped waiting must never
+    /// authorize execution. Keep the unavailable frame for replay, with the
+    /// durable reason distinguishing this refusal from a store write failure.
+    pub fn admission_timeout(frame: &Frame) -> Self {
+        let mut settlement = Self::from_reply(
+            frame,
+            DispatchEvidence {
+                refused_before_dispatch: true,
+                ..DispatchEvidence::default()
+            },
+        );
+        settlement.refusal_reason = Some("call_record_admission_timeout".to_string());
+        settlement
     }
 }
 
@@ -1096,8 +1116,9 @@ impl CallRecords {
         Begin::Execute(CallTicket { key })
     }
 
-    /// Record the call's reply. Call before the reply is sent, so a resend
-    /// that follows the reply always finds it.
+    /// Record the call's reply. The handler waits for this write before sending
+    /// the frame only within its settlement budget; a late write preserves the
+    /// same terminal reply while a retry may still find the call in flight.
     ///
     /// A failed write leaves `started` on disk, which a later start reads as
     /// `unknown`: never re-run, only less informative.
@@ -1669,5 +1690,54 @@ mod tests {
         let asked = Settlement::from_reply(&pending, reached_plane);
         assert_eq!(asked.state, CallState::Asked);
         assert_eq!(asked.ask_id.as_deref(), Some("ask-1"));
+    }
+
+    #[test]
+    fn terminal_gate_and_witness_settlement_truth_table() {
+        let unknown = reply(json!({
+            "outcome": "dispatch_outcome_unknown",
+            "effect_status": "effect_indeterminate",
+            "detail": {"dispatched": true, "reason": "action_deadline_exceeded"}
+        }));
+        let refusal = reply(json!({"outcome": "action_deadline_exceeded"}));
+        for gate_dispatched in [false, true] {
+            for committed in [false, true] {
+                for refused_before_dispatch in [false, true] {
+                    let evidence = DispatchEvidence {
+                        gate_dispatched,
+                        committed,
+                        commit_point: true,
+                        refused_before_dispatch,
+                        ..DispatchEvidence::default()
+                    };
+                    assert_eq!(
+                        Settlement::from_reply(&unknown, evidence).state,
+                        if gate_dispatched || committed { CallState::Unknown } else { CallState::Refused },
+                        "gate={gate_dispatched}, witness={committed}, refusal={refused_before_dispatch}"
+                    );
+                    if !committed {
+                        assert_eq!(
+                            Settlement::from_reply(&refusal, evidence).state,
+                            if gate_dispatched {
+                                CallState::Unknown
+                            } else {
+                                CallState::Refused
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            Settlement::from_reply(
+                &reply(json!({"outcome": "ok"})),
+                DispatchEvidence {
+                    gate_dispatched: true,
+                    ..ran()
+                }
+            )
+            .state,
+            CallState::Replied
+        );
     }
 }
