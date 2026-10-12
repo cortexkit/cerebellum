@@ -29,6 +29,26 @@ const HOST: &str = "com.cortexkit.cerebellum";
 const CHROME_MANIFEST_DIR: &str = "Library/Application Support/Google/Chrome/NativeMessagingHosts";
 const BUDGET_SECS: u64 = 180;
 
+// Chrome for Testing runs with a scratch HOME, so without a mock keychain
+// macOS finds no login keychain there and shows "Keychain Not Found", whose
+// "Reset To Defaults" button would reset the person's real keychain. The probe
+// must never touch the keychain: --use-mock-keychain and a basic password
+// store keep Chrome away from it entirely.
+const CHROME_PROBE_ARGS: [&str; 12] = [
+    "--use-mock-keychain",
+    "--password-store=basic",
+    "--no-startup-window",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--noerrdialogs",
+    "--remote-debugging-port=0",
+    "--remote-debugging-address=127.0.0.1",
+];
+
 #[derive(Debug)]
 struct Options {
     chrome: PathBuf,
@@ -151,14 +171,17 @@ fn write_manifest_at(directory: &Path, host: &Path) -> Result<PathBuf, String> {
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Result<Self, String> {
-        let mut bytes = [0u8; 16];
+        // Eight random bytes and a short prefix keep the scratch cerebellum's
+        // socket path (scratch/data/cortexkit/run/cerebellum/user-browser.sock)
+        // under macOS's 104-byte sun_path limit.
+        let mut bytes = [0u8; 8];
         getrandom::getrandom(&mut bytes).map_err(|e| e.to_string())?;
         let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         // Canonicalize /tmp on macOS (where it is /private/tmp), not a caller's
         // TMPDIR. No live profile, journal or runtime-directory fallback exists.
         let path = std::fs::canonicalize("/tmp")
             .map_err(|e| e.to_string())?
-            .join(format!("ck-user-browser-{nonce}"));
+            .join(format!("ckub-{nonce}"));
         private_fs::create_dir(&path).map_err(|e| e.to_string())?;
         Ok(Self(path))
     }
@@ -375,8 +398,10 @@ mod live {
     use tokio::sync::mpsc;
 
     fn verify(path: &Path, requirement: &str) -> Result<(), String> {
+        // codesign reads -R as a requirement FILE unless the text starts with
+        // "=", so an inline requirement must carry that prefix.
         let status = Command::new("/usr/bin/codesign")
-            .args(["--verify", "--strict", "-R", requirement])
+            .args(["--verify", "--strict", "-R", &format!("={requirement}")])
             .arg(path)
             .status()
             .map_err(|e| e.to_string())?;
@@ -976,7 +1001,7 @@ mod live {
         if canonical.parent() != Some(tmp.as_path())
             || !canonical
                 .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("ck-user-browser-"))
+                .is_some_and(|n| n.to_string_lossy().starts_with("ckub-"))
         {
             return Err(
                 "scratch child must be under /tmp, with the supervisor's private directory".into(),
@@ -1019,18 +1044,7 @@ mod live {
         let focus = Focus::start()?;
         let page = Page::start()?;
         let mut chrome = Command::new(&options.chrome)
-            .args([
-                "--no-startup-window",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-networking",
-                "--disable-component-update",
-                "--disable-sync",
-                "--metrics-recording-only",
-                "--noerrdialogs",
-                "--remote-debugging-port=0",
-                "--remote-debugging-address=127.0.0.1",
-            ])
+            .args(CHROME_PROBE_ARGS)
             .arg(format!(
                 "--user-data-dir={}",
                 root.join("profile").display()
@@ -1495,6 +1509,16 @@ async fn self_test() -> Result<(), String> {
         Err("probe did not enforce explicit approval and absolute inputs".into())
     };
     tests.push(("operator_approval_is_required", cli));
+    tests.push((
+        "chrome_never_touches_the_keychain",
+        if CHROME_PROBE_ARGS.contains(&"--use-mock-keychain")
+            && CHROME_PROBE_ARGS.contains(&"--password-store=basic")
+        {
+            Ok(())
+        } else {
+            Err("Chrome must launch with a mock keychain and basic password store".into())
+        },
+    ));
     tests.push((
         "extension_key_and_id_are_pinned",
         extension_is_pinned(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extension"))

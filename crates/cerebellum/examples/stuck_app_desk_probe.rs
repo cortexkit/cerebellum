@@ -177,7 +177,14 @@ mod desk {
             return 2;
         }
         install_interrupt_handler();
-        let child = match Command::new(TEXTEDIT).spawn() {
+        // A second TextEdit instance runs under the person's HOME, so without
+        // this it would reopen the person's documents from saved window state,
+        // and stopping and killing it could disturb them. Ignoring persistent
+        // state keeps the scratch instance to an empty window or open panel.
+        let child = match Command::new(TEXTEDIT)
+            .args(["-ApplePersistenceIgnoreState", "YES"])
+            .spawn()
+        {
             Ok(child) => child,
             Err(error) => {
                 eprintln!("UNMEASURABLE: cannot launch scratch TextEdit: {error}");
