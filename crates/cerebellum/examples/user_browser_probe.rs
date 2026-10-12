@@ -366,6 +366,8 @@ async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> 
         outside["outcome"] == "refused" && outside.get("state_text").is_none(),
     )?;
     let severity = json!({"tier":1,"credential":false,"financial":false});
+    // Input actions need at least tier 2; tier 1 covers reads and navigation.
+    let input_severity = json!({"tier":2,"credential":false,"financial":false});
     let (navigated, asks) = driver.call(json!({"action":"navigate","tab":tab,"url":format!("{origin}/"),"wait":"settle","intent":"load loopback probe","severity":severity})).await?;
     check(
         "navigation asks per site through scratch relay",
@@ -387,7 +389,7 @@ async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> 
     )?;
     detached_and_unfocused(driver)?;
     let button = reference(&snapshot, "Probe button")?;
-    let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":severity})).await?;
+    let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":input_severity})).await?;
     check(
         "click delivered to local fixture",
         ok(&clicked) && driver.observe()?["clicks"] == 1,
