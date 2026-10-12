@@ -7709,6 +7709,281 @@ mod tests {
             "a cookie value escaped into a driver command"
         );
     }
+    use crate::browser_session::{DriveScope, DriverWatch};
+    use std::sync::Arc;
+
+    fn call_terminal() -> Arc<crate::TerminalArbiter> {
+        let request = subc_protocol::Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::FrameType::Request,
+            crate::wire::control_flags(),
+            9,
+            3,
+            1,
+            serde_json::to_vec(&json!({"name": crate::browser::TYPE})).unwrap(),
+        )
+        .unwrap();
+        Arc::new(crate::TerminalArbiter::new(request))
+    }
+
+    /// Every `functionDeclaration` the typing path sends, read from its source
+    /// so the classification below cannot drift from what is actually sent.
+    fn typing_function_declarations() -> Vec<&'static str> {
+        include_str!("typing.rs")
+            .split("\"functionDeclaration\":\"")
+            .skip(1)
+            .map(|rest| rest.split("\",\"").next().unwrap())
+            .collect()
+    }
+
+    fn function_call(function: &str) -> Value {
+        json!({"objectId": "object-1", "functionDeclaration": function, "returnByValue": true})
+    }
+
+    fn possibly_dispatched(terminal: &crate::TerminalArbiter) -> bool {
+        terminal.stop(crate::TerminalCause::Deadline);
+        terminal.state.lock().unwrap().possibly_dispatched
+    }
+
+    #[test]
+    fn typing_selection_calls_are_gated_mutations_and_its_checks_are_reads() {
+        let declarations = typing_function_declarations();
+        assert_eq!(declarations.len(), 4, "{declarations:?}");
+        for function in declarations {
+            // The focus check and the empty check only read the page.
+            let read = function.contains("hasFocus") || function.contains("length === 0");
+            let params = function_call(function);
+            let effect = command_effect(
+                "Runtime.callFunctionOn",
+                params.as_object(),
+                Some("session-own"),
+            );
+            assert_eq!(effect == CommandEffect::Read, read, "{function}");
+        }
+        for method in ["DOM.focus", "Page.navigate", "Input.insertText"] {
+            assert_eq!(
+                command_effect(method, None, None),
+                CommandEffect::Mutation,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            command_effect("DOM.resolveNode", None, None),
+            CommandEffect::Read
+        );
+    }
+
+    #[test]
+    fn after_the_terminal_no_typing_or_navigation_command_reaches_the_pipe() {
+        let terminal = call_terminal();
+        let watch = Arc::new(DriverWatch::default());
+        let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
+        let mut driver = attached_driver([]);
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(10);
+        terminal.stop(crate::TerminalCause::Deadline);
+        let declarations = typing_function_declarations();
+        let mut commands = vec![
+            ("DOM.focus", json!({"backendNodeId": 7})),
+            (
+                "Input.dispatchKeyEvent",
+                json!({"type":"keyDown","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}),
+            ),
+            ("Input.insertText", json!({"text": "typed"})),
+            ("Page.navigate", json!({"url": "https://example.test/"})),
+            ("DOM.resolveNode", json!({"backendNodeId": 7})),
+        ];
+        for function in declarations {
+            commands.push(("Runtime.callFunctionOn", function_call(function)));
+        }
+        for (method, params) in commands {
+            let result = driver.command_response(
+                method,
+                params.as_object().cloned(),
+                Some("session-own".into()),
+                deadline,
+                None,
+                None,
+                &mut clock,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(NavigationDriveError::CommandDeadline {
+                        command_sent: false,
+                        ..
+                    })
+                ),
+                "{method}: {result:?}"
+            );
+        }
+        assert!(
+            driver.pipe.writes.is_empty(),
+            "sent after the terminal: {:?}",
+            driver.pipe.writes
+        );
+        assert!(watch.held().is_empty());
+        assert!(
+            !terminal.state.lock().unwrap().possibly_dispatched,
+            "nothing was dispatched, so the call may be retried"
+        );
+    }
+
+    #[test]
+    fn a_mutation_marks_its_call_possibly_dispatched_and_a_read_does_not() {
+        for (method, params, dispatched) in [
+            ("DOM.resolveNode", json!({"backendNodeId": 7}), false),
+            ("DOM.focus", json!({"backendNodeId": 7}), true),
+        ] {
+            let terminal = call_terminal();
+            let watch = Arc::new(DriverWatch::default());
+            let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
+            let mut driver = attached_driver([json!({"id": 1, "sessionId": "session-own", "result": {}})]);
+            let mut clock = FakeClock::new();
+            let deadline = clock.now() + Duration::from_millis(10);
+            driver
+                .command_response(
+                    method,
+                    params.as_object().cloned(),
+                    Some("session-own".into()),
+                    deadline,
+                    None,
+                    None,
+                    &mut clock,
+                )
+                .unwrap();
+            assert_eq!(possibly_dispatched(&terminal), dispatched, "{method}");
+        }
+    }
+
+    #[test]
+    fn a_press_stays_held_until_chrome_acknowledges_its_release_which_passes_a_stopped_gate() {
+        let terminal = call_terminal();
+        let watch = Arc::new(DriverWatch::default());
+        let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
+        let mut driver = attached_driver([
+            json!({"id": 1, "sessionId": "session-own", "result": {}}),
+            json!({"id": 2, "sessionId": "session-own", "result": {}}),
+        ]);
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(10);
+        let mut send = |driver: &mut CdpNavigationDriver<FakePipe>, method: &str, params: Value| {
+            driver.command_response(
+                method,
+                params.as_object().cloned(),
+                Some("session-own".into()),
+                deadline,
+                None,
+                None,
+                &mut clock,
+            )
+        };
+        send(
+            &mut driver,
+            MOUSE_EVENT,
+            json!({"type":"mousePressed","x":1.0,"y":2.0,"button":"left","clickCount":1}),
+        )
+        .unwrap();
+        assert_eq!(watch.held().len(), 1);
+
+        terminal.stop(crate::TerminalCause::Deadline);
+        assert!(send(
+            &mut driver,
+            KEY_EVENT,
+            json!({"type":"keyDown","key":"Backspace","code":"Backspace"}),
+        )
+        .is_err());
+        assert_eq!(driver.pipe.writes.len(), 1, "a new press passed a stopped gate");
+
+        send(
+            &mut driver,
+            MOUSE_EVENT,
+            json!({"type":"mouseReleased","x":1.0,"y":2.0,"button":"left","clickCount":1}),
+        )
+        .unwrap();
+        assert_eq!(driver.pipe.writes.len(), 2);
+        assert!(watch.held().is_empty(), "{:?}", watch.held());
+    }
+
+    #[test]
+    fn release_held_input_sends_only_the_recorded_releases() {
+        for acknowledged in [true, false] {
+            let terminal = call_terminal();
+            terminal.stop(crate::TerminalCause::Deadline);
+            let watch = Arc::new(DriverWatch::default());
+            let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
+            let press = json!({"type":"mousePressed","x":1.0,"y":2.0,"button":"left","clickCount":1});
+            let CommandEffect::Press(held) =
+                command_effect(MOUSE_EVENT, press.as_object(), Some("session-own"))
+            else {
+                panic!("a mouse press is a press");
+            };
+            watch.hold(held);
+            let reply = if acknowledged {
+                json!({"id": 1, "sessionId": "session-own", "result": {}})
+            } else {
+                json!({"id": 1, "sessionId": "session-own", "error": {"code": -32000, "message": "no target"}})
+            };
+            let mut driver = attached_driver([reply]);
+            let mut clock = FakeClock::new();
+            let released = driver.release_held_input_with_clock(10, &mut clock);
+            assert_eq!(released.is_ok(), acknowledged, "{released:?}");
+            assert_eq!(driver.pipe.writes.len(), 1);
+            let sent = &driver.pipe.writes[0];
+            assert_eq!(sent["method"], MOUSE_EVENT);
+            assert_eq!(sent["sessionId"], "session-own");
+            assert_eq!(
+                sent["params"],
+                json!({"type":"mouseReleased","x":1.0,"y":2.0,"button":"left","clickCount":1})
+            );
+            assert_eq!(watch.held().is_empty(), acknowledged);
+        }
+    }
+
+    /// A pipe that notes, at each write, which command the session's watch
+    /// shows in flight.
+    struct WatchedPipe {
+        inner: FakePipe,
+        watch: Arc<DriverWatch>,
+        in_flight_at_write: Vec<Option<String>>,
+    }
+
+    impl CdpPipeIo for WatchedPipe {
+        fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.in_flight_at_write.push(self.watch.oldest_method());
+            self.inner.write_frame(bytes)
+        }
+
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+            self.inner.read(destination)
+        }
+    }
+
+    #[test]
+    fn a_command_is_in_flight_from_before_its_write_until_it_returns() {
+        let watch = Arc::new(DriverWatch::default());
+        let _context = DriveScope::enter(None, &watch);
+        let mut driver = CdpNavigationDriver::new(
+            WatchedPipe {
+                inner: FakePipe::with_frames([json!({"id": 1, "result": {}})]),
+                watch: Arc::clone(&watch),
+                in_flight_at_write: Vec::new(),
+            },
+            CdpTransport::new(),
+            CdpFrameDecoder::default(),
+        );
+        let mut clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(10);
+        driver
+            .command_response("Page.getFrameTree", None, None, deadline, None, None, &mut clock)
+            .unwrap();
+        assert_eq!(
+            driver.pipe.in_flight_at_write,
+            [Some("Page.getFrameTree".to_string())]
+        );
+        assert_eq!(watch.oldest_method(), None);
+    }
+
 }
 
 /// The session-verification tab, driven against a pipe that answers each
@@ -8213,4 +8488,5 @@ mod signed_in_page_read_tests {
             "the read must reach the point where Chrome sends DOM events"
         );
     }
+
 }

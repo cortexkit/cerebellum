@@ -421,4 +421,95 @@ mod tests {
         assert!(queue.is_empty());
         drop(drain_tx);
     }
+
+    #[test]
+    fn quarantine_refusals_are_results_of_the_refused_capability() {
+        for capability in [
+            crate::browser::NAVIGATE,
+            crate::browser::SNAPSHOT,
+            crate::browser::CLICK,
+            crate::browser::TYPE,
+            crate::browser::SCREENSHOT,
+            crate::browser::CLICK_POINT,
+            crate::browser_session::BROWSER_CLOSE,
+        ] {
+            assert_eq!(session_capability(capability), Some(capability));
+            for reason in [None, Some(crate::browser_session::HELD_INPUT_UNCONFIRMED)] {
+                let refusal = QueueRefusal::TargetBusy {
+                    capability,
+                    step: "queue",
+                    reason,
+                    call: "Input.dispatchMouseEvent".into(),
+                };
+                assert_eq!(refusal.code(), "target_busy");
+                let (named, body) = refusal.response_body().unwrap();
+                assert_eq!(named, capability);
+                crate::browser::validate_browser_result(capability, &body)
+                    .unwrap_or_else(|error| panic!("{capability}: {error} in {body}"));
+                assert_eq!(body["outcome"], "target_busy");
+                assert_eq!(body["detail"]["dispatched"], false);
+                assert_eq!(body["detail"]["call"], "Input.dispatchMouseEvent");
+                match reason {
+                    Some(reason) => {
+                        assert_eq!(body["detail"]["reason"], reason);
+                        assert_eq!(body["detail"]["held_state"], "unknown");
+                        assert_eq!(body["remedy"], crate::browser_session::HELD_INPUT_REMEDY);
+                    }
+                    None => assert!(body["detail"].get("reason").is_none(), "{body}"),
+                }
+            }
+        }
+        assert!(QueueRefusal::WaitExpired.response_body().is_none());
+        assert_eq!(session_capability(crate::browser_session::BROWSER_LAUNCH), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_call_is_refused_or_bypasses_once_its_session_is_quarantined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        for bypass in [false, true] {
+            let queue = ConversationQueue::default();
+            let (holder, _) = queue.arrive("conversation".into(), None).acquire().await;
+            let ticket = queue.arrive("conversation".into(), None);
+            let quarantined = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&quarantined);
+            let check: QuarantineCheck = Box::new(move || {
+                seen.load(Ordering::SeqCst).then(|| {
+                    if bypass {
+                        Quarantined::Bypass
+                    } else {
+                        Quarantined::Refuse(QueueRefusal::TargetBusy {
+                            capability: crate::browser::NAVIGATE,
+                            step: "queue",
+                            reason: None,
+                            call: "Page.navigate".into(),
+                        })
+                    }
+                })
+            });
+            let (drain_tx, drain) = tokio::sync::watch::channel(false);
+            let queued = tokio::spawn(acquire(
+                ticket,
+                crate::CancelHandle::pending(),
+                drain,
+                Some(check),
+            ));
+            tokio::time::sleep(QUARANTINE_POLL * 3).await;
+            assert!(!queued.is_finished(), "a call behind ordinary work waits");
+            quarantined.store(true, Ordering::SeqCst);
+            tokio::time::sleep(QUARANTINE_POLL * 2).await;
+            assert!(queued.is_finished(), "the quarantine was not noticed");
+            match queued.await.unwrap() {
+                Ok(None) => assert!(bypass),
+                Err(refusal) => {
+                    assert!(!bypass);
+                    assert_eq!(refusal.code(), "target_busy");
+                }
+                Ok(Some(_)) => panic!("the lane held by the stuck worker was acquired"),
+            }
+            drop(holder);
+            assert!(queue.is_empty(), "the refused call kept its position");
+            drop(drain_tx);
+        }
+    }
 }

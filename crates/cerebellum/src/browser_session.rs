@@ -887,7 +887,7 @@ impl DriverWatch {
             .map(|command| command.method.clone())
     }
 
-    fn oldest_method(&self) -> Option<String> {
+    pub(crate) fn oldest_method(&self) -> Option<String> {
         recover_poisoned(self.in_flight.lock())
             .first()
             .map(|command| command.method.clone())
@@ -942,10 +942,13 @@ pub(crate) fn drive_context() -> Option<DriveContext> {
 
 /// Installs a drive context for one driver call and restores the previous
 /// one when dropped.
-struct DriveScope(Option<DriveContext>);
+pub(crate) struct DriveScope(Option<DriveContext>);
 
 impl DriveScope {
-    fn enter(terminal: Option<Arc<crate::TerminalArbiter>>, watch: &Arc<DriverWatch>) -> Self {
+    pub(crate) fn enter(
+        terminal: Option<Arc<crate::TerminalArbiter>>,
+        watch: &Arc<DriverWatch>,
+    ) -> Self {
         let context = DriveContext {
             terminal,
             watch: Arc::clone(watch),
@@ -2547,13 +2550,11 @@ impl BrowserSessions {
 
     /// Whether the route's session is in execution quarantine. Takes only the
     /// brief registry and meta locks, never the driver lock a stuck operation
-    /// holds.
+    /// holds. A session left with custody held stays quarantined while its
+    /// stuck holder lives, so calls are refused instead of queued behind it.
     pub fn execution_quarantine(&self, route_key: &str) -> Option<ExecutionQuarantine> {
         let cell = self.active_cell_recovering(route_key)?;
         let meta = recovered(cell.meta());
-        if meta.lifecycle.is_settled() {
-            return None;
-        }
         self.stuck_operation(&cell, &meta)
             .map(|call| ExecutionQuarantine {
                 browser_session_id: cell.browser_session_id.clone(),
@@ -5368,6 +5369,18 @@ mod tests {
         /// When set, the graceful wait ends as soon as this switch is killed.
         exit_on_kill: Option<Arc<KillSwitch>>,
         panic_on_screenshot: bool,
+        /// When set, the screenshot stands for a CDP command whose write
+        /// blocks: it records one command in flight, capped at its deadline,
+        /// and returns only once this switch is killed.
+        wedged_write: Option<Arc<KillSwitch>>,
+        /// When set, the screenshot runs this many commands one after
+        /// another, each in flight for `.2` under a cap of `.1`.
+        in_bound_commands: Option<(usize, Duration, Duration)>,
+        /// When set, the exit probe reports the browser gone once it is true.
+        exited: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// What a held-input release does: `Some(true)` acknowledges every
+        /// recorded press, `Some(false)` fails, `None` keeps the default.
+        release_ok: Option<bool>,
     }
 
     impl TestBrowser {
@@ -5380,6 +5393,10 @@ mod tests {
                 killer: None,
                 exit_on_kill: None,
                 panic_on_screenshot: false,
+                wedged_write: None,
+                in_bound_commands: None,
+                exited: None,
+                release_ok: None,
             }
         }
 
@@ -5419,7 +5436,7 @@ mod tests {
             &mut self,
             _: &str,
             _: u64,
-            _: u64,
+            deadline_ms: u64,
             _: bool,
         ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
             if self.panic_on_screenshot {
@@ -5427,7 +5444,48 @@ mod tests {
             }
             self.call_gate.pass();
             self.push("screenshot");
+            let context = drive_context();
+            if let (Some(switch), Some(context)) = (&self.wedged_write, &context) {
+                let _in_flight = context
+                    .watch
+                    .begin_command("Input.dispatchMouseEvent", Duration::from_millis(deadline_ms));
+                let mut killed = switch.killed.lock().unwrap();
+                while !*killed {
+                    killed = switch.wake.wait(killed).unwrap();
+                }
+                return Err(NavigationDriveError::ConnectorFailure);
+            }
+            if let (Some((count, cap, each)), Some(context)) = (self.in_bound_commands, &context) {
+                for _ in 0..count {
+                    let _in_flight = context.watch.begin_command("Network.getCookies", cap);
+                    std::thread::sleep(each);
+                }
+                return Err(NavigationDriveError::CdpFailure);
+            }
             Err(NavigationDriveError::CdpFailure)
+        }
+
+        fn release_held_input(&mut self, _: u64) -> Result<(), NavigationDriveError> {
+            self.push("release");
+            match (self.release_ok, drive_context()) {
+                (Some(true), Some(context)) => {
+                    for press in context.watch.held() {
+                        context.watch.released(
+                            press.session_id.as_deref(),
+                            press.method,
+                            &press.control,
+                        );
+                    }
+                    Ok(())
+                }
+                _ => Err(NavigationDriveError::CdpFailure),
+            }
+        }
+
+        fn exit_probe(&self) -> Option<Arc<dyn BrowserExitProbe>> {
+            self.exited
+                .clone()
+                .map(|exited| Arc::new(FlagProbe(exited)) as Arc<dyn BrowserExitProbe>)
         }
 
         fn generation_matches(&self) -> bool {
@@ -6229,5 +6287,451 @@ mod tests {
             stopped_waiting.is_ok(),
             "the inactivity waiter was not woken"
         );
+    }
+
+    /// Exit probe double: the browser is gone once the flag is set.
+    struct FlagProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl BrowserExitProbe for FlagProbe {
+        fn generation_matches(&self) -> bool {
+            !self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A call's terminal decision, as the route installs it around a call.
+    fn call_terminal() -> Arc<crate::TerminalArbiter> {
+        let request = subc_protocol::Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::FrameType::Request,
+            crate::wire::control_flags(),
+            9,
+            3,
+            1,
+            serde_json::to_vec(&json!({"name": crate::browser::SCREENSHOT})).unwrap(),
+        )
+        .unwrap();
+        Arc::new(crate::TerminalArbiter::new(request))
+    }
+
+    /// Admit an operation inside `terminal`'s call, as a browser handler does.
+    fn admit_in_call(
+        sessions: &BrowserSessions,
+        route: &str,
+        clock: &FakeClock,
+        terminal: &Arc<crate::TerminalArbiter>,
+    ) -> OperationGuard {
+        match crate::CALL_TERMINAL.sync_scope(Arc::clone(terminal), || {
+            sessions.accept_dispatch(route, clock)
+        }) {
+            DispatchAdmission::Accepted(operation) => operation,
+            _ => panic!("a ready session refused dispatch"),
+        }
+    }
+
+    /// Run a screenshot on its own thread, as a blocking worker does.
+    fn screenshot_in_thread(
+        mut operation: OperationGuard,
+        deadline_ms: u64,
+    ) -> std::sync::mpsc::Receiver<bool> {
+        in_thread(move || {
+            let failed = operation
+                .screenshot("context", 0, deadline_ms, false)
+                .is_err();
+            operation.finish();
+            failed
+        })
+    }
+
+    /// Run the idle enforcer's exit sweep until `done` holds or two seconds
+    /// pass, as the module's sweep task does every few milliseconds.
+    fn sweep_until(sessions: &BrowserSessions, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + PROMPTLY;
+        while !done() {
+            assert!(Instant::now() < deadline, "the sweep never got there");
+            sessions.observe_exits_all(&config());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn kill(switch: &KillSwitch) {
+        *switch.killed.lock().unwrap() = true;
+        switch.wake.notify_all();
+    }
+
+    #[test]
+    fn write_backstop_ends_a_wedged_write_as_connector_failure_once_the_browser_is_dead() {
+        let sessions =
+            BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+            browser.wedged_write = Some(Arc::clone(&switch));
+        });
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 5);
+
+        let terminal = json!({
+            "outcome": "terminal",
+            "browser_session_id": session.id,
+            "terminal_outcome": "connector_failure",
+        });
+        // The terminal reads as soon as the backstop records it; the session
+        // is torn down by a later sweep, once the killed write has failed.
+        sweep_until(&sessions, || session.released() == 1);
+        assert_eq!(sessions.status("route", &clock, UNIX_EPOCH), terminal);
+        assert!(
+            call.recv_timeout(PROMPTLY).unwrap(),
+            "the killed browser fails the wedged write"
+        );
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(session.released(), 1, "custody is released after the reap");
+        let events = session.events();
+        assert!(events.contains(&"reap"), "{events:?}");
+        assert!(
+            !events.contains(&"graceful"),
+            "a CDP close was sent over the wedged pipe: {events:?}"
+        );
+        assert!(sessions.execution_quarantine("route").is_none());
+        assert!(matches!(
+            sessions.accept_dispatch("route", &clock),
+            DispatchAdmission::NoSession
+        ));
+        crate::browser::validate_browser_result(BROWSER_STATUS, &terminal).unwrap();
+    }
+
+    #[test]
+    fn write_backstop_holds_custody_when_the_wedged_browser_is_not_confirmed_dead() {
+        for refusing in [true, false] {
+            let sessions =
+                BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+            let clock = FakeClock::new();
+            let wedge = Arc::new(KillSwitch::default());
+            let session =
+                establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                    browser.killer = refusing
+                        .then(|| Arc::new(RefusingKiller::default()) as Arc<dyn BrowserKiller>);
+                    browser.wedged_write = Some(Arc::clone(&wedge));
+                });
+            let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+            else {
+                panic!("a ready session refused dispatch");
+            };
+            let call = screenshot_in_thread(operation, 5);
+
+            sweep_until(&sessions, || {
+                sessions.status("route", &clock, UNIX_EPOCH)["stage"] == "custody_held"
+            });
+            let status = sessions.status("route", &clock, UNIX_EPOCH);
+            assert_eq!(status["outcome"], "cleanup_failure", "{status}");
+            let close = sessions.close("route", &session.id, &config());
+            assert_eq!(
+                close,
+                json!({
+                    "outcome": "cleanup_failure",
+                    "browser_session_id": session.id,
+                    "stage": "custody_held",
+                })
+            );
+            for (capability, reply) in [(BROWSER_STATUS, &status), (BROWSER_CLOSE, &close)] {
+                crate::browser::validate_browser_result(capability, reply)
+                    .unwrap_or_else(|error| panic!("{capability}: {error} in {reply}"));
+            }
+            // The holder still runs, so its session refuses calls at once
+            // rather than letting them queue behind it.
+            assert_eq!(
+                sessions
+                    .execution_quarantine("route")
+                    .map(|quarantine| quarantine.call),
+                Some("Input.dispatchMouseEvent".to_string())
+            );
+            assert!(matches!(
+                sessions.accept_dispatch("route", &clock),
+                DispatchAdmission::NoSession
+            ));
+            assert_eq!(session.released(), 0, "custody released under a live browser");
+            assert!(!session.events().contains(&"graceful"));
+
+            kill(&wedge);
+            assert!(call.recv_timeout(PROMPTLY).unwrap());
+            assert!(sessions.execution_quarantine("route").is_none());
+            assert_eq!(
+                sessions.status("route", &clock, UNIX_EPOCH)["stage"],
+                "custody_held"
+            );
+            assert_eq!(session.released(), 0);
+        }
+    }
+
+    #[test]
+    fn several_in_bound_commands_in_sequence_never_trip_the_write_backstop() {
+        let sessions =
+            BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+            // Three commands of 30 ms each under a 40 ms cap: each is in
+            // bound, while their 90 ms total exceeds cap plus slack.
+            browser.in_bound_commands = Some((
+                3,
+                Duration::from_millis(40),
+                Duration::from_millis(30),
+            ));
+        });
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 40);
+        loop {
+            sessions.observe_exits_all(&config());
+            match call.recv_timeout(Duration::from_millis(2)) {
+                Ok(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        sessions.observe_exits_all(&config());
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+            "ready"
+        );
+        assert_eq!(session.released(), 0);
+    }
+
+    #[test]
+    fn exit_sweep_skips_a_session_whose_operation_is_stuck_and_tears_it_down_after() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let stuck_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call_gate = Arc::new(Gate::default());
+        let stuck = establish_test_browser(&sessions, "stuck", &clock, Gate::opened(), |browser| {
+            browser.call_gate = Arc::clone(&call_gate);
+            browser.exited = Some(Arc::clone(&stuck_exited));
+        });
+        let other_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crashed = establish_test_browser(&sessions, "crashed", &clock, Gate::opened(), |browser| {
+            browser.exited = Some(Arc::clone(&other_exited));
+        });
+        let idle = establish_test_browser(&sessions, "idle", &clock, Gate::opened(), |_| {});
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("stuck", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 3_600_000);
+        call_gate.wait_entered(1);
+
+        // The stuck session's browser exits under its operation; another
+        // browser crashes, and a third session's lease runs out.
+        stuck_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        other_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms + 1));
+        let sweeping = sessions.clone();
+        let sweep_clock = clock.clone();
+        let sweep = in_thread(move || {
+            sweeping.observe_exits_all(&config());
+            sweeping.expire_all(&sweep_clock, &config());
+        });
+        sweep
+            .recv_timeout(PROMPTLY)
+            .expect("one stuck session stalled the sweep for the others");
+        assert_eq!(
+            sessions.status("crashed", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": crashed.id, "terminal_outcome": "browser_crashed"})
+        );
+        assert_eq!(
+            sessions.status("idle", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": idle.id, "terminal_outcome": "idle_expired"})
+        );
+        assert_eq!(
+            sessions.status("stuck", &clock, UNIX_EPOCH)["outcome"],
+            "ready",
+            "the stuck session's terminal was recorded under its operation"
+        );
+        assert_eq!(stuck.released(), 0);
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        sessions.observe_exits_all(&config());
+        assert_eq!(
+            sessions.status("stuck", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": stuck.id, "terminal_outcome": "browser_crashed"})
+        );
+        assert_eq!(stuck.released(), 1);
+    }
+
+    #[test]
+    fn an_operation_that_outlives_its_call_quarantines_its_session_until_it_ends() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let call_gate = Arc::new(Gate::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.call_gate = Arc::clone(&call_gate);
+        });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        assert_eq!(
+            sessions.execution_quarantine("route"),
+            None,
+            "a call still running is ordinary work, not quarantine"
+        );
+
+        terminal.stop(crate::TerminalCause::Deadline);
+        assert_eq!(
+            sessions.execution_quarantine("route"),
+            Some(ExecutionQuarantine {
+                browser_session_id: session.id.clone(),
+                call: "browser session operation".into(),
+            })
+        );
+        // Status takes no driver lock: it answers and reports the quarantine.
+        let status = sessions.status("route", &clock, UNIX_EPOCH);
+        assert_eq!(status["outcome"], "ready", "{status}");
+        assert!(
+            status["remedy"].as_str().unwrap().contains("target_busy"),
+            "{status}"
+        );
+        crate::browser::validate_browser_result(BROWSER_STATUS, &status).unwrap();
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(sessions.execution_quarantine("route"), None);
+        assert!(sessions.status("route", &clock, UNIX_EPOCH).get("remedy").is_none());
+    }
+
+    #[test]
+    fn a_close_of_a_quarantined_session_kills_it_on_the_control_permit() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+            browser.wedged_write = Some(Arc::clone(&switch));
+        });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(
+            admit_in_call(&sessions, "route", &clock, &terminal),
+            3_600_000,
+        );
+        let deadline = Instant::now() + PROMPTLY;
+        while !session.events().contains(&"screenshot") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal.stop(crate::TerminalCause::Deadline);
+        assert!(sessions.execution_quarantine("route").is_some());
+
+        // Every control permit is held: the close is refused before it acts.
+        let held = sessions.control_permit.try_take().unwrap();
+        let refused = sessions.close("route", &session.id, &config());
+        assert_eq!(refused["outcome"], "blocking_capacity_exhausted", "{refused}");
+        assert_eq!(refused["detail"]["dispatched"], false, "{refused}");
+        crate::browser::validate_browser_result(BROWSER_CLOSE, &refused).unwrap();
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+
+        let closed = sessions.close("route", &session.id, &config());
+        assert_eq!(
+            closed,
+            json!({"outcome": "closed", "browser_session_id": session.id})
+        );
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(session.released(), 1);
+        let events = session.events();
+        assert!(events.contains(&"reap"), "{events:?}");
+        assert!(!events.contains(&"graceful"), "{events:?}");
+    }
+
+    #[test]
+    fn a_close_of_a_session_not_in_quarantine_waits_and_closes_gracefully() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let call_gate = Arc::new(Gate::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+            browser.call_gate = Arc::clone(&call_gate);
+        });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        let closing = sessions.clone();
+        let id = session.id.clone();
+        let close = in_thread(move || closing.close("route", &id, &config()));
+        assert_still_running(&close, "a close behind a running call");
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(session.events().contains(&"graceful"));
+    }
+
+    fn held_click(session_id: &str) -> HeldPress {
+        let mut release = serde_json::Map::new();
+        release.insert("type".into(), json!("mouseReleased"));
+        release.insert("button".into(), json!("left"));
+        HeldPress {
+            session_id: Some(session_id.to_string()),
+            method: "Input.dispatchMouseEvent",
+            control: "left".into(),
+            release,
+        }
+    }
+
+    #[test]
+    fn a_later_input_call_releases_held_input_first_and_a_failed_release_keeps_quarantine() {
+        for release_ok in [false, true] {
+            let sessions = BrowserSessions::default();
+            let clock = FakeClock::new();
+            let session =
+                establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                    browser.release_ok = Some(release_ok);
+                });
+            let cell = sessions.active_cell_recovering("route").unwrap();
+            cell.watch.hold(held_click("cdp-session"));
+            assert!(sessions.held_input_unconfirmed("route"));
+            let status = sessions.status("route", &clock, UNIX_EPOCH);
+            assert_eq!(status["remedy"], HELD_INPUT_REMEDY, "{status}");
+
+            assert_eq!(sessions.retry_held_release("route", 10), release_ok);
+            assert_eq!(sessions.held_input_unconfirmed("route"), !release_ok);
+            assert_eq!(session.events(), ["release"]);
+        }
+    }
+
+    #[test]
+    fn held_input_is_not_released_while_a_worker_that_may_press_still_runs() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let call_gate = Arc::new(Gate::default());
+        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+            browser.call_gate = Arc::clone(&call_gate);
+            browser.release_ok = Some(true);
+        });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        terminal.stop(crate::TerminalCause::Deadline);
+        sessions
+            .active_cell_recovering("route")
+            .unwrap()
+            .watch
+            .hold(held_click("cdp-session"));
+
+        assert!(!sessions.retry_held_release("route", 10));
+        assert!(sessions.held_input_unconfirmed("route"));
+        assert!(!session.events().contains(&"release"));
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(sessions.retry_held_release("route", 10));
+        assert!(!sessions.held_input_unconfirmed("route"));
     }
 }
