@@ -2024,3 +2024,53 @@ pub fn v23_from_v22(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Bounded calls distinguish a safe pre-dispatch deadline from an unknown
+/// dispatch outcome. Every row carries the evidence needed before a retry,
+/// while legacy refusal reasons and existing effect statuses remain valid.
+pub fn v24_from_v23(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        properties["outcome"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!("action_deadline_exceeded"),
+                json!("dispatch_outcome_unknown"),
+                json!("target_busy"),
+                json!("blocking_capacity_exhausted"),
+            ]);
+        properties.entry("effect_status").or_insert_with(|| {
+            json!({
+                "type":"string",
+                "enum":["effect_observed", "no_effect_observed", "effect_indeterminate"],
+            })
+        });
+        // Terminals do not carry consent-only fields such as grant_label.
+        // The result dialect cannot condition required detail fields on outcome.
+        properties["detail"]["required"] = json!([]);
+        let detail = properties["detail"]["properties"].as_object_mut().unwrap();
+        detail.insert("dispatched".into(), json!({"type":"boolean"}));
+        detail.insert(
+            "step".into(),
+            json!({
+                "type":"string",
+                "enum":["admission", "queue", "consent", "preflight", "dispatch", "release"],
+            }),
+        );
+        detail.insert("call".into(), json!({"type":"string"}));
+        detail.insert(
+            "held_state".into(),
+            json!({
+                "type":"string", "enum":["none_held", "released", "unknown"],
+            }),
+        );
+        let reason = detail
+            .entry("reason")
+            .or_insert_with(|| json!({"type":"string"}));
+        reason["description"] = json!("Bounded-call causes include action_deadline_exceeded, cancelled, route_closed, module_draining and held_input_unconfirmed. Other refusal reasons remain free-form.");
+    }
+    next
+}

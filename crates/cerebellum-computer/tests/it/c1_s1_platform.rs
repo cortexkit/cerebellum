@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v23.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v24.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -765,7 +765,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v21_from_v20(&generated, historical_revision(21).as_str().unwrap());
     let generated =
         vocabulary_mint::v22_from_v21(&generated, historical_revision(22).as_str().unwrap());
-    let generated = vocabulary_mint::v23_from_v22(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v23_from_v22(&generated, historical_revision(23).as_str().unwrap());
+    let generated = vocabulary_mint::v24_from_v23(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1434,7 +1436,7 @@ fn v22_only_makes_the_changes_recreated_v21_undoes() {
 }
 
 fn recreated_v22() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v23();
     vocabulary["revision"] = historical_revision(22);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         row["result_schema"]["properties"]["outcome"]["enum"]
@@ -1450,5 +1452,60 @@ fn v23_only_adds_queue_expiry_to_the_recreated_v22_results() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v22()).unwrap()),
         "ba69cb7021353639ab6723578d2945dab5d7ceda0bb2756ec86e351a8bf7c6ae"
+    );
+}
+
+fn recreated_v23() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(23);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let had_consent_detail_requirements = matches!(
+            row["capability_id"].as_str().unwrap(),
+            "computer.wait" | "computer.list_apps"
+        );
+        let had_effect_status = matches!(
+            row["capability_id"].as_str().unwrap(),
+            "computer.write_text" | "computer.type" | "computer.keys"
+        );
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        for expected in [
+            "blocking_capacity_exhausted",
+            "target_busy",
+            "dispatch_outcome_unknown",
+            "action_deadline_exceeded",
+        ] {
+            assert_eq!(
+                properties["outcome"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+                expected
+            );
+        }
+        if !had_effect_status {
+            properties.remove("effect_status").unwrap();
+        }
+        if had_consent_detail_requirements {
+            properties["detail"]["required"] = json!(["reason", "grant", "grant_label"]);
+        }
+        let detail = properties["detail"]["properties"].as_object_mut().unwrap();
+        for name in ["dispatched", "step", "call", "held_state"] {
+            detail.remove(name).unwrap();
+        }
+        detail["reason"]
+            .as_object_mut()
+            .unwrap()
+            .remove("description")
+            .unwrap();
+    }
+    vocabulary
+}
+
+#[test]
+fn v24_only_adds_bounded_call_evidence_to_the_recreated_v23_results() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v23()).unwrap()),
+        "68fde428a263087692960d589de54117da77be4940fd5879085814f4620f53f7"
     );
 }
