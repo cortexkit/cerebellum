@@ -22,7 +22,7 @@ const MAX_APPS: usize = 200;
 const MAX_LAUNCHES: usize = 20;
 // Two minutes accommodates cold starts without letting stale or censored
 // timings hold an interactive request indefinitely. This is a TOTAL budget.
-const CEILING_MS: u64 = 120_000;
+pub(crate) const CEILING_MS: u64 = 120_000;
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

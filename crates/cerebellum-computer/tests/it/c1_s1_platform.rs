@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v22.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v23.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -763,7 +763,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v20_from_v19(&generated, historical_revision(20).as_str().unwrap());
     let generated =
         vocabulary_mint::v21_from_v20(&generated, historical_revision(21).as_str().unwrap());
-    let generated = vocabulary_mint::v22_from_v21(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v22_from_v21(&generated, historical_revision(22).as_str().unwrap());
+    let generated = vocabulary_mint::v23_from_v22(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1414,7 +1416,7 @@ fn v19_only_makes_the_changes_recreated_v18_undoes() {
 }
 
 fn recreated_v21() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v22();
     vocabulary["revision"] = historical_revision(21);
     let open = row_mut(&mut vocabulary, "computer.open_app");
     open["effect_observation"]["deadline_ms"] = json!(40000);
@@ -1428,5 +1430,25 @@ fn v22_only_makes_the_changes_recreated_v21_undoes() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v21()).unwrap()),
         "cfe82e8302f59219cdb715aa6ff8743f4daf29e7918b7923e703342c7efc24a5"
+    );
+}
+
+fn recreated_v22() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(22);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        row["result_schema"]["properties"]["outcome"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|word| word != "queue_wait_expired");
+    }
+    vocabulary
+}
+
+#[test]
+fn v23_only_adds_queue_expiry_to_the_recreated_v22_results() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v22()).unwrap()),
+        "ba69cb7021353639ab6723578d2945dab5d7ceda0bb2756ec86e351a8bf7c6ae"
     );
 }

@@ -122,6 +122,7 @@ pub(crate) struct ConversationPosition {
     conversation: String,
     message: Option<Arc<Message>>,
     index: Option<u32>,
+    arrived_at: Instant,
     deadline: Instant,
 }
 
@@ -139,6 +140,7 @@ impl ConversationQueue {
             conversation: conversation.clone(),
             message: None,
             index,
+            arrived_at: now,
             deadline: now + GAP_LIMIT,
         };
         if let Some(position) = position {
@@ -229,6 +231,10 @@ impl ConversationQueue {
 }
 
 impl ConversationPosition {
+    pub(crate) fn wait_deadline(&self, limit: Duration) -> Instant {
+        self.arrived_at + limit
+    }
+
     pub(crate) async fn acquire(mut self) -> (LaneGuard, ComputerOrderRecord) {
         let mut ordering = ComputerOrdering::Arrival;
         if let Some(message) = &self.message {
@@ -330,12 +336,13 @@ impl Registry {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl Registry {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.lock().unwrap().is_empty()
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn has_users(&self, count: usize) -> bool {
         self.0
             .lock()
@@ -345,12 +352,13 @@ impl Registry {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl ConversationQueue {
     pub(crate) fn is_empty(&self) -> bool {
         self.conversations.is_empty()
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn has_users(&self, count: usize) -> bool {
         self.conversations.has_users(count)
     }

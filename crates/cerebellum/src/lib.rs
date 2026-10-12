@@ -3355,8 +3355,8 @@ async fn handle_management_request(
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                outcome,
-                "the queued browser call ended before authorization or execution",
+                outcome.code(),
+                outcome.remedy(),
             )
             .await;
         }
@@ -5737,8 +5737,8 @@ async fn handle_tool_request(
                 frame.header.channel,
                 frame.header.epoch,
                 frame.header.corr,
-                outcome,
-                "the queued browser call ended before authorization or execution",
+                outcome.code(),
+                outcome.remedy(),
             )
             .await;
         }

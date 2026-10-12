@@ -59,6 +59,7 @@ const COMMON_OUTCOMES: &[&str] = &[
     "consent_granted_not_executed",
     "consent_unavailable",
     "module_draining",
+    "queue_wait_expired",
     "route_closed",
     "not_running",
     "ambiguous",
@@ -184,6 +185,7 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         ConsentRefusal::Draining,
         ConsentRefusal::RouteClosed,
         ConsentRefusal::Cancelled,
+        ConsentRefusal::QueueWaitExpired,
     ] {
         replies.push(AppRefusal::Consent(refusal).reply("com.example.Editor"));
     }
