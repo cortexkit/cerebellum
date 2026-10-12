@@ -260,6 +260,85 @@ fn reference(snapshot: &Value, name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("snapshot lacks {name}"))
 }
 
+// The supervisor reports cleanup on its own line. The probe's verdict is the
+// checks above it; folding it into this line made a successful cleanup after
+// a failed check read as a failed cleanup.
+fn cleanup_line(cleaned: &Result<(), String>) -> String {
+    match cleaned {
+        Ok(()) => "PASS process-group and scratch cleanup completed".into(),
+        Err(e) => format!("FAIL process-group and scratch cleanup: {e}"),
+    }
+}
+
+// File the probe build of the native host appends its exit reasons to, in the
+// `cerebellum` run directory beside the bridge socket. It must match
+// PROBE_EXIT_LOG in crates/cerebellum-native-host/src/macos.rs.
+const HOST_EXIT_LOG: &str = "native-host-exit.log";
+
+// Lines describing why each native host process ended. The host is silent by
+// design, so after a failed check this record is the only evidence of whether
+// Chrome, the socket, framing or a write closed the native port.
+fn host_exit_report(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => text
+            .lines()
+            .map(|line| format!("native host exit: {line}"))
+            .collect(),
+        Ok(_) => vec!["native host exit: record is empty".into()],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            vec!["native host exit: no record (no probe-build host has exited)".into()]
+        }
+        Err(e) => vec![format!("native host exit: record unreadable: {e}")],
+    }
+}
+
+// One readable line for a console, exception or log event that CDP reported
+// from the extension worker, or None for any other event. Only the extension's
+// own worker is observed, so no page content is printed.
+fn worker_event_line(event: &Value) -> Option<String> {
+    let params = &event["params"];
+    let line = match event["method"].as_str()? {
+        "Runtime.consoleAPICalled" => {
+            let args: Vec<String> = params["args"]
+                .as_array()
+                .map(|args| {
+                    args.iter()
+                        .map(|arg| match (&arg["value"], arg["description"].as_str()) {
+                            (Value::String(text), _) => text.clone(),
+                            (Value::Null, Some(description)) => description.to_owned(),
+                            (value, _) => value.to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                "console.{}: {}",
+                params["type"].as_str().unwrap_or("log"),
+                args.join(" ")
+            )
+        }
+        "Runtime.exceptionThrown" => {
+            let details = &params["exceptionDetails"];
+            format!(
+                "exception: {} {}",
+                details["text"].as_str().unwrap_or(""),
+                details["exception"]["description"].as_str().unwrap_or("")
+            )
+        }
+        "Log.entryAdded" => {
+            let entry = &params["entry"];
+            format!(
+                "log.{} ({}): {}",
+                entry["level"].as_str().unwrap_or("?"),
+                entry["source"].as_str().unwrap_or("?"),
+                entry["text"].as_str().unwrap_or("")
+            )
+        }
+        _ => return None,
+    };
+    Some(line.chars().take(1000).collect())
+}
+
 async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
     let (opened, _) = driver.call(json!({"action":"open_tab"})).await?;
     check(
@@ -522,13 +601,9 @@ mod live {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
             }
         };
-        group.cleanup()?;
-        scratch.cleanup()?;
-        println!(
-            "{} process-group and scratch cleanup completed",
-            if outcome.is_ok() { "PASS" } else { "FAIL" }
-        );
-        outcome
+        let cleaned = group.cleanup().and_then(|()| scratch.cleanup());
+        println!("{}", cleanup_line(&cleaned));
+        outcome.and(cleaned)
     }
     struct Group {
         child: Child,
@@ -983,6 +1058,13 @@ mod live {
         Ok(())
     }
     fn instrument(cdp: &mut Cdp, session: &str) -> Result<(), String> {
+        // Collect the worker's console and exception events so a failed check
+        // can show them. Enabling Runtime also replays console messages the
+        // worker logged before this point. Log carries Chrome's own messages,
+        // such as an unchecked native-port error; it is best effort because
+        // not every Chrome build offers it on worker targets.
+        cdp.call("Runtime.enable", json!({}), Some(session))?;
+        let _ = cdp.call("Log.enable", json!({}), Some(session));
         cdp.eval(
             session,
             r#"(() => {
@@ -995,6 +1077,43 @@ mod live {
         Ok(())
     }
 
+    // Print what the extension worker reported, after a failed check and
+    // before the bridge is shut down, so the output reflects the failure.
+    fn print_worker_events(cdp: &mut Cdp, session: &str) {
+        // Events that arrived after the last reply are still unread on the
+        // socket; a trivial call drains them into the event buffer.
+        let _ = cdp.call("Runtime.evaluate", json!({"expression":"0"}), Some(session));
+        let lines: Vec<String> = cdp.events.iter().filter_map(worker_event_line).collect();
+        if lines.is_empty() {
+            println!("worker: no console, exception or log events");
+        }
+        // Keep the tail: the events nearest the failure matter most.
+        for line in &lines[lines.len().saturating_sub(50)..] {
+            println!("worker {line}");
+        }
+    }
+
+    // Prints the native host's exit record once, either when asked after a
+    // failed check or when a startup step fails and returns early. Printing
+    // happens while the scratch tree still exists; the supervisor removes it.
+    struct HostExits {
+        path: PathBuf,
+        armed: bool,
+    }
+    impl HostExits {
+        fn print(&mut self) {
+            if std::mem::take(&mut self.armed) {
+                for line in host_exit_report(&self.path) {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    impl Drop for HostExits {
+        fn drop(&mut self) {
+            self.print();
+        }
+    }
     async fn child(options: &Options, root: &Path) -> Result<(), String> {
         let tmp = std::fs::canonicalize("/tmp").map_err(|e| e.to_string())?;
         let canonical = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
@@ -1058,6 +1177,15 @@ mod live {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
+        // Declared after the listener so it is dropped first (Rust drops
+        // locals in reverse order). On an early return the host's exit record
+        // is printed before the listener drops and tears down the bridge;
+        // that teardown would make the host exit too, for a reason unrelated
+        // to the failure.
+        let mut host_exits = HostExits {
+            path: run.join("cerebellum").join(HOST_EXIT_LOG),
+            armed: true,
+        };
         let deadline = Instant::now() + Duration::from_secs(25);
         let port_file = root.join("profile/DevToolsActivePort");
         let contents = loop {
@@ -1167,6 +1295,12 @@ mod live {
             corr: 10,
         };
         let result = exercise(&mut driver, &origin).await;
+        if result.is_err() {
+            let session = driver.worker_session.clone();
+            print_worker_events(&mut driver.cdp, &session);
+            host_exits.print();
+        }
+        host_exits.armed = false;
         let focus_ok = !driver.focus.changed.load(Ordering::SeqCst);
         driver.planes.user_browser.goodbye(Route {
             channel: CHANNEL,
@@ -1502,6 +1636,59 @@ fn relay_control() -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_line_control() -> Result<(), String> {
+    let passed = cleanup_line(&Ok(()));
+    let failed = cleanup_line(&Err("helper survived".into()));
+    if passed != "PASS process-group and scratch cleanup completed"
+        || !failed.starts_with("FAIL ")
+        || !failed.contains("helper survived")
+    {
+        return Err(format!("cleanup lines misreport: {passed:?} / {failed:?}"));
+    }
+    Ok(())
+}
+fn worker_event_control() -> Result<(), String> {
+    let events = [
+        json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","args":[
+            {"type":"string","value":"Unchecked runtime.lastError:"},
+            {"type":"object","description":"Error: Native host has exited."},
+            {"type":"number","value":3}]}}),
+        json!({"method":"Runtime.exceptionThrown","params":{"exceptionDetails":{"text":"Uncaught (in promise)",
+            "exception":{"description":"TypeError: tabGroups is undefined"}}}}),
+        json!({"method":"Log.entryAdded","params":{"entry":{"level":"error","source":"other","text":"port closed"}}}),
+        json!({"method":"Runtime.executionContextCreated","params":{}}),
+    ];
+    let lines: Vec<String> = events.iter().filter_map(worker_event_line).collect();
+    let expected = [
+        "console.error: Unchecked runtime.lastError: Error: Native host has exited. 3",
+        "exception: Uncaught (in promise) TypeError: tabGroups is undefined",
+        "log.error (other): port closed",
+    ];
+    if lines != expected {
+        return Err(format!("worker events rendered as {lines:?}"));
+    }
+    Ok(())
+}
+fn host_exit_control() -> Result<(), String> {
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join(HOST_EXIT_LOG);
+    let missing = host_exit_report(&path);
+    private_fs::create_new_file(&path).map_err(|e| e.to_string())?;
+    std::fs::write(
+        &path,
+        "native host pid 7: EOF from Chrome (native port closed)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let recorded = host_exit_report(&path);
+    if missing.len() != 1
+        || !missing[0].contains("no record")
+        || recorded != ["native host exit: native host pid 7: EOF from Chrome (native port closed)"]
+    {
+        return Err(format!("host exit report: {missing:?} / {recorded:?}"));
+    }
+    Ok(())
+}
+
 async fn self_test() -> Result<(), String> {
     let mut tests: Vec<(&str, Result<(), String>)> = Vec::new();
     let args = vec![
@@ -1556,6 +1743,15 @@ async fn self_test() -> Result<(), String> {
     tests.push((
         "relay_answers_only_fixture_site_and_user_target",
         relay_control(),
+    ));
+    tests.push(("cleanup_line_reports_cleanup_alone", cleanup_line_control()));
+    tests.push((
+        "worker_events_render_console_exceptions_and_logs",
+        worker_event_control(),
+    ));
+    tests.push((
+        "host_exit_record_is_printed_or_named_absent",
+        host_exit_control(),
     ));
     tests.push((
         "acceptance_routine_passes_with_independent_double",

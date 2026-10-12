@@ -1,0 +1,13 @@
+{
+  "description": "Native-messaging frames between the native host and the extension for a first open_tab. The host's Rust tests require it to send host_to_extension and forward extension_to_host unchanged; native.test.mjs requires the extension to answer host_to_extension with exactly extension_to_host.",
+  "epoch": 23,
+  "host_to_extension": [
+    { "type": "host_accepted", "protocol": 1, "epoch": 23 },
+    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "attach", "route": { "channel": 9, "epoch": 1 }, "command": { "version": 1, "action": "open_tab" } } } },
+    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "dispatch" } } }
+  ],
+  "extension_to_host": [
+    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "attached" } } },
+    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "dispatched", "input_dispatched": false } } }
+  ]
+}

@@ -19,7 +19,8 @@ The host forwards the shared socket frame objects unchanged through native
 messaging: `{type:"host_accepted", protocol:1, epoch:<positive safe integer>}`,
 `{type:"host_refused", reason:<string>}`, and `{type:"relay", message:<message>}`.
 The extension sends only `relay` frames. A fresh port needs `host_accepted` before
-any invocation. Server-assigned ids/epochs must be JavaScript-safe integers
+any invocation. `tests/native-host-wire.json` holds a first `open_tab` exchange in
+this exact shape; the extension's and the native host's tests both check it. Server-assigned ids/epochs must be JavaScript-safe integers
 (1 through 9007199254740991); unsupported larger values are not rounded.
 
 Messages are `{id, epoch, body}`. Invocation ids are positive; the bridge's route-wide

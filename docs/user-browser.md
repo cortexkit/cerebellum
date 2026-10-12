@@ -129,6 +129,12 @@ operator tabs are used. A scratch consent relay validates the production card's
 browser target, exact fixture origin, wording and `allow_once` choice before
 answering. No phone, live consent channel or standing permission is needed.
 It prints a **PASS/FAIL line per check** and exits nonzero on a failed check.
+After a failed check it also prints the extension worker's console, exception
+and log events (the observer enables CDP `Runtime` on the worker) and each
+probe-build native host's recorded exit reason, read from
+`native-host-exit.log` beside the scratch socket before anything is cleaned up.
+The last line reports process and scratch cleanup on its own, separate from the
+checks' verdict.
 
 Checks cover opening an Agent tab, per-site consent, allow-once expiration,
 snapshot, click and type with independent fixture beacons, an unrelated

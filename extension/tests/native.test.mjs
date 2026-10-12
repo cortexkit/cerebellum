@@ -3,6 +3,11 @@ import { test } from "node:test";
 import { NativeBridge, byteLength, chunks, CHUNK_BYTES, MAX_MESSAGE_BYTES } from "../native.mjs";
 import { setup, route, read, turn } from "./harness.mjs";
 import { deferred } from "./fake-chrome.mjs";
+import { readFileSync } from "node:fs";
+
+// Frames the native host's Rust tests also check, so both ends of the native
+// port are held to the same bytes rather than to their own idea of them.
+const hostWire = JSON.parse(readFileSync(new URL("./native-host-wire.json", import.meta.url), "utf8"));
 
 function waitBody(port, type, id) {
   const matches = frame => frame.message?.body.type === type && (id === undefined || frame.message.id === id);
@@ -229,4 +234,25 @@ test("native reply deadline cancels a stalled command and never sends the next i
   pause.resolve({});
   await turn();
   assert.equal(calls, 1);
+});
+
+test("native bridge answers the native host's own frames for a first open_tab without closing the port", async t => {
+  const f = await setup();
+  const bridge = new NativeBridge(f.chrome, f.agent);
+  bridge.connect();
+  const port = f.chrome.ports.at(-1);
+  t.after(async () => { bridge.drop(); await bridge.disconnecting; });
+  let disconnected = false;
+  port.onDisconnect.addListener(() => { disconnected = true; });
+  const [accepted, attach, dispatch] = hostWire.host_to_extension;
+  port.onMessage.emit(accepted);
+  port.onMessage.emit(attach);
+  await waitBody(port, "attached", 1);
+  port.onMessage.emit(dispatch);
+  const completed = await waitBody(port, "completed", 1);
+  assert.equal(disconnected, false);
+  assert.deepEqual(port.sent.slice(0, 2), hostWire.extension_to_host);
+  assert.equal(completed.detached, true);
+  assert.equal(typeof completed.result.tab, "string");
+  assert.equal(completed.result.connection_epoch, hostWire.epoch);
 });
