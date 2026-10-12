@@ -5526,7 +5526,8 @@ pub(crate) fn validate_user_browser_result(
                 "tabs":{"type":"array","items":closed_object(json!({"tab":string_schema(),"claim":enum_schema(&["claimed_by_this_route","unclaimed_handed"]),"interaction_epoch":integer_schema()}), &["tab","claim","interaction_epoch"])},
                 "snapshot_id":string_schema(), "state_text":string_schema(),
                 "omitted_frames":integer_schema(), "frame_note":string_schema(),
-                "image_png_b64":string_schema(), "image_width_px":integer_schema(), "image_height_px":integer_schema(),
+                "image":closed_object(json!({"mime":string_schema(),"data_b64":string_schema(),"width_px":integer_schema(),"height_px":integer_schema()}), &["mime","data_b64","width_px","height_px"]),
+                "image_width_px":integer_schema(), "image_height_px":integer_schema(),
                 "popup_activated_briefly":boolean_schema(),
                 "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"])]}
             }),

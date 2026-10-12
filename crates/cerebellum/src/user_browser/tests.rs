@@ -960,6 +960,30 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
 }
 
 #[tokio::test]
+async fn screenshot_returns_a_liftable_image_object_without_flat_base64() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (reply, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab}),
+            "allow_once",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["image"]["mime"], "image/png");
+    assert_eq!(reply["image"]["data_b64"], "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");
+    assert_eq!(reply["image"]["width_px"], reply["image_width_px"]);
+    assert_eq!(reply["image"]["height_px"], reply["image_height_px"]);
+    assert!(reply.get("image_png_b64").is_none());
+    assert!(crate::browser::validate_user_browser_result("screenshot", &reply).is_ok());
+    let mut flat = reply;
+    let image = flat.as_object_mut().unwrap().remove("image").unwrap();
+    flat["image_png_b64"] = image["data_b64"].clone();
+    assert!(crate::browser::validate_user_browser_result("screenshot", &flat).is_err());
+}
+
+#[tokio::test]
 async fn new_tab_actions_have_exactly_launch_admission_and_user_refusals_are_tagged() {
     let admitted = vec![crate::browser_session::BROWSER_STATUS.to_owned()];
     let tool = crate::flat_tools::browser_tool(&admitted).unwrap();

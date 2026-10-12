@@ -1466,7 +1466,7 @@ async fn screenshot(
     });
     context.target().retain(id.clone(), snapshot);
     Ok(
-        json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"image_png_b64":image,"image_width_px":width,"image_height_px":height,"input_dispatched":false}),
+        json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"image":{"mime":"image/png","data_b64":image,"width_px":width,"height_px":height},"image_width_px":width,"image_height_px":height,"input_dispatched":false}),
     )
 }
 
