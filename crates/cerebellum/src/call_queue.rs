@@ -342,7 +342,6 @@ impl Registry {
         self.0.lock().unwrap().is_empty()
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn has_users(&self, count: usize) -> bool {
         self.0
             .lock()
@@ -358,7 +357,6 @@ impl ConversationQueue {
         self.conversations.is_empty()
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn has_users(&self, count: usize) -> bool {
         self.conversations.has_users(count)
     }
