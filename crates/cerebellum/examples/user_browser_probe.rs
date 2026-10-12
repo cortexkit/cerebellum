@@ -224,6 +224,7 @@ fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
     fn observe(&mut self) -> Result<Value, String>;
+    async fn click_observation(&mut self) -> Result<Value, String>;
     async fn restart(&mut self) -> Result<(), String>;
     fn outside_tab(&self) -> String;
 }
@@ -258,6 +259,24 @@ fn reference(snapshot: &Value, name: &str) -> Result<String, String> {
         .and_then(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .ok_or_else(|| format!("snapshot lacks {name}"))
+}
+
+fn fixture_page_target(targets: &Value, origin: &str) -> Result<String, String> {
+    let rows = targets["targetInfos"]
+        .as_array()
+        .ok_or("observer target list missing")?;
+    let url = format!("{origin}/");
+    let mut pages = rows
+        .iter()
+        .filter(|target| target["type"] == "page" && target["url"] == url);
+    let target = pages.next().ok_or("fixture page target missing")?;
+    if pages.next().is_some() {
+        return Err("fixture page target is ambiguous".into());
+    }
+    target["targetId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or("fixture page target missing id".into())
 }
 
 // The supervisor reports cleanup on its own line. The probe's verdict is the
@@ -390,10 +409,17 @@ async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> 
     detached_and_unfocused(driver)?;
     let button = reference(&snapshot, "Probe button")?;
     let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":input_severity})).await?;
-    check(
-        "click delivered to local fixture",
-        ok(&clicked) && driver.observe()?["clicks"] == 1,
-    )?;
+    println!("click reply: {clicked}");
+    let observation = driver.click_observation().await.map_err(|error| {
+        println!("click diagnostics unavailable: {error}");
+        error
+    })?;
+    let delivered =
+        ok(&clicked) && observation["beacon_clicks"] == 1 && observation["page_clicks"] == 1;
+    if !delivered {
+        println!("click diagnostics: {observation}");
+    }
+    check("click delivered to local fixture", delivered)?;
     detached_and_unfocused(driver)?;
     let (fresh, _) = driver
         .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
@@ -806,7 +832,7 @@ mod live {
                     let body = if path == "/outside-secret" {
                         "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
                     } else if path == "/" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><button aria-label="Probe button" onclick="navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))">"#
+                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))">"#
                     } else {
                         "ok"
                     };
@@ -1382,6 +1408,42 @@ mod live {
             }
             Ok(observation)
         }
+        async fn click_observation(&mut self) -> Result<Value, String> {
+            // The page counter records handler execution independently of the
+            // beacon, which can arrive after the tool has acknowledged input.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.page.reports.lock().unwrap().0 == 0 && Instant::now() < deadline {
+                tokio::time::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+            let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
+            let target = fixture_page_target(&targets, &self.origin)?;
+            // Use the test browser's own page session, not extension evaluation
+            // or chrome.debugger. Detach even when evaluation fails so this
+            // observer cannot change the next action's attachment baseline.
+            let session = self.cdp.attach(&target)?;
+            let result = self.cdp.eval(
+                &session,
+                r#"(() => {
+                    const button = document.querySelector('[aria-label="Probe button"]');
+                    return {visibilityState: document.visibilityState,
+                        innerWidth, innerHeight, buttonRect: button?.getBoundingClientRect().toJSON(),
+                        page_clicks: window.__clicks, hasFocus: document.hasFocus()};
+                })()"#,
+            );
+            let detached = self.cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId":session}),
+                None,
+            );
+            let mut observation = result?;
+            detached?;
+            observation["beacon_clicks"] = json!(self.page.reports.lock().unwrap().0);
+            Ok(observation)
+        }
         async fn restart(&mut self) -> Result<(), String> {
             let before = self
                 .planes
@@ -1474,6 +1536,7 @@ struct Double {
     epoch: u64,
     clicked: usize,
     typed: String,
+    click_observations: usize,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -1482,6 +1545,7 @@ impl Double {
             epoch: 1,
             clicked: 0,
             typed: String::new(),
+            click_observations: 0,
         }
     }
 }
@@ -1516,7 +1580,9 @@ impl Driver for Double {
                 reply["outcome"] = json!("refused");
             }
             "click" => {
-                self.clicked += 1;
+                if self.fault != "missed_click" {
+                    self.clicked += 1;
+                }
             }
             "type" => {
                 self.typed = args["text"].as_str().unwrap().to_owned();
@@ -1533,6 +1599,15 @@ impl Driver for Double {
             json!({"agent_attached":self.fault == "detach", "focus_events":if self.fault == "focus" {1} else {0},
             "outside_group":if self.fault == "group" {1} else {-1}, "agent_tabs":1,
             "clicks":self.clicked,"typed":self.typed}),
+        )
+    }
+    async fn click_observation(&mut self) -> Result<Value, String> {
+        self.click_observations += 1;
+        Ok(
+            json!({"visibilityState":"hidden","innerWidth":800,"innerHeight":600,
+            "buttonRect":{"x":8,"y":8,"width":100,"height":20},"hasFocus":false,
+            "page_clicks":self.clicked,
+            "beacon_clicks":if self.fault == "missed_beacon" {0} else {self.clicked}}),
         )
     }
     async fn restart(&mut self) -> Result<(), String> {
@@ -1755,10 +1830,68 @@ async fn self_test() -> Result<(), String> {
         "host_exit_record_is_printed_or_named_absent",
         host_exit_control(),
     ));
+    let mut driver = Double::new("");
+    let result = exercise(&mut driver, "http://127.0.0.1:12345").await;
     tests.push((
         "acceptance_routine_passes_with_independent_double",
-        exercise(&mut Double::new(""), "http://127.0.0.1:12345").await,
+        result.and_then(|_| {
+            if driver.click_observations == 1 {
+                Ok(())
+            } else {
+                Err("click must have one independent page observation".into())
+            }
+        }),
     ));
+    let origin = "http://127.0.0.1:12345";
+    let targets = json!({"targetInfos":[
+        {"type":"service_worker","url":format!("{origin}/"),"targetId":"worker"},
+        {"type":"page","url":format!("{origin}/outside-secret"),"targetId":"outside"},
+        {"type":"page","url":format!("{origin}/"),"targetId":"fixture"}
+    ]});
+    let mut ambiguous = targets.clone();
+    ambiguous["targetInfos"]
+        .as_array_mut()
+        .unwrap()
+        .push(targets["targetInfos"][2].clone());
+    tests.push((
+        "page_diagnostics_select_only_the_unique_fixture_target",
+        if fixture_page_target(&targets, origin) == Ok("fixture".into())
+            && fixture_page_target(&targets, "http://127.0.0.1:54321").is_err()
+            && fixture_page_target(&ambiguous, origin).is_err()
+        {
+            Ok(())
+        } else {
+            Err("page diagnostics did not isolate the fixture target".into())
+        },
+    ));
+    for (fault, name) in [
+        (
+            "missed_click",
+            "acceptance_reads_page_counter_when_click_misses_button",
+        ),
+        (
+            "missed_beacon",
+            "acceptance_reads_page_counter_when_beacon_is_missing",
+        ),
+    ] {
+        let mut driver = Double::new(fault);
+        let result = exercise(&mut driver, origin).await;
+        tests.push((
+            name,
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error == "click delivered to local fixture")
+                && driver.click_observations == 1
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "fault {fault} lacks failed-click diagnostics: {result:?}"
+                ))
+            },
+        ));
+    }
     for (fault, name, expected) in [
         (
             "group",

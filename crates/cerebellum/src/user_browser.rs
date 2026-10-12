@@ -1837,13 +1837,13 @@ async fn input(
                 .await
                 .map_err(|reply| prior_input(reply, dispatched))?;
             }
-            let mut commands = Vec::new();
-            if action == "type" {
-                commands.push(command(
-                    "Emulation.setFocusEmulationEnabled",
-                    json!({"enabled":true}),
-                ));
-            }
+            // Background pages can acknowledge mouse input without delivering
+            // it. Emulate page focus without activating the person's tab or
+            // window, in the same debugger attachment as each input event.
+            let mut commands = vec![command(
+                "Emulation.setFocusEmulationEnabled",
+                json!({"enabled":true}),
+            )];
             commands.push(step);
             commands
         };

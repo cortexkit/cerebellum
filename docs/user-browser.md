@@ -140,8 +140,14 @@ Checks cover opening an Agent tab, per-site consent, allow-once expiration,
 snapshot, click and type with independent fixture beacons, an unrelated
 outside-group tab's invisibility/refused read/survival, no activation, and
 `chrome.debugger.getTargets()` showing no attached Agent page between actions.
-The independent observer attaches only to the extension worker and unrelated
-fixture; it does not drive Agent pages or stand in for `browser_use`.
+After a click, the probe waits up to two seconds for the beacon, then briefly
+attaches its own test-browser CDP session to the unique Agent fixture page to
+read the page-local click counter. On failure it prints that counter and the
+beacon count, `document.visibilityState`, `innerWidth`/`innerHeight`, the button's
+bounding rectangle and `document.hasFocus()`. This separates input missing the
+button from the handler running but its beacon not arriving. The observer
+detaches before the next action; it never dispatches Agent-page input or stands
+in for `browser_use`.
 
 For worker loss, the observer uses CDP `ServiceWorker.stopWorker`, verifies the
 old worker/connection disappeared, and explicitly wakes the registration with
@@ -170,7 +176,7 @@ bash -n scripts/install-native-host.sh
 bash scripts/rust-test-gate.sh
 ```
 
-The explicit self-test runs 11 portable checks (12 on macOS, including process-
+The explicit self-test runs 18 portable checks (19 on macOS, including process-
 group and directory cleanup) with driver doubles and scratch manifest
 fixtures, without Chrome, a socket, a durable journal or any live profile. Its
 negative controls deliberately fail named acceptance checks; the final named

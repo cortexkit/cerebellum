@@ -165,8 +165,10 @@ const APPEND_CARET = "function() { if (typeof this.setSelectionRange === 'functi
 const HAS_FOCUS = "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }";
 ```
 
-`Emulation.setFocusEmulationEnabled` and `DOM.focus` emulate document/element focus
-for typing, not tab/window activation; both are input-guarded. The stricter user-
+`Emulation.setFocusEmulationEnabled` emulates document focus for clicking and
+typing, not tab/window activation. Each mouse event's plan enables it because
+the debugger detaches between plans. `DOM.focus` focuses the typed element;
+both methods are input-guarded. The stricter user-
 frame filter, site/redirect authorization and risk classifier remain the adapter's
 responsibility, not raw-CDP permission conferred by a plan.
 

@@ -934,6 +934,49 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
 }
 
 #[tokio::test]
+async fn background_clicks_emulate_focus_in_each_mouse_event_attachment() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (image, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab}),
+            "allow_once",
+        )
+        .await;
+    let point = json!({"browser":"user","action":"click_point","tab":tab,"snapshot_id":image["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"intent":"click","severity":{"tier":2,"credential":false,"financial":false}});
+    for args in [click(&tab, &snapshot, &reference(&snapshot, "Go")), point] {
+        let before = fixture.state.lock().unwrap().commands.len();
+        let (clicked, _) = fixture.call(1, args, "allow_once").await;
+        assert_eq!(clicked["outcome"], "ok", "{clicked}");
+        let state = fixture.state.lock().unwrap();
+        let mut events = Vec::new();
+        for plan in &state.commands[before..] {
+            let commands = plan["commands"].as_array().unwrap();
+            if let Some(index) = commands
+                .iter()
+                .position(|command| command["method"] == "Input.dispatchMouseEvent")
+            {
+                // The extension detaches after every plan; focus emulation in
+                // an earlier attachment cannot prepare either mouse event.
+                assert!(index > 0, "mouse input lacks focus emulation: {plan}");
+                assert_eq!(
+                    commands[index - 1],
+                    command(
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({"enabled":true})
+                    ),
+                    "{plan}"
+                );
+                events.push(commands[index]["params"]["type"].as_str().unwrap());
+            }
+        }
+        assert_eq!(events, ["mousePressed", "mouseReleased"]);
+    }
+}
+
+#[tokio::test]
 async fn credential_payment_typing_refuses_and_normal_typing_uses_background_focus() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
