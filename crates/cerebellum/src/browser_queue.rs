@@ -255,7 +255,9 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
 /// removes a queued position without authorizing or running the browser action.
 /// Report interruption as a route error: browser actions have different frozen
 /// result vocabularies, and not all of them have a cancelled result outcome.
-/// A quarantine refusal is the exception: it is a result of the capability.
+/// A quarantine refusal is not reported as a route error: every browser
+/// capability's result vocabulary includes `target_busy`, so the caller gets
+/// it as that capability's result (see `QueueRefusal::response_body`).
 pub(crate) async fn enter(
     frame: &Frame,
     planes: &Planes,

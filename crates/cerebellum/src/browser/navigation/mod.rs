@@ -2691,8 +2691,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .json_bytes()
             .map_err(|_| NavigationDriveError::CdpFailure)?;
         bytes.push(0);
-        // Recorded before the write, which is the one step that can block
-        // past the deadline; the write backstop reads this record.
+        // Recorded before the write, the one step that can block past the
+        // deadline. The session's exit sweep reads the record, and kills the
+        // browser when the command outlives its cap plus a slack (the write
+        // backstop in browser_session).
         let _in_flight = context
             .as_ref()
             .map(|context| context.watch.begin_command(method, cap));
@@ -3771,8 +3773,9 @@ fn mouse_event_params(event_type: &str, position: BrowserClickPosition) -> Map<S
     params
 }
 
-/// How one CDP command bears on the page's input and on its call's dispatch
-/// gate.
+/// What one CDP command does to the page: read it, change it, press a key or
+/// button, or release one. Changes and presses must pass the call's dispatch
+/// gate; a release of a recorded press may pass a stopped gate.
 #[derive(Debug, PartialEq)]
 enum CommandEffect {
     /// Reads and setup that change nothing a person would see.

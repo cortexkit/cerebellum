@@ -6020,9 +6020,9 @@ async fn frame_for(rx: &mut mpsc::Receiver<Frame>, corr: u64) -> Frame {
     .unwrap_or_else(|_| panic!("no frame for request {corr}"))
 }
 
-/// Bind route 11/3 for the fixture's conversation, granted `browser.close`
-/// as well as status. Both routes share the conversation, so they share its
-/// execution lane.
+/// Bind route channel 11 (epoch 3) for the fixture's conversation, granted
+/// `browser.close` as well as status. It shares the conversation with the
+/// fixture's route on channel 9, so the two share its execution lane.
 async fn close_route(planes: &Planes) {
     bind_route(
         planes,
@@ -6157,8 +6157,9 @@ async fn a_close_of_a_quarantined_session_bypasses_the_lane_the_stuck_worker_hol
         .await
         .unwrap();
     // The worker is still parked in the browser, so this reply could not
-    // come through the conversation lane. This double has no killer, so the
-    // browser cannot be confirmed dead and custody stays held.
+    // come through the conversation lane. The test launcher's browser has no
+    // generation-checked killer, so it cannot be confirmed dead and custody
+    // stays held.
     let closed = body(&frame_for(&mut rx, 803).await);
     assert_eq!(
         closed,

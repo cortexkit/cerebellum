@@ -808,7 +808,9 @@ pub enum KillOutcome {
 }
 
 /// How far past its own cap one CDP command may stay in flight before the
-/// write backstop ends the browser. Reads poll a non-blocking pipe and stop at
+/// write backstop ends the browser. The write backstop is the exit sweep's
+/// check (`BrowserSessions::write_backstop`) that kills a ready session's
+/// browser whose CDP command has run that long, without the driver lock. Reads poll a non-blocking pipe and stop at
 /// their own deadline, so only a command write that blocks runs this far over.
 pub const WRITE_BACKSTOP_SLACK: Duration = Duration::from_millis(crate::budgets::BOUNDARY_SLACK_MS);
 
@@ -841,10 +843,13 @@ struct InFlightCommand {
     cap: Duration,
 }
 
-/// What a session shares with its CDP driver without the driver lock: the
-/// commands now in flight, which the write backstop and execution quarantine
-/// read, and the presses that may still be held, which held-input quarantine
-/// reads. Its locks are leaves: none is held across I/O or another lock.
+/// What a session shares with its CDP driver without the driver lock, so it
+/// can be read while a stuck command holds that lock: the commands now in
+/// flight, read by the write backstop and by execution quarantine (which
+/// refuses new calls on a session whose operation outlived its call), and the
+/// presses that may still be held, read by held-input quarantine (which
+/// refuses input calls until the release is confirmed). Its locks are
+/// leaves: none is held across I/O or another lock.
 #[derive(Default)]
 pub(crate) struct DriverWatch {
     in_flight: Mutex<Vec<InFlightCommand>>,
@@ -877,9 +882,10 @@ impl DriverWatch {
         InFlightRecord { watch: self, id }
     }
 
-    /// The method of a command older than its own cap plus `slack`, if any.
-    /// Each command is judged against its own cap, so a holder running several
-    /// in-bound commands one after another is never judged on their total.
+    /// The method of a command that has run longer than its own cap plus
+    /// `slack`, if any. Each command is judged against its own cap, so a
+    /// driver-lock holder that runs several commands back to back, each within
+    /// its cap, is never judged on their combined time.
     fn overdue(&self, slack: Duration) -> Option<String> {
         recover_poisoned(self.in_flight.lock())
             .iter()
@@ -921,8 +927,9 @@ impl DriverWatch {
     }
 }
 
-/// What a CDP driver call runs under: its call's terminal decision, whose
-/// dispatch gate every mutating command must pass, and its session's watch.
+/// The context of one CDP driver call. `terminal` is the terminal decision of
+/// the call it serves, if any; every mutating command must pass that
+/// decision's dispatch gate. `watch` is the session's `DriverWatch`.
 #[derive(Clone)]
 pub(crate) struct DriveContext {
     pub(crate) terminal: Option<Arc<crate::TerminalArbiter>>,
@@ -964,9 +971,9 @@ impl Drop for DriveScope {
     }
 }
 
-/// The one blocking-work permit each plane keeps outside its ordinary pool,
-/// so a close can still end a quarantined session when every ordinary permit
-/// is held by stuck work.
+/// The one blocking-work permit the browser plane (all browser sessions of
+/// this module) keeps outside its ordinary pool, so closing a session in
+/// execution quarantine still works when stuck work holds every other one.
 #[derive(Clone, Default)]
 struct ControlPermit(Arc<AtomicBool>);
 
@@ -987,7 +994,8 @@ impl Drop for ControlPermitHeld {
     }
 }
 
-/// The write backstop's slack, a field so that tests can shorten it.
+/// The time a CDP command may run past its own cap before the write backstop
+/// acts. A field, defaulting to `WRITE_BACKSTOP_SLACK`, so tests can shorten it.
 #[derive(Clone, Copy)]
 struct BackstopSlack(Duration);
 
@@ -1349,12 +1357,13 @@ struct SessionMeta {
     next_handoff_generation: u64,
     cleanup: Option<Box<dyn SessionCleanup>>,
     /// The terminal decision of each admitted call operation, keyed by its
-    /// admission. One whose gate has stopped while its operation is still
-    /// admitted is a worker that outlived its call.
+    /// operation number. An entry whose dispatch gate has stopped while its
+    /// operation is still admitted is a worker that outlived its call.
     live_calls: Vec<(u64, Arc<crate::TerminalArbiter>)>,
     next_operation: u64,
-    /// The write backstop has acted on this session. Its recorded terminal
-    /// is then the backstop's, and exit observation tears the session down.
+    /// The write backstop has acted on this session: it recorded the
+    /// session's terminal outcome (`connector_failure` unless one was already
+    /// set) and killed the browser, and exit observation tears it down.
     backstop_fired: bool,
 }
 
@@ -2409,8 +2418,9 @@ impl BrowserSessions {
             let Some(process) = driver.as_mut() else {
                 return HandoffPollResult::Gone;
             };
-            // The poll belongs to no call. Its commands are still recorded in
-            // flight, so one past its cap falls under the write backstop.
+            // The poll runs outside any call, so it has no terminal decision
+            // and is not gated. Its commands are still recorded in flight, so
+            // one that runs past its own cap is caught by the write backstop.
             let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
             let Ok(current_cookie_names) =
                 process.cookie_names_for_origin(route_key, &origin, deadline_ms)
@@ -2512,7 +2522,8 @@ impl BrowserSessions {
                     .record(&cell.browser_session_id)
                     .status_json(clock, wall_now);
                 // Status takes no driver lock, so it still answers while a
-                // quarantined operation holds that lock, and says so.
+                // quarantined operation holds that lock, and it reports the
+                // quarantine in `remedy`.
                 if let Some(call) = self.stuck_operation(&cell, &meta) {
                     status["remedy"] = json!(format!(
                         "a browser operation ({call}) is still running after its call ended; \
@@ -2585,8 +2596,9 @@ impl BrowserSessions {
                 return false;
             };
             if !meta.admits_calls() {
-                // A session that admits no call takes no input either; the
-                // call itself is refused by the session's own state.
+                // A session that admits no calls takes no page input, so its
+                // held press cannot affect a later call: report none held. The
+                // input call is then refused by the session's own state.
                 return true;
             }
             // A worker still running may yet land its press after a release
@@ -5373,8 +5385,9 @@ mod tests {
         /// blocks: it records one command in flight, capped at its deadline,
         /// and returns only once this switch is killed.
         wedged_write: Option<Arc<KillSwitch>>,
-        /// When set, the screenshot runs this many commands one after
-        /// another, each in flight for `.2` under a cap of `.1`.
+        /// When set to `(count, cap, each)`, the screenshot runs `count`
+        /// commands one after another, each recorded with the per-command
+        /// deadline `cap` and kept in flight for `each`.
         in_bound_commands: Option<(usize, Duration, Duration)>,
         /// When set, the exit probe reports the browser gone once it is true.
         exited: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -6381,8 +6394,9 @@ mod tests {
             "browser_session_id": session.id,
             "terminal_outcome": "connector_failure",
         });
-        // The terminal reads as soon as the backstop records it; the session
-        // is torn down by a later sweep, once the killed write has failed.
+        // Status shows the terminal outcome as soon as the write backstop
+        // records it; the session is released only by a later sweep, after
+        // the killed browser has failed the wedged screenshot.
         sweep_until(&sessions, || session.released() == 1);
         assert_eq!(sessions.status("route", &clock, UNIX_EPOCH), terminal);
         assert!(
@@ -6442,8 +6456,9 @@ mod tests {
                 crate::browser::validate_browser_result(capability, reply)
                     .unwrap_or_else(|error| panic!("{capability}: {error} in {reply}"));
             }
-            // The holder still runs, so its session refuses calls at once
-            // rather than letting them queue behind it.
+            // The wedged screenshot still holds the driver lock, so the
+            // session is in execution quarantine: calls are refused at once
+            // rather than queued behind it.
             assert_eq!(
                 sessions
                     .execution_quarantine("route")
