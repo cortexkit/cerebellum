@@ -7151,9 +7151,11 @@ mod tests {
             &json!({"name":tool.name,"description":tool.description,"input_schema":tool.schema}),
         )
         .unwrap();
+        // Same frozen digest as tool_provider's definition pin: the result-schema
+        // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "68ed4c43212c93922a34be1e6a9088da430ffefe60c2c88441f862f4606d9643"
+            "54dda58db3986210189226f18c9aaa9ba132c1ad54268cd384b3a8f12dfe782e"
         );
     }
 
