@@ -199,7 +199,7 @@ fn module_binary() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ck-cerebellum")));
     let binary = cortexkit_test_support::ckdev_binary(binary);
-    let binary = support::daemon_binary("ck-cerebellum", binary);
+    let binary = support::daemon_binary("ckdev-cerebellum", binary);
     eprintln!("flow e2e binary: {}", binary.display());
     binary
 }
