@@ -1997,9 +1997,8 @@ mod tests {
             "cancelled"
         );
         let keys_finished = response.header.ty == FrameType::Response && response.header.corr == 1;
-        let scroll_question = Some(rig.planes.consent_test.as_ref().unwrap().card(7, 1).await);
+        let question = rig.planes.consent_test.as_ref().unwrap().card(7, 1).await;
         assert!(keys_finished);
-        let question = scroll_question.expect("scroll ran after keys released the lane");
         assert_eq!(
             serde_json::from_slice::<Value>(&question.body).unwrap()["params"]["target"]["kind"],
             "machine"
