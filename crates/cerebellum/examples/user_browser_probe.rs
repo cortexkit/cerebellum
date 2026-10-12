@@ -1111,6 +1111,24 @@ mod live {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let worker_session = cdp.attach(&worker_target)?;
+        // A freshly started extension worker can be attached before Chrome has
+        // installed its extension bindings, and an evaluation then sees no
+        // `chrome`. Wait for the bindings before the first real query.
+        loop {
+            let ready = cdp.eval(
+                &worker_session,
+                "typeof chrome !== 'undefined' && !!chrome.tabs",
+            );
+            if matches!(ready, Ok(Value::Bool(true))) {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "extension bindings never appeared in the worker: {ready:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let outside_id = cdp
             .eval(
                 &worker_session,
