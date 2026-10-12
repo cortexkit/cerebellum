@@ -1,0 +1,56 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Path",
+      "value": "/Users/someone/Library/Application Support/cerebellum/profiles"
+    },
+    {
+      "label": "Profiles affected",
+      "value": "3"
+    },
+    {
+      "label": "Protection",
+      "value": "Only profiles created by the registry can be re-identified"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "allow",
+      "label": "Re-identify"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Re-identify the agent's browser profiles at their current location.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "generation": 7,
+    "new_identity": {
+      "birth_time": {
+        "nanoseconds": 5,
+        "unix_seconds": 1700000000
+      },
+      "formula": 2,
+      "inode": 42
+    },
+    "old_identity": {
+      "digest": "a1b2c3"
+    }
+  },
+  "target": {
+    "kind": "machine",
+    "label": "the agent's browser profiles"
+  },
+  "title": "Re-identify browser profiles?",
+  "urgency": "normal"
+}

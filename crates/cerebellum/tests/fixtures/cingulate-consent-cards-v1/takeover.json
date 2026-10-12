@@ -1,0 +1,33 @@
+{
+  "default": "deny",
+  "duration": "conversation",
+  "expires_in_ms": 300000,
+  "facts": [],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "allow_conversation",
+      "label": "Allow for this conversation"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It is machine-wide for this conversation and can reach every application on the screen.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "takeover": "machine"
+  },
+  "target": {
+    "kind": "machine",
+    "label": "your mouse and keyboard"
+  },
+  "title": "Allow control of your mouse and keyboard?",
+  "urgency": "high"
+}

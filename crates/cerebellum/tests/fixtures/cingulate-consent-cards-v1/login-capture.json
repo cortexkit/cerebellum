@@ -1,0 +1,50 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Account",
+      "value": "work"
+    },
+    {
+      "label": "Browser",
+      "value": "Sign in in a new, empty browser window; your own browser is not touched"
+    },
+    {
+      "label": "Storage",
+      "value": "Your login is stored in the vault for insula; the sign-in window is deleted afterwards"
+    },
+    {
+      "label": "Other browsers",
+      "value": "Some sites allow one sign-in at a time; signing in here may sign you out of this site in your other browsers."
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "allow",
+      "label": "Allow"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "insula will hold a copy of your ollama.com login.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "account": "work",
+    "credential_domain": "ollama.com"
+  },
+  "target": {
+    "kind": "site",
+    "label": "ollama.com"
+  },
+  "title": "Save your ollama.com login?",
+  "urgency": "high"
+}

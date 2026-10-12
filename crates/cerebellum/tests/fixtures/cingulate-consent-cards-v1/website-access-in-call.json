@@ -1,0 +1,66 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Standing access",
+      "value": "login.example and its subdomains"
+    },
+    {
+      "label": "Can",
+      "value": "It can open and read pages there and click ordinary buttons and links"
+    },
+    {
+      "label": "Can",
+      "value": "It can also follow links that lead to other sites and submit other forms, which can make lasting changes such as posting, saving or sending something"
+    },
+    {
+      "label": "Can",
+      "value": "It can also submit sign-in forms"
+    },
+    {
+      "label": "Can't",
+      "value": "It can't submit payment forms or forms whose purpose it couldn't check"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "detail": "Up to making lasting changes.",
+      "effect": "grant",
+      "id": "allow_conversation",
+      "label": "Allow for this conversation"
+    },
+    {
+      "detail": "Up to making lasting changes.",
+      "effect": "grant",
+      "id": "allow_origin_always",
+      "label": "Always allow on login.example and its subdomains"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Let the agent use its own browser on login.example to read pages and click, including actions that make lasting changes.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "hazards": [
+      "credential_form_submit"
+    ],
+    "origins": [
+      "https://login.example"
+    ],
+    "tier": 4
+  },
+  "target": {
+    "kind": "site",
+    "label": "login.example"
+  },
+  "title": "Allow access to login.example?",
+  "urgency": "high"
+}

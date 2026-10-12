@@ -1,0 +1,46 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Google Chrome",
+      "value": "login available"
+    },
+    {
+      "label": "Privacy",
+      "value": "No cookie value is read by the agent"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "transfer:chrome",
+      "label": "Copy my login from Google Chrome"
+    },
+    {
+      "effect": "grant",
+      "id": "hand_off",
+      "label": "I'll sign in myself"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Copy your x.com login from a browser on this Mac into the agent's browser.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "origin": "https://x.com"
+  },
+  "target": {
+    "kind": "site",
+    "label": "x.com"
+  },
+  "title": "Copy your x.com login?",
+  "urgency": "high"
+}
