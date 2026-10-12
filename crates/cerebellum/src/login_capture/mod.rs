@@ -1502,7 +1502,9 @@ impl CaptureModule {
 
         let guard = crate::elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
         let _parked = guard.as_ref().map(|guard| guard.park_on_consent());
-        let started = Instant::now();
+        // The runtime's clock, so tests can run a full-length handoff in
+        // paused time; in production it is the same monotonic clock.
+        let started = tokio::time::Instant::now();
         let mut saw_credential_field = false;
         let mut verification = VerificationRecord::default();
         loop {
@@ -1517,33 +1519,52 @@ impl CaptureModule {
                     }),
                 );
             }
-            tokio::time::sleep(self.env.poll_interval).await;
+            // Neither the wait nor the reads below run past the handoff's
+            // end, so the person's window is held no longer than promised.
+            tokio::time::sleep(
+                self.env
+                    .poll_interval
+                    .min(self.env.handoff_duration.saturating_sub(started.elapsed())),
+            )
+            .await;
+            let left = self.env.handoff_duration.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                // The deadline check at the top of the loop ends it.
+                continue;
+            }
             let poll_origin = origin.to_string();
             let saw = saw_credential_field;
             let opening = opening_cookie_names.clone();
             let (returned, polled) = on_browser(browser, move |browser| {
+                let end = Instant::now() + left;
                 // A liveness reading that failed is not evidence the person
                 // closed the window, so the handoff stays open on it and the
                 // login observation below still runs.
                 if browser.liveness() == crate::browser_launch::BrowserProcessLiveness::Gone {
                     return Poll::Exited;
                 }
+                let still_open = Poll::Open {
+                    saw_credential_field: saw,
+                };
                 // Read failures leave the handoff open, as they do for
                 // `browser.present`: a page mid-navigation fails a read.
-                let Ok(current) = browser.cookie_names_for_origin(&poll_origin, deadline_ms) else {
-                    return Poll::Open {
-                        saw_credential_field: saw,
-                    };
+                let Some(cap) = read_cap(deadline_ms, end) else {
+                    return still_open;
                 };
-                let Ok(url) = browser.main_frame_url(deadline_ms) else {
-                    return Poll::Open {
-                        saw_credential_field: saw,
-                    };
+                let Ok(current) = browser.cookie_names_for_origin(&poll_origin, cap) else {
+                    return still_open;
                 };
-                let Ok(has_credential_field) = browser.has_credential_field(deadline_ms) else {
-                    return Poll::Open {
-                        saw_credential_field: saw,
-                    };
+                let Some(cap) = read_cap(deadline_ms, end) else {
+                    return still_open;
+                };
+                let Ok(url) = browser.main_frame_url(cap) else {
+                    return still_open;
+                };
+                let Some(cap) = read_cap(deadline_ms, end) else {
+                    return still_open;
+                };
+                let Ok(has_credential_field) = browser.has_credential_field(cap) else {
+                    return still_open;
                 };
                 if crate::browser_session::handoff_login_observed(
                     saw,
@@ -1705,6 +1726,15 @@ impl VerificationRecord {
     fn last_failure(&self) -> Option<VerificationFailure> {
         self.last.as_ref().map(|(_, _, failure)| *failure)
     }
+}
+
+/// The deadline for one read of a handoff poll: its own cap, cut to what is
+/// left before `end`. `None` once nothing is left, so no read starts that
+/// could only run past the handoff's end.
+fn read_cap(deadline_ms: u64, end: Instant) -> Option<u64> {
+    let left = end.saturating_duration_since(Instant::now());
+    let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    (left_ms > 0).then_some(deadline_ms.min(left_ms))
 }
 
 /// Run blocking browser work off the async runtime, handing the browser back.

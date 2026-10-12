@@ -49,6 +49,7 @@ pub mod launch_recovery;
 pub mod login_capture;
 pub mod login_import;
 pub mod management;
+mod management_bounds;
 pub mod manifest;
 pub mod network;
 mod open_app_history;
@@ -83,6 +84,9 @@ use crate::call_record_supervisor::{
 };
 use crate::elicit::{Elicitor, SharedElicitor};
 use crate::management::ManagementPlane;
+use crate::management_bounds::{
+    close_idle_for_import_off_task, on_call_blocking_pool, spawn_handoff_poll, HandoffSettle,
+};
 use cerebellum_core::identity::RouteSurface;
 use socket2::{SockRef, TcpKeepalive};
 use subc_protocol::session::{
@@ -4652,11 +4656,11 @@ async fn complete_login_import(
                 )
                 .await;
             };
-            match planes
-                .sessions
-                .close_idle_for_import(&facts.identity.conversation_key, config)
-            {
-                Ok((closed, url)) if closed["outcome"] == "closed" => {
+            let closed =
+                close_idle_for_import_off_task(planes, &facts.identity.conversation_key, config)
+                    .await;
+            match closed {
+                Ok(Ok((closed, url))) if closed["outcome"] == "closed" => {
                     reopen = Some(url);
                     planes.browser.end_context(&facts.identity, false).await;
                 }
@@ -4823,14 +4827,33 @@ async fn present_browser_handoff(
         .browser_config
         .as_ref()
         .map_or(30_000, |config| config.navigation_settle_deadline_ms);
-    let presented = planes.sessions.present_for_profile(
-        &identity.conversation_key,
-        &identity.agent_project_id,
-        &browser_signed_in::SignedInDomains::profile_name(identity),
-        origin,
-        deadline_ms,
-        planes.lease_clock.as_ref(),
-    );
+    // Fronting the window and reading its cookies are blocking CDP commands
+    // under the session's driver lock, so they run on the blocking pool, never
+    // on this async task. The call took its work permit when it got its turn
+    // in the conversation's queue, and keeps it until this job finishes: if
+    // the call is answered (by its deadline, a cancel or a drain) before the
+    // job returns, its route task is kept alive, holding the permit, until
+    // then. So a stuck job keeps counting against the plane's capacity.
+    let sessions = planes.sessions.clone();
+    let clock = Arc::clone(&planes.lease_clock);
+    let route_key = identity.conversation_key.clone();
+    let profile = identity.agent_project_id.clone();
+    let profile_name = browser_signed_in::SignedInDomains::profile_name(identity);
+    let present_origin = origin.to_owned();
+    let presented = on_call_blocking_pool(move || {
+        sessions.present_for_profile(
+            &route_key,
+            &profile,
+            &profile_name,
+            &present_origin,
+            deadline_ms,
+            clock.as_ref(),
+        )
+    })
+    .await;
+    let Ok(presented) = presented else {
+        return json!({"outcome":"internal_failure"});
+    };
     let presented = match presented {
         Ok(presented) => presented,
         Err(browser_session::PresentRefusal::NoSession) => {
@@ -4890,59 +4913,22 @@ async fn present_browser_handoff(
         }
     }
 
-    let sessions = planes.sessions.clone();
-    let browser = Arc::clone(&planes.browser);
-    let clock = Arc::clone(&planes.lease_clock);
-    let identity = identity.clone();
-    let route_key = identity.conversation_key.clone();
-    let generation = presented.generation;
-    let calls = Arc::clone(&planes.calls);
-    let pending = held
-        .as_ref()
-        .map(|(principal, key, _)| (principal.clone(), key.clone()));
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(
-                browser_session::HANDOFF_POLL_INTERVAL_MS,
-            ))
-            .await;
-            let poll_sessions = sessions.clone();
-            let poll_clock = Arc::clone(&clock);
-            let poll_route = route_key.clone();
-            let polled = tokio::task::spawn_blocking(move || {
-                poll_sessions.poll_handoff(
-                    &poll_route,
-                    generation,
-                    deadline_ms,
-                    poll_clock.as_ref(),
-                )
-            })
-            .await;
-            let ending = match polled {
-                Ok(browser_session::HandoffPollResult::Open) => continue,
-                Ok(browser_session::HandoffPollResult::Closed(close)) => {
-                    if close.should_journal {
-                        let _ = browser.journal_handoff_closed(&identity, &close).await;
-                    }
-                    handoff_ending(close.outcome)
-                }
-                Ok(browser_session::HandoffPollResult::Gone) | Err(_) => {
-                    journal::call_records::HandoffEnding::HandoffInterrupted
-                }
-            };
-            if let Some((principal, key)) = pending.clone() {
-                let calls = Arc::clone(&calls);
-                let saved = tokio::task::spawn_blocking(move || {
-                    calls.finish_handoff(&principal, &key, ending, wall_clock_ms())
-                })
-                .await;
-                if !matches!(saved, Ok(Ok(()))) {
-                    continue;
-                }
-            }
-            break;
-        }
+    let settle = held.as_ref().map(|(principal, key, _)| {
+        let calls = Arc::clone(&planes.calls);
+        let (principal, key) = (principal.clone(), key.clone());
+        Arc::new(move |ending| {
+            calls
+                .finish_handoff(&principal, &key, ending, wall_clock_ms())
+                .is_ok()
+        }) as HandoffSettle
     });
+    spawn_handoff_poll(
+        planes,
+        identity.clone(),
+        presented.generation,
+        deadline_ms,
+        settle,
+    );
 
     if held.is_some() {
         json!({"outcome":"login_pending", "origin":origin, "expires_in_ms":presented.expires_in_ms})
@@ -9363,7 +9349,7 @@ mod tests {
 
     /// Planes whose management route declares elicitation, with the capture
     /// module running on the fixture's fakes and an in-memory journal.
-    fn capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
+    pub(super) fn capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
