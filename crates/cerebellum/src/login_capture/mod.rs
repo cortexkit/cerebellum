@@ -128,7 +128,7 @@ pub const OUTCOMES: [&str; 19] = [
     "capture_no_cookies_for_url",
     "capture_header_unusable",
     "capture_consent_not_given",
-    "elicitation_undeclared",
+    "consent_unavailable",
     "capture_browser_unavailable",
     "capture_launch_failed",
     "capture_not_stored",
@@ -157,6 +157,10 @@ pub fn reply_schema() -> Value {
             "tool": string(),
             "reason": string(),
             "stage": string(),
+            "detail": {
+                "type":"object", "properties":{"reason":string(),"remedy":string()},
+                "required":["reason","remedy"], "additionalProperties":false
+            },
             "remedy": string(),
         },
         "required": ["outcome"],
@@ -1087,8 +1091,8 @@ impl CaptureModule {
         }
         if !call.declares_elicitation {
             return record.refused(
-                "elicitation_undeclared",
-                json!({"remedy": "reconnect with a route that declares elicitation support"}),
+                "consent_unavailable",
+                json!({"detail":{"reason":"no_agent_session","remedy":"call from the agent session that needs the permission; it can raise the card"}}),
             );
         }
         let Some(launcher) = self.launcher() else {
@@ -1151,7 +1155,18 @@ impl CaptureModule {
             return record.ended("cancelled", None);
         };
         let answer = match answer.into() {
-            LoginConsent::Ended(answer) => answer,
+            LoginConsent::Ended(answer) => {
+                if let crate::cingulate_client::desk::Ending::NoCard(why) = answer.ending {
+                    return record.refused(
+                        "consent_unavailable",
+                        json!({"detail":{"reason":why.reason(), "remedy":why.remedy()}}),
+                    );
+                }
+                if answer.ending == crate::cingulate_client::desk::Ending::Withdrawn {
+                    return record.refused("capture_consent_not_given", json!({"reason":"question_withdrawn", "remedy":"retry this call to ask again"}));
+                }
+                answer.legacy_answer()
+            }
             // Nothing was launched: the capture runs only on a call made
             // while the person is at hand, so a later approval is kept for
             // the retry rather than acted on.

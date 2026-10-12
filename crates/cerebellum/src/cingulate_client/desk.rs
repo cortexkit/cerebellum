@@ -546,6 +546,9 @@ impl ConsentDesk {
             return Err(CallError::RegistryUnreadable);
         }
         let route = self.opener.open(live).await?;
+        if !live.is_held() {
+            return Err(CallError::NotLive);
+        }
         Ok(DeskSession {
             desk: self,
             live,
@@ -578,15 +581,17 @@ impl ConsentDesk {
             .collect()
     }
 
-    /// Take, at most once, the single-use approval `drain_answers` recorded
-    /// for `subject` on this session after the raising call had stopped
-    /// waiting. Returns the card's elicitation id, which the calling retry
-    /// reports its execution against with `report_execution`.
-    pub fn take_single_use_approval(&self, session: &SessionKey, subject: &str) -> Option<String> {
+    /// Take once the late approval recorded from the session's answer feed
+    /// for `subject`. Returns its card id and granting choice, so the retry
+    /// performs the selected action and reports what actually happened.
+    pub fn take_single_use_approval(
+        &self,
+        session: &SessionKey,
+        subject: &str,
+    ) -> Option<(String, String)> {
         lock(&self.single_use)
             .approvals
             .remove(&(session.clone(), subject.to_string()))
-            .map(|(elicitation_id, _choice)| elicitation_id)
     }
 
     fn record_single_use_approval(&self, card: &RaisedCard, choice_id: &str) {
@@ -626,6 +631,22 @@ impl ConsentDesk {
         self.save().map(|()| flipped)
     }
 
+    /// Remove an ended session's cards and unused approvals from storage.
+    /// No route to the consent service is opened: the session has ended, so
+    /// it can no longer authorize such a route.
+    pub fn forget_session(&self, session: &SessionKey) -> Result<(), String> {
+        lock(&self.registry).retain(|_, card| card.session != *session);
+        lock(&self.single_use)
+            .approvals
+            .retain(|(owner, _), _| owner != session);
+        self.save()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_single_use_approvals(&self) -> bool {
+        !lock(&self.single_use).approvals.is_empty()
+    }
+
     fn forget(&self, ids: &[String]) {
         {
             let mut registry = lock(&self.registry);
@@ -660,6 +681,9 @@ impl DeskSession<'_> {
     /// Raise `card` about `subject` and remember it. Returns the card's
     /// elicitation id, the ask id the agent is given.
     pub async fn raise(&mut self, card: CardRequest, subject: &str) -> Result<String, Ending> {
+        if !self.live.is_held() {
+            return Err(Ending::NoCard(NoCard::CallEnded));
+        }
         let result = self
             .route
             .call(wire::CONSENT_REQUEST, card.params.clone())

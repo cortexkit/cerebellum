@@ -163,6 +163,17 @@ impl TerminalArbiter {
         CALL_TERMINAL.try_with(Arc::clone).ok()
     }
 
+    /// Accounting guards can outlive a reply during worker cleanup, but may
+    /// no longer authorize a new consent route or card once it is finalized.
+    pub(crate) fn consent_call_held(&self) -> bool {
+        !self.state.lock().unwrap().reply_finalized
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_reply_for_test(&self) {
+        self.state.lock().unwrap().reply_finalized = true;
+    }
+
     pub fn set_step(&self, step: CallStep) {
         let mut state = self.state.lock().unwrap();
         if state.chosen.is_none() {

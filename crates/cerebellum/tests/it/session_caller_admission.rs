@@ -408,3 +408,49 @@ async fn operator_operations_are_served_to_a_direct_route() {
         String::from_utf8_lossy(&rebind[0].body)
     );
 }
+
+#[tokio::test]
+async fn an_unscoped_session_route_cannot_raise_login_cards() {
+    let script = cerebellum::cingulate_client::ScriptedCingulate::new();
+    let root = std::env::temp_dir().join(format!(
+        "unscoped-login-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let planes = planes_with_a_grant().await.with_cingulate(
+        Arc::new(script.clone()),
+        Arc::new(cerebellum::cingulate_client::desk::FileRegistryStore::new(
+            root.join("registry.json"),
+        )),
+    );
+    bind_acked(&planes, reserved("prefrontal-core"), management_route()).await;
+    for (method, params) in [
+        (
+            "browser.import_login",
+            json!({"origin":"https://example.com"}),
+        ),
+        (
+            "browser.capture_login",
+            json!({"credential_domain":"example.com","account":"work","fetch_url":"https://example.com/settings","login_url":"https://example.com/login"}),
+        ),
+    ] {
+        let frames = frames_for(
+            &planes,
+            route_request(80, json!({"method":method,"params":params})),
+        )
+        .await;
+        assert_eq!(frames.len(), 1, "no reverse question frame");
+        assert_eq!(frames[0].header.ty, FrameType::Response);
+        let reply: Value = serde_json::from_slice(&frames[0].body).unwrap();
+        assert_eq!(reply["outcome"], "consent_unavailable", "{method}: {reply}");
+        assert_eq!(reply["detail"]["reason"], "no_agent_session", "{reply}");
+        cerebellum::browser::validate_browser_result(method, &reply).unwrap();
+    }
+    assert_eq!(script.opens(), 0);
+    assert!(script.calls().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}

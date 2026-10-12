@@ -981,26 +981,34 @@ mod task {
 
 #[cfg(target_os = "macos")]
 mod macos_probe {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use cerebellum::cingulate_client::desk::ConsentDesk;
+    use cerebellum::cingulate_client::live_call::{LiveCall, NotLive};
+    use cerebellum::cingulate_client::route::{
+        BoxFuture, CallError, CingulateOpener, CingulateRoute,
+    };
+    use cerebellum::cingulate_client::{Reply, ScriptedCingulate};
     use cerebellum::computer_capability::{
         computer_audit, servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
     };
     use cerebellum::computer_grants::{
         AlwaysOpenRoute, ConsentContext, GrantCaller, QuestionCarrier,
     };
-    use cerebellum::elicit::AskOutcome;
     use cerebellum::management::{ManagementPlane, PlatformResolver};
     use cerebellum::{JournalPersistence, PlaneJournalStorage};
     use cerebellum_computer::audit::redaction::ExcludeApplicationText;
     use cerebellum_computer::platform::native::NativeCaptureBackend;
     use cerebellum_computer::platform::{MacOs26PlatformDriver, TargetResolution};
     use cerebellum_core::clock::SystemClock;
+    use cerebellum_core::dispatch::{DispatchTimingState, InFlightGuard};
     use cerebellum_core::identity::SessionKind;
     use cerebellum_core::journal::{JournalIdentity, ValidatedSeverityTaxonomy};
     use serde_json::{json, Value};
+    use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+    use subc_protocol::Principal;
 
     use super::task::{self, FindFailure, Planned, Sample, Span, TreeLine, DISCORD};
 
@@ -1041,21 +1049,81 @@ mod macos_probe {
     /// Prints each question the way a person would see its parts, then
     /// answers "allow for this conversation": running this probe with its
     /// arguments is the operator's consent to what it does.
-    struct AnsweringCarrier;
+    struct AnsweringCarrier {
+        desk: Arc<ConsentDesk>,
+        guard: Arc<InFlightGuard>,
+        stamp: ScopeStamp,
+    }
+
+    impl AnsweringCarrier {
+        fn new() -> Self {
+            let clock = SystemClock::new();
+            let timing = Arc::new(DispatchTimingState::new(&clock));
+            Self {
+                desk: Arc::new(ConsentDesk::new(Arc::new(AnsweringOpener(AtomicU64::new(
+                    1,
+                ))))),
+                guard: Arc::new(timing.enter(&clock)),
+                stamp: ScopeStamp {
+                    owner: Principal::Reserved {
+                        module_id: "prefrontal-core".into(),
+                    },
+                    scope_ref: identity().conversation_key,
+                    scope_epoch: 1,
+                    kind: ScopeKind::Ephemeral,
+                    parent: None,
+                    parent_state: None,
+                    attributes: ScopeAttributes::new()
+                        .with_agent_id(Some(identity().agent_project_id)),
+                    owner_authorized: true,
+                },
+            }
+        }
+    }
 
     impl QuestionCarrier for AnsweringCarrier {
-        fn put(
-            &self,
-            question: Value,
-            _deadline: Duration,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AskOutcome> + Send>> {
-            let params = question.get("params").unwrap_or(&question);
-            println!(
-                "  QUESTION grant_kind={} app={} message={}",
-                params["grant_kind"], params["app"], params["message"]
-            );
-            println!("  ANSWER allow_conversation");
-            Box::pin(async { AskOutcome::Answered(json!({"decision": "allow_conversation"})) })
+        fn desk(&self) -> Arc<ConsentDesk> {
+            self.desk.clone()
+        }
+        fn live(&self) -> Result<LiveCall, NotLive> {
+            LiveCall::from_inbound(Some(&self.stamp), &self.guard, Arc::new(AlwaysOpenRoute))
+        }
+    }
+
+    struct AnsweringOpener(AtomicU64);
+    impl CingulateOpener for AnsweringOpener {
+        fn open<'a>(
+            &'a self,
+            live: &'a LiveCall,
+        ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
+            Box::pin(async move {
+                let id = format!(
+                    "el_discord_probe_{}",
+                    self.0.fetch_add(1, Ordering::Relaxed)
+                );
+                let script = ScriptedCingulate::new();
+                script.then("consent.request", Reply::Result(json!({"elicitation_id":id})))
+                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_conversation"})));
+                Ok(Box::new(AnsweringRoute(script.open(live).await?)) as Box<dyn CingulateRoute>)
+            })
+        }
+    }
+
+    struct AnsweringRoute(Box<dyn CingulateRoute>);
+    impl CingulateRoute for AnsweringRoute {
+        fn call<'a>(
+            &'a mut self,
+            method: &'a str,
+            params: Value,
+        ) -> BoxFuture<'a, Result<Value, CallError>> {
+            if method == "consent.request" {
+                println!(
+                    "  QUESTION grant_kind={} app={} message={}",
+                    params["grant_kind"], params["app"], params["message"]
+                );
+                println!("  ANSWER allow_conversation");
+            }
+            self.0.call(method, params)
         }
     }
 
@@ -1080,11 +1148,34 @@ mod macos_probe {
                 agent_project_id: identity().agent_project_id,
                 durable_identity_attested: false,
             },
-            Some(Arc::new(AnsweringCarrier) as Arc<dyn QuestionCarrier>),
+            Some(Arc::new(AnsweringCarrier::new()) as Arc<dyn QuestionCarrier>),
             Arc::new(AlwaysOpenRoute),
             drain,
             None,
         )
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn answering_carrier_answers_repeated_cards_through_the_desk() {
+        use cerebellum::computer_grants::{ComputerGrants, GrantNeed};
+        let grants = Arc::new(ComputerGrants::in_memory());
+        let mut context = consent();
+        let carrier = context.carrier.as_ref().unwrap().clone();
+        let cancel = cerebellum::CancelHandle::pending();
+        grants
+            .require(&GrantNeed::Takeover, &context, &cancel)
+            .await
+            .unwrap();
+        assert!(grants.holds(&context.caller, &GrantNeed::Takeover));
+        context.caller.conversation_key.push_str(":second");
+        grants
+            .require(&GrantNeed::Takeover, &context, &cancel)
+            .await
+            .unwrap();
+        assert!(grants.holds(&context.caller, &GrantNeed::Takeover));
+        assert!(carrier.desk().raised("el_discord_probe_1").unwrap().applied);
+        assert!(carrier.desk().raised("el_discord_probe_2").unwrap().applied);
     }
 
     /// The frontmost application, sampled every 100 ms until stopped.

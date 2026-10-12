@@ -1015,7 +1015,7 @@ async fn a_late_login_approval_is_used_once_and_reported() {
     let (retry, _) = live_call("sc_head_alf");
     let applied = Applied::default();
     drain(&desk, &retry, &applied).await;
-    let id = desk
+    let (id, _) = desk
         .take_single_use_approval(retry.session(), "import:https://x.com")
         .expect("the late approval is recorded for the retry");
     assert_eq!(

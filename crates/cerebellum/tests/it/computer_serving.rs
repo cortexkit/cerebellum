@@ -129,7 +129,7 @@ async fn a_wait_without_its_app_grant_and_nobody_to_ask_is_consent_unavailable()
     .await;
 
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
-    assert_eq!(reply["reason"], "cannot_relay", "{reply}");
+    assert_eq!(reply["reason"], "no_agent_session", "{reply}");
 }
 
 /// A wait is admitted by the app grant for the application it NAMES, never by

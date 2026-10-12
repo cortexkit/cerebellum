@@ -226,11 +226,11 @@ fn type_request() -> Value {
 }
 
 fn decisions(question: &Value) -> Vec<String> {
-    question["params"]["requestedSchema"]["properties"]["decision"]["enum"]
+    question["params"]["options"]
         .as_array()
         .expect("the question offers its decisions")
         .iter()
-        .map(|decision| decision.as_str().unwrap().to_string())
+        .map(|option| option["id"].as_str().unwrap().to_string())
         .collect()
 }
 
@@ -399,6 +399,7 @@ async fn an_unanswered_wait_is_consent_pending_and_a_later_answer_still_grants()
 
     assert!(carrier.answer_next(answer("allow_conversation")));
     let grants = Arc::clone(management.computer_grants());
+    carrier.apply_late(management.computer_grants()).await;
     until(|| grants.holds(&caller("conversation-1", false), &app_need())).await;
 
     let retried = serve(
@@ -1156,10 +1157,9 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
             ids,
             "{kind}"
         );
-        assert_eq!(
-            p["requestedSchema"]["properties"]["decision"]["enum"],
-            json!(ids),
-            "{kind}"
+        assert!(
+            p.get("requestedSchema").is_none(),
+            "Cingulate receives options, not a reverse-lane schema"
         );
         for option in options {
             assert_eq!(

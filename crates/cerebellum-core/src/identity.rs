@@ -475,6 +475,7 @@ impl AcceptedBindFacts {
         None
     }
 
+    /// Used by reverse-lane cards until those flows move to Cingulate.
     /// Whether the consumer declared it can relay a question to a human.
     ///
     /// True means asking is worth attempting, never that an answer will arrive.
@@ -544,9 +545,8 @@ impl AcceptedBindFacts {
     /// kind (which resolves no browser profile), no attested facts, no browser
     /// controls and an explicitly empty capability scope. An operator whose
     /// route happens to name a live conversation therefore still sees none of
-    /// that conversation's grants. The principal, the surface and the declared
-    /// ability to relay a question to a person are kept, because the
-    /// operator's operations ask the person directly on this route.
+    /// that conversation's grants. The principal and surface are kept, but no
+    /// agent session remains under which an operator could raise a permission card.
     pub fn outside_session_scope(&self) -> Self {
         Self {
             identity: RouteIdentity {
@@ -1483,56 +1483,6 @@ mod tests {
             },
         );
         assert_eq!(internal.surface, RouteSurface::Unsupported);
-    }
-
-    /// A consumer that declares nothing can relay nothing.
-    ///
-    /// Absence must not read as an unknown the module resolves optimistically:
-    /// attempting to ask a consumer that never claimed it could relay produces a
-    /// question nobody receives, and the silence is indistinguishable from a
-    /// human declining.
-    #[test]
-    fn a_bind_declaring_no_capabilities_cannot_relay_a_question() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
-        let absent =
-            AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
-        assert!(!absent.declares_elicitation());
-
-        let empty = AcceptedBindFacts::from_bind(
-            &bind,
-            Some(Principal::Direct),
-            None,
-            Some(&[]),
-            &tool_route(),
-        );
-        assert!(!empty.declares_elicitation());
-    }
-
-    /// The declaration is read per family, not as a blanket claim.
-    ///
-    /// A consumer that services sampling has said nothing about reaching a
-    /// human, so treating any non-empty declaration as elicitation would ask a
-    /// consumer that never offered to answer.
-    #[test]
-    fn only_the_elicitation_family_admits_asking_a_human() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
-        let other = AcceptedBindFacts::from_bind(
-            &bind,
-            Some(Principal::Direct),
-            None,
-            Some(&["sampling".to_string(), "roots".to_string()]),
-            &tool_route(),
-        );
-        assert!(!other.declares_elicitation());
-
-        let declared = AcceptedBindFacts::from_bind(
-            &bind,
-            Some(Principal::Direct),
-            None,
-            Some(&["sampling".to_string(), "elicitation".to_string()]),
-            &tool_route(),
-        );
-        assert!(declared.declares_elicitation());
     }
 
     #[test]

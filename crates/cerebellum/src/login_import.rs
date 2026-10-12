@@ -205,7 +205,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
     json!({
         "type":"object",
         "properties":{
-            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","elicitation_undeclared","launch_binary_unsupported","profile_busy","resource_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","consent_unavailable","unrecognized_answer","question_withdrawn","launch_binary_unsupported","profile_busy","resource_busy","transfer_failed","invalid_origin","internal_failure"]},
             "domains_matched":{"type":"array","items":{"type":"string"}},
             "browser":{"type":"string"},
             "rows":{"type":"integer"},
@@ -218,7 +218,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
                     "restored_url":{"type":["string","null"]}
                 },"required":["browser_session_id","restored_url"],"additionalProperties":false
             },
-            "detail":{"anyOf":[launch_refusal,crate::browser::resource_busy_detail_schema()]}
+            "detail":{"anyOf":[launch_refusal,crate::browser::resource_busy_detail_schema(),{"type":"object","properties":{"reason":{"type":"string"},"remedy":{"type":"string"}},"required":["reason","remedy"],"additionalProperties":false}]}
         },
         "required":["outcome"],"additionalProperties":false
     })
@@ -1455,20 +1455,21 @@ mod tests {
             events.push("copy");
             Ok(())
         }));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        // A closed receiver is a carrier the question cannot be sent to.
-        let undeliverable = decision == "undeliverable";
-        if undeliverable {
-            rx.close();
-        }
+        planes = crate::computer_grants::tests::CardService::install(planes, 4, 1);
+        let facts = planes.routes.get(4, 1).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let cancel = crate::CancelHandle::pending();
-        let request =
-            crate::complete_login_import(&planes, &facts, &tx, 4, 1, plan, Some(cancel.clone()));
+        let request = crate::computer_grants::tests::with_live(crate::complete_login_import(
+            &planes,
+            &facts,
+            &tx,
+            4,
+            1,
+            plan,
+            Some(cancel.clone()),
+        ));
         let answer = async {
-            if undeliverable {
-                return;
-            }
-            let question = rx.recv().await.unwrap();
+            let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
             assert!(
                 events.lock().unwrap().is_empty(),
                 "browser closed before consent"
@@ -1477,9 +1478,17 @@ mod tests {
                 cancel.cancel();
                 return;
             }
+            let ending = match decision {
+                "no_answer" => crate::elicit::AskOutcome::NoAnswer,
+                "not_put_to_anyone" => crate::elicit::AskOutcome::NotPutToAnyone,
+                "undeliverable" => crate::elicit::AskOutcome::Undeliverable,
+                _ => crate::elicit::AskOutcome::Answered(json!({"decision":decision})),
+            };
             assert!(planes
-                .elicitor
-                .deliver(4, question.header.corr, json!({"decision":decision})));
+                .consent_test
+                .as_ref()
+                .unwrap()
+                .answer(question.header.corr, ending));
         };
         let (reply, ()) = tokio::join!(request, answer);
         crate::browser::validate_browser_result(crate::management::IMPORT_LOGIN, &reply).unwrap();
@@ -1545,6 +1554,8 @@ mod tests {
                 reply["outcome"],
                 if decision == "hand_off" {
                     "hand_off"
+                } else if decision == "transfer:unknown" {
+                    "unrecognized_answer"
                 } else {
                     "denied"
                 }
@@ -1565,11 +1576,8 @@ mod tests {
     /// person had refused.
     #[tokio::test]
     async fn an_import_question_that_ended_unanswered_is_never_reported_as_denied() {
-        // The decision word delivered for each case, the outcome it must
-        // produce, and the remedy it must carry. `no_answer` and
-        // `not_put_to_anyone` are the decision words a consumer sends when a
-        // person stayed silent or nobody could be asked (see `elicit`);
-        // `undeliverable` closes the receiver so the question cannot be sent.
+        // Script the card's ending, then check its wire outcome and remedy.
+        // Silence, requester refusal and transport failure are not declines.
         let cases = [
             ("deny", "denied", None),
             (
@@ -1583,7 +1591,11 @@ mod tests {
                 Some("shown to no one"),
             ),
             ("undeliverable", "undeliverable", Some("could not be sent")),
-            ("some_future_word", "denied", None),
+            (
+                "some_future_word",
+                "unrecognized_answer",
+                Some("could not be read"),
+            ),
         ];
         for (decision, outcome, remedy) in cases {
             let (reply, status, old, events) =

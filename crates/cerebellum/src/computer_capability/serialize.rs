@@ -895,7 +895,7 @@ mod tests {
             Some(&serde_json::json!({"agentProjectId": "fixture-project", "sessionKind": "primary", "effectiveCapabilityScope": ["*"]})),
             Some(&["elicitation".to_string()]),
             &subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },
-        ));
+        ).with_scope(Some(crate::computer_grants::tests::stamp("fixture-project"))));
     }
     struct SlowDispatch {
         armed: Arc<AtomicBool>,
@@ -960,6 +960,7 @@ mod tests {
         );
         bind(&planes, 7, "one");
         bind(&planes, 8, if second_conversation { "two" } else { "one" });
+        planes = crate::computer_grants::tests::CardService::install(planes, 7, 1);
         if let Some(SlowDispatch {
             armed,
             entered,
@@ -1123,10 +1124,17 @@ mod tests {
                 .unwrap();
         }
         async fn reply(&mut self) -> Frame {
-            tokio::time::timeout(Duration::from_secs(2), self.replies.recv())
-                .await
-                .expect("wire reply arrived promptly")
-                .unwrap()
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(2), self.replies.recv())
+                    .await
+                    .expect("wire reply arrived promptly")
+                    .unwrap();
+                if let Some(response) = crate::computer_grants::tests::scope_reply(&frame) {
+                    self.send(response).await;
+                    continue;
+                }
+                return frame;
+            }
         }
         async fn event(&mut self) -> Event {
             tokio::time::timeout(Duration::from_secs(2), self.events.recv())
@@ -1135,17 +1143,22 @@ mod tests {
                 .unwrap()
         }
         async fn allow(&mut self, question: &Frame) {
-            self.send(frame(
-                FrameType::Response,
-                question.header.channel,
+            assert!(self.planes.consent_test.as_ref().unwrap().answer(
                 question.header.corr,
-                serde_json::json!({"decision": "allow_conversation"}),
-            ))
-            .await;
+                crate::elicit::AskOutcome::Answered(
+                    serde_json::json!({"decision":"allow_conversation"})
+                )
+            ));
         }
         async fn start_held_launch(&mut self, channel: u16, corr: u64, app: &str) {
             self.send(open_request(channel, corr, app)).await;
-            let question = self.reply().await;
+            let question = self
+                .planes
+                .consent_test
+                .as_ref()
+                .unwrap()
+                .card(channel, 1)
+                .await;
             assert_eq!(question.header.ty, FrameType::Request);
             self.allow(&question).await;
             assert_eq!(
@@ -1162,12 +1175,11 @@ mod tests {
             let mut launch_reply = None;
             let mut read_reply = None;
             while launch_reply.is_none() || read_reply.is_none() {
-                let frame = self.reply().await;
-                if frame.header.ty == FrameType::Request {
-                    assert_eq!(frame.header.corr, corr);
-                    self.allow(&frame).await;
-                    continue;
-                }
+                let service = self.planes.consent_test.as_ref().unwrap().clone();
+                let frame = tokio::select! {
+                    question = service.card(8, 1) => { self.allow(&question).await; continue; },
+                    frame = self.reply() => frame,
+                };
                 assert_eq!(frame.header.ty, FrameType::Response);
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
                 if frame.header.corr == 1 {
@@ -1190,7 +1202,13 @@ mod tests {
             body["arguments"]["zoom"] = serde_json::json!("zz999999");
             let prime = frame(FrameType::Request, channel, 100 + u64::from(channel), body);
             self.send(prime).await;
-            let question = self.reply().await;
+            let question = self
+                .planes
+                .consent_test
+                .as_ref()
+                .unwrap()
+                .card(channel, 1)
+                .await;
             assert_eq!(question.header.ty, FrameType::Request);
             self.allow(&question).await;
             let response = self.reply().await;
@@ -1718,7 +1736,7 @@ mod tests {
         let mut rig = rig(false, None);
         rig.desk.release();
         rig.send(request(7, 1, APP)).await;
-        let question = rig.reply().await;
+        let question = rig.planes.consent_test.as_ref().unwrap().card(7, 1).await;
         assert_eq!(question.header.ty, FrameType::Request);
         rig.send(request(8, 2, APP)).await;
         // One lock owner and one waiter, and no app read before consent.
@@ -1767,7 +1785,7 @@ mod tests {
             } else {
                 // Closing the original route withdraws its carrier; the next
                 // live route must put its own question rather than wait on it.
-                let next_question = rig.reply().await;
+                let next_question = rig.planes.consent_test.as_ref().unwrap().card(8, 1).await;
                 assert_eq!(next_question.header.ty, FrameType::Request);
                 rig.allow(&next_question).await;
             }
@@ -1947,7 +1965,7 @@ mod tests {
         rig.send(frame(FrameType::Request, 7, 1, serde_json::json!({
             "name":"computer_use", "arguments":{"action":"keys", "target":"Editor", "keys":["d"]},
         }))).await;
-        let keys_question = rig.reply().await;
+        let keys_question = rig.planes.consent_test.as_ref().unwrap().card(7, 1).await;
         assert_eq!(keys_question.header.ty, FrameType::Request);
         assert_eq!(
             serde_json::from_slice::<Value>(&keys_question.body).unwrap()["params"]["target"]
@@ -1957,7 +1975,11 @@ mod tests {
         rig.send(frame(FrameType::Request, 7, 2, serde_json::json!({
             "name":"computer_use", "arguments":{"action":"takeover_scroll", "target":APP, "axis":"vertical", "amount_lines":2},
         }))).await;
-        let early = tokio::time::timeout(Duration::from_millis(100), rig.replies.recv()).await;
+        let early = tokio::time::timeout(
+            Duration::from_millis(100),
+            rig.planes.consent_test.as_ref().unwrap().card(7, 1),
+        )
+        .await;
         assert!(
             early.is_err(),
             "scroll overtook the keys call on the same app: {early:?}"
@@ -1967,25 +1989,16 @@ mod tests {
         // after the first app-lane owner finished.
         rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
             .await;
-        let mut keys_finished = false;
-        let mut scroll_question = None;
-        for _ in 0..2 {
-            let frame = rig.reply().await;
-            match frame.header.ty {
-                FrameType::Response => {
-                    assert_eq!(frame.header.corr, 1);
-                    assert_eq!(
-                        serde_json::from_slice::<Value>(&frame.body).unwrap()["outcome"],
-                        "cancelled"
-                    );
-                    keys_finished = true;
-                }
-                FrameType::Request => scroll_question = Some(frame),
-                _ => panic!("unexpected frame: {frame:?}"),
-            }
-        }
+        let response = rig.reply().await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.corr, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["outcome"],
+            "cancelled"
+        );
+        let keys_finished = response.header.ty == FrameType::Response && response.header.corr == 1;
+        let question = rig.planes.consent_test.as_ref().unwrap().card(7, 1).await;
         assert!(keys_finished);
-        let question = scroll_question.expect("scroll ran after keys released the lane");
         assert_eq!(
             serde_json::from_slice::<Value>(&question.body).unwrap()["params"]["target"]["kind"],
             "machine"
