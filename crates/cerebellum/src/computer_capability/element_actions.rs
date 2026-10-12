@@ -31,7 +31,7 @@ use cerebellum_computer::app_state::source::{
     TextAttribute,
 };
 use cerebellum_computer::audit::{
-    ActuationElementIdentity, ActuationIntent, ComputerAudit, ComputerCapability,
+    ActuationElementIdentity, ActuationIntent, AuditToken, ComputerCapability,
     ComputerPlaneDescriptor, ObservationState,
 };
 use cerebellum_computer::grounding::ContainmentRung;
@@ -434,7 +434,10 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
-    pub audit: &'a mut ComputerAudit<R, T, S>,
+    /// The call's handle on the shared audit: each step locks it briefly.
+    /// The intent's commit first asks the call's dispatch gate, so a call
+    /// already answered sends nothing.
+    pub audit: AuditToken<R, T, S>,
     pub identity: JournalIdentity,
     pub capability: ComputerCapability,
     grant: &'a ProcessGrant,
@@ -442,28 +445,40 @@ where
     recorded: bool,
 }
 
-impl<R, T, S> ElementJournal<'_, R, T, S>
+impl<'a, R, T, S> ElementJournal<'a, R, T, S>
 where
     R: Redactor,
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
+    pub(crate) fn new(
+        audit: AuditToken<R, T, S>,
+        identity: JournalIdentity,
+        capability: ComputerCapability,
+        grant: &'a ProcessGrant,
+    ) -> Self {
+        Self {
+            audit,
+            identity,
+            capability,
+            grant,
+            pending: None,
+            recorded: false,
+        }
+    }
+
     /// Record a refusal decided after the element was found, before anything
     /// was sent to it.
     fn refused(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
         self.recorded = true;
-        let handle = self
-            .audit
-            .reserve(self.identity.clone(), descriptor(self.capability))
-            .map_err(|_| ())?;
         self.audit
-            .finalize_rejected(
-                handle,
+            .reject(
+                self.identity.clone(),
+                descriptor(self.capability),
                 json!({"outcome": outcome, "role": role, "grant_identity": self.grant})
                     .to_string()
                     .into_bytes(),
             )
-            .map(|_| ())
             .map_err(|_| ())
     }
 
@@ -474,26 +489,44 @@ where
         element_id: &str,
         action: &str,
         role: &str,
-    ) -> Result<DispatchCommitmentToken, ()> {
+    ) -> Result<DispatchCommitmentToken, IntentRefused> {
         let descriptor = descriptor(self.capability);
+        let identity = self.identity.clone();
         let handle = self
             .audit
-            .reserve(self.identity.clone(), descriptor.clone())
-            .map_err(|_| ())?;
-        self.audit
-            .commit_actuation_intent(
+            .with_audit(|audit| audit.reserve(identity, descriptor.clone()))
+            .map_err(|_| IntentRefused::AuditUnavailable)?;
+        // Ask the call's dispatch gate before committing the intent: the call
+        // may have been answered (deadline, cancel, drain) while this worker
+        // ran, and then nothing more is sent.
+        if !self.audit.gate().begin_mutation() {
+            self.recorded = true;
+            let _ = self.audit.finalize_rejected(
                 handle,
-                &descriptor,
-                &ActuationIntent {
-                    element: Some(ActuationElementIdentity {
-                        matched_by: AccessibilityElementName::Identifier(element_id.to_string()),
-                        alternate_name: None,
-                    }),
-                    action: format!("{action} {role}"),
-                    grant_identity: grant.clone(),
-                },
-            )
-            .map_err(|_| ())
+                json!({"outcome": "dispatch_stopped", "role": role, "grant_identity": grant})
+                    .to_string()
+                    .into_bytes(),
+            );
+            return Err(IntentRefused::Stopped);
+        }
+        self.audit
+            .with_audit(|audit| {
+                audit.commit_actuation_intent(
+                    handle,
+                    &descriptor,
+                    &ActuationIntent {
+                        element: Some(ActuationElementIdentity {
+                            matched_by: AccessibilityElementName::Identifier(
+                                element_id.to_string(),
+                            ),
+                            alternate_name: None,
+                        }),
+                        action: format!("{action} {role}"),
+                        grant_identity: grant.clone(),
+                    },
+                )
+            })
+            .map_err(|_| IntentRefused::AuditUnavailable)
     }
 
     fn outcome(&mut self, token: DispatchCommitmentToken, outcome: &str) -> Result<(), ()> {
@@ -511,7 +544,6 @@ where
                     json!({"outcome": outcome}).to_string().into_bytes(),
                     Vec::new(),
                 )
-                .map(|_| ())
                 .map_err(|_| ())
         } else if !self.recorded
             && cerebellum_computer::audit::AccessibilityReadScope::current().is_some()
@@ -526,6 +558,23 @@ where
                 .map_err(|_| ())
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Why an element action's intent was not committed.
+enum IntentRefused {
+    /// The journal could not record the intent, so nothing is sent.
+    AuditUnavailable,
+    /// The call was answered before the action could start.
+    Stopped,
+}
+
+impl IntentRefused {
+    fn reply(self) -> Value {
+        match self {
+            Self::AuditUnavailable => audit_unavailable_reply(false),
+            Self::Stopped => super::quarantine::stopped_before_dispatch_reply(),
         }
     }
 }
@@ -604,11 +653,29 @@ where
             ),
         });
     }
-    let Ok(token) = journal.intent(grant, element_id, "AXPress", &role) else {
-        return audit_unavailable_reply(false);
+    let token = match journal.intent(grant, element_id, "AXPress", &role) {
+        Ok(token) => token,
+        Err(refused) => return refused.reply(),
     };
     let (outcome, reply) = match source.press(handle) {
         Ok(()) => ("completed", json!({"outcome": "completed"})),
+        // The press was sent and no answer came back in time: it may have
+        // happened, so this is never a refusal that is safe to retry.
+        Err(ElementActionError::Indeterminate) => (
+            "dispatch_outcome_unknown",
+            json!({
+                "outcome": "dispatch_outcome_unknown",
+                "effect_status": "effect_indeterminate",
+                "detail": {
+                    "reason": "application_did_not_answer",
+                    "dispatched": true,
+                    "step": "dispatch",
+                    "call": "AXPress",
+                    "held_state": "none_held",
+                },
+                "remedy": "read the state before retrying",
+            }),
+        ),
         Err(ElementActionError::Gone) => ("stale_element", stale_element_reply()),
         Err(_) => (
             "no_press_action",
@@ -753,8 +820,9 @@ where
             }
         }
     };
-    let Ok(token) = journal.intent(grant, element_id, action, &role) else {
-        return audit_unavailable_reply(false);
+    let token = match journal.intent(grant, element_id, action, &role) {
+        Ok(token) => token,
+        Err(refused) => return refused.reply(),
     };
     // One attempt. Whether the application accepted the message or not, the
     // value read back is what decides, and nothing is retried as keystrokes.
@@ -1047,7 +1115,15 @@ where
         let mut reply = json!({"outcome":"completed"});
         let mut acted = false;
         let mut unreadable = false;
+        let work = super::quarantine::CallWork::current();
         for (index, id) in parsed.element_ids.iter().enumerate() {
+            // Once the call has been answered, no later step starts: not its
+            // press, and not the reads that would precede it.
+            if index > 0 && work.stopped() {
+                reply = super::quarantine::stopped_before_dispatch_reply();
+                reply["stopped_at"] = json!(index + 1);
+                break;
+            }
             let different_app = match (grant.as_ref(), sessions.resolve(conversation, id)) {
                 (
                     Some(first),
@@ -1338,7 +1414,12 @@ where
             admission.decorate(&mut refusal);
             return refusal;
         }
-        let audit = self.audit.clone();
+        let work = super::quarantine::CallWork::current();
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+            admission.decorate(&mut busy);
+            return busy;
+        }
+        let audit = AuditToken::new(self.audit.clone(), work.gate());
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
         self.cursor.schedule(
@@ -1350,16 +1431,10 @@ where
             None,
         );
         let mut reply = tokio::task::spawn_blocking(move || {
+            let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            let mut audit = audit.blocking_lock();
-            let mut journal = ElementJournal {
-                audit: &mut audit,
-                identity,
-                capability: ComputerCapability::WriteText,
-                grant: &grant,
-                pending: None,
-                recorded: false,
-            };
+            let mut journal =
+                ElementJournal::new(audit, identity, ComputerCapability::WriteText, &grant);
             let written = write_blocking(
                 source.as_ref(),
                 &mut journal,
@@ -1469,11 +1544,16 @@ where
         target: PressTarget,
         view: super::StateView,
     ) -> Value {
-        let audit = self.audit.clone();
+        let work = super::quarantine::CallWork::current();
+        if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
+            return busy;
+        }
+        let mut audit = AuditToken::new(self.audit.clone(), work.gate());
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
         let cursor = self.cursor.clone();
         tokio::task::spawn_blocking(move || {
+            let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
             let point = match &target { PressTarget::Point(point) => Some([point.0, point.1]), _ => None };
             let (element_id, handle) = match target {
@@ -1491,7 +1571,7 @@ where
                     match found {
                         Ok(found) => found,
                         Err(reply) => {
-                            if audit.blocking_lock().record_accessibility_read(identity.clone(), capability, &grant, || ()).is_err() {
+                            if audit.record_accessibility_read(identity.clone(), capability, &grant, || ()).is_err() {
                                 return audit_unavailable_reply(false);
                             }
                             return reply;
@@ -1501,15 +1581,7 @@ where
             };
             cursor.schedule(identity.agent_project_id.clone(), cerebellum_computer::cursor::CursorKind::Press,
                 grant.clone(), source.clone(), Some(handle.clone()), point);
-            let mut audit = audit.blocking_lock();
-            let mut journal = ElementJournal {
-                audit: &mut audit,
-                identity: identity.clone(),
-                capability,
-                grant: &grant,
-                pending: None,
-                recorded: false,
-            };
+            let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if reply["outcome"] == "completed" {
                 let observed = settle_and_observe_view(

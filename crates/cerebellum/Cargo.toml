@@ -127,3 +127,7 @@ test = true
 [[example]]
 name = "v13_desk_arms"
 test = true
+
+[[example]]
+name = "stuck_app_desk_probe"
+test = true

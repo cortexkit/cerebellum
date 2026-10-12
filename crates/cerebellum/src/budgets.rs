@@ -66,7 +66,12 @@ pub const CDP_RELEASE_MS: u64 = CDP_STEP_MS;
 pub const RELEASE_BUDGET_MS: u64 = max(SYNTHETIC_RELEASE_MS, CDP_RELEASE_MS);
 pub const BOUNDARY_SLACK_MS: u64 = 5_000;
 pub const IN_FLIGHT_MARGIN_MS: u64 = 5_000;
-pub const MAX_BLOCKING_WORKERS_COMPUTER: usize = 2;
+// Each executing computer call holds two permits (work and release), so 8
+// lets four calls on different applications run at once, as computer calls
+// on different applications could before permits existed.
+// The bound exists to cap the threads stuck applications can hold, not to
+// serialize healthy ones; no budget or reply formula depends on it.
+pub const MAX_BLOCKING_WORKERS_COMPUTER: usize = 8;
 pub const MAX_BLOCKING_WORKERS_BROWSER: usize = 2;
 pub const MAX_CALL_RECORD_WORKERS: usize = 2;
 
