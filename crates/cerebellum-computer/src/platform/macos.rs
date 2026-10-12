@@ -204,6 +204,48 @@ fn dispatch_synthetic_to_pid(
     })
 }
 
+/// Post the releasing events of `action`, and only those, to the granted
+/// process generation, each through the same generation-checked routing as
+/// any post. Every release is attempted even when an earlier one fails, and
+/// any failure is reported, because only all of them returning shows the
+/// held input was released.
+fn release_held_to_pid(
+    target: &ProcessGrant,
+    action: &SyntheticAction,
+    transport: &mut impl PerProcessEventTransport<Event = cerebellum_macos::OwnedCgEvent>,
+) -> Result<u64, DriverError> {
+    let start_time_micros = target
+        .process_generation_evidence
+        .parse::<u64>()
+        .map_err(|_| {
+            DriverError::InvalidRequest("process generation evidence is not a kernel start time")
+        })?;
+    let process = ProcessEventTarget {
+        pid: target.pid,
+        start_time_micros,
+    };
+    let mut released = 0_u64;
+    let mut failed = None;
+    for step in super::macos_synthetic::synthetic_event_steps(action)? {
+        if step.role != super::process_event::SyntheticStepRole::Release {
+            continue;
+        }
+        transport.set_recovery(true);
+        match route_event_to_process(process, step.event, transport) {
+            Ok(_) => released += 1,
+            Err(refusal) => failed = Some(refusal),
+        }
+    }
+    match failed {
+        None => Ok(released),
+        Some(refusal) => Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+            posts_returned: released,
+            refusal,
+            held_state: HeldStateDisposition::Unknown,
+        })),
+    }
+}
+
 const SESSION_TAP_UNREAD_BOUND: usize = 256;
 static NEXT_HEARTBEAT_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1341,6 +1383,24 @@ impl PlatformDriver for MacOs26PlatformDriver {
             MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT)
         };
         let result = dispatch_synthetic_to_pid(&request, &mut transport, cancelled);
+        self.input_route_evidence = transport.evidence;
+        result
+    }
+    fn release_held(
+        &mut self,
+        target: &ProcessGrant,
+        action: &SyntheticAction,
+    ) -> Result<u64, DriverError> {
+        target.validate()?;
+        let mut transport = if matches!(
+            action,
+            SyntheticAction::TypeText { .. } | SyntheticAction::KeyCombination { .. }
+        ) {
+            MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT)
+        } else {
+            MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT)
+        };
+        let result = release_held_to_pid(target, action, &mut transport);
         self.input_route_evidence = transport.evidence;
         result
     }

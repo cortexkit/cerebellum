@@ -9,6 +9,7 @@
 mod attendance;
 mod bracket;
 mod effect;
+mod gate;
 pub mod post_condition;
 mod retry;
 mod seize;
@@ -17,13 +18,14 @@ mod wait;
 pub use attendance::*;
 pub use bracket::*;
 pub use effect::*;
+pub use gate::*;
 pub use retry::*;
 pub use seize::*;
 pub use wait::*;
 
 use crate::audit::{
-    ActuationElementIdentity, ActuationIntent, ActuationOutcome, ComputerAudit, ComputerCapability,
-    ComputerPlaneDescriptor, ObservationState,
+    ActuationAudit, ActuationElementIdentity, ActuationIntent, ActuationOutcome,
+    ComputerCapability, ComputerPlaneDescriptor, ObservationState,
 };
 use crate::grounding::ContainmentRung;
 use crate::platform::containment::{
@@ -41,9 +43,6 @@ use crate::platform::{
     TargetDisposition,
 };
 use cerebellum_core::consent::OnceDispatchToken;
-use cerebellum_core::journal::redaction::Redactor;
-use cerebellum_core::journal::severity::SeverityTaxonomy;
-use cerebellum_core::journal::storage::JournalStorage;
 use cerebellum_core::journal::{DispatchCommitmentToken, JournalIdentity, ReservationHandle};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -397,6 +396,9 @@ pub enum DispatchError {
     BackgroundUnsupportedTarget,
     Platform,
     AuditUnavailable,
+    /// The call reached its terminal decision (deadline, cancel, closed
+    /// route or drain) before this action could start, so nothing was sent.
+    DispatchStopped,
 }
 
 /// Every dispatch reason code is distinct.
@@ -463,6 +465,7 @@ mod reason_code_tests {
             DispatchError::BackgroundUnsupportedTarget,
             DispatchError::Platform,
             DispatchError::AuditUnavailable,
+            DispatchError::DispatchStopped,
         ];
 
         let mut seen: std::collections::BTreeMap<&'static str, usize> = Default::default();
@@ -526,6 +529,7 @@ impl DispatchError {
             Self::BackgroundUnsupportedTarget => "background_unsupported_target",
             Self::Platform => "platform_error",
             Self::AuditUnavailable => "audit_unavailable",
+            Self::DispatchStopped => "dispatch_stopped",
         }
     }
 }
@@ -536,6 +540,60 @@ impl fmt::Display for DispatchError {
     }
 }
 impl std::error::Error for DispatchError {}
+
+fn semantic_delivery_selected(request: &DispatchRequest) -> bool {
+    request.semantic.as_ref().is_some_and(|semantic| {
+        request.row.semantic_supported
+            && semantic.element.owning_process == request.target
+            && !request.semantic_known_ineffective
+    })
+}
+
+/// The journal descriptor a dispatch of `request` reserves its entry under.
+pub fn actuation_descriptor(
+    request: &DispatchRequest,
+) -> Result<ComputerPlaneDescriptor, DispatchError> {
+    let capability = ComputerCapability::parse(&request.row.capability_id)
+        .ok_or(DispatchError::InvalidRequest)?;
+    let containment = if semantic_delivery_selected(request) {
+        ContainmentRung::SemanticElement
+    } else {
+        match request.mode {
+            DispatchMode::Background => ContainmentRung::PidStructural,
+            DispatchMode::Observed => ContainmentRung::GlobalNone,
+        }
+    };
+    let observation = match request.mode {
+        DispatchMode::Observed => ObservationState::HumanObserved,
+        DispatchMode::Background => ObservationState::HumanUnobserved,
+    };
+    Ok(ComputerPlaneDescriptor::new(
+        capability,
+        containment,
+        observation,
+    ))
+}
+
+/// Reserve the journal entry a dispatch of `request` will use, before the
+/// blocking worker starts, so the entry exists whatever that worker later
+/// does. An observation reserves nothing, as in [`Dispatcher::dispatch`].
+pub fn reserve_actuation_ahead<R, T, S>(
+    token: &mut crate::audit::AuditToken<R, T, S>,
+    identity: JournalIdentity,
+    request: &DispatchRequest,
+) -> Result<(), DispatchError>
+where
+    R: cerebellum_core::journal::redaction::Redactor,
+    T: cerebellum_core::journal::severity::SeverityTaxonomy,
+    S: cerebellum_core::journal::storage::JournalStorage,
+{
+    if request.row.action_kind == ActionKind::Observe {
+        return Ok(());
+    }
+    token
+        .reserve_ahead(identity, actuation_descriptor(request)?)
+        .map_err(|_| DispatchError::AuditUnavailable)
+}
 
 pub struct Dispatcher<'a, D> {
     cancelled: &'a dyn Fn() -> bool,
@@ -610,17 +668,12 @@ impl<'a, D> Dispatcher<'a, D> {
 }
 
 impl<D: PlatformDriver> Dispatcher<'_, D> {
-    pub fn dispatch<R, T, S>(
+    pub fn dispatch<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         journal_identity: JournalIdentity,
         request: DispatchRequest,
-    ) -> Result<DispatchReport, DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<DispatchReport, DispatchError> {
         self.last_observed_abort = None;
         self.last_bracket = None;
         let mut audit_state = if request.row.action_kind == ActionKind::Observe {
@@ -628,7 +681,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         } else {
             let descriptor = Self::actuation_descriptor(&request)?;
             let handle = audit
-                .reserve(journal_identity, descriptor.clone())
+                .reserve_actuation(journal_identity, descriptor.clone())
                 .map_err(|_| DispatchError::AuditUnavailable)?;
             Some(ActuationAuditState::reserved(handle, descriptor))
         };
@@ -639,10 +692,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 .as_mut()
                 .filter(|state| state.needs_no_action_terminal())
             {
-                if audit
-                    .finalize_actuation_no_action(state.handle, refusal)
-                    .is_err()
-                {
+                if audit.finalize_no_action(state.handle, refusal).is_err() {
                     state.transition_failed = true;
                     return Err(DispatchError::AuditUnavailable);
                 }
@@ -652,17 +702,12 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         result
     }
 
-    fn dispatch_inner<R, T, S>(
+    fn dispatch_inner<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         audit_state: Option<&mut ActuationAuditState>,
         mut request: DispatchRequest,
-    ) -> Result<DispatchReport, DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<DispatchReport, DispatchError> {
         let predicate_bytes = request
             .expected_post_condition
             .serialize_before_dispatch()
@@ -839,69 +884,37 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
     }
 
     fn semantic_delivery_selected(request: &DispatchRequest) -> bool {
-        request.semantic.as_ref().is_some_and(|semantic| {
-            request.row.semantic_supported
-                && semantic.element.owning_process == request.target
-                && !request.semantic_known_ineffective
-        })
+        semantic_delivery_selected(request)
     }
 
     fn actuation_descriptor(
         request: &DispatchRequest,
     ) -> Result<ComputerPlaneDescriptor, DispatchError> {
-        let capability = ComputerCapability::parse(&request.row.capability_id)
-            .ok_or(DispatchError::InvalidRequest)?;
-        let containment = if Self::semantic_delivery_selected(request) {
-            ContainmentRung::SemanticElement
-        } else {
-            match request.mode {
-                DispatchMode::Background => ContainmentRung::PidStructural,
-                DispatchMode::Observed => ContainmentRung::GlobalNone,
-            }
-        };
-        let observation = match request.mode {
-            DispatchMode::Observed => ObservationState::HumanObserved,
-            DispatchMode::Background => ObservationState::HumanUnobserved,
-        };
-        Ok(ComputerPlaneDescriptor::new(
-            capability,
-            containment,
-            observation,
-        ))
+        actuation_descriptor(request)
     }
 
-    fn journal_no_action<R, T, S>(
-        audit: &mut ComputerAudit<R, T, S>,
+    fn journal_no_action<A: ActuationAudit>(
+        audit: &mut A,
         journal_identity: JournalIdentity,
         request: &DispatchRequest,
         refusal: &DispatchError,
-    ) -> Result<(), DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<(), DispatchError> {
         let descriptor = Self::actuation_descriptor(request)?;
         let handle = audit
-            .reserve(journal_identity, descriptor)
+            .reserve_actuation(journal_identity, descriptor)
             .map_err(|_| DispatchError::AuditUnavailable)?;
         audit
-            .finalize_actuation_no_action(handle, refusal)
+            .finalize_no_action(handle, refusal)
             .map_err(|_| DispatchError::AuditUnavailable)?;
         Ok(())
     }
 
-    pub fn dispatch_sequence<R, T, S>(
+    pub fn dispatch_sequence<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         journal_identity: &JournalIdentity,
         requests: impl IntoIterator<Item = DispatchRequest>,
-    ) -> Result<SequenceDispatchReport, DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<SequenceDispatchReport, DispatchError> {
         let mut completed = Vec::new();
         let mut previous_post_at_ms = None;
         for request in requests {
@@ -1057,9 +1070,9 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         Ok(evidence)
     }
 
-    fn deliver<R, T, S>(
+    fn deliver<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         mut audit_state: Option<&mut ActuationAuditState>,
         request: &DispatchRequest,
         once_dispatch_token: Option<OnceDispatchToken>,
@@ -1070,12 +1083,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
             Option<FocusEvidence>,
         ),
         DispatchError,
-    >
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    > {
         if let Some(semantic) = request.semantic.clone() {
             if Self::semantic_delivery_selected(request) {
                 if !semantic
@@ -1182,7 +1190,9 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     self.trace.push(DispatchPhase::PerPidDispatch);
                     return Ok((DeliveryPrimitive::PerPidSynthetic, result, None));
                 }
-                let result = match self.driver.dispatch_per_pid(synthetic, self.cancelled) {
+                let cancelled = self.cancelled;
+                let stopped = || cancelled() || audit.mutation_stopped();
+                let result = match self.driver.dispatch_per_pid(synthetic, &stopped) {
                     Ok(result) => {
                         self.finalize_audit_outcome(
                             audit,
@@ -1248,6 +1258,8 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 let token = once_dispatch_token.ok_or(DispatchError::AttendanceUnavailable)?;
                 let state = audit_state.ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
+                let cancelled = self.cancelled;
+                let stopped = || cancelled() || audit.mutation_stopped();
                 let result = match self.driver.dispatch_global(
                     GlobalDispatchRequest {
                         synthetic,
@@ -1257,7 +1269,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                             .maximum_seize_detection_latency_ms,
                         minimum_inter_post_interval_ms: request.row.minimum_inter_post_interval_ms,
                     },
-                    self.cancelled,
+                    &stopped,
                 ) {
                     Ok(result) => {
                         self.finalize_audit_outcome(
@@ -1333,26 +1345,23 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
     /// The bracket's report is kept whatever happens, because a bracket that
     /// stopped can still have left another application in front, and the
     /// caller must be able to say so.
-    fn deliver_fronted<R, T, S>(
+    fn deliver_fronted<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         state: &mut ActuationAuditState,
         request: &DispatchRequest,
         synthetic: SyntheticDispatchRequest,
         plan: FrontingBracketPlan,
-    ) -> Result<PlatformDispatchResult, DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<PlatformDispatchResult, DispatchError> {
+        let cancelled = self.cancelled;
+        let stopped = || cancelled() || audit.mutation_stopped();
         let fronted = self.driver.dispatch_fronted(
             FrontedDispatchRequest {
                 synthetic,
                 maximum_interval_ms: plan.maximum_interval_ms,
                 maximum_seize_detection_latency_ms: request.row.maximum_seize_detection_latency_ms,
             },
-            self.cancelled,
+            &stopped,
         );
         let report = match fronted {
             Ok(report) => report,
@@ -1448,20 +1457,21 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         }
     }
 
-    fn commit_audit_intent<R, T, S>(
-        audit: &mut ComputerAudit<R, T, S>,
+    fn commit_audit_intent<A: ActuationAudit>(
+        audit: &mut A,
         state: &mut ActuationAuditState,
         intent: &ActuationIntent,
-    ) -> Result<(), DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<(), DispatchError> {
         if state.token.is_some() || state.finalized || state.transition_failed {
             return Err(DispatchError::AuditUnavailable);
         }
-        match audit.commit_actuation_intent(state.handle, &state.descriptor, intent) {
+        // The computer gate point. The call may have been stopped while this
+        // worker was busy; from then on no intent is committed and nothing is
+        // sent, and the dispatch closes its reservation as a no-action.
+        if !audit.begin_mutation() {
+            return Err(DispatchError::DispatchStopped);
+        }
+        match audit.commit_intent(state.handle, &state.descriptor, intent) {
             Ok(token) => {
                 state.token = Some(token);
                 Ok(())
@@ -1473,20 +1483,15 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
         }
     }
 
-    fn finalize_audit_outcome<R, T, S>(
+    fn finalize_audit_outcome<A: ActuationAudit>(
         &mut self,
-        audit: &mut ComputerAudit<R, T, S>,
+        audit: &mut A,
         state: &mut ActuationAuditState,
         outcome: &ActuationOutcome,
-    ) -> Result<(), DispatchError>
-    where
-        R: Redactor,
-        T: SeverityTaxonomy,
-        S: JournalStorage,
-    {
+    ) -> Result<(), DispatchError> {
         let token = state.token.ok_or(DispatchError::AuditUnavailable)?;
         let routes = self.driver.take_input_route_evidence();
-        match audit.finalize_actuation_outcome_with_routes(token, outcome, &routes) {
+        match audit.finalize_outcome(token, outcome, &routes) {
             Ok(_) => {
                 state.finalized = true;
                 Ok(())

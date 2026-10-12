@@ -27,7 +27,9 @@ use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage
 use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
 use cerebellum_computer::app_state::AuditImageCustody;
-use cerebellum_computer::audit::{ComputerAudit, ComputerCapability};
+use cerebellum_computer::audit::{
+    lock_audit, AuditToken, ComputerAudit, ComputerCapability, SharedAudit,
+};
 use cerebellum_computer::capture::CaptureBackend;
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
@@ -87,6 +89,7 @@ pub mod image_freshness;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
 use read_image::ImageReadPlan;
+mod held_input;
 mod keystrokes;
 mod open_app;
 #[cfg(test)]
@@ -94,6 +97,10 @@ mod open_app_tests;
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
+mod quarantine;
+pub(crate) use quarantine::park_clock;
+#[cfg(test)]
+mod bounded_tests;
 mod serialize;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
@@ -475,8 +482,12 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
-    audit: Arc<Mutex<ComputerAudit<R, T, S>>>,
+    /// Locked only for each journal step, never across platform work: one
+    /// hung application must not stall journaling for every other one.
+    audit: SharedAudit<R, T, S>,
     serializer: serialize::Serializer,
+    /// Whether input this plane posted may still be held down.
+    held_input: Arc<held_input::HeldInput>,
     /// Startup-only readings, retained so a grant made while running cannot
     /// silently enable dispatch before the module has restarted.
     permissions: cerebellum_computer::platform::PermissionLivenessReport,
@@ -585,8 +596,9 @@ where
         make_synthetic_driver: Arc<dyn Fn() -> D + Send + Sync>,
     ) -> Self {
         Self {
-            audit: Arc::new(Mutex::new(audit)),
+            audit: Arc::new(StdMutex::new(audit)),
             serializer: serialize::Serializer::default(),
+            held_input: Arc::default(),
             permissions: crate::default_computer_context().startup.permissions,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
@@ -676,7 +688,7 @@ where
     /// reading the entries themselves, which would put a test in the position of
     /// interpreting the journal's contents to decide whether it was written to.
     pub async fn journal_entry_count(&self) -> u64 {
-        self.audit.lock().await.journal().next_sequence()
+        lock_audit(&self.audit).journal().next_sequence()
     }
 
     /// The lifecycle state one journal obligation settled into, if it exists.
@@ -688,9 +700,7 @@ where
         &self,
         action_obligation_id: u64,
     ) -> Option<cerebellum_core::journal::LifecycleState> {
-        self.audit
-            .lock()
-            .await
+        lock_audit(&self.audit)
             .read_obligation_audit(action_obligation_id)
             .ok()
             .map(|record| record.lifecycle)
@@ -771,8 +781,8 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
-        let _serialized = match self.serialize(capability, arguments, &mut context).await {
-            Ok(guard) => guard,
+        let admitted = match self.serialize(capability, arguments, &mut context).await {
+            Ok(admitted) => admitted,
             Err(refusal) => {
                 return self.finish_reply(
                     capability.capability(),
@@ -780,6 +790,50 @@ where
                 );
             }
         };
+        // Execution-lane acquisition: the call's work budget starts here, and
+        // so does its claim on blocking-worker capacity. Both permits are
+        // taken now or the call is refused before anything is dispatched; no
+        // permit is taken later, so exhaustion can never strike between an
+        // action and the observation or release that follows it.
+        let capability_id = capability.capability().capability_id();
+        let Some(permits) = self.serializer.permits.try_call() else {
+            return self.finish_reply(
+                capability.capability(),
+                serialize::refused_in_queue(
+                    capability,
+                    quarantine::capacity_exhausted_reply("queue", capability_id),
+                ),
+            );
+        };
+        if let Some(stuck) = self
+            .serializer
+            .quarantine
+            .busy(None, None, admitted.app.as_deref())
+        {
+            return self.finish_reply(
+                capability.capability(),
+                serialize::refused_in_queue(
+                    capability,
+                    quarantine::target_busy_reply(stuck, "queue"),
+                ),
+            );
+        }
+        let terminal = crate::TerminalArbiter::current();
+        let lease =
+            self.serializer
+                .quarantine
+                .enter(admitted.app.clone(), capability_id, terminal.clone());
+        let budget = capability_id
+            .strip_prefix("computer.")
+            .and_then(crate::budgets::computer)
+            .map_or(crate::budgets::MAX_ACTION_WORK_MS, |budget| budget.work_ms);
+        let work = quarantine::CallWork::new(
+            terminal,
+            std::time::Duration::from_millis(budget),
+            Some(lease),
+            Some(Arc::new(permits)),
+        );
+        let _lane = admitted.lane;
         // A locked screen hides application interfaces and cannot admit a new
         // launch either, so no call may mistake hidden windows for an
         // application with nothing there. Read after taking the app lock: the
@@ -795,38 +849,42 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
-        let mut reply = match capability.0 {
-            Served::ReadState => {
-                self.serve_read_state(arguments, context, make_backend)
-                    .await
-            }
-            Served::Wait => self.serve_wait(arguments, context).await,
-            Served::OpenApp => self.serve_open_app(arguments, context).await,
-            Served::ListApps => self.serve_list_apps(arguments, context).await,
-            Served::PressElement => self.serve_press_element(arguments, context).await,
-            Served::PressPoint => self.serve_press_point(arguments, context).await,
-            Served::WriteText => self.serve_write_text(arguments, context).await,
-            Served::Type => synthetic_wire_envelope(
-                self.serve_synthetic(ComputerCapability::Type, arguments, context)
-                    .await,
-            ),
-            Served::Keys => synthetic_wire_envelope(
-                self.serve_synthetic(ComputerCapability::Keys, arguments, context)
-                    .await,
-            ),
-            Served::TakeoverMove => {
-                self.serve_takeover(ComputerCapability::TakeoverMove, arguments, context)
-                    .await
-            }
-            Served::TakeoverDrag => {
-                self.serve_takeover(ComputerCapability::TakeoverDrag, arguments, context)
-                    .await
-            }
-            Served::TakeoverScroll => {
-                self.serve_takeover(ComputerCapability::TakeoverScroll, arguments, context)
-                    .await
-            }
-        };
+        let mut reply = work
+            .scope(async {
+                match capability.0 {
+                    Served::ReadState => {
+                        self.serve_read_state(arguments, context, make_backend)
+                            .await
+                    }
+                    Served::Wait => self.serve_wait(arguments, context).await,
+                    Served::OpenApp => self.serve_open_app(arguments, context).await,
+                    Served::ListApps => self.serve_list_apps(arguments, context).await,
+                    Served::PressElement => self.serve_press_element(arguments, context).await,
+                    Served::PressPoint => self.serve_press_point(arguments, context).await,
+                    Served::WriteText => self.serve_write_text(arguments, context).await,
+                    Served::Type => synthetic_wire_envelope(
+                        self.serve_synthetic(ComputerCapability::Type, arguments, context)
+                            .await,
+                    ),
+                    Served::Keys => synthetic_wire_envelope(
+                        self.serve_synthetic(ComputerCapability::Keys, arguments, context)
+                            .await,
+                    ),
+                    Served::TakeoverMove => {
+                        self.serve_takeover(ComputerCapability::TakeoverMove, arguments, context)
+                            .await
+                    }
+                    Served::TakeoverDrag => {
+                        self.serve_takeover(ComputerCapability::TakeoverDrag, arguments, context)
+                            .await
+                    }
+                    Served::TakeoverScroll => {
+                        self.serve_takeover(ComputerCapability::TakeoverScroll, arguments, context)
+                            .await
+                    }
+                }
+            })
+            .await;
         // The call went ahead without knowing whether the screen was locked.
         // Said on the reply so an empty tree or a missing element is not
         // taken for an application that has nothing there.
@@ -911,6 +969,11 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        let work = quarantine::CallWork::current();
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+            admission.decorate(&mut busy);
+            return busy;
+        }
         let takeover = !consent.unattended
             && management.computer_grants().holds(
                 &consent.caller,
@@ -967,7 +1030,14 @@ where
         );
         let expand_menus =
             sessions.zoom_expands_menus(&conversation_key, &grant, parsed.zoom.as_deref());
-        let (raw, manual_accessibility, seen) = tokio::task::spawn_blocking(move || {
+        let read_work = work.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let _ax = read_work.bound_ax();
+            // Expanding menus presses them, so it is a mutation: a call stopped
+            // while it waited for this worker reads nothing further.
+            if expand_menus && !read_work.begin_mutation() {
+                return None;
+            }
             let _scope =
                 cerebellum_computer::audit::AccessibilityReadScope::new(read_grant.pid, None);
             // Read before the tree, so a change the person makes while the
@@ -979,14 +1049,17 @@ where
             } else {
                 source.read_app_state(&read_grant, ReadBounds::default())
             };
-            (
+            Some((
                 raw,
                 cerebellum_computer::audit::AccessibilityReadScope::current(),
                 Some(seen),
-            )
+            ))
         })
         .await
-        .unwrap_or((Err(AppStateReadError::Unreadable), None, None));
+        .unwrap_or(Some((Err(AppStateReadError::Unreadable), None, None)));
+        let Some((raw, manual_accessibility, seen)) = read else {
+            return quarantine::stopped_before_dispatch_reply();
+        };
         let mut raw = match raw {
             Ok(raw) => raw,
             Err(AppStateReadError::TargetGone) => {
@@ -1098,6 +1171,7 @@ where
                     bracket_admitted: self.fronting_bracket_admitted,
                     cancel: Some(cancel),
                     now_ms,
+                    gate: None,
                 },
             )
             .await
@@ -1184,12 +1258,15 @@ where
         let make_driver = self.make_synthetic_driver.clone();
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
+        let work = quarantine::CallWork::current();
+        let mut image_plan = image_plan;
+        image_plan.gate = Some(work.gate());
         tokio::task::spawn_blocking(move || {
+            let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
                 grant.pid,
                 manual_accessibility,
             );
-            let mut audit = audit.blocking_lock();
             let evidence =
                 std::cell::RefCell::new(cerebellum_computer::app_state::ImageReadEvidence {
                     decision: image_plan
@@ -1198,7 +1275,7 @@ where
                     fronting: None,
                 });
             let mut custody = AuditImageCustody {
-                audit: &mut audit,
+                audit: &audit,
                 identity,
                 now_ms,
                 summary,
@@ -1221,7 +1298,10 @@ where
                 // The observed bracket posts a heartbeat, just as keys does;
                 // do not mistake that input for the person's next action.
                 let mut posting = (image_plan.bring_to_front && image_plan.takeover).then(|| {
-                    own_input.begin_posting(person::last_input_instant(input_source.as_ref()))
+                    let posting =
+                        own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
+                    work.publish_posting(&own_input, &posting);
+                    posting
                 });
                 let captured = read_image::capture(
                     backend,
@@ -1300,24 +1380,24 @@ where
                 None,
             );
             let timeout_ms = parsed.timeout_ms;
-            let audit = self.audit.clone();
+            let work = quarantine::CallWork::current();
+            if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
+                return busy;
+            }
+            let mut token = AuditToken::new(self.audit.clone(), work.gate());
             match tokio::task::spawn_blocking(move || {
+                let _ax = work.bound_ax();
                 let _scope =
                     cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-                audit.blocking_lock().record_accessibility_read(
-                    identity,
-                    ComputerCapability::Wait,
-                    &grant,
-                    || {
-                        let mut poller = PlatformPredicatePoller::new(
-                            NativeComputerPlatformDriver::default(),
-                            grant.clone(),
-                        );
-                        wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
-                            cancel.is_cancelled()
-                        })
-                    },
-                )
+                token.record_accessibility_read(identity, ComputerCapability::Wait, &grant, || {
+                    let mut poller = PlatformPredicatePoller::new(
+                        NativeComputerPlatformDriver::default(),
+                        grant.clone(),
+                    );
+                    wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
+                        cancel.is_cancelled()
+                    })
+                })
             })
             .await
             {
@@ -1434,6 +1514,18 @@ where
             admission.decorate(&mut refusal);
             return unposted(refusal);
         }
+        let work = quarantine::CallWork::current();
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+            admission.decorate(&mut busy);
+            return unposted(busy);
+        }
+        if let Err(mut unconfirmed) = self
+            .confirm_held_input_released(capability.capability_id(), management, &work)
+            .await
+        {
+            admission.decorate(&mut unconfirmed);
+            return unposted(unconfirmed);
+        }
 
         if consent.unattended
             && keystrokes::key_delivery(
@@ -1456,7 +1548,9 @@ where
         // keystrokes go to the target whichever application is in front.
         let source = self.app_state_source.clone();
         let focus_grant = grant.clone();
+        let focus_work = work.clone();
         let focus = tokio::task::spawn_blocking(move || {
+            let _ax = focus_work.bound_ax();
             keystrokes::read_target_focus(source.as_ref(), &focus_grant)
         })
         .await
@@ -1646,6 +1740,7 @@ where
             SyntheticAction::TypeText { text } => Some(text.clone()),
             _ => None,
         };
+        let held_press = held_input::HeldPress::per_process(&grant, &parsed.action);
         let mut request = DispatchRequest::new(
             row,
             mode,
@@ -1659,22 +1754,39 @@ where
             request = request.with_fronting_bracket(bound);
         }
 
+        // The journal entry is reserved here, under a short lock, before the
+        // blocking worker starts; the worker commits and finalizes it through
+        // the token, so no audit lock is held across platform work.
+        let mut token = AuditToken::new(self.audit.clone(), work.gate());
+        if cerebellum_computer::dispatch::reserve_actuation_ahead(
+            &mut token,
+            identity.clone(),
+            &request,
+        )
+        .is_err()
+        {
+            return unposted(synthetic_dispatch_refusal(&DispatchError::AuditUnavailable));
+        }
+        let ticket = self.track_held_input(held_press, &work);
+
         // Posting is synchronous and may take seconds. Keep the frame reader
         // runnable even on a single-thread runtime so Cancel can set the signal.
-        let audit = self.audit.clone();
         let make_driver = self.make_synthetic_driver.clone();
         let conversation_key = identity.conversation_key.clone();
         let mut unposted_refusal = false;
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
+        let dispatch_work = work.clone();
         let (dispatched, bracket) = tokio::task::spawn_blocking(move || {
-            let mut audit = audit.blocking_lock();
+            let _ax = dispatch_work.bound_ax();
             let cancelled = || cancel.is_cancelled();
             let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
             let posting =
                 own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
-            let dispatched = dispatcher.dispatch(&mut audit, identity, request);
+            dispatch_work.publish_posting(&own_input, &posting);
+            let dispatched = dispatcher.dispatch(&mut token, identity, request);
             own_input.end_posting(posting);
+            settle_held_input(ticket, &dispatched, make_driver.as_ref());
             (dispatched, dispatcher.last_bracket().cloned())
         })
         .await
@@ -1759,7 +1871,9 @@ where
             let settle = element_actions::settle_bound(capability);
             let effect_deadline = element_actions::effect_deadline(capability);
             let mut finished = reply;
+            let observe_work = work.clone();
             reply = tokio::task::spawn_blocking(move || {
+                let _ax = observe_work.bound_ax();
                 // Polled up to the row's effect deadline rather than read once:
                 // an application renders typed text some time after the posts
                 // return, and a backgrounded Electron app takes the longest.
@@ -1794,6 +1908,67 @@ where
         reply
     }
 
+    /// Refuse an input action while input this plane posted may still be
+    /// held, after first discharging presses whose processes have exited and
+    /// then, when no worker with a possibly-held send is alive, posting the
+    /// held presses' paired releases itself. Only when every release returns
+    /// may the call go on.
+    pub(super) async fn confirm_held_input_released(
+        &self,
+        call: &str,
+        management: &ManagementPlane,
+        work: &quarantine::CallWork,
+    ) -> Result<(), Value> {
+        self.held_input.discharge_exited(|pid, generation| {
+            management
+                .process_for_pid(pid)
+                .is_some_and(|current| current.process_generation_evidence == generation)
+        });
+        let pending = match self.held_input.pending_release() {
+            Ok(None) => return Ok(()),
+            Ok(Some(pending)) => pending,
+            Err(()) => return Err(held_input::held_input_unconfirmed_reply(call)),
+        };
+        let make_driver = self.make_synthetic_driver.clone();
+        let held = self.held_input.clone();
+        let release_work = work.clone();
+        let released = tokio::task::spawn_blocking(move || {
+            let _ax = release_work.bound_ax();
+            let mut driver = make_driver();
+            held_input::release_pending(&held, pending, |press| {
+                held_input::release_one(press, &mut driver)
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if released {
+            Ok(())
+        } else {
+            Err(held_input::held_input_unconfirmed_reply(call))
+        }
+    }
+
+    /// Track a send that may leave a key or button held, and give the call's
+    /// terminal decision a release window that reports how it ended. The
+    /// call's release permit moves into that window, so its capacity returns
+    /// only when the release work really ends.
+    pub(super) fn track_held_input(
+        &self,
+        press: Option<held_input::HeldPress>,
+        work: &quarantine::CallWork,
+    ) -> Option<held_input::SendTicket> {
+        let ticket = self.held_input.begin_send(press?, work.terminal.clone());
+        if let Some(terminal) = &work.terminal {
+            let outcome = ticket.outcome();
+            let permit = work.permits().and_then(|permits| permits.take_release());
+            terminal.set_release(async move {
+                let _permit = permit;
+                outcome.await
+            });
+        }
+        Some(ticket)
+    }
+
     async fn record_blocked_chord(&self, caller: &str, chord: &str, reason: &str) {
         let _ = self.refusal_ring.lock().await.record_refusal(
             caller,
@@ -1816,13 +1991,26 @@ where
     /// the name is returned as it is and the process lookup refuses it as it
     /// would any unknown bundle identity.
     pub(crate) async fn resolve_target_name(&self, target: &str) -> Result<String, Value> {
+        self.resolve_target_name_holding(target, None).await
+    }
+
+    /// [`Self::resolve_target_name`] with the listing query holding `hold`, a
+    /// blocking-worker permit, until the query really ends.
+    pub(crate) async fn resolve_target_name_holding(
+        &self,
+        target: &str,
+        hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Result<String, Value> {
         if looks_like_bundle_identity(target) {
             return Ok(target.to_string());
         }
         let source = self.app_state_source.clone();
-        let listed = tokio::task::spawn_blocking(move || source.running_apps())
-            .await
-            .unwrap_or(Err(AppStateReadError::Unreadable));
+        let listed = tokio::task::spawn_blocking(move || {
+            let _permit = hold;
+            source.running_apps()
+        })
+        .await
+        .unwrap_or(Err(AppStateReadError::Unreadable));
         match listed {
             Ok(apps) => match_target_name(target, &apps),
             Err(_) => Ok(target.to_string()),
@@ -1858,7 +2046,7 @@ where
             Err(_) => json!({"app_count":0,"listed":false}),
         };
         let journaled = tokio::task::spawn_blocking(move || {
-            journal_list_apps(&mut audit.blocking_lock(), identity, &summary)
+            journal_list_apps(&mut lock_audit(&audit), identity, &summary)
         })
         .await
         .unwrap_or(Err(()));
@@ -2702,7 +2890,26 @@ fn chord_action_kind(modifiers: SyntheticKeyModifiers) -> ActionKind {
     }
 }
 
+/// Settle a tracked send with the sequence's own report. When that report
+/// leaves the held state unknown, the worker has now returned, so its paired
+/// releases are posted here, outside the call's dispatch gate: a release is
+/// the one input a stopped call may still send.
+fn settle_held_input<T, D: PlatformDriver>(
+    ticket: Option<held_input::SendTicket>,
+    dispatched: &Result<T, DispatchError>,
+    make_driver: &(dyn Fn() -> D + Send + Sync),
+) {
+    if let Some(ticket) = ticket {
+        ticket.settle(held_input::disposition_of(dispatched), |press| {
+            held_input::release_one(press, &mut make_driver())
+        });
+    }
+}
+
 fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
+    if *refusal == DispatchError::DispatchStopped {
+        return quarantine::stopped_before_dispatch_reply();
+    }
     if let DispatchError::Cancelled {
         posts_returned,
         held_state,

@@ -55,6 +55,9 @@ fn action_error(error: AxElementActionError) -> ElementActionError {
         AxElementActionError::NotPermitted => ElementActionError::NotPermitted,
         AxElementActionError::ElementGone => ElementActionError::Gone,
         AxElementActionError::Unsupported => ElementActionError::Unsupported,
+        // kAXErrorCannotComplete: the message went out and no answer came
+        // back within the messaging timeout. The target may have acted.
+        AxElementActionError::Failed { ax_error: -25_204 } => ElementActionError::Indeterminate,
         AxElementActionError::Failed { .. } => ElementActionError::Failed,
     }
 }

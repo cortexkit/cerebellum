@@ -7,6 +7,9 @@
 //! severity inputs.
 
 pub mod redaction;
+mod token;
+
+pub use token::{lock_audit, ActuationAudit, AuditToken, SharedAudit};
 
 use crate::dispatch::{AbortDecision, DispatchError};
 use crate::grounding::ContainmentRung;

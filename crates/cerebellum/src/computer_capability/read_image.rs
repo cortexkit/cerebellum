@@ -21,6 +21,9 @@ pub(super) struct ImageReadPlan {
     pub bracket_admitted: bool,
     pub cancel: Option<crate::CancelHandle>,
     pub now_ms: u64,
+    /// The call's dispatch gate. Fronting the target is a mutation, so it
+    /// must still be open immediately before the bracket.
+    pub gate: Option<std::sync::Arc<dyn cerebellum_computer::dispatch::MutationGate>>,
 }
 
 pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
@@ -57,10 +60,19 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
+    // Bringing the target forward changes which application has the person's
+    // focus, so it is a mutation: the call's gate must still be open.
+    let gate = plan.gate.as_deref();
+    if gate.is_some_and(|gate| !gate.begin_mutation()) {
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
     let bracket = driver.read_fronted(
         grant,
         bound,
-        &|| plan.cancel.as_ref().is_some_and(|c| c.is_cancelled()),
+        &|| {
+            plan.cancel.as_ref().is_some_and(|c| c.is_cancelled())
+                || gate.is_some_and(|gate| gate.stopped())
+        },
         &mut || {
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

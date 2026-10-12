@@ -17,7 +17,7 @@ pub mod source;
 use cerebellum_core::journal::{JournalIdentity, JournalStorage, Redactor, SeverityTaxonomy};
 
 use crate::audit::{
-    ComputerAudit, ComputerCapability, ComputerPlaneDescriptor, ObservationState,
+    lock_audit, ComputerCapability, ComputerPlaneDescriptor, ObservationState, SharedAudit,
     TypedCaptureDispatch,
 };
 use crate::capture_custody::{CaptureScope, CustodyUnavailable, PixelArtifact};
@@ -32,7 +32,9 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
-    pub audit: &'a mut ComputerAudit<R, T, S>,
+    /// Locked only for each journal or custody step, never across the
+    /// capture itself, so a slow window read cannot stall other actions.
+    pub audit: &'a SharedAudit<R, T, S>,
     pub identity: JournalIdentity,
     pub now_ms: u64,
     pub summary: ReadStateSummary,
@@ -72,7 +74,7 @@ where
     type Admission = crate::capture_custody::CaptureAdmissionToken;
 
     fn reserve(&mut self) -> Result<Self::Reservation, CustodyStepFailed> {
-        self.audit
+        lock_audit(self.audit)
             .reserve(self.identity.clone(), descriptor())
             .map_err(|_| CustodyStepFailed)
     }
@@ -81,7 +83,7 @@ where
         &mut self,
         reservation: &Self::Reservation,
     ) -> Result<Self::Admission, CustodyStepFailed> {
-        self.audit
+        lock_audit(self.audit)
             .prepare_capture(*reservation, CaptureScope::PerWindow, None, self.now_ms)
             .map_err(|_| CustodyStepFailed)
     }
@@ -101,14 +103,14 @@ where
             width_px,
             height_px,
         );
-        let artifact_id = self
-            .audit
+        let mut audit = lock_audit(self.audit);
+        let artifact_id = audit
             .admit_capture(admission, artifact, self.now_ms)
             .map_err(|_| RetainFailure::NotRetained)?;
         // Custody must hold what is about to be returned. Checked rather than
         // assumed, because a reply carrying an image custody never took looks
         // exactly like a correct one at the wire.
-        match self.audit.custody().artifact_readable(&artifact_id) {
+        match audit.custody().artifact_readable(&artifact_id) {
             Ok(true) => Ok(()),
             Ok(false) => Err(RetainFailure::NotRetained),
             Err(CustodyUnavailable) => Err(RetainFailure::CustodyUnavailable),
@@ -140,8 +142,7 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
         .dispatch_material(
             serde_json::to_vec(&self.summary.grant_identity).map_err(|_| CustodyStepFailed)?,
         );
-        let token = self
-            .audit
+        let token = lock_audit(self.audit)
             .commit_dispatched(reservation, &dispatch, b"app_grant".to_vec(), None)
             .map_err(|_| CustodyStepFailed)?;
         let mut result = serde_json::json!({
@@ -160,7 +161,7 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
             result["longest_fronted_interval_ms"] =
                 serde_json::json!(fronting.longest_fronted_interval_ms);
         }
-        self.audit
+        lock_audit(self.audit)
             .finalize_dispatched(
                 token,
                 serde_json::to_vec(&result).map_err(|_| CustodyStepFailed)?,

@@ -1523,7 +1523,8 @@ mod platform {
                     code: AX_ERROR_API_DISABLED,
                 });
             };
-            let seconds = remaining.as_secs_f32().max(f32::MIN_POSITIVE);
+            // Never longer than the calling worker's remaining work budget.
+            let seconds = crate::ax_budget::messaging_timeout(remaining).as_secs_f32();
             // SAFETY: `application` is a retained AXUIElement application value.
             // This setter changes only the timeout used by subsequent
             // accessibility messages to the target application.
@@ -2004,6 +2005,9 @@ mod platform {
         Ok(strings)
     }
 
+    /// The longest one focus reading may wait for the accessibility server.
+    const FOCUS_READ_TIMEOUT_SECONDS: f32 = 1.0;
+
     /// The unix process id of the application that holds keyboard focus,
     /// asked of the accessibility server each call.
     ///
@@ -2027,6 +2031,16 @@ mod platform {
         // count is returned to the caller and released by OwnedCf.
         let system_wide = unsafe { OwnedCf::from_created(AXUIElementCreateSystemWide()) }
             .ok_or(FocusReadError::SystemWideElementUnavailable)?;
+        // SAFETY: the element is retained for the call. The system-wide
+        // element's timeout is shared by the whole process, so the last
+        // writer wins; every writer is bounded, which keeps this read bounded
+        // by the calling worker's remaining work budget or one second.
+        unsafe {
+            AXUIElementSetMessagingTimeout(
+                system_wide.as_ptr(),
+                crate::ax_budget::messaging_timeout_seconds(FOCUS_READ_TIMEOUT_SECONDS),
+            )
+        };
         let attribute = CFString::from_static_str("AXFocusedApplication");
         let mut value = std::ptr::null();
         // SAFETY: the element and the attribute string are retained for the

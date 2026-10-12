@@ -111,7 +111,15 @@ pub(crate) struct TerminalState {
     step: CallStep,
     release: Option<ReleaseJob>,
     pub(crate) settlement: Option<PendingSettlement>,
+    /// Run once, under this state's lock, at the moment the terminal is
+    /// chosen, then dropped. They hold this lock while they run, so each must
+    /// be constant-time and non-blocking: no I/O, no await, and no lock but
+    /// the one small cell it closes (a posting interval in the own-input
+    /// ledger).
+    on_terminal: Vec<TerminalHook>,
 }
+
+type TerminalHook = Box<dyn FnOnce() + Send>;
 
 /// One decision shared by the route task and its workers. A worker retains this
 /// handle when detached, but cannot change a terminal that has already won.
@@ -144,6 +152,7 @@ impl TerminalArbiter {
                 step: CallStep::Admission,
                 release: None,
                 settlement: None,
+                on_terminal: Vec::new(),
             }),
             request,
             changed: tokio::sync::Notify::new(),
@@ -185,6 +194,9 @@ impl TerminalArbiter {
             .store(committed, std::sync::atomic::Ordering::SeqCst);
         self.gate_dispatched
             .store(dispatched, std::sync::atomic::Ordering::SeqCst);
+        for hook in std::mem::take(&mut state.on_terminal) {
+            hook();
+        }
         state.cause = result.is_none().then_some(cause);
         state.possibly_dispatched = dispatched || committed;
         state.chosen = Some(result.unwrap_or_else(|| {
@@ -225,6 +237,24 @@ impl TerminalArbiter {
             .expect("terminal frame fits")
         }));
         self.changed.notify_one();
+        true
+    }
+
+    /// Register `close` to run under the terminal-state lock when the terminal
+    /// is chosen. Returns true when registered. Returns false, running
+    /// nothing, when the terminal was already chosen: the caller must then do
+    /// the work of `close` itself. Either way it happens exactly once.
+    ///
+    /// A worker publishes a posting interval this way as soon as it opens one,
+    /// so no interval stays open after its call's terminal, however long the
+    /// worker itself stays blocked. `close` must be constant-time and
+    /// non-blocking; see `TerminalState::on_terminal`.
+    pub fn publish_or_close(&self, close: Box<dyn FnOnce() + Send>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.chosen.is_some() {
+            return false;
+        }
+        state.on_terminal.push(close);
         true
     }
 
@@ -526,6 +556,47 @@ mod arbiter_egress_tests {
     fn body(terminal: &TerminalArbiter) -> Value {
         serde_json::from_slice(&terminal.state.lock().unwrap().chosen.as_ref().unwrap().body)
             .unwrap()
+    }
+
+    #[test]
+    fn terminal_hooks_run_once_per_terminal_and_never_after_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let causes: [Option<TerminalCause>; 5] = [
+            None,
+            Some(TerminalCause::Deadline),
+            Some(TerminalCause::Cancelled),
+            Some(TerminalCause::RouteClosed),
+            Some(TerminalCause::Draining),
+        ];
+        for cause in causes {
+            let terminal = TerminalArbiter::new(request());
+            let runs = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&runs);
+            assert!(terminal.publish_or_close(Box::new(move || {
+                counted.fetch_add(1, SeqCst);
+            })));
+            assert_eq!(runs.load(SeqCst), 0, "a hook runs only at the terminal");
+            match cause {
+                Some(cause) => assert!(terminal.stop(cause)),
+                None => assert!(terminal.complete(frame(
+                    FrameType::Response,
+                    1,
+                    br#"{"outcome":"ok"}"#.to_vec()
+                ))),
+            }
+            assert_eq!(runs.load(SeqCst), 1, "the hook ran once at the terminal");
+            assert!(!terminal.stop(TerminalCause::Cancelled));
+            assert_eq!(runs.load(SeqCst), 1, "a second choice runs nothing");
+            let late = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&late);
+            assert!(
+                !terminal.publish_or_close(Box::new(move || {
+                    counted.fetch_add(1, SeqCst);
+                })),
+                "registration after the terminal is reported to the caller"
+            );
+            assert_eq!(late.load(SeqCst), 0, "and its hook is never run");
+        }
     }
 
     #[test]

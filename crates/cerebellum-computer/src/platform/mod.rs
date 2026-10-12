@@ -1444,6 +1444,22 @@ pub trait PlatformDriver {
         request: GlobalDispatchRequest,
         _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError>;
+    /// Post only the releasing events of `action` to the granted process
+    /// generation: the paired release for input a stopped or stuck call may
+    /// have left held. Returns how many release posts returned.
+    ///
+    /// This is the one input path exempt from a stopped call's dispatch
+    /// gate. It never posts a press, only the releases the action itself
+    /// would have posted, through the same generation-checked routing. The
+    /// default refuses, so a platform without it reports the held state as
+    /// unknown rather than released.
+    fn release_held(
+        &mut self,
+        _target: &ProcessGrant,
+        _action: &SyntheticAction,
+    ) -> Result<u64, DriverError> {
+        Err(DriverError::Unsupported("paired release of held input"))
+    }
     /// Post to a target that is not frontmost through a fronting bracket.
     /// Returns the bracket's report however it ended once it started; an
     /// error means it never started.
