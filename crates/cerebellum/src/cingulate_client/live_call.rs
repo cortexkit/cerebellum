@@ -20,17 +20,24 @@ pub trait CallHold: Send + Sync {
     fn held(&self) -> bool;
 }
 
-/// The production hold: the request's in-flight guard is still alive (the
-/// frame loop drops it when the call's reply is sent) and the route the call
-/// arrived on is still bound.
+/// The production hold requires a retained accounting guard, a bound route,
+/// and an inbound reply that has not been finalized. Cleanup can retain the
+/// accounting guard after replying, so its reference count alone is not authority.
 struct InboundCallHold {
     guard: Weak<InFlightGuard>,
     route: Arc<dyn RouteLiveness>,
+    terminal: Option<Weak<crate::terminal_arbiter::TerminalArbiter>>,
 }
 
 impl CallHold for InboundCallHold {
     fn held(&self) -> bool {
-        self.guard.strong_count() > 0 && self.route.route_open()
+        self.guard.strong_count() > 0
+            && self.route.route_open()
+            && self.terminal.as_ref().is_none_or(|terminal| {
+                terminal
+                    .upgrade()
+                    .is_some_and(|terminal| terminal.consent_call_held())
+            })
     }
 }
 
@@ -87,6 +94,9 @@ impl LiveCall {
     ) -> Result<Self, NotLive> {
         let hold = Arc::new(InboundCallHold {
             guard: Arc::downgrade(guard),
+            terminal: crate::terminal_arbiter::TerminalArbiter::current()
+                .as_ref()
+                .map(Arc::downgrade),
             route,
         });
         Self::new(stamp, hold)

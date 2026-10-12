@@ -704,15 +704,16 @@ mod tests {
         let (writer, mut rx) = mpsc::channel(8);
         let arrived = tokio::time::Instant::now();
         handle_frame(frame, &writer, &planes).await.unwrap();
-        let question = rx.recv().await.expect("a consent card");
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
         assert_eq!(question.header.ty, FrameType::Request);
 
         let consent_wait = computer_grants::CONSENT_PARK_LIMIT - Duration::from_secs(1);
         tokio::time::sleep_until(arrived + consent_wait).await;
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_near_limit"}),
+            crate::elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_near_limit"})
+            ),
         ));
         let reply = rx.recv().await.expect("the capture's reply");
         let elapsed = arrived.elapsed();

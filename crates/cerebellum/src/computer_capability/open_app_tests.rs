@@ -92,6 +92,7 @@ fn rig_with_history(
         .into(),
     );
     planes.routes.insert(9,3,crate::AcceptedBindFacts::from_bind(&subc_protocol::BindIdentity::new("/test/project","test","test-session"),crate::session_caller_principal_for_test(),Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),Some(&["elicitation".into()]),&subc_protocol::RouteTarget::ToolProvider { module_id:"cerebellum".into() }));
+    let planes = crate::computer_grants::tests::CardService::install(planes, 9, 3);
     (planes, desk, storage)
 }
 
@@ -139,30 +140,20 @@ async fn wire_with_decision(
         .unwrap();
     let mut questions = 0;
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let value: Value = serde_json::from_slice(&frame.body).unwrap();
-        if frame.header.ty == FrameType::Request {
-            questions += 1;
-            assert!(value.to_string().contains("app"), "{value}");
-            let answer = Frame::build_with_version(
-                PROTOCOL_VERSION,
-                FrameType::Response,
-                Flags::new(false, Priority::Interactive, false),
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                serde_json::to_vec(&json!({"decision":decision})).unwrap(),
-            )
-            .unwrap();
-            crate::handle_frame_for_test(answer, &tx, planes)
-                .await
-                .unwrap();
-        } else {
-            assert_eq!(frame.header.ty, FrameType::Response, "{value}");
-            return (value, questions);
+        let service = planes.consent_test.as_ref().unwrap();
+        tokio::select! {
+            question = service.card(9, 3) => {
+                questions += 1;
+                let value: Value = serde_json::from_slice(&question.body).unwrap();
+                assert!(value.to_string().contains("app"), "{value}");
+                assert!(service.answer(question.header.corr, crate::elicit::AskOutcome::Answered(json!({"decision":decision}))));
+            }
+            frame = rx.recv() => {
+                let frame = frame.unwrap();
+                let value: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(frame.header.ty, FrameType::Response, "{value}");
+                return (value, questions);
+            }
         }
     }
 }

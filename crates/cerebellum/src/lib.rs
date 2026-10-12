@@ -1367,6 +1367,13 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             // A route under the scope whose close has not reached this module
             // yet belongs to the ended session too.
             conversations.extend(planes.routes.conversations_under_scope(&key));
+            let _ = planes
+                .consent
+                .forget_session(&cingulate_client::live_call::SessionKey {
+                    owner: serde_json::to_string(&key.owner).unwrap_or_default(),
+                    scope_ref: key.scope_ref.clone(),
+                    scope_epoch: key.scope_epoch,
+                });
             revoke_scope(&planes, &conversations).await;
             return;
         }
@@ -1468,6 +1475,28 @@ async fn scope_epoch_admits_bind(
 
 async fn cancel_conversation_cards(planes: &Planes, conversation_key: &str) {
     planes
+        .management
+        .computer_grants()
+        .forget_conversation_questions(conversation_key);
+    let sessions: Vec<_> = planes
+        .routes
+        .inner
+        .read()
+        .expect("route bindings lock poisoned")
+        .values()
+        .filter(|facts| facts.identity.conversation_key == conversation_key)
+        .filter_map(|facts| facts.scope.as_ref())
+        .map(|stamp| cingulate_client::live_call::SessionKey {
+            owner: serde_json::to_string(&stamp.owner).unwrap_or_default(),
+            scope_ref: stamp.scope_ref.clone(),
+            scope_epoch: stamp.scope_epoch,
+        })
+        .collect();
+    for session in sessions {
+        let _ = planes.consent.forget_session(&session);
+    }
+
+    planes
         .elicitor
         .cancel_where(|channel, epoch| {
             planes
@@ -1530,54 +1559,74 @@ impl computer_grants::RouteLiveness for BoundRoute {
     }
 }
 
-/// Puts a consent question to the person on the other end of one route.
+/// Cingulate routes require a live call from the attested agent session;
+/// permission to write replies to an inbound route grants no such authority.
 struct RouteCarrier {
-    elicitor: SharedElicitor,
-    writer: mpsc::Sender<Frame>,
-    channel: u16,
-    epoch: u32,
+    desk: Arc<cingulate_client::desk::ConsentDesk>,
+    facts: AcceptedBindFacts,
+    route: Arc<dyn computer_grants::RouteLiveness>,
+    guard: Option<Arc<cerebellum_core::dispatch::InFlightGuard>>,
     call_key: Option<String>,
 }
 
 impl computer_grants::QuestionCarrier for RouteCarrier {
-    fn put(
+    fn desk(&self) -> Arc<cingulate_client::desk::ConsentDesk> {
+        Arc::clone(&self.desk)
+    }
+    fn live(
         &self,
-        question: Value,
-        deadline: Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = elicit::AskOutcome> + Send>> {
-        let elicitor = Arc::clone(&self.elicitor);
-        let writer = self.writer.clone();
-        let (channel, epoch) = (self.channel, self.epoch);
-        let call_key = self.call_key.clone();
-        Box::pin(async move {
-            elicitor
-                .ask_for_call(&writer, channel, epoch, question, deadline, call_key)
-                .await
-        })
+    ) -> Result<cingulate_client::live_call::LiveCall, cingulate_client::live_call::NotLive> {
+        use cingulate_client::live_call::{LiveCall, NotLive};
+        let stamp = (self.facts.admits_session_calls()
+            && self.facts.agent_project_id_attested
+            && self.facts.flow_id.is_none())
+        .then_some(self.facts.scope.as_ref())
+        .flatten();
+        if stamp.is_none() {
+            return Err(NotLive::Unscoped);
+        }
+        let guard = self.guard.as_ref().ok_or(NotLive::CallEnded)?;
+        LiveCall::from_inbound(stamp, guard, Arc::clone(&self.route))
+    }
+    fn requester_ref(&self) -> Option<String> {
+        self.call_key.clone()
     }
 }
 
-/// What a login call on this route needs to ask the person and wait: the
-/// route's carrier, and the request's in-flight guard to park while it waits.
-/// Called only once the route was checked to declare elicitation.
+/// The live agent-session call that can raise the login card, and the
+/// in-flight guard that pauses busy accounting while the person decides.
 fn login_consent_request(
     planes: &Planes,
     facts: &AcceptedBindFacts,
-    writer: &mpsc::Sender<Frame>,
+    _writer: &mpsc::Sender<Frame>,
     (channel, epoch): (u16, u32),
     capability: computer_grants::LoginCapability,
     parameters: String,
+    cancel: Option<CancelHandle>,
 ) -> computer_grants::LoginConsentRequest {
     computer_grants::LoginConsentRequest {
         conversation_key: facts.identity.conversation_key.clone(),
         capability,
         parameters,
         carrier: Arc::new(RouteCarrier {
-            elicitor: Arc::clone(&planes.elicitor),
-            writer: writer.clone(),
+            desk: Arc::clone(&planes.consent),
+            facts: facts.clone(),
+            route: Arc::new(BoundRoute {
+                routes: Arc::clone(&planes.routes),
+                channel,
+                epoch,
+                conversation_key: facts.identity.conversation_key.clone(),
+            }),
+            guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+            call_key: elicit::current_call_key(),
+        }),
+        cancel,
+        drain: planes.drain_signal.subscribe(),
+        route: Arc::new(BoundRoute {
+            routes: Arc::clone(&planes.routes),
             channel,
             epoch,
-            call_key: elicit::current_call_key(),
+            conversation_key: facts.identity.conversation_key.clone(),
         }),
         park_guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
     }
@@ -1596,20 +1645,22 @@ tokio::task_local! {
 fn consent_context(
     planes: &Planes,
     facts: &AcceptedBindFacts,
-    writer: &mpsc::Sender<Frame>,
+    _writer: &mpsc::Sender<Frame>,
     channel: u16,
     epoch: u32,
 ) -> computer_grants::ConsentContext {
-    let carrier: Option<Arc<dyn computer_grants::QuestionCarrier>> =
-        facts.declares_elicitation().then(|| {
-            Arc::new(RouteCarrier {
-                elicitor: Arc::clone(&planes.elicitor),
-                writer: writer.clone(),
-                channel,
-                epoch,
-                call_key: elicit::current_call_key(),
-            }) as Arc<dyn computer_grants::QuestionCarrier>
-        });
+    let carrier: Option<Arc<dyn computer_grants::QuestionCarrier>> = Some(Arc::new(RouteCarrier {
+        desk: Arc::clone(&planes.consent),
+        facts: facts.clone(),
+        route: Arc::new(BoundRoute {
+            routes: Arc::clone(&planes.routes),
+            channel,
+            epoch,
+            conversation_key: facts.identity.conversation_key.clone(),
+        }),
+        guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+        call_key: elicit::current_call_key(),
+    }));
     let mut context = computer_grants::ConsentContext::new(
         computer_grants::GrantCaller {
             conversation_key: facts.identity.conversation_key.clone(),
@@ -2626,6 +2677,8 @@ pub struct Planes {
     /// Serializes answer-feed reads per session and calls each flow's adapter
     /// to elect one caller to store the answer's permission or approval.
     pub consent_drain: Arc<consent_drain::ConsentDrain>,
+    #[cfg(test)]
+    pub(crate) consent_test: Option<Arc<computer_grants::tests::CardService>>,
     /// The computer plane or the single typed reason it was withheld.
     ///
     /// Keeping the outcome in one field prevents availability and its diagnostic
@@ -2752,6 +2805,9 @@ impl Planes {
         self.consent = Arc::new(cingulate_client::desk::ConsentDesk::with_store(
             opener, store,
         ));
+        self.management
+            .computer_grants()
+            .register_drain(&self.consent_drain);
         self
     }
 
@@ -3073,6 +3129,8 @@ impl Planes {
             call_record_workers: Arc::new(CallRecordWorkers::default()),
             egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
+            #[cfg(test)]
+            consent_test: None,
         }
     }
 }
@@ -3112,6 +3170,8 @@ impl Clone for Planes {
             management: Arc::clone(&self.management),
             consent: Arc::clone(&self.consent),
             consent_drain: Arc::clone(&self.consent_drain),
+            #[cfg(test)]
+            consent_test: self.consent_test.clone(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: self.computer.clone(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -4560,13 +4620,19 @@ async fn import_browser_login(
     if let Err(result) = login_import::profile_precondition(origin, durable) {
         return journal_login_import_result(planes, &facts.identity, *result).await;
     }
-    if !facts.declares_elicitation() {
+    if !computer_grants::admits_consent(facts) {
+        if facts.flow_id.is_some() {
+            return flow_consent_refusal("unattended_flow");
+        }
+        let why = cingulate_client::desk::NoCard::NoAgentSession;
         let result = login_import::ImportResult::refusal(
             origin,
-            "elicitation_undeclared",
-            "reconnect with a route that declares elicitation support",
+            "consent_unavailable",
+            why.remedy().unwrap(),
         );
-        return journal_login_import_result(planes, &facts.identity, result).await;
+        let mut reply = journal_login_import_result(planes, &facts.identity, result).await;
+        reply["detail"] = json!({"reason":why.reason(),"remedy":why.remedy()});
+        return reply;
     }
     let (location, profile_uuid) = match planes
         .management
@@ -4648,45 +4714,65 @@ async fn complete_login_import(
     plan: login_import::LoginImportPlan,
     cancel: Option<CancelHandle>,
 ) -> Value {
-    let consent = planes.management.computer_grants().require_login(
-        login_consent_request(
-            planes,
-            facts,
-            writer,
-            (channel, epoch),
-            computer_grants::LoginCapability::ImportLogin,
-            plan.consent_parameters(),
-        ),
-        || {
+    let request = login_consent_request(
+        planes,
+        facts,
+        writer,
+        (channel, epoch),
+        computer_grants::LoginCapability::ImportLogin,
+        plan.consent_parameters(),
+        cancel.clone(),
+    );
+    let carrier = Arc::clone(&request.carrier);
+    let consent = planes
+        .management
+        .computer_grants()
+        .require_login(request, || {
             let ask_id = login_import::new_ask_id();
             let question = plan.question(&ask_id, &facts.identity.agent_project_id);
             (ask_id, question)
-        },
-    );
-    // `None` when the caller cancelled the request before the question ended.
-    // A cancel stops this call's wait; the card stays open, and an answer to
-    // it is remembered for a retry.
-    let answer = tokio::select! {
-        consent = consent => match consent {
-            computer_grants::LoginConsent::Ended(answer) => Some(answer),
-            computer_grants::LoginConsent::Pending { ask_id } => {
-                return journal_login_import_result(planes, &facts.identity, plan.pending(ask_id))
-                    .await;
+        });
+    let consent = consent.await;
+    let mut execution = None;
+    let answer = match consent {
+        computer_grants::LoginConsent::Ended(answer) => {
+            if let cingulate_client::desk::Ending::NoCard(why) = answer.ending {
+                return json!({"outcome":"consent_unavailable","detail":{"reason":why.reason(),"remedy":why.remedy()}});
             }
-        },
-        () = async {
-            match &cancel {
-                Some(cancel) => cancel.cancelled().await,
-                None => std::future::pending::<()>().await,
+            if matches!(&answer.ending, cingulate_client::desk::Ending::Declined { choice_id } if choice_id != "deny")
+            {
+                return json!({"outcome":"unrecognized_answer","remedy":"The answer could not be read; retry this call to ask again."});
             }
-        } => None,
+            if answer.ending == cingulate_client::desk::Ending::Withdrawn
+                && planes.draining.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return json!({"outcome":"module_draining"});
+            }
+            if answer.ending == cingulate_client::desk::Ending::Withdrawn
+                && !cancel.as_ref().is_some_and(CancelHandle::is_cancelled)
+            {
+                return json!({"outcome":"question_withdrawn","remedy":"retry this call to ask again"});
+            }
+            if answer.taken_approval {
+                execution = Some(answer.clone());
+            }
+            Some(answer.legacy_answer())
+        }
+        computer_grants::LoginConsent::Pending { ask_id } => {
+            return journal_login_import_result(planes, &facts.identity, plan.pending(ask_id))
+                .await;
+        }
     };
+
     let answer = if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
         None
     } else {
         answer
     };
-    let decision = match &answer {
+    // Journal or relaunch failures must not hide that the copy already ran.
+    let mut execution_result = json!({"outcome":"not_run"});
+    let reply = async {
+        let decision = match &answer {
         Some(elicit::AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
         // None of these permits a transfer, and they are listed rather than
         // wildcarded so a future outcome has to be decided about here.
@@ -4738,6 +4824,7 @@ async fn complete_login_import(
         // always has been; its caller has stopped waiting for the reply.
         None => plan.decide(None),
     };
+    execution_result = result.to_value();
     let mut reply = journal_login_import_result(planes, &facts.identity, result).await;
     if let Some(url) = reopen {
         // Even a failed copy must not leave a session we closed unnecessarily down.
@@ -4776,6 +4863,17 @@ async fn complete_login_import(
             reply["relaunched"] = Value::Null;
             reply["detail"] = launched;
         }
+    }
+    reply
+    }.await;
+    if let Some(answer) = execution {
+        computer_grants::report_login_execution(
+            &carrier,
+            &answer,
+            &execution_result,
+            "transferred",
+        )
+        .await;
     }
     reply
 }
@@ -4824,24 +4922,43 @@ async fn capture_browser_login(
     corr: u64,
     request: &login_capture::CaptureRequest,
 ) -> Value {
+    if !computer_grants::admits_consent(facts) {
+        let why = if facts.flow_id.is_some() {
+            return flow_consent_refusal("unattended_flow");
+        } else {
+            cingulate_client::desk::NoCard::NoAgentSession
+        };
+        return json!({"outcome":"consent_unavailable","detail":{"reason":why.reason(),"remedy":why.remedy()}});
+    }
     // A cancel frame for this request, a Goodbye for its route, or the start
     // of a drain all end the capture with nothing written.
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
+    let execution = std::sync::Mutex::new(None);
+    let report_carrier = login_consent_request(
+        planes,
+        facts,
+        writer,
+        (channel, epoch),
+        computer_grants::LoginCapability::CaptureLogin,
+        request.consent_parameters(),
+        cancel.clone(),
+    )
+    .carrier;
+    let cancel_for_capture = cancel.clone();
     let outcome = planes
         .capture
         .run(
             request,
             login_capture::CaptureCall {
                 accepted: facts,
-                declares_elicitation: facts.declares_elicitation(),
+                declares_elicitation: computer_grants::admits_consent(facts),
                 // The card is filed through the module's consent registry,
                 // which holds the call for a bounded wait, keeps the card
                 // open past it, and answers a retry from a late answer. The
                 // deadline is the card's lifetime, which the registry owns.
                 ask: |question: Value, _deadline| {
-                    let ask_id = question["id"].as_str().unwrap_or_default().to_string();
-                    planes.management.computer_grants().require_login(
+                    let consent = planes.management.computer_grants().require_login(
                         login_consent_request(
                             planes,
                             facts,
@@ -4849,17 +4966,39 @@ async fn capture_browser_login(
                             (channel, epoch),
                             computer_grants::LoginCapability::CaptureLogin,
                             request.consent_parameters(),
+                            cancel.clone(),
                         ),
-                        move || (ask_id.clone(), question.clone()),
-                    )
+                        move || (String::new(), question.clone()),
+                    );
+                    let execution = &execution;
+                    async move {
+                        let consent = consent.await;
+                        if let computer_grants::LoginConsent::Ended(answer) = &consent {
+                            if answer.taken_approval {
+                                *execution.lock().unwrap() = Some(answer.clone());
+                            }
+                        }
+                        consent
+                    }
                 },
                 cancelled: move || {
-                    cancel.as_ref().is_some_and(CancelHandle::is_cancelled)
+                    cancel_for_capture
+                        .as_ref()
+                        .is_some_and(CancelHandle::is_cancelled)
                         || draining.load(std::sync::atomic::Ordering::Acquire)
                 },
             },
         )
         .await;
+    if let Some(answer) = execution.into_inner().unwrap() {
+        computer_grants::report_login_execution(
+            &report_carrier,
+            &answer,
+            &outcome.reply,
+            "captured",
+        )
+        .await;
+    }
     // A deposit already made stays in the vault when this record cannot be
     // written: the vault cannot be asked to withdraw it, and its own audit
     // row, bound to the consent card's id, still describes it.
@@ -7963,7 +8102,8 @@ mod tests {
                 serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
             assert_eq!(flat_reply, management_reply, "{action} diverged");
             if action == "import_login" {
-                assert_eq!(flat_reply["outcome"], "elicitation_undeclared");
+                assert_eq!(flat_reply["outcome"], "consent_unavailable");
+                assert_eq!(flat_reply["detail"]["reason"], "no_agent_session");
             }
         }
     }
@@ -9123,6 +9263,8 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            #[cfg(test)]
+            consent_test: None,
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9186,6 +9328,8 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            #[cfg(test)]
+            consent_test: None,
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9376,7 +9520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_import_login_refuses_when_elicitation_was_not_declared() {
+    async fn browser_import_login_refuses_without_an_agent_session() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = management_bound_planes(4, 1);
         let request = json!({
@@ -9399,9 +9543,11 @@ mod tests {
             .expect("the import request is answered");
         let response = writer_rx.recv().await.expect("an immediate refusal");
         let body: Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["outcome"], "elicitation_undeclared", "{body}");
+        assert_eq!(body["outcome"], "consent_unavailable", "{body}");
+        assert_eq!(body["detail"]["reason"], "no_agent_session", "{body}");
         assert_eq!(
-            body["remedy"], "reconnect with a route that declares elicitation support",
+            body["remedy"],
+            "call from the agent session that needs the permission; it can raise the card",
             "{body}"
         );
         assert!(
@@ -9439,7 +9585,7 @@ mod tests {
                 },
             ),
         );
-        planes
+        computer_grants::tests::CardService::install(planes, 4, 1)
     }
 
     fn capture_request_frame(correlation: u64, params: Value) -> Frame {
@@ -9494,27 +9640,27 @@ mod tests {
         .await
         .unwrap();
 
-        let question = next_frame(&mut writer_rx).await;
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
         assert_eq!(question.header.ty, FrameType::Request);
         let asked: Value = serde_json::from_slice(&question.body).unwrap();
         assert_eq!(
             asked["params"]["prompt"],
             "insula will hold a copy of your ollama.com login."
         );
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_dispatch_301"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_dispatch_301"})
+            )
         ));
         let reply = next_frame(&mut writer_rx).await;
         assert_eq!(reply.header.corr, 301);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "captured", "{body}");
-        // The answer's card id survives the real elicitor and becomes the
-        // deposit's consent reference.
+        // The Cingulate card id becomes the deposit's consent reference.
         assert_eq!(
             fixture.vault.request_params()[0]["consent_ref"],
-            "el_dispatch_301"
+            "el_test_1"
         );
 
         // Positive control: the scanner finds the value where it was planted.
@@ -9580,11 +9726,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = next_frame(&mut writer_rx).await;
-        planes.elicitor.deliver(
-            question.header.channel,
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
+        planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_dispatch_302"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_dispatch_302"}),
+            ),
         );
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -9618,7 +9765,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = next_frame(&mut writer_rx).await;
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
         assert_eq!(question.header.ty, FrameType::Request);
         let cancel = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
@@ -9637,14 +9784,18 @@ mod tests {
         // The card outlives the cancelled call, so an answer to it is still
         // received; it is remembered, and nothing runs on it.
         assert_eq!(
-            planes.elicitor.outstanding(),
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
             1,
             "the cancelled capture closed its card"
         );
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_cancelled"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_cancelled"})
+            )
         ));
         await_remembered(&planes, true).await;
         assert!(fixture.fs.contents().is_empty());
@@ -9657,16 +9808,15 @@ mod tests {
         );
     }
 
-    /// Wait until a late login answer is, or is no longer, remembered. The
-    /// answer is applied on the card's own task, a moment after it arrives.
+    /// Apply a late login answer through the session's next call, then check
+    /// whether its approval or explicit refusal was remembered.
     async fn await_remembered(planes: &Planes, expected: bool) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while planes.management.computer_grants().remembers_login_answer() != expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the late answer was not applied");
+        computer_grants::tests::drain_call(planes, 4, 1).await;
+        assert_eq!(
+            planes.consent.has_single_use_approvals()
+                || planes.management.computer_grants().remembers_login_answer(),
+            expected
+        );
     }
 
     /// The next frame, which must be the reply to request `corr` and not a
@@ -9684,8 +9834,8 @@ mod tests {
     }
 
     /// The next frame, which must be a new consent card.
-    async fn card(rx: &mut mpsc::Receiver<Frame>) -> (Frame, Value) {
-        let frame = next_frame(rx).await;
+    async fn card(planes: &Planes) -> (Frame, Value) {
+        let frame = planes.consent_test.as_ref().unwrap().card(4, 1).await;
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(
             frame.header.ty,
@@ -9707,7 +9857,7 @@ mod tests {
         handle_frame(capture_request_frame(corr, params), writer, planes)
             .await
             .unwrap();
-        let (question, _) = card(rx).await;
+        let (question, _) = card(planes).await;
         let reply = reply_without_a_card(rx, corr).await;
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
         (question, reply)
@@ -9733,7 +9883,7 @@ mod tests {
 
         let fixture = fixture();
         let planes = capture_planes(&fixture);
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(8);
         handle_frame(
             capture_request_frame(310, ollama_capture_params()),
             &writer_tx,
@@ -9741,7 +9891,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, asked) = card(&mut writer_rx).await;
+        let (_, asked) = card(&planes).await;
         assert_eq!(asked["params"]["expires_in_ms"], 1_800_000, "{asked}");
         assert_eq!(asked["params"]["late_execution"], "notify_only", "{asked}");
     }
@@ -9770,7 +9920,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (question, asked) = card(&mut writer_rx).await;
+        let (question, asked) = card(&planes).await;
         let reply = next_frame(&mut writer_rx).await;
         assert_eq!(reply.header.corr, 311);
         assert!(started.elapsed() >= Duration::from_millis(300));
@@ -9783,15 +9933,19 @@ mod tests {
             "{body}"
         );
         assert_eq!(
-            planes.elicitor.outstanding(),
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
             1,
             "the card was closed when the call returned"
         );
         assert!(fixture.fs.contents().is_empty());
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_late_311"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_late_311"})
+            )
         ));
     }
 
@@ -9814,10 +9968,11 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_late_320"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_late_320"})
+            )
         ));
         await_remembered(&planes, true).await;
         assert_eq!(
@@ -9833,7 +9988,10 @@ mod tests {
         let (other_card, _) =
             capture_until_pending(&planes, &writer_tx, &mut writer_rx, 321, other).await;
         assert_ne!(other_card.header.corr, question.header.corr);
-        assert!(planes.management.computer_grants().remembers_login_answer());
+        assert!(
+            (planes.consent.has_single_use_approvals()
+                || planes.management.computer_grants().remembers_login_answer())
+        );
 
         handle_frame(
             capture_request_frame(322, ollama_capture_params()),
@@ -9844,11 +10002,31 @@ mod tests {
         .unwrap();
         let body = reply_without_a_card(&mut writer_rx, 322).await;
         assert_eq!(body["outcome"], "captured", "{body}");
+        let reports: Vec<_> = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == "consent.report_execution")
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "a taken approval must be reported before the reply"
+        );
+        assert_eq!(
+            reports[0].1,
+            json!({"elicitation_id":"el_test_1", "execution":"executed"})
+        );
         assert_eq!(
             fixture.vault.request_params()[0]["consent_ref"],
-            "el_late_320"
+            "el_test_1"
         );
-        assert!(!planes.management.computer_grants().remembers_login_answer());
+        assert!(
+            !(planes.consent.has_single_use_approvals()
+                || planes.management.computer_grants().remembers_login_answer())
+        );
 
         // Used once: the next call asks again.
         handle_frame(
@@ -9858,7 +10036,7 @@ mod tests {
         )
         .await
         .unwrap();
-        card(&mut writer_rx).await;
+        card(&planes).await;
         assert_eq!(fixture.vault.request_params().len(), 1);
     }
 
@@ -9879,10 +10057,11 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "deny", "elicitation_id": "el_late_330"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "deny", "elicitation_id": "el_late_330"})
+            )
         ));
         await_remembered(&planes, true).await;
         handle_frame(
@@ -9931,12 +10110,19 @@ mod tests {
         let second = reply_without_a_card(&mut writer_rx, 341).await;
         assert_eq!(second["outcome"], "consent_pending", "{second}");
         assert_eq!(second["ask_id"], first["ask_id"], "{second}");
-        assert_eq!(planes.elicitor.outstanding(), 1);
+        assert_eq!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
+            1
+        );
         // The one card still answers the agent's next retry.
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_late_340"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_late_340"})
+            )
         ));
         await_remembered(&planes, true).await;
     }
@@ -9958,15 +10144,19 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "allow", "elicitation_id": "el_late_350"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "allow", "elicitation_id": "el_late_350"})
+            )
         ));
         await_remembered(&planes, true).await;
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
-        assert!(!planes.management.computer_grants().remembers_login_answer());
+        assert!(
+            !(planes.consent.has_single_use_approvals()
+                || planes.management.computer_grants().remembers_login_answer())
+        );
         let (open_question, pending) = capture_until_pending(
             &planes,
             &writer_tx,
@@ -9978,39 +10168,38 @@ mod tests {
         assert_eq!(fixture.vault.request_params().len(), 0);
         // The revocation also closes a card still open, so its answer is
         // received by nothing.
-        assert_eq!(planes.elicitor.outstanding(), 1, "{pending}");
+        assert_eq!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
+            1,
+            "{pending}"
+        );
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
-        let cancel = next_frame(&mut writer_rx).await;
-        assert_eq!(cancel.header.ty, FrameType::Cancel);
-        assert_eq!(
-            (
-                cancel.header.channel,
-                cancel.header.epoch,
-                cancel.header.corr
-            ),
-            (
-                open_question.header.channel,
-                open_question.header.epoch,
-                open_question.header.corr
-            )
+        assert!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .is_empty(),
+            "the open card was not forgotten"
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while planes.elicitor.outstanding() != 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the open card was not closed");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "revocation opens no route and sends no reverse frame"
+        );
+        assert!(!planes
+            .management
+            .computer_grants()
+            .question_open(pending["ask_id"].as_str().unwrap()));
+        let _ = open_question;
     }
 
-    /// A consumer that answers the question with an error frame (a client with
-    /// no handler for questions does, at once) ends it immediately as a
-    /// question nobody was shown. Before the error arm, the frame was dropped
-    /// and the question waited out its five-minute deadline, then reported
+    /// A refused requester ends at once as a question nobody was shown, not
     /// silence from a person who never saw a prompt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_error_frame_answering_a_question_ends_it_as_not_put_to_anyone() {
+    async fn a_requester_refusal_ends_the_capture_as_not_put_to_anyone() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
@@ -10023,24 +10212,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = next_frame(&mut writer_rx).await;
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
         assert_eq!(question.header.ty, FrameType::Request);
-        let refusal = Frame::build_with_version(
-            subc_protocol::PROTOCOL_VERSION,
-            FrameType::Error,
-            Flags::new(false, Priority::Interactive, false),
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr,
-            serde_json::to_vec(&ErrorBody {
-                code: "REVERSE_REQUEST_UNHANDLED".to_string(),
-                message: "no reverse-request handler is registered for elicitation".to_string(),
-                detail: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        handle_frame(refusal, &writer_tx, &planes).await.unwrap();
+        assert!(planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .answer(question.header.corr, elicit::AskOutcome::NotPutToAnyone));
         // `next_frame` gives up after ten seconds; the question's own deadline
         // is thirty minutes and the call's wait two, so a reply inside that
         // window is the error ending it.
@@ -10049,7 +10227,13 @@ mod tests {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
         assert_eq!(body["reason"], "not_put_to_anyone", "{body}");
-        assert_eq!(planes.elicitor.outstanding(), 0);
+        assert_eq!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
+            0
+        );
         assert!(fixture.fs.contents().is_empty());
     }
 
@@ -10166,6 +10350,8 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            #[cfg(test)]
+            consent_test: None,
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
@@ -10243,6 +10429,8 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            #[cfg(test)]
+            consent_test: None,
             #[cfg(target_os = "macos")]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
@@ -11474,7 +11662,11 @@ mod drain_tests {
 
     #[tokio::test]
     async fn drain_does_not_wait_on_a_person() {
-        let mut planes = super::tests::management_bound_planes(1, 1);
+        let mut planes = computer_grants::tests::CardService::install(
+            super::tests::management_bound_planes(1, 1),
+            1,
+            1,
+        );
         let root =
             std::env::temp_dir().join(format!("consent-drain-{}", login_import::new_ask_id()));
         assert!(!root.exists());
@@ -11530,28 +11722,28 @@ mod drain_tests {
         )
         .await
         .unwrap();
-        let question = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(question.header.ty, FrameType::Request);
+        let question = planes.consent_test.as_ref().unwrap().card(1, 1).await;
         assert_eq!(count(&planes), 0);
         handle_frame(draining(), &tx, &planes).await.unwrap();
         assert_eq!(count(&planes), 0);
-        let mut answer = frame(FrameType::Response, 1, json!({"decision":"deny"}));
-        answer.header.corr = question.header.corr;
-        handle_frame(answer, &tx, &planes).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), result_rx)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(result["outcome"], "no_answer");
-        let cancel = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        assert_eq!(result["outcome"], "module_draining");
+        let calls = planes.consent_test.as_ref().unwrap().calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(method, params)| method == "consent.withdraw"
+                    && params["elicitation_id"] == format!("el_test_{}", question.header.corr)),
+            "the drain withdraws the card at Cingulate"
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(cancel.header.ty, FrameType::Cancel);
-        assert_eq!(cancel.header.corr, question.header.corr);
+        assert_eq!(reply.header.ty, FrameType::Response);
         await_count(&planes, 0).await;
     }
 
@@ -11616,7 +11808,11 @@ mod login_import_consent_tests {
     }
 
     fn short_wait_planes() -> Planes {
-        let planes = super::tests::management_bound_planes(1, 1);
+        let planes = computer_grants::tests::CardService::install(
+            super::tests::management_bound_planes(1, 1),
+            1,
+            1,
+        );
         planes
             .management
             .computer_grants()
@@ -11629,7 +11825,7 @@ mod login_import_consent_tests {
     async fn import(
         planes: &Planes,
         root: &std::path::Path,
-        rx: &mut mpsc::Receiver<Frame>,
+        _rx: &mut mpsc::Receiver<Frame>,
         writer: &mpsc::Sender<Frame>,
     ) -> (Option<Frame>, Value) {
         let facts = planes.routes.get(1, 1).unwrap();
@@ -11638,24 +11834,33 @@ mod login_import_consent_tests {
             let writer = writer.clone();
             let plan = plan(root);
             tokio::spawn(async move {
-                complete_login_import(&planes, &facts, &writer, 1, 1, plan, None).await
+                computer_grants::tests::with_live(complete_login_import(
+                    &planes, &facts, &writer, 1, 1, plan, None,
+                ))
+                .await
             })
         };
         let reply = tokio::time::timeout(Duration::from_secs(5), running)
             .await
             .expect("the import replies")
             .unwrap();
-        (rx.try_recv().ok(), reply)
+        (
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                planes.consent_test.as_ref().unwrap().card(1, 1),
+            )
+            .await
+            .ok(),
+            reply,
+        )
     }
 
     async fn await_remembered(planes: &Planes) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !planes.management.computer_grants().remembers_login_answer() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the late answer was not applied");
+        computer_grants::tests::drain_call(planes, 1, 1).await;
+        assert!(
+            planes.consent.has_single_use_approvals()
+                || planes.management.computer_grants().remembers_login_answer()
+        );
     }
 
     #[tokio::test]
@@ -11675,7 +11880,13 @@ mod login_import_consent_tests {
             computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
             "{reply}"
         );
-        assert_eq!(planes.elicitor.outstanding(), 1);
+        assert_eq!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
+            1
+        );
     }
 
     /// A granting answer that arrives after the call returned is used by the
@@ -11688,10 +11899,11 @@ mod login_import_consent_tests {
         let (question, reply) = import(&planes, &root, &mut rx, &tx).await;
         let question = question.expect("a card was filed");
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "hand_off", "elicitation_id": "el_import"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "hand_off", "elicitation_id": "el_import"})
+            )
         ));
         await_remembered(&planes).await;
         let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
@@ -11711,10 +11923,11 @@ mod login_import_consent_tests {
         let (tx, mut rx) = mpsc::channel(8);
         let (question, _) = import(&planes, &root, &mut rx, &tx).await;
         let question = question.expect("a card was filed");
-        assert!(planes.elicitor.deliver(
-            question.header.channel,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            json!({"decision": "deny", "elicitation_id": "el_import"}),
+            elicit::AskOutcome::Answered(
+                json!({"decision": "deny", "elicitation_id": "el_import"})
+            )
         ));
         await_remembered(&planes).await;
         let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
@@ -11725,25 +11938,31 @@ mod login_import_consent_tests {
     /// A question nobody was shown still ends the import at once, as itself.
     #[tokio::test]
     async fn a_card_nobody_was_shown_ends_the_import_at_once() {
-        let planes = super::tests::management_bound_planes(1, 1);
+        let planes = computer_grants::tests::CardService::install(
+            super::tests::management_bound_planes(1, 1),
+            1,
+            1,
+        );
         let root = root();
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
         let facts = planes.routes.get(1, 1).unwrap();
         let running = {
             let planes = planes.clone();
             let writer = tx.clone();
             let plan = plan(&root);
             tokio::spawn(async move {
-                complete_login_import(&planes, &facts, &writer, 1, 1, plan, None).await
+                computer_grants::tests::with_live(complete_login_import(
+                    &planes, &facts, &writer, 1, 1, plan, None,
+                ))
+                .await
             })
         };
-        let question = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let question = planes.consent_test.as_ref().unwrap().card(1, 1).await;
         assert!(planes
-            .elicitor
-            .refuse(question.header.channel, question.header.corr));
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .answer(question.header.corr, elicit::AskOutcome::NotPutToAnyone));
         let reply = tokio::time::timeout(Duration::from_secs(5), running)
             .await
             .expect("refused at once, not held for the park")
@@ -12019,7 +12238,7 @@ mod computer_consent_wire_tests {
                 },
             ),
         );
-        planes
+        computer_grants::tests::CardService::install(planes, CHANNEL, EPOCH)
     }
 
     fn frame(ty: FrameType, channel: u16, corr: u64, body: Value) -> Frame {
@@ -12084,13 +12303,15 @@ mod computer_consent_wire_tests {
     async fn parked_call(
         planes: &Planes,
         tx: &mpsc::Sender<Frame>,
-        rx: &mut mpsc::Receiver<Frame>,
+        _rx: &mut mpsc::Receiver<Frame>,
     ) -> String {
         handle_frame(wait_request(), tx, planes).await.unwrap();
-        let question = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("the call asked")
-            .unwrap();
+        let question = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .card(CHANNEL, EPOCH)
+            .await;
         assert_eq!(question.header.ty, FrameType::Request);
         let body: Value = serde_json::from_slice(&question.body).unwrap();
         assert_eq!(body["params"]["target"]["kind"], "app");
@@ -12119,11 +12340,18 @@ mod computer_consent_wire_tests {
         COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST
             .scope(
                 Duration::from_millis(20),
-                handle_tool_request_for_test_with_existing_planes(request, &tx, &planes),
+                computer_grants::tests::with_live(
+                    handle_tool_request_for_test_with_existing_planes(request, &tx, &planes),
+                ),
             )
             .await
             .unwrap();
-        let question = rx.recv().await.unwrap();
+        let question = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .card(CHANNEL, EPOCH)
+            .await;
         assert_eq!(question.header.ty, FrameType::Request);
         assert_eq!(reply(&mut rx).await["outcome"], "consent_pending");
         handle_frame(
@@ -12140,18 +12368,11 @@ mod computer_consent_wire_tests {
         .unwrap();
         let withdrawn: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
         assert_eq!(withdrawn["answer"], "withdrawn");
-        handle_frame(
-            frame(
-                FrameType::Response,
-                CHANNEL,
-                question.header.corr,
-                json!({"decision":"allow_conversation", "elicitation_id":"el_computer_late"}),
-            ),
-            &tx,
-            &planes,
-        )
-        .await
-        .unwrap();
+        assert!(planes.consent_test.as_ref().unwrap().answer(
+            question.header.corr,
+            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ));
+        computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
         let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
         let caller = computer_grants::GrantCaller {
             conversation_key: facts.identity.conversation_key,
@@ -12182,7 +12403,12 @@ mod computer_consent_wire_tests {
         let planes = planes();
         let (tx, mut rx) = mpsc::channel(8);
         handle_frame(wait_request(), &tx, &planes).await.unwrap();
-        let question = rx.recv().await.unwrap();
+        let question = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .card(CHANNEL, EPOCH)
+            .await;
         assert_eq!(question.header.ty, FrameType::Request);
         settle_to(&planes, (0, 1)).await;
 
@@ -12198,33 +12424,16 @@ mod computer_consent_wire_tests {
         )
         .await
         .unwrap();
-        let mut answer = None;
-        let mut cancellation = None;
-        for _ in 0..2 {
-            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if frame.header.ty == FrameType::Cancel {
-                cancellation = Some(frame);
-            } else {
-                answer = Some(serde_json::from_slice::<Value>(&frame.body).unwrap());
-            }
-        }
-        let cancel = cancellation.expect("drain ends the app card at the carrier");
-        assert_eq!(
-            (
-                cancel.header.channel,
-                cancel.header.epoch,
-                cancel.header.corr
-            ),
-            (
-                question.header.channel,
-                question.header.epoch,
-                question.header.corr
-            )
+        let body = reply(&mut rx).await;
+        let calls = planes.consent_test.as_ref().unwrap().calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(method, params)| method == "consent.withdraw"
+                    && params["elicitation_id"] == format!("el_test_{}", question.header.corr)),
+            "drain ends the app card at Cingulate"
         );
-        let body = answer.unwrap();
+        assert!(rx.try_recv().is_err(), "no reverse Cancel frame");
         assert_eq!(body["outcome"], "module_draining", "{body}");
         settle_to(&planes, (0, 0)).await;
     }
@@ -12246,6 +12455,11 @@ mod computer_consent_wire_tests {
         settle_to(&planes, (0, 0)).await;
         // The caller is gone, so nothing is sent back.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(query) = rx.try_recv() {
+            let response = computer_grants::tests::scope_reply(&query)
+                .expect("a reply was sent to an unbound route");
+            handle_frame(response, &tx, &planes).await.unwrap();
+        }
         assert!(
             rx.try_recv().is_err(),
             "a reply was sent to an unbound route"
@@ -12256,9 +12470,9 @@ mod computer_consent_wire_tests {
             "the question outlived its conversation"
         );
 
-        grants.settle(
+        let _ = planes.consent_test.as_ref().unwrap().answer_id(
             &ask_id,
-            elicit::AskOutcome::Answered(json!({"decision": "allow_conversation"})),
+            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"})),
         );
         let caller = computer_grants::GrantCaller {
             conversation_key: facts.identity.conversation_key.clone(),
@@ -12470,7 +12684,7 @@ mod relayed_computer_call_tests {
                 },
             ),
         );
-        planes
+        computer_grants::tests::CardService::install(planes, CHANNEL, EPOCH)
     }
 
     /// Send one `computer_use` read of the application, allow the app when
@@ -12501,21 +12715,20 @@ mod relayed_computer_call_tests {
         )
         .await
         .unwrap();
-        let mut frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let question = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .card(CHANNEL, EPOCH)
+            .await;
+        assert!(planes.consent_test.as_ref().unwrap().answer(
+            question.header.corr,
+            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ));
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
-            .expect("the call answered or asked")
+            .unwrap()
             .unwrap();
-        if frame.header.ty == FrameType::Request {
-            assert!(planes.elicitor.deliver(
-                frame.header.channel,
-                frame.header.corr,
-                json!({"decision": "allow_conversation"}),
-            ));
-            frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .expect("the allowed call answered")
-                .unwrap();
-        }
         assert_eq!(
             frame.header.ty,
             FrameType::Response,
@@ -12996,10 +13209,19 @@ mod relayed_computer_call_tests {
             )
             .await
             .unwrap();
-            let mut reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let mut reply = if flow_id.is_some() {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                planes
+                    .consent_test
+                    .as_ref()
+                    .unwrap()
+                    .card(CHANNEL, EPOCH)
+                    .await
+            };
             if flow_id.is_some() {
                 assert_eq!(reply.header.ty, FrameType::Response);
                 assert_eq!(
@@ -13020,10 +13242,9 @@ mod relayed_computer_call_tests {
                     FrameType::Request,
                     "the attended route may ask for app consent"
                 );
-                assert!(planes.elicitor.deliver(
-                    reply.header.channel,
+                assert!(planes.consent_test.as_ref().unwrap().answer(
                     reply.header.corr,
-                    json!({"decision":"allow_conversation"})
+                    elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"})),
                 ));
                 reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                     .await

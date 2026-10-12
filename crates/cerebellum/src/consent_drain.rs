@@ -538,8 +538,10 @@ mod tests {
     async fn unadapted_answer_is_not_applied_or_acked() {
         let cingulate = ScriptedCingulate::new();
         feed(&cingulate);
-        let (planes, _dir, store) =
-            planes(&[card(CardKind::AppControl)], Arc::new(cingulate.clone()));
+        let (planes, _dir, store) = planes(
+            &[card(CardKind::WebsiteAccessInCall)],
+            Arc::new(cingulate.clone()),
+        );
         let before = std::fs::read(store.path()).unwrap();
         ordinary_reply(&invoke(&planes, 1).await);
         assert_eq!(cingulate.methods(), [wire::CONSENT_ANSWERS]);
@@ -730,7 +732,7 @@ mod tests {
             planes
                 .consent
                 .take_single_use_approval(&card(CardKind::LoginImport).session, "test-subject"),
-            Some("el_1".into())
+            Some(("el_1".into(), "allow".into()))
         );
         assert!(store.load().unwrap().is_empty());
     }
@@ -746,7 +748,7 @@ mod tests {
                 planes
                     .consent
                     .take_single_use_approval(&card(kind).session, "test-subject"),
-                Some("el_1".into())
+                Some(("el_1".into(), "allow".into()))
             );
             assert_eq!(
                 planes

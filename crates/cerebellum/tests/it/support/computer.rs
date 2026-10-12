@@ -621,18 +621,37 @@ pub fn relayed(carrier: &ScriptedCarrier) -> ConsentContext {
 /// Each question put through it is recorded. It is answered by the next queued
 /// answer, if one was queued, or else waits until the test answers it with
 /// [`ScriptedCarrier::answer_next`].
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ScriptedCarrier {
     state: Arc<Mutex<ScriptState>>,
+    desk: Arc<cerebellum::cingulate_client::desk::ConsentDesk>,
+    guard: Arc<cerebellum_core::dispatch::InFlightGuard>,
+}
+
+impl Default for ScriptedCarrier {
+    fn default() -> Self {
+        let state = Arc::new(Mutex::new(ScriptState::default()));
+        let desk = Arc::new(cerebellum::cingulate_client::desk::ConsentDesk::new(
+            Arc::new(FixtureOpener(state.clone())),
+        ));
+        let clock = cerebellum_core::clock::FakeClock::new();
+        let timing = Arc::new(cerebellum_core::dispatch::DispatchTimingState::new(&clock));
+        Self {
+            state,
+            desk,
+            guard: Arc::new(timing.enter(&clock)),
+        }
+    }
 }
 
 #[derive(Default)]
 struct ScriptState {
     queued: std::collections::VecDeque<AskOutcome>,
-    waiting: std::collections::VecDeque<tokio::sync::oneshot::Sender<AskOutcome>>,
+    waiting: std::collections::VecDeque<(String, tokio::sync::oneshot::Sender<Value>)>,
+    records: std::collections::BTreeMap<String, Value>,
     questions: Vec<Value>,
+    calls: Vec<(String, Value)>,
 }
-
 #[allow(dead_code)]
 impl ScriptedCarrier {
     /// A carrier that answers each question, in order, with these decisions.
@@ -644,14 +663,31 @@ impl ScriptedCarrier {
         carrier
     }
 
+    pub async fn apply_late(&self, grants: &Arc<cerebellum::computer_grants::ComputerGrants>) {
+        let drain = cerebellum::consent_drain::ConsentDrain::default();
+        for kind in [
+            cerebellum::cingulate_client::card::CardKind::AppControl,
+            cerebellum::cingulate_client::card::CardKind::Takeover,
+        ] {
+            drain.register(kind, grants.clone());
+        }
+        drain.run(&self.desk, &self.live().unwrap()).await.unwrap();
+    }
+
     pub fn queue(&self, outcome: AskOutcome) {
         self.state.lock().unwrap().queued.push_back(outcome);
     }
 
     /// Answer the oldest question still waiting. False when none is.
     pub fn answer_next(&self, outcome: AskOutcome) -> bool {
-        let waiting = self.state.lock().unwrap().waiting.pop_front();
-        waiting.is_some_and(|sender| sender.send(outcome).is_ok())
+        let mut state = self.state.lock().unwrap();
+        let Some((id, sender)) = state.waiting.pop_front() else {
+            return false;
+        };
+        let record = fixture_record(&id, outcome);
+        state.records.insert(id, record.clone());
+        let _ = sender.send(record);
+        true
     }
 
     /// Every question put so far, in order.
@@ -661,19 +697,153 @@ impl ScriptedCarrier {
 }
 
 impl QuestionCarrier for ScriptedCarrier {
-    fn put(
+    fn desk(&self) -> Arc<cerebellum::cingulate_client::desk::ConsentDesk> {
+        self.desk.clone()
+    }
+    fn live(
         &self,
-        question: Value,
-        _deadline: std::time::Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AskOutcome> + Send>> {
-        let mut state = self.state.lock().unwrap();
-        state.questions.push(question);
-        if let Some(answer) = state.queued.pop_front() {
-            return Box::pin(async move { answer });
+    ) -> Result<
+        cerebellum::cingulate_client::live_call::LiveCall,
+        cerebellum::cingulate_client::live_call::NotLive,
+    > {
+        use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+        let stamp = ScopeStamp {
+            owner: subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            scope_ref: "computer-test".into(),
+            scope_epoch: 1,
+            kind: ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            attributes: ScopeAttributes::new().with_agent_id(Some(GRANTEE.into())),
+            owner_authorized: true,
+        };
+        cerebellum::cingulate_client::live_call::LiveCall::from_inbound(
+            Some(&stamp),
+            &self.guard,
+            Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
+        )
+    }
+}
+
+struct FixtureOpener(Arc<Mutex<ScriptState>>);
+struct FixtureRoute(Arc<Mutex<ScriptState>>);
+impl cerebellum::cingulate_client::route::CingulateOpener for FixtureOpener {
+    fn open<'a>(
+        &'a self,
+        _: &'a cerebellum::cingulate_client::live_call::LiveCall,
+    ) -> cerebellum::cingulate_client::route::BoxFuture<
+        'a,
+        Result<
+            Box<dyn cerebellum::cingulate_client::route::CingulateRoute>,
+            cerebellum::cingulate_client::route::CallError,
+        >,
+    > {
+        Box::pin(async {
+            Ok(Box::new(FixtureRoute(self.0.clone()))
+                as Box<
+                    dyn cerebellum::cingulate_client::route::CingulateRoute,
+                >)
+        })
+    }
+}
+
+fn fixture_record(id: &str, outcome: AskOutcome) -> Value {
+    match outcome {
+        AskOutcome::Answered(body) => {
+            json!({"elicitation_id":id,"state":"answered","answered_choice_id":body["decision"]})
         }
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        state.waiting.push_back(sender);
-        Box::pin(async move { receiver.await.unwrap_or(AskOutcome::NoAnswer) })
+        AskOutcome::NoAnswer => json!({"elicitation_id":id,"state":"expired"}),
+        AskOutcome::NotPutToAnyone => json!({"elicitation_id":id,"state":"not_put_to_anyone"}),
+        AskOutcome::Undeliverable => json!({"elicitation_id":id,"state":"delivery_failed"}),
+    }
+}
+
+impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
+    fn call<'a>(
+        &'a mut self,
+        method: &'a str,
+        params: Value,
+    ) -> cerebellum::cingulate_client::route::BoxFuture<
+        'a,
+        Result<Value, cerebellum::cingulate_client::route::CallError>,
+    > {
+        Box::pin(async move {
+            self.0
+                .lock()
+                .unwrap()
+                .calls
+                .push((method.into(), params.clone()));
+            let id = params["elicitation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match method {
+                "consent.request" => {
+                    let mut state = self.0.lock().unwrap();
+                    let id = format!("el_computer_{}", state.questions.len() + 1);
+                    state.questions.push(json!({"id":id,"params":params}));
+                    let record = state.queued.pop_front().map_or_else(
+                        || json!({"elicitation_id":id,"state":"pending"}),
+                        |answer| fixture_record(&id, answer),
+                    );
+                    state.records.insert(id.clone(), record);
+                    Ok(json!({"elicitation_id":id}))
+                }
+                "consent.await" => {
+                    let waiting = {
+                        let mut state = self.0.lock().unwrap();
+                        let record = state.records[&id].clone();
+                        if record["state"] == "not_put_to_anyone" {
+                            return Err(cerebellum::cingulate_client::double::refusal(
+                                "elicitation_requester_refused",
+                            ));
+                        }
+                        if record["state"] == "delivery_failed" {
+                            return Err(
+                                cerebellum::cingulate_client::route::CallError::Transport {
+                                    code: None,
+                                },
+                            );
+                        }
+                        if record["state"] != "pending" {
+                            return Ok(record);
+                        }
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        state.waiting.push_back((id.clone(), sender));
+                        receiver
+                    };
+                    let wait =
+                        std::time::Duration::from_millis(params["timeout_ms"].as_u64().unwrap());
+                    Ok(tokio::time::timeout(wait, waiting)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_else(|| self.0.lock().unwrap().records[&id].clone()))
+                }
+                "consent.get" | "consent.detach" | "consent.report_execution" => {
+                    let mut record = self.0.lock().unwrap().records[&id].clone();
+                    if method == "consent.detach" && record["state"] == "pending" {
+                        record["detached"] = json!(true);
+                    }
+                    Ok(record)
+                }
+                "consent.withdraw" => {
+                    let mut state = self.0.lock().unwrap();
+                    let record = state.records.get_mut(&id).unwrap();
+                    if record["state"] == "pending" {
+                        record["state"] = json!("withdrawn");
+                    }
+                    Ok(record.clone())
+                }
+                "consent.answers" => Ok(
+                    json!({"records":self.0.lock().unwrap().records.values().filter(|record| record["state"] != "pending").cloned().collect::<Vec<_>>(),"cursor":1}),
+                ),
+                "consent.ack" => Ok(json!({"cursor":1})),
+                _ => panic!("unexpected consent method {method}"),
+            }
+        })
     }
 }
 

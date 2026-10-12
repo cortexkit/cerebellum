@@ -694,7 +694,7 @@ async fn a_module_without_a_vault_refuses_before_asking() {
 }
 
 #[tokio::test]
-async fn an_undeclared_elicitation_route_is_refused_without_asking() {
+async fn a_call_without_consent_admission_is_refused_without_asking() {
     let fixture = fixture();
     let facts = accepted();
     let outcome = fixture
@@ -709,7 +709,10 @@ async fn an_undeclared_elicitation_route_is_refused_without_asking() {
             },
         )
         .await;
-    assert_eq!(outcome.reply["outcome"], "elicitation_undeclared");
+    assert_eq!(outcome.reply["outcome"], "consent_unavailable");
+    assert_eq!(outcome.reply["detail"]["reason"], "no_agent_session");
+    crate::browser::validate_browser_result(crate::management::CAPTURE_LOGIN, &outcome.reply)
+        .unwrap();
     assert!(fixture.fs.contents().is_empty());
 }
 
