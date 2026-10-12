@@ -7,8 +7,85 @@ const read = { method: "Page.getFrameTree", params: {} };
 const press = { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 10, y: 20, button: "left" } };
 const release = { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 10, y: 20, button: "left" } };
 import { setup } from "./harness.mjs";
+import { BrowserEvents } from "../events.mjs";
 
 const inputs = chrome => chrome.calls.filter(call => call[0] === "cdp" && call[2].startsWith("Input."));
+
+test("CDP press and release inside the action window leave the interaction epoch unchanged", async () => {
+  const f = await setup();
+  new BrowserEvents(f.chrome, f.tabs, f.epochs, f.agent).listen();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    const result = await send(...args);
+    if (args[1] === "Emulation.setFocusEmulationEnabled") {
+      f.chrome.tabs.onActivated.emit({ tabId: 2, windowId: 3 });
+      f.chrome.windows.onFocusChanged.emit(3);
+      f.chrome.input(2, { type: "focus" });
+    }
+    if (args[1] === "Input.dispatchMouseEvent") {
+      const types = args[2].type === "mousePressed" ? ["pointerdown", "mousedown"] : ["pointerup", "mouseup", "click"];
+      for (const type of types) f.chrome.input(2, { type, clientX: 10, clientY: 20, button: 0 });
+    }
+    return result;
+  };
+  const plan = f.input(epoch);
+  plan.commands.unshift({ method: "Emulation.setFocusEmulationEnabled", params: { enabled: true } });
+  const result = await f.run(plan);
+  assert.equal(result.interaction_epoch, epoch);
+  assert.equal(await f.epochs.sample(2), epoch);
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [press.params, release.params]);
+});
+
+test("clicks before attach and at detach count even when their observations arrive later", async () => {
+  const f = await setup();
+  let now = 5;
+  f.chrome.now = () => now;
+  const epoch = (await f.fresh()).interaction_epoch;
+  now = 10;
+  f.chrome.input(2, { type: "click" });
+  now = 20;
+  const state = await f.agent.prepare(route, f.cdp([read]), 50);
+  f.chrome.input(2, { type: "click" });
+  now = 25;
+  f.chrome.input(2, { type: "click" });
+  now = 30;
+  await f.agent.finish(state);
+  // No grace period: a click at the closed window's endpoint belongs to the
+  // person. Sampling now also sees the unsampled pre-attach and attached clicks.
+  f.chrome.input(2, { type: "click" });
+  assert.equal(await f.epochs.sample(2), epoch + 2);
+  now = 31;
+  f.chrome.input(2, { type: "keydown" });
+  f.chrome.input(2, { type: "wheel" });
+  assert.equal(await f.epochs.sample(2), epoch + 4);
+});
+
+test("membership refusal before a press dispatches no input or cleanup release", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const state = await f.agent.prepare(route, f.input(epoch), 50);
+  f.chrome.tabData.get(2).groupId = -1;
+  await assert.rejects(f.agent.execute(state), { reason: "tab_not_in_agent_group" });
+  await f.agent.finish(state);
+  assert.equal(inputs(f.chrome).length, 0);
+  assert.equal(state.input, false);
+});
+
+test("a failed cleanup release still detaches and reports unconfirmed input", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    if (args[2].type === "mouseReleased") throw new Error("release failed");
+    const result = await send(...args);
+    if (args[2].type === "mousePressed") f.epochs.bump(2);
+    return result;
+  };
+  await assert.rejects(f.run(f.input(epoch)), { reason: "input_release_unconfirmed", detail: { remedy: "read again", input_dispatched: true } });
+  assert.equal(f.agent.active.size, 0);
+  assert.equal(f.chrome.calls.filter(call => call[0] === "detach").length, 2);
+});
 
 test("group membership is rechecked before attachment", async () => {
   const f = await setup();
@@ -35,7 +112,7 @@ test("claims and status remain route bound", async () => {
   await assert.rejects(f.run(f.cdp([read]), other), { reason: "tab_not_claimed" });
 });
 
-test("group withdrawal before each input and before content returns dispatches no later input", async () => {
+test("group withdrawal after a press sends only its matching cleanup release", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
   const send = f.chrome.debugger.sendCommand;
@@ -45,7 +122,7 @@ test("group withdrawal before each input and before content returns dispatches n
     return result;
   };
   await assert.rejects(f.run(f.input(epoch)));
-  assert.equal(inputs(f.chrome).length, 1);
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [press.params, release.params]);
   assert.ok(f.chrome.calls.some(call => call[0] === "detach"));
   assert.equal(f.agent.baselines.has(2), false);
 });
@@ -60,7 +137,7 @@ test("withdrawal during a read returns no page content", async () => {
 test("detached human input refuses until a fresh read and refused input does not rebase", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
-  f.chrome.observations.get("2:0").sequence += 1;
+  f.chrome.input(2, { type: "click" });
   await assert.rejects(f.run(f.input(epoch)), { reason: "interaction_epoch_changed" });
   assert.equal(inputs(f.chrome).length, 0);
   await assert.rejects(f.run(f.input(epoch)), { reason: "interaction_epoch_changed" });
@@ -69,36 +146,38 @@ test("detached human input refuses until a fresh read and refused input does not
   assert.equal(inputs(f.chrome).length, 2);
 });
 
-test("human input while paused before the first input dispatches nothing", async () => {
+test("a person's click before attach refuses before the press and sends no input", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
-  const arm = f.epochs.arm.bind(f.epochs);
-  f.epochs.arm = async (...args) => { await arm(...args); f.chrome.observations.get("2:0").sequence += 1; };
+  const attach = f.chrome.debugger.attach;
+  f.chrome.debugger.attach = async (...args) => { f.chrome.input(2, { type: "click" }); await attach(...args); };
   await assert.rejects(f.run(f.input(epoch)), { reason: "interaction_epoch_changed" });
   assert.equal(inputs(f.chrome).length, 0);
-  assert.equal(f.chrome.calls.filter(call => call[0] === "sentinel" && call[2].operation === "disarm").length, 1);
 });
 
-test("activation between press and release stops the release and reports prior input", async () => {
+test("epoch refusal after a press sends only its matching cleanup release", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
   const send = f.chrome.debugger.sendCommand;
-  f.chrome.debugger.sendCommand = async (...args) => { const result = await send(...args); f.epochs.bump(2); return result; };
-  const state = await f.agent.prepare(route, f.input(epoch), 50);
+  f.chrome.debugger.sendCommand = async (...args) => { const result = await send(...args); if (args[2].type === "mousePressed") f.epochs.bump(2); return result; };
+  const plan = f.input(epoch);
+  plan.commands.push({ method: "Input.insertText", params: { text: "must not run" } });
+  const state = await f.agent.prepare(route, plan, 50);
   await assert.rejects(f.agent.execute(state), { reason: "interaction_epoch_changed" });
   assert.equal(state.input, true);
   await f.agent.finish(state);
-  assert.equal(inputs(f.chrome).length, 1);
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [press.params, release.params]);
 });
 
-test("human input between two typing steps stops further typing", async () => {
+test("trusted input within the attachment does not interrupt a typing plan", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
   const send = f.chrome.debugger.sendCommand;
-  f.chrome.debugger.sendCommand = async (...args) => { const result = await send(...args); f.chrome.observations.get("2:0").sequence += 1; return result; };
+  f.chrome.debugger.sendCommand = async (...args) => { const result = await send(...args); f.chrome.input(2, { type: "input" }); return result; };
   const type = { method: "Input.insertText", params: { text: "x" } };
-  await assert.rejects(f.run({ ...f.cdp([type, type]), interaction_epoch: epoch }), { reason: "interaction_epoch_changed" });
-  assert.equal(inputs(f.chrome).length, 1);
+  const result = await f.run({ ...f.cdp([type, type]), interaction_epoch: epoch });
+  assert.equal(result.interaction_epoch, epoch);
+  assert.equal(inputs(f.chrome).length, 2);
 });
 
 test("restart clears baselines even when interaction epoch happens to match", async () => {
@@ -167,11 +246,12 @@ test("result references resolve within one attachment without arbitrary JavaScri
   assert.equal(result.results.length, 2);
 });
 
-test("a cancelled in-flight command has no follow-up input", async () => {
+test("a cancelled in-flight press has only a matching cleanup release", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
   const pause = deferred();
-  f.chrome.debugger.sendCommand = () => pause.promise;
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = (...args) => args[2].type === "mousePressed" ? pause.promise : send(...args);
   const state = await f.agent.prepare(route, f.input(epoch), 50);
   const running = f.agent.execute(state);
   await new Promise(resolve => setImmediate(resolve));
@@ -180,6 +260,7 @@ test("a cancelled in-flight command has no follow-up input", async () => {
   await assert.rejects(running, { reason: "cancelled" });
   await f.agent.finish(state);
   assert.equal(state.input, true);
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [release.params]);
   assert.equal(f.chrome.calls.filter(call => call[0] === "detach").length, 2);
 });
 
@@ -195,23 +276,23 @@ test("close leaves every tab alive and returns handed tabs", async () => {
 });
 
 
-test("human input during a snapshot refuses rather than refreshing its baseline", async () => {
+test("trusted input during an attached snapshot does not invalidate its baseline", async () => {
   const f = await setup();
   const original = await f.fresh();
   const send = f.chrome.debugger.sendCommand;
   f.chrome.debugger.sendCommand = async (...args) => {
     const result = await send(...args);
-    f.chrome.observations.get("2:0").sequence += 1;
+    f.chrome.input(2, { type: "click" });
     return result;
   };
-  await assert.rejects(f.fresh(), { reason: "interaction_epoch_changed" });
+  assert.equal((await f.fresh()).interaction_epoch, original.interaction_epoch);
   assert.equal(f.agent.baselines.get(2).epoch, original.interaction_epoch);
 });
 
 test("agent document changes lose continuity without pretending to be human input", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
-  f.chrome.observations.get("2:0").documentId = "new-document";
+  await f.epochs.install(2);
   await assert.rejects(f.run(f.input(epoch)), { reason: "interaction_continuity_lost" });
   assert.equal(f.epochs.record(2).epoch, epoch);
   assert.equal(inputs(f.chrome).length, 0);

@@ -224,8 +224,47 @@ fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
     fn observe(&mut self) -> Result<Value, String>;
+    async fn click_observation(&mut self) -> Result<Value, String>;
+    fn failure_diagnostics(&mut self) -> Value;
     async fn restart(&mut self) -> Result<(), String>;
     fn outside_tab(&self) -> String;
+}
+
+#[derive(Default)]
+struct LastReply {
+    reply: Value,
+    asks: usize,
+}
+
+impl LastReply {
+    fn diagnostics(&self, fixture_text_allowed: bool) -> Value {
+        let text = self.reply["state_text"].as_str();
+        let prefix = text.filter(|_| fixture_text_allowed).map(|text| {
+            let mut end = text.len().min(400);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        });
+        json!({"outcome":self.reply["outcome"], "reason":self.reply["reason"],
+            "ask_count":self.asks, "state_text_prefix":prefix,
+            "state_text_withheld":text.is_some() && !fixture_text_allowed})
+    }
+}
+
+fn fixture_pages_only(targets: &Value, origin: &str) -> bool {
+    let Some(rows) = targets["targetInfos"].as_array() else {
+        return false;
+    };
+    let mut pages = rows
+        .iter()
+        .filter(|target| target["type"] == "page")
+        .peekable();
+    pages.peek().is_some()
+        && pages.all(|target| {
+            target["url"] == format!("{origin}/")
+                || target["url"] == format!("{origin}/outside-secret")
+        })
 }
 
 fn check(label: &str, passed: bool) -> Result<(), String> {
@@ -258,6 +297,24 @@ fn reference(snapshot: &Value, name: &str) -> Result<String, String> {
         .and_then(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .ok_or_else(|| format!("snapshot lacks {name}"))
+}
+
+fn fixture_page_target(targets: &Value, origin: &str) -> Result<String, String> {
+    let rows = targets["targetInfos"]
+        .as_array()
+        .ok_or("observer target list missing")?;
+    let url = format!("{origin}/");
+    let mut pages = rows
+        .iter()
+        .filter(|target| target["type"] == "page" && target["url"] == url);
+    let target = pages.next().ok_or("fixture page target missing")?;
+    if pages.next().is_some() {
+        return Err("fixture page target is ambiguous".into());
+    }
+    target["targetId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or("fixture page target missing id".into())
 }
 
 // The supervisor reports cleanup on its own line. The probe's verdict is the
@@ -340,6 +397,14 @@ fn worker_event_line(event: &Value) -> Option<String> {
 }
 
 async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
+    let result = exercise_checks(driver, origin).await;
+    if result.is_err() {
+        println!("failed-check reply: {}", driver.failure_diagnostics());
+    }
+    result
+}
+
+async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
     let (opened, _) = driver.call(json!({"action":"open_tab"})).await?;
     check(
         "open_tab in Agent group",
@@ -390,10 +455,17 @@ async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> 
     detached_and_unfocused(driver)?;
     let button = reference(&snapshot, "Probe button")?;
     let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":input_severity})).await?;
-    check(
-        "click delivered to local fixture",
-        ok(&clicked) && driver.observe()?["clicks"] == 1,
-    )?;
+    println!("click reply: {clicked}");
+    let observation = driver.click_observation().await.map_err(|error| {
+        println!("click diagnostics unavailable: {error}");
+        error
+    })?;
+    let delivered =
+        ok(&clicked) && observation["beacon_clicks"] == 1 && observation["page_clicks"] == 1;
+    if !delivered {
+        println!("click diagnostics: {observation}");
+    }
+    check("click delivered to local fixture", delivered)?;
     detached_and_unfocused(driver)?;
     let (fresh, _) = driver
         .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
@@ -806,7 +878,7 @@ mod live {
                     let body = if path == "/outside-secret" {
                         "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
                     } else if path == "/" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><button aria-label="Probe button" onclick="navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))">"#
+                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))">"#
                     } else {
                         "ok"
                     };
@@ -1004,6 +1076,7 @@ mod live {
         page: Page,
         focus: Focus,
         corr: u64,
+        last_reply: LastReply,
     }
     const CHANNEL: u16 = 9;
     const EPOCH: u32 = 1;
@@ -1295,6 +1368,7 @@ mod live {
             page,
             focus,
             corr: 10,
+            last_reply: LastReply::default(),
         };
         let result = exercise(&mut driver, &origin).await;
         if result.is_err() {
@@ -1364,6 +1438,10 @@ mod live {
                     if !ok(&body) && body["outcome"] != "closed" {
                         println!("reply: {body}");
                     }
+                    self.last_reply = LastReply {
+                        reply: body.clone(),
+                        asks,
+                    };
                     return Ok((body, asks));
                 }
             }
@@ -1381,6 +1459,52 @@ mod live {
                 observation["focus_events"] = json!(1);
             }
             Ok(observation)
+        }
+        async fn click_observation(&mut self) -> Result<Value, String> {
+            // The page counter records handler execution independently of the
+            // beacon, which can arrive after the tool has acknowledged input.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.page.reports.lock().unwrap().0 == 0 && Instant::now() < deadline {
+                tokio::time::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+            let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
+            let target = fixture_page_target(&targets, &self.origin)?;
+            // Use the test browser's own page session, not extension evaluation
+            // or chrome.debugger. Detach even when evaluation fails so this
+            // observer cannot change the next action's attachment baseline.
+            let session = self.cdp.attach(&target)?;
+            let result = self.cdp.eval(
+                &session,
+                r#"(() => {
+                    const button = document.querySelector('[aria-label="Probe button"]');
+                    return {visibilityState: document.visibilityState,
+                        innerWidth, innerHeight, buttonRect: button?.getBoundingClientRect().toJSON(),
+                        page_clicks: window.__clicks, hasFocus: document.hasFocus()};
+                })()"#,
+            );
+            let detached = self.cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId":session}),
+                None,
+            );
+            let mut observation = result?;
+            detached?;
+            observation["beacon_clicks"] = json!(self.page.reports.lock().unwrap().0);
+            Ok(observation)
+        }
+        fn failure_diagnostics(&mut self) -> Value {
+            // The scratch browser should contain only the two loopback pages.
+            // Verify that through its own CDP observer before printing any text;
+            // unknown targets or a failed provenance check withhold the prefix.
+            let fixture_text_allowed = self
+                .cdp
+                .call("Target.getTargets", json!({}), None)
+                .is_ok_and(|targets| fixture_pages_only(&targets, &self.origin));
+            self.last_reply.diagnostics(fixture_text_allowed)
         }
         async fn restart(&mut self) -> Result<(), String> {
             let before = self
@@ -1474,6 +1598,9 @@ struct Double {
     epoch: u64,
     clicked: usize,
     typed: String,
+    click_observations: usize,
+    last_reply: LastReply,
+    failure: Option<Value>,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -1482,6 +1609,9 @@ impl Double {
             epoch: 1,
             clicked: 0,
             typed: String::new(),
+            click_observations: 0,
+            last_reply: LastReply::default(),
+            failure: None,
         }
     }
 }
@@ -1511,12 +1641,17 @@ impl Driver for Double {
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
                     json!("button-ref button Probe button\ninput-ref textbox Probe input");
+                if self.fault == "snapshot_text" {
+                    reply["state_text"] = json!("fixture-only".repeat(50));
+                }
             }
             "click" if self.epoch != 1 => {
                 reply["outcome"] = json!("refused");
             }
             "click" => {
-                self.clicked += 1;
+                if self.fault != "missed_click" {
+                    self.clicked += 1;
+                }
             }
             "type" => {
                 self.typed = args["text"].as_str().unwrap().to_owned();
@@ -1526,6 +1661,10 @@ impl Driver for Double {
             }
             _ => return Err("unexpected double action".into()),
         }
+        self.last_reply = LastReply {
+            reply: reply.clone(),
+            asks,
+        };
         Ok((reply, asks))
     }
     fn observe(&mut self) -> Result<Value, String> {
@@ -1534,6 +1673,20 @@ impl Driver for Double {
             "outside_group":if self.fault == "group" {1} else {-1}, "agent_tabs":1,
             "clicks":self.clicked,"typed":self.typed}),
         )
+    }
+    async fn click_observation(&mut self) -> Result<Value, String> {
+        self.click_observations += 1;
+        Ok(
+            json!({"visibilityState":"hidden","innerWidth":800,"innerHeight":600,
+            "buttonRect":{"x":8,"y":8,"width":100,"height":20},"hasFocus":false,
+            "page_clicks":self.clicked,
+            "beacon_clicks":if self.fault == "missed_beacon" {0} else {self.clicked}}),
+        )
+    }
+    fn failure_diagnostics(&mut self) -> Value {
+        let diagnostics = self.last_reply.diagnostics(true);
+        self.failure = Some(diagnostics.clone());
+        diagnostics
     }
     async fn restart(&mut self) -> Result<(), String> {
         if self.fault != "epoch" {
@@ -1755,10 +1908,119 @@ async fn self_test() -> Result<(), String> {
         "host_exit_record_is_printed_or_named_absent",
         host_exit_control(),
     ));
+    let mut driver = Double::new("");
+    let result = exercise(&mut driver, "http://127.0.0.1:12345").await;
     tests.push((
         "acceptance_routine_passes_with_independent_double",
-        exercise(&mut Double::new(""), "http://127.0.0.1:12345").await,
+        result.and_then(|_| {
+            if driver.click_observations == 1 {
+                Ok(())
+            } else {
+                Err("click must have one independent page observation".into())
+            }
+        }),
     ));
+    let origin = "http://127.0.0.1:12345";
+    let targets = json!({"targetInfos":[
+        {"type":"service_worker","url":format!("{origin}/"),"targetId":"worker"},
+        {"type":"page","url":format!("{origin}/outside-secret"),"targetId":"outside"},
+        {"type":"page","url":format!("{origin}/"),"targetId":"fixture"}
+    ]});
+    let mut ambiguous = targets.clone();
+    ambiguous["targetInfos"]
+        .as_array_mut()
+        .unwrap()
+        .push(targets["targetInfos"][2].clone());
+    tests.push((
+        "page_diagnostics_select_only_the_unique_fixture_target",
+        if fixture_page_target(&targets, origin) == Ok("fixture".into())
+            && fixture_page_target(&targets, "http://127.0.0.1:54321").is_err()
+            && fixture_page_target(&ambiguous, origin).is_err()
+        {
+            Ok(())
+        } else {
+            Err("page diagnostics did not isolate the fixture target".into())
+        },
+    ));
+    let mut driver = Double::new("snapshot_text");
+    let result = exercise(&mut driver, origin).await;
+    tests.push((
+        "failed_checks_report_last_reply_outcome_asks_and_fixture_prefix",
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error == "snapshot reads fixture and asks again after allow_once")
+            && driver.failure.as_ref().is_some_and(|diagnostics| {
+                diagnostics["outcome"] == "ok"
+                    && diagnostics["reason"].is_null()
+                    && diagnostics["ask_count"] == 1
+                    && diagnostics["state_text_prefix"]
+                        .as_str()
+                        .is_some_and(|text| text.len() == 400)
+                    && diagnostics["state_text_withheld"] == false
+            })
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed snapshot lacks reply diagnostics: {result:?}"
+            ))
+        },
+    ));
+    let reply = LastReply {
+        reply: json!({"outcome":"refused","reason":"read_again","state_text":format!("{}☃", "a".repeat(399))}),
+        asks: 2,
+    };
+    let allowed = reply.diagnostics(fixture_pages_only(&targets, origin));
+    let mut foreign = targets.clone();
+    foreign["targetInfos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"page","url":"https://outside.invalid/private","targetId":"foreign"}));
+    let withheld = reply.diagnostics(fixture_pages_only(&foreign, origin));
+    tests.push((
+        "failure_text_prefix_is_utf8_safe_and_withheld_for_nonfixture_targets",
+        if allowed["state_text_prefix"] == "a".repeat(399)
+            && allowed["outcome"] == "refused"
+            && allowed["reason"] == "read_again"
+            && allowed["ask_count"] == 2
+            && withheld["state_text_prefix"].is_null()
+            && withheld["state_text_withheld"] == true
+            && !fixture_pages_only(&json!({"targetInfos":[]}), origin)
+        {
+            Ok(())
+        } else {
+            Err("failure text was unbounded or exposed a nonfixture page".into())
+        },
+    ));
+    for (fault, name) in [
+        (
+            "missed_click",
+            "acceptance_reads_page_counter_when_click_misses_button",
+        ),
+        (
+            "missed_beacon",
+            "acceptance_reads_page_counter_when_beacon_is_missing",
+        ),
+    ] {
+        let mut driver = Double::new(fault);
+        let result = exercise(&mut driver, origin).await;
+        tests.push((
+            name,
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error == "click delivered to local fixture")
+                && driver.click_observations == 1
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "fault {fault} lacks failed-click diagnostics: {result:?}"
+                ))
+            },
+        ));
+    }
     for (fault, name, expected) in [
         (
             "group",
@@ -1786,10 +2048,11 @@ async fn self_test() -> Result<(), String> {
             "killed worker reconnects with a new epoch",
         ),
     ] {
-        let result = exercise(&mut Double::new(fault), "http://127.0.0.1:12345").await;
+        let mut driver = Double::new(fault);
+        let result = exercise(&mut driver, "http://127.0.0.1:12345").await;
         tests.push((
             name,
-            if result.as_ref().err().is_some_and(|e| e == expected) {
+            if result.as_ref().err().is_some_and(|e| e == expected) && driver.failure.is_some() {
                 Ok(())
             } else {
                 Err(format!(

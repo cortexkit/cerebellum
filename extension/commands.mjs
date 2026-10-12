@@ -58,24 +58,3 @@ export function resolveParams(value, results, depth = 0) {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveParams(item, results, depth + 1)]));
   return value;
 }
-
-export function expectedEvents(command) {
-  const p = command.params;
-  if (command.method === "Input.dispatchMouseEvent") {
-    const button = { none: -1, left: 0, middle: 1, right: 2, back: 3, forward: 4 }[p.button ?? "none"];
-    const common = { clientX: p.x, clientY: p.y, button };
-    if (p.type === "mousePressed") return [{ type: "pointerdown", ...common }, { type: "mousedown", ...common }];
-    if (p.type === "mouseReleased") return [{ type: "pointerup", ...common }, { type: "mouseup", ...common }, { type: "click", ...common }];
-    if (p.type === "mouseWheel") return [{ type: "wheel", clientX: p.x, clientY: p.y, deltaX: p.deltaX, deltaY: p.deltaY }];
-  }
-  if (command.method === "Input.dispatchKeyEvent" && ["rawKeyDown", "keyDown", "keyUp"].includes(p.type)) {
-    // Text-producing key events have many layout-dependent forms. Leave those
-    // unattributed instead of discounting a person's keystroke accidentally.
-    if (p.text || p.unmodifiedText) return [];
-    const events = [{ type: p.type === "keyUp" ? "keyup" : "keydown", key: p.key, code: p.code }];
-    if (p.key === "Backspace" && p.type !== "keyUp" && !p.modifiers) events.push({ type: "beforeinput", data: null, inputType: "deleteContentBackward" }, { type: "input", data: null, inputType: "deleteContentBackward" });
-    return events;
-  }
-  if (command.method === "Input.insertText") return [{ type: "beforeinput", data: p.text, inputType: "insertText" }, { type: "input", data: p.text, inputType: "insertText" }];
-  return [];
-}

@@ -12,7 +12,7 @@ export async function setup() {
   let agent;
   const tabs = new AgentTabs(chrome, id => agent?.withdraw(id));
   await tabs.ready;
-  const epochs = new InteractionEpochs(chrome, tabs);
+  const epochs = new InteractionEpochs(chrome, tabs, () => chrome.now());
   agent = new Agent(chrome, tabs, epochs);
   agent.connect(50);
   const record = await tabs.join(2, "handed");

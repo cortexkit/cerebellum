@@ -94,6 +94,8 @@ struct DoubleState {
     /// `<button>` defaults to type submit, so this checks that a submit-type
     /// control without a form owner is not rated as a form submit.
     untyped_button: bool,
+    ax_override: Option<Value>,
+    top_level_only: bool,
 }
 
 struct Fixture {
@@ -434,7 +436,14 @@ fn execute(
                 json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
             }
             "Page.getFrameTree" => {
-                json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":"foreign-loader","url":"https://ungranted.example/secret"}}]}})
+                let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":"foreign-loader","url":"https://ungranted.example/secret"}}]}});
+                if state.top_level_only {
+                    tree["frameTree"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("childFrames");
+                }
+                tree
             }
             "Page.navigate" => {
                 tab.url = state
@@ -448,7 +457,7 @@ fn execute(
                 state
                     .captures
                     .push(command["params"]["frameId"].as_str().unwrap().into());
-                ax()
+                state.ax_override.clone().unwrap_or_else(ax)
             }
             "DOM.getFlattenedDocument" => dom(
                 state.new_tab_link,
@@ -607,10 +616,9 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
             assert!(methods[..read].contains(&"DOM.enable"), "{methods:?}");
         }
     }
-    // Six flattened-DOM reads: one for the snapshot's capture, one for the
-    // click's classification, and two re-verifications (target state and
-    // hit-test position) before each of the click's two mouse events.
-    assert_eq!(reads, 6);
+    // Four flattened-DOM reads: snapshot capture, click classification, and
+    // target-state plus hit-test verification immediately before the mouse pair.
+    assert_eq!(reads, 4);
 }
 
 #[tokio::test]
@@ -687,6 +695,118 @@ async fn open_navigate_snapshot_never_launches_an_owned_browser() {
         .commands
         .iter()
         .any(|command| command["action"] == "launch"));
+}
+
+#[tokio::test]
+async fn cold_snapshots_after_unsettled_navigation_refuse_empty_or_missing_ax_children() {
+    let mut root = ax()["nodes"][0].clone();
+    root["childIds"] = json!(["not_returned"]);
+    for capture in [json!({"nodes":[]}), json!({"nodes":[root]})] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        fixture.state.lock().unwrap().top_level_only = true;
+        let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/cold","wait":"settle","intent":"load page","severity":{"tier":1,"credential":false,"financial":false}}), "allow_once").await;
+        assert_eq!(navigated["outcome"], "ok", "{navigated}");
+        assert_eq!(navigated["settled"], false);
+        assert_eq!(cards.len(), 1);
+        fixture.state.lock().unwrap().ax_override = Some(capture);
+        let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+        assert_eq!(cards.len(), 1);
+        assert_eq!(snapshot["reason"], "snapshot_not_ready", "{snapshot}");
+        assert_eq!(snapshot["remedy"], "read again");
+        assert!(snapshot.get("state_text").is_none());
+        assert!(snapshot.get("snapshot_id").is_none());
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn root_only_snapshots_disclose_unknown_readiness_without_rejecting_empty_pages() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let mut root = ax()["nodes"][0].clone();
+    root["childIds"] = json!([]);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.ax_override = Some(json!({"nodes":[root]}));
+    }
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(cards.len(), 1);
+    assert_eq!(snapshot["settled"], false);
+    assert_eq!(snapshot["truncated"], false);
+    assert_eq!(snapshot["refs_truncated"], false);
+    assert!(snapshot["settlement_reason"]
+        .as_str()
+        .unwrap()
+        .contains("not observed"));
+    assert!(snapshot["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("empty or still-loading"));
+    assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+    fixture.state.lock().unwrap().ax_override = None;
+    let (complete, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    assert_eq!(complete["outcome"], "ok", "{complete}");
+    assert_eq!(cards.len(), 1);
+    assert_eq!(complete["truncated"], false);
+    assert_eq!(complete["refs_truncated"], false);
+    assert!(complete["state_text"].as_str().unwrap().contains("Go"));
+    assert!(complete.get("remedy").is_none());
+}
+
+#[tokio::test]
+async fn bounded_ax_snapshots_preserve_projection_truncation_flags() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let mut capture = ax();
+    capture["nodes"][1]["name"]["value"] = json!("X".repeat(8192));
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.ax_override = Some(capture);
+    }
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(cards.len(), 1);
+    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["refs_truncated"], true);
+    assert!(snapshot["remedy"].as_str().unwrap().contains("partial"));
+    assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+}
+
+#[tokio::test]
+async fn snapshot_byte_budget_and_omitted_frames_are_disclosed_as_partial() {
+    let mut root = ax()["nodes"][0].clone();
+    root["childIds"] = json!([]);
+    for (top_level_only, max_bytes, capture) in [
+        (true, 64, None),
+        (false, 5000, None),
+        (true, 1, Some(json!({"nodes":[root]}))),
+    ] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.top_level_only = top_level_only;
+            state.ax_override = capture;
+        }
+        let (snapshot, cards) = fixture
+            .call(
+                1,
+                json!({"browser":"user","action":"snapshot","tab":tab,"max_bytes":max_bytes}),
+                "allow_once",
+            )
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["refs_truncated"], false);
+        assert!(snapshot["state_text"].as_str().unwrap().len() <= max_bytes);
+        assert!(snapshot["remedy"].as_str().unwrap().contains("partial"));
+        assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+    }
 }
 
 #[tokio::test]
@@ -819,20 +939,22 @@ async fn redirect_to_ungranted_landing_site_exposes_no_content() {
 }
 
 #[tokio::test]
-async fn human_input_before_dispatch_and_between_steps_stops_all_further_input() {
+async fn human_input_before_click_and_between_typing_steps_stops_all_further_input() {
     for before in [true, false] {
         let fixture = Fixture::new();
         let tab = fixture.claim(1).await;
         let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
-        let reference = reference(&snapshot, "Go");
+        let args = if before {
+            click(&tab, &snapshot, &reference(&snapshot, "Go"))
+        } else {
+            json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"not dispatched"})
+        };
         {
             let mut state = fixture.state.lock().unwrap();
             state.human_before_input = before;
             state.human_after_input = !before;
         }
-        let (reply, _) = fixture
-            .call(1, click(&tab, &snapshot, &reference), "allow_once")
-            .await;
+        let (reply, _) = fixture.call(1, args, "allow_once").await;
         assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
         assert_eq!(reply["remedy"], "read again");
         assert_eq!(reply["input_dispatched"], !before);
@@ -931,6 +1053,54 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
         .unwrap()
         .tabs
         .contains_key(opened["tab"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn background_clicks_keep_focus_press_and_release_in_one_attachment() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (image, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab}),
+            "allow_once",
+        )
+        .await;
+    let point = json!({"browser":"user","action":"click_point","tab":tab,"snapshot_id":image["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"intent":"click","severity":{"tier":2,"credential":false,"financial":false}});
+    for args in [click(&tab, &snapshot, &reference(&snapshot, "Go")), point] {
+        let before = fixture.state.lock().unwrap().commands.len();
+        let (clicked, _) = fixture.call(1, args, "allow_once").await;
+        assert_eq!(clicked["outcome"], "ok", "{clicked}");
+        let state = fixture.state.lock().unwrap();
+        let mut pairs = 0;
+        for plan in &state.commands[before..] {
+            let commands = plan["commands"].as_array().unwrap();
+            if let Some(index) = commands
+                .iter()
+                .position(|command| command["method"] == "Input.dispatchMouseEvent")
+            {
+                // One attachment owns the complete gesture, including any
+                // release-only cleanup needed after a between-event refusal.
+                assert_eq!(index, 1, "mouse input lacks focus emulation: {plan}");
+                assert_eq!(commands.len(), 3, "{plan}");
+                assert_eq!(
+                    commands[index - 1],
+                    command(
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({"enabled":true})
+                    ),
+                    "{plan}"
+                );
+                assert_eq!(commands[index]["params"]["type"], "mousePressed");
+                let mut released = commands[index].clone();
+                released["params"]["type"] = json!("mouseReleased");
+                assert_eq!(commands[index + 1], released, "{plan}");
+                pairs += 1;
+            }
+        }
+        assert_eq!(pairs, 1);
+    }
 }
 
 #[tokio::test]
@@ -1210,6 +1380,12 @@ fn late_snapshot_results_cannot_restore_goodbye_handles_or_cross_connection_refs
 fn user_result_envelopes_are_closed_and_target_tagged() {
     let valid = json!({"browser":"user","outcome":"ok","tab":"t","state_text":"page","snapshot_id":"s","interaction_epoch":1,"connection_epoch":7});
     assert!(crate::browser::validate_user_browser_result("snapshot", &valid).is_ok());
+    let mut partial = valid.clone();
+    partial["truncated"] = json!(true);
+    partial["refs_truncated"] = json!(false);
+    assert!(crate::browser::validate_user_browser_result("snapshot", &partial).is_ok());
+    partial["truncated"] = json!("true");
+    assert!(crate::browser::validate_user_browser_result("snapshot", &partial).is_err());
     let mut invalid = valid.clone();
     invalid["undeclared"] = json!(true);
     assert!(crate::browser::validate_user_browser_result("snapshot", &invalid).is_err());

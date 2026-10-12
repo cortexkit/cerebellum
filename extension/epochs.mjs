@@ -3,14 +3,15 @@ import { bounded, Refusal } from "./errors.mjs";
 // Only group members are instrumented. The observer has no debugger dependency,
 // so human input while the per-action debugger is detached still invalidates refs.
 export class InteractionEpochs {
-  constructor(chrome, tabs) {
+  constructor(chrome, tabs, now = () => performance.timeOrigin + performance.now()) {
     this.chrome = chrome;
     this.tabs = tabs;
     this.records = new Map();
+    this.now = now;
   }
 
   record(tabId) {
-    if (!this.records.has(tabId)) this.records.set(tabId, { epoch: 0, continuity: 0, documents: new Map() });
+    if (!this.records.has(tabId)) this.records.set(tabId, { epoch: 0, continuity: 0, documents: new Map(), actions: [] });
     return this.records.get(tabId);
   }
 
@@ -22,6 +23,16 @@ export class InteractionEpochs {
     this.records.delete(tabId);
   }
 
+  beginAction(tabId) {
+    const action = { start: this.now(), end: null };
+    this.record(tabId).actions.push(action);
+    return action;
+  }
+
+  endAction(action) {
+    if (action && action.end === null) action.end = this.now();
+  }
+
   async observe(message, sender) {
     if (!sender.tab || sender.id !== this.chrome.runtime.id) return;
     try { await this.tabs.eligible(sender.tab.id); } catch { return; }
@@ -29,20 +40,30 @@ export class InteractionEpochs {
   }
 
   accept(tabId, frameId, observation) {
-    if (!observation || ("enabled" in observation && !observation.enabled) || typeof observation.documentId !== "string" || !Number.isSafeInteger(observation.sequence) || observation.sequence < 0) {
+    if (!observation || ("enabled" in observation && !observation.enabled) || typeof observation.documentId !== "string" || !Number.isSafeInteger(observation.sequence) || observation.sequence < 0 || !Number.isFinite(observation.observedAt) || !Array.isArray(observation.interactions)) {
       throw new Refusal("interaction_continuity_lost");
     }
     const record = this.record(tabId);
     const previous = record.documents.get(frameId);
-    if (!previous || previous.documentId !== observation.documentId) {
-      record.continuity += 1;
-      record.epoch += observation.sequence;
-    } else if (observation.sequence > previous.sequence) {
-      record.epoch += observation.sequence - previous.sequence;
-    } else if (observation.sequence < previous.sequence) {
+    const sameDocument = previous?.documentId === observation.documentId;
+    if (sameDocument && observation.sequence < previous.sequence) {
       return; // An older asynchronous notification cannot roll the counter back.
     }
-    record.documents.set(frameId, { documentId: observation.documentId, sequence: observation.sequence });
+    let sequence = sameDocument ? previous.sequence : 0;
+    let increments = 0;
+    for (const event of observation.interactions) {
+      if (!Number.isSafeInteger(event.sequence) || !Number.isFinite(event.at) || event.at > observation.observedAt) throw new Refusal("interaction_continuity_lost");
+      if (event.sequence <= sequence) continue;
+      if (event.sequence !== sequence + 1) throw new Refusal("interaction_continuity_lost");
+      sequence = event.sequence;
+      if (!record.actions.some(action => event.at >= action.start && (action.end === null || event.at < action.end))) increments += 1;
+    }
+    // A truncated history cannot prove which side of attach/detach the missing
+    // input belongs to. Fail closed instead of discounting unknown events.
+    if (sequence !== observation.sequence) throw new Refusal("interaction_continuity_lost");
+    if (!sameDocument) record.continuity += 1;
+    record.epoch += increments;
+    record.documents.set(frameId, { documentId: observation.documentId, sequence, observedAt: Math.max(sameDocument ? previous.observedAt : 0, observation.observedAt) });
   }
 
   async sample(tabId) {
@@ -67,6 +88,10 @@ export class InteractionEpochs {
       this.accept(tabId, frame.frameId, observation);
     }
     await this.tabs.eligible(tabId);
+    // Once every live frame has been sampled beyond a closed window, later
+    // sequence advances cannot contain its events; stale messages are ignored.
+    const sampledThrough = Math.min(...[...record.documents.values()].map(document => document.observedAt));
+    record.actions = record.actions.filter(action => action.end === null || action.end > sampledThrough);
     return record.epoch;
   }
 
@@ -85,15 +110,6 @@ export class InteractionEpochs {
   async check(tabId, expected) {
     const actual = await this.sample(tabId);
     if (!Number.isSafeInteger(expected) || actual !== expected) throw new Refusal("interaction_epoch_changed");
-  }
-
-  async arm(tabId, frameId, events) {
-    await this.tabs.eligible(tabId);
-    await bounded(this.chrome.tabs.sendMessage(tabId, { kind: "agent-sentinel", operation: "arm", events }, { frameId }), "dispatch");
-  }
-
-  async disarm(tabId, frameId) {
-    await this.chrome.tabs.sendMessage(tabId, { kind: "agent-sentinel", operation: "disarm" }, { frameId }).catch(() => {});
   }
 
   async disable(tabId) {

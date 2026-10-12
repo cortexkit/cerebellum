@@ -1,5 +1,5 @@
 import { bounded, Refusal } from "./errors.mjs";
-import { classifyCommand, expectedEvents, resolveParams, verifyRuntime } from "./commands.mjs";
+import { classifyCommand, resolveParams, verifyRuntime } from "./commands.mjs";
 
 const routeKey = route => `${route.channel}:${route.epoch}`;
 const closed = (value, fields) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
@@ -137,6 +137,7 @@ export class Agent {
         // A late attach completion still detaches even after timeout/cancellation.
         const pending = this.chrome.debugger.attach({ tabId: state.tabId }, "1.3").then(async () => {
           state.attached = true;
+          state.actionWindow = this.epochs.beginAction(state.tabId);
           if (state.cancelled || this.connectionEpoch !== state.epoch) await this.detach(state);
         }).finally(() => {
           state.attachSettled = true;
@@ -163,8 +164,31 @@ export class Agent {
   async detach(state) {
     if (!state.attached) return;
     if (state.detaching) return state.detaching;
-    state.detaching = bounded(this.chrome.debugger.detach({ tabId: state.tabId }), "cancel").then(() => { state.attached = false; }).finally(() => { state.detaching = null; });
+    state.detaching = Promise.resolve().then(async () => {
+      try { await this.releaseMouse(state); } finally {
+        // Keep the window open until Chrome actually detaches, even if the
+        // caller's deadline expires before the detach promise settles.
+        const pending = this.chrome.debugger.detach({ tabId: state.tabId }).then(() => {
+          state.attached = false;
+          this.epochs.endAction(state.actionWindow);
+        });
+        await bounded(pending, "cancel");
+      }
+    }).finally(() => { state.detaching = null; });
     return state.detaching;
+  }
+
+  async releaseMouse(state) {
+    if (state.releasing) return state.releasing;
+    if (!state.heldMouse || !state.attached) return;
+    const params = state.heldMouse;
+    state.heldMouse = null;
+    // This is release-only cleanup for a press we dispatched on this attachment.
+    // A refusal may revoke membership or freshness, but must not leave that
+    // button held. Never resume the plan or dispatch another press during cleanup.
+    state.releasing = bounded(this.chrome.debugger.sendCommand({ tabId: state.tabId }, "Input.dispatchMouseEvent", params), "reply")
+      .catch(() => { throw new Refusal("input_release_unconfirmed", "read again", { input_dispatched: true }); });
+    return state.releasing;
   }
 
   async cancel(state) {
@@ -173,8 +197,9 @@ export class Agent {
   }
 
   async finish(state) {
-    await this.detach(state);
-    this.active.delete(state);
+    try { await this.detach(state); } finally {
+      if (!state.attached) this.active.delete(state);
+    }
   }
 
   async execute(state) {
@@ -223,6 +248,17 @@ export class Agent {
   }
 
   async executeCommands(state) {
+    try {
+      return await this.runCommands(state);
+    } catch (error) {
+      if (error instanceof Refusal && state.input) error.detail.input_dispatched = true;
+      throw error;
+    } finally {
+      await this.releaseMouse(state);
+    }
+  }
+
+  async runCommands(state) {
     const results = [];
     let readObservation = null;
     const hasInput = state.plan.commands.some(command => classifyCommand(command) === "input");
@@ -244,24 +280,22 @@ export class Agent {
         if (kind === "input") {
           await this.epochs.check(state.tabId, state.plan.interaction_epoch);
           if (this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
-          await this.epochs.arm(state.tabId, frameId, expectedEvents(command));
-          // Sample once more after arming: a human event during the round trip must
-          // invalidate the baseline before the next individual input dispatch.
-          await this.epochs.check(state.tabId, state.plan.interaction_epoch);
         }
         await this.guard(state);
         if (kind === "input" && this.epochs.record(state.tabId).epoch !== state.plan.interaction_epoch) throw new Refusal("interaction_epoch_changed");
         if (kind === "input" && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
         if (kind === "navigate") this.navigation.set(state.tabId, { state, frameId, started: false, url: command.params.url, deadline: Date.now() + 30000 });
         if (kind === "input") state.input = true;
+        if (command.method === "Input.dispatchMouseEvent") {
+          if (command.params.type === "mousePressed") state.heldMouse = { ...command.params, type: "mouseReleased" };
+          if (command.params.type === "mouseReleased") state.heldMouse = null;
+        }
         const result = await bounded(this.chrome.debugger.sendCommand({ tabId: state.tabId }, command.method, command.params), "reply");
         results.push({ result });
       } catch (error) {
         if (error instanceof Refusal) throw error;
         results.push({ error: debuggerError(error) });
         break;
-      } finally {
-        if (kind === "input") await this.epochs.disarm(state.tabId, frameId);
       }
       await this.guard(state);
     }

@@ -1272,6 +1272,8 @@ async fn capture(
     let mut facts = HashMap::new();
     let mut html = Vec::new();
     let mut popup = false;
+    let mut ax_truncated = false;
+    let mut refs_truncated = false;
     let mut zoom_target = None;
     let zoom_ref = args["zoom"].as_str();
     let expected_zoom =
@@ -1329,7 +1331,13 @@ async fn capture(
             document.interaction,
             &frame.url,
         )
-        .map_err(|_| refusal("snapshot_not_ready"))?;
+        .map_err(|_| {
+            let mut reply = refusal("snapshot_not_ready");
+            reply["remedy"] = json!("read again");
+            reply
+        })?;
+        ax_truncated |= observation.ax_truncated;
+        refs_truncated |= observation.refs_truncated;
         let mut renamed = BTreeMap::new();
         for reference in observation.refs {
             let Some(mut identity) = reference.backend_identity else {
@@ -1430,18 +1438,34 @@ async fn capture(
     snapshot
         .refs
         .retain(|reference, _| rendered.printed_refs.contains(reference));
-    let text = if args["mode"] == "dom_full" {
+    let (text, text_truncated) = if args["mode"] == "dom_full" {
         snapshot.refs.clear();
-        crate::snapshot_store::encode_dom_text(&html.join("\n"), max_bytes).0
-    } else if args["mode"] == "ax" {
-        // The ax option reads the browser's accessibility tree. The shared
-        // renderer withholds credential, payment and unclassified field values.
-        rendered.text
+        crate::snapshot_store::encode_dom_text(&html.join("\n"), max_bytes)
     } else {
-        rendered.text
+        // AX and actionable reads share the renderer that withholds protected
+        // field values. Its output budget can cut an otherwise complete tree.
+        (
+            rendered.text,
+            rendered.cut_bytes > 0 || rendered.cut_lines > 0,
+        )
     };
+    let truncated =
+        ax_truncated || refs_truncated || text_truncated || document.embedded_frames != 0;
     context.target().retain(id.clone(), snapshot);
-    let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false});
+    let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false,"truncated":truncated,"refs_truncated":refs_truncated});
+    // A committed document and an unchanged interaction epoch do not establish
+    // that Chrome has finished loading its page or accessibility tree.
+    reply["settled"] = json!(false);
+    reply["settlement_reason"] = json!("Page settlement is not observed on the person's browser.");
+    if truncated {
+        reply["remedy"] = json!(
+            "This snapshot is partial; read again before assuming absent controls are unavailable."
+        );
+    } else if args["mode"] != "dom_full"
+        && records.iter().all(|record| record.role == "RootWebArea")
+    {
+        reply["remedy"] = json!("Chrome exposed no page content beyond the document root. This may be an empty or still-loading page; read again before assuming controls are absent.");
+    }
     if document.embedded_frames != 0 {
         reply["omitted_frames"] = json!(document.embedded_frames);
         reply["frame_note"] =
@@ -1757,7 +1781,8 @@ async fn input(
     }
     let mut dispatched = false;
     let mut popup = false;
-    for step in steps {
+    let mut steps = steps.into_iter();
+    while let Some(step) = steps.next() {
         if !context.granted(&frame.origin, severity, &hazards, Some(&once))
             || classification
                 .activation_destination_origin
@@ -1837,14 +1862,18 @@ async fn input(
                 .await
                 .map_err(|reply| prior_input(reply, dispatched))?;
             }
-            let mut commands = Vec::new();
-            if action == "type" {
-                commands.push(command(
-                    "Emulation.setFocusEmulationEnabled",
-                    json!({"enabled":true}),
-                ));
-            }
+            // Background pages can acknowledge mouse input without delivering
+            // it. Emulate page focus without activating the person's tab or
+            // window. Keep the mouse pair in one attachment so the extension
+            // can release our press even if its between-event guard refuses.
+            let mut commands = vec![command(
+                "Emulation.setFocusEmulationEnabled",
+                json!({"enabled":true}),
+            )];
             commands.push(step);
+            if action != "type" {
+                commands.extend(steps.by_ref());
+            }
             commands
         };
         let outcome = context.cdp(tab, Some(snapshot.interaction), commands).await;

@@ -27,6 +27,22 @@ actions. If you interact with or activate a controlled tab, an old snapshot can
 no longer authorize input: the agent must read again. A worker reconnect also
 invalidates old snapshots; commands are never replayed.
 
+## Snapshot completeness
+
+Navigation confirms the committed document, not page or network settlement, and
+reports `settled: false`. Snapshots make the same limitation explicit: a stable
+document and interaction epoch do not prove that Chrome has finished loading the
+accessibility tree. An empty AX response or a missing declared child refuses with
+`snapshot_not_ready` and `read again`. A root-only tree can be a legitimate empty
+page, so it remains readable; its remedy explains that the page may instead still
+be loading and that absent controls should not be assumed unavailable.
+
+Like own-browser snapshots, user snapshots report `truncated` and
+`refs_truncated`. Known AX/reference bounds, omitted embedded frames and output
+byte cuts mark the snapshot partial, with a remedy to read again before relying
+on absent content. These flags describe the capture, not whether additional page
+content might load later. They do not change site consent or add automatic retries.
+
 ## Development installation in normal Chrome
 
 Use an unpacked extension for development. Branded Chrome 137 and later ignores
@@ -129,6 +145,11 @@ operator tabs are used. A scratch consent relay validates the production card's
 browser target, exact fixture origin, wording and `allow_once` choice before
 answering. No phone, live consent channel or standing permission is needed.
 It prints a **PASS/FAIL line per check** and exits nonzero on a failed check.
+Every failed acceptance check also prints the last reply's outcome, reason, ask
+count and a UTF-8-safe prefix of at most 400 bytes of `state_text`. Text is
+withheld unless the probe's own CDP observer confirms that every page target is
+one of its two loopback fixtures; failed or unknown target checks never expose
+other page text.
 After a failed check it also prints the extension worker's console, exception
 and log events (the observer enables CDP `Runtime` on the worker) and each
 probe-build native host's recorded exit reason, read from
@@ -140,8 +161,14 @@ Checks cover opening an Agent tab, per-site consent, allow-once expiration,
 snapshot, click and type with independent fixture beacons, an unrelated
 outside-group tab's invisibility/refused read/survival, no activation, and
 `chrome.debugger.getTargets()` showing no attached Agent page between actions.
-The independent observer attaches only to the extension worker and unrelated
-fixture; it does not drive Agent pages or stand in for `browser_use`.
+After a click, the probe waits up to two seconds for the beacon, then briefly
+attaches its own test-browser CDP session to the unique Agent fixture page to
+read the page-local click counter. On failure it prints that counter and the
+beacon count, `document.visibilityState`, `innerWidth`/`innerHeight`, the button's
+bounding rectangle and `document.hasFocus()`. This separates input missing the
+button from the handler running but its beacon not arriving. The observer
+detaches before the next action; it never dispatches Agent-page input or stands
+in for `browser_use`.
 
 For worker loss, the observer uses CDP `ServiceWorker.stopWorker`, verifies the
 old worker/connection disappeared, and explicitly wakes the registration with
@@ -170,7 +197,7 @@ bash -n scripts/install-native-host.sh
 bash scripts/rust-test-gate.sh
 ```
 
-The explicit self-test runs 11 portable checks (12 on macOS, including process-
+The explicit self-test runs 20 portable checks (21 on macOS, including process-
 group and directory cleanup) with driver doubles and scratch manifest
 fixtures, without Chrome, a socket, a durable journal or any live profile. Its
 negative controls deliberately fail named acceptance checks; the final named
