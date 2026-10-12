@@ -619,6 +619,25 @@ impl StandingBrowserGrants {
         }
     }
 
+    /// A distinct store prevents grants for the agent's profile from authorizing
+    /// the person's signed-in Chrome (and vice versa).
+    pub(crate) fn open_user_durable(machine_uuid: Option<String>) -> Self {
+        match cerebellum_core::journal::journal_data_path("user-browser-standing-grants.json") {
+            Ok(path) => Self::open(
+                Arc::new(FilesystemStandingGrantStorage::new(path)),
+                machine_uuid,
+            ),
+            Err(error) => {
+                let grants =
+                    Self::open(Arc::new(InMemoryStandingGrantStorage::new()), machine_uuid);
+                *lock(&grants.rows) = Err(StandingGrantStoreError::Unreadable {
+                    detail: format!("{error:?}"),
+                });
+                grants
+            }
+        }
+    }
+
     /// Grants held only in memory with no machine identity, so no standing
     /// answer is ever offered or stored. For tests and isolated planes.
     pub fn in_memory() -> Self {

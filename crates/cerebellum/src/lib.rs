@@ -53,6 +53,7 @@ pub mod public_suffix;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod tool_provider;
+mod user_browser;
 pub mod user_browser_bridge;
 pub mod wire;
 
@@ -2793,6 +2794,14 @@ impl Planes {
                 (Arc::new(computer_grants::ComputerGrants::in_memory()), None)
             }
         };
+        let user_grants = Arc::new(match &durable_standing {
+            Some(machine_uuid) => {
+                browser_standing_grants::StandingBrowserGrants::open_user_durable(
+                    machine_uuid.clone(),
+                )
+            }
+            None => browser_standing_grants::StandingBrowserGrants::in_memory(),
+        });
         let standing = standing.unwrap_or_else(|| {
             Arc::new(match durable_standing {
                 Some(machine_uuid) => {
@@ -2903,7 +2912,7 @@ impl Planes {
             browser,
             browser_config,
             sessions,
-            user_browser: user_browser_bridge::UserBrowserBridge::new(),
+            user_browser: user_browser_bridge::UserBrowserBridge::with_user_grants(user_grants),
             lease_clock,
             launch_service,
             management,
@@ -5728,6 +5737,55 @@ async fn handle_tool_request(
     planes: &Planes,
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
+    let user = serde_json::from_slice::<Value>(&frame.body)
+        .ok()
+        .is_some_and(|body| {
+            body["name"] == flat_tools::BROWSER_USE && body["arguments"]["browser"] == "user"
+        });
+    if !user {
+        return handle_tool_request_inner(frame, writer, planes, call).await;
+    }
+    // Tag even admission/schema refusals, which never reach the user adapter.
+    // Own calls bypass this forwarding path and keep their original bytes.
+    let (tagged, mut replies) = mpsc::channel::<Frame>(16);
+    let writer = writer.clone();
+    let forwarding = tokio::spawn(async move {
+        while let Some(frame) = replies.recv().await {
+            let frame = if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+                let mut body: Value =
+                    serde_json::from_slice(&frame.body).map_err(ModuleError::Json)?;
+                body["browser"] = json!("user");
+                Frame::build_with_version(
+                    frame.header.ver,
+                    frame.header.ty,
+                    frame.header.flags,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                    serde_json::to_vec(&body).map_err(ModuleError::Json)?,
+                )
+                .map_err(|error| ModuleError::Message(error.to_string()))?
+            } else {
+                frame
+            };
+            send(&writer, frame).await?;
+        }
+        Ok::<(), ModuleError>(())
+    });
+    let result = handle_tool_request_inner(frame, &tagged, planes, call).await;
+    drop(tagged);
+    forwarding
+        .await
+        .map_err(|error| ModuleError::Message(error.to_string()))??;
+    result
+}
+
+async fn handle_tool_request_inner(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    call: &CallObservation,
+) -> Result<(), ModuleError> {
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
         Err(outcome) => {
@@ -6012,6 +6070,61 @@ async fn handle_tool_request(
         )
         .await;
     }
+    if let Some(flat_tools::FlatDispatch::UserBrowser {
+        action,
+        capability,
+        arguments,
+    }) = translated.as_ref()
+    {
+        if accepted_facts.flow_id.is_some() && !accepted_facts.acts_as_agent {
+            return send_tool_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                flow_consent_refusal("unattended_flow"),
+            )
+            .await;
+        }
+        if let Some(capability) = capability {
+            // The selector cannot widen the route's capability admission. In
+            // particular, open_tab and claim_tab have launch's exact authority.
+            if !accepted_facts.allows_capability(capability) {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "capability_denied",
+                    "capability is outside the effective capability scope",
+                )
+                .await;
+            }
+            if let Some(refusal) = browser_session::CONTROL_TOOLS
+                .contains(&capability.as_str())
+                .then(|| accepted_facts.control_operation_refusal(capability))
+                .flatten()
+            {
+                return send_tool_response(writer, ver, channel, epoch, corr, json!({"browser":"user","outcome":"authorization_denied","reason":refusal.reason_code(),"remedy":accepted_facts.control_refusal_remedy(refusal)})).await;
+            }
+        }
+        call.commit_point_follows();
+        let result = user_browser::serve(
+            planes,
+            &accepted_facts,
+            writer,
+            (channel, epoch, corr),
+            action,
+            arguments,
+        )
+        .await;
+        if planes.routes.get(channel, epoch).is_none() {
+            return Ok(());
+        }
+        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+    }
     let (name, arguments) = match translated.as_ref() {
         Some(flat_tools::FlatDispatch::Computer {
             capability,
@@ -6022,6 +6135,7 @@ async fn handle_tool_request(
             arguments,
         }) => (capability.as_str(), arguments),
         Some(flat_tools::FlatDispatch::Management { .. }) => unreachable!("returned above"),
+        Some(flat_tools::FlatDispatch::UserBrowser { .. }) => unreachable!("returned above"),
         None => (name, arguments),
     };
 
