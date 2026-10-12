@@ -6,12 +6,17 @@
 
 use serde_json::Value;
 
-use super::double::{vector, vector_result, VECTORS};
+use super::desk::{Detach, Ending};
+use super::double::{
+    vector, vector_result, DETACH_PENDING, DETACH_REPEAT, DETACH_SETTLED, DETACH_WRONG_OWNER,
+    VECTORS,
+};
+use super::route::CallError;
 use super::wire::{self, CardState, Record, Refusal, RefusalCode};
 
 /// The SHA-256 of the copied `SHA256SUMS`. The manifest covers every other
 /// file but cannot cover itself, so its own hash is pinned here.
-const MANIFEST_SHA256: &str = "d276eaed5330b95923166d006b2f1b5d83a9a95e050cfe99446d685b22c2e568";
+const MANIFEST_SHA256: &str = "23b231fbb08a9c51c661604e1781ce125f5c4c15c3695fb4c8ee54691caf754d";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -83,6 +88,26 @@ fn request_envelopes_are_the_vector_bytes() {
             wire::CONSENT_ANSWERS,
             wire::answers_params(0),
         ),
+        (
+            "cerebellum-detach-pending-request.json",
+            wire::CONSENT_DETACH,
+            wire::id_params("el_1"),
+        ),
+        (
+            "cerebellum-detach-repeat-request.json",
+            wire::CONSENT_DETACH,
+            wire::id_params("el_1"),
+        ),
+        (
+            "cerebellum-detach-settled-request.json",
+            wire::CONSENT_DETACH,
+            wire::id_params("el_2"),
+        ),
+        (
+            "cerebellum-detach-wrong-owner-request.json",
+            wire::CONSENT_DETACH,
+            wire::id_params("el_1"),
+        ),
     ] {
         assert_eq!(
             String::from_utf8(wire::envelope(method, params)).unwrap(),
@@ -143,4 +168,48 @@ fn requester_refs_follow_the_contract_bounds() {
     assert!(!wire::is_requester_ref(&"x".repeat(129)));
     assert!(!wire::is_requester_ref("tab\there"));
     assert!(!wire::is_requester_ref("caf\u{e9}"));
+}
+
+/// Cingulate's four served `consent.detach` replies read as the client must
+/// read them: a pending card it detached, a card that had already settled
+/// (whose answer the call then gives itself, since no notice will come), a
+/// repeated detach of the same card (still detached, the same record), and
+/// a card of another owner (refused, never treated as detached).
+#[test]
+fn the_detach_vectors_parse_to_what_each_shows() {
+    let read = |name: &str| Detach::of_reply(Ok(Record::parse(vector_result(name)).unwrap()));
+
+    let pending = read(DETACH_PENDING).unwrap();
+    let Detach::Detached(record) = &pending else {
+        panic!("the pending vector did not read as detached: {pending:?}");
+    };
+    assert_eq!(record.elicitation_id, "el_1");
+    assert_eq!(record.state, CardState::Pending);
+    assert!(record.detached);
+
+    let settled = read(DETACH_SETTLED).unwrap();
+    let Detach::AlreadySettled(record) = &settled else {
+        panic!("the settled vector did not read as already settled: {settled:?}");
+    };
+    assert_eq!(record.elicitation_id, "el_2");
+    assert_eq!(record.state, CardState::Answered);
+    assert_eq!(record.answered_choice_id.as_deref(), Some("allow_once"));
+    assert!(
+        !record.detached,
+        "only a pending card's detach reply carries the mark"
+    );
+
+    let repeat = read(DETACH_REPEAT).unwrap();
+    assert_eq!(
+        repeat, pending,
+        "a second detach of the same card reads as the first"
+    );
+
+    let refusal = Refusal::from_error_body(&raw(DETACH_WRONG_OWNER)).unwrap();
+    assert_eq!(refusal.code, RefusalCode::NotOwner);
+    assert_eq!(
+        Detach::of_reply(Err(CallError::Refused(refusal))),
+        Err(Ending::NoAnswer),
+        "a card of another owner is never treated as detached"
+    );
 }

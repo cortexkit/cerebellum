@@ -32,6 +32,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT,
         crate::journal::BASELINE_ENTRY_FORMAT,
         crate::journal::call_records::CALL_RECORD_FORMAT,
+        crate::cingulate_client::desk::CINGULATE_RAISED_FORMAT,
         // Under `browser/`.
         crate::profile::REGISTRY_FORMAT,
         crate::browser_signed_in::SIGNED_IN_FORMAT,
@@ -70,5 +71,12 @@ mod tests {
     #[test]
     fn open_app_history_reader_is_listed_for_the_staging_floor_gate() {
         assert!(readable_formats().contains(&crate::open_app_history::LAUNCH_HISTORY_FORMAT));
+    }
+
+    #[test]
+    fn the_raised_card_registry_reader_is_listed_for_the_staging_floor_gate() {
+        assert!(
+            readable_formats().contains(&crate::cingulate_client::desk::CINGULATE_RAISED_FORMAT)
+        );
     }
 }

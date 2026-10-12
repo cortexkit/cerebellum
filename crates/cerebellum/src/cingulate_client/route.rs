@@ -43,6 +43,10 @@ pub enum CallError {
     /// No live inbound call was held when the route was to be opened, so it
     /// was not opened.
     NotLive,
+    /// The registry of raised cards could not be read at startup (a newer
+    /// version or a damaged file), so no route is opened and no card raised:
+    /// raising one would mean saving the registry over that file.
+    RegistryUnreadable,
 }
 
 /// One open route to Cingulate. Dropping it closes the route.
