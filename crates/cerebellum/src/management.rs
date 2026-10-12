@@ -90,6 +90,14 @@ pub const OPERATIONS: [&str; 14] = [
     LIST_GRANTS,
 ];
 
+/// Receive-to-terminal bounds for a Management-surface method. Flat browser
+/// actions use the browser tool's larger park and maximum-work allowances.
+pub fn call_limits(method: &str) -> Option<&'static crate::budgets::ManagementLimits> {
+    crate::budgets::MANAGEMENT_LIMITS
+        .iter()
+        .find(|limits| limits.method == method)
+}
+
 /// How long a question the person usually answers from a phone may stay open:
 /// a browser grant, or re-identifying the profile root.
 ///

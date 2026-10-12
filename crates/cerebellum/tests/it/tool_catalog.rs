@@ -130,7 +130,12 @@ async fn catalog_matches_hello_and_digest_is_stable() {
             schema_digest(&tool.input_schema).unwrap()
         );
         assert_eq!(tool.semantics, 1);
-        assert!(tool.reply.is_none());
+        let max_ms = match tool.name.as_str() {
+            "computer_use" => cerebellum::budgets::COMPUTER_REPLY_MAX_MS,
+            "browser_use" => cerebellum::budgets::BROWSER_REPLY_MAX_MS,
+            _ => panic!("unexpected catalog tool: {}", tool.name),
+        };
+        assert_eq!(tool.reply.as_ref().unwrap().max_ms, max_ms);
     }
     let composition = json!({"params":{},"composition":{"opaque":{"v":3}}});
     let composed = catalog(&planes, composition.clone()).await;

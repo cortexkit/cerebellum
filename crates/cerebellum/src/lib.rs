@@ -21,6 +21,7 @@ pub mod browser_session;
 pub mod browser_signed_in;
 pub mod browser_standing_grants;
 pub mod browser_type;
+pub mod budgets;
 mod call_queue;
 pub mod capability;
 pub mod cdp;
@@ -127,27 +128,9 @@ use cerebellum_core::principal::{
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
 pub use wire::{build_error_frame, control_flags};
 
-// Absorbs scheduling delay and the pipe handshake's own bounded steps.
-const IN_FLIGHT_MARGIN_MS: u64 = 5_000;
-
-fn derive_in_flight_age_stale_ms(browser: Option<&BrowserConfig>) -> u64 {
-    let mut cap = computer_capability::MAX_WAIT_TIMEOUT_MS;
-    if let Some(browser) = browser {
-        cap = cap
-            .max(browser.navigation_settle_deadline_ms)
-            .max(browser.launch_handshake_deadline_ms)
-            .max(
-                browser
-                    .termination_grace_period_ms
-                    .saturating_add(browser.browser_exit_observation_deadline_ms),
-            );
-    }
-    cap.saturating_add(IN_FLIGHT_MARGIN_MS)
-}
-
 const DEFAULT_MODULE_ID: &str = "cerebellum";
 const HELLO_CORR: u64 = 1;
-const EGRESS_BUFFER: usize = 64;
+const EGRESS_BUFFER: usize = budgets::EGRESS_BUFFER;
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_RETRIES: u32 = 4;
@@ -1831,10 +1814,7 @@ async fn run(
     let (mut read_half, write_half) = tokio::io::split(stream);
 
     let mut health_config = config.health;
-    health_config.in_flight_age_stale_ms = derive_in_flight_age_stale_ms(match &config.browser {
-        BrowserSurface::Available(browser) => Some(browser),
-        _ => None,
-    });
+    health_config.in_flight_age_stale_ms = budgets::IN_FLIGHT_AGE_STALE_MS;
     let health_state = Arc::new(HealthState::with_config(health_config));
     let browser_config = match &config.browser {
         BrowserSurface::Available(browser) => Some(browser.clone()),
@@ -7704,22 +7684,11 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_bound_derives_from_the_longest_declared_cap() {
-        let mut config = browser_surface_config();
-        config.navigation_settle_deadline_ms = 45_000;
-        assert_eq!(derive_in_flight_age_stale_ms(None), 35_000);
-        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 50_000);
-        assert!(
-            derive_in_flight_age_stale_ms(Some(&config)) > computer_capability::MAX_WAIT_TIMEOUT_MS
+    fn in_flight_bound_covers_the_longest_work_and_release() {
+        assert_eq!(
+            budgets::IN_FLIGHT_AGE_STALE_MS,
+            budgets::MAX_ACTION_WORK_MS + budgets::RELEASE_BUDGET_MS + budgets::IN_FLIGHT_MARGIN_MS
         );
-        assert!(
-            derive_in_flight_age_stale_ms(Some(&config)) > config.navigation_settle_deadline_ms
-        );
-        config.launch_handshake_deadline_ms = 60_000;
-        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 65_000);
-        config.termination_grace_period_ms = 40_000;
-        config.browser_exit_observation_deadline_ms = 40_000;
-        assert_eq!(derive_in_flight_age_stale_ms(Some(&config)), 85_000);
     }
 
     fn browser_surface_config() -> BrowserConfig {
