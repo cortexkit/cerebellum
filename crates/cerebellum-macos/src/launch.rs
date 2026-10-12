@@ -1198,16 +1198,34 @@ mod tests {
 
     use super::*;
 
+    /// A copy of this test binary under `/tmp`, to hand to `spawn_barred` and
+    /// its variants instead of `std::env::current_exe()`.
+    ///
+    /// Those launches disclaim privacy responsibility, so the child is the
+    /// process macOS asks permissions for, under the name of its own image.
+    /// The build directory may live on an external disk, which macOS treats
+    /// as a removable volume: a child started from there makes macOS prompt
+    /// the person at the desk to let "cerebellum_macos-<hash>" access files
+    /// on a removable volume, and every rebuild is a new binary that asks
+    /// again. `/tmp` is on the internal disk. The copy is named by its
+    /// content, so one build reuses one path rather than copying per test.
+    /// A plain `Command` launch keeps the launcher's responsibility, never
+    /// prompts in its own name, and does not need this.
+    fn relocated_test_executable() -> PathBuf {
+        let bytes = fs::read(std::env::current_exe().expect("test executable"))
+            .expect("read test executable");
+        crate::content_named_fixture::content_named_fixture(
+            "launch-test-executable",
+            "launch-test-executable",
+            &bytes,
+            0o700,
+        )
+    }
+
     #[test]
     fn disclaim_makes_fixture_its_own_responsible_process() {
         let _serial = serialize_launch_fixtures();
-        let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
-        let fixture = crate::content_named_fixture::content_named_fixture(
-            "responsibility",
-            "responsibility-fixture",
-            &bytes,
-            0o700,
-        );
+        let fixture = relocated_test_executable();
         let directory = TestDirectory::new("responsibility");
         for disclaim in [false, true] {
             let report = directory.join(if disclaim { "disclaimed" } else { "inherited" });
@@ -1438,7 +1456,7 @@ mod tests {
         assert_ne!(previous as usize, SIG_ERR, "ignore SIGUSR1");
 
         let (command_read, _command_write, _response_read, response_write) = cdp_descriptors();
-        let executable = std::env::current_exe().expect("test executable");
+        let executable = relocated_test_executable();
         let child = spawn_barred(
             &executable,
             &[
@@ -1552,7 +1570,9 @@ mod tests {
             return;
         };
         let mode = std::env::var("CEREBELLUM_STDIO_SPAWN").expect("spawn mode");
-        let executable = std::env::current_exe().expect("test executable");
+        // The inheriting control runs the same copy, so both modes start the
+        // same image and differ only in how they are launched.
+        let executable = relocated_test_executable();
         let observer = [
             OsString::from("--ignored"),
             OsString::from("--exact"),
@@ -1978,5 +1998,352 @@ mod termination_tests {
 
         assert_eq!(outcome, TerminationOutcome::Signalled);
         let _ = target.wait();
+    }
+}
+
+/// A source scan that keeps tests from launching this crate's test binary in
+/// place through `spawn_barred` or its variants.
+///
+/// Those launches disclaim privacy responsibility, so macOS asks for
+/// permissions in the child's own name. A test binary started from the build
+/// directory, which may sit on an external disk that macOS treats as
+/// removable, makes macOS prompt the person at the desk about access to a
+/// removable volume, once per rebuild. Tests start a copy under `/tmp`
+/// instead (`relocated_test_executable` in the launch tests). Nothing at run
+/// time shows the difference, so the scan reads the source.
+///
+/// The scan reads every file under `src/` and `tests/`, production code
+/// included, because this crate never starts its own image disclaimed outside
+/// tests. Comments and the contents of string literals are blanked before
+/// matching. A call is flagged when its first argument mentions
+/// `current_exe`, or is a single variable whose closest `let` within the
+/// same function mentions it. An image reached through another function's
+/// return value is not followed.
+#[cfg(test)]
+mod disclaimed_launch_scan_tests {
+    use std::path::{Path, PathBuf};
+
+    /// The source with comments and the contents of string and char literals
+    /// replaced by spaces. Line breaks are kept, so line numbers still match.
+    fn code_only(source: &str) -> String {
+        let source: Vec<char> = source.chars().collect();
+        let at = |index: usize| source.get(index).copied();
+        let mut code = source.clone();
+        let blank = |code: &mut Vec<char>, from: usize, to: usize| {
+            let to = to.min(code.len());
+            for c in &mut code[from..to] {
+                if *c != '\n' {
+                    *c = ' ';
+                }
+            }
+        };
+        let is_identifier = |c: char| c.is_alphanumeric() || c == '_';
+        let mut index = 0;
+        while index < source.len() {
+            let c = source[index];
+            if c == '/' && at(index + 1) == Some('/') {
+                let end = (index..source.len())
+                    .find(|&position| source[position] == '\n')
+                    .unwrap_or(source.len());
+                blank(&mut code, index, end);
+                index = end;
+            } else if c == '/' && at(index + 1) == Some('*') {
+                // Block comments nest in Rust.
+                let mut depth = 0;
+                let mut position = index;
+                while position < source.len() {
+                    if source[position] == '/' && at(position + 1) == Some('*') {
+                        depth += 1;
+                        position += 2;
+                    } else if source[position] == '*' && at(position + 1) == Some('/') {
+                        depth -= 1;
+                        position += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        position += 1;
+                    }
+                }
+                blank(&mut code, index, position);
+                index = position;
+            } else if c == '"' {
+                let mut position = index + 1;
+                while position < source.len() && source[position] != '"' {
+                    if source[position] == '\\' {
+                        position += 1;
+                    }
+                    position += 1;
+                }
+                blank(&mut code, index, position + 1);
+                index = position + 1;
+            } else if c == '\'' {
+                // A char literal, or else a lifetime, which is left alone.
+                if at(index + 1) == Some('\\') {
+                    let end = (index + 3..source.len())
+                        .find(|&position| source[position] == '\'')
+                        .unwrap_or(source.len());
+                    blank(&mut code, index, end + 1);
+                    index = end + 1;
+                } else if at(index + 2) == Some('\'') {
+                    blank(&mut code, index, index + 3);
+                    index += 3;
+                } else {
+                    index += 1;
+                }
+            } else if is_identifier(c) {
+                // Whole identifiers at a time, so only a standalone `r` or
+                // `br` can open a raw string.
+                let start = index;
+                while index < source.len() && is_identifier(source[index]) {
+                    index += 1;
+                }
+                let word: String = source[start..index].iter().collect();
+                if word == "r" || word == "br" {
+                    let hashes = (index..source.len())
+                        .take_while(|&position| source[position] == '#')
+                        .count();
+                    if at(index + hashes) == Some('"') {
+                        let mut position = index + hashes + 1;
+                        while position < source.len()
+                            && !(source[position] == '"'
+                                && (1..=hashes).all(|offset| at(position + offset) == Some('#')))
+                        {
+                            position += 1;
+                        }
+                        let end = position + 1 + hashes;
+                        blank(&mut code, start, end);
+                        index = end;
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+        code.into_iter().collect()
+    }
+
+    /// Identifiers, `::`, and every other non-space character on its own,
+    /// each with its 1-based line number. Layout and line breaks only
+    /// separate tokens, so a call split over lines reads like a one-liner.
+    fn tokens(code: &str) -> Vec<(usize, &str)> {
+        let is_identifier = |c: char| c.is_alphanumeric() || c == '_';
+        let mut found = Vec::new();
+        for (index, line) in code.lines().enumerate() {
+            let mut rest = line;
+            while let Some(first) = rest.chars().next() {
+                let length = if first.is_whitespace() {
+                    rest = &rest[first.len_utf8()..];
+                    continue;
+                } else if is_identifier(first) {
+                    rest.find(|c: char| !is_identifier(c)).unwrap_or(rest.len())
+                } else if rest.starts_with("::") {
+                    2
+                } else {
+                    first.len_utf8()
+                };
+                found.push((index + 1, &rest[..length]));
+                rest = &rest[length..];
+            }
+        }
+        found
+    }
+
+    /// The tokens up to the first `,`, `;` or closing bracket at the starting
+    /// depth: one argument of a call, or the rest of a `let` statement.
+    fn until_separator<'a>(tokens: &[(usize, &'a str)]) -> Vec<&'a str> {
+        let mut depth = 0_i32;
+        let mut taken = Vec::new();
+        for &(_, token) in tokens {
+            match token {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" if depth == 0 => break,
+                ")" | "]" | "}" => depth -= 1,
+                "," | ";" if depth == 0 => break,
+                _ => {}
+            }
+            taken.push(token);
+        }
+        taken
+    }
+
+    /// The initializer of the closest `let name = ..;` before the end of
+    /// `before`, looking back no further than the enclosing `fn`.
+    fn binding<'a>(before: &[(usize, &'a str)], name: &str) -> Option<Vec<&'a str>> {
+        for index in (0..before.len()).rev() {
+            match before[index].1 {
+                "fn" => return None,
+                "let" => {}
+                _ => continue,
+            }
+            let mut position = index + 1;
+            if before.get(position).map(|token| token.1) == Some("mut") {
+                position += 1;
+            }
+            if before.get(position).map(|token| token.1) != Some(name) {
+                continue;
+            }
+            let equals = (position..before.len()).find(|&next| before[next].1 == "=")?;
+            return Some(until_separator(&before[equals + 1..]));
+        }
+        None
+    }
+
+    /// How many `spawn_barred*` calls the source makes, and the lines of those
+    /// that launch the running test binary from where it was built: the
+    /// executable argument mentions `current_exe`, either in the call itself
+    /// or in the `let` that bound the variable passed. Such a launch disclaims
+    /// responsibility for an image that may sit on a removable volume.
+    fn disclaimed_test_binary_launches(source: &str) -> (usize, Vec<usize>) {
+        let code = code_only(source);
+        let tokens = tokens(&code);
+        let mut calls = 0;
+        let mut violations = Vec::new();
+        for (index, &(line, word)) in tokens.iter().enumerate() {
+            let is_call = word.starts_with("spawn_barred")
+                && tokens.get(index + 1).map(|token| token.1) == Some("(")
+                && (index == 0 || tokens[index - 1].1 != "fn");
+            if !is_call {
+                continue;
+            }
+            calls += 1;
+            let argument = until_separator(&tokens[index + 2..]);
+            let names_own_image = argument.contains(&"current_exe");
+            let variable: Vec<&str> = argument
+                .iter()
+                .copied()
+                .filter(|token| *token != "&")
+                .collect();
+            let bound_to_own_image = match variable.as_slice() {
+                [name] => binding(&tokens[..index], name)
+                    .is_some_and(|initializer| initializer.contains(&"current_exe")),
+                _ => false,
+            };
+            if names_own_image || bound_to_own_image {
+                violations.push(line);
+            }
+        }
+        (calls, violations)
+    }
+
+    fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("source directory entry").path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn no_test_launches_the_test_binary_in_place_with_responsibility_disclaimed() {
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&crate_root.join("src"), &mut files);
+        rust_files(&crate_root.join("tests"), &mut files);
+        let mut calls = 0;
+        let mut violations = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).expect("read a source file");
+            let (found, lines) = disclaimed_test_binary_launches(&source);
+            calls += found;
+            for line in lines {
+                let relative = file.strip_prefix(crate_root).unwrap_or(file);
+                violations.push(format!("{}:{line}", relative.display()));
+            }
+        }
+        // An empty report means nothing if the walk found no files or the
+        // matcher recognised no calls. The crate made eleven such calls when
+        // this was written, eight of them in the launch tests.
+        assert!(
+            files.len() > 10 && calls > 5,
+            "the scan read {} files and saw {calls} spawn_barred calls; it is not looking",
+            files.len()
+        );
+        assert!(
+            violations.is_empty(),
+            "these launches disclaim responsibility for the test binary in its build \
+             directory, which makes macOS prompt about a removable volume when that \
+             directory is on an external disk; launch relocated_test_executable() \
+             instead: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn the_scan_flags_a_planted_launch_of_the_test_binary_in_place() {
+        let cases: &[(&str, &str, usize)] = &[
+            (
+                "the image named in the call",
+                "fn t() {\n    spawn_barred(&std::env::current_exe().unwrap(), &[], &[], 3, 4);\n}\n",
+                2,
+            ),
+            (
+                "the image bound to a variable first",
+                "fn t() {\n    let executable = std::env::current_exe().expect(\"x\");\n    \
+                 let child = spawn_barred(\n        &executable,\n        &[],\n    );\n}\n",
+                3,
+            ),
+            (
+                "a mutable binding and the responsibility variant",
+                "fn t() {\n    let mut helper = current_exe().unwrap();\n    \
+                 spawn_barred_with_responsibility(&helper, &[], &[], 3, 4, true);\n}\n",
+                3,
+            ),
+            (
+                "the stdin variant, split over lines",
+                "fn t() {\n    spawn_barred_stdin(\n        std::env::current_exe()\n            \
+                 .unwrap()\n            .as_path(),\n        &[],\n    );\n}\n",
+                2,
+            ),
+        ];
+        for (case, source, line) in cases {
+            let (calls, violations) = disclaimed_test_binary_launches(source);
+            assert_eq!(calls, 1, "case {case:?}: the call was not recognised");
+            assert_eq!(
+                violations,
+                vec![*line],
+                "case {case:?}: the planted launch was not flagged on its line"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scan_ignores_comments_strings_and_relocated_launches() {
+        let source = r##"
+// spawn_barred(&std::env::current_exe().unwrap(), &[], &[], 3, 4);
+/* spawn_barred(&std::env::current_exe().unwrap()) /* nested */ still a comment */
+const NOTE: &str = "spawn_barred(&std::env::current_exe().unwrap(), \" ) ";
+const RAW: &str = r#"spawn_barred(&std::env::current_exe().unwrap(), "quoted")"#;
+const QUOTE: char = '"';
+fn relocated() {
+    let executable = relocated_test_executable();
+    spawn_barred(&executable, &[], &[], 3, 4);
+}
+fn inherited() {
+    let helper = std::env::current_exe().expect("test executable");
+    Command::new(&helper).status();
+}
+fn spawn_barred(executable: &Path) {}
+fn shell() {
+    let executable = std::env::current_exe().unwrap();
+    drop(executable);
+}
+fn other() {
+    spawn_barred(&executable, &[], &[], 3, 4);
+}
+"##;
+        let (calls, violations) = disclaimed_test_binary_launches(source);
+        // Two real calls: the relocated launch and the one in `other`, whose
+        // `executable` is not bound in its own function.
+        assert_eq!(calls, 2, "the scan miscounted calls");
+        assert!(
+            violations.is_empty(),
+            "comments, strings or a relocated launch were flagged: {violations:?}"
+        );
     }
 }
