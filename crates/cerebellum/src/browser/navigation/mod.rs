@@ -7838,7 +7838,8 @@ mod tests {
             let terminal = call_terminal();
             let watch = Arc::new(DriverWatch::default());
             let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
-            let mut driver = attached_driver([json!({"id": 1, "sessionId": "session-own", "result": {}})]);
+            let mut driver =
+                attached_driver([json!({"id": 1, "sessionId": "session-own", "result": {}})]);
             let mut clock = FakeClock::new();
             let deadline = clock.now() + Duration::from_millis(10);
             driver
@@ -7893,7 +7894,11 @@ mod tests {
             json!({"type":"keyDown","key":"Backspace","code":"Backspace"}),
         )
         .is_err());
-        assert_eq!(driver.pipe.writes.len(), 1, "a new press passed a stopped gate");
+        assert_eq!(
+            driver.pipe.writes.len(),
+            1,
+            "a new press passed a stopped gate"
+        );
 
         send(
             &mut driver,
@@ -7912,7 +7917,8 @@ mod tests {
             terminal.stop(crate::TerminalCause::Deadline);
             let watch = Arc::new(DriverWatch::default());
             let _context = DriveScope::enter(Some(Arc::clone(&terminal)), &watch);
-            let press = json!({"type":"mousePressed","x":1.0,"y":2.0,"button":"left","clickCount":1});
+            let press =
+                json!({"type":"mousePressed","x":1.0,"y":2.0,"button":"left","clickCount":1});
             let CommandEffect::Press(held) =
                 command_effect(MOUSE_EVENT, press.as_object(), Some("session-own"))
             else {
@@ -7975,7 +7981,15 @@ mod tests {
         let mut clock = FakeClock::new();
         let deadline = clock.now() + Duration::from_millis(10);
         driver
-            .command_response("Page.getFrameTree", None, None, deadline, None, None, &mut clock)
+            .command_response(
+                "Page.getFrameTree",
+                None,
+                None,
+                deadline,
+                None,
+                None,
+                &mut clock,
+            )
             .unwrap();
         assert_eq!(
             driver.pipe.in_flight_at_write,
@@ -7983,7 +7997,6 @@ mod tests {
         );
         assert_eq!(watch.oldest_method(), None);
     }
-
 }
 
 /// The session-verification tab, driven against a pipe that answers each
@@ -8488,5 +8501,4 @@ mod signed_in_page_read_tests {
             "the read must reach the point where Chrome sends DOM events"
         );
     }
-
 }

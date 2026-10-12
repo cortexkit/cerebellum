@@ -5446,9 +5446,10 @@ mod tests {
             self.push("screenshot");
             let context = drive_context();
             if let (Some(switch), Some(context)) = (&self.wedged_write, &context) {
-                let _in_flight = context
-                    .watch
-                    .begin_command("Input.dispatchMouseEvent", Duration::from_millis(deadline_ms));
+                let _in_flight = context.watch.begin_command(
+                    "Input.dispatchMouseEvent",
+                    Duration::from_millis(deadline_ms),
+                );
                 let mut killed = switch.killed.lock().unwrap();
                 while !*killed {
                     killed = switch.wake.wait(killed).unwrap();
@@ -6364,10 +6365,11 @@ mod tests {
             BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
         let clock = FakeClock::new();
         let switch = Arc::new(KillSwitch::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-            browser.wedged_write = Some(Arc::clone(&switch));
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.wedged_write = Some(Arc::clone(&switch));
+            });
         let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
         else {
             panic!("a ready session refused dispatch");
@@ -6452,7 +6454,11 @@ mod tests {
                 sessions.accept_dispatch("route", &clock),
                 DispatchAdmission::NoSession
             ));
-            assert_eq!(session.released(), 0, "custody released under a live browser");
+            assert_eq!(
+                session.released(),
+                0,
+                "custody released under a live browser"
+            );
             assert!(!session.events().contains(&"graceful"));
 
             kill(&wedge);
@@ -6472,16 +6478,14 @@ mod tests {
             BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
         let clock = FakeClock::new();
         let switch = Arc::new(KillSwitch::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-            // Three commands of 30 ms each under a 40 ms cap: each is in
-            // bound, while their 90 ms total exceeds cap plus slack.
-            browser.in_bound_commands = Some((
-                3,
-                Duration::from_millis(40),
-                Duration::from_millis(30),
-            ));
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                // Three commands of 30 ms each under a 40 ms cap: each is in
+                // bound, while their 90 ms total exceeds cap plus slack.
+                browser.in_bound_commands =
+                    Some((3, Duration::from_millis(40), Duration::from_millis(30)));
+            });
         let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
         else {
             panic!("a ready session refused dispatch");
@@ -6515,9 +6519,10 @@ mod tests {
             browser.exited = Some(Arc::clone(&stuck_exited));
         });
         let other_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let crashed = establish_test_browser(&sessions, "crashed", &clock, Gate::opened(), |browser| {
-            browser.exited = Some(Arc::clone(&other_exited));
-        });
+        let crashed =
+            establish_test_browser(&sessions, "crashed", &clock, Gate::opened(), |browser| {
+                browser.exited = Some(Arc::clone(&other_exited));
+            });
         let idle = establish_test_browser(&sessions, "idle", &clock, Gate::opened(), |_| {});
         let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("stuck", &clock)
         else {
@@ -6570,9 +6575,10 @@ mod tests {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
         let call_gate = Arc::new(Gate::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.call_gate = Arc::clone(&call_gate);
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.call_gate = Arc::clone(&call_gate);
+            });
         let terminal = call_terminal();
         let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
         call_gate.wait_entered(1);
@@ -6602,7 +6608,10 @@ mod tests {
         call_gate.open();
         assert!(call.recv_timeout(PROMPTLY).unwrap());
         assert_eq!(sessions.execution_quarantine("route"), None);
-        assert!(sessions.status("route", &clock, UNIX_EPOCH).get("remedy").is_none());
+        assert!(sessions
+            .status("route", &clock, UNIX_EPOCH)
+            .get("remedy")
+            .is_none());
     }
 
     #[test]
@@ -6610,10 +6619,11 @@ mod tests {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
         let switch = Arc::new(KillSwitch::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-            browser.wedged_write = Some(Arc::clone(&switch));
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.wedged_write = Some(Arc::clone(&switch));
+            });
         let terminal = call_terminal();
         let call = screenshot_in_thread(
             admit_in_call(&sessions, "route", &clock, &terminal),
@@ -6630,7 +6640,10 @@ mod tests {
         // Every control permit is held: the close is refused before it acts.
         let held = sessions.control_permit.try_take().unwrap();
         let refused = sessions.close("route", &session.id, &config());
-        assert_eq!(refused["outcome"], "blocking_capacity_exhausted", "{refused}");
+        assert_eq!(
+            refused["outcome"], "blocking_capacity_exhausted",
+            "{refused}"
+        );
         assert_eq!(refused["detail"]["dispatched"], false, "{refused}");
         crate::browser::validate_browser_result(BROWSER_CLOSE, &refused).unwrap();
         assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -6655,10 +6668,11 @@ mod tests {
         let clock = FakeClock::new();
         let switch = Arc::new(KillSwitch::default());
         let call_gate = Arc::new(Gate::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-            browser.call_gate = Arc::clone(&call_gate);
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.call_gate = Arc::clone(&call_gate);
+            });
         let terminal = call_terminal();
         let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
         call_gate.wait_entered(1);
@@ -6711,10 +6725,11 @@ mod tests {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
         let call_gate = Arc::new(Gate::default());
-        let session = establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
-            browser.call_gate = Arc::clone(&call_gate);
-            browser.release_ok = Some(true);
-        });
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.call_gate = Arc::clone(&call_gate);
+                browser.release_ok = Some(true);
+            });
         let terminal = call_terminal();
         let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
         call_gate.wait_entered(1);

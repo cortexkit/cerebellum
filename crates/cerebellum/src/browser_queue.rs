@@ -460,7 +460,10 @@ mod tests {
             }
         }
         assert!(QueueRefusal::WaitExpired.response_body().is_none());
-        assert_eq!(session_capability(crate::browser_session::BROWSER_LAUNCH), None);
+        assert_eq!(
+            session_capability(crate::browser_session::BROWSER_LAUNCH),
+            None
+        );
     }
 
     #[tokio::test(start_paused = true)]
