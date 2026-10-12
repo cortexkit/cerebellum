@@ -5463,6 +5463,36 @@ async fn allowed_keyed_navigation(
     reply
 }
 
+/// The stack a browser call's route path may use, from the frame reader
+/// through a granted navigation to its journal commit. That path measured
+/// about 430 KiB at its deepest in an unoptimized macOS build once its route
+/// handlers were boxed; before, it took over 2 MiB and overflowed the default
+/// test-thread stack. Half the default leaves room to grow while failing well
+/// before a 2 MiB thread would.
+const ROUTE_STACK_BUDGET_BYTES: usize = 1024 * 1024;
+
+#[test]
+fn a_browser_call_fits_half_a_default_thread_stack() {
+    let call = std::thread::Builder::new()
+        .name("route-stack-budget".into())
+        .stack_size(ROUTE_STACK_BUDGET_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (planes, launcher) = blocking_grant_fixture().await;
+                    let (tx, mut rx) = mpsc::channel(8);
+                    allowed_keyed_navigation(&planes, &tx, &mut rx, "pf:stack-budget").await;
+                    assert!(launcher.effects.lock().unwrap().contains(&"navigate"));
+                })
+        })
+        .unwrap();
+    // A thread that overflows aborts the whole test binary, which fails it.
+    call.join().expect("the browser call ran to its reply");
+}
+
 #[tokio::test]
 async fn keyed_call_consent_card_carries_the_dispatcher_key() {
     let (planes, _launcher) = blocking_grant_fixture().await;
