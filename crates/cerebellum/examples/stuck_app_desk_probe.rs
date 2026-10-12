@@ -22,6 +22,10 @@
 //! no other process is signalled. Plane-level quarantine behaviour is covered
 //! by the `computer_capability` unit tests and is not measured here.
 
+// Other platforms only print a refusal; the shared constants serve the macOS
+// desk module alone.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::time::Duration;
 
 const APPROVAL_FLAG: &str = "--approve-desk-probe";
@@ -195,6 +199,8 @@ mod desk {
         }
     }
 
+    /// Read the scratch window while it answers, stop the process, then run
+    /// each bounded check against it. Returns the process exit code.
     fn measure(scratch: &Scratch) -> i32 {
         let source = Arc::new(MacAppStateSource);
         let pid = scratch.pid();
@@ -283,6 +289,7 @@ mod desk {
         }
     }
 
+    /// Stop the scratch process so its accessibility server cannot answer.
     fn signal_stop(pid: u32) -> bool {
         signal(pid, "STOP")
     }

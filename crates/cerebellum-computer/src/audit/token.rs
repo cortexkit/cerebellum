@@ -41,8 +41,9 @@ pub trait ActuationAudit {
         descriptor: ComputerPlaneDescriptor,
     ) -> Result<ReservationHandle, ComputerAuditError>;
 
-    /// The computer gate point: ask to start the mutation the next commit
-    /// announces. False once the call has been stopped.
+    /// Ask the call's dispatch gate (see `MutationGate`) to start the
+    /// mutation the next commit announces. False once the call has been
+    /// stopped by its terminal decision; the dispatcher then commits nothing.
     fn begin_mutation(&self) -> bool;
 
     /// Whether the call has been stopped; checked between the posts of one
@@ -213,7 +214,8 @@ where
     }
 
     /// Record a read that may change application state (an accessibility
-    /// opt-in) on its own entry. The read itself runs without the lock.
+    /// opt-in) on its own entry. The read itself runs without the shared
+    /// audit lock; only the reserve, commit and finalize steps take it.
     pub fn record_accessibility_read<U>(
         &mut self,
         identity: JournalIdentity,

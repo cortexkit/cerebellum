@@ -1387,7 +1387,7 @@ impl ComputerGrants {
             .park_guard
             .as_ref()
             .map(|guard| guard.park_on_consent());
-        // The call's work budget pauses for the same wait.
+        // The call's work budget pauses while it waits on the person.
         let _park_clock = crate::computer_capability::park_clock();
         let mut drain = context.drain.clone();
 
@@ -1592,7 +1592,7 @@ impl ComputerGrants {
                 .park_guard
                 .as_ref()
                 .map(|guard| guard.park_on_consent());
-            // The call's work budget pauses for the same wait.
+            // The call's work budget pauses while it waits on the person.
             let _park_clock = crate::computer_capability::park_clock();
             let waited = tokio::select! {
                 result = settled.wait_for(Option::is_some) => match result {

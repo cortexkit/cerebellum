@@ -82,7 +82,8 @@ impl HeldPress {
 struct Outstanding {
     press: HeldPress,
     terminal: Option<Arc<TerminalArbiter>>,
-    /// Set when the press's process exited while the worker was still alive.
+    /// Set when the press's process exited while the blocking worker that
+    /// posted it was still running.
     discharged: bool,
 }
 

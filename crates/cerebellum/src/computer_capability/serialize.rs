@@ -218,8 +218,8 @@ where
             // Ordering is best-effort when resolution exceeds two seconds:
             // run this call unserialized rather than letting a wedged platform
             // query stall every other app in the conversation. Dropping the
-            // await cannot stop a running blocking query, but that query owns
-            // neither lane, keeps its own permit, and cannot reserve an app
+            // await cannot stop a running blocking query, but that query holds
+            // neither the conversation lane nor an app lane, keeps its own permit, and cannot reserve an app
             // lock after the timeout.
             let app = tokio::time::timeout(
                 RESOLUTION_LIMIT,
@@ -425,8 +425,9 @@ fn resolution_may_block(capability: Servable) -> bool {
     )
 }
 
-/// A refusal decided before the call's action could start, in the envelope
-/// its row requires.
+/// A refusal decided before the call's action could start, in the reply
+/// envelope its capability's vocabulary row requires (the keystroke rows
+/// require effect and containment fields).
 pub(super) fn refused_in_queue(capability: Servable, reply: Value) -> Value {
     if matches!(capability.0, Served::Type | Served::Keys) {
         super::synthetic_wire_envelope(super::keystrokes::refused_before_posting(reply))

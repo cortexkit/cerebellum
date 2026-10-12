@@ -151,8 +151,8 @@ fn a_worker_publishing_after_the_terminal_closes_its_own_interval_at_once() {
     let call = terminal();
     let work = CallWork::new(Some(call.clone()), Duration::from_secs(1), None, None);
     call.stop(TerminalCause::Cancelled);
-    // The barrier between `begin_posting` and publication: the terminal fired
-    // in between, and the worker stays stuck afterwards.
+    // The terminal was chosen after the worker opened its interval but before
+    // it published it; the worker then stays blocked in its post.
     let posting = ledger.begin_posting(None);
     assert!(ledger.has_open_posting());
     work.publish_posting(&ledger, &posting);

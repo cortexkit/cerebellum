@@ -185,7 +185,8 @@ pub struct Posting {
 }
 
 impl Posting {
-    /// When the interval began; the key `end_posting_at` closes it by.
+    /// When the interval began. Pass it to `end_posting_at` to close this
+    /// interval without the `Posting` itself.
     pub fn start(&self) -> Instant {
         self.start
     }

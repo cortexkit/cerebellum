@@ -434,8 +434,9 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
-    /// The call's handle on the shared audit: each step locks it briefly,
-    /// and the intent's commit is the call's dispatch gate point.
+    /// The call's handle on the shared audit: each step locks it briefly.
+    /// The intent's commit first asks the call's dispatch gate, so a call
+    /// already answered sends nothing.
     pub audit: AuditToken<R, T, S>,
     pub identity: JournalIdentity,
     pub capability: ComputerCapability,
@@ -495,8 +496,9 @@ where
             .audit
             .with_audit(|audit| audit.reserve(identity, descriptor.clone()))
             .map_err(|_| IntentRefused::AuditUnavailable)?;
-        // The computer gate point: the call may have been answered while
-        // this worker ran, and then nothing more is sent.
+        // Ask the call's dispatch gate before committing the intent: the call
+        // may have been answered (deadline, cancel, drain) while this worker
+        // ran, and then nothing more is sent.
         if !self.audit.gate().begin_mutation() {
             self.recorded = true;
             let _ = self.audit.finalize_rejected(
