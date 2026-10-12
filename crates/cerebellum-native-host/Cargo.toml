@@ -1,0 +1,28 @@
+[package]
+name = "cerebellum-native-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "ck-cerebellum-native-host"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pinned Chrome for Testing probes require the machine owner's approval to launch
+# that browser; this feature is forbidden in attested release builds.
+chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
+
+[dependencies]
+cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cerebellum-macos = { path = "../cerebellum-macos" }
+cortexkit-paths = "=0.1.2"
+
+[dev-dependencies]
+cerebellum-core = { path = "../cerebellum-core" }
+cortexkit-test-support = "=0.1.2"

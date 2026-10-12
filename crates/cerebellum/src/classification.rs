@@ -384,23 +384,14 @@ impl NonTypeClassificationRecord {
         if computed.0 != self.credential || computed.1 != self.financial {
             return Err(ClassificationError::DerivedFieldMismatch);
         }
-        let expected_tier = if self.activation_invokes_form_submit
-            || self.credential
-            || self.financial
-            || self
-                .activation_destination_origin
-                .as_deref()
-                .is_some_and(|origin| origin != self.current_top_level_origin)
-        {
-            4
-        } else if self.target_kind.is_navigation_target()
-            && self.activation_destination_origin.as_deref()
-                == Some(self.current_top_level_origin.as_str())
-        {
-            1
-        } else {
-            2
-        };
+        let expected_tier = activation_tier(
+            self.target_kind,
+            self.activation_invokes_form_submit,
+            self.credential,
+            self.financial,
+            &self.current_top_level_origin,
+            self.activation_destination_origin.as_deref(),
+        );
         if self.required_tier != expected_tier {
             return Err(ClassificationError::DerivedFieldMismatch);
         }
@@ -750,21 +741,14 @@ pub fn classify_non_type(
         activation_target.password,
         &associated_form_controls,
     );
-    let elevated = activation_invokes_form_submit
-        || credential
-        || financial
-        || activation_destination_origin
-            .as_deref()
-            .is_some_and(|origin| origin != current_origin);
-    let required_tier = if elevated {
-        4
-    } else if activation_target.target_kind.is_navigation_target()
-        && activation_destination_origin.as_deref() == Some(current_origin.as_str())
-    {
-        1
-    } else {
-        2
-    };
+    let required_tier = activation_tier(
+        activation_target.target_kind,
+        activation_invokes_form_submit,
+        credential,
+        financial,
+        &current_origin,
+        activation_destination_origin.as_deref(),
+    );
 
     let record = NonTypeClassificationRecord {
         schema: NON_TYPE_CLASSIFICATION_SCHEMA.to_string(),
@@ -1148,6 +1132,31 @@ fn hex_digest(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+// Moving to a public page is reading, not a lasting change. Both the source and
+// destination still pass authorization, so local destinations retain site consent.
+fn activation_tier(
+    kind: TargetKind,
+    submits: bool,
+    credential: bool,
+    financial: bool,
+    current: &str,
+    destination: Option<&str>,
+) -> u8 {
+    let public_link = kind.is_navigation_target()
+        && destination.is_some_and(crate::browser_standing_grants::origin_is_public);
+    if submits
+        || credential
+        || financial
+        || destination.is_some_and(|origin| origin != current && !public_link)
+    {
+        4
+    } else if kind.is_navigation_target() && (destination == Some(current) || public_link) {
+        1
+    } else {
+        2
+    }
 }
 
 #[cfg(test)]

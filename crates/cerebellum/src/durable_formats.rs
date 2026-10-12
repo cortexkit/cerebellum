@@ -7,11 +7,11 @@
 //! constant the format's own reader checks against, never a copy of it: a
 //! copy could say a build reads a version its reader refuses.
 //!
-//! Formats this module writes but never reads back are not listed: no build
-//! fails on them, so no build should be refused over them. Those are the
-//! custody event log and the profile-root rebind log (append-only records for
-//! people) and the browser journal's entries (exported as written, never
-//! decoded).
+//! The browser journal also has a floored reason for public-web actions allowed
+//! by risk policy without asking a person. That reason must not be interpreted
+//! by an older deployment as a person's approval.
+//! Other write-only formats need no reader floor: the custody event log,
+//! profile-root rebind log, and opaque legacy browser entries.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,9 +30,11 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         crate::browser_launch::LAUNCH_ENTRY_FORMAT,
         crate::browser_launch::LAUNCH_RECOVERY_CLEAR_FORMAT,
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT,
+        crate::journal::BASELINE_ENTRY_FORMAT,
         crate::journal::call_records::CALL_RECORD_FORMAT,
         // Under `browser/`.
         crate::profile::REGISTRY_FORMAT,
+        crate::browser_signed_in::SIGNED_IN_FORMAT,
         crate::profile_custody::CUSTODY_LOCK_FORMAT,
     ]
 }

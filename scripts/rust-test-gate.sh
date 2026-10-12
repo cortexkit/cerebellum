@@ -139,6 +139,9 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
+run_phase "extension tests (nonzero test count required)" \
+  node extension/test-gate.mjs
+
 # Registry checksums and git revisions in Cargo.lock replace sibling source pins.
 # Check every manifest, including target-specific and test dependencies, before
 # Cargo runs so an external checkout can never become an implicit build input.

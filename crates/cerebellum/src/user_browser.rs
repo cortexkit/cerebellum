@@ -316,7 +316,18 @@ async fn invoke(
         reply["reason"] = serde_json::to_value(reason).expect("reason serializes");
     }
     if let Some(reason) = outcome.extension_reason {
-        reply["reason"] = json!(reason);
+        // The extension encodes its machine reason and human remedy as JSON
+        // inside the bridge's refusal string. Do not expose that envelope as a
+        // machine code or copy arbitrary diagnostic/page fields into the reply.
+        match serde_json::from_str::<Value>(&reason) {
+            Ok(detail) if detail["reason"].as_str().is_some() => {
+                reply["reason"] = detail["reason"].clone();
+                if let Some(remedy) = detail["remedy"].as_str() {
+                    reply["remedy"] = json!(remedy);
+                }
+            }
+            _ => reply["reason"] = json!(reason),
+        }
     }
     if let Some(remedy) = outcome.remedy {
         reply["remedy"] = json!(remedy);
@@ -349,8 +360,8 @@ async fn plan(
             command["method"].as_str().is_some_and(|method| {
                 method.starts_with("Input.")
                     || method == "DOM.focus"
-                    || (method == "Runtime.callFunctionOn"
-                        && command["params"]["functionDeclaration"] != functions::HAS_FOCUS)
+                    || method == "Runtime.callFunctionOn"
+                    || method == "Emulation.setFocusEmulationEnabled"
             })
         })
         .collect();
@@ -402,18 +413,17 @@ async fn plan(
     })
 }
 
-fn command(method: &str, params: Value, frame: Option<&str>) -> Value {
-    let mut command = json!({"method":method,"params":params});
-    if let Some(frame) = frame {
-        command["frame_id"] = json!(frame);
-    }
-    command
+fn command(method: &str, params: Value) -> Value {
+    // WebNavigation frame 0 is the only admitted input-sentinel scope. CDP
+    // frame ids belong in method parameters, never in sentinel routing.
+    json!({"method":method,"params":params,"frame_id":0})
 }
 
 struct Document {
     committed: CommittedDocument,
     frames: Vec<FrameDocument>,
     interaction: u64,
+    embedded_frames: usize,
 }
 
 async fn document(
@@ -431,8 +441,8 @@ async fn document(
         None,
         cancel,
         vec![
-            command("Page.getNavigationHistory", json!({}), None),
-            command("Page.getFrameTree", json!({}), None),
+            command("Page.getNavigationHistory", json!({})),
+            command("Page.getFrameTree", json!({})),
         ],
     )
     .await?;
@@ -445,11 +455,19 @@ async fn document(
     let committed = crate::browser::navigation::committed_document_from(history, tree)
         .ok_or_else(|| refusal("document_not_ready"))?;
     let mut frames = Vec::new();
-    collect_frames(&plan.results[1]["frameTree"], tab, &mut frames, 0)?;
+    let mut frame_count = 0;
+    collect_frames(
+        &plan.results[1]["frameTree"],
+        tab,
+        &mut frames,
+        0,
+        &mut frame_count,
+    )?;
     Ok(Document {
         committed,
         frames,
         interaction: plan.interaction,
+        embedded_frames: frame_count.saturating_sub(1),
     })
 }
 
@@ -458,10 +476,12 @@ fn collect_frames(
     tab: &str,
     frames: &mut Vec<FrameDocument>,
     depth: usize,
+    count: &mut usize,
 ) -> Result<(), Value> {
-    if depth > 64 || frames.len() >= 256 {
+    if depth > 64 || *count >= 256 {
         return Err(refusal("frame_limit"));
     }
+    *count += 1;
     let frame = &tree["frame"];
     let text = |field: &str| {
         frame[field]
@@ -474,7 +494,8 @@ fn collect_frames(
         frames.push(FrameDocument {
             navigation_revision: 0,
             frame_id: text("id")?,
-            parent_id: frame["parentId"].as_str().map(str::to_owned),
+            parent_id: (depth != 0)
+                .then(|| frame["parentId"].as_str().unwrap_or("embedded").to_owned()),
             session_id: tab.into(),
             loader_id: text("loaderId")?,
             origin,
@@ -483,7 +504,7 @@ fn collect_frames(
     }
     if let Some(children) = tree["childFrames"].as_array() {
         for child in children {
-            collect_frames(child, tab, frames, depth + 1)?;
+            collect_frames(child, tab, frames, depth + 1, count)?;
         }
     }
     Ok(())
@@ -631,6 +652,13 @@ fn validate(action: &str, args: &Value) -> Result<(), Value> {
             return Err(invalid(field, "missing_field"));
         }
     }
+    if action == "snapshot" && object.get("mode").is_some_and(|mode| mode != "actionable") {
+        for field in ["zoom", "text_filter", "role_filter"] {
+            if object.contains_key(field) {
+                return Err(invalid(field, "unsupported_value"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -756,6 +784,9 @@ impl Context<'_> {
             hazards,
             once: false,
         };
+        if severity.tier > 4 {
+            return Err(refusal("severity_ungrantable"));
+        }
         if self
             .target()
             .covers(self.agent(), origin, severity, &grant.hazards)
@@ -1102,7 +1133,7 @@ async fn serve_inner(
                 .cdp(
                     tab,
                     Some(current.interaction),
-                    vec![command("Page.navigate", json!({"url":args["url"]}), None)],
+                    vec![command("Page.navigate", json!({"url":args["url"]}))],
                 )
                 .await?;
             if navigation.results[0].get("errorText").is_some() {
@@ -1211,6 +1242,9 @@ async fn capture(
         return Err(read_again(false));
     }
     for frame in &document.frames {
+        if frame.parent_id.is_some() {
+            continue;
+        }
         if !context.granted(
             &frame.origin,
             Severity::new(1, false, false),
@@ -1227,17 +1261,15 @@ async fn capture(
                 tab,
                 Some(document.interaction),
                 vec![
-                    command("Accessibility.enable", json!({}), Some(&frame.frame_id)),
+                    command("Accessibility.enable", json!({})),
                     command(
                         "Accessibility.getFullAXTree",
                         json!({"frameId":frame.frame_id}),
-                        Some(&frame.frame_id),
                     ),
-                    command("DOM.enable", json!({}), Some(&frame.frame_id)),
+                    command("DOM.enable", json!({})),
                     command(
                         "DOM.getFlattenedDocument",
                         json!({"depth":-1,"pierce":true}),
-                        Some(&frame.frame_id),
                     ),
                 ],
             )
@@ -1305,11 +1337,7 @@ async fn capture(
                 .cdp(
                     tab,
                     Some(document.interaction),
-                    vec![command(
-                        "DOM.getOuterHTML",
-                        json!({"backendNodeId":root}),
-                        Some(&frame.frame_id),
-                    )],
+                    vec![command("DOM.getOuterHTML", json!({"backendNodeId":root}))],
                 )
                 .await?;
             html.push(
@@ -1325,7 +1353,7 @@ async fn capture(
     }
     confirm(context, tab, document).await?;
     let max_bytes = args["max_bytes"].as_u64().unwrap_or(5000).min(262144) as usize;
-    let filters = Filters {
+    let mut filters = Filters {
         text: args["text_filter"].as_str().map(str::to_owned),
         roles: args["role_filter"]
             .as_array()
@@ -1337,6 +1365,16 @@ async fn capture(
             })
             .unwrap_or_default(),
     };
+    if args["mode"] == "ax" {
+        // Matching every captured role expands the full accessibility tree
+        // through the same renderer that masks protected or unknown values.
+        filters.roles = records
+            .iter()
+            .map(|record| record.role.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
     let rendered = state_text::render(&RenderInput {
         records: &records,
         facts: &facts,
@@ -1364,6 +1402,11 @@ async fn capture(
     };
     context.target().retain(id.clone(), snapshot);
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false});
+    if document.embedded_frames != 0 {
+        reply["omitted_frames"] = json!(document.embedded_frames);
+        reply["frame_note"] =
+            json!("Embedded frames are omitted; they cannot be used in the person's browser yet.");
+    }
     if popup {
         reply["popup_activated_briefly"] = json!(true);
     }
@@ -1390,13 +1433,12 @@ async fn screenshot(
             tab,
             Some(document.interaction),
             vec![
-                command("Page.getLayoutMetrics", json!({}), None),
+                command("Page.getLayoutMetrics", json!({})),
                 command(
                     "Page.captureScreenshot",
                     json!({"format":"png","captureBeyondViewport":false}),
-                    None,
                 ),
-                command("Page.getLayoutMetrics", json!({}), None),
+                command("Page.getLayoutMetrics", json!({})),
             ],
         )
         .await?;
@@ -1459,7 +1501,7 @@ async fn input(
             .cdp(
                 tab,
                 Some(snapshot.interaction),
-                vec![command("Page.getLayoutMetrics", json!({}), None)],
+                vec![command("Page.getLayoutMetrics", json!({}))],
             )
             .await?;
         if metrics.results[0]["cssVisualViewport"] != image.viewport {
@@ -1474,7 +1516,7 @@ async fn input(
         )
         .map_err(|_| refusal("invalid_coordinates"))?;
         let (x, y) = mapped.tuple();
-        let hit = context.cdp(tab, Some(snapshot.interaction), vec![command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}), None)]).await?;
+        let hit = context.cdp(tab, Some(snapshot.interaction), vec![command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await?;
         let frame_id = hit.results[0]["frameId"]
             .as_str()
             .ok_or_else(|| refusal("classification_unavailable"))?;
@@ -1500,6 +1542,11 @@ async fn input(
             .ok_or_else(|| refusal("ref_scope_mismatch"))?;
         (reference.identity.clone(), reference.frame.clone(), None)
     };
+    if frame.parent_id.is_some() {
+        let mut reply = refusal("embedded_frame_unsupported");
+        reply["remedy"] = json!("The embedded frame cannot be used in the person's browser yet; use the top-level page instead.");
+        return Err(reply);
+    }
     if !current.frames.iter().any(|live| live.same_document(&frame)) {
         return Err(refusal("frame_changed"));
     }
@@ -1518,11 +1565,10 @@ async fn input(
             tab,
             Some(snapshot.interaction),
             vec![
-                command("DOM.enable", json!({}), Some(&frame.frame_id)),
+                command("DOM.enable", json!({})),
                 command(
                     "DOM.getFlattenedDocument",
                     json!({"depth":-1,"pierce":true}),
-                    Some(&frame.frame_id),
                 ),
             ],
         )
@@ -1619,7 +1665,7 @@ async fn input(
                 context.route,
                 &context.cancel,
                 "open_tab",
-                json!({"url":url,"opener_tab":tab,"interaction_epoch":snapshot.interaction}),
+                json!({"url":url,"opener_tab":tab}),
             )
             .await?;
             let opened: Claimed =
@@ -1649,7 +1695,6 @@ async fn input(
                 vec![command(
                     "DOM.getContentQuads",
                     json!({"backendNodeId":identity.backend_node_id}),
-                    Some(&frame.frame_id),
                 )],
             )
             .await?;
@@ -1660,7 +1705,6 @@ async fn input(
         steps.push(command(
             "DOM.focus",
             json!({"backendNodeId":identity.backend_node_id}),
-            Some(&frame.frame_id),
         ));
         let declaration = if args["clear_first"] == true {
             functions::SELECT
@@ -1670,26 +1714,20 @@ async fn input(
         steps.push(command(
             "Runtime.callFunctionOn",
             json!({"functionDeclaration":declaration,"returnByValue":true}),
-            Some(&frame.frame_id),
         ));
-        steps.push(command(
-            "Input.insertText",
-            json!({"text":args["text"]}),
-            Some(&frame.frame_id),
-        ));
+        steps.push(command("Input.insertText", json!({"text":args["text"]})));
     } else {
         let (x, y) = position.unwrap();
         for event in ["mousePressed", "mouseReleased"] {
             steps.push(command(
                 "Input.dispatchMouseEvent",
                 json!({"type":event,"x":x,"y":y,"button":"left","clickCount":1}),
-                Some(&frame.frame_id),
             ));
         }
     }
     let mut dispatched = false;
     let mut popup = false;
-    for mut step in steps {
+    for step in steps {
         if !context.granted(&frame.origin, severity, &hazards, Some(&once))
             || classification
                 .activation_destination_origin
@@ -1732,40 +1770,30 @@ async fn input(
             .await
             .map_err(|reply| prior_input(reply, dispatched))?;
         }
-        let mut commands = Vec::new();
-        if action == "type" {
-            if step["method"] == "Runtime.callFunctionOn" || step["method"] == "Input.insertText" {
-                let resolved = context
+        let commands = if action == "type" && step["method"] == "Runtime.callFunctionOn" {
+            runtime_plan(
+                &identity,
+                step["params"]["functionDeclaration"]
+                    .as_str()
+                    .expect("pinned declaration"),
+            )
+        } else {
+            if action == "type" && step["method"] == "Input.insertText" {
+                let focused = context
                     .cdp(
                         tab,
                         Some(snapshot.interaction),
-                        vec![
-                            command("Runtime.enable", json!({}), Some(&frame.frame_id)),
-                            command(
-                                "DOM.resolveNode",
-                                json!({"backendNodeId":identity.backend_node_id}),
-                                Some(&frame.frame_id),
-                            ),
-                        ],
+                        runtime_plan(&identity, functions::HAS_FOCUS),
                     )
                     .await
-                    .map_err(|mut reply| {
-                        if dispatched {
-                            reply["input_dispatched"] = json!(true);
-                        }
-                        reply
-                    })?;
-                let object = resolved.results[1]["object"]["objectId"]
-                    .as_str()
-                    .ok_or_else(|| prior_input(refusal("type_not_ready"), dispatched))?;
-                if step["method"] == "Runtime.callFunctionOn" {
-                    step["params"]["objectId"] = json!(object);
-                }
-                if step["method"] == "Input.insertText" {
-                    let focused = context.cdp(tab, Some(snapshot.interaction), vec![command("Emulation.setFocusEmulationEnabled", json!({"enabled":true}), Some(&frame.frame_id)), command("Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":functions::HAS_FOCUS,"returnByValue":true}), Some(&frame.frame_id))]).await.map_err(|reply| prior_input(reply, dispatched))?;
-                    if focused.results[1].pointer("/result/value") != Some(&json!(true)) {
-                        return Err(prior_input(refusal("type_focus_not_ready"), dispatched));
-                    }
+                    .map_err(|reply| prior_input(reply, dispatched))?;
+                if focused
+                    .results
+                    .last()
+                    .and_then(|result| result.pointer("/result/value"))
+                    != Some(&json!(true))
+                {
+                    return Err(prior_input(refusal("type_focus_not_ready"), dispatched));
                 }
                 verify_input(
                     context,
@@ -1779,16 +1807,26 @@ async fn input(
                 .await
                 .map_err(|reply| prior_input(reply, dispatched))?;
             }
-            commands.push(command(
-                "Emulation.setFocusEmulationEnabled",
-                json!({"enabled":true}),
-                Some(&frame.frame_id),
-            ));
-        }
-        commands.push(step);
+            let mut commands = Vec::new();
+            if action == "type" {
+                commands.push(command(
+                    "Emulation.setFocusEmulationEnabled",
+                    json!({"enabled":true}),
+                ));
+            }
+            commands.push(step);
+            commands
+        };
         let outcome = context.cdp(tab, Some(snapshot.interaction), commands).await;
         match outcome {
             Ok(result) => {
+                if result
+                    .results
+                    .iter()
+                    .any(|result| result.get("exceptionDetails").is_some())
+                {
+                    return Err(prior_input(refusal("runtime_exception"), true));
+                }
                 dispatched = true;
                 popup |= result.popup;
             }
@@ -1863,7 +1901,6 @@ async fn verify_input(
             vec![command(
                 "DOM.getFlattenedDocument",
                 json!({"depth":-1,"pierce":true}),
-                Some(&frame.frame_id),
             )],
         )
         .await
@@ -1987,7 +2024,7 @@ async fn verify_click_position(
     dispatched: bool,
 ) -> Result<(), Value> {
     let (x, y) = position;
-    let result = context.cdp(tab, Some(snapshot.interaction), vec![command("Page.getLayoutMetrics", json!({}), None), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}), None)]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
+    let result = context.cdp(tab, Some(snapshot.interaction), vec![command("Page.getLayoutMetrics", json!({})), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
     let viewport = &result.results[0]["cssVisualViewport"];
     if snapshot
         .image
@@ -2023,7 +2060,6 @@ async fn verify_click_position(
             vec![command(
                 "DOM.getFlattenedDocument",
                 json!({"depth":-1,"pierce":true}),
-                Some(&frame.frame_id),
             )],
         )
         .await?;
@@ -2049,4 +2085,24 @@ fn prior_input(mut reply: Value, dispatched: bool) -> Value {
         reply["input_dispatched"] = json!(true);
     }
     reply
+}
+
+fn runtime_plan(identity: &BackendNodeIdentity, declaration: &str) -> Vec<Value> {
+    // A remote object is valid only while this debugger attachment lives.
+    // Resolve and consume it in one plan instead of carrying its id past detach.
+    vec![
+        command(
+            "Emulation.setFocusEmulationEnabled",
+            json!({"enabled":true}),
+        ),
+        command("Runtime.enable", json!({})),
+        command(
+            "DOM.resolveNode",
+            json!({"backendNodeId":identity.backend_node_id}),
+        ),
+        command(
+            "Runtime.callFunctionOn",
+            json!({"objectId":{"$result":2,"path":["object","objectId"]},"functionDeclaration":declaration,"returnByValue":true}),
+        ),
+    ]
 }

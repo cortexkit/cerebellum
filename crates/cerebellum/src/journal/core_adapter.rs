@@ -33,7 +33,15 @@ impl BrowserJournalCodec {
         Ok(EncodedJournalState {
             durable_bytes: bytes.to_vec(),
             accounted_serialized_size: bytes.len() as u64,
-            codec_version: BROWSER_CODEC_VERSION.to_string(),
+            codec_version: if serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .is_some_and(|entry| entry["format_version"] == super::BASELINE_FORMAT_VERSION)
+            {
+                super::BASELINE_FORMAT_VERSION
+            } else {
+                BROWSER_CODEC_VERSION
+            }
+            .to_string(),
         })
     }
 }
@@ -99,6 +107,16 @@ impl PlaneJournalCodec for BrowserJournalCodec {
     /// newer one and none is floored.
     fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
         None
+    }
+
+    fn entry_format_for(
+        &self,
+        codec_version: &str,
+    ) -> Option<cerebellum_core::format_floor::DurableFormat> {
+        // Only public_web_baseline entries need the v8 decision vocabulary.
+        // Keeping ordinary entries at v7 lets older binaries serve them without
+        // rewriting the journal or advancing its format floor.
+        (codec_version == super::BASELINE_FORMAT_VERSION).then_some(super::BASELINE_ENTRY_FORMAT)
     }
 }
 

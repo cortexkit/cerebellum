@@ -49,6 +49,9 @@ use serde::{Deserialize, Serialize};
 /// v7 added the optional `identity.origin` member: the caller behind a relayed
 /// call. Entries of v3 through v6 still decode as [`JournalEntry`].
 pub const FORMAT_VERSION: &str = "ck-browser-journal/v7";
+pub const BASELINE_FORMAT_VERSION: &str = "ck-browser-journal/v8";
+pub const BASELINE_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new("browser-journal-entry", 8);
 
 /// The export `format_version` reported by the administration export surface.
 pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v7";
@@ -322,8 +325,8 @@ pub struct Severity {
     pub financial: bool,
 }
 
-/// The grant-decision block. `reason` is null exactly for `allowed` and
-/// `not_reached`.
+/// The grant-decision block. An allowed baseline decision names
+/// `public_web_baseline`; person-issued grants retain a null reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantDecision {

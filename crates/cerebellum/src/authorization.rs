@@ -65,6 +65,21 @@ fn current_standing_caller() -> Option<StandingCaller> {
 
 pub const OBSERVE: u8 = 1;
 pub const COMPOSE: u8 = 2;
+pub const PUBLIC_WEB_BASELINE: &str = "public_web_baseline";
+
+/// Public browsing has no human approval to revoke. Sensitive or lasting
+/// actions still go through the ordinary site-grant and disclosure checks.
+pub fn public_web_baseline_covers(
+    origin: &str,
+    required: Severity,
+    hazards: &BTreeSet<HazardClass>,
+) -> bool {
+    required.tier <= COMPOSE
+        && !required.credential
+        && !required.financial
+        && hazards.is_empty()
+        && crate::browser_standing_grants::origin_is_public(origin)
+}
 pub const MUTATE_REVERSIBLE: u8 = 3;
 pub const MUTATE_DURABLE: u8 = 4;
 pub const ACTUATE: u8 = 5;
@@ -199,6 +214,7 @@ pub enum Action {
     Screenshot,
     Click,
     ClickPoint,
+    Type,
 }
 
 pub type CapabilityAction = Action;
@@ -209,7 +225,7 @@ impl Action {
             Self::Navigate | Self::Snapshot | Self::Screenshot => {
                 Severity::new(OBSERVE, false, false)
             }
-            Self::Click | Self::ClickPoint => Severity::new(COMPOSE, false, false),
+            Self::Click | Self::ClickPoint | Self::Type => Severity::new(COMPOSE, false, false),
         }
     }
 }
@@ -303,6 +319,7 @@ pub struct AuthorizationRequest<'a> {
     pub requested_severity: Severity,
     pub invocation_id: &'a str,
     pub bind_identity: &'a str,
+    pub signed_in_profile: &'a str,
     pub classification: Option<&'a NonTypeClassificationRecord>,
 }
 
@@ -319,6 +336,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity,
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: None,
         }
     }
@@ -334,6 +352,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity: Action::Snapshot.floor(),
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: None,
         }
     }
@@ -349,6 +368,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity: Action::Screenshot.floor(),
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: None,
         }
     }
@@ -366,6 +386,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity,
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: Some(classification),
         }
     }
@@ -382,6 +403,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity,
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: None,
         }
     }
@@ -399,6 +421,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity,
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: Some(classification),
         }
     }
@@ -415,6 +438,7 @@ impl<'a> AuthorizationRequest<'a> {
             requested_severity,
             invocation_id,
             bind_identity,
+            signed_in_profile: "default",
             classification: None,
         }
     }
@@ -438,11 +462,17 @@ pub struct AuthorizationDecision {
     disclosed_hazards: BTreeSet<HazardClass>,
     classification_fingerprint: Option<NonTypeClassificationFingerprint>,
     action: Action,
+    baseline: bool,
+    signed_in_profile: String,
 }
 
 pub type ImmutableAuthorizationDecision = AuthorizationDecision;
 
 impl AuthorizationDecision {
+    pub fn is_public_web_baseline(&self) -> bool {
+        self.baseline
+    }
+
     pub fn authorization_decision_id(&self) -> &str {
         &self.decision_id
     }
@@ -552,11 +582,23 @@ pub struct GrantStore {
     /// covers an action and the request runs for an attested agent (see
     /// [`with_standing_caller`]).
     standing: Option<Arc<StandingBrowserGrants>>,
+    signed_in: Option<Arc<crate::browser_signed_in::SignedInDomains>>,
 }
 
 pub type AuthorizationStore = GrantStore;
 
 impl GrantStore {
+    pub fn with_public_web_baseline(
+        mut self,
+        signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    ) -> Self {
+        self.signed_in = Some(signed_in);
+        self
+    }
+
+    pub fn signed_in_domains(&self) -> Option<&Arc<crate::browser_signed_in::SignedInDomains>> {
+        self.signed_in.as_ref()
+    }
     pub fn new(grants: impl IntoIterator<Item = ActionGrant>) -> Self {
         let mut store = Self::default();
         for grant in grants {
@@ -628,9 +670,37 @@ impl GrantStore {
         )
     }
 
-    /// The conversation grant covering this action, or else the standing row
-    /// that does. When neither does, the conversation's refusal is returned
-    /// unchanged, so its remedy still names the card that would cover it.
+    fn baseline_grant(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        required: Severity,
+        attempted_origin: &str,
+        required_hazards: &BTreeSet<HazardClass>,
+    ) -> Option<ActionGrant> {
+        if let Some(signed_in) = &self.signed_in {
+            if public_web_baseline_covers(attempted_origin, required, required_hazards)
+                && (request.action != Action::Type
+                    || !signed_in.is_signed_in(
+                        request.bind_identity,
+                        request.signed_in_profile,
+                        attempted_origin,
+                    ))
+            {
+                return Some(ActionGrant::new(
+                    PUBLIC_WEB_BASELINE,
+                    1,
+                    request.conversation_key,
+                    Severity::new(COMPOSE, false, false),
+                    [attempted_origin],
+                ));
+            }
+        }
+        None
+    }
+
+    /// Prefer a person's covering grant, falling back to public risk policy.
+    /// Only a person's approval of the top page permits reading embedded local
+    /// services; policy-only public reads must omit those frames.
     fn select_conversation_or_standing(
         &self,
         request: &AuthorizationRequest<'_>,
@@ -651,11 +721,17 @@ impl GrantStore {
             ) => Err(refusal),
             Err(refusal) => self
                 .standing_grant(request, required, attempted_origin, required_hazards)
+                .or_else(|| {
+                    self.baseline_grant(request, required, attempted_origin, required_hazards)
+                })
                 .ok_or(refusal),
         }
     }
 
     fn insert_initial(&mut self, grant: ActionGrant) -> Result<(), AuthorizationError> {
+        if grant.id == PUBLIC_WEB_BASELINE {
+            return Err(AuthorizationError::InvalidGrant);
+        }
         grant.validate()?;
         if self.current.insert(grant.id.clone(), grant).is_some() {
             return Err(AuthorizationError::DuplicateGrantIdentity);
@@ -664,6 +740,9 @@ impl GrantStore {
     }
 
     pub fn replace(&mut self, grant: ActionGrant) -> Result<(), AuthorizationError> {
+        if grant.id == PUBLIC_WEB_BASELINE {
+            return Err(AuthorizationError::InvalidGrant);
+        }
         self.ensure_valid()?;
         grant.validate()?;
         if let Some(previous) = self.current.get(&grant.id) {
@@ -856,7 +935,10 @@ impl GrantStore {
                 &required_hazards,
             )?;
         }
-        make_decision(&grant, request, effective, fingerprint)
+        let baseline = self.signed_in.is_some() && grant.id == PUBLIC_WEB_BASELINE;
+        let mut decision = make_decision(&grant, request, effective, fingerprint)?;
+        decision.baseline = baseline;
+        Ok(decision)
     }
 
     /// Commit is the pre-input guard.  It succeeds only if the exact selected
@@ -867,6 +949,23 @@ impl GrantStore {
     ) -> Result<AuthorizationCommitment, AuthorizationCommitError> {
         self.ensure_valid()
             .map_err(|_| AuthorizationCommitError::InvalidGrantState)?;
+        if decision.baseline {
+            if decision.action == Action::Type
+                && self.signed_in.as_ref().is_none_or(|signed_in| {
+                    signed_in.is_signed_in(
+                        &decision.bind_identity,
+                        &decision.signed_in_profile,
+                        &decision.authorized_origins[0],
+                    )
+                })
+            {
+                return Err(AuthorizationCommitError::GrantRevoked);
+            }
+            return Ok(AuthorizationCommitment {
+                token: format!("commit-{}", decision.decision_id),
+                decision: decision.clone(),
+            });
+        }
         if let Some(key) = decision.grant_id.strip_prefix(STANDING_GRANT_ID_PREFIX) {
             // A standing decision commits only while its row is still in
             // force: revoked or expired since authorization admits nothing.
@@ -964,10 +1063,10 @@ pub fn computed_required_severity(
 ) -> Result<(Severity, Option<NonTypeClassificationFingerprint>), AuthorizationError> {
     match action {
         Action::Navigate | Action::Snapshot | Action::Screenshot => Ok((action.floor(), None)),
-        Action::Click | Action::ClickPoint if classification.is_none() => {
+        Action::Click | Action::ClickPoint | Action::Type if classification.is_none() => {
             Ok((Severity::new(MUTATE_DURABLE, true, true), None))
         }
-        Action::Click | Action::ClickPoint => {
+        Action::Click | Action::ClickPoint | Action::Type => {
             let record = classification.ok_or(AuthorizationError::SeverityUnclassifiable)?;
             record
                 .validate()
@@ -1003,10 +1102,10 @@ pub fn target_hazards(
         // using a grant that never named the hazard. `computed_required_severity`
         // already derives severity identically for both; this keeps disclosure
         // in step with it.
-        (Action::Click | Action::ClickPoint, None) => {
+        (Action::Click | Action::ClickPoint | Action::Type, None) => {
             Ok(BTreeSet::from([HazardClass::UnverifiedFormContents]))
         }
-        (Action::Click | Action::ClickPoint, Some(record)) => {
+        (Action::Click | Action::ClickPoint | Action::Type, Some(record)) => {
             record
                 .validate()
                 .map_err(|_| AuthorizationError::SeverityUnclassifiable)?;
@@ -1064,6 +1163,8 @@ fn make_decision(
         disclosed_hazards: grant.disclosed_hazards.clone(),
         classification_fingerprint: fingerprint,
         action: request.action,
+        baseline: false,
+        signed_in_profile: request.signed_in_profile.to_string(),
     })
 }
 

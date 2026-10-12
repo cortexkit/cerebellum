@@ -1,0 +1,92 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+import { test } from "node:test";
+import { setup } from "./harness.mjs";
+import { expectedEvents } from "../commands.mjs";
+
+const source = await readFile(new URL("../sentinel.js", import.meta.url), "utf8");
+function sentinel() {
+  const handlers = new Map();
+  let receiver;
+  let clock = 0;
+  const messages = [];
+  const context = {
+    crypto: { randomUUID: () => "document-one" },
+    performance: { now: () => clock },
+    addEventListener(type, fn) { handlers.set(type, fn); },
+    removeEventListener(type) { handlers.delete(type); },
+    chrome: { runtime: { id: "extension-id", sendMessage(message) { messages.push(message); return Promise.resolve(); }, onMessage: { addListener(fn) { receiver = fn; }, removeListener() { receiver = null; } } } },
+  };
+  vm.runInNewContext(source, context);
+  return {
+    messages,
+    event(event) { handlers.get(event.type)?.(event); },
+    advance(ms) { clock += ms; },
+    send(operation, events = []) {
+      let result;
+      receiver?.({ kind: "agent-sentinel", operation, events }, { id: "extension-id" }, value => { result = value; });
+      return result;
+    },
+    get listeners() { return handlers.size; },
+  };
+}
+
+test("sentinel counts detached trusted input but reads no page content", () => {
+  const s = sentinel();
+  s.event({ type: "keydown", isTrusted: true, key: "x", code: "KeyX", get target() { throw new Error("must not read target"); } });
+  assert.equal(s.send("sample").sequence, 1);
+  s.event({ type: "keydown", isTrusted: false });
+  assert.equal(s.send("sample").sequence, 1);
+});
+
+test("sentinel attributes only a one-shot exact current input ticket", () => {
+  const s = sentinel();
+  s.send("arm", [{ type: "mousedown", clientX: 10, clientY: 20, button: 0 }]);
+  s.event({ type: "mousedown", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
+  assert.equal(s.send("sample").sequence, 0);
+  s.event({ type: "mousedown", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
+  assert.equal(s.send("sample").sequence, 1);
+});
+
+test("sentinel counts mismatched and expired tickets as human input", () => {
+  const s = sentinel();
+  s.send("arm", [{ type: "keydown", key: "a", code: "KeyA" }]);
+  s.event({ type: "keydown", isTrusted: true, key: "b", code: "KeyB" });
+  s.send("arm", [{ type: "keydown", key: "a", code: "KeyA" }]);
+  s.advance(251);
+  s.event({ type: "keydown", isTrusted: true, key: "a", code: "KeyA" });
+  assert.equal(s.send("sample").sequence, 2);
+});
+
+test("sentinel withdrawal removes all page input observers", () => {
+  const s = sentinel();
+  assert.ok(s.listeners > 0);
+  assert.equal(s.send("disable").enabled, false);
+  assert.equal(s.listeners, 0);
+  s.event({ type: "keydown", isTrusted: true });
+  assert.equal(s.send("sample"), undefined);
+});
+
+
+test("trusted pointer and mouse movement do not change the tab interaction epoch", async () => {
+  const f = await setup();
+  const s = sentinel();
+  f.chrome.observations.set("2:0", s.send("sample"));
+  const epoch = await f.epochs.sample(2);
+  s.event({ type: "pointermove", isTrusted: true, clientX: 10, clientY: 20 });
+  s.event({ type: "mousemove", isTrusted: true, clientX: 10, clientY: 20 });
+  f.chrome.observations.set("2:0", s.send("sample"));
+  assert.equal(await f.epochs.sample(2), epoch);
+  assert.deepEqual(expectedEvents({ method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 10, y: 20 } }), []);
+});
+
+test("a trusted click still changes the tab interaction epoch", async () => {
+  const f = await setup();
+  const s = sentinel();
+  f.chrome.observations.set("2:0", s.send("sample"));
+  const epoch = await f.epochs.sample(2);
+  s.event({ type: "click", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
+  f.chrome.observations.set("2:0", s.send("sample"));
+  assert.equal(await f.epochs.sample(2), epoch + 1);
+});

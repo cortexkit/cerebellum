@@ -171,7 +171,7 @@ impl Fixture {
                                 detached: true,
                             },
                             Err(reason) => MessageBody::Refused {
-                                reason,
+                                reason: json!({"reason":reason,"remedy":if reason == "state_changed_by_person" { "read again" } else { "use an eligible claimed Agent-group tab" }}).to_string(),
                                 input_dispatched: false,
                                 detached: true,
                             },
@@ -420,7 +420,7 @@ fn execute(
             "Accessibility.getFullAXTree" => {
                 state
                     .captures
-                    .push(command["frame_id"].as_str().unwrap().into());
+                    .push(command["params"]["frameId"].as_str().unwrap().into());
                 ax()
             }
             "DOM.getFlattenedDocument" => dom(state.new_tab_link, state.password, state.payment),
@@ -938,8 +938,20 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
     }
     fixture.state.lock().unwrap().inputs.clear();
     fixture.state.lock().unwrap().foreign_hit = true;
-    let (foreign, _) = fixture.call(1, point.clone(), "deny").await;
-    assert_eq!(foreign["reason"], "consent_declined");
+    let before = fixture.state.lock().unwrap().commands.len();
+    let (foreign, cards) = fixture.call(1, point.clone(), "allow_once").await;
+    assert!(cards.is_empty());
+    assert!(!fixture.state.lock().unwrap().commands[before..]
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .any(|command| command["method"]
+            .as_str()
+            .is_some_and(|method| method.starts_with("Input."))));
+    assert_eq!(foreign["reason"], "embedded_frame_unsupported");
+    assert!(foreign["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be used"));
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
     fixture.state.lock().unwrap().viewport_changed = true;
     let (changed, _) = fixture.call(1, point, "allow_once").await;
@@ -1111,4 +1123,82 @@ async fn popup_reports_from_metadata_plans_survive_terminal_refusals() {
     );
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
     assert!(fixture.state.lock().unwrap().captures.is_empty());
+}
+
+#[tokio::test]
+async fn typing_consumes_remote_objects_in_the_same_plan_that_resolves_them() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"hello","clear_first":true}), "allow_once").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    let mut functions = 0;
+    for plan in &state.commands {
+        let Some(commands) = plan["commands"].as_array() else {
+            continue;
+        };
+        for (index, command) in commands.iter().enumerate() {
+            assert_eq!(
+                command["frame_id"], 0,
+                "CDP ids are not webNavigation sentinel ids"
+            );
+            if command["method"] == "Runtime.callFunctionOn" {
+                functions += 1;
+                let object = &command["params"]["objectId"];
+                assert!(
+                    !object.is_string(),
+                    "a remote object id must not outlive debugger detach"
+                );
+                let source = object["$result"].as_u64().unwrap() as usize;
+                assert!(source < index);
+                assert_eq!(commands[source]["method"], "DOM.resolveNode");
+                assert_eq!(object["path"], json!(["object", "objectId"]));
+            }
+        }
+    }
+    assert!(
+        functions >= 2,
+        "selection and focus checks must actually execute"
+    );
+}
+
+#[tokio::test]
+async fn embedded_frames_are_explicitly_omitted_without_text_or_refs() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["omitted_frames"], 1);
+    assert!(snapshot["frame_note"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be used"));
+    assert!(!snapshot["state_text"].as_str().unwrap().contains("FOREIGN"));
+    let state = fixture.planes.user_browser.target().state();
+    let retained = state
+        .snapshots
+        .get(snapshot["snapshot_id"].as_str().unwrap())
+        .unwrap();
+    assert!(!retained.refs.is_empty());
+    assert!(
+        retained
+            .refs
+            .values()
+            .all(|reference| reference.frame.parent_id.is_none()
+                && reference.frame.frame_id == "main")
+    );
+}
+
+#[tokio::test]
+async fn authority_changing_severity_is_never_grantable_in_the_user_browser() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let mut request = click(&tab, &snapshot, &reference(&snapshot, "Go"));
+    request["severity"]["tier"] = json!(5);
+    let (reply, cards) = fixture.call(1, request, "allow_once").await;
+    assert_eq!(reply["reason"], "severity_ungrantable");
+    assert!(cards.is_empty());
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
 }

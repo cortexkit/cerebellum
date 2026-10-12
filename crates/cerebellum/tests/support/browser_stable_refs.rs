@@ -132,11 +132,11 @@ async fn fixture() -> (Planes, Arc<RecordingLauncher>, Arc<Mutex<Dropdowns>>) {
     planes.launch_service = Some(launcher.clone());
     grant_browser(
         &planes,
-        "https://page.example",
+        "https://page.example:8443",
         vec![HazardClass::CredentialFormSubmit],
     )
     .await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     (planes, launcher, dropdowns)
 }
 
@@ -259,7 +259,7 @@ async fn stable_refs_wire_type_uses_named_older_snapshot_and_ledger() {
     assert_eq!(dropdowns.lock().unwrap().typed, "older");
     let typed = call(&planes, "type", json!({"ref":notes,"text":"ledger"})).await;
     assert_eq!(typed["outcome"], "ok", "{typed}");
-    launcher.page.commit("https://page.example/reloaded");
+    launcher.page.commit("https://page.example:8443/reloaded");
     let stale = call(&planes, "type", json!({"ref":notes,"text":"not sent"})).await;
     assert_eq!(stale["outcome"], "stale_snapshot", "{stale}");
     assert_eq!(
@@ -337,9 +337,9 @@ async fn stable_refs_wire_frame_same_document_url_keeps_old_click() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    grant_browser(&planes, "https://page.example", vec![]).await;
-    grant_browser(&planes, "https://payment.example", vec![]).await;
-    launch_at(&planes, &launcher.page, "https://page.example").await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
+    grant_browser(&planes, "https://payment.example:8443", vec![]).await;
+    launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let before = call(&planes, "snapshot", json!({})).await;
     let old = first_ref(&before);
     {
