@@ -11,10 +11,13 @@
 //! Each subject is a JSON array whose first element names the family, so
 //! subjects of different kinds never collide (a takeover and a profile
 //! re-identification are both keyed by the conversation alone) and the parts
-//! can be read back, as the next-call drain does for login cards after a
-//! restart. Both website-access kinds share one family on purpose: a
+//! can be read back: a late answer to a login card is applied on the
+//! session's next call, possibly after a restart, and the subject is all
+//! that survives to say which conversation, capability and parameters it
+//! approved. Both website-access kinds share one family on purpose: a
 //! navigate that needs the same origins as an open `open_grant` card joins
-//! that card instead of raising its own.
+//! that card instead of putting a second card about the same sites to the
+//! person.
 
 use serde_json::{json, Value};
 
@@ -34,13 +37,15 @@ fn website(conversation_key: &str, origins: &[String]) -> String {
 }
 
 /// `CardKind::WebsiteAccessInCall`. The same string as
-/// [`website_access_in_advance`] for the same conversation and origins.
+/// [`website_access_in_advance`] for the same conversation and origins, so
+/// an in-call request joins an open card asked ahead (see the module doc).
 pub fn website_access_in_call(conversation_key: &str, origins: &[String]) -> String {
     website(conversation_key, origins)
 }
 
 /// `CardKind::WebsiteAccessInAdvance`. The same string as
-/// [`website_access_in_call`] for the same conversation and origins.
+/// [`website_access_in_call`] for the same conversation and origins, so
+/// an in-call request joins an open card asked ahead (see the module doc).
 pub fn website_access_in_advance(conversation_key: &str, origins: &[String]) -> String {
     website(conversation_key, origins)
 }

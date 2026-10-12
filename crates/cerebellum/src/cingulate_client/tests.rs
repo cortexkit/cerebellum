@@ -199,9 +199,9 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
 const USER_BROWSER_SITE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The site card `user_browser`'s `authorize` builds inline, written out
-/// field for field because that card has no named builder this list could
-/// call. Its golden pins the bytes, so whatever builds it later must render
-/// exactly this card.
+/// field for field because that card has no named builder `todays_cards`
+/// could call. Its golden (`user-browser-site.json`) pins the bytes, so
+/// whatever builds it later must render exactly this card.
 fn user_browser_site_card(
     origin: &str,
     tier: u8,
@@ -1266,8 +1266,9 @@ fn calls_that_cannot_raise_a_card_take_their_refusal_rows() {
     );
 }
 
-/// A daemon that refuses the route to Cingulate refuses it with its own
-/// code, and the call takes that code's row.
+/// A daemon that refuses the route to Cingulate replies with its own code,
+/// and the call ends with that code's `NoCard` reason: `scope_not_carrier`
+/// is `NotACarrier`, `scope_ended` is `ScopeEnded`.
 #[tokio::test]
 async fn a_refused_route_open_takes_its_refusal_row() {
     for (code, expected) in [
@@ -1607,8 +1608,8 @@ async fn a_card_asked_ahead_is_detached_at_once_and_never_awaited() {
 }
 
 /// A card asked ahead that cannot be detached is withdrawn, and the call
-/// ends `DeliveryFailed`; a refused raise ends on its own ending with no
-/// detach.
+/// ends `DeliveryFailed`. A refused `consent.request` ends with that
+/// refusal's ending and no detach is attempted.
 #[tokio::test]
 async fn a_card_asked_ahead_that_cannot_be_detached_is_withdrawn() {
     let cingulate = ScriptedCingulate::new();
@@ -1651,9 +1652,10 @@ async fn a_card_asked_ahead_that_cannot_be_detached_is_withdrawn() {
 // Withdrawal
 // ---------------------------------------------------------------------------
 
-/// A withdrawal Cingulate refuses because the card is not this session's or
-/// no longer exists forgets the card: no answer to it can ever be read. A
-/// withdrawal that failed in transit keeps it.
+/// A withdrawal that succeeds, or that Cingulate refuses because the card
+/// is not this session's or no longer exists, forgets the card: no answer
+/// to it can ever be read. A withdrawal that failed in transit, or was
+/// refused for another reason, keeps it.
 #[tokio::test]
 async fn a_withdrawal_refused_as_gone_forgets_the_card() {
     for (reply, forgotten) in [
@@ -1729,8 +1731,9 @@ async fn a_settlement_with_no_record_is_acked_without_effect() {
 static SCRATCH_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
 /// A fresh directory for one test, outside the operator's data home so the
-/// live journal and its format floor are never touched, removed when the
-/// guard drops (also after a failed assertion).
+/// live journal and its format-floor file (the record of which durable
+/// formats are on disk) are never touched, removed when the guard drops
+/// (also after a failed assertion).
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -1760,8 +1763,9 @@ impl Drop for Scratch {
     }
 }
 
-/// The registry file carries its version, survives a restart, and raises
-/// its format floor before its first write and not before.
+/// The registry file carries its version and survives a restart. Its format
+/// is recorded in the format-floor file when the registry is first written,
+/// not when it is merely loaded.
 #[tokio::test]
 async fn the_registry_file_is_versioned_and_survives_a_restart() {
     let scratch = Scratch::new("restart");
@@ -1792,9 +1796,10 @@ async fn the_registry_file_is_versioned_and_survives_a_restart() {
     assert_eq!(card.subject, "login");
 }
 
-/// A registry file this build cannot read (a newer version, or damaged) is
-/// never overwritten, and while it stands no route is opened and no card is
-/// raised: every call takes the `consent_registry_unreadable` row.
+/// A registry file this build cannot read (a newer version, damaged, or
+/// unversioned) is never overwritten, and while it stands no route is
+/// opened and no card is raised: every call ends
+/// `NoCard::RegistryUnreadable`, reason `consent_registry_unreadable`.
 #[tokio::test]
 async fn an_unreadable_registry_is_refused_and_never_overwritten() {
     for (name, bytes) in [
@@ -1822,8 +1827,9 @@ async fn an_unreadable_registry_is_refused_and_never_overwritten() {
     }
 }
 
-/// `unapplied` lists one session's unapplied cards and nothing else: the
-/// test of whether a call has anything to read from the answers feed.
+/// `unapplied` lists only the given session's unapplied cards. A call uses
+/// it to decide whether there is anything to read from Cingulate's answers
+/// feed, and so whether to open a route at all.
 #[tokio::test]
 async fn unapplied_lists_one_sessions_open_cards() {
     let cingulate = ScriptedCingulate::new();

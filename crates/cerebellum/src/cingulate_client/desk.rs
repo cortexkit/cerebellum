@@ -89,7 +89,9 @@ pub enum NoCard {
 }
 
 impl NoCard {
-    /// The row a call that could not be proved live takes.
+    /// The reason for a call that `LiveCall` refused ([`NotLive`]): an
+    /// unscoped call or one naming no agent has no agent session to raise
+    /// the card for, and an ended call has nobody to reply to.
     pub fn of_not_live(not_live: NotLive) -> Self {
         match not_live {
             NotLive::Unscoped | NotLive::NoAgent => Self::NoAgentSession,
@@ -127,9 +129,10 @@ impl NoCard {
     }
 }
 
-/// The daemon's codes for refusing the route to Cingulate that have their
-/// own `consent_unavailable` row. Any other refusal of the open is a
-/// delivery failure.
+/// The daemon's refusal codes for opening the route to Cingulate that mean
+/// no card can be raised in this session at all, so they map to their own
+/// [`NoCard`] reason instead of a retryable delivery failure. Any other
+/// refusal of the open is a delivery failure.
 const OPEN_REFUSED_NOT_CARRIER: &str = "scope_not_carrier";
 const OPEN_REFUSED_SCOPE_ENDED: &str = "scope_ended";
 
@@ -302,7 +305,11 @@ pub const CINGULATE_RAISED_FILE: &str = "cingulate_raised.json";
 /// writes.
 pub const CINGULATE_RAISED_VERSION: u64 = 1;
 
-/// The registry file's format, as the format floor and staging name it.
+/// The registry file's durable format (name and version). Every format this
+/// module writes is recorded in the operator's format-floor file before its
+/// first write; installing a new build compares the floors against what that
+/// build can read (`durable_formats::readable_formats`) and refuses a build
+/// that could not read a file already on disk.
 pub const CINGULATE_RAISED_FORMAT: cerebellum_core::format_floor::DurableFormat =
     cerebellum_core::format_floor::DurableFormat::new("cingulate-raised", CINGULATE_RAISED_VERSION);
 
@@ -375,10 +382,11 @@ impl RegistryStore for FileRegistryStore {
     fn save(&self, cards: &[RaisedCard]) -> Result<(), String> {
         use std::io::Write;
 
-        // Before the first write, not at startup: until a card is raised no
-        // file in this format exists, so rolling back to a build without it
-        // stays a plain binary swap. Once the file is written, a floor must
-        // name it, or staging could pass a build that cannot read it.
+        // The format floor is raised here, before the first write, not at
+        // startup: until a card is raised no file in this format exists, so
+        // rolling back to a build without it stays a plain binary swap. Once
+        // the file is written, the floor must record its format, or the
+        // install-time check could accept a build that cannot read it.
         self.floor
             .raise(CINGULATE_RAISED_FORMAT)
             .map_err(|error| error.to_string())?;
@@ -909,8 +917,10 @@ impl DeskSession<'_> {
     /// [`Apply::NoRecord`] when the flow holds nothing the effect could be
     /// applied to. The feed is acknowledged only after every settlement read
     /// is marked in the stored registry, either way. A single-use card's
-    /// approval is recorded here for the retry to take, in addition to
-    /// whatever `apply` does, but only when it was applied.
+    /// (login import or capture, see `CardKind::single_use`) approval is
+    /// also recorded here, but only when it was applied, so the agent's next
+    /// call of the same tool with the same arguments can take it with
+    /// [`ConsentDesk::take_single_use_approval`] and act on it once.
     pub async fn drain_answers(
         &mut self,
         apply: &mut (dyn FnMut(&RaisedCard, &Record, &Ending) -> Result<Apply, ApplyFailed> + Send),

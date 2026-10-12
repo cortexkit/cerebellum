@@ -44,9 +44,9 @@ pub fn vector_reply(name: &str) -> Reply {
 }
 
 /// The four replies Cingulate served for `consent.detach`, by what each
-/// shows: a pending card now detached, a card that had already settled
-/// (`el_2`), a second detach of the same pending card, and a card of
-/// another owner.
+/// shows: a pending card now detached, a card that had already settled (the
+/// vector's card id is `el_2`, not the `el_1` the other vectors use), a
+/// second detach of the same pending card, and a card of another owner.
 pub const DETACH_PENDING: &str = "cerebellum-detach-pending-reply.json";
 pub const DETACH_SETTLED: &str = "cerebellum-detach-settled-reply.json";
 pub const DETACH_REPEAT: &str = "cerebellum-detach-repeat-reply.json";
