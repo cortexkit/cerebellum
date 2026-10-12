@@ -137,6 +137,20 @@ test("CDP errors stop at the first error and the debugger always detaches", asyn
   assert.ok(f.chrome.calls.some(call => call[0] === "detach"));
 });
 
+test("Chrome's CDP error code and fixed message are relayed without its data", async () => {
+  const f = await setup();
+  // chrome.debugger.sendCommand rejects with the CDP error object serialized as the message.
+  const cdp = JSON.stringify({ code: -32000, message: "DOM agent hasn't been enabled", data: "extra detail" });
+  f.chrome.debugger.sendCommand = async () => { throw new Error(cdp); };
+  const result = await f.run(f.cdp([read, read]));
+  assert.deepEqual(result.results, [{ error: { code: -32000, message: "DOM agent hasn't been enabled" } }]);
+  for (const message of ["x".repeat(201), "line one\nline two"]) {
+    f.chrome.debugger.sendCommand = async () => { throw new Error(JSON.stringify({ code: -32000, message })); };
+    const replaced = await f.run(f.cdp([read]));
+    assert.deepEqual(replaced.results, [{ error: { code: -32000, message: "Chrome debugger command failed" } }]);
+  }
+});
+
 test("result references resolve within one attachment without arbitrary JavaScript", async () => {
   const f = await setup();
   let calls = 0;

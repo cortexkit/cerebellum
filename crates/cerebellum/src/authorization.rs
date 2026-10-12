@@ -1483,6 +1483,8 @@ mod tests {
             NodeIdentityInput::new("target", "frame", 1),
             TargetKind::Button,
         )
+        // The button submits the form that owns the password field.
+        .form_owner(NodeIdentityInput::new("target", "frame", 3))
         .associated_control(
             crate::classification::AssociatedFormControlInput::new(NodeIdentityInput::new(
                 "target", "frame", 2,
@@ -1524,6 +1526,8 @@ mod tests {
             NodeIdentityInput::new("target", "frame", 1),
             TargetKind::Button,
         )
+        // The button submits the form that owns the card-number field.
+        .form_owner(NodeIdentityInput::new("target", "frame", 3))
         .associated_control(
             crate::classification::AssociatedFormControlInput::new(NodeIdentityInput::new(
                 "target", "frame", 2,

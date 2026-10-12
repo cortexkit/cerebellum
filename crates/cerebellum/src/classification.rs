@@ -892,7 +892,11 @@ fn effective_input_type(
 }
 
 fn activation_invokes_submit(element: &ElementClassificationInput) -> bool {
-    if element.disabled {
+    // Submission needs a form owner: an ancestor <form>, or a `form` attribute
+    // naming a form in the same document. A submit-type control without one
+    // submits nothing, so it must not be rated as a form submit (which would
+    // ask for the highest grantable tier).
+    if element.disabled || element.form_owner.is_none() {
         return false;
     }
     match element.target_kind {

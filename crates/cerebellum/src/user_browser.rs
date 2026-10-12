@@ -354,6 +354,10 @@ async fn plan(
     commands: Vec<Value>,
 ) -> Result<Plan, Value> {
     let count = commands.len();
+    let methods: Vec<String> = commands
+        .iter()
+        .map(|command| command["method"].as_str().unwrap_or_default().to_owned())
+        .collect();
     let input_commands: Vec<bool> = commands
         .iter()
         .map(|command| {
@@ -386,9 +390,8 @@ async fn plan(
                 results.push(success.result);
             }
             CommandResult::Error(failure) => {
-                // Error text can contain page data. It is never journaled or relayed.
-                let _ = (failure.error.code, failure.error.message);
                 let mut refusal = refusal("cdp_error");
+                refusal["detail"] = cdp_error_detail(&methods[index], failure.error);
                 refusal["input_dispatched"] = json!(dispatched);
                 return Err(refusal);
             }
@@ -417,6 +420,43 @@ fn command(method: &str, params: Value) -> Value {
     // WebNavigation frame 0 is the only admitted input-sentinel scope. CDP
     // frame ids belong in method parameters, never in sentinel routing.
     json!({"method":method,"params":params,"frame_id":0})
+}
+
+/// Longest Chrome error message relayed in a `cdp_error` refusal.
+const MAX_CDP_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// Which plan command Chrome rejected, with Chrome's own error code and
+/// message, so a refused plan says what failed. CDP error messages are fixed
+/// protocol strings such as "DOM agent hasn't been enabled" and carry no page
+/// content; Chrome's optional `data` field is never relayed. A message that
+/// does not look like such a string (too long, or containing control
+/// characters) is replaced rather than passed through. The detail is part of
+/// the reply only: the journal records the outcome, not this detail.
+fn cdp_error_detail(method: &str, error: CdpError) -> Value {
+    let message = if error.message.chars().count() <= MAX_CDP_ERROR_MESSAGE_CHARS
+        && !error.message.chars().any(char::is_control)
+    {
+        error.message
+    } else {
+        "Chrome debugger command failed".into()
+    };
+    json!({"method":method, "code":error.code, "message":message})
+}
+
+/// The flattened DOM read used to classify and re-verify input targets.
+/// Chrome refuses `DOM.getFlattenedDocument` with "DOM agent hasn't been
+/// enabled" unless `DOM.enable` ran earlier on the same debugger attachment,
+/// and the extension attaches afresh for every plan and detaches after it. So
+/// every plan that reads the flattened DOM enables the DOM agent first; the
+/// document is the plan's last result.
+fn flattened_document() -> Vec<Value> {
+    vec![
+        command("DOM.enable", json!({})),
+        command(
+            "DOM.getFlattenedDocument",
+            json!({"depth":-1,"pierce":true}),
+        ),
+    ]
 }
 
 struct Document {
@@ -1561,17 +1601,7 @@ async fn input(
         .authorize(&frame.origin, requested, BTreeSet::new())
         .await?;
     let mut observed = context
-        .cdp(
-            tab,
-            Some(snapshot.interaction),
-            vec![
-                command("DOM.enable", json!({})),
-                command(
-                    "DOM.getFlattenedDocument",
-                    json!({"depth":-1,"pierce":true}),
-                ),
-            ],
-        )
+        .cdp(tab, Some(snapshot.interaction), flattened_document())
         .await?;
     let dom = observed
         .results
@@ -1895,14 +1925,7 @@ async fn verify_input(
         return Err(reply);
     }
     let mut plan = context
-        .cdp(
-            tab,
-            Some(snapshot.interaction),
-            vec![command(
-                "DOM.getFlattenedDocument",
-                json!({"depth":-1,"pierce":true}),
-            )],
-        )
+        .cdp(tab, Some(snapshot.interaction), flattened_document())
         .await
         .map_err(|mut reply| {
             if dispatched {
@@ -2053,19 +2076,15 @@ async fn verify_click_position(
         .ok_or_else(|| refusal("element_intercepted"))?;
     let identity = BackendNodeIdentity::new(tab, &frame.frame_id, backend)
         .map_err(|_| refusal("element_intercepted"))?;
-    let dom = context
-        .cdp(
-            tab,
-            Some(snapshot.interaction),
-            vec![command(
-                "DOM.getFlattenedDocument",
-                json!({"depth":-1,"pierce":true}),
-            )],
-        )
+    let mut dom = context
+        .cdp(tab, Some(snapshot.interaction), flattened_document())
         .await?;
+    let dom = dom
+        .results
+        .pop()
+        .ok_or_else(|| refusal("classification_unavailable"))?;
     let record = classify_flattened_document(
-        dom.results[0]
-            .as_object()
+        dom.as_object()
             .ok_or_else(|| refusal("classification_unavailable"))?,
         &identity,
         snapshot.interaction,

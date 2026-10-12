@@ -5568,7 +5568,10 @@ pub(crate) fn validate_user_browser_result(
                 "image":closed_object(json!({"mime":string_schema(),"data_b64":string_schema(),"width_px":integer_schema(),"height_px":integer_schema()}), &["mime","data_b64","width_px","height_px"]),
                 "image_width_px":integer_schema(), "image_height_px":integer_schema(),
                 "popup_activated_briefly":boolean_schema(),
-                "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"])]}
+                "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"]),
+                    // A cdp_error refusal names the rejected plan command and
+                    // Chrome's fixed error code and message, never page text.
+                    closed_object(json!({"method":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"])]}
             }),
             &["browser", "outcome"],
         )
