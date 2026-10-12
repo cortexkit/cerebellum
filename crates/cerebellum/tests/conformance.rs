@@ -1163,6 +1163,7 @@ async fn start_live_daemon_with_browser(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
         });
     let binary = cortexkit_test_support::ckdev_binary(binary);
+    let binary = support::daemon_binary("ck-cerebellum", binary);
     // Pay the first-exec cost of a freshly built binary before the registration
     // deadline starts.  macOS validates a newly written executable's signature on
     // its first exec and caches the result: measured 5-22s for the first run of a
