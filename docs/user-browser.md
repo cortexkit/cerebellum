@@ -27,6 +27,22 @@ actions. If you interact with or activate a controlled tab, an old snapshot can
 no longer authorize input: the agent must read again. A worker reconnect also
 invalidates old snapshots; commands are never replayed.
 
+## Snapshot completeness
+
+Navigation confirms the committed document, not page or network settlement, and
+reports `settled: false`. Snapshots make the same limitation explicit: a stable
+document and interaction epoch do not prove that Chrome has finished loading the
+accessibility tree. An empty AX response or a missing declared child refuses with
+`snapshot_not_ready` and `read again`. A root-only tree can be a legitimate empty
+page, so it remains readable; its remedy explains that the page may instead still
+be loading and that absent controls should not be assumed unavailable.
+
+Like own-browser snapshots, user snapshots report `truncated` and
+`refs_truncated`. Known AX/reference bounds, omitted embedded frames and output
+byte cuts mark the snapshot partial, with a remedy to read again before relying
+on absent content. These flags describe the capture, not whether additional page
+content might load later. They do not change site consent or add automatic retries.
+
 ## Development installation in normal Chrome
 
 Use an unpacked extension for development. Branded Chrome 137 and later ignores
