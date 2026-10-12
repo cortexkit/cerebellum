@@ -1,5 +1,6 @@
 //! Test executables handed to the daemon must live on the internal disk.
 #[allow(dead_code)]
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::path::{Path, PathBuf};

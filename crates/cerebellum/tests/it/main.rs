@@ -25,6 +25,7 @@ mod computer_synthetic;
 mod computer_takeover;
 mod consent_relay;
 mod crash_report_health;
+mod disclaimed_binary_paths;
 mod insulated_health;
 mod late_results;
 mod launch_outcome_vocabulary;
