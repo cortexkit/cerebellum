@@ -51,8 +51,9 @@ pub(crate) enum QueueRefusal {
         /// The stuck action, or the refused input call.
         call: String,
     },
-    /// Every work and release permit of the browser plane is held, possibly
-    /// by stuck workers. Nothing was dispatched for the call.
+    /// Fewer than the two permits a call needs (one work, one release) are
+    /// free on the browser plane, possibly because stuck workers hold them.
+    /// Nothing was dispatched for the call.
     CapacityExhausted {
         /// The browser capability whose result vocabulary the reply uses.
         capability: &'static str,
@@ -366,8 +367,10 @@ pub(crate) async fn enter(
 
 /// What a browser call holds once it reaches its execution lane: the lane,
 /// and, for a call that runs blocking browser work, its work and release
-/// permits. Both are kept until the call's route future ends, which a call
-/// detached by its terminal decision outlives only until its worker ends.
+/// permits. Both are kept until the task serving the call ends. A call
+/// answered by its deadline, a cancel or a drain while its blocking worker
+/// still runs keeps them until that worker ends, because its serving task is
+/// kept alive until then.
 pub(crate) struct BrowserLane {
     _guard: LaneGuard,
     _permits: Option<crate::blocking_permits::CallPermits>,

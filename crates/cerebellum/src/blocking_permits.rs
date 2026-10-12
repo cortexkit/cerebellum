@@ -3,8 +3,11 @@
 //!
 //! Each plane runs its blocking platform or Chrome work on its own pool of
 //! permits. A call takes one work permit and one release permit, atomically,
-//! when it acquires its execution lane, and keeps each until the job holding
-//! it really ends. With no pair free the call is refused before anything is
+//! when it acquires its execution lane. The work permit backs the call's
+//! blocking jobs; the release permit is reserved for the bounded held-input
+//! release that may run after the call's terminal decision. Each is kept until
+//! the thread holding it has finished, even when the call has already been
+//! answered. With no pair free the call is refused before anything is
 //! dispatched, so a run of stuck threads cannot grow without bound.
 
 use std::sync::{Arc, Mutex};

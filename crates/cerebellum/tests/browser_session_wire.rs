@@ -6203,9 +6203,10 @@ async fn a_call_with_no_blocking_worker_free_is_refused_before_dispatch() {
 }
 
 /// Bind route `channel`/3 for a second conversation, `other-session`, so its
-/// calls share no lane with the fixture's conversation. It may close, so a
-/// close of a session it does not have is a call that takes permits and
-/// answers at once.
+/// calls share no lane with the fixture's conversation. The binding grants
+/// `browser.close`: closing a session that conversation does not have takes
+/// a permit pair like any session call, yet answers at once, which makes it a
+/// cheap probe of the pool.
 async fn bind_other_conversation(planes: &Planes, channel: u16) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,

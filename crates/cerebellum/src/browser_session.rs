@@ -1006,18 +1006,20 @@ impl Default for BrowserPermits {
     }
 }
 
-/// What a module shutdown left behind when its plan ran out: never a clean
-/// stop while any of these is non-empty.
+/// What a module shutdown left behind at the end of its shutdown budget
+/// (`ShutdownBudget`, fixed when the shutdown starts). The shutdown was not a
+/// clean stop while any of these fields is non-empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShutdownReport {
     /// Sessions whose browser could not be confirmed stopped, so their
     /// profile custody stays held for the next start's launch recovery.
     pub custody_held: Vec<String>,
-    /// Browser operations still running when the plan ended: workers stuck
-    /// inside a driver call. A call's worker is counted in health by its
-    /// detached route future; this counts every one, whatever started it.
+    /// Browser operations still running when the budget ended: workers stuck
+    /// inside a driver call, whatever started them. Health already counts a
+    /// call's stuck worker as a detached worker, through the task that served
+    /// the call; this field also counts operations that belong to no call.
     pub operations_running: usize,
-    /// Teardowns still running when the plan ended. Each is counted as a
+    /// Teardowns still running when the budget ended. Each is counted as a
     /// detached worker in health until it really ends.
     pub teardowns_running: usize,
 }
