@@ -3554,6 +3554,18 @@ async fn handle_route_request(
         .await;
     }
 
+    // Draining can apply a permission, so reject an unsupported tool mode before
+    // reading or settling any consent answers for that call.
+    if facts.surface == RouteSurface::Tools {
+        if let Ok(request) = serde_json::from_slice::<Value>(&frame.body) {
+            if let Some(name) = request.get("name").and_then(Value::as_str) {
+                if let Err(error) = tool_provider::check_call_mode(name, &facts.call_mode, planes) {
+                    return tool_provider::send_error(error, (ver, channel, epoch, corr), writer)
+                        .await;
+                }
+            }
+        }
+    }
     if let Ok(live) = consent_drain::live_call(&frame, &facts, planes) {
         // A failed drain is retried on a later call; it must not replace this
         // call's ordinary reply with a consent refusal.

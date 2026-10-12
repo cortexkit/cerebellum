@@ -1,7 +1,8 @@
 # Legacy result bytes
 
 These files are exact response bodies captured from Cerebellum main at
-`3101135f4f08d0a38805d7f66e244794ecab2917`, before route-level result negotiation.
+`5018d7b1de138d36e9f02d8c57780b7bd221c94c`. All three files were regenerated
+from that commit; no body from the earlier `3101135` baseline was reused.
 The snapshot and screenshot represent `browser_use`; the application tree
 represents `computer_use`. The screenshot contains a valid one-pixel PNG.
 
@@ -27,7 +28,7 @@ Captured SHA-256 values:
 
 - `browser_snapshot.json`: `f8ef1834fb2d2910e8601b4ea9ed3dab58589ac20c7d9fc22481b2156d81dea2`
 - `browser_screenshot.json`: `9625a7285b11888330285938f8f5e2d04177cff5489ad50bccc47074566d2be2`
-- `computer_read_state.json`: `c271fc27ab4ce369fc81e8403a75705e9db48ff4a1202f847e7b8360f1aec37f`
+- `computer_read_state.json`: `5f98fd10f96833db6ee166fcdb3e4e912fc7d8083cc0d95c4b32c6635bebd1f4`
 
 Do not regenerate these from the current projector. If `send_tool_response`
 accidentally encoded legacy callers' replies as content/v1, regenerating the
