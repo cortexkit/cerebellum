@@ -1,36 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import vm from "node:vm";
 import { test } from "node:test";
 import { setup } from "./harness.mjs";
-import { expectedEvents } from "../commands.mjs";
-
-const source = await readFile(new URL("../sentinel.js", import.meta.url), "utf8");
-function sentinel() {
-  const handlers = new Map();
-  let receiver;
-  let clock = 0;
-  const messages = [];
-  const context = {
-    crypto: { randomUUID: () => "document-one" },
-    performance: { now: () => clock },
-    addEventListener(type, fn) { handlers.set(type, fn); },
-    removeEventListener(type) { handlers.delete(type); },
-    chrome: { runtime: { id: "extension-id", sendMessage(message) { messages.push(message); return Promise.resolve(); }, onMessage: { addListener(fn) { receiver = fn; }, removeListener() { receiver = null; } } } },
-  };
-  vm.runInNewContext(source, context);
-  return {
-    messages,
-    event(event) { handlers.get(event.type)?.(event); },
-    advance(ms) { clock += ms; },
-    send(operation, events = []) {
-      let result;
-      receiver?.({ kind: "agent-sentinel", operation, events }, { id: "extension-id" }, value => { result = value; });
-      return result;
-    },
-    get listeners() { return handlers.size; },
-  };
-}
+import { sentinel } from "./sentinel-fixture.mjs";
 
 test("sentinel counts detached trusted input but reads no page content", () => {
   const s = sentinel();
@@ -40,23 +11,19 @@ test("sentinel counts detached trusted input but reads no page content", () => {
   assert.equal(s.send("sample").sequence, 1);
 });
 
-test("sentinel attributes only a one-shot exact current input ticket", () => {
+test("sentinel timestamps every trusted click without a post-action grace period", () => {
   const s = sentinel();
-  s.send("arm", [{ type: "mousedown", clientX: 10, clientY: 20, button: 0 }]);
-  s.event({ type: "mousedown", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
-  assert.equal(s.send("sample").sequence, 0);
-  s.event({ type: "mousedown", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
-  assert.equal(s.send("sample").sequence, 1);
+  s.advance(10);
+  s.event({ type: "click", isTrusted: true });
+  s.advance(1);
+  s.event({ type: "click", isTrusted: true });
+  assert.deepEqual(s.send("sample").interactions, [{ sequence: 1, at: 10 }, { sequence: 2, at: 11 }]);
 });
 
-test("sentinel counts mismatched and expired tickets as human input", () => {
+test("sentinel never records focus or tab visibility as interaction", () => {
   const s = sentinel();
-  s.send("arm", [{ type: "keydown", key: "a", code: "KeyA" }]);
-  s.event({ type: "keydown", isTrusted: true, key: "b", code: "KeyB" });
-  s.send("arm", [{ type: "keydown", key: "a", code: "KeyA" }]);
-  s.advance(251);
-  s.event({ type: "keydown", isTrusted: true, key: "a", code: "KeyA" });
-  assert.equal(s.send("sample").sequence, 2);
+  for (const type of ["focus", "blur", "focusin", "focusout", "visibilitychange"]) s.event({ type, isTrusted: true });
+  assert.equal(s.send("sample").sequence, 0);
 });
 
 test("sentinel withdrawal removes all page input observers", () => {
@@ -71,22 +38,26 @@ test("sentinel withdrawal removes all page input observers", () => {
 
 test("trusted pointer and mouse movement do not change the tab interaction epoch", async () => {
   const f = await setup();
-  const s = sentinel();
-  f.chrome.observations.set("2:0", s.send("sample"));
+  const s = f.chrome.sentinels.get("2:0");
   const epoch = await f.epochs.sample(2);
   s.event({ type: "pointermove", isTrusted: true, clientX: 10, clientY: 20 });
   s.event({ type: "mousemove", isTrusted: true, clientX: 10, clientY: 20 });
-  f.chrome.observations.set("2:0", s.send("sample"));
   assert.equal(await f.epochs.sample(2), epoch);
-  assert.deepEqual(expectedEvents({ method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 10, y: 20 } }), []);
 });
 
 test("a trusted click still changes the tab interaction epoch", async () => {
   const f = await setup();
-  const s = sentinel();
-  f.chrome.observations.set("2:0", s.send("sample"));
+  const s = f.chrome.sentinels.get("2:0");
   const epoch = await f.epochs.sample(2);
   s.event({ type: "click", isTrusted: true, clientX: 10, clientY: 20, button: 0 });
-  f.chrome.observations.set("2:0", s.send("sample"));
   assert.equal(await f.epochs.sample(2), epoch + 1);
+});
+
+test("missing interaction history refuses instead of hiding unknown input", async () => {
+  const f = await setup();
+  const epoch = await f.epochs.sample(2);
+  for (let i = 0; i < 257; i++) f.chrome.input(2, { type: "click" });
+  assert.equal(f.chrome.sentinels.get("2:0").send("sample").interactions.length, 256);
+  await assert.rejects(f.epochs.sample(2), { reason: "interaction_continuity_lost" });
+  assert.equal(f.epochs.record(2).epoch, epoch);
 });

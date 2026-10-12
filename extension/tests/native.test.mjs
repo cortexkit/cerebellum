@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { NativeBridge, byteLength, chunks, CHUNK_BYTES, MAX_MESSAGE_BYTES } from "../native.mjs";
-import { setup, route, read, turn } from "./harness.mjs";
+import { setup, route, read, release, turn } from "./harness.mjs";
 import { deferred } from "./fake-chrome.mjs";
 import { readFileSync } from "node:fs";
 
@@ -131,7 +131,16 @@ test("native reconnect is a new epoch and never replays an old dispatch", async 
   const pause = deferred();
   const sendCommand = f.chrome.debugger.sendCommand;
   let dispatches = 0;
-  f.chrome.debugger.sendCommand = async (...args) => { dispatches += 1; await pause.promise; return sendCommand(...args); };
+  const cleanup = [];
+  f.chrome.debugger.sendCommand = async (...args) => {
+    if (args[2].type === "mouseReleased") {
+      cleanup.push(args[2]);
+      return sendCommand(...args);
+    }
+    dispatches += 1;
+    await pause.promise;
+    return sendCommand(...args);
+  };
   f.attach(1, f.input(fresh.interaction_epoch));
   await waitBody(f.port, "attached", 1);
   f.send(1, { type: "dispatch" });
@@ -147,6 +156,7 @@ test("native reconnect is a new epoch and never replays an old dispatch", async 
   pause.resolve();
   await turn();
   assert.equal(dispatches, 1);
+  assert.deepEqual(cleanup, [release.params]);
   assert.equal(next.sent.length, 0);
   assert.equal(f.agent.connectionEpoch, 51);
   assert.equal(f.agent.baselines.size, 0);
@@ -213,12 +223,21 @@ test("native dispatch deadline detaches without sending any command", async t =>
   assert.equal(f.chrome.calls.some(call => call[0] === "cdp"), false);
 });
 
-test("native reply deadline cancels a stalled command and never sends the next input", async t => {
+test("native reply deadline cancels a stalled press and sends only its cleanup release", async t => {
   const f = await native(t);
   const fresh = await f.fresh();
   const pause = deferred();
   let calls = 0;
-  f.chrome.debugger.sendCommand = async () => { calls += 1; return pause.promise; };
+  const cleanup = [];
+  const sendCommand = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    if (args[2].type === "mouseReleased") {
+      cleanup.push(args[2]);
+      return sendCommand(...args);
+    }
+    calls += 1;
+    return pause.promise;
+  };
   t.mock.timers.enable({ apis: ["setTimeout"] });
   f.attach(1, f.input(fresh.interaction_epoch));
   await turn();
@@ -234,6 +253,7 @@ test("native reply deadline cancels a stalled command and never sends the next i
   pause.resolve({});
   await turn();
   assert.equal(calls, 1);
+  assert.deepEqual(cleanup, [release.params]);
 });
 
 test("native bridge answers the native host's own frames for a first open_tab without closing the port", async t => {

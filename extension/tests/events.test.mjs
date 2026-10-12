@@ -77,13 +77,14 @@ test("popup from an outside opener is not listed read grouped or driven", async 
   assert.equal(f.tabs.tabs.has(40), false);
 });
 
-test("activation and unattributed navigation invalidate but agent navigation is excluded", async () => {
+test("focus never counts as interaction but unattributed navigation still invalidates", async () => {
   const f = await setup();
   listen(f);
   f.chrome.tabs.onActivated.emit({ tabId: 2, windowId: 3 });
-  assert.equal(f.epochs.record(2).epoch, 1);
+  f.chrome.windows.onFocusChanged.emit(3);
+  assert.equal(f.epochs.record(2).epoch, 0);
   f.chrome.webNavigation.onBeforeNavigate.emit({ tabId: 2, frameId: 0 });
-  assert.equal(f.epochs.record(2).epoch, 2);
+  assert.equal(f.epochs.record(2).epoch, 1);
   await f.fresh();
   const epoch = f.epochs.record(2).epoch;
   const send = f.chrome.debugger.sendCommand;

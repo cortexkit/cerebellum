@@ -607,10 +607,9 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
             assert!(methods[..read].contains(&"DOM.enable"), "{methods:?}");
         }
     }
-    // Six flattened-DOM reads: one for the snapshot's capture, one for the
-    // click's classification, and two re-verifications (target state and
-    // hit-test position) before each of the click's two mouse events.
-    assert_eq!(reads, 6);
+    // Four flattened-DOM reads: snapshot capture, click classification, and
+    // target-state plus hit-test verification immediately before the mouse pair.
+    assert_eq!(reads, 4);
 }
 
 #[tokio::test]
@@ -819,20 +818,22 @@ async fn redirect_to_ungranted_landing_site_exposes_no_content() {
 }
 
 #[tokio::test]
-async fn human_input_before_dispatch_and_between_steps_stops_all_further_input() {
+async fn human_input_before_click_and_between_typing_steps_stops_all_further_input() {
     for before in [true, false] {
         let fixture = Fixture::new();
         let tab = fixture.claim(1).await;
         let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
-        let reference = reference(&snapshot, "Go");
+        let args = if before {
+            click(&tab, &snapshot, &reference(&snapshot, "Go"))
+        } else {
+            json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"not dispatched"})
+        };
         {
             let mut state = fixture.state.lock().unwrap();
             state.human_before_input = before;
             state.human_after_input = !before;
         }
-        let (reply, _) = fixture
-            .call(1, click(&tab, &snapshot, &reference), "allow_once")
-            .await;
+        let (reply, _) = fixture.call(1, args, "allow_once").await;
         assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
         assert_eq!(reply["remedy"], "read again");
         assert_eq!(reply["input_dispatched"], !before);
@@ -934,7 +935,7 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
 }
 
 #[tokio::test]
-async fn background_clicks_emulate_focus_in_each_mouse_event_attachment() {
+async fn background_clicks_keep_focus_press_and_release_in_one_attachment() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
@@ -951,16 +952,17 @@ async fn background_clicks_emulate_focus_in_each_mouse_event_attachment() {
         let (clicked, _) = fixture.call(1, args, "allow_once").await;
         assert_eq!(clicked["outcome"], "ok", "{clicked}");
         let state = fixture.state.lock().unwrap();
-        let mut events = Vec::new();
+        let mut pairs = 0;
         for plan in &state.commands[before..] {
             let commands = plan["commands"].as_array().unwrap();
             if let Some(index) = commands
                 .iter()
                 .position(|command| command["method"] == "Input.dispatchMouseEvent")
             {
-                // The extension detaches after every plan; focus emulation in
-                // an earlier attachment cannot prepare either mouse event.
-                assert!(index > 0, "mouse input lacks focus emulation: {plan}");
+                // One attachment owns the complete gesture, including any
+                // release-only cleanup needed after a between-event refusal.
+                assert_eq!(index, 1, "mouse input lacks focus emulation: {plan}");
+                assert_eq!(commands.len(), 3, "{plan}");
                 assert_eq!(
                     commands[index - 1],
                     command(
@@ -969,10 +971,14 @@ async fn background_clicks_emulate_focus_in_each_mouse_event_attachment() {
                     ),
                     "{plan}"
                 );
-                events.push(commands[index]["params"]["type"].as_str().unwrap());
+                assert_eq!(commands[index]["params"]["type"], "mousePressed");
+                let mut released = commands[index].clone();
+                released["params"]["type"] = json!("mouseReleased");
+                assert_eq!(commands[index + 1], released, "{plan}");
+                pairs += 1;
             }
         }
-        assert_eq!(events, ["mousePressed", "mouseReleased"]);
+        assert_eq!(pairs, 1);
     }
 }
 

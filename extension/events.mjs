@@ -41,7 +41,6 @@ export class BrowserEvents {
       }
       this.lastActivation = { tabId: info.tabId, windowId: info.windowId, previousTab: this.activeTabs.get(this.focusedWindow), previousWindow: this.focusedWindow };
       this.activeTabs.set(info.windowId, info.tabId);
-      if (this.tabs.tabs.has(info.tabId)) this.epochs.bump(info.tabId);
     });
     this.chrome.windows.onFocusChanged.addListener(windowId => {
       if (windowId >= 0 && ![...this.popupSources.values()].some(popup => popup.windowId === windowId)) {
@@ -83,9 +82,10 @@ export class BrowserEvents {
     });
     this.chrome.debugger.onDetach.addListener(source => {
       for (const state of this.agent.active) {
-        if (state.tabId !== source.tabId || state.detaching) continue;
+        if (state.tabId !== source.tabId) continue;
         state.attached = false;
-        state.cancelled = true;
+        this.epochs.endAction(state.actionWindow);
+        if (!state.detaching) state.cancelled = true;
       }
     });
   }

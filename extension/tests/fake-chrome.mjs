@@ -1,3 +1,5 @@
+import { sentinel } from "./sentinel-fixture.mjs";
+
 export class Event {
   listeners = new Set();
   addListener = fn => this.listeners.add(fn);
@@ -17,10 +19,14 @@ export function fakeChrome() {
   const groups = new Map();
   const store = {};
   const observations = new Map();
+  const sentinels = new Map();
+  let nextDocument = 0;
   let nextTab = 10;
   const ports = [];
   const chrome = {
-    calls, tabData, groups, observations, ports,
+    calls, tabData, groups, observations, ports, sentinels,
+    now: () => performance.timeOrigin + performance.now(),
+    input(tabId, event, frameId = 0) { sentinels.get(`${tabId}:${frameId}`)?.event({ isTrusted: true, ...event }); },
     runtime: {
       id: "test-extension", onMessage: new Event(), onStartup: new Event(), onInstalled: new Event(),
       connectNative(name) {
@@ -59,7 +65,10 @@ export function fakeChrome() {
         calls.push(["sentinel", tabId, message, options]);
         const key = `${tabId}:${options.frameId ?? 0}`;
         if (!observations.has(key)) throw new Error("no observer");
-        return { enabled: true, ...observations.get(key) };
+        const observation = sentinels.get(key).send(message.operation);
+        if (!observation) throw new Error("no observer");
+        observations.set(key, observation);
+        return observation;
       },
       async update(id, options) {
         if (!chrome.allowPopupRecovery) throw new Error("focus update forbidden");
@@ -73,7 +82,17 @@ export function fakeChrome() {
       async get(id) { if (!groups.has(id)) throw new Error("missing group"); return { ...groups.get(id) }; },
       async update(id, value) { Object.assign(groups.get(id), value); calls.push(["groupUpdate", id, value]); return { ...groups.get(id) }; },
     },
-    scripting: { async executeScript(options) { calls.push(["inject", options]); observations.set(`${options.target.tabId}:0`, { documentId: "doc", sequence: 0 }); return []; } },
+    scripting: { async executeScript(options) {
+      calls.push(["inject", options]);
+      const key = `${options.target.tabId}:0`;
+      const observer = sentinel({ now: () => chrome.now(), documentId: `doc-${++nextDocument}`, onInteraction: message => {
+        observations.set(key, message);
+        chrome.runtime.onMessage.emit(message, { id: chrome.runtime.id, tab: { id: options.target.tabId }, frameId: 0 });
+      } });
+      sentinels.set(key, observer);
+      observations.set(key, observer.send("sample"));
+      return [];
+    } },
     webNavigation: { onCreatedNavigationTarget: new Event(), onCommitted: new Event(), onBeforeNavigate: new Event(), onErrorOccurred: new Event(), async getAllFrames({ tabId }) { return [{ tabId, frameId: 0 }]; } },
     debugger: {
       onEvent: new Event(), onDetach: new Event(),

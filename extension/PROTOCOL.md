@@ -40,7 +40,11 @@ Goodbye uses `id:0`. Bodies follow `user_browser_bridge.rs`:
    Each terminal acknowledgement has `input_dispatched` and `detached:true`.
 
 `cancel` stops attaching, further commands/input and chunk production; it never
-undoes input. A late attach is detached, not replayed. If detachment cannot be
+undoes input. A dispatched mouse press has a release-only cleanup exception:
+while its debugger attachment is still held, refusal or cancellation sends only
+the matching release at the original point and button, never another press or
+the rest of the plan. Prior input remains disclosed even when cleanup succeeds.
+A late attach is detached, not replayed. If detachment cannot be
 established (including an unresolved attach), the port is closed rather than
 acknowledging a false `detached:true`. `goodbye` has `{type:"goodbye",route}` and
 releases that route's claims without closing any tab. Connection loss clears
@@ -166,8 +170,8 @@ const HAS_FOCUS = "function() { return this.ownerDocument.hasFocus() && this.get
 ```
 
 `Emulation.setFocusEmulationEnabled` emulates document focus for clicking and
-typing, not tab/window activation. Each mouse event's plan enables it because
-the debugger detaches between plans. `DOM.focus` focuses the typed element;
+typing, not tab/window activation. A mouse gesture's plan enables it before the
+press/release pair; the debugger detaches between plans. `DOM.focus` focuses the typed element;
 both methods are input-guarded. The stricter user-
 frame filter, site/redirect authorization and risk classifier remain the adapter's
 responsibility, not raw-CDP permission conferred by a plan.
@@ -182,14 +186,20 @@ cancels active work and invalidates its handle.
 
 An isolated-world sentinel is injected only into group members. It reads no page
 text, URLs or field values, and persists between debugger attachments. Trusted
-click/key/wheel/input/touch events increment the interaction epoch unless they match the
-one-shot, exact ticket for the currently dispatched agent input. Ambiguous,
-unmatched or expired events count as the person's input. Cursor movement alone
+click/key/wheel/input/touch events increment the interaction epoch only outside
+the extension's own debugger attachment for that tab. CDP input is also trusted,
+so an attached action's input cannot be distinguished from the person's by
+`isTrusted` or an event fingerprint. The action window starts when attach succeeds
+and ends when detach completes, with no grace period. Sentinel event timestamps
+and bounded sequence history attribute delayed messages to the event's actual
+side of those boundaries; missing history refuses input rather than hiding it.
+Outside the window, even a click identical to the preceding agent click counts.
+Focus/blur, tab activation and window focus never count as interaction.
+Cursor movement alone
 (`pointermove`/`mousemove`) is not interaction and is neither observed nor attributed.
-Text-producing key events are intentionally not attributed: they count as the
-person's input. The browser adapter must type text with `Input.insertText` and use
-`Input.dispatchKeyEvent` only for non-text keys. Human activation and
-non-agent navigation also invalidate freshness; agent Page navigation is excluded.
+The browser adapter types text with `Input.insertText` and uses
+`Input.dispatchKeyEvent` only for non-text keys. Non-agent navigation still
+invalidates freshness; agent Page navigation is excluded.
 Missing observer/frame coverage and changed document identity invalidate input.
 
 Successful AX/DOM content reads or screenshots with live observer coverage establish

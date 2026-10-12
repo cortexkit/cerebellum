@@ -1757,7 +1757,8 @@ async fn input(
     }
     let mut dispatched = false;
     let mut popup = false;
-    for step in steps {
+    let mut steps = steps.into_iter();
+    while let Some(step) = steps.next() {
         if !context.granted(&frame.origin, severity, &hazards, Some(&once))
             || classification
                 .activation_destination_origin
@@ -1839,12 +1840,16 @@ async fn input(
             }
             // Background pages can acknowledge mouse input without delivering
             // it. Emulate page focus without activating the person's tab or
-            // window, in the same debugger attachment as each input event.
+            // window. Keep the mouse pair in one attachment so the extension
+            // can release our press even if its between-event guard refuses.
             let mut commands = vec![command(
                 "Emulation.setFocusEmulationEnabled",
                 json!({"enabled":true}),
             )];
             commands.push(step);
+            if action != "type" {
+                commands.extend(steps.by_ref());
+            }
             commands
         };
         let outcome = context.cdp(tab, Some(snapshot.interaction), commands).await;
