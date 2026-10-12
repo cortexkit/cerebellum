@@ -143,6 +143,7 @@ impl HeldInput {
     }
 
     /// Whether input may be held that nothing has confirmed released.
+    #[cfg(test)]
     pub(crate) fn unconfirmed(&self) -> bool {
         let state = self.state.lock().unwrap();
         !state.quarantined.is_empty() || state.outstanding.values().any(Outstanding::stuck)
@@ -312,14 +313,14 @@ pub(crate) fn release_one<D: PlatformDriver>(press: &HeldPress, driver: &mut D) 
 
 /// A later input call's own paired releases. The quarantine clears only when
 /// every release returns; a partial release confirms nothing.
-pub(crate) fn release_pending<D: PlatformDriver>(
+pub(crate) fn release_pending(
     held: &HeldInput,
     pending: PendingRelease,
-    driver: &mut D,
+    mut release: impl FnMut(&HeldPress) -> bool,
 ) -> bool {
     let mut released = Vec::new();
     for (id, press) in pending.presses {
-        if !release_one(&press, driver) {
+        if !release(&press) {
             return false;
         }
         released.push(id);

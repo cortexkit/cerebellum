@@ -64,7 +64,7 @@ impl PermitPool {
         let mut both = Arc::clone(&self.permits).try_acquire_many_owned(2).ok()?;
         let release = both.split(1)?;
         Some(CallPermits {
-            work: Arc::new(both),
+            _work: Arc::new(both),
             release: Mutex::new(Some(release)),
         })
     }
@@ -77,6 +77,7 @@ impl PermitPool {
             .map(Arc::new)
     }
 
+    #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
         self.permits.available_permits()
     }
@@ -93,7 +94,7 @@ impl Default for PermitPool {
 /// holding it really ends. The release permit moves into the held-input
 /// release job, if the call registers one.
 pub(crate) struct CallPermits {
-    work: Arc<OwnedSemaphorePermit>,
+    _work: Arc<OwnedSemaphorePermit>,
     release: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
@@ -177,16 +178,6 @@ impl ExecutionQuarantine {
             .filter(|entry| own.is_none_or(|own| own.id != entry.id))
             .find(|entry| entry.stuck() && entry.matches(pid, bundle_identity))
             .map(|entry| entry.action)
-    }
-
-    /// How many workers are running past their call's terminal decision.
-    pub(crate) fn stuck_count(&self) -> usize {
-        self.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|entry| entry.stuck())
-            .count()
     }
 
     #[cfg(test)]
@@ -343,8 +334,11 @@ impl CallWork {
         cerebellum_macos::ax_budget::bound_messages_until(self.deadline())
     }
 
+    /// Other platforms set no accessibility messaging timeouts.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn bound_ax(&self) {}
+    pub(crate) fn bound_ax(&self) -> NoAxBudget {
+        NoAxBudget
+    }
 
     /// Record the process this call acts on, and refuse it when a stuck
     /// worker from another call holds that process.
@@ -384,6 +378,10 @@ impl CallWork {
         }
     }
 }
+
+/// Stands in for the macOS accessibility budget guard where there is none.
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct NoAxBudget;
 
 /// Adds the time a call spends waiting on a person to its work deadline.
 /// Taken on the async side where a consent wait begins; dropped when it ends.

@@ -1171,6 +1171,7 @@ where
                     bracket_admitted: self.fronting_bracket_admitted,
                     cancel: Some(cancel),
                     now_ms,
+                    gate: None,
                 },
             )
             .await
@@ -1258,6 +1259,8 @@ where
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
         let work = quarantine::CallWork::current();
+        let mut image_plan = image_plan;
+        image_plan.gate = Some(work.gate());
         tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
@@ -1300,7 +1303,6 @@ where
                     work.publish_posting(&own_input, &posting);
                     posting
                 });
-                let gate = work.gate();
                 let captured = read_image::capture(
                     backend,
                     &mut make_driver(),
@@ -1313,7 +1315,6 @@ where
                             own_input.end_posting(posting);
                         }
                     },
-                    gate.as_ref(),
                 );
                 if let Some(posting) = posting {
                     own_input.end_posting(posting);
@@ -1933,7 +1934,10 @@ where
         let release_work = work.clone();
         let released = tokio::task::spawn_blocking(move || {
             let _ax = release_work.bound_ax();
-            held_input::release_pending(&held, pending, &mut make_driver())
+            let mut driver = make_driver();
+            held_input::release_pending(&held, pending, |press| {
+                held_input::release_one(press, &mut driver)
+            })
         })
         .await
         .unwrap_or(false);

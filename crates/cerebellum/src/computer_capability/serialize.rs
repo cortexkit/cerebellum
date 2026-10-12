@@ -546,6 +546,7 @@ mod tests {
         Start(usize),
         End(usize),
         LaunchStarted(String),
+        PressStarted(usize),
     }
 
     /// Each read reports its invocation number through a different real reply:
@@ -566,8 +567,15 @@ mod tests {
         launch_released: (Mutex<bool>, Condvar),
         running_queries: AtomicUsize,
         read_targets: Mutex<Vec<String>>,
+        presses: AtomicUsize,
+        press_released: (Mutex<bool>, Condvar),
     }
     impl Desk {
+        fn release_press(&self) {
+            *self.press_released.0.lock().unwrap() = true;
+            self.press_released.1.notify_all();
+        }
+
         fn script_apps(&self, installed: Vec<InstalledApp>, running: &[&str]) {
             *self.scripted_installed.lock().unwrap() = Some(installed);
             *self.scripted_running.lock().unwrap() =
@@ -607,6 +615,37 @@ mod tests {
     }
 
     impl AppStateSource for Desk {
+        fn element_facts(
+            &self,
+            _: &ElementHandle,
+        ) -> Result<cerebellum_computer::app_state::source::ElementFacts, ElementActionError>
+        {
+            Ok(cerebellum_computer::app_state::source::ElementFacts {
+                pid: Some(42),
+                role: Some("AXButton".into()),
+                subrole: None,
+                title: Some("Go".into()),
+                actions: vec!["AXPress".into()],
+                value_settable: false,
+                selected_text_settable: false,
+            })
+        }
+        /// Every press is counted; each waits until the test releases it.
+        fn press(&self, _: &ElementHandle) -> Result<(), ElementActionError> {
+            let number = self.presses.fetch_add(1, Ordering::SeqCst) + 1;
+            self.events.send(Event::PressStarted(number)).unwrap();
+            let (released, _) = self
+                .press_released
+                .1
+                .wait_timeout_while(
+                    self.press_released.0.lock().unwrap(),
+                    Duration::from_secs(30),
+                    |released| !*released,
+                )
+                .unwrap();
+            drop(released);
+            Ok(())
+        }
         fn element_at(
             &self,
             _: HitScope,
@@ -795,6 +834,28 @@ mod tests {
         });
         frame(FrameType::Request, 7, corr, body)
     }
+    fn press_request(channel: u16, corr: u64, ids: &[String]) -> Frame {
+        frame(
+            FrameType::Request,
+            channel,
+            corr,
+            serde_json::json!({
+                "name": "computer_use",
+                "arguments": {"action": "press_element", "element_ids": ids},
+            }),
+        )
+    }
+    /// A read_state whose zoom names nothing: it is admitted and checked like
+    /// any read, then answers `stale_element` without reading the desk.
+    fn unread_request(channel: u16, corr: u64, app: &str) -> Frame {
+        let mut body: Value = serde_json::from_slice(&request(channel, corr, app).body).unwrap();
+        body["arguments"]["zoom"] = serde_json::json!("zz999999");
+        frame(FrameType::Request, channel, corr, body)
+    }
+    fn outcome(frame: &Frame) -> Value {
+        assert_eq!(frame.header.ty, FrameType::Response, "{frame:?}");
+        serde_json::from_slice(&frame.body).unwrap()
+    }
     fn open_request(channel: u16, corr: u64, app: &str) -> Frame {
         frame(
             FrameType::Request,
@@ -845,6 +906,8 @@ mod tests {
             launch_released: (Mutex::new(true), Condvar::new()),
             running_queries: AtomicUsize::new(0),
             read_targets: Mutex::new(Vec::new()),
+            presses: AtomicUsize::new(0),
+            press_released: (Mutex::new(false), Condvar::new()),
         });
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
@@ -874,6 +937,7 @@ mod tests {
                 "computer.takeover_move",
                 "computer.takeover_scroll",
                 "computer.keys",
+                "computer.press_element",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1135,6 +1199,63 @@ mod tests {
             .await
             .expect("idle app lock map is empty");
         }
+        /// Number two buttons of the editor for `channel`'s conversation, as a
+        /// read would, and return their element ids.
+        fn register_buttons(&self, channel: u16) -> Vec<String> {
+            use cerebellum_computer::app_state::source::{
+                ElementValue, FixtureElementToken, RawElement,
+            };
+            let conversation = self
+                .planes
+                .routes
+                .get(channel, 1)
+                .unwrap()
+                .identity
+                .conversation_key;
+            let button = |token: u64| RawElement {
+                handle: Arc::new(FixtureElementToken(token)),
+                role: Some("AXButton".into()),
+                subrole: None,
+                title: Some(format!("Go {token}")),
+                description: None,
+                value_description: None,
+                value: ElementValue::Absent,
+                value_settable: false,
+                selected: false,
+                enabled: true,
+                focused: false,
+                expanded: None,
+                menu_visible: false,
+                closed_menu_children: 0,
+                url: None,
+                children: Vec::new(),
+                unreadable_children: 0,
+            };
+            let raw = RawAppState {
+                roots: vec![button(1), button(2)],
+                focused: None,
+                unreadable_subtrees: 0,
+                read_bound_reached: false,
+            };
+            let grant = ProcessGrant {
+                pid: 42,
+                bundle_identity: APP.into(),
+                process_generation_evidence: "fixture-generation".into(),
+            };
+            let read =
+                self.planes
+                    .management
+                    .app_state_sessions()
+                    .observe(&conversation, &grant, &raw);
+            let ids: Vec<String> = read
+                .roots
+                .iter()
+                .filter_map(|node| node.element_id.clone())
+                .collect();
+            assert_eq!(ids.len(), 2, "both buttons were numbered");
+            ids
+        }
+
         async fn finish(mut self) {
             self.idle().await;
             self.send(frame(FrameType::Goodbye, 0, 0, serde_json::json!({})))
@@ -1865,6 +1986,123 @@ mod tests {
             serde_json::from_slice::<Value>(&response.body).unwrap()["outcome"],
             "cancelled"
         );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_after_a_press_began_answers_unknown_and_no_later_press_runs() {
+        let mut rig = rig(false, None);
+        rig.grant(7, APP).await;
+        rig.desk.release();
+        let ids = rig.register_buttons(7);
+        rig.send(press_request(7, 1, &ids)).await;
+        assert_eq!(rig.event().await, Event::PressStarted(1));
+        rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The first press returns inside the cleanup window; the batch's
+        // second press must not follow it.
+        rig.desk.release_press();
+        let reply = outcome(&rig.reply().await);
+        assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+        assert_eq!(reply["detail"]["reason"], "cancelled", "{reply}");
+        assert_eq!(reply["detail"]["dispatched"], true, "{reply}");
+        assert_eq!(
+            rig.desk.presses.load(Ordering::SeqCst),
+            1,
+            "no external call after the stop"
+        );
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_stuck_press_quarantines_its_app_for_every_conversation_until_it_ends() {
+        let mut rig = rig(true, None);
+        rig.grant(7, APP).await;
+        rig.grant(8, APP).await;
+        rig.grant(8, OTHER).await;
+        rig.desk.release();
+        let ids = rig.register_buttons(7);
+        rig.send(press_request(7, 1, &ids[..1])).await;
+        assert_eq!(rig.event().await, Event::PressStarted(1));
+        rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
+            .await;
+        let stuck = tokio::time::timeout(Duration::from_secs(10), rig.replies.recv())
+            .await
+            .expect("the stuck call is answered after its bounded cleanup window")
+            .unwrap();
+        assert_eq!(outcome(&stuck)["outcome"], "dispatch_outcome_unknown");
+
+        let plane = rig.planes.computer.as_ref().unwrap().clone();
+        for (channel, corr) in [(8, 2), (7, 3)] {
+            rig.send(unread_request(channel, corr, APP)).await;
+            let busy = rig.reply().await;
+            assert_eq!(busy.header.corr, corr);
+            let busy = outcome(&busy);
+            assert_eq!(busy["outcome"], "target_busy", "channel {channel}: {busy}");
+            assert_eq!(busy["detail"]["call"], "computer.press_element", "{busy}");
+            assert_eq!(busy["detail"]["dispatched"], false, "{busy}");
+        }
+        rig.send(unread_request(8, 4, OTHER)).await;
+        assert_eq!(
+            outcome(&rig.reply().await)["outcome"],
+            "stale_element",
+            "a call on another application proceeds"
+        );
+        assert_eq!(rig.desk.presses.load(Ordering::SeqCst), 1);
+
+        rig.desk.release_press();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !plane.serializer.quarantine.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("execution quarantine clears when the worker ends");
+        rig.send(unread_request(8, 5, APP)).await;
+        assert_eq!(outcome(&rig.reply().await)["outcome"], "stale_element");
+        rig.finish().await;
+    }
+
+    #[tokio::test]
+    async fn no_free_permit_refuses_before_any_blocking_work_is_spawned() {
+        let mut rig = rig(false, None);
+        rig.grant(7, APP).await;
+        let plane = rig.planes.computer.as_ref().unwrap().clone();
+        let mut held: Vec<_> = (0..crate::budgets::MAX_BLOCKING_WORKERS_COMPUTER / 2)
+            .map(|_| plane.serializer.permits.try_call().unwrap())
+            .collect();
+        let queries = rig.desk.running_queries.load(Ordering::SeqCst);
+        rig.send(request(7, 1, "Editor")).await;
+        let refused = outcome(&rig.reply().await);
+        assert_eq!(
+            refused["outcome"], "blocking_capacity_exhausted",
+            "{refused}"
+        );
+        assert_eq!(refused["detail"]["call"], "target resolution", "{refused}");
+        assert_eq!(
+            rig.desk.running_queries.load(Ordering::SeqCst),
+            queries,
+            "no resolution query was spawned"
+        );
+
+        // One permit free: the resolution query runs on it and returns it,
+        // but the call's lane needs two, so it is refused there instead.
+        let last = held.pop().unwrap();
+        drop(last.take_release());
+        rig.send(request(7, 2, "Editor")).await;
+        let refused = outcome(&rig.reply().await);
+        assert_eq!(
+            refused["outcome"], "blocking_capacity_exhausted",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["detail"]["call"], "computer.read_state",
+            "{refused}"
+        );
+        assert_eq!(rig.desk.running_queries.load(Ordering::SeqCst), queries + 1);
+        assert_eq!(rig.desk.reads.load(Ordering::SeqCst), 0, "nothing was read");
+        drop((held, last));
         rig.finish().await;
     }
 }
