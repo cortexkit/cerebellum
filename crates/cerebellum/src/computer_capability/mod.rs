@@ -2813,9 +2813,19 @@ fn synthetic_wire_envelope(mut reply: Value) -> Value {
     object
         .entry("containment_rung")
         .or_insert_with(|| Value::String("global_none".to_string()));
-    // Permission admission names both the missing service and its startup
-    // state. Preserve those diagnostics through the keystroke envelope.
-    if object.get("outcome").and_then(Value::as_str) != Some("permission_missing") {
+    // Permission admission names the missing service and its startup state.
+    // Bounded-call terminals carry dispatch and held-input evidence that callers
+    // need before retrying. Preserve both kinds of diagnostics in the envelope.
+    if !matches!(
+        object.get("outcome").and_then(Value::as_str),
+        Some(
+            "permission_missing"
+                | "action_deadline_exceeded"
+                | "dispatch_outcome_unknown"
+                | "target_busy"
+                | "blocking_capacity_exhausted"
+        )
+    ) {
         object.remove("detail");
     }
     reply

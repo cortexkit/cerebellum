@@ -4534,6 +4534,12 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             result_schema: browser_close_result_schema(),
         },
     ]
+    .into_iter()
+    .map(|mut definition| {
+        definition.result_schema = with_bounded_call_results(definition.result_schema);
+        definition
+    })
+    .collect()
 }
 
 pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
@@ -4668,6 +4674,39 @@ fn refusal_detail_schema() -> Value {
         }),
         &[],
     )
+}
+
+fn bounded_call_reply_schema() -> Value {
+    closed_object(
+        json!({
+            "outcome":enum_schema(&[
+                "action_deadline_exceeded", "dispatch_outcome_unknown",
+                "target_busy", "blocking_capacity_exhausted",
+            ]),
+            "detail":closed_object(json!({
+                "dispatched":boolean_schema(),
+                "step":enum_schema(&["admission", "queue", "consent", "preflight", "dispatch", "release"]),
+                "call":string_schema(),
+                "held_state":enum_schema(&["none_held", "released", "unknown"]),
+                "reason":{
+                    "type":"string",
+                    "description":"Bounded-call causes include action_deadline_exceeded, cancelled, route_closed, module_draining and held_input_unconfirmed. Other refusal reasons remain free-form."
+                },
+            }), &[]),
+            "effect_status":enum_schema(&["effect_observed", "no_effect_observed", "effect_indeterminate"]),
+            "remedy":string_schema(),
+            "context":context_result_schema(),
+        }),
+        &["outcome", "detail"],
+    )
+}
+
+fn with_bounded_call_results(legacy_schema: Value) -> Value {
+    // Deadline, unknown-dispatch, busy-target and capacity replies can end a call
+    // before context resolution or an operation-specific result exists. Their
+    // separate branch permits only those four outcomes and six execution phases,
+    // without relaxing legacy required fields or legacy CDP method step strings.
+    json!({"anyOf": [legacy_schema, bounded_call_reply_schema()]})
 }
 
 fn text_snapshot_properties() -> Value {
@@ -5035,7 +5074,7 @@ fn browser_status_result_schema() -> Value {
             "browser_session_id":string_schema(),
             "profile_disposition":enum_schema(&["durable", "disposable"]),
             "lease":browser_lease_result_schema(),
-            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", "crash_reports_delete", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", "crash_reports_delete", "custody_held", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
             "terminal_outcome":enum_schema(&["closed", "browser_crashed", "connector_failure", "cdp_failure", "idle_expired", "route_unbound", "scope_revoked", "module_shutdown", "cleanup_failure", "startup_indeterminate"]),
             "failed_signals":string_array_schema(),
         }),
@@ -5062,7 +5101,7 @@ fn browser_close_result_schema() -> Value {
         ],
         json!({
             "browser_session_id":string_schema(),
-            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", "crash_reports_delete", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
+            "stage":enum_schema(&["reap", "record_terminalization", "custody_release", "disposable_delete", "crash_reports_delete", "custody_held", crate::browser_session::BROWSER_SESSION_LOCK_STAGE]),
             "failed_signals":string_array_schema(),
         }),
     )
@@ -6833,6 +6872,208 @@ mod tests {
                 json!({"vendor":"cloudflare","evidence":"cf-mitigated: challenge"}),
             );
         assert!(validate_browser_result(NAVIGATE, &present).is_ok());
+    }
+
+    #[test]
+    fn every_browser_vocabulary_accepts_bounded_call_shapes() {
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+        for definition in browser_tool_definitions() {
+            for step in [
+                "admission",
+                "queue",
+                "consent",
+                "preflight",
+                "dispatch",
+                "release",
+            ] {
+                let mut replies = vec![
+                    json!({"outcome":"action_deadline_exceeded","detail":{"dispatched":false,"step":step}}),
+                    json!({"outcome":"target_busy","detail":{"reason":"held_input_unconfirmed","dispatched":false,"step":step,"call":"browser.type","held_state":"unknown"},"remedy":"retry release before input"}),
+                    json!({"outcome":"blocking_capacity_exhausted","detail":{"dispatched":false,"step":step,"call":"session operation"}}),
+                ];
+                for reason in [
+                    "action_deadline_exceeded",
+                    "cancelled",
+                    "route_closed",
+                    "module_draining",
+                ] {
+                    for held_state in ["none_held", "released", "unknown"] {
+                        replies.push(json!({
+                            "outcome":"dispatch_outcome_unknown",
+                            "effect_status":"effect_indeterminate",
+                            "detail":{"reason":reason,"dispatched":true,"step":step,"call":"Page.navigate","held_state":held_state},
+                            "remedy":"read the state before retrying",
+                        }));
+                    }
+                }
+                for reply in replies {
+                    assert_eq!(
+                        plane
+                            .finish_reply(definition.name, reply.clone())
+                            .unwrap_or_else(|error| panic!(
+                                "{} was withheld: {error}",
+                                definition.name
+                            )),
+                        reply
+                    );
+                }
+            }
+            let reason =
+                json!({"outcome":"target_busy","detail":{"reason":"legacy_free_form_reason"}});
+            assert_eq!(
+                plane.finish_reply(definition.name, reason.clone()).unwrap(),
+                reason
+            );
+        }
+        assert!(plane.result_schema_findings().is_empty());
+    }
+
+    #[test]
+    fn bounded_browser_vocabulary_is_closed_and_preserves_legacy_contracts() {
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+        for definition in browser_tool_definitions() {
+            for (field, value) in [
+                ("dispatched", json!("false")),
+                ("step", json!("settle")),
+                ("step", json!("egress")),
+                ("call", json!(true)),
+                ("held_state", json!("held")),
+                ("reason", json!(false)),
+                ("misspelled_field", json!(true)),
+            ] {
+                let mut reply = json!({"outcome":"dispatch_outcome_unknown", "effect_status":"effect_indeterminate", "detail":{}});
+                reply["detail"][field] = value;
+                assert!(
+                    plane.finish_reply(definition.name, reply).is_err(),
+                    "{} accepted invalid {field}",
+                    definition.name
+                );
+            }
+            let reply = json!({"outcome":"target_busy","detail":{},"misspelled_field":true});
+            assert!(plane.finish_reply(definition.name, reply).is_err());
+        }
+        let mut legacy = declared_navigate_reply();
+        legacy["misspelled_field"] = json!(true);
+        assert!(plane.finish_reply(NAVIGATE, legacy).is_err());
+        assert!(plane
+            .finish_reply(NAVIGATE, json!({"outcome":"ok"}))
+            .is_err());
+        let context = declared_navigate_reply()["context"].clone();
+        for (outcome, detail) in [
+            (
+                "command_timeout",
+                json!({"step":"Input.dispatchKeyEvent","command_sent":true,"reason_code":"command_deadline_expired"}),
+            ),
+            (
+                "internal_error",
+                json!({"step":"Runtime.callFunctionOn","reason_code":"cdp_failure"}),
+            ),
+            (
+                "authorization_denied",
+                json!({"reason":"legacy_free_form_reason"}),
+            ),
+        ] {
+            let legacy = json!({"outcome":outcome,"context":context,"detail":detail});
+            assert_eq!(
+                plane.finish_reply(NAVIGATE, legacy.clone()).unwrap(),
+                legacy
+            );
+        }
+    }
+
+    #[test]
+    fn browser_bounded_call_vocabulary_is_frozen() {
+        let definitions = browser_tool_definitions();
+        assert_eq!(definitions.len(), 16);
+        for definition in definitions {
+            let terminal = &definition.result_schema["anyOf"][1];
+            assert_eq!(terminal["additionalProperties"], false);
+            assert_eq!(
+                terminal["properties"]["outcome"]["enum"],
+                json!([
+                    "action_deadline_exceeded",
+                    "dispatch_outcome_unknown",
+                    "target_busy",
+                    "blocking_capacity_exhausted",
+                ])
+            );
+            let detail = &terminal["properties"]["detail"];
+            assert_eq!(detail["additionalProperties"], false);
+            assert_eq!(
+                detail["properties"]["step"]["enum"],
+                json!([
+                    "admission",
+                    "queue",
+                    "consent",
+                    "preflight",
+                    "dispatch",
+                    "release",
+                ])
+            );
+            assert_eq!(
+                detail["properties"]["held_state"]["enum"],
+                json!(["none_held", "released", "unknown"])
+            );
+            assert_eq!(detail["properties"]["reason"]["type"], "string");
+            assert!(detail["properties"]["reason"].get("enum").is_none());
+            assert_eq!(
+                terminal["properties"]["effect_status"]["enum"],
+                json!([
+                    "effect_observed",
+                    "no_effect_observed",
+                    "effect_indeterminate"
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn browser_control_stage_enums_include_custody_held() {
+        let plane =
+            BrowserPlane::new().with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+        for name in [
+            crate::browser_session::BROWSER_STATUS,
+            crate::browser_session::BROWSER_CLOSE,
+        ] {
+            let definition = browser_tool_definitions()
+                .into_iter()
+                .find(|definition| definition.name == name)
+                .unwrap();
+            assert_eq!(
+                definition.result_schema["anyOf"][0]["properties"]["stage"]["enum"],
+                json!([
+                    "reap",
+                    "record_terminalization",
+                    "custody_release",
+                    "disposable_delete",
+                    "crash_reports_delete",
+                    "custody_held",
+                    "browser_session_lock",
+                ])
+            );
+            let reply = json!({"outcome":"cleanup_failure","stage":"custody_held"});
+            assert_eq!(plane.finish_reply(name, reply.clone()).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn bounded_results_leave_advertised_browser_use_bytes_unchanged() {
+        let names = crate::tool_provider::browser_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        let tool = crate::flat_tools::browser_tool(&names).unwrap();
+        assert!(tool.schema.get("anyOf").is_none());
+        let bytes = serde_json::to_vec(
+            &json!({"name":tool.name,"description":tool.description,"input_schema":tool.schema}),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::manifest::sha256_hex(&bytes),
+            "68ed4c43212c93922a34be1e6a9088da430ffefe60c2c88441f862f4606d9643"
+        );
     }
 
     /// A composite keyword on the WRONG composite type is refused, not ignored.

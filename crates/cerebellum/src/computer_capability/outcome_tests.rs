@@ -75,7 +75,67 @@ const COMMON_OUTCOMES: &[&str] = &[
     "no_running_app_named",
     "state_changed_by_person",
     "permission_missing",
+    "action_deadline_exceeded",
+    "dispatch_outcome_unknown",
+    "target_busy",
+    "blocking_capacity_exhausted",
 ];
+
+const BOUNDED_OUTCOMES: &[&str] = &[
+    "action_deadline_exceeded",
+    "dispatch_outcome_unknown",
+    "target_busy",
+    "blocking_capacity_exhausted",
+];
+
+fn bounded_call_replies() -> Vec<Value> {
+    let mut replies = Vec::new();
+    for step in [
+        "admission",
+        "queue",
+        "consent",
+        "preflight",
+        "dispatch",
+        "release",
+    ] {
+        replies.push(json!({
+            "outcome":"action_deadline_exceeded",
+            "detail":{"dispatched":false,"step":step},
+        }));
+        for reason in [
+            "action_deadline_exceeded",
+            "cancelled",
+            "route_closed",
+            "module_draining",
+        ] {
+            for held_state in ["none_held", "released", "unknown"] {
+                replies.push(json!({
+                    "outcome":"dispatch_outcome_unknown",
+                    "effect_status":"effect_indeterminate",
+                    "detail":{"reason":reason,"dispatched":true,"step":step,
+                        "call":"Input.dispatchKeyEvent","held_state":held_state},
+                    "remedy":"read the state before retrying",
+                }));
+            }
+        }
+        replies.push(json!({
+            "outcome":"target_busy",
+            "detail":{"reason":"held_input_unconfirmed","dispatched":false,
+                "step":step,"call":"computer.keys","held_state":"unknown"},
+            "remedy":"held input could not be confirmed released; the next input action retries the release first",
+        }));
+        replies.push(json!({
+            "outcome":"target_busy",
+            "detail":{"dispatched":false,"step":step,"call":"stuck action"},
+            "remedy":"retry later or check the app",
+        }));
+        replies.push(json!({
+            "outcome":"blocking_capacity_exhausted",
+            "detail":{"dispatched":false,"step":step,"call":"target resolution"},
+        }));
+    }
+    replies
+}
 
 fn dispatch_refusals() -> Vec<DispatchError> {
     use DispatchError::*;
@@ -282,10 +342,41 @@ fn check_outcomes(capability: ComputerCapability, additional: &[&str]) {
     .unwrap();
     let plane: ComputerPlane<InMemoryCaptureBackend, _, _, _> =
         ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::Withhold);
-    let expected: BTreeSet<_> = COMMON_OUTCOMES.iter().chain(additional).copied().collect();
+    let synthetic = matches!(
+        capability,
+        ComputerCapability::Type | ComputerCapability::Keys
+    );
+    let expected: BTreeSet<_> = if synthetic {
+        COMMON_OUTCOMES
+    } else {
+        BOUNDED_OUTCOMES
+    }
+    .iter()
+    .chain(additional)
+    .copied()
+    .collect();
     let mut observed = BTreeSet::new();
-    for reply in replies(capability) {
-        let reply = synthetic_wire_envelope(reply);
+    let mut cases = if synthetic {
+        replies(capability)
+    } else {
+        Vec::new()
+    };
+    cases.extend(bounded_call_replies());
+    for reply in cases {
+        let detail = reply.get("detail").cloned();
+        let bounded = BOUNDED_OUTCOMES.contains(&reply["outcome"].as_str().unwrap_or(""));
+        let reply = if synthetic {
+            synthetic_wire_envelope(reply)
+        } else {
+            reply
+        };
+        if bounded {
+            assert_eq!(
+                reply.get("detail"),
+                detail.as_ref(),
+                "bounded evidence was lost"
+            );
+        }
         let outcome = reply["outcome"].as_str().unwrap().to_owned();
         assert!(
             expected.contains(outcome.as_str()),
@@ -320,13 +411,130 @@ fn check_outcomes(capability: ComputerCapability, additional: &[&str]) {
         .iter()
         .map(|word| word.as_str().unwrap())
         .collect();
-    assert_eq!(declared, expected);
-    assert!(plane
-        .finish_reply(
+    if synthetic {
+        assert_eq!(declared, expected);
+    } else {
+        assert!(
+            expected.is_subset(&declared),
+            "{} omits bounded outcomes",
+            capability.capability_id()
+        );
+    }
+    let properties = &row["result_schema"]["properties"];
+    assert_eq!(
+        properties["detail"]["properties"]["step"]["enum"],
+        json!([
+            "admission",
+            "queue",
+            "consent",
+            "preflight",
+            "dispatch",
+            "release",
+        ])
+    );
+    assert_eq!(
+        properties["detail"]["properties"]["held_state"]["enum"],
+        json!(["none_held", "released", "unknown"])
+    );
+    assert_eq!(
+        properties["detail"]["properties"]["dispatched"]["type"],
+        "boolean"
+    );
+    assert_eq!(properties["detail"]["properties"]["call"]["type"], "string");
+    assert_eq!(
+        properties["effect_status"]["enum"],
+        if synthetic {
+            json!([
+                "effect_observed",
+                "no_effect_observed",
+                "effect_indeterminate",
+                "not_dispatched"
+            ])
+        } else {
+            json!([
+                "effect_observed",
+                "no_effect_observed",
+                "effect_indeterminate"
+            ])
+        }
+    );
+    assert_eq!(
+        row["result_schema"]["properties"]["detail"]["properties"]["reason"]["type"],
+        "string"
+    );
+    assert!(
+        row["result_schema"]["properties"]["detail"]["properties"]["reason"]
+            .get("enum")
+            .is_none()
+    );
+    for reason in [
+        "input_seen",
+        "window_list_unavailable",
+        "legacy_free_form_reason",
+    ] {
+        let mut legacy = json!({"outcome":"invalid_request", "detail":{"reason":reason}});
+        if synthetic {
+            legacy = synthetic_wire_envelope(legacy);
+            legacy["detail"] = json!({"reason":reason});
+        }
+        assert_eq!(
+            plane.finish_reply(capability, legacy.clone()).unwrap(),
+            legacy
+        );
+    }
+    for status in [
+        "effect_observed",
+        "no_effect_observed",
+        "effect_indeterminate",
+    ] {
+        let mut reply = json!({"outcome":"action_deadline_exceeded", "effect_status":status,
+            "detail":{"dispatched":false,"step":"preflight"}});
+        if synthetic {
+            reply = synthetic_wire_envelope(reply);
+        }
+        assert_eq!(
+            plane.finish_reply(capability, reply.clone()).unwrap(),
+            reply
+        );
+    }
+    for (field, invalid) in [
+        ("dispatched", json!("false")),
+        ("step", json!("settle")),
+        ("step", json!("egress")),
+        ("call", json!(true)),
+        ("held_state", json!("held")),
+        ("reason", json!(false)),
+    ] {
+        let mut malformed = json!({"outcome":"dispatch_outcome_unknown", "effect_status":"effect_indeterminate", "detail":{}});
+        if synthetic {
+            malformed = synthetic_wire_envelope(malformed);
+        }
+        malformed["detail"][field] = invalid;
+        assert!(
+            plane.finish_reply(capability, malformed).is_err(),
+            "{} accepted invalid {field}",
+            capability.capability_id()
+        );
+    }
+    let unlisted = json!({"outcome": "unlisted_outcome"});
+    let unlisted = if synthetic {
+        synthetic_wire_envelope(unlisted)
+    } else {
+        unlisted
+    };
+    assert!(plane.finish_reply(capability, unlisted).is_err());
+}
+
+#[test]
+fn every_computer_capability_accepts_bounded_call_shapes() {
+    for capability in ComputerCapability::ALL {
+        if !matches!(
             capability,
-            synthetic_wire_envelope(json!({"outcome": "unlisted_outcome"}))
-        )
-        .is_err());
+            ComputerCapability::Type | ComputerCapability::Keys
+        ) {
+            check_outcomes(capability, &[]);
+        }
+    }
 }
 
 #[test]
