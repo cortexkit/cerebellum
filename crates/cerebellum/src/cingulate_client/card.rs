@@ -51,10 +51,13 @@ pub enum CardKind {
     ProfileReidentification,
     /// A browser profile stuck in launch recovery, to be cleared.
     StuckProfileClearance,
+    /// Access to one site in the person's own signed-in browser, asked while
+    /// the call is held and never left open after it.
+    UserBrowserSite,
 }
 
 impl CardKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::WebsiteAccessInCall,
         Self::WebsiteAccessInAdvance,
         Self::AppControl,
@@ -63,6 +66,7 @@ impl CardKind {
         Self::LoginCapture,
         Self::ProfileReidentification,
         Self::StuckProfileClearance,
+        Self::UserBrowserSite,
     ];
 
     /// Whether an approval of this card is consumed once rather than becoming

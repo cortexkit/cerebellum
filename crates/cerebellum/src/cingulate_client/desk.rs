@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::card::{CardKind, CardRequest};
-use super::live_call::{LiveCall, SessionKey};
+use super::live_call::{LiveCall, NotLive, SessionKey};
 use super::route::{CallError, CingulateOpener, CingulateRoute};
 use super::wire::{self, CardState, Execution, Record, RefusalCode};
 
@@ -59,14 +59,98 @@ pub enum Ending {
     DeliveryFailed,
     /// Cerebellum withdrew the card.
     Withdrawn,
+    /// No card could be raised for this call at all, for a reason that is
+    /// not about Cingulate or the person: see [`NoCard`].
+    NoCard(NoCard),
 }
 
+/// Why no card can be raised for a call. Each is one row of the
+/// `consent_unavailable` reply the flows give, with its own reason and
+/// remedy, and in none of them is a route to Cingulate used to ask anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCard {
+    /// The call came from no agent session that could raise a card: an
+    /// unscoped route (every operator `direct` route), a scope naming no
+    /// agent, or a caller the session admission does not admit.
+    NoAgentSession,
+    /// The daemon refused the route because core does not list cerebellum
+    /// as a carrier of the agent's session scope (`scope_not_carrier`).
+    NotACarrier,
+    /// The daemon refused the route because the session's scope has ended
+    /// (`scope_ended`).
+    ScopeEnded,
+    /// The registry of raised cards on disk is newer than this build reads,
+    /// or damaged. Raising a card would mean saving over it, so none is
+    /// raised.
+    RegistryUnreadable,
+    /// The call is no longer held: its reply was already decided or its
+    /// route unbound, so there is nobody to reply to.
+    CallEnded,
+}
+
+impl NoCard {
+    /// The reason for a call that `LiveCall` refused ([`NotLive`]): an
+    /// unscoped call or one naming no agent has no agent session to raise
+    /// the card for, and an ended call has nobody to reply to.
+    pub fn of_not_live(not_live: NotLive) -> Self {
+        match not_live {
+            NotLive::Unscoped | NotLive::NoAgent => Self::NoAgentSession,
+            NotLive::CallEnded => Self::CallEnded,
+        }
+    }
+
+    /// The `reason` the reply carries. `None` for [`NoCard::CallEnded`],
+    /// whose call sends no reply about the card.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::NoAgentSession => Some("no_agent_session"),
+            Self::NotACarrier => Some("not_a_carrier"),
+            Self::ScopeEnded => Some("scope_ended"),
+            Self::RegistryUnreadable => Some("consent_registry_unreadable"),
+            Self::CallEnded => None,
+        }
+    }
+
+    /// What the agent can do about it. `None` for [`NoCard::CallEnded`].
+    pub fn remedy(self) -> Option<&'static str> {
+        match self {
+            Self::NoAgentSession => {
+                Some("call from the agent session that needs the permission; it can raise the card")
+            }
+            Self::NotACarrier => {
+                Some("the agent session does not list cerebellum as a carrier; restart the session")
+            }
+            Self::ScopeEnded => Some("this session has ended; call from the current session"),
+            Self::RegistryUnreadable => {
+                Some("the consent registry file is newer or damaged; update cerebellum")
+            }
+            Self::CallEnded => None,
+        }
+    }
+}
+
+/// The daemon's refusal codes for opening the route to Cingulate that mean
+/// no card can be raised in this session at all, so they map to their own
+/// [`NoCard`] reason instead of a retryable delivery failure. Any other
+/// refusal of the open is a delivery failure.
+const OPEN_REFUSED_NOT_CARRIER: &str = "scope_not_carrier";
+const OPEN_REFUSED_SCOPE_ENDED: &str = "scope_ended";
+
 impl Ending {
-    /// The ending a refusal of `consent.request`, `consent.await` or
-    /// `consent.get` stands for.
+    /// The ending a failed call to Cingulate stands for: a refusal of
+    /// `consent.request`, `consent.await`, `consent.get` or another method,
+    /// a refused or failed route open, or a call that could not open one.
     pub fn of_refusal(error: &CallError) -> Self {
         match error {
-            CallError::NotLive | CallError::Transport { .. } => Self::DeliveryFailed,
+            CallError::NotLive => Self::NoCard(NoCard::CallEnded),
+            CallError::RegistryUnreadable => Self::NoCard(NoCard::RegistryUnreadable),
+            CallError::Transport { code: Some(code) } if code == OPEN_REFUSED_NOT_CARRIER => {
+                Self::NoCard(NoCard::NotACarrier)
+            }
+            CallError::Transport { code: Some(code) } if code == OPEN_REFUSED_SCOPE_ENDED => {
+                Self::NoCard(NoCard::ScopeEnded)
+            }
+            CallError::Transport { .. } => Self::DeliveryFailed,
             CallError::Refused(refusal) => match refusal.code {
                 RefusalCode::RequesterRefused
                 | RefusalCode::FailClosedRequired
@@ -111,32 +195,77 @@ impl Ending {
 }
 
 /// How a held call's wait on its card ended.
+///
+/// A settlement is only reported here, never marked applied: the flow that
+/// holds the card decides whether this call or another one (a second call
+/// joined to the same card, or the session's next-call drain) acts on it,
+/// and the one that does calls [`ConsentDesk::mark_applied`] after storing
+/// the effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InCall {
     /// The card settled while the call held it: answer in the call.
     Settled(Ending),
-    /// The call stops holding the card unsettled. `wake` says whether
-    /// Cingulate will notify the agent when it settles: true only when the
-    /// card was detached.
-    Pending { ask_id: String, wake: bool },
-    /// The call was cancelled while it waited; the card was withdrawn.
+    /// The call stops holding the card unsettled. The card was detached, so
+    /// Cingulate notifies the agent when it settles, and the session's next
+    /// call applies the answer.
+    Pending { ask_id: String },
+    /// The call was cancelled while it waited; the card was detached or
+    /// withdrawn as the cancel asked (see [`LetGo`]).
     Cancelled,
     /// The call's route unbound while it waited; the card was withdrawn.
     RouteClosed,
+}
+
+/// What a cancelled call does with the card it holds, chosen by whoever
+/// cancels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LetGo {
+    /// The conversation is still bound, so the agent may still want the
+    /// answer: the card is detached and stays answerable, and its answer
+    /// reaches the agent as a late answer.
+    Detach,
+    /// Nobody is left to want the answer (the conversation is gone, the
+    /// session said goodbye, or the module is draining): the card is
+    /// withdrawn.
+    Withdraw,
 }
 
 /// What `consent.detach` did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detach {
     /// The card is pending and now detached: a later settlement produces a
-    /// notice to the agent.
+    /// notice to the agent. Detaching an already detached card says the same.
     Detached(Record),
     /// The card had already settled; no notice will ever be sent for it.
     AlreadySettled(Record),
-    /// The consent module does not know `consent.detach` yet (it answered
-    /// `unknown_method`). The card stays open but was never detached, so no
-    /// notice will come for it.
+    /// The card stays open but was not detached (the consent module answered
+    /// `unknown_method`, or a pending record without the detached mark), so
+    /// no notice would come for it. Callers withdraw such a card and end the
+    /// call as [`Ending::DeliveryFailed`]: there is no way to promise the
+    /// agent its answer.
     NotDetached,
+}
+
+impl Detach {
+    /// What a `consent.detach` reply says, read as the parsed record or the
+    /// failure of the call.
+    pub fn of_reply(reply: Result<Record, CallError>) -> Result<Self, Ending> {
+        match reply {
+            Ok(record) if record.is_settled() => Ok(Self::AlreadySettled(record)),
+            Ok(record) if record.detached => Ok(Self::Detached(record)),
+            // A pending record without `detached: true` means Cingulate did
+            // not detach the card, so the agent cannot be promised the notice
+            // Cingulate sends when a detached card settles.
+            Ok(_) => Ok(Self::NotDetached),
+            // A consent module that does not implement `consent.detach`
+            // refuses it as an unknown method: the card stays open, not
+            // detached.
+            Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::UnknownMethod => {
+                Ok(Self::NotDetached)
+            }
+            Err(error) => Err(Ending::of_refusal(&error)),
+        }
+    }
 }
 
 /// A card cerebellum raised, remembered until its settlement has been applied
@@ -159,36 +288,147 @@ pub struct RaisedCard {
 
 /// Where the registry of raised cards is kept across restarts.
 pub trait RegistryStore: Send + Sync {
-    fn load(&self) -> Vec<RaisedCard>;
+    /// Read the whole registry. A registry never written reads as empty. An
+    /// error means the stored registry exists but cannot be read (a newer
+    /// version, or damaged); the desk then raises no cards and never saves
+    /// over it.
+    fn load(&self) -> Result<Vec<RaisedCard>, String>;
     /// Store the whole registry. An error means the change may not survive
     /// a restart, so nothing that depends on it is acknowledged.
     fn save(&self, cards: &[RaisedCard]) -> Result<(), String>;
 }
 
+/// The registry file's name under the module's journal directory.
+pub const CINGULATE_RAISED_FILE: &str = "cingulate_raised.json";
+
+/// The highest registry file version this build reads, and the one it
+/// writes.
+pub const CINGULATE_RAISED_VERSION: u64 = 1;
+
+/// The registry file's durable format (name and version). Every format this
+/// module writes is recorded in the operator's format-floor file before its
+/// first write; installing a new build compares the floors against what that
+/// build can read (`durable_formats::readable_formats`) and refuses a build
+/// that could not read a file already on disk.
+pub const CINGULATE_RAISED_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new("cingulate-raised", CINGULATE_RAISED_VERSION);
+
+/// The registry file's contents: its version, read before anything else so
+/// a file from a newer build is refused rather than misread.
+#[derive(Serialize, Deserialize)]
+struct RegistryFile {
+    version: u64,
+    cards: Vec<RaisedCard>,
+}
+
 /// The registry in one JSON file, replaced atomically on every save.
 pub struct FileRegistryStore {
     path: std::path::PathBuf,
+    floor: cerebellum_core::format_floor::FormatFloor,
 }
 
+static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl FileRegistryStore {
+    /// A registry file at `path`, raising the format floor that governs
+    /// where it is: the operator's floor under the module's data directory,
+    /// none for a file anywhere else (a test's scratch directory).
     pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+        let floor = cerebellum_core::format_floor::FormatFloor::governing(&path);
+        Self { path, floor }
+    }
+
+    /// Raise `floor` instead of the one chosen from the file's location.
+    pub fn with_format_floor(mut self, floor: cerebellum_core::format_floor::FormatFloor) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// The operator's registry, beside the audit journal.
+    pub fn production() -> Result<Self, String> {
+        cerebellum_core::journal::journal_data_path(CINGULATE_RAISED_FILE)
+            .map(Self::new)
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
 impl RegistryStore for FileRegistryStore {
-    fn load(&self) -> Vec<RaisedCard> {
-        std::fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    fn load(&self) -> Result<Vec<RaisedCard>, String> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            // Never written: no card has been raised on this machine.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or("the registry file has no version")?;
+        if !(1..=CINGULATE_RAISED_VERSION).contains(&version) {
+            return Err(format!(
+                "the registry file is version {version}; this build reads up to {CINGULATE_RAISED_VERSION}"
+            ));
+        }
+        let file: RegistryFile =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        Ok(file.cards)
     }
 
     fn save(&self, cards: &[RaisedCard]) -> Result<(), String> {
-        let bytes = serde_json::to_vec(cards).map_err(|error| error.to_string())?;
-        let partial = self.path.with_extension("partial");
-        std::fs::write(&partial, bytes).map_err(|error| error.to_string())?;
-        std::fs::rename(&partial, &self.path).map_err(|error| error.to_string())
+        use std::io::Write;
+
+        // The format floor is raised here, before the first write, not at
+        // startup: until a card is raised no file in this format exists, so
+        // rolling back to a build without it stays a plain binary swap. Once
+        // the file is written, the floor must record its format, or the
+        // install-time check could accept a build that cannot read it.
+        self.floor
+            .raise(CINGULATE_RAISED_FORMAT)
+            .map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&RegistryFile {
+            version: CINGULATE_RAISED_VERSION,
+            cards: cards.to_vec(),
+        })
+        .map_err(|error| error.to_string())?;
+        let directory = self
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        cerebellum_core::private_fs::create_dir_all(&directory)
+            .map_err(|error| error.to_string())?;
+        let file_name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| CINGULATE_RAISED_FILE.to_string());
+        let temporary = directory.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Written beside the target and renamed over it, so a crash mid-write
+        // leaves either the old registry or the new one, never half of one.
+        let written = (|| {
+            let mut file = cerebellum_core::private_fs::create_new_file(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &self.path)?;
+            if let Ok(directory) = std::fs::File::open(&directory) {
+                let _ = directory.sync_all();
+            }
+            Ok::<(), std::io::Error>(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        written.map_err(|error| error.to_string())
     }
 }
 
@@ -197,11 +437,26 @@ impl RegistryStore for FileRegistryStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyFailed(pub String);
 
+/// What applying one settlement from the answers feed did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apply {
+    /// The effect is stored.
+    Applied,
+    /// The flow holds no record that could carry the effect (it was kept
+    /// only in memory and lost in a restart), so nothing was done. The
+    /// settlement is still acknowledged, so it is not read again, and no
+    /// grant is ever made from it.
+    NoRecord,
+}
+
 /// What one pass over the answers feed did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrainReport {
     /// Settlements applied in this pass, by elicitation id.
     pub applied: Vec<String>,
+    /// Settlements of this session's cards that the flow had no record for
+    /// ([`Apply::NoRecord`]): acknowledged without any effect.
+    pub without_effect: Vec<String>,
     /// Settlements of cards cerebellum did not raise on this session, which
     /// were not applied.
     pub ignored: Vec<String>,
@@ -223,6 +478,10 @@ struct SingleUse {
 pub struct ConsentDesk {
     opener: Arc<dyn CingulateOpener>,
     store: Option<Arc<dyn RegistryStore>>,
+    /// False when the stored registry could not be read at startup. The desk
+    /// then opens no route, raises no card, and never saves, so the file it
+    /// could not read is left exactly as it was for a build that can.
+    readable: bool,
     registry: Mutex<HashMap<String, RaisedCard>>,
     single_use: Mutex<SingleUse>,
 }
@@ -239,21 +498,30 @@ impl ConsentDesk {
         Self {
             opener,
             store: None,
+            readable: true,
             registry: Mutex::new(HashMap::new()),
             single_use: Mutex::new(SingleUse::default()),
         }
     }
 
-    /// A desk whose registry is loaded from, and saved to, `store`.
+    /// A desk whose registry is loaded from, and saved to, `store`. When the
+    /// stored registry cannot be read, the desk is unusable: every
+    /// [`ConsentDesk::session`] returns `CallError::RegistryUnreadable`.
     pub fn with_store(opener: Arc<dyn CingulateOpener>, store: Arc<dyn RegistryStore>) -> Self {
-        let cards = store
-            .load()
-            .into_iter()
-            .map(|card| (card.elicitation_id.clone(), card))
-            .collect();
+        let (readable, cards) = match store.load() {
+            Ok(cards) => (
+                true,
+                cards
+                    .into_iter()
+                    .map(|card| (card.elicitation_id.clone(), card))
+                    .collect(),
+            ),
+            Err(_) => (false, HashMap::new()),
+        };
         Self {
             opener,
             store: Some(store),
+            readable,
             registry: Mutex::new(cards),
             single_use: Mutex::new(SingleUse::default()),
         }
@@ -266,9 +534,16 @@ impl ConsentDesk {
     /// cerebellum as a carrier of the agent's session scope (allowed to open
     /// routes to Cingulate under it), and that permission exists for calls the
     /// agent is making, not for cerebellum acting on its own.
+    ///
+    /// Returns `CallError::RegistryUnreadable` without opening anything when
+    /// the stored registry could not be read: a card raised now could not be
+    /// remembered without saving over that file.
     pub async fn session<'a>(&'a self, live: &'a LiveCall) -> Result<DeskSession<'a>, CallError> {
         if !live.is_held() {
             return Err(CallError::NotLive);
+        }
+        if !self.readable {
+            return Err(CallError::RegistryUnreadable);
         }
         let route = self.opener.open(live).await?;
         Ok(DeskSession {
@@ -292,6 +567,17 @@ impl ConsentDesk {
             .cloned()
     }
 
+    /// Every card this session raised whose settlement has not been applied,
+    /// in no particular order. A session with none has nothing to read from
+    /// the answers feed, so its call need not open a route to Cingulate.
+    pub fn unapplied(&self, session: &SessionKey) -> Vec<RaisedCard> {
+        lock(&self.registry)
+            .values()
+            .filter(|card| !card.applied && card.session == *session)
+            .cloned()
+            .collect()
+    }
+
     /// Take, at most once, the single-use approval `drain_answers` recorded
     /// for `subject` on this session after the raising call had stopped
     /// waiting. Returns the card's elicitation id, which the calling retry
@@ -311,6 +597,10 @@ impl ConsentDesk {
     }
 
     fn save(&self) -> Result<(), String> {
+        if !self.readable {
+            // Never save over a registry this build could not read.
+            return Err("the stored registry could not be read; it is not overwritten".into());
+        }
         let Some(store) = &self.store else {
             return Ok(());
         };
@@ -318,11 +608,22 @@ impl ConsentDesk {
         store.save(&cards)
     }
 
-    fn mark_applied(&self, elicitation_id: &str) -> Result<(), String> {
-        if let Some(card) = lock(&self.registry).get_mut(elicitation_id) {
-            card.applied = true;
-        }
-        self.save()
+    /// Record that `elicitation_id`'s settlement has been acted on and its
+    /// effect stored, then store the registry.
+    ///
+    /// Returns whether this call is the one that marked it: `Ok(false)` when
+    /// it was already marked, or is not a card this desk holds. An error
+    /// means the registry could not be stored, so the mark may not survive a
+    /// restart and nothing that depends on it may be acknowledged.
+    pub fn mark_applied(&self, elicitation_id: &str) -> Result<bool, String> {
+        let flipped = match lock(&self.registry).get_mut(elicitation_id) {
+            Some(card) if !card.applied => {
+                card.applied = true;
+                true
+            }
+            _ => false,
+        };
+        self.save().map(|()| flipped)
     }
 
     fn forget(&self, ids: &[String]) {
@@ -341,6 +642,13 @@ pub struct DeskSession<'a> {
     desk: &'a ConsentDesk,
     live: &'a LiveCall,
     route: Box<dyn CingulateRoute>,
+}
+
+/// What ended a held call's wait on its card.
+enum Woke<C> {
+    Read(Result<Record, CallError>),
+    Cancelled(C),
+    RouteClosed,
 }
 
 impl DeskSession<'_> {
@@ -383,53 +691,84 @@ impl DeskSession<'_> {
         Ok(elicitation_id)
     }
 
-    /// Hold the call on the card for at most `park`, then either answer in
-    /// the call or detach the card and report it pending.
+    /// Raise `card` about `subject`, then detach it at once, without waiting
+    /// on it: for cards asked ahead, whose call replies `consent_pending`
+    /// straight away. Returns the elicitation id, the ask id the agent is
+    /// given. The answer reaches the agent through Cingulate's notice and is
+    /// applied on the session's next call.
     ///
-    /// `cancelled` resolves when the caller cancels the call. The route the
-    /// call arrived on is watched too. Either ending withdraws the card,
-    /// since nobody is left to want its answer from this call.
-    ///
-    /// A settlement returned here is the call's to apply before it replies;
-    /// the registry marks it applied so the answers feed does not apply it a
-    /// second time.
-    pub async fn park(
+    /// A card that could not be detached is withdrawn and the call ends
+    /// [`Ending::DeliveryFailed`], since nothing would tell the agent it was
+    /// answered. A card already settled by the time of the detach is returned
+    /// like a detached one: its settlement waits in the answers feed for the
+    /// next call.
+    pub async fn raise_detached(
+        &mut self,
+        card: CardRequest,
+        subject: &str,
+    ) -> Result<String, Ending> {
+        let elicitation_id = self.raise(card, subject).await?;
+        match self.detach_or_withdraw(&elicitation_id).await? {
+            Detach::Detached(_) | Detach::AlreadySettled(_) => Ok(elicitation_id),
+            Detach::NotDetached => Err(Ending::DeliveryFailed),
+        }
+    }
+
+    /// Wait on `elicitation_id` for at most `wait`, while also watching for
+    /// the caller's cancellation and for the route the call arrived on
+    /// unbinding.
+    async fn wait_on<C>(
         &mut self,
         elicitation_id: &str,
-        park: Duration,
-        cancelled: impl Future<Output = ()>,
-    ) -> InCall {
-        let Some(card) = self.desk.raised(elicitation_id) else {
-            // Never wait on, and never act on, a card this desk did not raise.
-            // Being asked to is a defect on this side.
-            return InCall::Settled(Ending::DeliveryFailed);
-        };
+        wait: Duration,
+        cancelled: impl Future<Output = C>,
+    ) -> Woke<C> {
         let live = self.live;
         let route_closed = async {
             while live.is_held() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        let timeout_ms = u64::try_from(park.as_millis()).unwrap_or(u64::MAX);
-        enum Woke {
-            Read(Result<Record, CallError>),
-            Cancelled,
-            RouteClosed,
+        let timeout_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let waiting = self.record(
+            wire::CONSENT_AWAIT,
+            wire::await_params(elicitation_id, timeout_ms),
+        );
+        tokio::select! {
+            read = waiting => Woke::Read(read),
+            cancel = cancelled => Woke::Cancelled(cancel),
+            () = route_closed => Woke::RouteClosed,
         }
-        let woke = {
-            let waiting = self.record(
-                wire::CONSENT_AWAIT,
-                wire::await_params(elicitation_id, timeout_ms),
-            );
-            tokio::select! {
-                read = waiting => Woke::Read(read),
-                () = cancelled => Woke::Cancelled,
-                () = route_closed => Woke::RouteClosed,
-            }
+    }
+
+    /// Hold the call on the card for at most `park`, then either answer in
+    /// the call or detach the card and report it pending.
+    ///
+    /// `cancelled` resolves when the caller cancels the call, saying whether
+    /// the card is detached or withdrawn ([`LetGo`]). The route the call
+    /// arrived on is watched too; its unbinding withdraws the card.
+    ///
+    /// A settlement returned here is not marked applied: the caller marks it
+    /// with [`ConsentDesk::mark_applied`] once it has stored the effect, and
+    /// only if it is the one that acts on it.
+    pub async fn park(
+        &mut self,
+        elicitation_id: &str,
+        park: Duration,
+        cancelled: impl Future<Output = LetGo>,
+    ) -> InCall {
+        let Some(card) = self.desk.raised(elicitation_id) else {
+            // Never wait on, and never act on, a card this desk did not raise.
+            // Being asked to is a defect on this side.
+            return InCall::Settled(Ending::DeliveryFailed);
         };
-        let read = match woke {
+        let read = match self.wait_on(elicitation_id, park, cancelled).await {
             Woke::Read(read) => read,
-            Woke::Cancelled => {
+            Woke::Cancelled(LetGo::Detach) => {
+                let _ = self.detach_or_withdraw(elicitation_id).await;
+                return InCall::Cancelled;
+            }
+            Woke::Cancelled(LetGo::Withdraw) => {
                 let _ = self.withdraw(elicitation_id).await;
                 return InCall::Cancelled;
             }
@@ -443,25 +782,57 @@ impl DeskSession<'_> {
             Err(error) => return InCall::Settled(Ending::of_refusal(&error)),
         };
         if let Some(ending) = Ending::of_record(&record, &card) {
-            let _ = self.desk.mark_applied(elicitation_id);
             return InCall::Settled(ending);
         }
-        match self.detach(elicitation_id).await {
+        match self.detach_or_withdraw(elicitation_id).await {
             Ok(Detach::Detached(_)) => InCall::Pending {
                 ask_id: elicitation_id.to_string(),
-                wake: true,
             },
             Ok(Detach::AlreadySettled(record)) => {
-                let ending = Ending::of_record(&record, &card).unwrap_or(Ending::NoAnswer);
-                let _ = self.desk.mark_applied(elicitation_id);
-                InCall::Settled(ending)
+                InCall::Settled(Ending::of_record(&record, &card).unwrap_or(Ending::NoAnswer))
             }
-            Ok(Detach::NotDetached) => InCall::Pending {
-                ask_id: elicitation_id.to_string(),
-                wake: false,
-            },
+            Ok(Detach::NotDetached) => InCall::Settled(Ending::DeliveryFailed),
             Err(ending) => InCall::Settled(ending),
         }
+    }
+
+    /// Hold the call on the card for at most `wait` and never detach it: for
+    /// a card whose answer is wanted only by this call (the user-browser site
+    /// card, which expires as the wait ends).
+    ///
+    /// An answer is returned as [`InCall::Settled`] and left for the caller
+    /// to mark applied, as with [`DeskSession::park`]. Anything else (the
+    /// card still pending or expired when the wait ends, a failed await, the
+    /// caller's cancellation, the route unbinding) withdraws the card and
+    /// then forgets it whatever the withdrawal said, an `expired` readback
+    /// included: no later call will ever act on it, so a stray record of it
+    /// in the answers feed is ignored.
+    pub async fn hold(
+        &mut self,
+        elicitation_id: &str,
+        wait: Duration,
+        cancelled: impl Future<Output = ()>,
+    ) -> InCall {
+        let Some(card) = self.desk.raised(elicitation_id) else {
+            return InCall::Settled(Ending::DeliveryFailed);
+        };
+        let unanswered = match self.wait_on(elicitation_id, wait, cancelled).await {
+            Woke::Read(Ok(record)) => match Ending::of_record(&record, &card) {
+                Some(ending @ (Ending::Granted { .. } | Ending::Declined { .. })) => {
+                    return InCall::Settled(ending)
+                }
+                Some(ending) => InCall::Settled(ending),
+                // Still pending when the wait ended: the card is about to
+                // expire, and nobody will wait on it again.
+                None => InCall::Settled(Ending::NoAnswer),
+            },
+            Woke::Read(Err(error)) => InCall::Settled(Ending::of_refusal(&error)),
+            Woke::Cancelled(()) => InCall::Cancelled,
+            Woke::RouteClosed => InCall::RouteClosed,
+        };
+        let _ = self.withdraw(elicitation_id).await;
+        self.desk.forget(&[elicitation_id.to_string()]);
+        unanswered
     }
 
     /// Mark the moment cerebellum stops holding the call on `elicitation_id`.
@@ -470,24 +841,21 @@ impl DeskSession<'_> {
     /// one of "settled while held" (returned here, to answer in the call) and
     /// "settled after detach" (notified to the agent) applies.
     pub async fn detach(&mut self, elicitation_id: &str) -> Result<Detach, Ending> {
-        match self
+        let reply = self
             .record(wire::CONSENT_DETACH, wire::id_params(elicitation_id))
-            .await
-        {
-            Ok(record) if record.is_settled() => Ok(Detach::AlreadySettled(record)),
-            Ok(record) if record.detached => Ok(Detach::Detached(record)),
-            // A pending record without `detached: true` means Cingulate did
-            // not detach the card, so the agent cannot be promised the notice
-            // Cingulate sends when a detached card settles.
-            Ok(_) => Ok(Detach::NotDetached),
-            // A consent module that does not implement `consent.detach` yet
-            // refuses it as an unknown method: the card stays open, not
-            // detached.
-            Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::UnknownMethod => {
-                Ok(Detach::NotDetached)
-            }
-            Err(error) => Err(Ending::of_refusal(&error)),
+            .await;
+        Detach::of_reply(reply)
+    }
+
+    /// Detach `elicitation_id`, and withdraw it if it could not be detached:
+    /// an open card nobody would hear the answer to must not stay on the
+    /// person's phone.
+    async fn detach_or_withdraw(&mut self, elicitation_id: &str) -> Result<Detach, Ending> {
+        let detach = self.detach(elicitation_id).await?;
+        if matches!(detach, Detach::NotDetached) {
+            let _ = self.withdraw(elicitation_id).await;
         }
+        Ok(detach)
     }
 
     pub async fn get(&mut self, elicitation_id: &str) -> Result<Record, Ending> {
@@ -498,18 +866,34 @@ impl DeskSession<'_> {
 
     /// Withdraw a card cerebellum raised. A card that already settled keeps
     /// its settlement; withdrawal never reverses an answer.
+    ///
+    /// The desk forgets the card when it is withdrawn, and when Cingulate
+    /// says it is not this session's or no longer exists
+    /// (`elicitation_not_owner`, `elicitation_not_found`): no answer to it
+    /// can ever be read, so nothing else would clear it from the registry.
     pub async fn withdraw(&mut self, elicitation_id: &str) -> Result<Record, Ending> {
-        let record = self
+        match self
             .record(wire::CONSENT_WITHDRAW, wire::id_params(elicitation_id))
             .await
-            .map_err(|error| Ending::of_refusal(&error))?;
-        // A withdrawal never appears in the answers feed, so nothing would
-        // ever clear it from the registry otherwise. A card that settled
-        // first stays, for the feed to apply.
-        if record.state == CardState::Withdrawn {
-            self.desk.forget(&[elicitation_id.to_string()]);
+        {
+            Ok(record) => {
+                // A withdrawal never appears in the answers feed, so nothing
+                // would ever clear it from the registry otherwise. A card that
+                // settled first stays, for the feed to apply.
+                if record.state == CardState::Withdrawn {
+                    self.desk.forget(&[elicitation_id.to_string()]);
+                }
+                Ok(record)
+            }
+            Err(error) => {
+                if let CallError::Refused(refusal) = &error {
+                    if matches!(refusal.code, RefusalCode::NotOwner | RefusalCode::NotFound) {
+                        self.desk.forget(&[elicitation_id.to_string()]);
+                    }
+                }
+                Err(Ending::of_refusal(&error))
+            }
         }
-        Ok(record)
     }
 
     /// Report what became of an answered card.
@@ -529,13 +913,17 @@ impl DeskSession<'_> {
     /// session raised, then acknowledge the feed.
     ///
     /// `apply` receives the card, its record and its ending, and must make
-    /// the effect durable before returning `Ok`: the feed is acknowledged
-    /// only after every applied settlement is marked in the stored registry.
-    /// A single-use card's approval is recorded here for the retry to take,
-    /// in addition to whatever `apply` does.
+    /// the effect durable before returning [`Apply::Applied`]; it returns
+    /// [`Apply::NoRecord`] when the flow holds nothing the effect could be
+    /// applied to. The feed is acknowledged only after every settlement read
+    /// is marked in the stored registry, either way. A single-use card's
+    /// (login import or capture, see `CardKind::single_use`) approval is
+    /// also recorded here, but only when it was applied, so the agent's next
+    /// call of the same tool with the same arguments can take it with
+    /// [`ConsentDesk::take_single_use_approval`] and act on it once.
     pub async fn drain_answers(
         &mut self,
-        apply: &mut (dyn FnMut(&RaisedCard, &Record, &Ending) -> Result<(), ApplyFailed> + Send),
+        apply: &mut (dyn FnMut(&RaisedCard, &Record, &Ending) -> Result<Apply, ApplyFailed> + Send),
     ) -> Result<DrainReport, Ending> {
         let mut report = DrainReport::default();
         let mut seen = Vec::new();
@@ -563,11 +951,12 @@ impl DeskSession<'_> {
                 let Some(ending) = Ending::of_record(record, &card) else {
                     continue;
                 };
-                if let Err(ApplyFailed(_)) = apply(&card, record, &ending) {
+                let applied = match apply(&card, record, &ending) {
+                    Ok(applied) => applied,
                     // Not acknowledged: the next call reads it again.
-                    return Ok(report);
-                }
-                if card.kind.single_use() {
+                    Err(ApplyFailed(_)) => return Ok(report),
+                };
+                if applied == Apply::Applied && card.kind.single_use() {
                     if let Ending::Granted { choice_id } = &ending {
                         self.desk.record_single_use_approval(&card, choice_id);
                     }
@@ -575,7 +964,10 @@ impl DeskSession<'_> {
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {
                     return Ok(report);
                 }
-                report.applied.push(card.elicitation_id.clone());
+                match applied {
+                    Apply::Applied => report.applied.push(card.elicitation_id.clone()),
+                    Apply::NoRecord => report.without_effect.push(card.elicitation_id.clone()),
+                }
             }
             match page.continuation {
                 Some(next) => since = next,
@@ -595,19 +987,13 @@ impl DeskSession<'_> {
     }
 }
 
-/// The reply a call gives when it stops holding an unsettled card.
-///
-/// Only a card that `consent.detach` detached (see [`Detach::Detached`]) is
-/// followed by Cingulate's notice to the agent when it settles, so callers
-/// pass `wake = true` only then; otherwise the reply says to call again later.
-pub fn pending_reply(ask_id: &str, wake: bool) -> Value {
-    let remedy = if wake {
-        "The person has been asked and hasn't answered yet. You'll be woken when they answer; \
-         then call this tool again with the same arguments."
-    } else {
-        "The person has been asked and hasn't answered yet. No notice will come for this card: \
-         call this tool again later with the same arguments."
-    };
+/// The reply a call gives when it stops holding an unsettled card. A card
+/// is reported pending only once `consent.detach` detached it (see
+/// [`Detach::Detached`]), so Cingulate's notice will wake the agent when it
+/// settles.
+pub fn pending_reply(ask_id: &str) -> Value {
+    let remedy = "The person has been asked and hasn't answered yet. You'll be woken when they \
+                  answer; then call this tool again with the same arguments.";
     json!({"outcome": "consent_pending", "ask_id": ask_id, "remedy": remedy})
 }
 

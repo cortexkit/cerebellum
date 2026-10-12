@@ -22,11 +22,14 @@
 //! the same cards.
 //! - [`desk`]: raising, waiting in the call, detaching, withdrawing, and
 //!   applying late answers from the answers feed.
+//! - [`subject`]: the one subject string per card kind that a card is filed
+//!   under, so a second call asking the same thing joins the open card.
 
 pub mod card;
 pub mod desk;
 pub mod live_call;
 pub mod route;
+pub mod subject;
 pub mod wire;
 
 #[cfg(test)]

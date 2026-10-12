@@ -1,0 +1,62 @@
+{
+  "default": "deny",
+  "expires_in_ms": 120000,
+  "facts": [
+    {
+      "label": "Browser",
+      "value": "Your own Chrome, signed in as you"
+    },
+    {
+      "label": "Site",
+      "value": "https://bank.example"
+    },
+    {
+      "label": "Level",
+      "value": "3"
+    },
+    {
+      "label": "Hazards",
+      "value": "credential_form_submit"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "detail": "Only this invocation, including its landing-page read.",
+      "effect": "grant",
+      "id": "allow_once",
+      "label": "Allow once"
+    },
+    {
+      "effect": "grant",
+      "id": "allow_origin_always",
+      "label": "Always on this site"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Let the agent use your own Chrome, signed in as you, on this site?",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "browser": "user",
+    "hazards": [
+      "credential_form_submit"
+    ],
+    "origins": [
+      "https://bank.example"
+    ],
+    "severity_tier": 3
+  },
+  "target": {
+    "kind": "site",
+    "label": "https://bank.example"
+  },
+  "title": "Allow access to https://bank.example?",
+  "urgency": "high"
+}

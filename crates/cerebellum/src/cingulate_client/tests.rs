@@ -13,11 +13,16 @@ use subc_protocol::Principal;
 
 use super::card::{consent_request, phone_visible, CardKind, CardRequest};
 use super::desk::{
-    pending_reply, ConsentDesk, DrainReport, Ending, InCall, RaisedCard, RegistryStore,
+    pending_reply, Apply, ConsentDesk, DrainReport, Ending, FileRegistryStore, InCall, LetGo,
+    NoCard, RaisedCard, RegistryStore, CINGULATE_RAISED_FORMAT,
 };
-use super::double::{vector, vector_result, Reply, ScriptedCingulate};
+use super::double::{
+    vector, vector_reply, vector_result, Reply, ScriptedCingulate, DETACH_PENDING, DETACH_SETTLED,
+    DETACH_WRONG_OWNER,
+};
 use super::live_call::{CallHold, LiveCall, NotLive};
 use super::route::CallError;
+use super::subject;
 use super::wire::{self, Record};
 
 // ---------------------------------------------------------------------------
@@ -113,6 +118,12 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
         };
         crate::management::launch_recovery_clear_question("clear", &preview)
     };
+    let user_browser_site = user_browser_site_card(
+        "https://bank.example",
+        3,
+        &[HazardClass::CredentialFormSubmit],
+        true,
+    );
     vec![
         (
             CardKind::WebsiteAccessInCall,
@@ -174,7 +185,65 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             clear,
             PHONE_CONSENT_DEADLINE,
         ),
+        (
+            CardKind::UserBrowserSite,
+            "user-browser-site.json",
+            user_browser_site,
+            USER_BROWSER_SITE_DEADLINE,
+        ),
     ]
+}
+
+/// How long the user-browser site card waits, as `user_browser` enforces it
+/// (its `CONSENT_DEADLINE`, which is private to that module).
+const USER_BROWSER_SITE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The site card `user_browser`'s `authorize` builds inline, written out
+/// field for field because that card has no named builder `todays_cards`
+/// could call. Its golden (`user-browser-site.json`) pins the bytes, so
+/// whatever builds it later must render exactly this card.
+fn user_browser_site_card(
+    origin: &str,
+    tier: u8,
+    hazards: &[crate::authorization::HazardClass],
+    standing: bool,
+) -> Value {
+    use crate::consent_card::*;
+    let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
+    let mut options = vec![ConsentOption::grant("allow_once", "Allow once")
+        .with_detail("Only this invocation, including its landing-page read.")];
+    if standing {
+        options.push(ConsentOption::grant(
+            "allow_origin_always",
+            "Always on this site",
+        ));
+    }
+    ConsentCard {
+        title: format!("Allow access to {origin}?"),
+        prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
+        target: Target {
+            kind: TargetKind::Site,
+            label: origin.into(),
+        },
+        facts: vec![
+            Fact::new("Browser", "Your own Chrome, signed in as you"),
+            Fact::new("Site", origin),
+            Fact::new("Level", tier.to_string()),
+            Fact::new("Hazards", hazard_names.join(", ")),
+        ],
+        grants: options,
+        decline: ConsentOption::decline("deny", "Don't allow"),
+        expires_in: USER_BROWSER_SITE_DEADLINE,
+        material_damage: true,
+        urgency: Urgency::High,
+        scope: Scope::new()
+            .with("browser", "user")
+            .with("origins", json!([origin]))
+            .with("severity_tier", tier)
+            .with("hazards", json!(hazard_names)),
+        duration: None,
+    }
+    .render("user-browser")
 }
 
 fn request_for(kind: CardKind, body: &Value, deadline: Duration) -> CardRequest {
@@ -451,10 +520,9 @@ fn pending() -> Value {
     vector_result("cerebellum-ref-await-reply.json")
 }
 
+/// Cingulate's served reply to the first `consent.detach` of a pending card.
 fn detached() -> Value {
-    let mut record = pending();
-    record["detached"] = json!(true);
-    record
+    vector_result(DETACH_PENDING)
 }
 
 fn created() -> Reply {
@@ -514,7 +582,8 @@ async fn every_card_kind_is_raised_with_cingulate() {
 
 /// An answer that lands while the call holds the card is answered in the
 /// call, after one await capped at Cingulate's `consent.await` limit of two
-/// minutes (`wire::AWAIT_CAP_MS`).
+/// minutes (`wire::AWAIT_CAP_MS`). The park does not mark it applied: the
+/// flow that acts on it does, once, after storing the effect.
 #[tokio::test]
 async fn an_answer_inside_the_park_is_answered_in_the_call() {
     let cingulate = ScriptedCingulate::new();
@@ -543,6 +612,16 @@ async fn an_answer_inside_the_park_is_answered_in_the_call() {
         vec![wire::CONSENT_REQUEST, wire::CONSENT_AWAIT],
         "an answered card is not detached"
     );
+    assert!(
+        !desk.raised("el_1").unwrap().applied,
+        "the park marked the answer applied before any flow acted on it"
+    );
+    assert_eq!(desk.mark_applied("el_1"), Ok(true));
+    assert_eq!(
+        desk.mark_applied("el_1"),
+        Ok(false),
+        "a second caller was told it marked the answer"
+    );
 }
 
 /// The call stops waiting on the card unanswered: the card is detached at
@@ -569,25 +648,29 @@ async fn an_unanswered_park_detaches_and_is_pending_with_a_wake() {
         ending,
         InCall::Pending {
             ask_id: "el_1".into(),
-            wake: true
         }
     );
     assert_eq!(cingulate.calls()[2].1, json!({"elicitation_id": "el_1"}));
-    let reply = pending_reply("el_1", true);
+    let reply = pending_reply("el_1");
     assert_eq!(reply["outcome"], "consent_pending");
     assert_eq!(reply["ask_id"], "el_1");
     assert!(reply["remedy"].as_str().unwrap().contains("woken"));
 }
 
 /// A card that settled before the detach landed is answered in the call:
-/// Cingulate will never notify the agent about it.
+/// Cingulate will never notify the agent about it. The settlement is left
+/// unmarked for the flow that acts on it.
 #[tokio::test]
 async fn a_card_settled_at_detach_is_answered_in_the_call() {
     let cingulate = ScriptedCingulate::new();
+    // Cingulate's settled-detach vector answers `el_2`.
     cingulate
-        .then(wire::CONSENT_REQUEST, created())
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id": "el_2"})),
+        )
         .then(wire::CONSENT_AWAIT, Reply::Result(pending()))
-        .then(wire::CONSENT_DETACH, Reply::Result(answered()));
+        .then(wire::CONSENT_DETACH, vector_reply(DETACH_SETTLED));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, _) = live_call("sc_head_alf");
     let mut session = desk.session(&live).await.unwrap();
@@ -605,21 +688,23 @@ async fn a_card_settled_at_detach_is_answered_in_the_call() {
         })
     );
     assert!(
-        desk.raised("el_1").unwrap().applied,
-        "the in-call answer is applied once"
+        !desk.raised("el_2").unwrap().applied,
+        "the park marked the answer applied before any flow acted on it"
     );
 }
 
-/// A consent module without `consent.detach` refuses it as an unknown
-/// method. The card stays open, but no notice will come for it, so the
-/// reply must not promise one.
+/// A card that could not be detached (the consent module refuses
+/// `consent.detach` as an unknown method) would stay open with no notice to
+/// come for it. It is withdrawn, and the call ends `DeliveryFailed` rather
+/// than reporting a pending card nobody would ever hear about.
 #[tokio::test]
-async fn an_unknown_detach_is_pending_without_a_wake() {
+async fn an_undetached_card_is_withdrawn_and_undeliverable() {
     let cingulate = ScriptedCingulate::new();
     cingulate
         .then(wire::CONSENT_REQUEST, created())
         .then(wire::CONSENT_AWAIT, Reply::Result(pending()))
-        .then(wire::CONSENT_DETACH, Reply::Refused("unknown_method"));
+        .then(wire::CONSENT_DETACH, Reply::Refused("unknown_method"))
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, _) = live_call("sc_head_alf");
     let mut session = desk.session(&live).await.unwrap();
@@ -630,19 +715,17 @@ async fn an_unknown_detach_is_pending_without_a_wake() {
     let ending = session
         .park(&id, Duration::from_secs(120), std::future::pending())
         .await;
+    assert_eq!(ending, InCall::Settled(Ending::DeliveryFailed));
     assert_eq!(
-        ending,
-        InCall::Pending {
-            ask_id: "el_1".into(),
-            wake: false
-        }
+        cingulate.methods(),
+        vec![
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_DETACH,
+            wire::CONSENT_WITHDRAW
+        ]
     );
-    let remedy = pending_reply("el_1", false)["remedy"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(!remedy.contains("woken"), "{remedy}");
-    assert!(remedy.contains("call this tool again later"), "{remedy}");
+    assert_eq!(desk.raised("el_1"), None);
 }
 
 /// A detach refusal other than `unknown_method` ends the call with its typed
@@ -667,16 +750,36 @@ async fn another_detach_refusal_is_a_typed_ending() {
     assert_eq!(ending, InCall::Settled(Ending::DeliveryFailed));
 }
 
-/// Cancelling the call withdraws its card, and the desk forgets it.
+/// A withdrawn card's record, as `consent.withdraw` reads it back.
+fn withdrawn() -> Value {
+    let mut record = pending();
+    record["state"] = json!("withdrawn");
+    record
+}
+
+/// The same card past its deadline.
+fn expired() -> Value {
+    let mut record = pending();
+    record["state"] = json!("expired");
+    record
+}
+
+/// A cancel that lands after the await is in flight, as a caller's would,
+/// asking for `let_go`.
+async fn cancel_after_a_moment(let_go: LetGo) -> LetGo {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let_go
+}
+
+/// Cancelling the call when nobody is left to want the answer withdraws its
+/// card, and the desk forgets it.
 #[tokio::test]
 async fn a_cancelled_call_withdraws_its_card() {
     let cingulate = ScriptedCingulate::new();
-    let mut withdrawn = pending();
-    withdrawn["state"] = json!("withdrawn");
     cingulate
         .then(wire::CONSENT_REQUEST, created())
         .then(wire::CONSENT_AWAIT, Reply::Hang)
-        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn));
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, _) = live_call("sc_head_alf");
     let mut session = desk.session(&live).await.unwrap();
@@ -684,12 +787,53 @@ async fn a_cancelled_call_withdraws_its_card() {
         .raise(vector_card(CardKind::AppControl), "app")
         .await
         .unwrap();
-    // The cancel lands after the await is in flight, as a caller's would.
-    let cancel = tokio::time::sleep(Duration::from_millis(20));
-    let ending = session.park(&id, Duration::from_secs(120), cancel).await;
+    let ending = session
+        .park(
+            &id,
+            Duration::from_secs(120),
+            cancel_after_a_moment(LetGo::Withdraw),
+        )
+        .await;
     assert_eq!(ending, InCall::Cancelled);
     assert_eq!(cingulate.methods()[2], wire::CONSENT_WITHDRAW);
     assert_eq!(desk.raised("el_1"), None);
+}
+
+/// Cancelling the call while its conversation is still bound detaches the
+/// card instead: it stays answerable and remembered, and its answer reaches
+/// the agent as a late answer.
+#[tokio::test]
+async fn a_cancelled_call_of_a_bound_conversation_detaches_its_card() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_AWAIT, Reply::Hang)
+        .then(wire::CONSENT_DETACH, vector_reply(DETACH_PENDING));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let id = session
+        .raise(vector_card(CardKind::AppControl), "app")
+        .await
+        .unwrap();
+    let ending = session
+        .park(
+            &id,
+            Duration::from_secs(120),
+            cancel_after_a_moment(LetGo::Detach),
+        )
+        .await;
+    assert_eq!(ending, InCall::Cancelled);
+    assert_eq!(
+        cingulate.methods(),
+        vec![
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_DETACH
+        ],
+        "a cancel of a bound conversation withdrew the card"
+    );
+    assert!(desk.raised("el_1").is_some_and(|card| !card.applied));
 }
 
 /// If the route the call arrived on closes while the call waits on the card,
@@ -697,12 +841,10 @@ async fn a_cancelled_call_withdraws_its_card() {
 #[tokio::test]
 async fn a_closed_route_withdraws_its_card() {
     let cingulate = ScriptedCingulate::new();
-    let mut withdrawn = pending();
-    withdrawn["state"] = json!("withdrawn");
     cingulate
         .then(wire::CONSENT_REQUEST, created())
         .then(wire::CONSENT_AWAIT, Reply::Hang)
-        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn));
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, hold) = live_call("sc_head_alf");
     let mut session = desk.session(&live).await.unwrap();
@@ -746,7 +888,7 @@ async fn drain(desk: &ConsentDesk, live: &LiveCall, applied: &Applied) -> DrainR
     session
         .drain_answers(&mut |card, record, ending| {
             applied.apply(card, record, ending);
-            Ok(())
+            Ok(Apply::Applied)
         })
         .await
         .unwrap()
@@ -773,10 +915,7 @@ async fn a_detached_card_settled_later_is_picked_up_on_the_next_call() {
         let ending = session
             .park(&id, Duration::from_secs(120), std::future::pending())
             .await;
-        assert!(
-            matches!(ending, InCall::Pending { wake: true, .. }),
-            "{ending:?}"
-        );
+        assert!(matches!(ending, InCall::Pending { .. }), "{ending:?}");
     }
     cingulate
         .then(
@@ -913,8 +1052,8 @@ struct MemoryStore {
 }
 
 impl RegistryStore for MemoryStore {
-    fn load(&self) -> Vec<RaisedCard> {
-        self.cards.lock().unwrap().clone()
+    fn load(&self) -> Result<Vec<RaisedCard>, String> {
+        Ok(self.cards.lock().unwrap().clone())
     }
     fn save(&self, cards: &[RaisedCard]) -> Result<(), String> {
         self.saves.fetch_add(1, Ordering::SeqCst);
@@ -989,7 +1128,7 @@ async fn a_crash_between_apply_and_ack_reapplies_once_without_duplicating() {
         "an answer marked applied was applied again"
     );
     assert!(
-        store.load().is_empty(),
+        store.load().unwrap().is_empty(),
         "the acknowledged card is still stored"
     );
 }
@@ -1055,6 +1194,99 @@ fn every_refusal_code_maps_to_its_typed_ending() {
         Ending::of_refusal(&CallError::Transport { code: None }),
         Ending::DeliveryFailed
     );
+}
+
+/// A call that cannot get a card raised for reasons that are not about
+/// Cingulate or the person ends on its own `consent_unavailable` row, never
+/// as `DeliveryFailed` ("undeliverable, retry"), which would send the agent
+/// retrying something no retry fixes.
+#[test]
+fn calls_that_cannot_raise_a_card_take_their_refusal_rows() {
+    let transport = |code: &str| CallError::Transport {
+        code: Some(code.into()),
+    };
+    for (error, expected) in [
+        (CallError::NotLive, NoCard::CallEnded),
+        (CallError::RegistryUnreadable, NoCard::RegistryUnreadable),
+        (transport("scope_not_carrier"), NoCard::NotACarrier),
+        (transport("scope_ended"), NoCard::ScopeEnded),
+    ] {
+        assert_eq!(
+            Ending::of_refusal(&error),
+            Ending::NoCard(expected),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        Ending::of_refusal(&transport("some_other_open_refusal")),
+        Ending::DeliveryFailed
+    );
+    for (not_live, expected) in [
+        (NotLive::Unscoped, NoCard::NoAgentSession),
+        (NotLive::NoAgent, NoCard::NoAgentSession),
+        (NotLive::CallEnded, NoCard::CallEnded),
+    ] {
+        assert_eq!(NoCard::of_not_live(not_live), expected, "{not_live:?}");
+    }
+    let rows: Vec<(Option<&str>, Option<&str>)> = [
+        NoCard::NoAgentSession,
+        NoCard::NotACarrier,
+        NoCard::ScopeEnded,
+        NoCard::RegistryUnreadable,
+        NoCard::CallEnded,
+    ]
+    .into_iter()
+    .map(|row| (row.reason(), row.remedy()))
+    .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("no_agent_session"),
+                Some(
+                    "call from the agent session that needs the permission; it can raise the card"
+                )
+            ),
+            (
+                Some("not_a_carrier"),
+                Some(
+                    "the agent session does not list cerebellum as a carrier; restart the session"
+                )
+            ),
+            (
+                Some("scope_ended"),
+                Some("this session has ended; call from the current session")
+            ),
+            (
+                Some("consent_registry_unreadable"),
+                Some("the consent registry file is newer or damaged; update cerebellum")
+            ),
+            (None, None),
+        ]
+    );
+}
+
+/// A daemon that refuses the route to Cingulate replies with its own code,
+/// and the call ends with that code's `NoCard` reason: `scope_not_carrier`
+/// is `NotACarrier`, `scope_ended` is `ScopeEnded`.
+#[tokio::test]
+async fn a_refused_route_open_takes_its_refusal_row() {
+    for (code, expected) in [
+        ("scope_not_carrier", NoCard::NotACarrier),
+        ("scope_ended", NoCard::ScopeEnded),
+    ] {
+        let cingulate = ScriptedCingulate::new();
+        *cingulate.refuse_open.lock().unwrap() = Some(code);
+        let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+        let (live, _) = live_call("sc_head_alf");
+        let error = desk.session(&live).await.err().unwrap();
+        assert_eq!(
+            Ending::of_refusal(&error),
+            Ending::NoCard(expected),
+            "{code}"
+        );
+        assert!(cingulate.methods().is_empty(), "{code}");
+    }
 }
 
 /// A refused raise ends as its typed ending and leaves nothing remembered.
@@ -1213,4 +1445,506 @@ async fn the_production_hold_ends_with_the_inbound_call() {
         Some(NotLive::CallEnded)
     );
     assert_eq!(cingulate.opens(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Holding a card that is never detached
+// ---------------------------------------------------------------------------
+
+/// A held card answered in the call is returned as the answer, with no
+/// detach and no withdrawal, and is left for the flow to mark applied.
+#[tokio::test]
+async fn a_held_card_answered_in_the_wait_is_the_answer() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_AWAIT, Reply::Result(answered()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let id = session
+        .raise(vector_card(CardKind::UserBrowserSite), "site")
+        .await
+        .unwrap();
+    let ending = session
+        .hold(&id, USER_BROWSER_SITE_DEADLINE, std::future::pending())
+        .await;
+    assert_eq!(
+        ending,
+        InCall::Settled(Ending::Granted {
+            choice_id: "allow_once".into()
+        })
+    );
+    assert_eq!(
+        cingulate.methods(),
+        vec![wire::CONSENT_REQUEST, wire::CONSENT_AWAIT]
+    );
+    assert!(desk.raised("el_1").is_some_and(|card| !card.applied));
+}
+
+/// A held card that expires with its wait is withdrawn and forgotten even
+/// though the withdrawal reads back `expired` rather than `withdrawn`, and it
+/// is never detached. A stray record of it in the answers feed is ignored.
+#[tokio::test]
+async fn a_held_card_that_expires_is_forgotten_and_never_detached() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_AWAIT, Reply::Result(expired()))
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(expired()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    {
+        let mut session = desk.session(&live).await.unwrap();
+        let id = session
+            .raise(vector_card(CardKind::UserBrowserSite), "site")
+            .await
+            .unwrap();
+        let ending = session
+            .hold(&id, USER_BROWSER_SITE_DEADLINE, std::future::pending())
+            .await;
+        assert_eq!(ending, InCall::Settled(Ending::NoAnswer));
+    }
+    assert_eq!(
+        cingulate.methods(),
+        vec![
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_WITHDRAW
+        ],
+        "a held card was detached"
+    );
+    assert_eq!(desk.raised("el_1"), None, "the expired card is remembered");
+    assert!(desk.unapplied(live.session()).is_empty());
+
+    cingulate
+        .then(
+            wire::CONSENT_ANSWERS,
+            Reply::Result(vector_result("cerebellum-ref-answers-reply.json")),
+        )
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"ok": true})));
+    let applied = Applied::default();
+    let report = drain(&desk, &live, &applied).await;
+    assert_eq!(report.ignored, vec!["el_1".to_string()]);
+    assert!(applied.seen().is_empty());
+}
+
+/// A held card still pending when the wait ends, or whose holding call is
+/// cancelled, is withdrawn and forgotten, even when the withdrawal itself
+/// fails.
+#[tokio::test]
+async fn a_held_card_let_go_unanswered_is_withdrawn_and_forgotten() {
+    // Still pending as the wait ends.
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_AWAIT, Reply::Result(pending()))
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let id = session
+        .raise(vector_card(CardKind::UserBrowserSite), "site")
+        .await
+        .unwrap();
+    let ending = session
+        .hold(&id, USER_BROWSER_SITE_DEADLINE, std::future::pending())
+        .await;
+    assert_eq!(ending, InCall::Settled(Ending::NoAnswer));
+    assert_eq!(desk.raised("el_1"), None);
+
+    // Cancelled, and the withdrawal fails in transit.
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_AWAIT, Reply::Hang)
+        .then(wire::CONSENT_WITHDRAW, Reply::Transport);
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let mut session = desk.session(&live).await.unwrap();
+    let id = session
+        .raise(vector_card(CardKind::UserBrowserSite), "site")
+        .await
+        .unwrap();
+    let ending = session
+        .hold(
+            &id,
+            USER_BROWSER_SITE_DEADLINE,
+            tokio::time::sleep(Duration::from_millis(20)),
+        )
+        .await;
+    assert_eq!(ending, InCall::Cancelled);
+    assert!(!cingulate
+        .methods()
+        .contains(&wire::CONSENT_DETACH.to_string()));
+    assert_eq!(desk.raised("el_1"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Cards asked ahead
+// ---------------------------------------------------------------------------
+
+/// A card asked ahead is raised and detached at once, never awaited, and
+/// remembered for the session's next call.
+#[tokio::test]
+async fn a_card_asked_ahead_is_detached_at_once_and_never_awaited() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_DETACH, vector_reply(DETACH_PENDING));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let id = session
+        .raise_detached(vector_card(CardKind::WebsiteAccessInAdvance), "site")
+        .await
+        .unwrap();
+    assert_eq!(id, "el_1");
+    assert_eq!(
+        cingulate.methods(),
+        vec![wire::CONSENT_REQUEST, wire::CONSENT_DETACH]
+    );
+    assert_eq!(cingulate.calls()[1].1, wire::id_params("el_1"));
+    assert_eq!(desk.unapplied(live.session()).len(), 1);
+}
+
+/// A card asked ahead that cannot be detached is withdrawn, and the call
+/// ends `DeliveryFailed`. A refused `consent.request` ends with that
+/// refusal's ending and no detach is attempted.
+#[tokio::test]
+async fn a_card_asked_ahead_that_cannot_be_detached_is_withdrawn() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(wire::CONSENT_DETACH, Reply::Refused("unknown_method"))
+        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let raised = session
+        .raise_detached(vector_card(CardKind::ProfileReidentification), "rebind")
+        .await;
+    assert_eq!(raised, Err(Ending::DeliveryFailed));
+    assert_eq!(
+        cingulate.methods(),
+        vec![
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_DETACH,
+            wire::CONSENT_WITHDRAW
+        ]
+    );
+    assert_eq!(desk.raised("el_1"), None);
+
+    let cingulate = ScriptedCingulate::new();
+    cingulate.then(
+        wire::CONSENT_REQUEST,
+        Reply::Refused("elicitation_requester_refused"),
+    );
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let mut session = desk.session(&live).await.unwrap();
+    let raised = session
+        .raise_detached(vector_card(CardKind::StuckProfileClearance), "clear")
+        .await;
+    assert_eq!(raised, Err(Ending::NotPutToAnyone));
+    assert_eq!(cingulate.methods(), vec![wire::CONSENT_REQUEST]);
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawal
+// ---------------------------------------------------------------------------
+
+/// A withdrawal that succeeds, or that Cingulate refuses because the card
+/// is not this session's or no longer exists, forgets the card: no answer
+/// to it can ever be read. A withdrawal that failed in transit, or was
+/// refused for another reason, keeps it.
+#[tokio::test]
+async fn a_withdrawal_refused_as_gone_forgets_the_card() {
+    for (reply, forgotten) in [
+        (vector_reply(DETACH_WRONG_OWNER), true),
+        (Reply::Refused("elicitation_not_found"), true),
+        (Reply::Result(withdrawn()), true),
+        (Reply::Transport, false),
+        (Reply::Refused("consent_unavailable"), false),
+    ] {
+        let cingulate = ScriptedCingulate::new();
+        cingulate
+            .then(wire::CONSENT_REQUEST, created())
+            .then(wire::CONSENT_WITHDRAW, reply);
+        let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+        let (live, _) = live_call("sc_head_alf");
+        let mut session = desk.session(&live).await.unwrap();
+        let id = session
+            .raise(vector_card(CardKind::AppControl), "app")
+            .await
+            .unwrap();
+        let withdrawal = session.withdraw(&id).await;
+        assert_eq!(
+            desk.raised("el_1").is_none(),
+            forgotten,
+            "withdrawal ended {withdrawal:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settlements with no record to apply to
+// ---------------------------------------------------------------------------
+
+/// A settlement the flow has no record for is acknowledged without effect:
+/// listed in `without_effect`, not in `applied`, marked so it is never read
+/// again, and, for a single-use card, never recorded as an approval.
+#[tokio::test]
+async fn a_settlement_with_no_record_is_acked_without_effect() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate
+        .then(wire::CONSENT_REQUEST, created())
+        .then(
+            wire::CONSENT_ANSWERS,
+            Reply::Result(vector_result("cerebellum-ref-answers-reply.json")),
+        )
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"ok": true})));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    session
+        .raise(vector_card(CardKind::LoginImport), "login")
+        .await
+        .unwrap();
+    let report = session
+        .drain_answers(&mut |_, _, _| Ok(Apply::NoRecord))
+        .await
+        .unwrap();
+    assert_eq!(report.without_effect, vec!["el_1".to_string()]);
+    assert!(report.applied.is_empty());
+    assert_eq!(report.acked, Some(1));
+    assert_eq!(desk.raised("el_1"), None);
+    assert_eq!(
+        desk.take_single_use_approval(live.session(), "login"),
+        None,
+        "an approval with no record was kept for a retry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The registry file
+// ---------------------------------------------------------------------------
+
+static SCRATCH_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+/// A fresh directory for one test, outside the operator's data home so the
+/// live journal and its format-floor file (the record of which durable
+/// formats are on disk) are never touched, removed when the guard drops
+/// (also after a failed assertion).
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let directory = std::env::temp_dir().join(format!(
+            "cerebellum-cingulate-raised-{name}-{}-{}",
+            std::process::id(),
+            SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        Self(directory)
+    }
+
+    fn store(&self) -> FileRegistryStore {
+        FileRegistryStore::new(self.0.join("cingulate_raised.json"))
+            .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(self.floor()))
+    }
+
+    fn floor(&self) -> std::path::PathBuf {
+        self.0.join("format-floor.json")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The registry file carries its version and survives a restart. Its format
+/// is recorded in the format-floor file when the registry is first written,
+/// not when it is merely loaded.
+#[tokio::test]
+async fn the_registry_file_is_versioned_and_survives_a_restart() {
+    let scratch = Scratch::new("restart");
+    let cingulate = ScriptedCingulate::new();
+    cingulate.then(wire::CONSENT_REQUEST, created());
+    {
+        let desk = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
+        assert!(
+            !scratch.floor().exists(),
+            "the floor was raised before anything was written"
+        );
+        let (live, _) = live_call("sc_head_alf");
+        let mut session = desk.session(&live).await.unwrap();
+        session
+            .raise(vector_card(CardKind::LoginCapture), "login")
+            .await
+            .unwrap();
+    }
+    let floor = std::fs::read_to_string(scratch.floor()).unwrap();
+    assert!(floor.contains(CINGULATE_RAISED_FORMAT.name), "{floor}");
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(scratch.0.join("cingulate_raised.json")).unwrap())
+            .unwrap();
+    assert_eq!(file["version"], 1);
+    let desk = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
+    let card = desk.raised("el_1").expect("the card did not survive");
+    assert_eq!(card.kind, CardKind::LoginCapture);
+    assert_eq!(card.subject, "login");
+}
+
+/// A registry file this build cannot read (a newer version, damaged, or
+/// unversioned) is never overwritten, and while it stands no route is
+/// opened and no card is raised: every call ends
+/// `NoCard::RegistryUnreadable`, reason `consent_registry_unreadable`.
+#[tokio::test]
+async fn an_unreadable_registry_is_refused_and_never_overwritten() {
+    for (name, bytes) in [
+        ("newer", br#"{"version":2,"cards":[]}"#.to_vec()),
+        ("damaged", b"{not json".to_vec()),
+        ("unversioned", b"[]".to_vec()),
+    ] {
+        let scratch = Scratch::new(name);
+        let path = scratch.0.join("cingulate_raised.json");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(scratch.store().load().is_err(), "{name}");
+        let cingulate = ScriptedCingulate::new();
+        let desk = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
+        let (live, _) = live_call("sc_head_alf");
+        let error = desk.session(&live).await.err();
+        assert_eq!(error, Some(CallError::RegistryUnreadable), "{name}");
+        assert_eq!(
+            Ending::of_refusal(&error.unwrap()),
+            Ending::NoCard(NoCard::RegistryUnreadable)
+        );
+        assert_eq!(cingulate.opens(), 0, "{name}: a route was opened");
+        assert!(desk.mark_applied("el_1").is_err(), "{name}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}: overwritten");
+        assert!(!scratch.floor().exists(), "{name}: the floor was raised");
+    }
+}
+
+/// `unapplied` lists only the given session's unapplied cards. A call uses
+/// it to decide whether there is anything to read from Cingulate's answers
+/// feed, and so whether to open a route at all.
+#[tokio::test]
+async fn unapplied_lists_one_sessions_open_cards() {
+    let cingulate = ScriptedCingulate::new();
+    cingulate.then(wire::CONSENT_REQUEST, created()).then(
+        wire::CONSENT_REQUEST,
+        Reply::Result(json!({"elicitation_id": "el_2"})),
+    );
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (alf, _) = live_call("sc_head_alf");
+    let (other, _) = live_call("sc_other");
+    desk.session(&alf)
+        .await
+        .unwrap()
+        .raise(vector_card(CardKind::AppControl), "app")
+        .await
+        .unwrap();
+    desk.session(&other)
+        .await
+        .unwrap()
+        .raise(vector_card(CardKind::AppControl), "app")
+        .await
+        .unwrap();
+    let ids = |live: &LiveCall| -> Vec<String> {
+        desk.unapplied(live.session())
+            .into_iter()
+            .map(|card| card.elicitation_id)
+            .collect()
+    };
+    assert_eq!(ids(&alf), vec!["el_1".to_string()]);
+    assert_eq!(desk.mark_applied("el_1"), Ok(true));
+    assert!(ids(&alf).is_empty());
+    assert_eq!(ids(&other), vec!["el_2".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Subjects
+// ---------------------------------------------------------------------------
+
+/// Each kind has one subject function. Subjects of different kinds never
+/// collide, even where the same conversation key is all they carry; both
+/// website kinds give the same subject for the same origins in any order,
+/// so a navigate joins an open `open_grant` card; and a login subject reads
+/// back into its parts.
+#[test]
+fn every_kind_has_one_subject_and_kinds_never_collide() {
+    use crate::computer_grants::LoginCapability;
+    let conversation = "conv-1";
+    let origins = vec![
+        "https://b.example".to_string(),
+        "https://a.example".to_string(),
+    ];
+    let reversed: Vec<String> = origins.iter().rev().cloned().collect();
+    let by_kind = [
+        (
+            CardKind::WebsiteAccessInCall,
+            subject::website_access_in_call(conversation, &origins),
+        ),
+        (
+            CardKind::WebsiteAccessInAdvance,
+            subject::website_access_in_advance(conversation, &reversed),
+        ),
+        (
+            CardKind::AppControl,
+            subject::app_control(conversation, "com.example.Editor"),
+        ),
+        (CardKind::Takeover, subject::takeover(conversation)),
+        (
+            CardKind::LoginImport,
+            subject::login_import(conversation, "{\"origin\":\"https://x.com\"}"),
+        ),
+        (
+            CardKind::LoginCapture,
+            subject::login_capture(conversation, "{\"origin\":\"https://x.com\"}"),
+        ),
+        (
+            CardKind::ProfileReidentification,
+            subject::profile_reidentification(conversation),
+        ),
+        (
+            CardKind::StuckProfileClearance,
+            subject::stuck_profile_clearance("project-1", 12),
+        ),
+        (
+            CardKind::UserBrowserSite,
+            subject::user_browser_site("https://a.example"),
+        ),
+    ];
+    assert_eq!(
+        by_kind.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+        CardKind::ALL,
+        "a card kind has no subject function"
+    );
+    assert_eq!(
+        by_kind[0].1, by_kind[1].1,
+        "a navigate would not join an open open_grant card"
+    );
+    let distinct: std::collections::BTreeSet<&String> =
+        by_kind[1..].iter().map(|(_, subject)| subject).collect();
+    assert_eq!(distinct.len(), by_kind.len() - 1, "{by_kind:#?}");
+    assert_ne!(
+        subject::app_control(conversation, "com.a"),
+        subject::app_control(conversation, "com.b")
+    );
+    assert_ne!(
+        subject::stuck_profile_clearance("project-1", 12),
+        subject::stuck_profile_clearance("project-1", 13)
+    );
+
+    let login = subject::login_parts(&by_kind[5].1).unwrap();
+    assert_eq!(login.conversation_key, conversation);
+    assert_eq!(login.capability, LoginCapability::CaptureLogin);
+    assert_eq!(login.parameters, "{\"origin\":\"https://x.com\"}");
+    assert_eq!(
+        subject::login_parts(&by_kind[4].1).unwrap().capability,
+        LoginCapability::ImportLogin
+    );
+    assert_eq!(subject::login_parts(&by_kind[3].1), None);
 }

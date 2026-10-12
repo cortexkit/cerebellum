@@ -32,11 +32,33 @@ pub fn vector_result(name: &str) -> Value {
     vector(name)["result"].clone()
 }
 
+/// The reply a copied vector file holds, as the scripted Cingulate gives it:
+/// a success reply's `result`, or a refusal file's exact Error frame body,
+/// read through the same parser the production route uses.
+pub fn vector_reply(name: &str) -> Reply {
+    let reply = vector(name);
+    match reply.get("result") {
+        Some(result) => Reply::Result(result.clone()),
+        None => Reply::ErrorBody(std::fs::read(std::path::Path::new(VECTORS).join(name)).unwrap()),
+    }
+}
+
+/// The four replies Cingulate served for `consent.detach`, by what each
+/// shows: a pending card now detached, a card that had already settled (the
+/// vector's card id is `el_2`, not the `el_1` the other vectors use), a
+/// second detach of the same pending card, and a card of another owner.
+pub const DETACH_PENDING: &str = "cerebellum-detach-pending-reply.json";
+pub const DETACH_SETTLED: &str = "cerebellum-detach-settled-reply.json";
+pub const DETACH_REPEAT: &str = "cerebellum-detach-repeat-reply.json";
+pub const DETACH_WRONG_OWNER: &str = "cerebellum-detach-wrong-owner-refusal.json";
+
 /// One reply the scripted Cingulate gives to a call, in place of a real
 /// Cingulate response.
 pub enum Reply {
     Result(Value),
     Refused(&'static str),
+    /// An Error frame with exactly this body, as a refusal vector holds it.
+    ErrorBody(Vec<u8>),
     Transport,
     /// Never answers: the call waits until the caller stops waiting.
     Hang,
@@ -54,10 +76,11 @@ pub struct ScriptedCingulate {
     pub opens: AtomicUsize,
     pub calls: Mutex<Vec<(String, Value)>>,
     script: Mutex<VecDeque<(&'static str, Reply)>>,
-    /// When set, refuse every route.open, as a daemon would when core has not
-    /// listed cerebellum as a carrier (a module allowed to open routes) of the
-    /// agent's session scope.
-    pub refuse_open: std::sync::atomic::AtomicBool,
+    /// When set, refuse every route.open with this daemon code, as a daemon
+    /// would when core has not listed cerebellum as a carrier (a module
+    /// allowed to open routes) of the agent's session scope
+    /// (`scope_not_carrier`), or when that scope has ended (`scope_ended`).
+    pub refuse_open: Mutex<Option<&'static str>>,
 }
 
 impl ScriptedCingulate {
@@ -92,9 +115,9 @@ impl CingulateOpener for Arc<ScriptedCingulate> {
     ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
         Box::pin(async move {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            if self.refuse_open.load(Ordering::SeqCst) {
+            if let Some(code) = *self.refuse_open.lock().unwrap() {
                 return Err(CallError::Transport {
-                    code: Some("scope_not_carrier".into()),
+                    code: Some(code.into()),
                 });
             }
             Ok(Box::new(ScriptedRoute(Arc::clone(self))) as Box<dyn CingulateRoute>)
@@ -122,6 +145,8 @@ impl CingulateRoute for ScriptedRoute {
             match reply {
                 Reply::Result(value) => Ok(value),
                 Reply::Refused(code) => Err(refusal(code)),
+                Reply::ErrorBody(body) => Err(Refusal::from_error_body(&body)
+                    .map_or(CallError::Transport { code: None }, CallError::Refused)),
                 Reply::Transport => Err(CallError::Transport { code: None }),
                 Reply::Hang => std::future::pending().await,
             }
