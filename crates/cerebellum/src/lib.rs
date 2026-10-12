@@ -3447,18 +3447,7 @@ async fn handle_management_request(
     }
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
-        Err(outcome) => {
-            return send_route_error(
-                writer,
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                outcome.code(),
-                outcome.remedy(),
-            )
-            .await;
-        }
+        Err(outcome) => return send_queue_refusal(writer, &frame, planes, outcome).await,
     };
     let mut facts = facts.clone();
     if let Some(terminal) = TerminalArbiter::current() {
@@ -5978,18 +5967,7 @@ async fn handle_tool_request_inner(
     }
     let _browser_guard = match browser_queue::enter(&frame, planes).await {
         Ok(guard) => guard,
-        Err(outcome) => {
-            return send_route_error(
-                writer,
-                frame.header.ver,
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                outcome.code(),
-                outcome.remedy(),
-            )
-            .await;
-        }
+        Err(outcome) => return send_queue_refusal(writer, &frame, planes, outcome).await,
     };
     let route_bindings = &planes.routes;
     if let Some(terminal) = TerminalArbiter::current() {
@@ -7066,6 +7044,37 @@ async fn send_tool_response(
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, response).await
+}
+
+/// A quarantine refusal is a result of the browser capability, checked
+/// against its frozen vocabulary; other queue refusals are route errors.
+async fn send_queue_refusal(
+    writer: &mpsc::Sender<Frame>,
+    frame: &Frame,
+    planes: &Planes,
+    refusal: browser_queue::QueueRefusal,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    if let Some((capability, body)) = refusal.response_body() {
+        if let Ok(body) = planes.browser.finish_reply(capability, body) {
+            return send_tool_response(writer, ver, channel, epoch, corr, body).await;
+        }
+    }
+    send_route_error(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        refusal.code(),
+        refusal.remedy(),
+    )
+    .await
 }
 
 async fn send_route_error(

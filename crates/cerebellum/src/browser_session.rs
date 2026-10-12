@@ -1,6 +1,8 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -726,6 +728,13 @@ pub trait OwnedBrowserProcess: Send {
 
     fn generation_matches(&self) -> bool;
 
+    /// Send the paired release of every press this session's driver recorded
+    /// as possibly held, and nothing else: no caller chooses the events. The
+    /// default refuses, which leaves held-input quarantine in place.
+    fn release_held_input(&mut self, _deadline_ms: u64) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Whether the recorded generation has positively gone, which is narrower
     /// than `!generation_matches()`: a generation whose reading failed neither
     /// matches nor has gone, and ending a session on it would end one whose
@@ -796,6 +805,202 @@ pub enum KillOutcome {
     /// Whether the pid still names this browser could not be confirmed, so
     /// nothing was signalled and the browser may still be running.
     Refused,
+}
+
+/// How far past its own cap one CDP command may stay in flight before the
+/// write backstop ends the browser. Reads poll a non-blocking pipe and stop at
+/// their own deadline, so only a command write that blocks runs this far over.
+pub const WRITE_BACKSTOP_SLACK: Duration = Duration::from_millis(crate::budgets::BOUNDARY_SLACK_MS);
+
+/// The text a call refused for possibly held input carries in `detail.reason`.
+pub const HELD_INPUT_UNCONFIRMED: &str = "held_input_unconfirmed";
+
+/// The remedy sent with a held-input refusal.
+pub const HELD_INPUT_REMEDY: &str =
+    "held input could not be confirmed released; the next input action retries the release first";
+
+/// A key or mouse-button press sent to the page whose paired release Chrome
+/// has not acknowledged. The driver records it before the press is written,
+/// so a press whose send fails or never returns still counts as held, and
+/// removes it only when Chrome acknowledges the paired release.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HeldPress {
+    pub(crate) session_id: Option<String>,
+    pub(crate) method: &'static str,
+    /// The mouse button or key the press holds down.
+    pub(crate) control: String,
+    /// The parameters of the paired release, derived from the press itself,
+    /// so a later release cannot be steered to any other command.
+    pub(crate) release: serde_json::Map<String, Value>,
+}
+
+struct InFlightCommand {
+    id: u64,
+    method: String,
+    started: Instant,
+    cap: Duration,
+}
+
+/// What a session shares with its CDP driver without the driver lock: the
+/// commands now in flight, which the write backstop and execution quarantine
+/// read, and the presses that may still be held, which held-input quarantine
+/// reads. Its locks are leaves: none is held across I/O or another lock.
+#[derive(Default)]
+pub(crate) struct DriverWatch {
+    in_flight: Mutex<Vec<InFlightCommand>>,
+    held: Mutex<Vec<HeldPress>>,
+    next_command: AtomicU64,
+}
+
+/// Removes one in-flight record when its command returns, however it returns.
+pub(crate) struct InFlightRecord<'a> {
+    watch: &'a DriverWatch,
+    id: u64,
+}
+
+impl Drop for InFlightRecord<'_> {
+    fn drop(&mut self) {
+        recover_poisoned(self.watch.in_flight.lock()).retain(|command| command.id != self.id);
+    }
+}
+
+impl DriverWatch {
+    /// Record one command as written now and allowed `cap` to complete.
+    pub(crate) fn begin_command(&self, method: &str, cap: Duration) -> InFlightRecord<'_> {
+        let id = self.next_command.fetch_add(1, Ordering::Relaxed);
+        recover_poisoned(self.in_flight.lock()).push(InFlightCommand {
+            id,
+            method: method.to_string(),
+            started: Instant::now(),
+            cap,
+        });
+        InFlightRecord { watch: self, id }
+    }
+
+    /// The method of a command older than its own cap plus `slack`, if any.
+    /// Each command is judged against its own cap, so a holder running several
+    /// in-bound commands one after another is never judged on their total.
+    fn overdue(&self, slack: Duration) -> Option<String> {
+        recover_poisoned(self.in_flight.lock())
+            .iter()
+            .find(|command| command.started.elapsed() > command.cap.saturating_add(slack))
+            .map(|command| command.method.clone())
+    }
+
+    fn oldest_method(&self) -> Option<String> {
+        recover_poisoned(self.in_flight.lock())
+            .first()
+            .map(|command| command.method.clone())
+    }
+
+    pub(crate) fn held(&self) -> Vec<HeldPress> {
+        recover_poisoned(self.held.lock()).clone()
+    }
+
+    pub(crate) fn hold(&self, press: HeldPress) {
+        let mut held = recover_poisoned(self.held.lock());
+        if !held.contains(&press) {
+            held.push(press);
+        }
+    }
+
+    pub(crate) fn holds(&self, session_id: Option<&str>, method: &str, control: &str) -> bool {
+        recover_poisoned(self.held.lock()).iter().any(|press| {
+            press.session_id.as_deref() == session_id
+                && press.method == method
+                && press.control == control
+        })
+    }
+
+    pub(crate) fn released(&self, session_id: Option<&str>, method: &str, control: &str) {
+        recover_poisoned(self.held.lock()).retain(|press| {
+            !(press.session_id.as_deref() == session_id
+                && press.method == method
+                && press.control == control)
+        });
+    }
+}
+
+/// What a CDP driver call runs under: its call's terminal decision, whose
+/// dispatch gate every mutating command must pass, and its session's watch.
+#[derive(Clone)]
+pub(crate) struct DriveContext {
+    pub(crate) terminal: Option<Arc<crate::TerminalArbiter>>,
+    pub(crate) watch: Arc<DriverWatch>,
+}
+
+thread_local! {
+    static DRIVE_CONTEXT: RefCell<Option<DriveContext>> = const { RefCell::new(None) };
+}
+
+/// The context of the driver call running on this thread, if any. The CDP
+/// driver reads it here because the process adapters between the session and
+/// the driver carry only each capability's own arguments.
+pub(crate) fn drive_context() -> Option<DriveContext> {
+    DRIVE_CONTEXT.with(|context| context.borrow().clone())
+}
+
+/// Installs a drive context for one driver call and restores the previous
+/// one when dropped.
+struct DriveScope(Option<DriveContext>);
+
+impl DriveScope {
+    fn enter(terminal: Option<Arc<crate::TerminalArbiter>>, watch: &Arc<DriverWatch>) -> Self {
+        let context = DriveContext {
+            terminal,
+            watch: Arc::clone(watch),
+        };
+        Self(DRIVE_CONTEXT.with(|slot| slot.borrow_mut().replace(context)))
+    }
+}
+
+impl Drop for DriveScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        DRIVE_CONTEXT.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// The one blocking-work permit each plane keeps outside its ordinary pool,
+/// so a close can still end a quarantined session when every ordinary permit
+/// is held by stuck work.
+#[derive(Clone, Default)]
+struct ControlPermit(Arc<AtomicBool>);
+
+struct ControlPermitHeld(Arc<AtomicBool>);
+
+impl ControlPermit {
+    fn try_take(&self) -> Option<ControlPermitHeld> {
+        self.0
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ControlPermitHeld(Arc::clone(&self.0)))
+    }
+}
+
+impl Drop for ControlPermitHeld {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The write backstop's slack, a field so that tests can shorten it.
+#[derive(Clone, Copy)]
+struct BackstopSlack(Duration);
+
+impl Default for BackstopSlack {
+    fn default() -> Self {
+        Self(WRITE_BACKSTOP_SLACK)
+    }
+}
+
+/// A session whose operation outlived its call, or whose CDP command has run
+/// past its cap plus slack. Calls on it are refused rather than queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionQuarantine {
+    pub browser_session_id: String,
+    /// The CDP method in flight, or a generic name when none is.
+    pub call: String,
 }
 
 /// How long a module shutdown may spend closing browsers, measured from the
@@ -1140,6 +1345,14 @@ struct SessionMeta {
     handoff_opening: bool,
     next_handoff_generation: u64,
     cleanup: Option<Box<dyn SessionCleanup>>,
+    /// The terminal decision of each admitted call operation, keyed by its
+    /// admission. One whose gate has stopped while its operation is still
+    /// admitted is a worker that outlived its call.
+    live_calls: Vec<(u64, Arc<crate::TerminalArbiter>)>,
+    next_operation: u64,
+    /// The write backstop has acted on this session. Its recorded terminal
+    /// is then the backstop's, and exit observation tears the session down.
+    backstop_fired: bool,
 }
 
 impl SessionMeta {
@@ -1259,6 +1472,8 @@ struct SessionCell {
     /// whether the browser is still running without waiting for a call in
     /// progress to give LD back.
     exit_probe: OnceLock<Arc<dyn BrowserExitProbe>>,
+    /// Shared with the driver while it runs a call: see [`DriverWatch`].
+    watch: Arc<DriverWatch>,
 }
 
 impl SessionCell {
@@ -1282,11 +1497,15 @@ impl SessionCell {
                 handoff_opening: false,
                 next_handoff_generation: 0,
                 cleanup: None,
+                live_calls: Vec::new(),
+                next_operation: 0,
+                backstop_fired: false,
             }),
             wake: Condvar::new(),
             driver: Mutex::new(None),
             killer: OnceLock::new(),
             exit_probe: OnceLock::new(),
+            watch: Arc::new(DriverWatch::default()),
         }
     }
 
@@ -1335,6 +1554,8 @@ pub struct BrowserSessions {
     /// L3.
     shutdown: Arc<Mutex<ShutdownSide>>,
     signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    control_permit: ControlPermit,
+    backstop_slack: BackstopSlack,
 }
 
 #[derive(Debug)]
@@ -1395,6 +1616,11 @@ pub struct OperationGuard {
     cell: Arc<SessionCell>,
     /// This operation is a `present` holding the handoff reservation.
     handoff_reservation: bool,
+    /// The terminal decision of the call that admitted this operation, when
+    /// it was admitted inside one. Its dispatch gate guards every mutating
+    /// CDP command the operation sends.
+    terminal: Option<Arc<crate::TerminalArbiter>>,
+    operation_id: u64,
     finished: bool,
 }
 
@@ -1429,6 +1655,7 @@ impl OperationGuard {
         let process = driver
             .as_mut()
             .ok_or_else(|| refused(NavigationDriveError::Unavailable))?;
+        let _context = DriveScope::enter(self.terminal.clone(), &self.cell.watch);
         call(process.as_mut())
     }
 
@@ -1627,6 +1854,7 @@ impl OperationGuard {
         }
         self.finished = true;
         meta.pending_operations = meta.pending_operations.saturating_sub(1);
+        meta.live_calls.retain(|(id, _)| *id != self.operation_id);
         if self.handoff_reservation {
             meta.handoff_opening = false;
         }
@@ -1729,6 +1957,15 @@ impl BrowserSessions {
         handoff_reservation: bool,
     ) -> OperationGuard {
         meta.pending_operations = meta.pending_operations.saturating_add(1);
+        meta.next_operation = meta.next_operation.wrapping_add(1);
+        let operation_id = meta.next_operation;
+        // Read from the calling task: an operation admitted inside a call
+        // carries that call's terminal decision, while background work (a
+        // handoff poll on the blocking pool) runs under none.
+        let terminal = crate::TerminalArbiter::current();
+        if let Some(terminal) = &terminal {
+            meta.live_calls.push((operation_id, Arc::clone(terminal)));
+        }
         if let Some(switch) = self
             .side()
             .routes
@@ -1741,6 +1978,8 @@ impl BrowserSessions {
             sessions: self.clone(),
             cell: Arc::clone(cell),
             handoff_reservation,
+            terminal,
+            operation_id,
             finished: false,
         }
     }
@@ -2006,6 +2245,7 @@ impl BrowserSessions {
         let opening_cookie_names = {
             let mut driver = cell.driver().map_err(|_| PresentRefusal::NoSession)?;
             let process = driver.as_mut().ok_or(PresentRefusal::NoSession)?;
+            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
             let current_url = process
                 .main_frame_url(route_key, deadline_ms)
                 .map_err(|error| PresentRefusal::PresentFailed {
@@ -2166,6 +2406,9 @@ impl BrowserSessions {
             let Some(process) = driver.as_mut() else {
                 return HandoffPollResult::Gone;
             };
+            // The poll belongs to no call. Its commands are still recorded in
+            // flight, so one past its cap falls under the write backstop.
+            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
             let Ok(current_cookie_names) =
                 process.cookie_names_for_origin(route_key, &origin, deadline_ms)
             else {
@@ -2261,12 +2504,113 @@ impl BrowserSessions {
             }
         };
         let status = match cell.meta() {
-            Ok(meta) => meta
-                .record(&cell.browser_session_id)
-                .status_json(clock, wall_now),
+            Ok(meta) => {
+                let mut status = meta
+                    .record(&cell.browser_session_id)
+                    .status_json(clock, wall_now);
+                // Status takes no driver lock, so it still answers while a
+                // quarantined operation holds that lock, and says so.
+                if let Some(call) = self.stuck_operation(&cell, &meta) {
+                    status["remedy"] = json!(format!(
+                        "a browser operation ({call}) is still running after its call ended; \
+                         other calls on this session are refused as target_busy until it ends; \
+                         browser.close ends it"
+                    ));
+                } else if !cell.watch.held().is_empty() {
+                    status["remedy"] = json!(HELD_INPUT_REMEDY);
+                }
+                status
+            }
             Err(_) => internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
         };
         status
+    }
+
+    /// The stuck action, when the session is in execution quarantine: an
+    /// admitted operation whose call has already ended, or a CDP command past
+    /// its own cap plus the backstop slack. Called with the meta lock held.
+    fn stuck_operation(&self, cell: &SessionCell, meta: &SessionMeta) -> Option<String> {
+        let overdue = cell.watch.overdue(self.backstop_slack.0);
+        let detached = meta
+            .live_calls
+            .iter()
+            .any(|(_, terminal)| terminal.gate.stopped());
+        if overdue.is_none() && !detached {
+            return None;
+        }
+        Some(
+            overdue
+                .or_else(|| cell.watch.oldest_method())
+                .unwrap_or_else(|| "browser session operation".to_string()),
+        )
+    }
+
+    /// Whether the route's session is in execution quarantine. Takes only the
+    /// brief registry and meta locks, never the driver lock a stuck operation
+    /// holds.
+    pub fn execution_quarantine(&self, route_key: &str) -> Option<ExecutionQuarantine> {
+        let cell = self.active_cell_recovering(route_key)?;
+        let meta = recovered(cell.meta());
+        if meta.lifecycle.is_settled() {
+            return None;
+        }
+        self.stuck_operation(&cell, &meta)
+            .map(|call| ExecutionQuarantine {
+                browser_session_id: cell.browser_session_id.clone(),
+                call,
+            })
+    }
+
+    /// Whether the route's session has a press whose release Chrome has not
+    /// acknowledged, so its page input is quarantined.
+    pub fn held_input_unconfirmed(&self, route_key: &str) -> bool {
+        self.active_cell_recovering(route_key)
+            .is_some_and(|cell| !cell.watch.held().is_empty())
+    }
+
+    /// Retry the paired release of every press the route's session may still
+    /// hold, as one admitted operation. Returns whether no press is left held.
+    /// Blocks on the driver lock, so callers run it on the blocking pool; the
+    /// driver bounds each release by `deadline_ms`.
+    pub fn retry_held_release(&self, route_key: &str, deadline_ms: u64) -> bool {
+        let Some(cell) = self.active_cell_recovering(route_key) else {
+            return true;
+        };
+        if cell.watch.held().is_empty() {
+            return true;
+        }
+        let mut operation = {
+            let Ok(mut meta) = cell.meta() else {
+                return false;
+            };
+            if !meta.admits_calls() {
+                // A session that admits no call takes no input either; the
+                // call itself is refused by the session's own state.
+                return true;
+            }
+            // A worker still running may yet land its press after a release
+            // sent now, so the quarantine stays until it ends.
+            if self.stuck_operation(&cell, &meta).is_some() {
+                return false;
+            }
+            self.admit(&cell, &mut meta, false)
+        };
+        let released = operation
+            .drive(
+                |error| error,
+                |process| process.release_held_input(deadline_ms),
+            )
+            .is_ok();
+        operation.finish();
+        released && cell.watch.held().is_empty()
+    }
+
+    /// Shorten the write backstop's slack, so tests need not wait out the
+    /// production one.
+    #[doc(hidden)]
+    pub fn with_backstop_slack_for_test(mut self, slack: Duration) -> Self {
+        self.backstop_slack = BackstopSlack(slack);
+        self
     }
 
     pub fn accept_dispatch<C: MonotonicClock>(
@@ -2344,33 +2688,93 @@ impl BrowserSessions {
         true
     }
 
-    /// Tear down every session whose browser has exited on its own.
+    /// Tear down every session whose browser has exited on its own, after
+    /// running the write backstop on each.
     ///
     /// Asks each browser's exit probe, which never waits for a call in
     /// progress. A browser without a probe is checked through its driver slot
     /// only when that slot is free; a busy one is looked at on the next sweep,
     /// and its call in progress fails on its own if the browser is gone.
+    ///
+    /// A session with an operation still pending is skipped and revisited on
+    /// the next sweep: its teardown would wait for that operation, and one
+    /// session's stuck operation must not stall the sweep for every other.
     pub fn observe_exits_all(&self, config: &BrowserConfig) {
         for cell in self.active_cells_recovering() {
-            {
+            self.write_backstop(&cell);
+            let backstop_fired = {
                 let meta = recovered(cell.meta());
-                if meta.terminal.is_some() || meta.lifecycle != Lifecycle::Ready {
+                if meta.lifecycle != Lifecycle::Ready
+                    || (meta.terminal.is_some() && !meta.backstop_fired)
+                {
                     continue;
                 }
-            }
-            let exited = match cell.exit_probe.get() {
-                Some(probe) => probe.generation_gone(),
-                None => cell.try_driver().is_some_and(|driver| {
-                    driver
-                        .as_ref()
-                        .is_some_and(|process| process.generation_gone())
-                }),
+                meta.backstop_fired
             };
-            if exited {
-                // The collected session itself, not whatever the route holds
-                // now, so a session that replaced it is not torn down.
-                self.teardown_cell(&cell, BrowserSessionTerminalOutcome::BrowserCrashed, config);
+            // A browser the backstop killed is gone whatever its probe says.
+            let exited = (backstop_fired && self.cell_killed(&cell))
+                || match cell.exit_probe.get() {
+                    Some(probe) => probe.generation_gone(),
+                    None => cell.try_driver().is_some_and(|driver| {
+                        driver
+                            .as_ref()
+                            .is_some_and(|process| process.generation_gone())
+                    }),
+                };
+            if !exited {
+                continue;
             }
+            {
+                // Checked and recorded under the same meta lock: with no
+                // operation pending and the terminal set, none can be
+                // admitted, so the teardown below never waits on one.
+                let mut meta = recovered(cell.meta());
+                if meta.lifecycle != Lifecycle::Ready
+                    || meta.pending_operations != 0
+                    || (meta.terminal.is_some() && !meta.backstop_fired)
+                {
+                    continue;
+                }
+                meta.terminal
+                    .get_or_insert(BrowserSessionTerminalOutcome::BrowserCrashed);
+            }
+            cell.notify();
+            // The collected session itself, not whatever the route holds
+            // now, so a session that replaced it is not torn down.
+            self.finish_teardown(
+                &cell,
+                BrowserSessionTerminalOutcome::BrowserCrashed,
+                configured_grace(config),
+            );
+        }
+    }
+
+    /// End a ready session one of whose CDP commands has run past its own cap
+    /// plus the backstop slack, whoever holds the driver lock. Such a command
+    /// is a write blocked on a wedged pipe, so nothing is sent over that pipe:
+    /// the browser is killed by its exact generation, with no lock held.
+    ///
+    /// A dead browser fails the write, the holder ends, and the next sweep
+    /// tears the session down with the terminal recorded here. A browser that
+    /// cannot be confirmed dead may still have its profile open, so custody
+    /// stays held. A session in any other lifecycle is left to its launch or
+    /// teardown owner, whose own deadlines bound it.
+    fn write_backstop(&self, cell: &Arc<SessionCell>) {
+        if cell.watch.overdue(self.backstop_slack.0).is_none() {
+            return;
+        }
+        {
+            let mut meta = recovered(cell.meta());
+            if meta.lifecycle != Lifecycle::Ready || meta.backstop_fired {
+                return;
+            }
+            meta.backstop_fired = true;
+            meta.terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::ConnectorFailure);
+        }
+        cell.notify();
+        if !self.kill_cell(cell, false) {
+            self.hold_custody(cell, Lifecycle::Ready);
         }
     }
 
@@ -2407,6 +2811,7 @@ impl BrowserSessions {
         }
         cell.notify();
         let url = cell.driver().ok().and_then(|mut driver| {
+            let _context = DriveScope::enter(None, &cell.watch);
             driver
                 .as_mut()?
                 .main_frame_url(route_key, config.navigation_settle_deadline_ms)
@@ -2459,6 +2864,10 @@ impl BrowserSessions {
                 Lifecycle::Abandoned => return json!({"outcome": "browser_session_not_found"}),
                 _ => {}
             }
+            if meta.lifecycle == Lifecycle::Ready && self.stuck_operation(&cell, &meta).is_some() {
+                drop(meta);
+                return self.close_quarantined(&cell, browser_session_id, config);
+            }
             meta.terminal
                 .get_or_insert(BrowserSessionTerminalOutcome::Closed);
         }
@@ -2479,6 +2888,71 @@ impl BrowserSessions {
         if meta.lifecycle == Lifecycle::Abandoned {
             return json!({"outcome": "browser_session_not_found"});
         }
+        meta.record(browser_session_id).close_result()
+    }
+
+    /// Close a session in execution quarantine. A graceful close would wait
+    /// for the stuck operation to give the driver lock back, so this takes
+    /// the write backstop's path instead, on the plane's one control permit:
+    /// kill the browser by its exact generation, then reap once the holder
+    /// has ended. A browser that cannot be confirmed dead, or a holder that
+    /// outlives the teardown budget, leaves custody held.
+    fn close_quarantined(
+        &self,
+        cell: &Arc<SessionCell>,
+        browser_session_id: &str,
+        config: &BrowserConfig,
+    ) -> Value {
+        let Some(_permit) = self.control_permit.try_take() else {
+            return json!({
+                "outcome": "blocking_capacity_exhausted",
+                "detail": {"dispatched": false, "step": "preflight", "call": BROWSER_CLOSE},
+                "remedy": "another close is ending a stuck browser session; retry",
+            });
+        };
+        {
+            let mut meta = recovered(cell.meta());
+            meta.terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::Closed);
+        }
+        cell.notify();
+        if self.kill_cell(cell, false) {
+            // The dying browser fails the holder's command; wait, within the
+            // teardown budget, for the holder to give the session back.
+            let until = Instant::now() + Duration::from_millis(crate::budgets::TEARDOWN_MS);
+            let holder_ended = {
+                let mut meta = recovered(cell.meta());
+                loop {
+                    if meta.pending_operations == 0 || meta.lifecycle != Lifecycle::Ready {
+                        break meta.lifecycle == Lifecycle::Ready;
+                    }
+                    let now = Instant::now();
+                    if now >= until {
+                        break false;
+                    }
+                    meta = recovered(meta.wait_timeout(&cell.wake, until - now));
+                }
+            };
+            if holder_ended {
+                self.finish_teardown(
+                    cell,
+                    BrowserSessionTerminalOutcome::Closed,
+                    configured_grace(config),
+                );
+            } else {
+                // The browser is dead but its holder still holds the driver,
+                // or another terminalizer owns the teardown; join that one.
+                let teardown_owned = recovered(cell.meta()).lifecycle == Lifecycle::TeardownOwned;
+                if teardown_owned {
+                    cell.wait_settled();
+                } else {
+                    self.hold_custody(cell, Lifecycle::Ready);
+                }
+            }
+        } else {
+            self.hold_custody(cell, Lifecycle::Ready);
+        }
+        let meta = recovered(cell.meta());
         meta.record(browser_session_id).close_result()
     }
 
@@ -2806,8 +3280,9 @@ impl BrowserSessions {
 
     /// Fire this session's shutdown killer, at most once per session, with no
     /// lock held. With `only_in_flight`, a session with no operation in flight
-    /// is left alone: its browser still gets a graceful close.
-    fn kill_cell(&self, cell: &SessionCell, only_in_flight: bool) {
+    /// is left alone: its browser still gets a graceful close. Returns whether
+    /// the browser is known dead, by this kill or an earlier one.
+    fn kill_cell(&self, cell: &SessionCell, only_in_flight: bool) -> bool {
         let fire = {
             let mut side = self.side();
             match side
@@ -2825,10 +3300,10 @@ impl BrowserSessions {
             }
         };
         if !fire {
-            return;
+            return self.cell_killed(cell);
         }
         let Some(killer) = cell.killer.get() else {
-            return;
+            return false;
         };
         if killer.kill_exact_generation() == KillOutcome::Dead {
             if let Some(switch) = self
@@ -2840,6 +3315,7 @@ impl BrowserSessions {
                 switch.killed = true;
             }
         }
+        self.cell_killed(cell)
     }
 
     fn cell_killed(&self, cell: &SessionCell) -> bool {
@@ -2962,7 +3438,15 @@ impl BrowserSessions {
             cell.wait_settled();
             return;
         };
-        let outcome = teardown_process_with_grace(process.as_mut(), grace).and_then(|()| {
+        // A browser already killed by its exact generation (the write
+        // backstop or a quarantined close) has only its reap left: a graceful
+        // close would write to the pipe that wedged.
+        let outcome = if self.cell_killed(cell) {
+            process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
+        } else {
+            teardown_process_with_grace(process.as_mut(), grace)
+        }
+        .and_then(|()| {
             let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
             cleanup.set_terminal_outcome(terminal_outcome);
             cleanup.after_reap()

@@ -13,8 +13,8 @@ use crate::browser::Tracker;
 use crate::browser_launch_readiness::{CdpPipeIo, PipeRead};
 use crate::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserInputEvent, BrowserJavaScriptDialog,
-    ClickDriveError, ClickNavigation, ClickPointDriveError, JavaScriptDialogResponse,
-    NavigationDriveError, NavigationWait, ViewportRefusal,
+    ClickDriveError, ClickNavigation, ClickPointDriveError, DriveContext, HeldPress,
+    JavaScriptDialogResponse, NavigationDriveError, NavigationWait, ViewportRefusal,
 };
 use crate::cdp::{Attachment, CdpEvent, CdpFrameDecoder, CdpResponse, CdpTransport, IdentityMap};
 use crate::classification::{
@@ -2448,6 +2448,43 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map_err(|_| NavigationDriveError::ConnectorFailure)
     }
 
+    /// Send the paired release of each press this session recorded as
+    /// possibly held, all within one `deadline_ms`. The events are the ones
+    /// recorded from the presses themselves; nothing else can be sent here.
+    /// Fails, leaving the rest recorded, at the first release Chrome does not
+    /// acknowledge.
+    pub fn release_held_input(&mut self, deadline_ms: u64) -> Result<(), NavigationDriveError> {
+        self.release_held_input_with_clock(deadline_ms, &mut SystemNavigationClock)
+    }
+
+    fn release_held_input_with_clock<C: NavigationClock>(
+        &mut self,
+        deadline_ms: u64,
+        clock: &mut C,
+    ) -> Result<(), NavigationDriveError> {
+        let context =
+            crate::browser_session::drive_context().ok_or(NavigationDriveError::Unavailable)?;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        for press in context.watch.held() {
+            let response = self.command_response(
+                press.method,
+                Some(press.release.clone()),
+                press.session_id.clone(),
+                deadline,
+                None,
+                None,
+                clock,
+            )?;
+            if response.error.is_some() {
+                return Err(NavigationDriveError::CdpFailure.at_step(press.method));
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_attached<C: NavigationClock>(
         &mut self,
         context_key: &str,
@@ -2639,6 +2676,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 command_sent: false,
             });
         }
+        let context = crate::browser_session::drive_context();
+        let effect = command_effect(method, params.as_ref(), session_id.as_deref());
+        if let Some(context) = &context {
+            admit_command(context, method, &effect)?;
+        }
+        let cap = deadline.saturating_duration_since(clock.now());
         let command = self
             .transport
             .issue_command(method, params, session_id, clock.now())
@@ -2648,6 +2691,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .json_bytes()
             .map_err(|_| NavigationDriveError::CdpFailure)?;
         bytes.push(0);
+        // Recorded before the write, which is the one step that can block
+        // past the deadline; the write backstop reads this record.
+        let _in_flight = context
+            .as_ref()
+            .map(|context| context.watch.begin_command(method, cap));
         self.pipe
             .write_frame(&bytes)
             .map_err(|_| NavigationDriveError::ConnectorFailure)?;
@@ -2655,9 +2703,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             callback();
         }
 
-        loop {
+        let response = loop {
             if let Some(response) = self.pending_responses.remove(&command_id) {
-                return Ok(response);
+                break response;
             }
             if clock.now() >= deadline {
                 // A read deadline is not a disconnected browser. Retire the
@@ -2680,11 +2728,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 self.dismiss_pending_javascript_dialogs(deadline, dialogs, &mut tracking, clock)?;
             }
             if let Some(response) = response {
-                return Ok(response);
+                break response;
             }
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+        };
+        if let Some(context) = &context {
+            settle_command(context, &effect, response.error.is_none());
         }
+        Ok(response)
     }
 
     fn dismiss_pending_javascript_dialogs<C: NavigationClock>(
@@ -3717,6 +3769,163 @@ fn mouse_event_params(event_type: &str, position: BrowserClickPosition) -> Map<S
         ),
     );
     params
+}
+
+/// How one CDP command bears on the page's input and on its call's dispatch
+/// gate.
+#[derive(Debug, PartialEq)]
+enum CommandEffect {
+    /// Reads and setup that change nothing a person would see.
+    Read,
+    /// An ordinary mutation: input, navigation, focus, or a change to the
+    /// page's selection.
+    Mutation,
+    /// A key or button press. It may stay held, so it is recorded before it
+    /// is sent, with the release that would end it.
+    Press(HeldPress),
+    /// The release that pairs with a press.
+    Release {
+        session_id: Option<String>,
+        method: &'static str,
+        control: String,
+    },
+}
+
+const MOUSE_EVENT: &str = "Input.dispatchMouseEvent";
+const KEY_EVENT: &str = "Input.dispatchKeyEvent";
+
+/// The typing path changes the selection with `select()`,
+/// `setSelectionRange`, `removeAllRanges` and `collapse`; its other
+/// `Runtime.callFunctionOn` calls only read focus and value.
+fn selection_mutating(function: &str) -> bool {
+    [
+        ".select()",
+        "setSelectionRange",
+        "removeAllRanges",
+        "collapse(",
+    ]
+    .iter()
+    .any(|mutation| function.contains(mutation))
+}
+
+fn command_effect(
+    method: &str,
+    params: Option<&Map<String, Value>>,
+    session_id: Option<&str>,
+) -> CommandEffect {
+    let param = |name: &str| {
+        params
+            .and_then(|params| params.get(name))
+            .and_then(Value::as_str)
+    };
+    let input = |method: &'static str, control: &str, release_type: Option<&str>| {
+        let session_id = session_id.map(str::to_owned);
+        let control = control.to_string();
+        match release_type {
+            Some(release_type) => {
+                let mut release = params.cloned().unwrap_or_default();
+                release.insert("type".into(), Value::String(release_type.into()));
+                CommandEffect::Press(HeldPress {
+                    session_id,
+                    method,
+                    control,
+                    release,
+                })
+            }
+            None => CommandEffect::Release {
+                session_id,
+                method,
+                control,
+            },
+        }
+    };
+    match method {
+        MOUSE_EVENT => {
+            let button = param("button").unwrap_or("none");
+            match param("type") {
+                Some("mousePressed") => input(MOUSE_EVENT, button, Some("mouseReleased")),
+                Some("mouseReleased") => input(MOUSE_EVENT, button, None),
+                _ => CommandEffect::Mutation,
+            }
+        }
+        KEY_EVENT => {
+            let key = param("key").or(param("code")).unwrap_or("");
+            match param("type") {
+                Some("keyDown" | "rawKeyDown") => input(KEY_EVENT, key, Some("keyUp")),
+                Some("keyUp") => input(KEY_EVENT, key, None),
+                _ => CommandEffect::Mutation,
+            }
+        }
+        "Page.navigate" | "DOM.focus" => CommandEffect::Mutation,
+        "Runtime.callFunctionOn"
+            if param("functionDeclaration").is_some_and(selection_mutating) =>
+        {
+            CommandEffect::Mutation
+        }
+        _ if method.starts_with("Input.") => CommandEffect::Mutation,
+        _ => CommandEffect::Read,
+    }
+}
+
+/// Pass the call's dispatch gate before a command is sent. Every mutation
+/// takes the gate's begin-mutation step, which fails once the call's terminal
+/// has been decided; after that only the release of a recorded press, which
+/// is the bounded held-input release, may still be sent. A read after the
+/// terminal is refused too, since nothing the worker reads can reach the
+/// caller. Background work runs with no call terminal and is not gated.
+fn admit_command(
+    context: &DriveContext,
+    method: &str,
+    effect: &CommandEffect,
+) -> Result<(), NavigationDriveError> {
+    let refused = || NavigationDriveError::CommandDeadline {
+        method: method.to_string(),
+        command_sent: false,
+    };
+    if let CommandEffect::Release {
+        session_id,
+        method,
+        control,
+    } = effect
+    {
+        if context.watch.holds(session_id.as_deref(), method, control) {
+            return Ok(());
+        }
+    }
+    let Some(terminal) = &context.terminal else {
+        if let CommandEffect::Press(press) = effect {
+            context.watch.hold(press.clone());
+        }
+        return Ok(());
+    };
+    match effect {
+        CommandEffect::Read if terminal.gate.stopped() => return Err(refused()),
+        CommandEffect::Read => {}
+        _ if !terminal.gate.begin_mutation() => return Err(refused()),
+        CommandEffect::Press(press) => context.watch.hold(press.clone()),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Update the possibly held presses once Chrome answers a command. A release
+/// it accepted ends its press; a press it refused never went down.
+fn settle_command(context: &DriveContext, effect: &CommandEffect, accepted: bool) {
+    match effect {
+        CommandEffect::Release {
+            session_id,
+            method,
+            control,
+        } if accepted => context
+            .watch
+            .released(session_id.as_deref(), method, control),
+        CommandEffect::Press(press) if !accepted => {
+            context
+                .watch
+                .released(press.session_id.as_deref(), press.method, &press.control)
+        }
+        _ => {}
+    }
 }
 
 fn required_content_quads(result: &Map<String, Value>) -> Result<Vec<Quad>, NavigationDriveError> {
