@@ -92,7 +92,8 @@ pub struct CardRequest {
 
 /// Why a rendered body could not become a request. Only a bug in a card
 /// builder causes it. The card is then never raised, and the caller should
-/// end the call as `Ending::NotPutToAnyone`: no person was shown anything.
+/// end the call as `Ending::DeliveryFailed`: a defect on this side, not a
+/// person who could not be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotACard(pub &'static str);
 

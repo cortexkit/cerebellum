@@ -46,12 +46,16 @@ pub enum Ending {
     Declined { choice_id: String },
     /// The card expired unanswered, or is no longer retained.
     NoAnswer,
-    /// Cingulate would not put the card to anyone: the requester or kind was
-    /// refused, the card was malformed, or the agent is retired. Asking again
-    /// goes the same way.
+    /// Cingulate will not put the card to anyone, and asking again goes the
+    /// same way until something outside cerebellum changes: cerebellum is not
+    /// an admitted requester for this kind, Cingulate refuses a card without
+    /// a safe default, or the agent is retired.
     NotPutToAnyone,
     /// The card or its answer could not be carried: no route, a transport
-    /// failure, or the consent module being unavailable.
+    /// failure, the consent module being unavailable, or cerebellum building
+    /// a card Cingulate cannot accept (a defect on this side, not an
+    /// unreachable person). Retry once; if it fails again the module needs
+    /// attention.
     DeliveryFailed,
     /// Cerebellum withdrew the card.
     Withdrawn,
@@ -65,12 +69,15 @@ impl Ending {
             CallError::NotLive | CallError::Transport { .. } => Self::DeliveryFailed,
             CallError::Refused(refusal) => match refusal.code {
                 RefusalCode::RequesterRefused
-                | RefusalCode::InvalidRequest
-                | RefusalCode::UnknownKind
                 | RefusalCode::FailClosedRequired
-                | RefusalCode::ConsentRetired
+                | RefusalCode::ConsentRetired => Self::NotPutToAnyone,
+                // Cerebellum built a card Cingulate cannot decode or accept:
+                // a defect here, which telling the agent "nobody is
+                // reachable" would hide.
+                RefusalCode::InvalidRequest
+                | RefusalCode::UnknownKind
                 | RefusalCode::RequestTooLarge
-                | RefusalCode::InvalidEnvelope => Self::NotPutToAnyone,
+                | RefusalCode::InvalidEnvelope => Self::DeliveryFailed,
                 // The card is gone from this requester's view: acknowledged,
                 // past retention, or not this session's. Nothing can be
                 // concluded about a choice.
@@ -394,7 +401,8 @@ impl DeskSession<'_> {
     ) -> InCall {
         let Some(card) = self.desk.raised(elicitation_id) else {
             // Never wait on, and never act on, a card this desk did not raise.
-            return InCall::Settled(Ending::NotPutToAnyone);
+            // Being asked to is a defect on this side.
+            return InCall::Settled(Ending::DeliveryFailed);
         };
         let live = self.live;
         let route_closed = async {

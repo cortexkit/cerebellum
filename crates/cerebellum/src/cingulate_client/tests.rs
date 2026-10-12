@@ -994,31 +994,62 @@ async fn a_crash_between_apply_and_ack_reapplies_once_without_duplicating() {
     );
 }
 
-/// Each refusal code maps to its typed ending: refusals that mean Cingulate
-/// will never show this card are `NotPutToAnyone`, a card that is gone from
-/// this requester's view is `NoAnswer`, and failures to carry the request are
-/// `DeliveryFailed`.
+/// Every refusal code, named with the ending it must map to:
+///
+/// - `NotPutToAnyone` only where nobody can be reached and asking again
+///   cannot help until something outside cerebellum changes: cerebellum is
+///   not an admitted requester, the card has no safe default, the agent is
+///   retired.
+/// - `DeliveryFailed` where cerebellum built a card Cingulate cannot accept
+///   (a defect here: retry once, then the module needs attention), and where
+///   the request could not be carried.
+/// - `NoAnswer` where the card is gone from this requester's view.
 #[test]
 fn every_refusal_code_maps_to_its_typed_ending() {
     use super::double::refusal;
-    for (code, ending) in [
+    let table: [(&str, Ending); 15] = [
+        // Nobody can be reached.
         ("elicitation_requester_refused", Ending::NotPutToAnyone),
-        ("elicitation_invalid_request", Ending::NotPutToAnyone),
-        ("elicitation_unknown_kind", Ending::NotPutToAnyone),
         ("elicitation_fail_closed_required", Ending::NotPutToAnyone),
         ("consent_retired", Ending::NotPutToAnyone),
-        ("elicitation_request_too_large", Ending::NotPutToAnyone),
-        ("invalid_request", Ending::NotPutToAnyone),
-        ("elicitation_not_owner", Ending::NoAnswer),
-        ("elicitation_not_found", Ending::NoAnswer),
+        // Cerebellum built a bad card.
+        ("elicitation_invalid_request", Ending::DeliveryFailed),
+        ("elicitation_unknown_kind", Ending::DeliveryFailed),
+        ("elicitation_request_too_large", Ending::DeliveryFailed),
+        ("invalid_request", Ending::DeliveryFailed),
+        // The request could not be carried.
         ("unknown_method", Ending::DeliveryFailed),
         ("consent_unavailable", Ending::DeliveryFailed),
         ("elicitation_store_error", Ending::DeliveryFailed),
         ("cancelled", Ending::DeliveryFailed),
         ("elicitation_invalid_execution", Ending::DeliveryFailed),
         ("some_future_code", Ending::DeliveryFailed),
-    ] {
-        assert_eq!(Ending::of_refusal(&refusal(code)), ending, "{code}");
+        // The card is gone from this requester's view.
+        ("elicitation_not_owner", Ending::NoAnswer),
+        ("elicitation_not_found", Ending::NoAnswer),
+    ];
+    let wrong: Vec<String> = table
+        .iter()
+        .filter_map(|(code, expected)| {
+            let got = Ending::of_refusal(&refusal(code));
+            (got != *expected).then(|| format!("{code}: expected {expected:?}, got {got:?}"))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "mismapped refusal codes:\n{}",
+        wrong.join("\n")
+    );
+    // Every code the client knows is in the table, so none is left to the
+    // match's default by accident.
+    for (code, _) in table.iter().filter(|(code, _)| *code != "some_future_code") {
+        assert!(
+            !matches!(
+                super::wire::RefusalCode::parse(code),
+                super::wire::RefusalCode::Unknown(_)
+            ),
+            "{code} is not a known refusal code"
+        );
     }
     assert_eq!(
         Ending::of_refusal(&CallError::Transport { code: None }),
@@ -1031,7 +1062,7 @@ fn every_refusal_code_maps_to_its_typed_ending() {
 async fn a_refused_raise_is_a_typed_ending() {
     for (code, ending) in [
         ("elicitation_requester_refused", Ending::NotPutToAnyone),
-        ("elicitation_invalid_request", Ending::NotPutToAnyone),
+        ("elicitation_unknown_kind", Ending::DeliveryFailed),
         ("consent_unavailable", Ending::DeliveryFailed),
     ] {
         let cingulate = ScriptedCingulate::new();
