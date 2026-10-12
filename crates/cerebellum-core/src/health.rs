@@ -1,31 +1,23 @@
 //! The insulated `health.check` execution lane.
 //!
-//! Health-Path-Rule-v2: `health.check` rides an insulated lane; status is
-//! derived mechanically from atomics stamped by the dispatch path (heartbeat,
-//! oldest-queued-age, oldest-in-flight-age). The insulated lane reads only
-//! those atomics plus cached gauges, never a live probe. Cached gauges never
-//! block `health.check` and never alter overall dispatch status.
+//! Health checks read dispatch timing atomics and the detached-worker count,
+//! never enqueue work or perform a live browser or platform probe. Callers may
+//! attach cached gauges, but those gauges never change dispatch health status.
 //!
 //! Status ladder:
-//! - **healthy** when heartbeat age AND oldest-queued/in-flight age are below
-//!   OR exactly equal to their configured thresholds.
-//! - **degraded** one tick after an age exceeds its threshold.
+//! - **healthy** when no detached worker remains and every applicable age is
+//!   below or exactly equal to its configured threshold.
+//! - **degraded** while a detached worker is still running, or one tick after
+//!   an age exceeds its threshold.
 //!
-//! In Spec A there is no browser, so the cached browser/CDP gauges are stubbed
-//! as absent. Dispatch is exercised by `browser.status` and a synthetic
-//! wedged-dispatch test.
-//!
-//! This module is the integration point between the frozen configuration
-//! surface ([`crate::config::HealthConfig`]), the monotonic clock abstraction
-//! ([`crate::clock`]), and the dispatch timing state
-//! ([`crate::dispatch::DispatchTimingState`]). [`HealthState`] owns all three
-//! and exposes the API the wire handler in `lib.rs` consumes
-//! ([`HealthState::new`], [`HealthState::stamp_heartbeat`],
-//! [`HealthState::report`]). The wire-visible report shape
-//! (`ModuleControlResponse::HealthCheck { status, detail, metrics }`) and its
-//! metric keys are preserved per Spec A.
+//! [`HealthState`] combines the frozen [`crate::config::HealthConfig`], the
+//! monotonic clock and [`crate::dispatch::DispatchTimingState`]. The wire
+//! handler stamps the heartbeat and consumes [`HealthState::report`]; it adds
+//! no live probes to this path. The report preserves the established
+//! `ModuleControlResponse::HealthCheck { status, detail, metrics }` envelope
+//! and timing metric keys used by health-check clients.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use subc_protocol::session::{HealthStatus, ModuleControlResponse};
@@ -56,6 +48,7 @@ pub struct HealthState {
     /// yes). A module that has never ticked is healthy (it just started and
     /// the heartbeat was initialized at construction).
     heartbeat_stamped: AtomicU8,
+    detached_workers: std::sync::Arc<AtomicUsize>,
 }
 
 impl HealthState {
@@ -76,6 +69,7 @@ impl HealthState {
             config,
             timing,
             heartbeat_stamped: AtomicU8::new(0),
+            detached_workers: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -110,6 +104,17 @@ impl HealthState {
     /// Hold this guard for the entire route request, including writing its reply.
     pub fn enter_request(&self) -> crate::dispatch::InFlightGuard {
         self.timing.enter(&self.clock)
+    }
+
+    /// Count detached workers until they really end, without keeping an
+    /// in-flight request alive.
+    pub fn enter_detached_worker(&self) -> DetachedWorkerGuard {
+        self.detached_workers.fetch_add(1, Ordering::SeqCst);
+        DetachedWorkerGuard(std::sync::Arc::clone(&self.detached_workers))
+    }
+
+    pub fn detached_workers(&self) -> usize {
+        self.detached_workers.load(Ordering::SeqCst)
     }
 
     /// Stamp the dispatch heartbeat. Called at the top of every loop turn so a
@@ -172,10 +177,18 @@ impl HealthState {
     }
 
     fn report_ages(&self, ages: HealthAges) -> ModuleControlResponse {
-        let status = classify(&ages, &self.config);
+        let detached = self.detached_workers();
+        let status = if detached > 0 {
+            HealthStatus::Degraded
+        } else {
+            classify(&ages, &self.config)
+        };
 
         let detail = if status == HealthStatus::Degraded {
             let mut reasons = Vec::new();
+            if detached > 0 {
+                reasons.push(format!("{detached} detached workers still running"));
+            }
             if ages.heartbeat_age > self.config.heartbeat_threshold() {
                 reasons.push(format!(
                     "dispatch heartbeat {}s stale",
@@ -204,6 +217,7 @@ impl HealthState {
         let metrics = serde_json::json!({
             "inFlightActions": self.timing.in_flight(),
             "awaitingConsent": self.timing.awaiting_consent(),
+            "detachedWorkers": detached,
             "heartbeatAgeSecs": ages.heartbeat_age.as_secs(),
             "oldestQueuedAgeSecs": ages.oldest_queued_age.map(|d| d.as_secs()).unwrap_or(0),
             "oldestInFlightAgeSecs": ages.oldest_in_flight_age.map(|d| d.as_secs()).unwrap_or(0),
@@ -254,6 +268,15 @@ impl Default for HealthState {
     }
 }
 
+/// Owns one detached-worker count independently of route request accounting.
+pub struct DetachedWorkerGuard(std::sync::Arc<AtomicUsize>);
+
+impl Drop for DetachedWorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The per-gauge ages at the moment of the health check, for observability.
 /// Each age is `Some(duration)` when the gauge is present, or `None` when the
 /// set is empty (and so contributes no stale age).
@@ -298,7 +321,11 @@ pub fn health_check_with_clock(state: &HealthState, clock: &impl MonotonicClock)
         oldest_queued_age,
         oldest_in_flight_age,
     };
-    let status = classify(&ages, &state.config);
+    let status = if state.detached_workers() > 0 {
+        HealthStatus::Degraded
+    } else {
+        classify(&ages, &state.config)
+    };
     HealthReport { status, ages }
 }
 
@@ -611,5 +638,42 @@ mod tests {
             }
             _ => panic!("expected HealthCheck response"),
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_worker_tests {
+    use super::*;
+
+    #[test]
+    fn detached_workers_degrade_fresh_health_until_last_guard_ends() {
+        let state = HealthState::new();
+        let first = state.enter_detached_worker();
+        let second = state.enter_detached_worker();
+        let ModuleControlResponse::HealthCheck {
+            status,
+            metrics: Some(metrics),
+            detail,
+        } = state.report()
+        else {
+            panic!("health report")
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(metrics["detachedWorkers"], 2);
+        assert_eq!(metrics["inFlightActions"], 0);
+        assert!(detail.unwrap().contains("2 detached workers"));
+        drop(first);
+        assert_eq!(state.detached_workers(), 1);
+        drop(second);
+        let ModuleControlResponse::HealthCheck {
+            status,
+            metrics: Some(metrics),
+            ..
+        } = state.report()
+        else {
+            panic!("health report")
+        };
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(metrics["detachedWorkers"], 0);
     }
 }
