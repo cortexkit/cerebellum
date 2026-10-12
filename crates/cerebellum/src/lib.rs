@@ -27,6 +27,7 @@ mod call_queue;
 mod call_record_supervisor;
 pub mod capability;
 pub mod cdp;
+pub mod cingulate_client;
 pub mod classification;
 pub mod computer_capability;
 pub mod computer_grants;

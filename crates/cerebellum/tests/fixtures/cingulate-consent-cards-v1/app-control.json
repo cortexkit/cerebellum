@@ -1,0 +1,38 @@
+{
+  "default": "deny",
+  "expires_in_ms": 1800000,
+  "facts": [],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "allow_conversation",
+      "label": "Allow for this conversation"
+    },
+    {
+      "effect": "grant",
+      "id": "allow_always",
+      "label": "Always allow"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Covers reading and acting inside this application.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "app": "com.example.Editor",
+    "team_id": "ABCDE12345"
+  },
+  "target": {
+    "kind": "app",
+    "label": "Editor"
+  },
+  "title": "Allow access to Editor?",
+  "urgency": "high"
+}

@@ -1,0 +1,50 @@
+{
+  "default": "keep",
+  "expires_in_ms": 1800000,
+  "facts": [
+    {
+      "label": "Browser launched",
+      "value": "Time not recorded"
+    },
+    {
+      "label": "Verified evidence",
+      "value": "none of the 3 running process(es) of this user names the profile directory; The browser lock is absent"
+    },
+    {
+      "label": "Recovery",
+      "value": "After restarting, the module could not prove the previous browser had exited"
+    },
+    {
+      "label": "Safety check",
+      "value": "The evidence is read again before anything is cleared"
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "effect": "grant",
+      "id": "clear",
+      "label": "Clear it"
+    },
+    {
+      "effect": "decline",
+      "id": "keep",
+      "label": "Keep it locked"
+    }
+  ],
+  "prompt": "Clear the stuck record so the agent can open its browser on this profile again.",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "profile_uuid": "7f0c2a8e-0000-4000-8000-000000000001",
+    "sequence": 12
+  },
+  "target": {
+    "kind": "machine",
+    "label": "the agent's browser profile"
+  },
+  "title": "Clear the stuck browser record?",
+  "urgency": "normal"
+}
