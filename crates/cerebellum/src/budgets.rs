@@ -297,6 +297,30 @@ budget!(
     ]
 );
 budget!(BROWSER_STATUS, "status", [("metadata", GRANT_LOOKUP_MS, 1)]);
+// open_tab and claim_tab ask the person's Chrome through the extension
+// bridge: one bridge turn (queue wait then reply) for the tab request. The
+// other user-target actions are served from the own-browser budgets above
+// until the user target adopts the call envelope as its own follow-up.
+pub const BRIDGE_TURN_MS: u64 = crate::user_browser_bridge::QUEUE_DEADLINE.as_millis() as u64
+    + crate::user_browser_bridge::REPLY_DEADLINE.as_millis() as u64;
+budget!(
+    BROWSER_OPEN_TAB,
+    "open_tab",
+    [
+        ("preflight", PREFLIGHT_MS, 1),
+        ("bridge_turn", BRIDGE_TURN_MS, 1),
+        ("journal", STORE_MS, 1),
+    ]
+);
+budget!(
+    BROWSER_CLAIM_TAB,
+    "claim_tab",
+    [
+        ("preflight", PREFLIGHT_MS, 1),
+        ("bridge_turn", BRIDGE_TURN_MS, 1),
+        ("journal", STORE_MS, 1),
+    ]
+);
 budget!(
     BROWSER_CLOSE,
     "close",
@@ -442,8 +466,10 @@ budget!(
         ("journal", STORE_MS, 1),
     ]
 );
-pub const BROWSER_ACTIONS: [ActionBudget; 9] = [
+pub const BROWSER_ACTIONS: [ActionBudget; 11] = [
     BROWSER_LAUNCH,
+    BROWSER_OPEN_TAB,
+    BROWSER_CLAIM_TAB,
     BROWSER_STATUS,
     BROWSER_CLOSE,
     BROWSER_NAVIGATE,
@@ -864,6 +890,8 @@ mod tests {
     fn browser_phase_accounting_includes_helpers_and_read_page() {
         let expected = [
             (BROWSER_LAUNCH, PREFLIGHT_MS + BROWSER_LAUNCH_MS + STORE_MS),
+            (BROWSER_OPEN_TAB, PREFLIGHT_MS + 60_000 + STORE_MS),
+            (BROWSER_CLAIM_TAB, PREFLIGHT_MS + 60_000 + STORE_MS),
             (BROWSER_STATUS, GRANT_LOOKUP_MS),
             (BROWSER_CLOSE, PREFLIGHT_MS + TEARDOWN_MS + STORE_MS),
             (
