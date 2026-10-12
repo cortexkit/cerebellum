@@ -225,8 +225,46 @@ trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
     fn observe(&mut self) -> Result<Value, String>;
     async fn click_observation(&mut self) -> Result<Value, String>;
+    fn failure_diagnostics(&mut self) -> Value;
     async fn restart(&mut self) -> Result<(), String>;
     fn outside_tab(&self) -> String;
+}
+
+#[derive(Default)]
+struct LastReply {
+    reply: Value,
+    asks: usize,
+}
+
+impl LastReply {
+    fn diagnostics(&self, fixture_text_allowed: bool) -> Value {
+        let text = self.reply["state_text"].as_str();
+        let prefix = text.filter(|_| fixture_text_allowed).map(|text| {
+            let mut end = text.len().min(400);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        });
+        json!({"outcome":self.reply["outcome"], "reason":self.reply["reason"],
+            "ask_count":self.asks, "state_text_prefix":prefix,
+            "state_text_withheld":text.is_some() && !fixture_text_allowed})
+    }
+}
+
+fn fixture_pages_only(targets: &Value, origin: &str) -> bool {
+    let Some(rows) = targets["targetInfos"].as_array() else {
+        return false;
+    };
+    let mut pages = rows
+        .iter()
+        .filter(|target| target["type"] == "page")
+        .peekable();
+    pages.peek().is_some()
+        && pages.all(|target| {
+            target["url"] == format!("{origin}/")
+                || target["url"] == format!("{origin}/outside-secret")
+        })
 }
 
 fn check(label: &str, passed: bool) -> Result<(), String> {
@@ -359,6 +397,14 @@ fn worker_event_line(event: &Value) -> Option<String> {
 }
 
 async fn exercise(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
+    let result = exercise_checks(driver, origin).await;
+    if result.is_err() {
+        println!("failed-check reply: {}", driver.failure_diagnostics());
+    }
+    result
+}
+
+async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
     let (opened, _) = driver.call(json!({"action":"open_tab"})).await?;
     check(
         "open_tab in Agent group",
@@ -1030,6 +1076,7 @@ mod live {
         page: Page,
         focus: Focus,
         corr: u64,
+        last_reply: LastReply,
     }
     const CHANNEL: u16 = 9;
     const EPOCH: u32 = 1;
@@ -1321,6 +1368,7 @@ mod live {
             page,
             focus,
             corr: 10,
+            last_reply: LastReply::default(),
         };
         let result = exercise(&mut driver, &origin).await;
         if result.is_err() {
@@ -1390,6 +1438,10 @@ mod live {
                     if !ok(&body) && body["outcome"] != "closed" {
                         println!("reply: {body}");
                     }
+                    self.last_reply = LastReply {
+                        reply: body.clone(),
+                        asks,
+                    };
                     return Ok((body, asks));
                 }
             }
@@ -1443,6 +1495,16 @@ mod live {
             detached?;
             observation["beacon_clicks"] = json!(self.page.reports.lock().unwrap().0);
             Ok(observation)
+        }
+        fn failure_diagnostics(&mut self) -> Value {
+            // The scratch browser should contain only the two loopback pages.
+            // Verify that through its own CDP observer before printing any text;
+            // unknown targets or a failed provenance check withhold the prefix.
+            let fixture_text_allowed = self
+                .cdp
+                .call("Target.getTargets", json!({}), None)
+                .is_ok_and(|targets| fixture_pages_only(&targets, &self.origin));
+            self.last_reply.diagnostics(fixture_text_allowed)
         }
         async fn restart(&mut self) -> Result<(), String> {
             let before = self
@@ -1537,6 +1599,8 @@ struct Double {
     clicked: usize,
     typed: String,
     click_observations: usize,
+    last_reply: LastReply,
+    failure: Option<Value>,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -1546,6 +1610,8 @@ impl Double {
             clicked: 0,
             typed: String::new(),
             click_observations: 0,
+            last_reply: LastReply::default(),
+            failure: None,
         }
     }
 }
@@ -1575,6 +1641,9 @@ impl Driver for Double {
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
                     json!("button-ref button Probe button\ninput-ref textbox Probe input");
+                if self.fault == "snapshot_text" {
+                    reply["state_text"] = json!("fixture-only".repeat(50));
+                }
             }
             "click" if self.epoch != 1 => {
                 reply["outcome"] = json!("refused");
@@ -1592,6 +1661,10 @@ impl Driver for Double {
             }
             _ => return Err("unexpected double action".into()),
         }
+        self.last_reply = LastReply {
+            reply: reply.clone(),
+            asks,
+        };
         Ok((reply, asks))
     }
     fn observe(&mut self) -> Result<Value, String> {
@@ -1609,6 +1682,11 @@ impl Driver for Double {
             "page_clicks":self.clicked,
             "beacon_clicks":if self.fault == "missed_beacon" {0} else {self.clicked}}),
         )
+    }
+    fn failure_diagnostics(&mut self) -> Value {
+        let diagnostics = self.last_reply.diagnostics(true);
+        self.failure = Some(diagnostics.clone());
+        diagnostics
     }
     async fn restart(&mut self) -> Result<(), String> {
         if self.fault != "epoch" {
@@ -1864,6 +1942,57 @@ async fn self_test() -> Result<(), String> {
             Err("page diagnostics did not isolate the fixture target".into())
         },
     ));
+    let mut driver = Double::new("snapshot_text");
+    let result = exercise(&mut driver, origin).await;
+    tests.push((
+        "failed_checks_report_last_reply_outcome_asks_and_fixture_prefix",
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error == "snapshot reads fixture and asks again after allow_once")
+            && driver.failure.as_ref().is_some_and(|diagnostics| {
+                diagnostics["outcome"] == "ok"
+                    && diagnostics["reason"].is_null()
+                    && diagnostics["ask_count"] == 1
+                    && diagnostics["state_text_prefix"]
+                        .as_str()
+                        .is_some_and(|text| text.len() == 400)
+                    && diagnostics["state_text_withheld"] == false
+            })
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed snapshot lacks reply diagnostics: {result:?}"
+            ))
+        },
+    ));
+    let reply = LastReply {
+        reply: json!({"outcome":"refused","reason":"read_again","state_text":format!("{}☃", "a".repeat(399))}),
+        asks: 2,
+    };
+    let allowed = reply.diagnostics(fixture_pages_only(&targets, origin));
+    let mut foreign = targets.clone();
+    foreign["targetInfos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"page","url":"https://outside.invalid/private","targetId":"foreign"}));
+    let withheld = reply.diagnostics(fixture_pages_only(&foreign, origin));
+    tests.push((
+        "failure_text_prefix_is_utf8_safe_and_withheld_for_nonfixture_targets",
+        if allowed["state_text_prefix"] == "a".repeat(399)
+            && allowed["outcome"] == "refused"
+            && allowed["reason"] == "read_again"
+            && allowed["ask_count"] == 2
+            && withheld["state_text_prefix"].is_null()
+            && withheld["state_text_withheld"] == true
+            && !fixture_pages_only(&json!({"targetInfos":[]}), origin)
+        {
+            Ok(())
+        } else {
+            Err("failure text was unbounded or exposed a nonfixture page".into())
+        },
+    ));
     for (fault, name) in [
         (
             "missed_click",
@@ -1919,10 +2048,11 @@ async fn self_test() -> Result<(), String> {
             "killed worker reconnects with a new epoch",
         ),
     ] {
-        let result = exercise(&mut Double::new(fault), "http://127.0.0.1:12345").await;
+        let mut driver = Double::new(fault);
+        let result = exercise(&mut driver, "http://127.0.0.1:12345").await;
         tests.push((
             name,
-            if result.as_ref().err().is_some_and(|e| e == expected) {
+            if result.as_ref().err().is_some_and(|e| e == expected) && driver.failure.is_some() {
                 Ok(())
             } else {
                 Err(format!(

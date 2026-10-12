@@ -129,6 +129,11 @@ operator tabs are used. A scratch consent relay validates the production card's
 browser target, exact fixture origin, wording and `allow_once` choice before
 answering. No phone, live consent channel or standing permission is needed.
 It prints a **PASS/FAIL line per check** and exits nonzero on a failed check.
+Every failed acceptance check also prints the last reply's outcome, reason, ask
+count and a UTF-8-safe prefix of at most 400 bytes of `state_text`. Text is
+withheld unless the probe's own CDP observer confirms that every page target is
+one of its two loopback fixtures; failed or unknown target checks never expose
+other page text.
 After a failed check it also prints the extension worker's console, exception
 and log events (the observer enables CDP `Runtime` on the worker) and each
 probe-build native host's recorded exit reason, read from
@@ -176,7 +181,7 @@ bash -n scripts/install-native-host.sh
 bash scripts/rust-test-gate.sh
 ```
 
-The explicit self-test runs 18 portable checks (19 on macOS, including process-
+The explicit self-test runs 20 portable checks (21 on macOS, including process-
 group and directory cleanup) with driver doubles and scratch manifest
 fixtures, without Chrome, a socket, a durable journal or any live profile. Its
 negative controls deliberately fail named acceptance checks; the final named
