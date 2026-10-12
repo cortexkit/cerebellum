@@ -801,6 +801,8 @@ pub enum ConsentRefusal {
     RouteClosed,
     /// The caller cancelled the request while it waited.
     Cancelled,
+    /// An earlier call still owns the queue; this call never dispatched.
+    QueueWaitExpired,
 }
 
 impl ConsentRefusal {
@@ -851,6 +853,10 @@ impl ConsentRefusal {
             }),
             Self::RouteClosed => json!({"outcome": "route_closed"}),
             Self::Cancelled => json!({"outcome": "cancelled"}),
+            Self::QueueWaitExpired => json!({
+                "outcome": "queue_wait_expired",
+                "remedy": "an earlier action in this conversation is still running; nothing was dispatched for this call; retry",
+            }),
         };
         if let (Some(bundle_identity), Self::Denied { grant_kind, .. }) = (bundle_identity, self) {
             if *grant_kind == "app" {

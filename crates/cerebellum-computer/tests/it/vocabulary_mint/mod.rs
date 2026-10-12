@@ -2009,3 +2009,18 @@ pub fn v22_from_v21(previous: &Value, revision: &str) -> Value {
     });
     next
 }
+
+/// Queue expiry is a pre-dispatch refusal for every row. Even
+/// indexed inventory calls can wait on a conversation predecessor; keystroke
+/// rows retain their existing not-dispatched envelope and held-state fields.
+pub fn v23_from_v22(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        row["result_schema"]["properties"]["outcome"]["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("queue_wait_expired"));
+    }
+    next
+}

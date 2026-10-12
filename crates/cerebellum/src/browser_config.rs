@@ -7,6 +7,14 @@ use std::ffi::OsString;
 
 use serde_json::{Map, Value};
 
+// Each renderer step gets at most the 30s budget already used by computer.wait.
+// Launch may use the same budget to reach its pipe handshake. Teardown gets
+// two 5s windows (grace and exit observation), matching the shipped defaults:
+// it must not turn a failed launch or close into another full action wait.
+pub(crate) const MAX_ACTION_DEADLINE_MS: u64 = 30_000;
+pub(crate) const MAX_LAUNCH_DEADLINE_MS: u64 = MAX_ACTION_DEADLINE_MS;
+pub(crate) const MAX_TERMINATION_DEADLINE_MS: u64 = 5_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserConfig {
     pub executable_path: Option<PathBuf>,
@@ -34,6 +42,9 @@ pub enum BrowserConfigReason {
     NotInteger,
     NotPositive,
     OutOfRange,
+    AboveDeadlineCap {
+        cap_ms: u64,
+    },
     PathNotAbsolute,
     ExpectedIdentityRequired,
     ExecutableProbeFailed(String),
@@ -67,6 +78,7 @@ impl BrowserConfigReason {
             Self::NotInteger => "not_integer",
             Self::NotPositive => "not_positive",
             Self::OutOfRange => "out_of_range",
+            Self::AboveDeadlineCap { .. } => "above_deadline_cap",
             Self::PathNotAbsolute => "path_not_absolute",
             Self::ExpectedIdentityRequired => "expected_identity_required",
             Self::ExecutableProbeFailed(_) => "executable_probe_failed",
@@ -87,6 +99,7 @@ impl BrowserConfigReason {
             | Self::NotInteger
             | Self::NotPositive
             | Self::OutOfRange
+            | Self::AboveDeadlineCap { .. }
             | Self::PathNotAbsolute
             | Self::ExpectedIdentityRequired
             | Self::FinalImageMismatch { .. }
@@ -115,6 +128,9 @@ impl std::fmt::Display for BrowserConfigError {
                 write!(f, "{}: value must be greater than zero", self.field)
             }
             BrowserConfigReason::OutOfRange => write!(f, "{}: value exceeds u64", self.field),
+            BrowserConfigReason::AboveDeadlineCap { cap_ms } => {
+                write!(f, "{}: deadline must not exceed {cap_ms}ms", self.field)
+            }
             BrowserConfigReason::PathNotAbsolute => {
                 write!(f, "{}: expected an absolute path", self.field)
             }
@@ -361,12 +377,21 @@ fn parse_browser(value: &Value) -> Result<BrowserConfig, BrowserConfigError> {
     Ok(BrowserConfig {
         executable_path,
         expected_identity,
-        launch_handshake_deadline_ms: required_positive_ms(object, "launch_handshake_deadline_ms")?,
-        termination_grace_period_ms: required_positive_ms(object, "termination_grace_period_ms")?,
+        launch_handshake_deadline_ms: bounded_deadline_ms(
+            object,
+            "launch_handshake_deadline_ms",
+            MAX_LAUNCH_DEADLINE_MS,
+        )?,
+        termination_grace_period_ms: bounded_deadline_ms(
+            object,
+            "termination_grace_period_ms",
+            MAX_TERMINATION_DEADLINE_MS,
+        )?,
         browser_idle_timeout_ms: required_positive_ms(object, "browser_idle_timeout_ms")?,
-        browser_exit_observation_deadline_ms: required_positive_ms(
+        browser_exit_observation_deadline_ms: bounded_deadline_ms(
             object,
             "browser_exit_observation_deadline_ms",
+            MAX_TERMINATION_DEADLINE_MS,
         )?,
         navigation_settle_deadline_ms: settle_deadline_ms(object)?,
     })
@@ -384,7 +409,11 @@ fn parse_browser(value: &Value) -> Result<BrowserConfig, BrowserConfigError> {
 /// value which disables a capability leaves the next person to discover it the
 /// hard way.
 fn settle_deadline_ms(object: &Map<String, Value>) -> Result<u64, BrowserConfigError> {
-    let value = required_positive_ms(object, "navigation_settle_deadline_ms")?;
+    let value = bounded_deadline_ms(
+        object,
+        "navigation_settle_deadline_ms",
+        MAX_ACTION_DEADLINE_MS,
+    )?;
     if value <= crate::browser::QUIET_MS {
         return Err(BrowserConfigError {
             field: "browser.navigation_settle_deadline_ms".to_string(),
@@ -438,6 +467,21 @@ fn required_positive_ms(
             reason: BrowserConfigReason::NotInteger,
         }),
     }
+}
+
+fn bounded_deadline_ms(
+    object: &Map<String, Value>,
+    member: &str,
+    cap_ms: u64,
+) -> Result<u64, BrowserConfigError> {
+    let value = required_positive_ms(object, member)?;
+    if value > cap_ms {
+        return Err(BrowserConfigError {
+            field: format!("browser.{member}"),
+            reason: BrowserConfigReason::AboveDeadlineCap { cap_ms },
+        });
+    }
+    Ok(value)
 }
 
 /// Map an executable-identity refusal to the configuration reason it means.
@@ -539,6 +583,53 @@ mod tests {
             }
         }"#
         .to_string()
+    }
+
+    #[test]
+    fn deadlines_above_caps_are_refused_with_field_and_cap() {
+        for (member, cap_ms) in [
+            ("launch_handshake_deadline_ms", 30_000),
+            ("termination_grace_period_ms", 5_000),
+            ("browser_exit_observation_deadline_ms", 5_000),
+            ("navigation_settle_deadline_ms", 30_000),
+        ] {
+            let mut value: Value = serde_json::from_str(&configured()).unwrap();
+            value["browser"][member] = serde_json::json!(cap_ms);
+            parse_browser_config(&value.to_string()).expect("cap itself must load");
+            for above in [cap_ms + 1, u64::MAX] {
+                value["browser"][member] = serde_json::json!(above);
+                let error =
+                    parse_browser_config(&value.to_string()).expect_err("never clamp a deadline");
+                assert_eq!(error.field, format!("browser.{member}"));
+                assert_eq!(
+                    error.reason,
+                    BrowserConfigReason::AboveDeadlineCap { cap_ms }
+                );
+                assert_eq!(error.reason.reason_code(), "above_deadline_cap");
+                assert!(error.to_string().contains(&format!("{cap_ms}ms")));
+                assert!(error.to_string().contains(member));
+            }
+        }
+    }
+
+    #[test]
+    fn default_browser_deadlines_load_unchanged() {
+        let config = parse_browser_config(
+            r#"{"browser":{
+            "launch_handshake_deadline_ms":10000,
+            "termination_grace_period_ms":5000,
+            "browser_idle_timeout_ms":60000,
+            "browser_exit_observation_deadline_ms":5000,
+            "navigation_settle_deadline_ms":30000
+        }}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.launch_handshake_deadline_ms, 10_000);
+        assert_eq!(config.termination_grace_period_ms, 5_000);
+        assert_eq!(config.browser_idle_timeout_ms, 60_000);
+        assert_eq!(config.browser_exit_observation_deadline_ms, 5_000);
+        assert_eq!(config.navigation_settle_deadline_ms, 30_000);
     }
 
     #[test]

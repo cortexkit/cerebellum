@@ -8,7 +8,6 @@
 //! app. Platform work can never hold the frame reader.
 
 use std::cell::RefCell;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +29,14 @@ use crate::call_queue::{
 use crate::computer_grants::ConsentRefusal;
 
 const RESOLUTION_LIMIT: Duration = Duration::from_secs(2);
+
+// A predecessor may park for consent for 120s, then spend the signer's learned
+// launch budget (at most 120s) opening an app. Include the 2s target-resolution
+// window. One arrival-based deadline covers both queues so moving from the
+// conversation lane to the app FIFO cannot restart the wait budget.
+const QUEUE_WAIT_LIMIT: Duration = crate::computer_grants::CONSENT_PARK_LIMIT
+    .saturating_add(Duration::from_millis(crate::open_app_history::CEILING_MS))
+    .saturating_add(RESOLUTION_LIMIT);
 
 #[derive(Default)]
 pub(super) struct Serializer {
@@ -148,12 +155,13 @@ where
             return Ok(None);
         }
         let cancel = context.cancel.clone();
-        let mut drain = context.consent.drain.clone();
+        let drain = context.consent.drain.clone();
+        let ticket = ticket.unwrap_or_else(|| {
+            self.serializer
+                .arrive(context.identity.conversation_key.clone(), None)
+        });
+        let deadline = ticket.wait_deadline(QUEUE_WAIT_LIMIT);
         let enter = async {
-            let ticket = ticket.unwrap_or_else(|| {
-                self.serializer
-                    .arrive(context.identity.conversation_key.clone(), None)
-            });
             let (conversation, order) = ticket.acquire().await;
             context.identity.computer_order = order.positioned();
             #[cfg(test)]
@@ -179,16 +187,7 @@ where
             let ticket = app?;
             Some(ticket.acquire().await)
         };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(ConsentRefusal::Cancelled),
-            _ = async {
-                if drain.wait_for(|draining| *draining).await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            } => Err(ConsentRefusal::Draining),
-            guard = enter => Ok(guard),
-        }
+        wait_for_lane(deadline, enter, cancel, drain).await
     }
 
     async fn reserve_app(
@@ -328,6 +327,25 @@ where
         .await
         .ok()
         .flatten()
+    }
+}
+
+async fn wait_for_lane(
+    deadline: tokio::time::Instant,
+    enter: impl Future<Output = Option<LaneGuard>>,
+    cancel: crate::CancelHandle,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<LaneGuard>, ConsentRefusal> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ConsentRefusal::Cancelled),
+        _ = async {
+            if drain.wait_for(|draining| *draining).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        } => Err(ConsentRefusal::Draining),
+        _ = tokio::time::sleep_until(deadline) => Err(ConsentRefusal::QueueWaitExpired),
+        guard = enter => Ok(guard),
     }
 }
 
@@ -1751,5 +1769,114 @@ mod tests {
             "cancelled"
         );
         rig.finish().await;
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_computer_holder_expires_both_queue_waits_without_dispatch() {
+        assert_eq!(QUEUE_WAIT_LIMIT, Duration::from_secs(242));
+        for stuck_app in [false, true] {
+            let queue = ConversationQueue::default();
+            let registry = Arc::new(Registry::default());
+            let (conversation, _) = queue.arrive("conversation".into(), None).acquire().await;
+            let mut conversation = Some(conversation);
+            let mut app_holder = Some(
+                registry
+                    .reserve(("conversation".into(), "app".into()))
+                    .acquire()
+                    .await,
+            );
+            let ticket = queue.arrive("conversation".into(), None);
+            let deadline = ticket.wait_deadline(QUEUE_WAIT_LIMIT);
+            let app = registry.reserve(("conversation".into(), "app".into()));
+            let (drain_tx, drain) = tokio::sync::watch::channel(false);
+            let enter = async move {
+                let (guard, _) = ticket.acquire().await;
+                drop(guard);
+                Some(app.acquire().await)
+            };
+            let queued = tokio::spawn(wait_for_lane(
+                deadline,
+                enter,
+                crate::CancelHandle::pending(),
+                drain,
+            ));
+            tokio::task::yield_now().await;
+            tokio::time::advance(RESOLUTION_LIMIT).await;
+            if stuck_app {
+                drop(conversation.take());
+            } else {
+                drop(app_holder.take());
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(QUEUE_WAIT_LIMIT - RESOLUTION_LIMIT - Duration::from_millis(1))
+                .await;
+            assert!(!queued.is_finished());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                queued.is_finished(),
+                "queue deadline did not end the call (app={stuck_app})"
+            );
+            assert_eq!(
+                queued.await.unwrap().err(),
+                Some(ConsentRefusal::QueueWaitExpired)
+            );
+            drop(conversation);
+            drop(app_holder);
+            assert!(queue.is_empty());
+            assert!(registry.is_empty());
+            drop(drain_tx);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn computer_queue_preserves_a_normal_consent_park() {
+        let registry = Arc::new(Registry::default());
+        let holder = registry
+            .reserve(("conversation".into(), "app".into()))
+            .acquire()
+            .await;
+        let ticket = registry.reserve(("conversation".into(), "app".into()));
+        let (drain_tx, drain) = tokio::sync::watch::channel(false);
+        let queued = tokio::spawn(wait_for_lane(
+            tokio::time::Instant::now() + QUEUE_WAIT_LIMIT,
+            async move { Some(ticket.acquire().await) },
+            crate::CancelHandle::pending(),
+            drain,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::computer_grants::CONSENT_PARK_LIMIT).await;
+        assert!(
+            !queued.is_finished(),
+            "normal consent must not expire the successor"
+        );
+        drop(holder);
+        drop(queued.await.unwrap().unwrap());
+        assert!(registry.is_empty());
+        drop(drain_tx);
+    }
+
+    #[test]
+    fn queue_expiry_replies_validate_for_every_computer_row() {
+        for id in cerebellum_computer::platform::COMPUTER_CAPABILITY_ROW_IDS {
+            let capability = super::super::servable(id).unwrap();
+            let reply = queued_refusal(
+                capability,
+                &serde_json::json!({}),
+                ConsentRefusal::QueueWaitExpired,
+            );
+            assert_eq!(reply["outcome"], "queue_wait_expired", "{id}: {reply}");
+            assert!(reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was dispatched"));
+            cerebellum_computer::platform::vocabulary::validate_capability_result(id, &reply)
+                .unwrap();
+        }
     }
 }

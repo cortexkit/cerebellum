@@ -273,6 +273,31 @@ fn positioned(mut frame: Frame, index: u32) -> Frame {
     frame
 }
 
+#[tokio::test(start_paused = true)]
+async fn browser_queue_waits_through_normal_consent_on_wire() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    grant_browser(&planes, "https://landed.example:8443", vec![]).await;
+    let (tx, mut rx) = mpsc::channel(16);
+    let question = begin(&planes, &tx, &mut rx).await;
+    send(&planes, &tx, call(802, "snapshot", json!({}))).await;
+    tokio::time::advance(Duration::from_secs(119)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "successor must wait through consent"
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
+    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    let results = replies(&mut rx, 2).await;
+    assert_eq!(
+        results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
+        [801, 802]
+    );
+    assert_eq!(body(&results[0])["outcome"], "ok");
+    assert_eq!(body(&results[1])["outcome"], "ok");
+    assert_eq!(*launcher.effects.lock().unwrap(), ["navigate", "snapshot"]);
+}
+
 #[tokio::test]
 async fn browser_queue_model_order_beats_reversed_arrival() {
     let (planes, launcher) = blocking_grant_fixture().await;
