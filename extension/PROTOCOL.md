@@ -78,8 +78,13 @@ implemented. Same-process CDP frame/context parameters retain their CDP meanings
 
 Results are exactly `{result:<CDP result>}` or
 `{error:{code:<int>, message:<string>}}`, in command order. Stop the plan at the
-first CDP error; later commands are absent. Error messages are sanitized so a
-Chrome error cannot bypass the adapter's page-content filtering. Group/claim,
+first CDP error; later commands are absent. The error is Chrome's own CDP code
+and fixed protocol message (for example `-32000`, "DOM agent hasn't been
+enabled"), which name the failure and carry no page content. Chrome's `data`
+field is dropped. A message over 200 characters or containing control
+characters, and any rejection that is not a CDP error object, becomes "Chrome
+debugger command failed". Cerebellum reports the failing method, code and
+message as the `detail` of its `cdp_error` refusal. Group/claim,
 stale interaction, method allowlist and debugger-busy failures are **plan-level
 refusals**, never a successful result containing an error entry.
 

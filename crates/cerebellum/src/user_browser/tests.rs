@@ -87,6 +87,8 @@ struct DoubleState {
     remove_group_on_card: bool,
     foreign_hit: bool,
     viewport_changed: bool,
+    /// Chrome's CDP error for the next plan command with this method.
+    fail_method: Option<(&'static str, i64, String)>,
 }
 
 struct Fixture {
@@ -400,8 +402,28 @@ fn execute(
         state.popup_once_on_metadata = false;
     }
     let mut results = Vec::new();
+    // Each plan is a fresh debugger attachment, so agents enabled by an
+    // earlier plan are disabled again, as in Chrome.
+    let mut dom_enabled = false;
     for command in commands {
         let method = command["method"].as_str().unwrap();
+        let failure = match &state.fail_method {
+            Some((failing, code, message)) if *failing == method => {
+                Some(json!({"code":code,"message":message}))
+            }
+            // Chrome refuses a flattened document before DOM.enable.
+            _ if method == "DOM.getFlattenedDocument" && !dom_enabled => {
+                Some(json!({"code":-32000,"message":"DOM agent hasn't been enabled"}))
+            }
+            _ => None,
+        };
+        if let Some(error) = failure {
+            state.fail_method = None;
+            // The extension stops a plan at its first CDP error.
+            results.push(json!({"error":error}));
+            break;
+        }
+        dom_enabled |= method == "DOM.enable";
         let result = match method {
             "Page.getNavigationHistory" => {
                 json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
@@ -493,6 +515,85 @@ fn reference(reply: &Value, name: &str) -> String {
 
 fn click(tab: &str, snapshot: &Value, reference: &str) -> Value {
     json!({"browser":"user","action":"click","tab":tab,"snapshot_id":snapshot["snapshot_id"],"ref":reference,"intent":"press Go","severity":{"tier":2,"credential":false,"financial":false}})
+}
+
+#[tokio::test]
+async fn cdp_errors_name_the_failing_method_with_chromes_code_and_message() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+    let reference = reference(&snapshot, "Go");
+    fixture.state.lock().unwrap().fail_method = Some((
+        "DOM.getContentQuads",
+        -32000,
+        "Could not compute content quads.".into(),
+    ));
+    let (reply, _) = fixture
+        .call(1, click(&tab, &snapshot, &reference), "allow_once")
+        .await;
+    assert_eq!(reply["reason"], "cdp_error", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"method":"DOM.getContentQuads","code":-32000,"message":"Could not compute content quads."})
+    );
+    assert_eq!(reply["input_dispatched"], false);
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+
+    // Anything that does not look like a fixed protocol string is replaced.
+    for message in ["line one\nline two".to_owned(), "x".repeat(201)] {
+        fixture.state.lock().unwrap().fail_method = Some(("DOM.getContentQuads", -32000, message));
+        let (reply, _) = fixture
+            .call(1, click(&tab, &snapshot, &reference), "allow_once")
+            .await;
+        assert_eq!(
+            reply["detail"],
+            json!({"method":"DOM.getContentQuads","code":-32000,"message":"Chrome debugger command failed"}),
+            "{reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() {
+    // The extension detaches between plans, so an agent enabled by one plan is
+    // gone in the next. A plan that reads the flattened DOM without enabling
+    // it first is refused by Chrome before any input is sent.
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+    let (clicked, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_once",
+        )
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(
+        state.inputs,
+        ["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]
+    );
+    let mut reads = 0;
+    for plan in &state.commands {
+        let methods: Vec<&str> = plan["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|command| command["method"].as_str().unwrap())
+            .collect();
+        if let Some(read) = methods
+            .iter()
+            .position(|method| *method == "DOM.getFlattenedDocument")
+        {
+            reads += 1;
+            assert!(methods[..read].contains(&"DOM.enable"), "{methods:?}");
+        }
+    }
+    // Six flattened-DOM reads: one for the snapshot's capture, one for the
+    // click's classification, and two re-verifications (target state and
+    // hit-test position) before each of the click's two mouse events.
+    assert_eq!(reads, 6);
 }
 
 #[tokio::test]
@@ -1077,6 +1178,12 @@ fn user_result_envelopes_are_closed_and_target_tagged() {
     let mut untagged = valid;
     untagged.as_object_mut().unwrap().remove("browser");
     assert!(crate::browser::validate_user_browser_result("snapshot", &untagged).is_err());
+    let cdp_error = json!({"browser":"user","outcome":"refused","reason":"cdp_error","input_dispatched":false,
+        "detail":{"method":"DOM.getContentQuads","code":-32000,"message":"Could not compute content quads."}});
+    assert!(crate::browser::validate_user_browser_result("click", &cdp_error).is_ok());
+    let mut with_data = cdp_error;
+    with_data["detail"]["data"] = json!("page text");
+    assert!(crate::browser::validate_user_browser_result("click", &with_data).is_err());
 }
 
 #[tokio::test]

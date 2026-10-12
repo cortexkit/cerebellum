@@ -4,6 +4,23 @@ import { classifyCommand, expectedEvents, resolveParams, verifyRuntime } from ".
 const routeKey = route => `${route.channel}:${route.epoch}`;
 const closed = (value, fields) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
 
+// chrome.debugger.sendCommand rejects with an Error whose message is Chrome's
+// CDP error object serialized as JSON, for example
+// {"code":-32000,"message":"DOM agent hasn't been enabled"}. Relay only that
+// code and its fixed protocol message, so cerebellum can say which command
+// failed and why. Chrome's optional `data` field is dropped, and any other
+// rejection, or a message that is long or multi-line, keeps the generic text.
+const MAX_CDP_ERROR_MESSAGE = 200;
+export function debuggerError(error) {
+  try {
+    const cdp = JSON.parse(error?.message);
+    if (Number.isSafeInteger(cdp?.code) && typeof cdp.message === "string" && cdp.message.length <= MAX_CDP_ERROR_MESSAGE && !/[\u0000-\u001f\u007f]/.test(cdp.message)) {
+      return { code: cdp.code, message: cdp.message };
+    }
+  } catch { /* Not a CDP error object. */ }
+  return { code: Number.isInteger(error?.code) ? error.code : -32000, message: "Chrome debugger command failed" };
+}
+
 export function validatePlan(plan) {
   if (!closed(plan, ["version", "action", "tab", "url", "opener_tab", "interaction_epoch", "commands"]) || plan.version !== 1) throw new Refusal("invalid_plan", "update cerebellum and the extension together");
   const fields = {
@@ -241,7 +258,7 @@ export class Agent {
         results.push({ result });
       } catch (error) {
         if (error instanceof Refusal) throw error;
-        results.push({ error: { code: Number.isInteger(error.code) ? error.code : -32000, message: "Chrome debugger command failed" } });
+        results.push({ error: debuggerError(error) });
         break;
       } finally {
         if (kind === "input") await this.epochs.disarm(state.tabId, frameId);
