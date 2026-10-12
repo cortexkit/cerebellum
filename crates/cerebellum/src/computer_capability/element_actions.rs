@@ -444,12 +444,28 @@ where
     recorded: bool,
 }
 
-impl<R, T, S> ElementJournal<'_, R, T, S>
+impl<'a, R, T, S> ElementJournal<'a, R, T, S>
 where
     R: Redactor,
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
+    pub(crate) fn new(
+        audit: AuditToken<R, T, S>,
+        identity: JournalIdentity,
+        capability: ComputerCapability,
+        grant: &'a ProcessGrant,
+    ) -> Self {
+        Self {
+            audit,
+            identity,
+            capability,
+            grant,
+            pending: None,
+            recorded: false,
+        }
+    }
+
     /// Record a refusal decided after the element was found, before anything
     /// was sent to it.
     fn refused(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
@@ -1415,14 +1431,8 @@ where
         let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            let mut journal = ElementJournal {
-                audit,
-                identity,
-                capability: ComputerCapability::WriteText,
-                grant: &grant,
-                pending: None,
-                recorded: false,
-            };
+            let mut journal =
+                ElementJournal::new(audit, identity, ComputerCapability::WriteText, &grant);
             let written = write_blocking(
                 source.as_ref(),
                 &mut journal,
@@ -1569,14 +1579,7 @@ where
             };
             cursor.schedule(identity.agent_project_id.clone(), cerebellum_computer::cursor::CursorKind::Press,
                 grant.clone(), source.clone(), Some(handle.clone()), point);
-            let mut journal = ElementJournal {
-                audit,
-                identity: identity.clone(),
-                capability,
-                grant: &grant,
-                pending: None,
-                recorded: false,
-            };
+            let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if reply["outcome"] == "completed" {
                 let observed = settle_and_observe_view(

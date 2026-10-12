@@ -166,6 +166,27 @@ fn a_worker_publishing_after_the_terminal_closes_its_own_interval_at_once() {
 }
 
 #[tokio::test]
+async fn the_work_deadline_pauses_while_the_call_waits_on_a_person() {
+    CallWork::new(None, Duration::from_secs(1), None, None)
+        .scope(async {
+            let before = CallWork::current().deadline();
+            {
+                let _parked = quarantine::park_clock().expect("a call has a work context");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                CallWork::current().deadline() >= before + Duration::from_millis(50),
+                "the time parked was added back to the work budget"
+            );
+        })
+        .await;
+    assert!(
+        quarantine::park_clock().is_none(),
+        "outside a call nothing is counted"
+    );
+}
+
+#[tokio::test]
 async fn held_input_clears_when_the_late_worker_reports_its_presses_released() {
     let held = Arc::new(HeldInput::default());
     let call = terminal();
@@ -349,6 +370,91 @@ fn bounded_refusals_pass_every_rows_frozen_result_schema() {
             }
         }
     }
+}
+
+/// An element source that counts presses: a press after the call's stop is
+/// an external call the gate must have refused.
+#[cfg(target_os = "macos")]
+struct CountingPresses(AtomicUsize);
+
+#[cfg(target_os = "macos")]
+impl cerebellum_computer::app_state::source::AppStateSource for CountingPresses {
+    fn read_app_state(
+        &self,
+        _: &ProcessGrant,
+        _: cerebellum_computer::app_state::source::ReadBounds,
+    ) -> Result<
+        cerebellum_computer::app_state::source::RawAppState,
+        cerebellum_computer::app_state::source::AppStateReadError,
+    > {
+        Err(cerebellum_computer::app_state::source::AppStateReadError::Unreadable)
+    }
+    fn element_facts(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Result<
+        cerebellum_computer::app_state::source::ElementFacts,
+        cerebellum_computer::app_state::source::ElementActionError,
+    > {
+        Ok(cerebellum_computer::app_state::source::ElementFacts {
+            pid: Some(42),
+            role: Some("AXButton".into()),
+            subrole: None,
+            title: None,
+            actions: vec!["AXPress".into()],
+            value_settable: false,
+            selected_text_settable: false,
+        })
+    }
+    fn press(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Result<(), cerebellum_computer::app_state::source::ElementActionError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_element_press_after_the_stop_is_never_sent_and_is_journaled_as_stopped() {
+    use cerebellum_computer::audit::{lock_audit, AuditToken, ComputerCapability};
+    let audit = Arc::new(std::sync::Mutex::new(
+        super::computer_audit(crate::JournalPersistence::Isolated).unwrap(),
+    ));
+    let call = terminal();
+    call.stop(TerminalCause::Deadline);
+    let token = AuditToken::new(audit.clone(), Arc::new(quarantine::ArbiterGate(Some(call))));
+    let target = grant(42, EDITOR);
+    let identity = cerebellum_computer::audit::journal_identity(
+        "direct:agent",
+        "conversation",
+        "project",
+        cerebellum_core::identity::SessionKind::Primary,
+    );
+    let mut journal = super::element_actions::ElementJournal::new(
+        token,
+        identity,
+        ComputerCapability::PressElement,
+        &target,
+    );
+    let source = CountingPresses(AtomicUsize::new(0));
+    let handle: cerebellum_computer::app_state::source::ElementHandle = Arc::new(
+        cerebellum_computer::app_state::source::FixtureElementToken(1),
+    );
+    let reply =
+        super::element_actions::press_blocking(&source, &mut journal, &target, "e1", &handle);
+    assert_eq!(reply["outcome"], "action_deadline_exceeded", "{reply}");
+    assert_eq!(
+        source.0.load(Ordering::SeqCst),
+        0,
+        "no press after the stop"
+    );
+    assert_eq!(
+        lock_audit(&audit).journal().unfinalized_dispatch_count(),
+        0,
+        "the reserved entry was closed, not left open"
+    );
 }
 
 /// A driver whose every method is unreachable: releasing global input must
