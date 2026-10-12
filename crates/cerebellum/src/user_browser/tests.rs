@@ -89,6 +89,11 @@ struct DoubleState {
     viewport_changed: bool,
     /// Chrome's CDP error for the next plan command with this method.
     fail_method: Option<(&'static str, i64, String)>,
+    /// The "Go" button has no type attribute and no form, like the button in
+    /// the real-Chrome probe's page (examples/user_browser_probe.rs). A
+    /// `<button>` defaults to type submit, so this checks that a submit-type
+    /// control without a form owner is not rated as a form submit.
+    untyped_button: bool,
 }
 
 struct Fixture {
@@ -445,7 +450,12 @@ fn execute(
                     .push(command["params"]["frameId"].as_str().unwrap().into());
                 ax()
             }
-            "DOM.getFlattenedDocument" => dom(state.new_tab_link, state.password, state.payment),
+            "DOM.getFlattenedDocument" => dom(
+                state.new_tab_link,
+                state.password,
+                state.payment,
+                state.untyped_button,
+            ),
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
             "DOM.getNodeForLocation" => {
                 json!({"backendNodeId":3,"frameId":if state.foreign_hit { "foreign" } else { "main" }})
@@ -490,11 +500,18 @@ fn ax() -> Value {
     ]})
 }
 
-fn dom(new_tab: bool, password: bool, payment: bool) -> Value {
+fn dom(new_tab: bool, password: bool, payment: bool, untyped_button: bool) -> Value {
+    let button_attributes = if new_tab {
+        json!(["href", "/new", "target", "_blank"])
+    } else if untyped_button {
+        json!([])
+    } else {
+        json!(["type", "button"])
+    };
     json!({"nodes":[
         {"nodeId":1,"backendNodeId":1,"nodeType":9,"nodeName":"#document","localName":"","nodeValue":""},
         {"nodeId":2,"parentId":1,"backendNodeId":2,"nodeType":1,"nodeName":"DIV","localName":"div","attributes":[]},
-        {"nodeId":3,"parentId":2,"backendNodeId":3,"nodeType":1,"nodeName":if new_tab {"A"} else {"BUTTON"},"localName":if new_tab {"a"} else {"button"},"attributes":if new_tab {json!(["href","/new","target","_blank"])} else {json!(["type","button"])}},
+        {"nodeId":3,"parentId":2,"backendNodeId":3,"nodeType":1,"nodeName":if new_tab {"A"} else {"BUTTON"},"localName":if new_tab {"a"} else {"button"},"attributes":button_attributes},
         {"nodeId":4,"parentId":2,"backendNodeId":4,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":if payment { json!(["type","text","autocomplete","cc-number"]) } else { json!(["type",if password {"password"} else {"text"}]) }},
         {"nodeId":5,"parentId":2,"backendNodeId":5,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":["type","password"]}
     ]})
@@ -594,6 +611,27 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
     // click's classification, and two re-verifications (target state and
     // hit-test position) before each of the click's two mouse events.
     assert_eq!(reads, 6);
+}
+
+#[tokio::test]
+async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
+    // A <button> defaults to type submit, but with no form owner it submits
+    // nothing. It must classify at the declared level, so the read card is the
+    // only card: one invocation, one allow_once ask.
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().untyped_button = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (clicked, cards) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_once",
+        )
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0]["params"]["scope"]["severity_tier"], 2);
 }
 
 #[tokio::test]

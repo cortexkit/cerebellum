@@ -4603,6 +4603,79 @@ mod tests {
         new_snapshot_id, BrowserSnapshotStore, RefCandidate, RefResolution, TextSnapshot, AX_SCHEMA,
     };
 
+    /// Classify element 3 of a flattened DOM, the owned browser's capture shape.
+    fn submit_classification(nodes: Value) -> (bool, u8) {
+        let identity = BackendNodeIdentity::new("page", "main", 3).unwrap();
+        let record = classify_flattened_document(
+            json!({ "nodes": nodes }).as_object().unwrap(),
+            &identity,
+            1,
+            "https://example.test/",
+        )
+        .unwrap();
+        (record.activation_invokes_form_submit, record.required_tier)
+    }
+
+    #[test]
+    fn only_controls_with_a_form_owner_are_form_submits() {
+        let document = json!({"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"#document"});
+        let form = |attributes: Value| json!({"nodeId":2,"parentId":1,"backendNodeId":2,"nodeType":1,"localName":"form","attributes":attributes});
+        let control = |parent: u64, local: &str, attributes: Value| json!({"nodeId":3,"parentId":parent,"backendNodeId":3,"nodeType":1,"localName":local,"attributes":attributes});
+        // A button's default type is submit, but without a form owner there
+        // is nothing to submit.
+        assert_eq!(
+            submit_classification(json!([document, control(1, "button", json!([]))])),
+            (false, 2),
+            "form-less button"
+        );
+        assert_eq!(
+            submit_classification(json!([
+                document,
+                form(json!([])),
+                control(2, "button", json!([]))
+            ])),
+            (true, 4),
+            "button inside a form"
+        );
+        assert_eq!(
+            submit_classification(json!([
+                document,
+                form(json!(["id", "f"])),
+                control(1, "button", json!(["form", "f"]))
+            ])),
+            (true, 4),
+            "button naming an existing form"
+        );
+        // A form attribute that names no form leaves the control without an
+        // owner, even inside another form.
+        assert_eq!(
+            submit_classification(json!([
+                document,
+                form(json!(["id", "f"])),
+                control(2, "button", json!(["form", "missing"]))
+            ])),
+            (false, 2),
+            "button naming a missing form"
+        );
+        assert_eq!(
+            submit_classification(json!([
+                document,
+                control(1, "input", json!(["type", "submit"]))
+            ])),
+            (false, 2),
+            "form-less submit input"
+        );
+        assert_eq!(
+            submit_classification(json!([
+                document,
+                form(json!([])),
+                control(2, "input", json!(["type", "image"]))
+            ])),
+            (true, 4),
+            "image input inside a form"
+        );
+    }
+
     #[derive(Default)]
     struct FakePipe {
         writes: Vec<Value>,
