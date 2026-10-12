@@ -5,7 +5,7 @@ use crate::*;
 use cortexkit_role_tool_provider::call::SchemaPin;
 use cortexkit_role_tool_provider::catalog::{
     composition_digest, schema_digest, session_capabilities, CatalogAnswer, CatalogRequest,
-    CatalogTool,
+    CatalogTool, Reply,
 };
 use cortexkit_role_tool_provider::describe::{Major, RoleDescribe};
 use cortexkit_role_tool_provider::late_results::{AckRequest, LateResultsRequest};
@@ -43,26 +43,34 @@ fn catalog_tools(planes: &Planes) -> Vec<CatalogTool> {
 
 fn definitions(browser_names: &[String], computer_names: &[String]) -> Vec<CatalogTool> {
     [
-        (flat_tools::computer_tool(computer_names), "computer.use/v1"),
-        (flat_tools::browser_tool(browser_names), "browser.use/v1"),
+        (
+            flat_tools::computer_tool(computer_names),
+            "computer.use/v1",
+            budgets::COMPUTER_REPLY_MAX_MS,
+        ),
+        (
+            flat_tools::browser_tool(browser_names),
+            "browser.use/v1",
+            budgets::BROWSER_REPLY_MAX_MS,
+        ),
     ]
     .into_iter()
-    .filter_map(|(tool, tag)| {
+    .filter_map(|(tool, tag, max_ms)| {
         let tool = tool?;
         let tags = vec![tag.to_string(), format!("cerebellum:{tag}")];
         for tag in &tags {
             check_capability_tag(tag).expect("provider capability tag is valid");
         }
-        // No reply deadline is declared: browser queue waits and configured
-        // action deadlines are unbounded. A finite max_ms would promise a
-        // receive-to-terminal bound execution does not currently enforce.
+        // The bound ends at terminal-frame delivery or connection failure,
+        // not at enqueueing the reply on the connection's output channel.
         let mut definition = CatalogTool::new(
             tool.name,
             schema_digest(&tool.schema).expect("flat schema canonicalizes structurally"),
             1,
             tool.schema,
         )
-        .with_capabilities(tags);
+        .with_capabilities(tags)
+        .with_reply(Reply::new(max_ms));
         definition.description = tool.description;
         Some(definition)
     })
@@ -412,6 +420,31 @@ pub(crate) async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_declares_each_tools_formula_derived_reply_bound() {
+        let definitions = definitions(
+            &[crate::browser::NAVIGATE.to_owned()],
+            &["computer.wait".to_owned()],
+        );
+        assert_eq!(definitions.len(), 2);
+        for tool in definitions {
+            cortexkit_role_tool_provider::catalog::check_reply(&tool).unwrap();
+            let max_ms = match tool.name.as_str() {
+                "computer_use" => budgets::COMPUTER_REPLY_MAX_MS,
+                "browser_use" => budgets::BROWSER_REPLY_MAX_MS,
+                _ => panic!("unexpected tool: {}", tool.name),
+            };
+            let mut serialized = serde_json::to_value(&tool).unwrap();
+            assert_eq!(serialized["reply"], json!({"max_ms": max_ms}));
+            let with_bound = manifest::sha256_hex(&manifest::canonical_json_bytes(&serialized));
+            serialized.as_object_mut().unwrap().remove("reply");
+            assert_ne!(
+                with_bound,
+                manifest::sha256_hex(&manifest::canonical_json_bytes(&serialized))
+            );
+        }
+    }
 
     #[test]
     fn catalog_preserves_flat_definition_bytes() {

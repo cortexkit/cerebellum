@@ -671,6 +671,75 @@ pub fn translate_browser(arguments: &Value) -> Result<FlatDispatch, InvalidFlatR
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_admitted_action_has_a_budget() {
+        use crate::budgets;
+        use std::collections::BTreeSet;
+
+        let vocabulary = super::computer_vocabulary();
+        let admitted = vocabulary["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["capability_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let computer = super::computer_action_fields(&admitted);
+        assert!(!computer.is_empty());
+        let mut expected = BTreeSet::new();
+        for (action, _, _) in computer {
+            assert!(budgets::computer(&action).is_some(), "{action}");
+            expected.insert(action);
+        }
+        assert_eq!(
+            expected,
+            budgets::COMPUTER_ACTIONS
+                .iter()
+                .map(|entry| entry.action.to_owned())
+                .collect()
+        );
+        assert_eq!(expected.len(), budgets::COMPUTER_ACTIONS.len());
+
+        for action in super::BROWSER_CAPABILITY_ACTIONS {
+            assert!(budgets::browser(action).is_some(), "{action}");
+        }
+        assert_eq!(
+            super::BROWSER_CAPABILITY_ACTIONS
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            budgets::BROWSER_ACTIONS
+                .iter()
+                .map(|entry| entry.action)
+                .collect()
+        );
+        assert_eq!(
+            super::BROWSER_CAPABILITY_ACTIONS.len(),
+            budgets::BROWSER_ACTIONS.len()
+        );
+        for (action, method) in super::BROWSER_MANAGEMENT_ACTIONS {
+            assert!(budgets::management(method).is_some(), "{action}: {method}");
+            assert!(budgets::management(method).unwrap().work_ms <= budgets::BROWSER_MAX_WORK_MS);
+        }
+        for method in crate::management::OPERATIONS {
+            assert!(budgets::management(method).is_some(), "{method}");
+        }
+        assert_eq!(
+            crate::management::OPERATIONS
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            budgets::MANAGEMENT_ACTIONS
+                .iter()
+                .map(|entry| entry.action)
+                .collect()
+        );
+        assert_eq!(
+            crate::management::OPERATIONS.len(),
+            budgets::MANAGEMENT_ACTIONS.len()
+        );
+        assert!(budgets::computer("unknown").is_none());
+        assert!(budgets::browser("unknown").is_none());
+        assert!(budgets::management("unknown").is_none());
+    }
+
     use super::*;
 
     /// Every capability this module serves, which is every one production
