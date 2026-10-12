@@ -1,7 +1,7 @@
 //! The client's wire tests, against the scripted Cingulate in `double.rs`.
 //!
-//! Part one pins every card kind's bytes. Part two drives the desk through
-//! each ending the contract allows.
+//! Part one pins every card kind's bytes. Part two drives `ConsentDesk`
+//! through each ending Cingulate's `consent-requester-v2` contract allows.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use super::route::CallError;
 use super::wire::{self, Record};
 
 // ---------------------------------------------------------------------------
-// Every card kind, as today's builders render it
+// Every card kind, as the production builders render it
 // ---------------------------------------------------------------------------
 
 /// The call key every golden card carries as its `requester_ref`.
@@ -182,10 +182,10 @@ fn request_for(kind: CardKind, body: &Value, deadline: Duration) -> CardRequest 
         .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"))
 }
 
-/// The params as the reverse lane sent them: the builder's params with the
-/// enforced deadline stamped as `expires_in_ms`. Written out here rather
-/// than taken from the mapping, so the comparison below is with the old wire
-/// and not with the mapping's own idea of it.
+/// The params as the reverse elicitation lane (see `mod.rs`) sent them: the
+/// builder's params with the enforced deadline stamped as `expires_in_ms`.
+/// Written out here rather than taken from the mapping, so the comparison
+/// below is with that earlier wire and not with the mapping's own idea of it.
 fn as_the_reverse_lane_sent_it(body: &Value, deadline: Duration) -> Value {
     let mut params = body["params"].clone();
     params["expires_in_ms"] = json!(deadline.as_millis() as u64);
@@ -221,10 +221,10 @@ const REQUEST_KEYS: [&str; 22] = [
 const OPTION_KEYS: [&str; 5] = ["id", "label", "effect", "detail", "group"];
 
 /// Every kind maps to a kind-`consent` request Cingulate's closed decoder
-/// accepts, and differs from the card the reverse lane sent only by what the
-/// move requires: no `requestedSchema`, no `call_key`, no option
-/// `next_step`, and the call key as `requester_ref`. So every field the phone
-/// renders is the same as before.
+/// accepts, and differs from the card the reverse elicitation lane sent only
+/// by what Cingulate's closed format requires: no `requestedSchema`, no
+/// `call_key`, no option `next_step`, and the call key as `requester_ref`.
+/// So every field the phone renders is unchanged.
 #[test]
 fn every_card_kind_shows_the_phone_what_it_showed_before() {
     for (kind, name, body, deadline) in todays_cards() {
@@ -258,7 +258,10 @@ fn every_card_kind_shows_the_phone_what_it_showed_before() {
         }
         let mut after = request.params.clone();
         after.as_object_mut().unwrap().remove("requester_ref");
-        assert_eq!(after, before, "{name}: the card changed beyond the move");
+        assert_eq!(
+            after, before,
+            "{name}: the card changed beyond what Cingulate requires"
+        );
         assert_eq!(
             serde_json::to_string(&phone_visible(&request.params)).unwrap(),
             serde_json::to_string(&phone_visible(&as_the_reverse_lane_sent_it(
@@ -510,7 +513,8 @@ async fn every_card_kind_is_raised_with_cingulate() {
 }
 
 /// An answer that lands while the call holds the card is answered in the
-/// call, after one await capped at Cingulate's two minutes.
+/// call, after one await capped at Cingulate's `consent.await` limit of two
+/// minutes (`wire::AWAIT_CAP_MS`).
 #[tokio::test]
 async fn an_answer_inside_the_park_is_answered_in_the_call() {
     let cingulate = ScriptedCingulate::new();
@@ -541,8 +545,9 @@ async fn an_answer_inside_the_park_is_answered_in_the_call() {
     );
 }
 
-/// The park ends unanswered: the card is detached at that moment and the
-/// call reports it pending, promising the wake Cingulate's notice gives.
+/// The call stops waiting on the card unanswered: the card is detached at
+/// that moment and the call reports it pending, telling the agent it will be
+/// woken by Cingulate's notice when the card settles.
 #[tokio::test]
 async fn an_unanswered_park_detaches_and_is_pending_with_a_wake() {
     let cingulate = ScriptedCingulate::new();
@@ -640,7 +645,8 @@ async fn an_unknown_detach_is_pending_without_a_wake() {
     assert!(remedy.contains("call this tool again later"), "{remedy}");
 }
 
-/// Any other detach refusal ends the call through the normal endings.
+/// A detach refusal other than `unknown_method` ends the call with its typed
+/// `Ending`, here `DeliveryFailed` for `consent_unavailable`.
 #[tokio::test]
 async fn another_detach_refusal_is_a_typed_ending() {
     let cingulate = ScriptedCingulate::new();
@@ -686,7 +692,8 @@ async fn a_cancelled_call_withdraws_its_card() {
     assert_eq!(desk.raised("el_1"), None);
 }
 
-/// The call's route unbinding while it waits withdraws the card too.
+/// If the route the call arrived on closes while the call waits on the card,
+/// the card is withdrawn, as on cancellation.
 #[tokio::test]
 async fn a_closed_route_withdraws_its_card() {
     let cingulate = ScriptedCingulate::new();
@@ -987,8 +994,10 @@ async fn a_crash_between_apply_and_ack_reapplies_once_without_duplicating() {
     );
 }
 
-/// Each refusal code maps to the ending the reverse lane reported for the
-/// same situation.
+/// Each refusal code maps to its typed ending: refusals that mean Cingulate
+/// will never show this card are `NotPutToAnyone`, a card that is gone from
+/// this requester's view is `NoAnswer`, and failures to carry the request are
+/// `DeliveryFailed`.
 #[test]
 fn every_refusal_code_maps_to_its_typed_ending() {
     use super::double::refusal;

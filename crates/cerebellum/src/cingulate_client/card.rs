@@ -1,17 +1,19 @@
-//! Today's consent cards, as Cingulate `consent.request` params.
+//! Cerebellum's consent cards, as Cingulate `consent.request` params.
 //!
-//! Every card cerebellum raises is built by the same builders as before
+//! Every card cerebellum raises is built by the builders that also served the
+//! reverse elicitation lane (see the module docs in `mod.rs`)
 //! (`management::browser_grant_question`, `computer_grants::question_body`,
 //! `login_import::import_question`, `login_capture::consent_question`,
 //! `management::profile_root_rebind_question`,
 //! `management::launch_recovery_clear_question`), which render an
 //! `elicitation/create` body. This file lifts that body's `params` into
-//! Cingulate's generic `consent` request and changes only what the move
-//! requires, so the phone sees the same title, prompt, target, facts,
-//! options, default, urgency, scope, lifetime and duration as before:
+//! Cingulate's generic `consent` request and changes only what Cingulate's
+//! closed request format requires, so the phone sees the same title, prompt,
+//! target, facts, options, default, urgency, scope, lifetime and duration as
+//! it did on the reverse elicitation lane. The differences:
 //!
 //! - `expires_in_ms` is stamped from the deadline the call site enforces, as
-//!   the reverse lane stamped it, so the number on the card is the number the
+//!   that lane stamped it, so the number on the card is the number the
 //!   code waits on.
 //! - The originating call's key travels as `requester_ref` (opaque
 //!   correlation, no dedup meaning), not `call_key`, which Cingulate refuses.
@@ -63,9 +65,11 @@ impl CardKind {
         Self::StuckProfileClearance,
     ];
 
-    /// Whether an approval of this card is used once by the agent's retry,
-    /// rather than becoming a grant: such a late approval is recorded as
-    /// single-use and its execution reported back to Cingulate.
+    /// Whether an approval of this card is consumed once rather than becoming
+    /// a grant. An approval that arrives after the call that raised the card
+    /// stopped waiting is recorded as single-use: the agent's next call of the
+    /// same tool with the same arguments acts on it once and reports its
+    /// execution back to Cingulate.
     pub fn single_use(self) -> bool {
         matches!(self, Self::LoginImport | Self::LoginCapture)
     }
@@ -86,8 +90,9 @@ pub struct CardRequest {
     pub next_steps: BTreeMap<String, String>,
 }
 
-/// Why a rendered body could not become a request. Only a builder bug causes
-/// it, and a card that is not raised is reported as put to nobody.
+/// Why a rendered body could not become a request. Only a bug in a card
+/// builder causes it. The card is then never raised, and the caller should
+/// end the call as `Ending::NotPutToAnyone`: no person was shown anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotACard(pub &'static str);
 

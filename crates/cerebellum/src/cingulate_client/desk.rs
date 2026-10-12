@@ -30,12 +30,13 @@ use super::live_call::{LiveCall, SessionKey};
 use super::route::{CallError, CingulateOpener, CingulateRoute};
 use super::wire::{self, CardState, Execution, Record, RefusalCode};
 
-/// How a card ended, as the code that raised it reads it.
+/// How a card ended, from the point of view of the code that raised it.
 ///
-/// These are the endings the reverse lane reported, kept apart for the same
-/// reason: a refusal is a decision, silence may be answered next time, a card
-/// nobody was shown never will be, and a delivery failure is this side's
-/// fault and worth retrying.
+/// The same endings the reverse elicitation lane reported, kept as separate
+/// variants because callers must treat them differently: a refusal is a
+/// decision, silence may be answered next time, a card nobody was shown
+/// never will be, and a delivery failure is this side's fault and worth
+/// retrying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ending {
     /// The operator chose one of the card's granting options.
@@ -201,8 +202,10 @@ pub struct DrainReport {
     pub acked: Option<i64>,
 }
 
-/// Late approvals of single-use cards (login import and capture), each
-/// waiting for the one retry that may act on it.
+/// Approvals of single-use cards (login import and capture) that arrived
+/// after the raising call stopped waiting, keyed by session and subject. Each
+/// waits for the agent's next call of the same tool with the same arguments,
+/// which may act on it once.
 #[derive(Default)]
 struct SingleUse {
     approvals: HashMap<(SessionKey, String), (String, String)>,
@@ -251,9 +254,11 @@ impl ConsentDesk {
 
     /// Open a route to Cingulate for `live`'s call.
     ///
-    /// Refuses without opening anything once the call is no longer held:
-    /// the carrier listing that admits this route exists for calls the agent
-    /// is making, not for cerebellum acting on its own.
+    /// Returns `CallError::NotLive` without opening anything once the call is
+    /// no longer held. The daemon admits this route only because core lists
+    /// cerebellum as a carrier of the agent's session scope (allowed to open
+    /// routes to Cingulate under it), and that permission exists for calls the
+    /// agent is making, not for cerebellum acting on its own.
     pub async fn session<'a>(&'a self, live: &'a LiveCall) -> Result<DeskSession<'a>, CallError> {
         if !live.is_held() {
             return Err(CallError::NotLive);
@@ -280,9 +285,10 @@ impl ConsentDesk {
             .cloned()
     }
 
-    /// Take the late single-use approval recorded for `subject` on this
-    /// session, at most once. Returns the card's elicitation id, which the
-    /// retry reports its execution against.
+    /// Take, at most once, the single-use approval `drain_answers` recorded
+    /// for `subject` on this session after the raising call had stopped
+    /// waiting. Returns the card's elicitation id, which the calling retry
+    /// reports its execution against with `report_execution`.
     pub fn take_single_use_approval(&self, session: &SessionKey, subject: &str) -> Option<String> {
         lock(&self.single_use)
             .approvals
@@ -362,9 +368,10 @@ impl DeskSession<'_> {
                 applied: false,
             },
         );
-        // A card that is not in the stored registry would have its late
-        // answer ignored after a restart; the card is still raised, so the
-        // in-call answer is unaffected.
+        // The save result is deliberately ignored: if it fails, the card is
+        // missing from the stored registry and an answer arriving after a
+        // restart would be ignored, but the card is raised either way, so an
+        // answer given while this call waits is unaffected.
         let _ = self.desk.save();
         Ok(elicitation_id)
     }
@@ -461,11 +468,13 @@ impl DeskSession<'_> {
         {
             Ok(record) if record.is_settled() => Ok(Detach::AlreadySettled(record)),
             Ok(record) if record.detached => Ok(Detach::Detached(record)),
-            // A pending record without the mark is outside the contract: the
-            // card was not detached, so no wake can be promised.
+            // A pending record without `detached: true` means Cingulate did
+            // not detach the card, so the agent cannot be promised the notice
+            // Cingulate sends when a detached card settles.
             Ok(_) => Ok(Detach::NotDetached),
-            // Tolerated until the consent module ships the operation: the
-            // card stays open, undetached.
+            // A consent module that does not implement `consent.detach` yet
+            // refuses it as an unknown method: the card stays open, not
+            // detached.
             Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::UnknownMethod => {
                 Ok(Detach::NotDetached)
             }
@@ -580,8 +589,9 @@ impl DeskSession<'_> {
 
 /// The reply a call gives when it stops holding an unsettled card.
 ///
-/// Only a detached card is followed by a notice to the agent, so only then
-/// may the reply promise a wake; otherwise it says to call again later.
+/// Only a card that `consent.detach` detached (see [`Detach::Detached`]) is
+/// followed by Cingulate's notice to the agent when it settles, so callers
+/// pass `wake = true` only then; otherwise the reply says to call again later.
 pub fn pending_reply(ask_id: &str, wake: bool) -> Value {
     let remedy = if wake {
         "The person has been asked and hasn't answered yet. You'll be woken when they answer; \

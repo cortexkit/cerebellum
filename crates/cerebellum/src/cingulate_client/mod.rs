@@ -12,7 +12,14 @@
 //!   `subc-transport`.
 //! - [`live_call`]: the proof that a live inbound call is held, without which
 //!   no route is opened.
-//! - [`card`]: today's card bodies as `consent.request` params.
+//! - [`card`]: the card bodies cerebellum's builders render, as
+//!   `consent.request` params.
+//!
+//! Before this client, cards were sent on the "reverse elicitation lane": as
+//! `elicitation/create` requests back along the route of core's inbound call,
+//! answered by whoever held that route. Several comments and tests here
+//! compare against what that path sent, because the phone must keep seeing
+//! the same cards.
 //! - [`desk`]: raising, waiting in the call, detaching, withdrawing, and
 //!   applying late answers from the answers feed.
 

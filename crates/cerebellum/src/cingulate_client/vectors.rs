@@ -1,5 +1,8 @@
-//! The copied `consent-requester-v2` vectors: their integrity, and this
-//! client's requests and reply parsing held to their bytes.
+//! Cingulate's served test vectors for the requester contract, copied byte
+//! for byte from its `test-vectors/consent-requester-v2/` into
+//! `tests/vectors/consent-requester-v2/` (the README beside that directory
+//! names the tag and commit): their integrity, and this client's requests and
+//! reply parsing checked byte for byte against them.
 
 use serde_json::Value;
 

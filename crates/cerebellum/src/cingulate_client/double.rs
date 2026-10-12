@@ -32,7 +32,8 @@ pub fn vector_result(name: &str) -> Value {
     vector(name)["result"].clone()
 }
 
-/// One scripted reply.
+/// One reply the scripted Cingulate gives to a call, in place of a real
+/// Cingulate response.
 pub enum Reply {
     Result(Value),
     Refused(&'static str),
@@ -53,8 +54,9 @@ pub struct ScriptedCingulate {
     pub opens: AtomicUsize,
     pub calls: Mutex<Vec<(String, Value)>>,
     script: Mutex<VecDeque<(&'static str, Reply)>>,
-    /// Refuse every route.open, as a daemon that does not list cerebellum
-    /// as the scope's carrier would.
+    /// When set, refuse every route.open, as a daemon would when core has not
+    /// listed cerebellum as a carrier (a module allowed to open routes) of the
+    /// agent's session scope.
     pub refuse_open: std::sync::atomic::AtomicBool,
 }
 
