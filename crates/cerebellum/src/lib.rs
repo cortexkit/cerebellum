@@ -54,6 +54,8 @@ mod open_app_history;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
+#[cfg(test)]
+mod route_future_size_tests;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod terminal_arbiter;
@@ -3341,10 +3343,14 @@ async fn handle_frame(
                     }
                     return Ok(());
                 }
-                let dispatch = browser_queue::scope(
+                // Boxed so this worker's poll frame holds a pointer rather
+                // than the whole handler: unoptimized builds give every
+                // awaited future its own stack slot, and the nested route
+                // handlers otherwise overflow a 2 MiB thread stack.
+                let dispatch = Box::pin(browser_queue::scope(
                     browser_arrival,
-                    handle_route_request(frame, &proxy, &planes),
-                );
+                    Box::pin(handle_route_request(frame, &proxy, &planes)),
+                ));
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3352,7 +3358,7 @@ async fn handle_frame(
                 result
             };
             tokio::spawn(run_arbitrated_route(
-                worker,
+                Box::pin(worker),
                 outgoing,
                 writer,
                 planes,
@@ -3418,8 +3424,11 @@ async fn handle_route_request(
     }
 
     match facts.surface {
-        RouteSurface::Tools => handle_keyed_tool_request(frame, writer, planes).await,
-        RouteSurface::Management => handle_management_request(frame, writer, &facts, planes).await,
+        // Boxed for the same stack-frame reason as the route worker's handler.
+        RouteSurface::Tools => Box::pin(handle_keyed_tool_request(frame, writer, planes)).await,
+        RouteSurface::Management => {
+            Box::pin(handle_management_request(frame, writer, &facts, planes)).await
+        }
         // A route bound to a surface this module does not advertise. Refused
         // with the surface named rather than served as one of the others, which
         // would answer a caller from an envelope it did not use.
@@ -5263,7 +5272,13 @@ async fn handle_keyed_tool_request(
     // A body that does not decode, or is not an object, is left to the call's
     // own envelope check, which already refuses it by name.
     let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(&frame.body) else {
-        return handle_tool_request(frame, writer, planes, &CallObservation::new()).await;
+        return Box::pin(handle_tool_request(
+            frame,
+            writer,
+            planes,
+            &CallObservation::new(),
+        ))
+        .await;
     };
     if object.contains_key("schema_pin") {
         if let Err(error) = tool_provider::check_tool_call(&object, planes) {
@@ -5480,7 +5495,7 @@ async fn handle_keyed_tool_request(
         return elicit::CALL_KEY
             .scope(
                 call_key,
-                handle_tool_request(call, writer, planes, &observation),
+                Box::pin(handle_tool_request(call, writer, planes, &observation)),
             )
             .await;
     }
@@ -5502,7 +5517,7 @@ async fn handle_keyed_tool_request(
         let observation = pending.observation.clone();
         let call = elicit::CALL_KEY.scope(
             call_key,
-            handle_tool_request(call, &proxy, planes, &observation),
+            Box::pin(handle_tool_request(call, &proxy, planes, &observation)),
         );
         tokio::pin!(call);
         loop {
@@ -5921,7 +5936,7 @@ async fn handle_tool_request(
             body["name"] == flat_tools::BROWSER_USE && body["arguments"]["browser"] == "user"
         });
     if !user {
-        return handle_tool_request_inner(frame, writer, planes, call).await;
+        return Box::pin(handle_tool_request_inner(frame, writer, planes, call)).await;
     }
     // Tag even admission/schema refusals, which never reach the user adapter.
     // Own calls bypass this forwarding path and keep their original bytes.
@@ -5950,7 +5965,7 @@ async fn handle_tool_request(
         }
         Ok::<(), ModuleError>(())
     });
-    let result = handle_tool_request_inner(frame, &tagged, planes, call).await;
+    let result = Box::pin(handle_tool_request_inner(frame, &tagged, planes, call)).await;
     drop(tagged);
     forwarding
         .await
@@ -6549,7 +6564,7 @@ async fn handle_tool_request_inner(
     if capability != browser::BrowserCapability::WaitFor {
         call.commit_point_follows();
     }
-    let result = serve_browser_with_consent(
+    let result = Box::pin(serve_browser_with_consent(
         planes,
         &accepted_facts,
         writer,
@@ -6559,7 +6574,7 @@ async fn handle_tool_request_inner(
         BROWSER_CONSENT_PARK_LIMIT
             .try_with(|limit| *limit)
             .unwrap_or(Duration::from_secs(120)),
-    )
+    ))
     .await;
     if planes.routes.get(channel, epoch).is_none() {
         return Ok(());
