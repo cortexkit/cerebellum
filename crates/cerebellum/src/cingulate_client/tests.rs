@@ -678,7 +678,9 @@ async fn a_cancelled_call_withdraws_its_card() {
         .raise(vector_card(CardKind::AppControl), "app")
         .await
         .unwrap();
-    let ending = session.park(&id, Duration::from_secs(120), async {}).await;
+    // The cancel lands after the await is in flight, as a caller's would.
+    let cancel = tokio::time::sleep(Duration::from_millis(20));
+    let ending = session.park(&id, Duration::from_secs(120), cancel).await;
     assert_eq!(ending, InCall::Cancelled);
     assert_eq!(cingulate.methods()[2], wire::CONSENT_WITHDRAW);
     assert_eq!(desk.raised("el_1"), None);

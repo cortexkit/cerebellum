@@ -310,7 +310,7 @@ mod tests {
     /// Cingulate's management surface, and presents the launch nonce so the
     /// daemon stamps `reserved:cerebellum`.
     #[test]
-    fn the_route_open_names_cingulate_the_scope_and_the_launch_nonce() {
+    fn the_route_open_presents_cingulate_the_scope_and_the_nonce() {
         let cingulate = DaemonCingulate::new(
             PathBuf::from("/run/subc/connection.json"),
             "cerebellum".into(),
