@@ -427,6 +427,7 @@ impl<C: MonotonicClock> Clone for ServeContext<'_, C> {
             consent: ConsentContext {
                 caller: self.consent.caller.clone(),
                 unattended: self.consent.unattended,
+                agent_run: self.consent.agent_run,
                 carrier: self.consent.carrier.clone(),
                 route: self.consent.route.clone(),
                 drain: self.consent.drain.clone(),

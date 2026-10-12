@@ -1095,6 +1095,7 @@ mod live {
     async fn bind(planes: &Planes, root: &Path) -> Result<(), String> {
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel: CHANNEL,
             epoch: EPOCH,
             target: RouteTarget::ToolProvider {

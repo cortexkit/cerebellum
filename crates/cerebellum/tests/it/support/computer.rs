@@ -707,18 +707,16 @@ impl QuestionCarrier for ScriptedCarrier {
         cerebellum::cingulate_client::live_call::NotLive,
     > {
         use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
-        let stamp = ScopeStamp {
-            owner: subc_protocol::Principal::Reserved {
+        let stamp = ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
-            scope_ref: "computer-test".into(),
-            scope_epoch: 1,
-            kind: ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: ScopeAttributes::new().with_agent_id(Some(GRANTEE.into())),
-            owner_authorized: true,
-        };
+            "computer-test",
+            1,
+            ScopeKind::Head,
+        )
+        .with_attributes(ScopeAttributes::new().with_agent_id(Some(GRANTEE.into())))
+        .with_owner_authorized(true);
         cerebellum::cingulate_client::live_call::LiveCall::from_inbound(
             Some(&stamp),
             &self.guard,

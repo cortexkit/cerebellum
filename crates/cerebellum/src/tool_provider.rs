@@ -10,8 +10,10 @@ use cortexkit_role_tool_provider::catalog::{
 use cortexkit_role_tool_provider::describe::{Major, RoleDescribe};
 use cortexkit_role_tool_provider::late_results::{AckRequest, LateResultsRequest};
 use cortexkit_role_tool_provider::ops;
+use cortexkit_role_tool_provider::result::ResultFormat;
 use cortexkit_role_tool_provider::{check_capability_tag, errors, PROVIDES};
 use serde_json::Map;
+use subc_protocol::call_mode::CallMode;
 
 pub(crate) fn is_operation(name: &str) -> bool {
     matches!(
@@ -71,10 +73,42 @@ fn definitions(browser_names: &[String], computer_names: &[String]) -> Vec<Catal
         )
         .with_capabilities(tags)
         .with_reply(Reply::new(max_ms));
+        definition.modes = Some(vec![CallMode::Classic, CallMode::Codemode, CallMode::Flow]);
+        definition.result_format = Some(ResultFormat::ContentV1);
+        cortexkit_role_tool_provider::catalog::check_modes(&definition)
+            .expect("only known, unique call modes are declared");
         definition.description = tool.description;
         Some(definition)
     })
     .collect()
+}
+
+pub(crate) fn check_call_mode(
+    name: &str,
+    mode: &CallMode,
+    planes: &Planes,
+) -> Result<(), ErrorBody> {
+    if is_operation(name) || name == ops::TOOL_WITHDRAW {
+        return Ok(());
+    }
+    // Legacy capability names use the same mode policy as the flat tools that
+    // dispatch them. Keeping one policy prevents bypassing it through an alias.
+    let tool = catalog_tools(planes)
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| {
+            let mut tool = CatalogTool::new(name, "", 1, json!({}));
+            tool.modes = Some(vec![CallMode::Classic, CallMode::Codemode, CallMode::Flow]);
+            tool
+        });
+    if !cortexkit_role_tool_provider::catalog::serves_call_mode(&tool, mode) {
+        return Err(ErrorBody::new(
+            errors::CALL_MODE_UNSUPPORTED,
+            "this tool does not serve the route's call mode",
+        )
+        .with_detail(json!({"tool": name, "mode": mode})));
+    }
+    Ok(())
 }
 
 fn catalog(arguments: &Map<String, Value>, planes: &Planes) -> Result<Value, ErrorBody> {

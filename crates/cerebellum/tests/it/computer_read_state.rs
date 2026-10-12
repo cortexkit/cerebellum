@@ -997,3 +997,84 @@ async fn serialized_read_row_has_all_four_desk_check_fields() {
     assert_eq!(row["manual_accessibility"].as_str(), Some("newly_enabled"));
     assert!(row.get("unreadable_count").is_none());
 }
+
+#[tokio::test]
+async fn an_agent_run_reads_only_under_a_held_app_grant() {
+    let source = FixtureSource::new(vec![chat_window()]);
+    let plane = plane(source);
+    let management = support::computer::management();
+    let mut consent = no_relay();
+    consent.agent_run = true;
+    let refusal = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        consent,
+        json!({"target":TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(refusal["outcome"], "consent_unavailable");
+    assert_eq!(refusal["reason"], "agent_run");
+    assert!(refusal.get("state_text").is_none());
+    assert_eq!(management.app_state_sessions().session_count(), 0);
+    let management = granted_management().await;
+    let mut consent = no_relay();
+    consent.agent_run = true;
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        consent,
+        json!({"target":TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed");
+    assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
+}
+
+#[tokio::test]
+async fn codemode_computer_read_never_raises_a_desk_card() {
+    let management = support::computer::management();
+    let plane = plane(FixtureSource::new(vec![chat_window()]));
+    let carrier = support::computer::ScriptedCarrier::answering(&["allow_conversation"]);
+    let mut consent = support::computer::relayed(&carrier);
+    consent.agent_run = true;
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        consent,
+        json!({"target":TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert!(
+        carrier.questions().is_empty(),
+        "a codemode run raised a Cingulate card"
+    );
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["reason"], "agent_run");
+    assert!(reply.get("state_text").is_none());
+    assert_eq!(management.app_state_sessions().session_count(), 0);
+}
+
+#[tokio::test]
+async fn classic_computer_read_keeps_the_desk_card_flow() {
+    let management = support::computer::management();
+    let plane = plane(FixtureSource::new(vec![chat_window()]));
+    let carrier = support::computer::ScriptedCarrier::answering(&["allow_conversation"]);
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        support::computer::relayed(&carrier),
+        json!({"target":TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(carrier.questions().len(), 1);
+    assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
+}

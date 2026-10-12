@@ -697,6 +697,8 @@ pub struct ConsentContext {
     /// A flow (see `AcceptedBindFacts::flow_id`) has no person to ask: it may use
     /// its owner's persistent app grants, but never raises a consent question.
     pub unattended: bool,
+    /// A program run may use held grants, but cannot put a question to a person.
+    pub agent_run: bool,
     /// The admitted live session, or `None` when no agent session can ask.
     pub carrier: Option<Arc<dyn QuestionCarrier>>,
     pub route: Arc<dyn RouteLiveness>,
@@ -725,6 +727,7 @@ impl ConsentContext {
             park_guard,
             park_limit: CONSENT_PARK_LIMIT,
             unattended: false,
+            agent_run: false,
         }
     }
 
@@ -1371,6 +1374,12 @@ impl ComputerGrants {
         context: &ConsentContext,
         cancel: &CancelHandle,
     ) -> Result<GrantAdmission, ConsentRefusal> {
+        if context.agent_run && matches!(need, GrantNeed::Takeover) {
+            return Err(ConsentRefusal::Unavailable {
+                reason: "agent_run",
+                remedy: "takeover requires an attended session",
+            });
+        }
         if context.unattended && matches!(need, GrantNeed::Takeover) {
             return Err(ConsentRefusal::Unavailable {
                 reason: "takeover_not_for_flows",
@@ -1395,6 +1404,12 @@ impl ComputerGrants {
                     self.drop_conversation_grant(caller, need, &stale);
                 }
             }
+        }
+        if context.agent_run {
+            return Err(ConsentRefusal::Unavailable {
+                reason: "agent_run",
+                remedy: "an agent run cannot ask a person; configure standing grants in an attended session",
+            });
         }
         if context.unattended {
             if let GrantNeed::App {

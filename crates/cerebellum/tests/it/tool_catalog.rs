@@ -44,10 +44,16 @@ async fn exchange(planes: &Planes, channel: u16, body: Value) -> Frame {
         .await
         .unwrap();
     drop(tx);
-    let reply = rx.recv().await.unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        rx.recv().await.is_none(),
-        "request produced more than one frame"
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("no background elicitation may hold the writer")
+            .is_none(),
+        "request produced more than one frame (including an elicitation frame)"
     );
     reply
 }
@@ -63,8 +69,38 @@ async fn bind_with_scope(
     module: &str,
     scope: Option<subc_protocol::scope::ScopeStamp>,
 ) {
+    bind_with_scope_mode(planes, channel, module, scope, None).await;
+}
+async fn bind_with_scope_mode(
+    planes: &Planes,
+    channel: u16,
+    module: &str,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    call_mode: Option<subc_protocol::call_mode::CallMode>,
+) {
+    bind_with_readers(
+        planes,
+        channel,
+        module,
+        scope,
+        call_mode,
+        Some(vec![
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+        ]),
+    )
+    .await;
+}
+async fn bind_with_readers(
+    planes: &Planes,
+    channel: u16,
+    module: &str,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    call_mode: Option<subc_protocol::call_mode::CallMode>,
+    consumer_capabilities: Option<Vec<String>>,
+) {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -74,7 +110,7 @@ async fn bind_with_scope(
         principal: Some(Principal::Reserved {
             module_id: module.into(),
         }),
-        consumer_capabilities: None,
+        consumer_capabilities,
         scope,
         admission_facts: Some(
             json!({"agentProjectId":"catalog-test","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
@@ -136,6 +172,11 @@ async fn catalog_matches_hello_and_digest_is_stable() {
             _ => panic!("unexpected catalog tool: {}", tool.name),
         };
         assert_eq!(tool.reply.as_ref().unwrap().max_ms, max_ms);
+        assert_eq!(
+            serde_json::to_value(&tool.modes).unwrap(),
+            json!(["classic", "codemode", "flow"])
+        );
+        assert_eq!(tool.result_format.as_ref().unwrap().as_str(), "content/v1");
     }
     let composition = json!({"params":{},"composition":{"opaque":{"v":3}}});
     let composed = catalog(&planes, composition.clone()).await;
@@ -221,7 +262,10 @@ async fn mismatched_schema_pins_are_refused_before_dispatch() {
         json!({"name":"browser_use","arguments":{"action":"status"},"tool_call_id":"display-only"});
     let unpinned = exchange(&planes, 9, call.clone()).await;
     assert_eq!(unpinned.header.ty, FrameType::Response);
-    assert_eq!(body(&unpinned)["outcome"], "no_session");
+    assert_eq!(
+        body(&unpinned)["structuredContent"]["outcome"],
+        "no_session"
+    );
     let mut pinned = call.clone();
     pinned["schema_pin"] = json!(
         SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
@@ -307,18 +351,16 @@ async fn another_principals_key_is_an_unknown_call() {
 #[tokio::test]
 async fn withdrawal_checks_the_carriers_own_record_scope() {
     let planes = planes(true);
-    let scope = subc_protocol::scope::ScopeStamp {
-        owner: Principal::Reserved {
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: "scope-one".into(),
-        scope_epoch: 1,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: subc_protocol::scope::ScopeAttributes::default(),
-        owner_authorized: true,
-    };
+        "scope-one",
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_attributes(subc_protocol::scope::ScopeAttributes::default())
+    .with_owner_authorized(true);
     bind_with_scope(&planes, 9, "broca", Some(scope.clone())).await;
     let result = exchange(
         &planes,
@@ -371,4 +413,283 @@ async fn withdrawal_validation_is_a_contract_route_error() {
     let named_scope = exchange(&planes, 9, json!({"name":"tool.withdraw","arguments":{"call_key":"key","scope":{"owner":"reserved:prefrontal-core","ref":"claim","scope_epoch":1}}})).await;
     assert_eq!(named_scope.header.ty, FrameType::Error);
     assert_eq!(body(&named_scope)["code"], "withdraw_scope_mismatch");
+}
+
+fn mode_scope(
+    mode: &subc_protocol::call_mode::CallMode,
+) -> Option<subc_protocol::scope::ScopeStamp> {
+    use subc_protocol::call_mode::CallMode;
+    use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+    let attributes = ScopeAttributes::new()
+        .with_agent_id(Some("catalog-test".into()))
+        .with_delegates(true);
+    let attributes = match mode {
+        CallMode::Codemode => attributes.with_run_id(Some("run-test".into())),
+        CallMode::Flow => attributes.with_flow_id(Some("flow-test".into())),
+        _ => return None,
+    };
+    Some(
+        ScopeStamp::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "head",
+            1,
+            ScopeKind::Head,
+        )
+        .with_attributes(attributes)
+        .with_owner_authorized(true),
+    )
+}
+
+#[tokio::test]
+async fn served_modes_reach_status_on_the_production_handler() {
+    use subc_protocol::call_mode::CallMode;
+    for mode in [CallMode::Classic, CallMode::Codemode, CallMode::Flow] {
+        let planes = planes(true);
+        let module = if mode == CallMode::Flow {
+            "basal"
+        } else {
+            "prefrontal-core"
+        };
+        bind_with_scope_mode(&planes, 9, module, mode_scope(&mode), Some(mode.clone())).await;
+        let response = exchange(
+            &planes,
+            9,
+            json!({"name":"browser_use", "arguments":{"action":"status"}}),
+        )
+        .await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{mode:?}: {}",
+            body(&response)
+        );
+        assert_eq!(
+            body(&response)["structuredContent"]["outcome"],
+            "no_session",
+            "{mode:?}"
+        );
+        let result: cortexkit_role_tool_provider::result::ToolResult =
+            serde_json::from_slice(&response.body).unwrap();
+        cortexkit_role_tool_provider::result::validate(&result).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unknown_mode_refused_before_grants_and_argument_dispatch() {
+    use subc_protocol::call_mode::CallMode;
+    let planes = planes(true);
+    bind_with_scope_mode(
+        &planes,
+        9,
+        "prefrontal-core",
+        None,
+        Some(CallMode::Unknown("future-mode".into())),
+    )
+    .await;
+    let response = exchange(&planes, 9, json!({"name":"browser_use", "arguments":{"action":"open_grant", "origins":["https://example.com"], "hazards":[]}, "call_key":"unknown-mode-key"})).await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    assert_eq!(body(&response)["code"], "call_mode_unsupported");
+    assert_eq!(
+        body(&response)["detail"],
+        json!({"tool":"browser_use", "mode":"future-mode"})
+    );
+}
+
+#[tokio::test]
+async fn codemode_never_elicits_a_consent_card() {
+    use subc_protocol::call_mode::CallMode;
+    let planes = planes(true);
+    let typed = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        call_mode: Some(CallMode::Codemode),
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+        consumer_capabilities: Some(vec![
+            "elicitation".into(),
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        ]),
+        scope: mode_scope(&CallMode::Codemode),
+        admission_facts: Some(
+            json!({"agentProjectId":"catalog-test", "sessionKind":"primary", "effectiveCapabilityScope":["*"]}),
+        ),
+    };
+    let ack = exchange(&planes, 0, serde_json::to_value(typed).unwrap()).await;
+    assert_eq!(ack.header.ty, FrameType::Response);
+    let reply = exchange(&planes, 9, json!({"name":"browser_use", "arguments":{"action":"open_grant", "origins":["https://example.com"], "hazards":[]}})).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let reply = body(&reply);
+    assert_eq!(reply["structuredContent"]["outcome"], "consent_unavailable");
+    assert_eq!(reply["structuredContent"]["detail"]["reason"], "agent_run");
+    assert_eq!(reply["isError"], true);
+    assert_eq!(reply["errorCode"], "consent_unavailable");
+}
+
+#[tokio::test]
+async fn flow_still_refuses_consent_on_the_production_handler() {
+    use subc_protocol::call_mode::CallMode;
+    let planes = planes(true);
+    bind_with_scope_mode(
+        &planes,
+        9,
+        "basal",
+        mode_scope(&CallMode::Flow),
+        Some(CallMode::Flow),
+    )
+    .await;
+    let response = exchange(&planes, 9, json!({"name":"browser_use", "arguments":{"action":"open_grant", "origins":["https://example.com"], "hazards":[]}})).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(
+        body(&response)["structuredContent"]["outcome"],
+        "consent_unavailable"
+    );
+    assert_eq!(
+        body(&response)["structuredContent"]["detail"]["reason"],
+        "unattended_flow"
+    );
+}
+
+#[tokio::test]
+async fn classic_still_elicits_a_consent_card() {
+    let planes = planes(true);
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        call_mode: Some(subc_protocol::call_mode::CallMode::Classic),
+        route_channel: 9,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        principal: Some(Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+        consumer_capabilities: Some(vec![
+            "elicitation".into(),
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        ]),
+        scope: None,
+        admission_facts: Some(
+            json!({"agentProjectId":"catalog-test", "sessionKind":"primary", "effectiveCapabilityScope":["*"]}),
+        ),
+    };
+    assert_eq!(
+        exchange(&planes, 0, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let (tx, mut rx) = mpsc::channel(8);
+    let request = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request,
+        Flags::new(false, Priority::Interactive, false), 9, 3, 2,
+        serde_json::to_vec(&json!({"name":"browser_use", "arguments":{"action":"open_grant", "origins":["https://example.com"], "hazards":[]}})).unwrap()).unwrap();
+    cerebellum::handle_frame_for_test(request, &tx, &planes)
+        .await
+        .unwrap();
+    let mut elicited = false;
+    let mut replied = false;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match frame.header.ty {
+            FrameType::Request => elicited = true,
+            FrameType::Response => {
+                replied = true;
+                assert_eq!(
+                    body(&frame)["structuredContent"]["outcome"],
+                    "consent_pending"
+                );
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert!(elicited && replied);
+}
+
+#[tokio::test]
+async fn call_members_cannot_enable_a_result_reader() {
+    let planes = planes(true);
+    bind_with_readers(&planes, 9, "prefrontal-core", None, None, None).await;
+    let response = exchange(
+        &planes,
+        9,
+        json!({"name":"browser_use",
+        "arguments":{"action":"status"}, "consumer_capabilities":[cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY]}),
+    )
+    .await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let reply = body(&response);
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["detail"]["field"], "consumer_capabilities");
+    assert!(reply.get("content").is_none());
+    let status = exchange(
+        &planes,
+        9,
+        json!({"name":"browser_use", "arguments":{"action":"status"}}),
+    )
+    .await;
+    assert_eq!(status.body.as_slice(), br#"{"outcome":"no_session"}"#);
+}
+
+#[tokio::test]
+async fn keyed_replays_use_the_current_routes_result_reader() {
+    for first_reads in [false, true] {
+        let planes = planes(true);
+        let declaration = |reads| {
+            if reads {
+                Some(vec![
+                    cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+                ])
+            } else {
+                None
+            }
+        };
+        bind_with_readers(
+            &planes,
+            9,
+            "prefrontal-core",
+            None,
+            None,
+            declaration(first_reads),
+        )
+        .await;
+        bind_with_readers(
+            &planes,
+            10,
+            "prefrontal-core",
+            None,
+            None,
+            declaration(!first_reads),
+        )
+        .await;
+        let call = json!({"name":"browser_use", "arguments":{"action":"status", "unexpected":true}, "call_key":"format-replay"});
+        let first = exchange(&planes, 9, call.clone()).await;
+        assert_eq!(first.header.ty, FrameType::Response);
+        let first_body = body(&first);
+        let legacy = first_body.get("structuredContent").unwrap_or(&first_body);
+        assert_eq!(legacy["outcome"], "invalid_request");
+        let second = exchange(&planes, 10, call.clone()).await;
+        assert_eq!(second.header.ty, FrameType::Response, "{}", body(&second));
+        let second_body = body(&second);
+        if first_reads {
+            assert_eq!(second.body, serde_json::to_vec(legacy).unwrap());
+        } else {
+            let result: cortexkit_role_tool_provider::result::ToolResult =
+                serde_json::from_slice(&second.body).unwrap();
+            cortexkit_role_tool_provider::result::validate(&result).unwrap();
+            assert_eq!(second_body["structuredContent"], *legacy);
+        }
+        assert_eq!(second.body, exchange(&planes, 10, call).await.body);
+    }
 }

@@ -235,18 +235,16 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn stamp() -> ScopeStamp {
-        ScopeStamp {
-            owner: Principal::Reserved {
+        ScopeStamp::new(
+            Principal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
-            scope_ref: "head".into(),
-            scope_epoch: 3,
-            kind: ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: ScopeAttributes::new().with_agent_id(Some("test-project".into())),
-            owner_authorized: true,
-        }
+            "head",
+            3,
+            ScopeKind::Head,
+        )
+        .with_attributes(ScopeAttributes::new().with_agent_id(Some("test-project".into())))
+        .with_owner_authorized(true)
     }
 
     fn facts() -> AcceptedBindFacts {

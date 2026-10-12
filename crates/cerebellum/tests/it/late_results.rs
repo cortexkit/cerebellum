@@ -207,11 +207,13 @@ async fn call(planes: &Planes, channel: u16, name: &str, arguments: Value) -> Va
         "{}",
         String::from_utf8_lossy(&reply.body)
     );
-    serde_json::from_slice(&reply.body).unwrap()
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    reply.get("structuredContent").cloned().unwrap_or(reply)
 }
 async fn bind(planes: &Planes, channel: u16, principal: Principal, management: bool) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: if management {
@@ -229,16 +231,11 @@ async fn bind(planes: &Planes, channel: u16, principal: Principal, management: b
         admission_facts: Some(
             json!({"agentProjectId":"pj-late-results","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.present","browser.resume"]}),
         ),
-        scope: Some(ScopeStamp {
-            owner: reserved("prefrontal-core"),
-            scope_ref: "scope-7".into(),
-            scope_epoch: 3,
-            kind: ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: ScopeAttributes::default(),
-            owner_authorized: true,
-        }),
+        scope: Some(
+            ScopeStamp::new(reserved("prefrontal-core"), "scope-7", 3, ScopeKind::Head)
+                .with_attributes(ScopeAttributes::default())
+                .with_owner_authorized(true),
+        ),
     };
     let reply = exchange(planes, frame(0, serde_json::to_value(bind).unwrap())).await;
     assert_eq!(
@@ -260,7 +257,8 @@ async fn present(planes: &Planes, key: Option<&str>) -> Value {
         "{}",
         String::from_utf8_lossy(&reply.body)
     );
-    serde_json::from_slice(&reply.body).unwrap()
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    reply.get("structuredContent").cloned().unwrap_or(reply)
 }
 async fn read(
     planes: &Planes,
@@ -787,6 +785,7 @@ async fn provider_ops_require_tool_route_and_verified_principal() {
     }
     let unverified_bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 10,
         epoch: 3,
         target: RouteTarget::ToolProvider {

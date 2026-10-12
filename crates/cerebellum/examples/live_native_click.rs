@@ -1012,6 +1012,7 @@ mod macos_probe {
     ) -> Result<(), String> {
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel,
             epoch,
             target,

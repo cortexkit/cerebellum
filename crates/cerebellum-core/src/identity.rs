@@ -339,6 +339,8 @@ pub struct AcceptedBindFacts {
     /// a request body. `None` for a route opened without a scope, which is
     /// served exactly as routes were before scopes existed.
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Execution mode stamped by the daemon, never chosen by tool arguments.
+    pub call_mode: subc_protocol::call_mode::CallMode,
     /// The flow's id, fixed at bind time and retained only for an admitted carrier.
     ///
     /// A **flow** is an unattended workflow that the Basal module runs on an
@@ -382,6 +384,7 @@ impl AcceptedBindFacts {
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
             scope: None,
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
             flow_id: None,
         }
     }
@@ -414,7 +417,11 @@ impl AcceptedBindFacts {
                 .filter(|_| self.flow_id.is_none() || stamp.attributes.delegates)
             {
                 self.identity.agent_project_id = agent.clone();
-                self.identity.session_kind = session_kind_from_scope(stamp.kind);
+                // A run's ephemeral lifetime does not change the head browser's
+                // storage identity. Its bind still names the head conversation.
+                if stamp.attributes.run_id.is_none() {
+                    self.identity.session_kind = session_kind_from_scope(stamp.kind);
+                }
                 self.identity.profile_disposition = if !stamp.attributes.delegates
                     && self.identity.session_kind == SessionKind::Primary
                 {
@@ -425,7 +432,15 @@ impl AcceptedBindFacts {
                 self.agent_project_id_attested = true;
                 self.session_kind_attested = true;
                 self.acts_as_agent = stamp.attributes.delegates;
-                self.control_operations = match stamp.kind {
+                self.control_operations = match if stamp.attributes.run_id.is_some() {
+                    match self.identity.session_kind {
+                        SessionKind::Primary => subc_protocol::scope::ScopeKind::Head,
+                        SessionKind::Subagent => subc_protocol::scope::ScopeKind::Worker,
+                        SessionKind::Ephemeral => subc_protocol::scope::ScopeKind::Ephemeral,
+                    }
+                } else {
+                    stamp.kind
+                } {
                     subc_protocol::scope::ScopeKind::Head
                     | subc_protocol::scope::ScopeKind::Worker => {
                         ["browser.launch", "browser.status", "browser.close"]
@@ -465,8 +480,9 @@ impl AcceptedBindFacts {
                 field: "agentProjectId",
             });
         }
-        if admitted_session_kind(facts)
-            .is_some_and(|kind| kind != session_kind_from_scope(stamp.kind))
+        if stamp.attributes.run_id.is_none()
+            && admitted_session_kind(facts)
+                .is_some_and(|kind| kind != session_kind_from_scope(stamp.kind))
         {
             return Some(AdmissionFactsRefusal::ScopeFactsConflict {
                 field: "sessionKind",
@@ -481,10 +497,17 @@ impl AcceptedBindFacts {
     /// True means asking is worth attempting, never that an answer will arrive.
     pub fn declares_elicitation(&self) -> bool {
         self.flow_id.is_none()
+            && self.call_mode == subc_protocol::call_mode::CallMode::Classic
             && self
                 .consumer_capabilities
                 .iter()
                 .any(|family| family == ELICITATION_CAPABILITY)
+    }
+
+    /// Consumer declarations retained from the daemon's accepted route bind.
+    /// An absent or empty list declares no reverse requests or result readers.
+    pub fn consumer_capabilities(&self) -> Option<&[String]> {
+        (!self.consumer_capabilities.is_empty()).then_some(self.consumer_capabilities.as_slice())
     }
 
     /// Whether daemon-attested bind facts admit this control operation. Caller
@@ -566,6 +589,7 @@ impl AcceptedBindFacts {
             effective_capability_scope: Some(Vec::new()),
             consumer_capabilities: self.consumer_capabilities.clone(),
             surface: self.surface,
+            call_mode: self.call_mode.clone(),
             // A scope is session identity, like the conversation above, so an
             // operator's view outside any session carries none.
             scope: None,
@@ -881,18 +905,18 @@ mod tests {
         let core = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
-        let stamp = subc_protocol::scope::ScopeStamp {
-            owner: core.clone(),
-            scope_ref: "ephemeral".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Ephemeral,
-            parent: None,
-            parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes::new()
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            core.clone(),
+            "ephemeral",
+            1,
+            subc_protocol::scope::ScopeKind::Ephemeral,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
                 .with_agent_id(Some("pj-agent".into()))
                 .with_delegates(true),
-            owner_authorized: true,
-        };
+        )
+        .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
             &bind_identity("/caller/project", "conversation"),
             Some(core),
@@ -914,19 +938,19 @@ mod tests {
         let core = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
-        let stamp = subc_protocol::scope::ScopeStamp {
-            owner: core.clone(),
-            scope_ref: "flow-head".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: subc_protocol::scope::ScopeAttributes::new()
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            core.clone(),
+            "flow-head",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
                 .with_agent_id(Some("pj-agent".into()))
                 .with_delegates(true)
                 .with_flow_id(Some("flow".into())),
-            owner_authorized: true,
-        };
+        )
+        .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
             &bind_identity("/caller/project", "conversation"),
             Some(core),

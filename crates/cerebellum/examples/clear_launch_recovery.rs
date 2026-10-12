@@ -97,6 +97,7 @@ mod live {
 
         let bind = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: None,
             route_channel: CHANNEL,
             epoch: EPOCH,
             target: RouteTarget::ManagementSurface {

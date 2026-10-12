@@ -30,6 +30,7 @@ async fn main() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: 9,
         epoch: 3,
         target: subc_protocol::RouteTarget::ToolProvider {

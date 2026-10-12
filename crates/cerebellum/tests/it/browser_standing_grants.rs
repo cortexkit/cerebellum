@@ -577,6 +577,20 @@ impl Fixture {
     }
 
     async fn bind(&mut self, session: Session<'_>, management: bool) -> Route {
+        self.bind_mode(
+            session,
+            management,
+            subc_protocol::call_mode::CallMode::Classic,
+        )
+        .await
+    }
+
+    async fn bind_mode(
+        &mut self,
+        session: Session<'_>,
+        management: bool,
+        mode: subc_protocol::call_mode::CallMode,
+    ) -> Route {
         let channel = self.next_channel;
         self.next_channel += 1;
         let mut facts = json!({
@@ -594,6 +608,7 @@ impl Fixture {
         );
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
+            call_mode: Some(mode.clone()),
             route_channel: channel,
             epoch: 1,
             target: if management {
@@ -609,7 +624,21 @@ impl Fixture {
             principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: session.asks.then(|| vec!["elicitation".to_string()]),
             admission_facts: Some(facts),
-            scope: None,
+            scope: (mode == subc_protocol::call_mode::CallMode::Codemode).then(|| {
+                subc_protocol::scope::ScopeStamp::new(
+                    cerebellum::session_caller_principal_for_test().unwrap(),
+                    "run",
+                    1,
+                    subc_protocol::scope::ScopeKind::Ephemeral,
+                )
+                .with_attributes(
+                    subc_protocol::scope::ScopeAttributes::new()
+                        .with_agent_id(session.agent.map(str::to_owned))
+                        .with_delegates(true)
+                        .with_run_id(Some("run-test".into())),
+                )
+                .with_owner_authorized(true)
+            }),
         };
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,
@@ -656,7 +685,10 @@ impl Fixture {
         }
         // A browser session is launched only for an attested agent; an
         // unattested route is refused at launch, so it is left without one.
-        if !management && session.agent.is_some() {
+        if !management
+            && session.agent.is_some()
+            && mode == subc_protocol::call_mode::CallMode::Classic
+        {
             let launched = self.call(&route, "browser.launch", json!({})).await;
             assert_eq!(launched["outcome"], "launched", "{launched}");
         }
@@ -727,9 +759,16 @@ impl Fixture {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
-        consent_relay::elicit_and_answer_observing(&self.planes, frame, answer, "request", observe)
-            .await
-            .expect("the request completes")
+        let reply = consent_relay::elicit_and_answer_observing(
+            &self.planes,
+            frame,
+            answer,
+            "request",
+            observe,
+        )
+        .await
+        .expect("the request completes");
+        reply.get("structuredContent").cloned().unwrap_or(reply)
     }
 
     // Declare reversible-change severity (tier 3), above the public-browsing
@@ -2261,4 +2300,87 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
     assert!(fixture
         .signed_in
         .is_signed_in(AGENT, "default", "https://any-other.example"));
+}
+
+#[tokio::test]
+async fn codemode_borrows_the_head_browser_and_standing_grants_without_a_card() {
+    let mut fixture = Fixture::new();
+    fixture.seed(AGENT, StandingSubject::AllSites, 2, &[]);
+    let head = fixture
+        .route(Session::primary("head-conversation", AGENT))
+        .await;
+    let run = fixture
+        .bind_mode(
+            Session::primary("head-conversation", AGENT).asking(),
+            false,
+            subc_protocol::call_mode::CallMode::Codemode,
+        )
+        .await;
+    let head_status = fixture.call(&head, "browser.status", json!({})).await;
+    let run_status = fixture.call(&run, "browser.status", json!({})).await;
+    assert_eq!(
+        head_status["browser_session_id"],
+        run_status["browser_session_id"]
+    );
+    assert_eq!(run_status["outcome"], "ready");
+    let navigation = fixture
+        .call(
+            &run,
+            "browser_use",
+            json!({"action":"navigate", "url":PUBLIC,
+        "intent":"read", "severity":{"tier":2,"credential":false,"financial":false}}),
+        )
+        .await;
+    assert_eq!(navigation["outcome"], "ok", "{navigation}");
+    assert_eq!(
+        fixture.browser.effects(),
+        vec![format!("navigate {PUBLIC}")]
+    );
+    let goodbye = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Goodbye,
+        Flags::new(false, Priority::Passive, false),
+        run.channel,
+        1,
+        0,
+        vec![],
+    )
+    .unwrap();
+    let (tx, _) = mpsc::channel(4);
+    cerebellum::handle_frame_for_test(goodbye, &tx, &fixture.planes)
+        .await
+        .unwrap();
+    let still_ready = fixture.call(&head, "browser.status", json!({})).await;
+    assert_eq!(still_ready["outcome"], "ready");
+    assert_eq!(
+        still_ready["browser_session_id"],
+        head_status["browser_session_id"]
+    );
+    assert_eq!(fixture.store.live_rows(AGENT).len(), 1);
+}
+
+#[tokio::test]
+async fn codemode_missing_browser_grant_refuses_without_elicitation() {
+    let mut fixture = Fixture::new();
+    fixture
+        .route(Session::primary("head-conversation", AGENT))
+        .await;
+    let run = fixture
+        .bind_mode(
+            Session::primary("head-conversation", AGENT).asking(),
+            false,
+            subc_protocol::call_mode::CallMode::Codemode,
+        )
+        .await;
+    let refusal = fixture
+        .call(
+            &run,
+            "browser_use",
+            json!({"action":"navigate", "url":"http://127.0.0.1:8080",
+        "intent":"read", "severity":{"tier":2,"credential":false,"financial":false}}),
+        )
+        .await;
+    assert_eq!(refusal["outcome"], "consent_unavailable", "{refusal}");
+    assert_eq!(refusal["detail"]["reason"], "agent_run");
+    assert!(fixture.browser.effects().is_empty());
 }

@@ -78,6 +78,7 @@ async fn management_planes() -> Planes {
     );
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: MANAGEMENT_CHANNEL,
         epoch: MANAGEMENT_EPOCH,
         target: RouteTarget::ManagementSurface {
