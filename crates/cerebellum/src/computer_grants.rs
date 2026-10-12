@@ -1502,8 +1502,11 @@ impl ComputerGrants {
     /// call waits on rather than filing a second; otherwise a new card from
     /// `new_card`, which returns its ask id and body.
     ///
-    /// The call waits up to [`CONSENT_PARK_LIMIT`] and then returns
-    /// [`LoginConsent::Pending`]. The card is asked on its own task and stays
+    /// The call waits up to [`CONSENT_PARK_LIMIT`] in total and then returns
+    /// [`LoginConsent::Pending`]. The limit is one allowance for the whole
+    /// call: when another call waiting on the same card takes its approval
+    /// and this call waits again, it waits only for what is left of that
+    /// allowance, never a fresh one. The card is asked on its own task and stays
     /// open for its full [`LOGIN_CARD_LIFETIME`]: neither that return nor the
     /// caller dropping this future closes it. A late answer is remembered
     /// rather than acted on, because nobody is waiting for the result.
@@ -1519,8 +1522,11 @@ impl ComputerGrants {
             capability: request.capability,
             parameters: request.parameters.clone(),
         };
+        // One deadline for every wait in this call, so a call that loses an
+        // approval to another waiter and waits again still parks no longer
+        // in total than the limit.
+        let park_end = tokio::time::Instant::now() + self.login_park_limit();
         loop {
-            let park_limit = self.login_park_limit();
             let (ask_id, id, mut settled) = {
                 let mut state = lock(&self.state);
                 let now = tokio::time::Instant::now();
@@ -1601,7 +1607,7 @@ impl ComputerGrants {
                     // conversation or session scope ended.
                     Err(_) => None,
                 },
-                () = tokio::time::sleep(park_limit) => Some(None),
+                () = tokio::time::sleep_until(park_end) => Some(None),
             };
             drop(parked);
             let ask_id = waiter.ask_id.clone();
@@ -2423,6 +2429,95 @@ mod consent_card_tests {
             .await
             .expect("the unowned ask is aborted")
             .is_err());
+    }
+
+    /// Two calls wait on one login card; the person's approval admits only
+    /// the first, so the second starts over on a new card. Its second wait
+    /// gets only what is left of its single allowance: it returns
+    /// `consent_pending` at the limit counted from its start, not a full limit
+    /// after the approval.
+    #[tokio::test(start_paused = true)]
+    async fn a_login_call_that_loses_its_approval_parks_no_longer_than_one_allowance() {
+        /// The first card answers when the test sends an answer; every later
+        /// card is never answered.
+        struct Carrier(Mutex<Option<tokio::sync::oneshot::Receiver<AskOutcome>>>);
+        impl QuestionCarrier for Carrier {
+            fn put(
+                &self,
+                _: Value,
+                _: Duration,
+            ) -> Pin<Box<dyn Future<Output = AskOutcome> + Send>> {
+                let answer = lock(&self.0).take();
+                Box::pin(async move {
+                    match answer {
+                        Some(answer) => answer.await.unwrap_or(AskOutcome::NoAnswer),
+                        None => std::future::pending().await,
+                    }
+                })
+            }
+        }
+        let grants = Arc::new(ComputerGrants::open(
+            Arc::new(InMemoryGrantStorage::new()),
+            None,
+        ));
+        let (answer, answer_rx) = tokio::sync::oneshot::channel();
+        let carrier: Arc<dyn QuestionCarrier> = Arc::new(Carrier(Mutex::new(Some(answer_rx))));
+        let wait = |ask_id: &'static str| {
+            let grants = Arc::clone(&grants);
+            let request = LoginConsentRequest {
+                conversation_key: "conversation".into(),
+                capability: LoginCapability::ImportLogin,
+                parameters: "same parameters".into(),
+                carrier: Arc::clone(&carrier),
+                park_guard: None,
+            };
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                let consent = grants
+                    .require_login(request, || {
+                        (
+                            ask_id.to_string(),
+                            json!({"params": {"options": [
+                                {"id": "allow", "effect": "grant"},
+                                {"id": "deny", "effect": "decline"},
+                            ]}}),
+                        )
+                    })
+                    .await;
+                (consent, started.elapsed())
+            })
+        };
+        let first = wait("first-card");
+        // Let the first call file its card before the second joins it.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let second = wait("second-card");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        answer
+            .send(AskOutcome::Answered(json!({"decision": "allow"})))
+            .unwrap();
+
+        let (first, _) = first.await.unwrap();
+        assert_eq!(
+            first,
+            LoginConsent::Ended(AskOutcome::Answered(json!({"decision": "allow"})))
+        );
+        let (second, parked) = second.await.unwrap();
+        assert_eq!(
+            second,
+            LoginConsent::Pending {
+                ask_id: "second-card".into()
+            },
+            "the second call should have started over on a card of its own"
+        );
+        assert_eq!(
+            parked, CONSENT_PARK_LIMIT,
+            "both waits together must fit one allowance"
+        );
     }
 
     #[test]

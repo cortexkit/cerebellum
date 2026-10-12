@@ -2665,6 +2665,13 @@ impl BrowserSessions {
         self.permits.0.try_call()
     }
 
+    /// One work permit from the browser plane's pool for a blocking job that
+    /// belongs to no call, such as one handoff poll, or `None` when none is
+    /// free. The job keeps it until it really ends.
+    pub(crate) fn try_job_permit(&self) -> Option<Arc<tokio::sync::OwnedSemaphorePermit>> {
+        self.permits.0.try_resolution()
+    }
+
     /// Size the blocking-worker pool, so tests can exhaust it.
     #[doc(hidden)]
     pub fn with_blocking_workers_for_test(mut self, size: usize) -> Self {
