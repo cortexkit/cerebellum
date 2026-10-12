@@ -504,6 +504,12 @@ impl AcceptedBindFacts {
                 .any(|family| family == ELICITATION_CAPABILITY)
     }
 
+    /// Consumer declarations retained from the daemon's accepted route bind.
+    /// An absent or empty list declares no reverse requests or result readers.
+    pub fn consumer_capabilities(&self) -> Option<&[String]> {
+        (!self.consumer_capabilities.is_empty()).then_some(self.consumer_capabilities.as_slice())
+    }
+
     /// Whether daemon-attested bind facts admit this control operation. Caller
     /// request fields cannot substitute for missing identity or authority facts.
     pub fn allows_control_operation(&self, operation: &str) -> bool {

@@ -78,6 +78,26 @@ async fn bind_with_scope_mode(
     scope: Option<subc_protocol::scope::ScopeStamp>,
     call_mode: Option<subc_protocol::call_mode::CallMode>,
 ) {
+    bind_with_readers(
+        planes,
+        channel,
+        module,
+        scope,
+        call_mode,
+        Some(vec![
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+        ]),
+    )
+    .await;
+}
+async fn bind_with_readers(
+    planes: &Planes,
+    channel: u16,
+    module: &str,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    call_mode: Option<subc_protocol::call_mode::CallMode>,
+    consumer_capabilities: Option<Vec<String>>,
+) {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode,
@@ -90,7 +110,7 @@ async fn bind_with_scope_mode(
         principal: Some(Principal::Reserved {
             module_id: module.into(),
         }),
-        consumer_capabilities: None,
+        consumer_capabilities,
         scope,
         admission_facts: Some(
             json!({"agentProjectId":"catalog-test","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
@@ -493,7 +513,10 @@ async fn codemode_never_elicits_a_consent_card() {
         principal: Some(Principal::Reserved {
             module_id: "prefrontal-core".into(),
         }),
-        consumer_capabilities: Some(vec!["elicitation".into()]),
+        consumer_capabilities: Some(vec![
+            "elicitation".into(),
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        ]),
         scope: mode_scope(&CallMode::Codemode),
         admission_facts: Some(
             json!({"agentProjectId":"catalog-test", "sessionKind":"primary", "effectiveCapabilityScope":["*"]}),
@@ -549,7 +572,10 @@ async fn classic_still_elicits_a_consent_card() {
         principal: Some(Principal::Reserved {
             module_id: "prefrontal-core".into(),
         }),
-        consumer_capabilities: Some(vec!["elicitation".into()]),
+        consumer_capabilities: Some(vec![
+            "elicitation".into(),
+            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        ]),
         scope: None,
         admission_facts: Some(
             json!({"agentProjectId":"catalog-test", "sessionKind":"primary", "effectiveCapabilityScope":["*"]}),
@@ -589,4 +615,81 @@ async fn classic_still_elicits_a_consent_card() {
         }
     }
     assert!(elicited && replied);
+}
+
+#[tokio::test]
+async fn call_members_cannot_enable_a_result_reader() {
+    let planes = planes(true);
+    bind_with_readers(&planes, 9, "prefrontal-core", None, None, None).await;
+    let response = exchange(
+        &planes,
+        9,
+        json!({"name":"browser_use",
+        "arguments":{"action":"status"}, "consumer_capabilities":[cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY]}),
+    )
+    .await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let reply = body(&response);
+    assert_eq!(reply["outcome"], "invalid_request");
+    assert_eq!(reply["detail"]["field"], "consumer_capabilities");
+    assert!(reply.get("content").is_none());
+    let status = exchange(
+        &planes,
+        9,
+        json!({"name":"browser_use", "arguments":{"action":"status"}}),
+    )
+    .await;
+    assert_eq!(status.body.as_slice(), br#"{"outcome":"no_session"}"#);
+}
+
+#[tokio::test]
+async fn keyed_replays_use_the_current_routes_result_reader() {
+    for first_reads in [false, true] {
+        let planes = planes(true);
+        let declaration = |reads| {
+            if reads {
+                Some(vec![
+                    cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+                ])
+            } else {
+                None
+            }
+        };
+        bind_with_readers(
+            &planes,
+            9,
+            "prefrontal-core",
+            None,
+            None,
+            declaration(first_reads),
+        )
+        .await;
+        bind_with_readers(
+            &planes,
+            10,
+            "prefrontal-core",
+            None,
+            None,
+            declaration(!first_reads),
+        )
+        .await;
+        let call = json!({"name":"browser_use", "arguments":{"action":"status", "unexpected":true}, "call_key":"format-replay"});
+        let first = exchange(&planes, 9, call.clone()).await;
+        assert_eq!(first.header.ty, FrameType::Response);
+        let first_body = body(&first);
+        let legacy = first_body.get("structuredContent").unwrap_or(&first_body);
+        assert_eq!(legacy["outcome"], "invalid_request");
+        let second = exchange(&planes, 10, call.clone()).await;
+        assert_eq!(second.header.ty, FrameType::Response, "{}", body(&second));
+        let second_body = body(&second);
+        if first_reads {
+            assert_eq!(second.body, serde_json::to_vec(legacy).unwrap());
+        } else {
+            let result: cortexkit_role_tool_provider::result::ToolResult =
+                serde_json::from_slice(&second.body).unwrap();
+            cortexkit_role_tool_provider::result::validate(&result).unwrap();
+            assert_eq!(second_body["structuredContent"], *legacy);
+        }
+        assert_eq!(second.body, exchange(&planes, 10, call).await.body);
+    }
 }

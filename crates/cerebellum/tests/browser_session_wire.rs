@@ -6244,6 +6244,7 @@ async fn a_call_with_no_blocking_worker_free_is_refused_before_dispatch() {
 async fn bind_other_conversation(planes: &Planes, channel: u16) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
+        call_mode: None,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
@@ -9872,6 +9873,7 @@ fn only_profile_creation_marks_signed_in_coverage_complete() {
         flow_id: None,
         consumer_capabilities: vec![],
         surface: RouteSurface::Tools,
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
     };
     let legacy = service

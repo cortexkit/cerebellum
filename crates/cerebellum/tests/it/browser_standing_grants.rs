@@ -2376,7 +2376,7 @@ async fn codemode_missing_browser_grant_refuses_without_elicitation() {
         .call(
             &run,
             "browser_use",
-            json!({"action":"navigate", "url":PUBLIC,
+            json!({"action":"navigate", "url":"http://127.0.0.1:8080",
         "intent":"read", "severity":{"tier":2,"credential":false,"financial":false}}),
         )
         .await;

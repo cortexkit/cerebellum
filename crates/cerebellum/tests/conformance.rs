@@ -406,14 +406,6 @@ async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
             let response = rx.recv().await.unwrap();
             assert_eq!(response.header.ty, FrameType::Response);
             let body: Value = serde_json::from_slice(&response.body).unwrap();
-            let body = if name == "browser_use" {
-                let result: cortexkit_role_tool_provider::result::ToolResult =
-                    serde_json::from_value(body.clone()).unwrap();
-                cortexkit_role_tool_provider::result::validate(&result).unwrap();
-                body["structuredContent"].clone()
-            } else {
-                body
-            };
             if preset == Some(json!("head")) {
                 assert_eq!(body["outcome"], "invalid_request", "{name}: {body}");
                 assert_eq!(body["detail"]["field"], "preset");

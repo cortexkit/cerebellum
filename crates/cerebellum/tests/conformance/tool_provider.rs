@@ -56,6 +56,48 @@ fn config() -> BrowserConfig {
     }
 }
 
+async fn bind_reader_route(
+    planes: &Arc<Planes>,
+    stamp: &RouteStamp,
+    consumer_capabilities: Option<Vec<String>>,
+) -> Result<Route, HarnessError> {
+    let channel = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        call_mode: None,
+        route_channel: channel,
+        epoch: 3,
+        target: RouteTarget::ToolProvider {
+            module_id: MODULE_ID.into(),
+        },
+        identity: BindIdentity::new("/test/project", "conformance", "test-session"),
+        principal: Some(principal(&stamp.principal)),
+        consumer_capabilities,
+        admission_facts: Some(
+            json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
+        ),
+        scope: stamp.scope.as_ref().map(|scope| {
+            subc_protocol::scope::ScopeStamp::new(
+                principal(&scope.owner),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_attributes(subc_protocol::scope::ScopeAttributes::default())
+            .with_owner_authorized(true)
+        }),
+    };
+    let (tx, mut rx) = mpsc::channel(8);
+    cerebellum::handle_frame_for_test(frame(0, serde_json::to_value(bind).unwrap()), &tx, planes)
+        .await
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+    Ok(Route {
+        planes: planes.clone(),
+        channel,
+    })
+}
+
 #[async_trait]
 impl Harness for Subject {
     type Handle = Arc<Planes>;
@@ -79,45 +121,7 @@ impl Harness for Subject {
         Ok(Arc::new(planes))
     }
     async fn route(&self, planes: &Arc<Planes>, stamp: &RouteStamp) -> Result<Route, HarnessError> {
-        let channel = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
-        let bind = ModuleControlRequest::RouteBind {
-            role_versions: None,
-            call_mode: None,
-            route_channel: channel,
-            epoch: 3,
-            target: RouteTarget::ToolProvider {
-                module_id: MODULE_ID.into(),
-            },
-            identity: BindIdentity::new("/test/project", "conformance", "test-session"),
-            principal: Some(principal(&stamp.principal)),
-            consumer_capabilities: None,
-            admission_facts: Some(
-                json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
-            ),
-            scope: stamp.scope.as_ref().map(|scope| {
-                subc_protocol::scope::ScopeStamp::new(
-                    principal(&scope.owner),
-                    scope.scope_ref.clone(),
-                    scope.scope_epoch,
-                    subc_protocol::scope::ScopeKind::Head,
-                )
-                .with_attributes(subc_protocol::scope::ScopeAttributes::default())
-                .with_owner_authorized(true)
-            }),
-        };
-        let (tx, mut rx) = mpsc::channel(8);
-        cerebellum::handle_frame_for_test(
-            frame(0, serde_json::to_value(bind).unwrap()),
-            &tx,
-            planes,
-        )
-        .await
-        .map_err(|error| HarnessError::new(error.to_string()))?;
-        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
-        Ok(Route {
-            planes: planes.clone(),
-            channel,
-        })
+        bind_reader_route(planes, stamp, None).await
     }
     async fn kill_at(
         &self,
@@ -170,6 +174,15 @@ impl ToolRoute for Route {
 
 #[async_trait]
 impl ToolProviderSubject for Subject {
+    async fn route_with_consumer_capabilities(
+        &self,
+        handle: &Self::Handle,
+        stamp: &RouteStamp,
+        consumer_capabilities: &[String],
+    ) -> Result<Self::Route, HarnessError> {
+        bind_reader_route(handle, stamp, Some(consumer_capabilities.to_vec())).await
+    }
+
     fn capabilities(&self) -> BTreeSet<Capability> {
         [
             Capability::CallKey,
@@ -305,4 +318,44 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
     );
     drop(client);
     daemon.stop();
+}
+
+#[tokio::test]
+async fn content_v1_requires_route_reader_declaration() {
+    let root = live_daemon_directory(0);
+    let planes = Subject.spawn(&root).await.unwrap();
+    let stamp = Subject.plain_stamp();
+    let legacy = bind_reader_route(&planes, &stamp, None).await.unwrap();
+    let reader = Subject
+        .route_with_consumer_capabilities(
+            &planes,
+            &stamp,
+            &[cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()],
+        )
+        .await
+        .unwrap();
+    let call = json!({"name":"browser_use", "arguments":{"action":"status"}});
+    let legacy_reply = legacy.request(call.clone()).await.unwrap();
+    let [ObservedFrame::Response(legacy_body)] = legacy_reply.frames.as_slice() else {
+        panic!("legacy route did not produce exactly one response: {legacy_reply:?}");
+    };
+    assert_eq!(legacy_body, &json!({"outcome":"no_session"}));
+    let reader_reply = reader.request(call).await.unwrap();
+    let [ObservedFrame::Response(content)] = reader_reply.frames.as_slice() else {
+        panic!("reader route did not produce exactly one response: {reader_reply:?}");
+    };
+    let result: cortexkit_role_tool_provider::result::ToolResult =
+        serde_json::from_value(content.clone()).unwrap();
+    cortexkit_role_tool_provider::result::validate(&result).unwrap();
+    assert_eq!(
+        result.structured_content.unwrap(),
+        legacy_body.as_object().unwrap().clone()
+    );
+    let catalog_call = json!({"name":"tool.catalog", "arguments":{"params":{}}});
+    assert_eq!(
+        legacy.request(catalog_call.clone()).await.unwrap().frames,
+        reader.request(catalog_call).await.unwrap().frames,
+        "reader declarations must not change catalog metadata"
+    );
+    let _ = fs::remove_dir_all(root);
 }

@@ -60,13 +60,15 @@ pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
 #[cfg(test)]
+mod result_negotiation_tests;
+#[cfg(test)]
 mod route_future_size_tests;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod terminal_arbiter;
 mod tool_provider;
-mod user_browser;
 mod tool_result;
+mod user_browser;
 pub mod user_browser_bridge;
 pub mod wire;
 
@@ -5513,10 +5515,8 @@ async fn handle_keyed_tool_request(
 ) -> Result<(), ModuleError> {
     let object = serde_json::from_slice::<Value>(&frame.body).ok();
     let name = object.as_ref().and_then(|value| value["name"].as_str());
-    if let (Some(name), Some(facts)) = (
-        name,
-        planes.routes.get(frame.header.channel, frame.header.epoch),
-    ) {
+    let bind = planes.routes.get(frame.header.channel, frame.header.epoch);
+    if let (Some(name), Some(facts)) = (name, bind.as_ref()) {
         if let Err(error) = tool_provider::check_call_mode(name, &facts.call_mode, planes) {
             return tool_provider::send_error(
                 error,
@@ -5531,13 +5531,12 @@ async fn handle_keyed_tool_request(
             .await;
         }
     }
-    let content_v1 = matches!(
-        name,
-        Some(flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE)
-    );
-    tool_result::CONTENT_V1
+    // Result-reader support is a route declaration, never a call argument.
+    // Older cores retain their exact legacy body until they declare the reader.
+    let result_bind = name.zip(bind).map(|(name, bind)| (name.to_owned(), bind));
+    tool_result::RESULT_BIND
         .scope(
-            content_v1,
+            result_bind,
             handle_keyed_tool_request_inner(frame, writer, planes),
         )
         .await
@@ -5633,6 +5632,10 @@ async fn handle_keyed_tool_request_inner(
         )
         .await;
     };
+    let flat_tool = matches!(
+        object.get("name").and_then(Value::as_str),
+        Some(flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE)
+    );
     let mut call = frame;
     call.body = serde_json::to_vec(&Value::Object(object)).map_err(ModuleError::Json)?;
     // Without an accepted bind there is no principal to record the call under.
@@ -5684,6 +5687,27 @@ async fn handle_keyed_tool_request_inner(
     let ticket = match begun {
         Begin::Execute(ticket) => ticket,
         Begin::Replay(reply) => {
+            // A reconnect can change its declared result reader without changing
+            // the recorded action. Adapt only the encoding, never execute again.
+            if flat_tool {
+                if let Some(result) = reply.result() {
+                    let is_content = result.get("content").is_some()
+                        && result.get("structuredContent").is_some();
+                    let wants_content = tool_result::RESULT_BIND
+                        .try_with(|binding| {
+                            binding.as_ref().is_some_and(|(_, bind)| {
+                                cortexkit_role_tool_provider::consumer_reads_content_v1(
+                                    bind.consumer_capabilities(),
+                                )
+                            })
+                        })
+                        .unwrap_or(false);
+                    if is_content != wants_content {
+                        let legacy = result.get("structuredContent").cloned().unwrap_or(result);
+                        return send_tool_response(writer, ver, channel, epoch, corr, legacy).await;
+                    }
+                }
+            }
             return send(writer, reply.readdressed(ver, channel, epoch, corr)).await;
         }
         Begin::InFlight => {
@@ -7367,10 +7391,19 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
-    let body = if tool_result::CONTENT_V1
-        .try_with(|enabled| *enabled)
-        .unwrap_or(false)
-    {
+    let content_v1 = tool_result::RESULT_BIND
+        .try_with(|binding| {
+            binding.as_ref().is_some_and(|(tool, bind)| {
+                matches!(
+                    tool.as_str(),
+                    flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE
+                ) && cortexkit_role_tool_provider::consumer_reads_content_v1(
+                    bind.consumer_capabilities(),
+                )
+            })
+        })
+        .unwrap_or(false);
+    let body = if content_v1 {
         tool_result::encode(body)?
     } else {
         serde_json::to_vec(&body).map_err(ModuleError::Json)?

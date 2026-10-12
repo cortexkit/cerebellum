@@ -476,18 +476,16 @@ impl CallHold for TestHold {
 }
 
 fn stamp(scope_ref: &str, agent: Option<&str>) -> ScopeStamp {
-    ScopeStamp {
-        owner: Principal::Reserved {
+    ScopeStamp::new(
+        Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: scope_ref.into(),
-        scope_epoch: 3,
-        kind: ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: ScopeAttributes::new().with_agent_id(agent.map(str::to_string)),
-        owner_authorized: true,
-    }
+        scope_ref,
+        3,
+        ScopeKind::Head,
+    )
+    .with_attributes(ScopeAttributes::new().with_agent_id(agent.map(str::to_string)))
+    .with_owner_authorized(true)
 }
 
 /// A live call on the session `sc_head_alf`, and the switch that ends it.

@@ -6,7 +6,7 @@ use cortexkit_role_tool_provider::result::{self, ContentPart, ImageContent, Tool
 use serde_json::{json, Map, Value};
 
 tokio::task_local! {
-    pub(crate) static CONTENT_V1: bool;
+    pub(crate) static RESULT_BIND: Option<(String, cerebellum_core::identity::AcceptedBindFacts)>;
 }
 
 fn notice(id: Option<&str>, reason: &str) -> String {
