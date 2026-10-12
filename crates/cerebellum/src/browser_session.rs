@@ -1,6 +1,8 @@
 //! Route-owned browser session lifecycle, leases, and the common teardown ladder.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -726,6 +728,13 @@ pub trait OwnedBrowserProcess: Send {
 
     fn generation_matches(&self) -> bool;
 
+    /// Send the paired release of every press this session's driver recorded
+    /// as possibly held, and nothing else: no caller chooses the events. The
+    /// default refuses, which leaves held-input quarantine in place.
+    fn release_held_input(&mut self, _deadline_ms: u64) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Whether the recorded generation has positively gone, which is narrower
     /// than `!generation_matches()`: a generation whose reading failed neither
     /// matches nor has gone, and ending a session on it would end one whose
@@ -796,6 +805,243 @@ pub enum KillOutcome {
     /// Whether the pid still names this browser could not be confirmed, so
     /// nothing was signalled and the browser may still be running.
     Refused,
+}
+
+/// How far past its own cap one CDP command may stay in flight before the
+/// write backstop ends the browser. The write backstop is the exit sweep's
+/// check (`BrowserSessions::write_backstop`) that kills a ready session's
+/// browser whose CDP command has run that long, without the driver lock. Reads poll a non-blocking pipe and stop at
+/// their own deadline, so only a command write that blocks runs this far over.
+pub const WRITE_BACKSTOP_SLACK: Duration = Duration::from_millis(crate::budgets::BOUNDARY_SLACK_MS);
+
+/// The text a call refused for possibly held input carries in `detail.reason`.
+pub const HELD_INPUT_UNCONFIRMED: &str = "held_input_unconfirmed";
+
+/// The remedy sent with a held-input refusal.
+pub const HELD_INPUT_REMEDY: &str =
+    "held input could not be confirmed released; the next input action retries the release first";
+
+/// A key or mouse-button press sent to the page whose paired release Chrome
+/// has not acknowledged. The driver records it before the press is written,
+/// so a press whose send fails or never returns still counts as held, and
+/// removes it only when Chrome acknowledges the paired release.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HeldPress {
+    pub(crate) session_id: Option<String>,
+    pub(crate) method: &'static str,
+    /// The mouse button or key the press holds down.
+    pub(crate) control: String,
+    /// The parameters of the paired release, derived from the press itself,
+    /// so a later release cannot be steered to any other command.
+    pub(crate) release: serde_json::Map<String, Value>,
+}
+
+struct InFlightCommand {
+    id: u64,
+    method: String,
+    started: Instant,
+    cap: Duration,
+}
+
+/// What a session shares with its CDP driver without the driver lock, so it
+/// can be read while a stuck command holds that lock: the commands now in
+/// flight, read by the write backstop and by execution quarantine (which
+/// refuses new calls on a session whose operation outlived its call), and the
+/// presses that may still be held, read by held-input quarantine (which
+/// refuses input calls until the release is confirmed). Its locks are
+/// leaves: none is held across I/O or another lock.
+#[derive(Default)]
+pub(crate) struct DriverWatch {
+    in_flight: Mutex<Vec<InFlightCommand>>,
+    held: Mutex<Vec<HeldPress>>,
+    next_command: AtomicU64,
+}
+
+/// Removes one in-flight record when its command returns, however it returns.
+pub(crate) struct InFlightRecord<'a> {
+    watch: &'a DriverWatch,
+    id: u64,
+}
+
+impl Drop for InFlightRecord<'_> {
+    fn drop(&mut self) {
+        recover_poisoned(self.watch.in_flight.lock()).retain(|command| command.id != self.id);
+    }
+}
+
+impl DriverWatch {
+    /// Record one command as written now and allowed `cap` to complete.
+    pub(crate) fn begin_command(&self, method: &str, cap: Duration) -> InFlightRecord<'_> {
+        let id = self.next_command.fetch_add(1, Ordering::Relaxed);
+        recover_poisoned(self.in_flight.lock()).push(InFlightCommand {
+            id,
+            method: method.to_string(),
+            started: Instant::now(),
+            cap,
+        });
+        InFlightRecord { watch: self, id }
+    }
+
+    /// The method of a command that has run longer than its own cap plus
+    /// `slack`, if any. Each command is judged against its own cap, so a
+    /// driver-lock holder that runs several commands back to back, each within
+    /// its cap, is never judged on their combined time.
+    fn overdue(&self, slack: Duration) -> Option<String> {
+        recover_poisoned(self.in_flight.lock())
+            .iter()
+            .find(|command| command.started.elapsed() > command.cap.saturating_add(slack))
+            .map(|command| command.method.clone())
+    }
+
+    pub(crate) fn oldest_method(&self) -> Option<String> {
+        recover_poisoned(self.in_flight.lock())
+            .first()
+            .map(|command| command.method.clone())
+    }
+
+    pub(crate) fn held(&self) -> Vec<HeldPress> {
+        recover_poisoned(self.held.lock()).clone()
+    }
+
+    pub(crate) fn hold(&self, press: HeldPress) {
+        let mut held = recover_poisoned(self.held.lock());
+        if !held.contains(&press) {
+            held.push(press);
+        }
+    }
+
+    pub(crate) fn holds(&self, session_id: Option<&str>, method: &str, control: &str) -> bool {
+        recover_poisoned(self.held.lock()).iter().any(|press| {
+            press.session_id.as_deref() == session_id
+                && press.method == method
+                && press.control == control
+        })
+    }
+
+    pub(crate) fn released(&self, session_id: Option<&str>, method: &str, control: &str) {
+        recover_poisoned(self.held.lock()).retain(|press| {
+            !(press.session_id.as_deref() == session_id
+                && press.method == method
+                && press.control == control)
+        });
+    }
+}
+
+/// The context of one CDP driver call. `terminal` is the terminal decision of
+/// the call it serves, if any; every mutating command must pass that
+/// decision's dispatch gate. `watch` is the session's `DriverWatch`.
+#[derive(Clone)]
+pub(crate) struct DriveContext {
+    pub(crate) terminal: Option<Arc<crate::TerminalArbiter>>,
+    pub(crate) watch: Arc<DriverWatch>,
+}
+
+thread_local! {
+    static DRIVE_CONTEXT: RefCell<Option<DriveContext>> = const { RefCell::new(None) };
+}
+
+/// The context of the driver call running on this thread, if any. The CDP
+/// driver reads it here because the process adapters between the session and
+/// the driver carry only each capability's own arguments.
+pub(crate) fn drive_context() -> Option<DriveContext> {
+    DRIVE_CONTEXT.with(|context| context.borrow().clone())
+}
+
+/// Installs a drive context for one driver call and restores the previous
+/// one when dropped.
+pub(crate) struct DriveScope(Option<DriveContext>);
+
+impl DriveScope {
+    pub(crate) fn enter(
+        terminal: Option<Arc<crate::TerminalArbiter>>,
+        watch: &Arc<DriverWatch>,
+    ) -> Self {
+        let context = DriveContext {
+            terminal,
+            watch: Arc::clone(watch),
+        };
+        Self(DRIVE_CONTEXT.with(|slot| slot.borrow_mut().replace(context)))
+    }
+}
+
+impl Drop for DriveScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        DRIVE_CONTEXT.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// The one blocking-work permit the browser plane (all browser sessions of
+/// this module) keeps outside its ordinary pool, so closing a session in
+/// execution quarantine still works when stuck work holds every other one.
+#[derive(Clone, Default)]
+struct ControlPermit(Arc<AtomicBool>);
+
+struct ControlPermitHeld(Arc<AtomicBool>);
+
+impl ControlPermit {
+    fn try_take(&self) -> Option<ControlPermitHeld> {
+        self.0
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ControlPermitHeld(Arc::clone(&self.0)))
+    }
+}
+
+impl Drop for ControlPermitHeld {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The browser plane's pool of `MAX_BLOCKING_WORKERS_BROWSER` permits.
+#[derive(Clone)]
+struct BrowserPermits(Arc<crate::blocking_permits::PermitPool>);
+
+impl Default for BrowserPermits {
+    fn default() -> Self {
+        Self(Arc::new(crate::blocking_permits::PermitPool::new(
+            crate::budgets::MAX_BLOCKING_WORKERS_BROWSER,
+        )))
+    }
+}
+
+/// What a module shutdown left behind at the end of its shutdown budget
+/// (`ShutdownBudget`, fixed when the shutdown starts). The shutdown was not a
+/// clean stop while any of these fields is non-empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Sessions whose browser could not be confirmed stopped, so their
+    /// profile custody stays held for the next start's launch recovery.
+    pub custody_held: Vec<String>,
+    /// Browser operations still running when the budget ended: workers stuck
+    /// inside a driver call, whatever started them. Health already counts a
+    /// call's stuck worker as a detached worker, through the task that served
+    /// the call; this field also counts operations that belong to no call.
+    pub operations_running: usize,
+    /// Teardowns still running when the budget ended. Each is counted as a
+    /// detached worker in health until it really ends.
+    pub teardowns_running: usize,
+}
+
+/// The time a CDP command may run past its own cap before the write backstop
+/// acts. A field, defaulting to `WRITE_BACKSTOP_SLACK`, so tests can shorten it.
+#[derive(Clone, Copy)]
+struct BackstopSlack(Duration);
+
+impl Default for BackstopSlack {
+    fn default() -> Self {
+        Self(WRITE_BACKSTOP_SLACK)
+    }
+}
+
+/// A session whose operation outlived its call, or whose CDP command has run
+/// past its cap plus slack. Calls on it are refused rather than queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionQuarantine {
+    pub browser_session_id: String,
+    /// The CDP method in flight, or a generic name when none is.
+    pub call: String,
 }
 
 /// How long a module shutdown may spend closing browsers, measured from the
@@ -1140,6 +1386,15 @@ struct SessionMeta {
     handoff_opening: bool,
     next_handoff_generation: u64,
     cleanup: Option<Box<dyn SessionCleanup>>,
+    /// The terminal decision of each admitted call operation, keyed by its
+    /// operation number. An entry whose dispatch gate has stopped while its
+    /// operation is still admitted is a worker that outlived its call.
+    live_calls: Vec<(u64, Arc<crate::TerminalArbiter>)>,
+    next_operation: u64,
+    /// The write backstop has acted on this session: it recorded the
+    /// session's terminal outcome (`connector_failure` unless one was already
+    /// set) and killed the browser, and exit observation tears it down.
+    backstop_fired: bool,
 }
 
 impl SessionMeta {
@@ -1259,6 +1514,8 @@ struct SessionCell {
     /// whether the browser is still running without waiting for a call in
     /// progress to give LD back.
     exit_probe: OnceLock<Arc<dyn BrowserExitProbe>>,
+    /// Shared with the driver while it runs a call: see [`DriverWatch`].
+    watch: Arc<DriverWatch>,
 }
 
 impl SessionCell {
@@ -1282,11 +1539,15 @@ impl SessionCell {
                 handoff_opening: false,
                 next_handoff_generation: 0,
                 cleanup: None,
+                live_calls: Vec::new(),
+                next_operation: 0,
+                backstop_fired: false,
             }),
             wake: Condvar::new(),
             driver: Mutex::new(None),
             killer: OnceLock::new(),
             exit_probe: OnceLock::new(),
+            watch: Arc::new(DriverWatch::default()),
         }
     }
 
@@ -1335,6 +1596,13 @@ pub struct BrowserSessions {
     /// L3.
     shutdown: Arc<Mutex<ShutdownSide>>,
     signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
+    control_permit: ControlPermit,
+    backstop_slack: BackstopSlack,
+    /// The browser plane's blocking-worker pool, shared by every clone.
+    permits: BrowserPermits,
+    /// Where a shutdown teardown that outlives its plan is counted as a
+    /// detached worker until it really ends. Unset where no health is kept.
+    health: Option<Arc<cerebellum_core::health::HealthState>>,
 }
 
 #[derive(Debug)]
@@ -1395,6 +1663,11 @@ pub struct OperationGuard {
     cell: Arc<SessionCell>,
     /// This operation is a `present` holding the handoff reservation.
     handoff_reservation: bool,
+    /// The terminal decision of the call that admitted this operation, when
+    /// it was admitted inside one. Its dispatch gate guards every mutating
+    /// CDP command the operation sends.
+    terminal: Option<Arc<crate::TerminalArbiter>>,
+    operation_id: u64,
     finished: bool,
 }
 
@@ -1429,6 +1702,7 @@ impl OperationGuard {
         let process = driver
             .as_mut()
             .ok_or_else(|| refused(NavigationDriveError::Unavailable))?;
+        let _context = DriveScope::enter(self.terminal.clone(), &self.cell.watch);
         call(process.as_mut())
     }
 
@@ -1627,6 +1901,7 @@ impl OperationGuard {
         }
         self.finished = true;
         meta.pending_operations = meta.pending_operations.saturating_sub(1);
+        meta.live_calls.retain(|(id, _)| *id != self.operation_id);
         if self.handoff_reservation {
             meta.handoff_opening = false;
         }
@@ -1729,6 +2004,15 @@ impl BrowserSessions {
         handoff_reservation: bool,
     ) -> OperationGuard {
         meta.pending_operations = meta.pending_operations.saturating_add(1);
+        meta.next_operation = meta.next_operation.wrapping_add(1);
+        let operation_id = meta.next_operation;
+        // Read from the calling task: an operation admitted inside a call
+        // carries that call's terminal decision, while background work (a
+        // handoff poll on the blocking pool) runs under none.
+        let terminal = crate::TerminalArbiter::current();
+        if let Some(terminal) = &terminal {
+            meta.live_calls.push((operation_id, Arc::clone(terminal)));
+        }
         if let Some(switch) = self
             .side()
             .routes
@@ -1741,6 +2025,8 @@ impl BrowserSessions {
             sessions: self.clone(),
             cell: Arc::clone(cell),
             handoff_reservation,
+            terminal,
+            operation_id,
             finished: false,
         }
     }
@@ -2006,6 +2292,7 @@ impl BrowserSessions {
         let opening_cookie_names = {
             let mut driver = cell.driver().map_err(|_| PresentRefusal::NoSession)?;
             let process = driver.as_mut().ok_or(PresentRefusal::NoSession)?;
+            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
             let current_url = process
                 .main_frame_url(route_key, deadline_ms)
                 .map_err(|error| PresentRefusal::PresentFailed {
@@ -2166,6 +2453,10 @@ impl BrowserSessions {
             let Some(process) = driver.as_mut() else {
                 return HandoffPollResult::Gone;
             };
+            // The poll runs outside any call, so it has no terminal decision
+            // and is not gated. Its commands are still recorded in flight, so
+            // one that runs past its own cap is caught by the write backstop.
+            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
             let Ok(current_cookie_names) =
                 process.cookie_names_for_origin(route_key, &origin, deadline_ms)
             else {
@@ -2261,12 +2552,132 @@ impl BrowserSessions {
             }
         };
         let status = match cell.meta() {
-            Ok(meta) => meta
-                .record(&cell.browser_session_id)
-                .status_json(clock, wall_now),
+            Ok(meta) => {
+                let mut status = meta
+                    .record(&cell.browser_session_id)
+                    .status_json(clock, wall_now);
+                // Status takes no driver lock, so it still answers while a
+                // quarantined operation holds that lock, and it reports the
+                // quarantine in `remedy`.
+                if let Some(call) = self.stuck_operation(&cell, &meta) {
+                    status["remedy"] = json!(format!(
+                        "a browser operation ({call}) is still running after its call ended; \
+                         other calls on this session are refused as target_busy until it ends; \
+                         browser.close ends it"
+                    ));
+                } else if !cell.watch.held().is_empty() {
+                    status["remedy"] = json!(HELD_INPUT_REMEDY);
+                }
+                status
+            }
             Err(_) => internal_failure_reply(BROWSER_SESSION_LOCK_STAGE),
         };
         status
+    }
+
+    /// The stuck action, when the session is in execution quarantine: an
+    /// admitted operation whose call has already ended, or a CDP command past
+    /// its own cap plus the backstop slack. Called with the meta lock held.
+    fn stuck_operation(&self, cell: &SessionCell, meta: &SessionMeta) -> Option<String> {
+        let overdue = cell.watch.overdue(self.backstop_slack.0);
+        let detached = meta
+            .live_calls
+            .iter()
+            .any(|(_, terminal)| terminal.gate.stopped());
+        if overdue.is_none() && !detached {
+            return None;
+        }
+        Some(
+            overdue
+                .or_else(|| cell.watch.oldest_method())
+                .unwrap_or_else(|| "browser session operation".to_string()),
+        )
+    }
+
+    /// Whether the route's session is in execution quarantine. Takes only the
+    /// brief registry and meta locks, never the driver lock a stuck operation
+    /// holds. A session left with custody held stays quarantined while its
+    /// stuck holder lives, so calls are refused instead of queued behind it.
+    pub fn execution_quarantine(&self, route_key: &str) -> Option<ExecutionQuarantine> {
+        let cell = self.active_cell_recovering(route_key)?;
+        let meta = recovered(cell.meta());
+        self.stuck_operation(&cell, &meta)
+            .map(|call| ExecutionQuarantine {
+                browser_session_id: cell.browser_session_id.clone(),
+                call,
+            })
+    }
+
+    /// Whether the route's session has a press whose release Chrome has not
+    /// acknowledged, so its page input is quarantined.
+    pub fn held_input_unconfirmed(&self, route_key: &str) -> bool {
+        self.active_cell_recovering(route_key)
+            .is_some_and(|cell| !cell.watch.held().is_empty())
+    }
+
+    /// Retry the paired release of every press the route's session may still
+    /// hold, as one admitted operation. Returns whether no press is left held.
+    /// Blocks on the driver lock, so callers run it on the blocking pool; the
+    /// driver bounds each release by `deadline_ms`.
+    pub fn retry_held_release(&self, route_key: &str, deadline_ms: u64) -> bool {
+        let Some(cell) = self.active_cell_recovering(route_key) else {
+            return true;
+        };
+        if cell.watch.held().is_empty() {
+            return true;
+        }
+        let mut operation = {
+            let Ok(mut meta) = cell.meta() else {
+                return false;
+            };
+            if !meta.admits_calls() {
+                // A session that admits no calls takes no page input, so its
+                // held press cannot affect a later call: report none held. The
+                // input call is then refused by the session's own state.
+                return true;
+            }
+            // A worker still running may yet land its press after a release
+            // sent now, so the quarantine stays until it ends.
+            if self.stuck_operation(&cell, &meta).is_some() {
+                return false;
+            }
+            self.admit(&cell, &mut meta, false)
+        };
+        let released = operation
+            .drive(
+                |error| error,
+                |process| process.release_held_input(deadline_ms),
+            )
+            .is_ok();
+        operation.finish();
+        released && cell.watch.held().is_empty()
+    }
+
+    /// Count teardowns that outlive a shutdown in `health`.
+    pub fn with_health(mut self, health: Arc<cerebellum_core::health::HealthState>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// A call's work and release permits from the browser plane's pool, or
+    /// `None` when every pair is held.
+    pub(crate) fn try_call_permits(&self) -> Option<crate::blocking_permits::CallPermits> {
+        self.permits.0.try_call()
+    }
+
+    /// Size the blocking-worker pool, so tests can exhaust it.
+    #[doc(hidden)]
+    pub fn with_blocking_workers_for_test(mut self, size: usize) -> Self {
+        self.permits = BrowserPermits(Arc::new(crate::blocking_permits::PermitPool::new(size)));
+        self
+    }
+
+    /// Shorten the write backstop's slack, so tests need not wait out the
+    /// production one.
+    #[doc(hidden)]
+    pub fn with_backstop_slack_for_test(mut self, slack: Duration) -> Self {
+        self.backstop_slack = BackstopSlack(slack);
+        self
     }
 
     pub fn accept_dispatch<C: MonotonicClock>(
@@ -2344,33 +2755,93 @@ impl BrowserSessions {
         true
     }
 
-    /// Tear down every session whose browser has exited on its own.
+    /// Tear down every session whose browser has exited on its own, after
+    /// running the write backstop on each.
     ///
     /// Asks each browser's exit probe, which never waits for a call in
     /// progress. A browser without a probe is checked through its driver slot
     /// only when that slot is free; a busy one is looked at on the next sweep,
     /// and its call in progress fails on its own if the browser is gone.
+    ///
+    /// A session with an operation still pending is skipped and revisited on
+    /// the next sweep: its teardown would wait for that operation, and one
+    /// session's stuck operation must not stall the sweep for every other.
     pub fn observe_exits_all(&self, config: &BrowserConfig) {
         for cell in self.active_cells_recovering() {
-            {
+            self.write_backstop(&cell);
+            let backstop_fired = {
                 let meta = recovered(cell.meta());
-                if meta.terminal.is_some() || meta.lifecycle != Lifecycle::Ready {
+                if meta.lifecycle != Lifecycle::Ready
+                    || (meta.terminal.is_some() && !meta.backstop_fired)
+                {
                     continue;
                 }
-            }
-            let exited = match cell.exit_probe.get() {
-                Some(probe) => probe.generation_gone(),
-                None => cell.try_driver().is_some_and(|driver| {
-                    driver
-                        .as_ref()
-                        .is_some_and(|process| process.generation_gone())
-                }),
+                meta.backstop_fired
             };
-            if exited {
-                // The collected session itself, not whatever the route holds
-                // now, so a session that replaced it is not torn down.
-                self.teardown_cell(&cell, BrowserSessionTerminalOutcome::BrowserCrashed, config);
+            // A browser the backstop killed is gone whatever its probe says.
+            let exited = (backstop_fired && self.cell_killed(&cell))
+                || match cell.exit_probe.get() {
+                    Some(probe) => probe.generation_gone(),
+                    None => cell.try_driver().is_some_and(|driver| {
+                        driver
+                            .as_ref()
+                            .is_some_and(|process| process.generation_gone())
+                    }),
+                };
+            if !exited {
+                continue;
             }
+            {
+                // Checked and recorded under the same meta lock: with no
+                // operation pending and the terminal set, none can be
+                // admitted, so the teardown below never waits on one.
+                let mut meta = recovered(cell.meta());
+                if meta.lifecycle != Lifecycle::Ready
+                    || meta.pending_operations != 0
+                    || (meta.terminal.is_some() && !meta.backstop_fired)
+                {
+                    continue;
+                }
+                meta.terminal
+                    .get_or_insert(BrowserSessionTerminalOutcome::BrowserCrashed);
+            }
+            cell.notify();
+            // The collected session itself, not whatever the route holds
+            // now, so a session that replaced it is not torn down.
+            self.finish_teardown(
+                &cell,
+                BrowserSessionTerminalOutcome::BrowserCrashed,
+                configured_grace(config),
+            );
+        }
+    }
+
+    /// End a ready session one of whose CDP commands has run past its own cap
+    /// plus the backstop slack, whoever holds the driver lock. Such a command
+    /// is a write blocked on a wedged pipe, so nothing is sent over that pipe:
+    /// the browser is killed by its exact generation, with no lock held.
+    ///
+    /// A dead browser fails the write, the holder ends, and the next sweep
+    /// tears the session down with the terminal recorded here. A browser that
+    /// cannot be confirmed dead may still have its profile open, so custody
+    /// stays held. A session in any other lifecycle is left to its launch or
+    /// teardown owner, whose own deadlines bound it.
+    fn write_backstop(&self, cell: &Arc<SessionCell>) {
+        if cell.watch.overdue(self.backstop_slack.0).is_none() {
+            return;
+        }
+        {
+            let mut meta = recovered(cell.meta());
+            if meta.lifecycle != Lifecycle::Ready || meta.backstop_fired {
+                return;
+            }
+            meta.backstop_fired = true;
+            meta.terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::ConnectorFailure);
+        }
+        cell.notify();
+        if !self.kill_cell(cell, false) {
+            self.hold_custody(cell, Lifecycle::Ready);
         }
     }
 
@@ -2407,6 +2878,7 @@ impl BrowserSessions {
         }
         cell.notify();
         let url = cell.driver().ok().and_then(|mut driver| {
+            let _context = DriveScope::enter(None, &cell.watch);
             driver
                 .as_mut()?
                 .main_frame_url(route_key, config.navigation_settle_deadline_ms)
@@ -2459,6 +2931,10 @@ impl BrowserSessions {
                 Lifecycle::Abandoned => return json!({"outcome": "browser_session_not_found"}),
                 _ => {}
             }
+            if meta.lifecycle == Lifecycle::Ready && self.stuck_operation(&cell, &meta).is_some() {
+                drop(meta);
+                return self.close_quarantined(&cell, browser_session_id, config);
+            }
             meta.terminal
                 .get_or_insert(BrowserSessionTerminalOutcome::Closed);
         }
@@ -2479,6 +2955,71 @@ impl BrowserSessions {
         if meta.lifecycle == Lifecycle::Abandoned {
             return json!({"outcome": "browser_session_not_found"});
         }
+        meta.record(browser_session_id).close_result()
+    }
+
+    /// Close a session in execution quarantine. A graceful close would wait
+    /// for the stuck operation to give the driver lock back, so this takes
+    /// the write backstop's path instead, on the plane's one control permit:
+    /// kill the browser by its exact generation, then reap once the holder
+    /// has ended. A browser that cannot be confirmed dead, or a holder that
+    /// outlives the teardown budget, leaves custody held.
+    fn close_quarantined(
+        &self,
+        cell: &Arc<SessionCell>,
+        browser_session_id: &str,
+        config: &BrowserConfig,
+    ) -> Value {
+        let Some(_permit) = self.control_permit.try_take() else {
+            return json!({
+                "outcome": "blocking_capacity_exhausted",
+                "detail": {"dispatched": false, "step": "preflight", "call": BROWSER_CLOSE},
+                "remedy": "another close is ending a stuck browser session; retry",
+            });
+        };
+        {
+            let mut meta = recovered(cell.meta());
+            meta.terminal
+                .get_or_insert(BrowserSessionTerminalOutcome::Closed);
+        }
+        cell.notify();
+        if self.kill_cell(cell, false) {
+            // The dying browser fails the holder's command; wait, within the
+            // teardown budget, for the holder to give the session back.
+            let until = Instant::now() + Duration::from_millis(crate::budgets::TEARDOWN_MS);
+            let holder_ended = {
+                let mut meta = recovered(cell.meta());
+                loop {
+                    if meta.pending_operations == 0 || meta.lifecycle != Lifecycle::Ready {
+                        break meta.lifecycle == Lifecycle::Ready;
+                    }
+                    let now = Instant::now();
+                    if now >= until {
+                        break false;
+                    }
+                    meta = recovered(meta.wait_timeout(&cell.wake, until - now));
+                }
+            };
+            if holder_ended {
+                self.finish_teardown(
+                    cell,
+                    BrowserSessionTerminalOutcome::Closed,
+                    configured_grace(config),
+                );
+            } else {
+                // The browser is dead but its holder still holds the driver,
+                // or another terminalizer owns the teardown; join that one.
+                let teardown_owned = recovered(cell.meta()).lifecycle == Lifecycle::TeardownOwned;
+                if teardown_owned {
+                    cell.wait_settled();
+                } else {
+                    self.hold_custody(cell, Lifecycle::Ready);
+                }
+            }
+        } else {
+            self.hold_custody(cell, Lifecycle::Ready);
+        }
+        let meta = recovered(cell.meta());
         meta.record(browser_session_id).close_result()
     }
 
@@ -2555,14 +3096,18 @@ impl BrowserSessions {
     /// ending, SIGTERM) comes here, and they share one deadline fixed by the
     /// first of them, so a later caller joins the teardown already running
     /// rather than granting itself a fresh budget.
-    pub fn teardown_all(&self, config: &BrowserConfig) {
-        self.teardown_all_within(config, ShutdownBudget::PRODUCTION);
+    pub fn teardown_all(&self, config: &BrowserConfig) -> ShutdownReport {
+        self.teardown_all_within(config, ShutdownBudget::PRODUCTION)
     }
 
     /// [`Self::teardown_all`] under an explicit budget, so tests can observe
     /// the bound without sleeping for the production one.
     #[doc(hidden)]
-    pub fn teardown_all_within(&self, config: &BrowserConfig, budget: ShutdownBudget) {
+    pub fn teardown_all_within(
+        &self,
+        config: &BrowserConfig,
+        budget: ShutdownBudget,
+    ) -> ShutdownReport {
         let plan = *self
             .side()
             .plan
@@ -2584,11 +3129,33 @@ impl BrowserSessions {
         let grace = configured_grace(config);
         // One thread per session, so the time taken is the slowest session's,
         // not the sum over sessions.
-        std::thread::scope(|scope| {
-            for cell in cells {
-                scope.spawn(move || self.shutdown_cell(&cell, grace, &plan));
-            }
+        let teardowns_running = std::thread::scope(|scope| {
+            let shutdowns: Vec<_> = cells
+                .iter()
+                .map(|cell| scope.spawn(move || self.shutdown_cell(cell, grace, &plan)))
+                .collect();
+            shutdowns
+                .into_iter()
+                .map(|shutdown| {
+                    shutdown
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .filter(|left_running| *left_running)
+                .count()
         });
+        let mut report = ShutdownReport {
+            teardowns_running,
+            ..ShutdownReport::default()
+        };
+        for cell in &cells {
+            let meta = recovered(cell.meta());
+            if meta.lifecycle == Lifecycle::CustodyHeld {
+                report.custody_held.push(cell.browser_session_id.clone());
+            }
+            report.operations_running += meta.pending_operations;
+        }
+        report
     }
 
     /// Tear one session down inside the shutdown plan.
@@ -2599,13 +3166,14 @@ impl BrowserSessions {
     /// `graceful_until`; and the kill, reap and after-reap cleanup run in the
     /// reserve that follows, ending at `deadline`. A browser that cannot be
     /// reached or finished in that time keeps its profile custody held (see
-    /// [`Lifecycle::CustodyHeld`]).
-    fn shutdown_cell(&self, cell: &Arc<SessionCell>, grace: Duration, plan: &ShutdownPlan) {
+    /// [`Lifecycle::CustodyHeld`]). Returns whether a teardown thread it
+    /// started is still running when the plan ends.
+    fn shutdown_cell(&self, cell: &Arc<SessionCell>, grace: Duration, plan: &ShutdownPlan) -> bool {
         let in_flight_at_cap = {
             let mut meta = recovered(cell.meta());
             loop {
                 if meta.lifecycle.is_settled() {
-                    return;
+                    return false;
                 }
                 let now = Instant::now();
                 if meta.lifecycle == Lifecycle::Launching {
@@ -2613,7 +3181,7 @@ impl BrowserSessions {
                     // browser, the session (already terminal) is torn down
                     // here like any other.
                     if now >= plan.deadline {
-                        return;
+                        return false;
                     }
                     meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
                     continue;
@@ -2648,12 +3216,12 @@ impl BrowserSessions {
             // or there is none. The browser may still be alive with its
             // profile open, so custody must not be released under it.
             self.hold_custody(cell, Lifecycle::Ready);
-            return;
+            return false;
         };
         let Some(process) = driver.take() else {
             drop(driver);
             self.join_other_teardown(cell, plan);
-            return;
+            return false;
         };
         let (terminal_outcome, cleanup) = {
             let mut meta = recovered(cell.meta());
@@ -2679,7 +3247,7 @@ impl BrowserSessions {
                 grace,
             },
             plan,
-        );
+        )
     }
 
     /// Another terminalizer owns this session's process. Join it without
@@ -2720,16 +3288,32 @@ impl BrowserSessions {
     /// cleanup does filesystem and journal work. If they overrun, custody is
     /// left held rather than letting the shutdown wait past its budget; the
     /// thread carries on, and if it does finish, it retires the session then.
-    fn teardown_within(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown, plan: &ShutdownPlan) {
+    fn teardown_within(
+        &self,
+        cell: &Arc<SessionCell>,
+        owned: OwnedTeardown,
+        plan: &ShutdownPlan,
+    ) -> bool {
         let slot = Arc::new(Mutex::new(Some(owned)));
+        // Whether the thread has ended, and the health count it then drops.
+        // One lock covers both, so a count handed over as the thread ends is
+        // either dropped by the thread or never handed over.
+        let reaper: Arc<Mutex<Reaper>> = Arc::default();
         let run = {
             let sessions = self.clone();
             let cell = Arc::clone(cell);
             let slot = Arc::clone(&slot);
+            let reaper = Arc::clone(&reaper);
             move || {
                 if let Some(owned) = recover_poisoned(slot.lock()).take() {
                     sessions.run_owned_teardown(&cell, owned);
                 }
+                let counted = {
+                    let mut reaper = recover_poisoned(reaper.lock());
+                    reaper.ended = true;
+                    reaper.counted.take()
+                };
+                drop(counted);
             }
         };
         if std::thread::Builder::new()
@@ -2742,13 +3326,13 @@ impl BrowserSessions {
             if let Some(owned) = recover_poisoned(slot.lock()).take() {
                 self.run_owned_teardown(cell, owned);
             }
-            return;
+            return false;
         }
         {
             let mut meta = recovered(cell.meta());
             loop {
                 if meta.lifecycle.is_settled() {
-                    return;
+                    return false;
                 }
                 let now = Instant::now();
                 if now >= plan.deadline {
@@ -2758,6 +3342,17 @@ impl BrowserSessions {
             }
         }
         self.hold_custody(cell, Lifecycle::TeardownOwned);
+        // The thread carries on past the plan: count it as a detached worker
+        // until it ends, so health does not read as a clean stop meanwhile.
+        let mut reaper = recover_poisoned(reaper.lock());
+        if reaper.ended {
+            return false;
+        }
+        reaper.counted = self
+            .health
+            .as_ref()
+            .map(|health| health.enter_detached_worker());
+        true
     }
 
     fn run_owned_teardown(&self, cell: &Arc<SessionCell>, owned: OwnedTeardown) {
@@ -2806,8 +3401,9 @@ impl BrowserSessions {
 
     /// Fire this session's shutdown killer, at most once per session, with no
     /// lock held. With `only_in_flight`, a session with no operation in flight
-    /// is left alone: its browser still gets a graceful close.
-    fn kill_cell(&self, cell: &SessionCell, only_in_flight: bool) {
+    /// is left alone: its browser still gets a graceful close. Returns whether
+    /// the browser is known dead, by this kill or an earlier one.
+    fn kill_cell(&self, cell: &SessionCell, only_in_flight: bool) -> bool {
         let fire = {
             let mut side = self.side();
             match side
@@ -2825,10 +3421,10 @@ impl BrowserSessions {
             }
         };
         if !fire {
-            return;
+            return self.cell_killed(cell);
         }
         let Some(killer) = cell.killer.get() else {
-            return;
+            return false;
         };
         if killer.kill_exact_generation() == KillOutcome::Dead {
             if let Some(switch) = self
@@ -2840,6 +3436,7 @@ impl BrowserSessions {
                 switch.killed = true;
             }
         }
+        self.cell_killed(cell)
     }
 
     fn cell_killed(&self, cell: &SessionCell) -> bool {
@@ -2962,13 +3559,28 @@ impl BrowserSessions {
             cell.wait_settled();
             return;
         };
-        let outcome = teardown_process_with_grace(process.as_mut(), grace).and_then(|()| {
+        // A browser already killed by its exact generation (the write
+        // backstop or a quarantined close) has only its reap left: a graceful
+        // close would write to the pipe that wedged.
+        let outcome = if self.cell_killed(cell) {
+            process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
+        } else {
+            teardown_process_with_grace(process.as_mut(), grace)
+        }
+        .and_then(|()| {
             let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
             cleanup.set_terminal_outcome(terminal_outcome);
             cleanup.after_reap()
         });
         self.retire(cell, process, cleanup, outcome);
     }
+}
+
+/// A shutdown teardown thread's end, as its waiter sees it.
+#[derive(Default)]
+struct Reaper {
+    ended: bool,
+    counted: Option<cerebellum_core::health::DetachedWorkerGuard>,
 }
 
 /// What the shutdown teardown thread takes over from `shutdown_cell`.
@@ -4305,7 +4917,9 @@ mod tests {
         sessions.poison_for_test();
 
         let tearing_down = sessions.clone();
-        finishes_within(move || tearing_down.teardown_all(&config()));
+        finishes_within(move || {
+            tearing_down.teardown_all(&config());
+        });
         for (process, cleanup) in [(first, first_cleanup), (second, second_cleanup)] {
             assert_eq!(
                 process.lock().unwrap().as_slice(),
@@ -4884,6 +5498,19 @@ mod tests {
         /// When set, the graceful wait ends as soon as this switch is killed.
         exit_on_kill: Option<Arc<KillSwitch>>,
         panic_on_screenshot: bool,
+        /// When set, the screenshot stands for a CDP command whose write
+        /// blocks: it records one command in flight, capped at its deadline,
+        /// and returns only once this switch is killed.
+        wedged_write: Option<Arc<KillSwitch>>,
+        /// When set to `(count, cap, each)`, the screenshot runs `count`
+        /// commands one after another, each recorded with the per-command
+        /// deadline `cap` and kept in flight for `each`.
+        in_bound_commands: Option<(usize, Duration, Duration)>,
+        /// When set, the exit probe reports the browser gone once it is true.
+        exited: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// What a held-input release does: `Some(true)` acknowledges every
+        /// recorded press, `Some(false)` fails, `None` keeps the default.
+        release_ok: Option<bool>,
     }
 
     impl TestBrowser {
@@ -4896,6 +5523,10 @@ mod tests {
                 killer: None,
                 exit_on_kill: None,
                 panic_on_screenshot: false,
+                wedged_write: None,
+                in_bound_commands: None,
+                exited: None,
+                release_ok: None,
             }
         }
 
@@ -4935,7 +5566,7 @@ mod tests {
             &mut self,
             _: &str,
             _: u64,
-            _: u64,
+            deadline_ms: u64,
             _: bool,
         ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
             if self.panic_on_screenshot {
@@ -4943,7 +5574,49 @@ mod tests {
             }
             self.call_gate.pass();
             self.push("screenshot");
+            let context = drive_context();
+            if let (Some(switch), Some(context)) = (&self.wedged_write, &context) {
+                let _in_flight = context.watch.begin_command(
+                    "Input.dispatchMouseEvent",
+                    Duration::from_millis(deadline_ms),
+                );
+                let mut killed = switch.killed.lock().unwrap();
+                while !*killed {
+                    killed = switch.wake.wait(killed).unwrap();
+                }
+                return Err(NavigationDriveError::ConnectorFailure);
+            }
+            if let (Some((count, cap, each)), Some(context)) = (self.in_bound_commands, &context) {
+                for _ in 0..count {
+                    let _in_flight = context.watch.begin_command("Network.getCookies", cap);
+                    std::thread::sleep(each);
+                }
+                return Err(NavigationDriveError::CdpFailure);
+            }
             Err(NavigationDriveError::CdpFailure)
+        }
+
+        fn release_held_input(&mut self, _: u64) -> Result<(), NavigationDriveError> {
+            self.push("release");
+            match (self.release_ok, drive_context()) {
+                (Some(true), Some(context)) => {
+                    for press in context.watch.held() {
+                        context.watch.released(
+                            press.session_id.as_deref(),
+                            press.method,
+                            &press.control,
+                        );
+                    }
+                    Ok(())
+                }
+                _ => Err(NavigationDriveError::CdpFailure),
+            }
+        }
+
+        fn exit_probe(&self) -> Option<Arc<dyn BrowserExitProbe>> {
+            self.exited
+                .clone()
+                .map(|exited| Arc::new(FlagProbe(exited)) as Arc<dyn BrowserExitProbe>)
         }
 
         fn generation_matches(&self) -> bool {
@@ -5744,6 +6417,535 @@ mod tests {
         assert!(
             stopped_waiting.is_ok(),
             "the inactivity waiter was not woken"
+        );
+    }
+
+    /// Exit probe double: the browser is gone once the flag is set.
+    struct FlagProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl BrowserExitProbe for FlagProbe {
+        fn generation_matches(&self) -> bool {
+            !self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A call's terminal decision, as the route installs it around a call.
+    fn call_terminal() -> Arc<crate::TerminalArbiter> {
+        let request = subc_protocol::Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::FrameType::Request,
+            crate::wire::control_flags(),
+            9,
+            3,
+            1,
+            serde_json::to_vec(&json!({"name": crate::browser::SCREENSHOT})).unwrap(),
+        )
+        .unwrap();
+        Arc::new(crate::TerminalArbiter::new(request))
+    }
+
+    /// Admit an operation inside `terminal`'s call, as a browser handler does.
+    fn admit_in_call(
+        sessions: &BrowserSessions,
+        route: &str,
+        clock: &FakeClock,
+        terminal: &Arc<crate::TerminalArbiter>,
+    ) -> OperationGuard {
+        match crate::CALL_TERMINAL.sync_scope(Arc::clone(terminal), || {
+            sessions.accept_dispatch(route, clock)
+        }) {
+            DispatchAdmission::Accepted(operation) => operation,
+            _ => panic!("a ready session refused dispatch"),
+        }
+    }
+
+    /// Run a screenshot on its own thread, as a blocking worker does.
+    fn screenshot_in_thread(
+        mut operation: OperationGuard,
+        deadline_ms: u64,
+    ) -> std::sync::mpsc::Receiver<bool> {
+        in_thread(move || {
+            let failed = operation
+                .screenshot("context", 0, deadline_ms, false)
+                .is_err();
+            operation.finish();
+            failed
+        })
+    }
+
+    /// Run the idle enforcer's exit sweep until `done` holds or two seconds
+    /// pass, as the module's sweep task does every few milliseconds.
+    fn sweep_until(sessions: &BrowserSessions, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + PROMPTLY;
+        while !done() {
+            assert!(Instant::now() < deadline, "the sweep never got there");
+            sessions.observe_exits_all(&config());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn kill(switch: &KillSwitch) {
+        *switch.killed.lock().unwrap() = true;
+        switch.wake.notify_all();
+    }
+
+    #[test]
+    fn write_backstop_ends_a_wedged_write_as_connector_failure_once_the_browser_is_dead() {
+        let sessions =
+            BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.wedged_write = Some(Arc::clone(&switch));
+            });
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 5);
+
+        let terminal = json!({
+            "outcome": "terminal",
+            "browser_session_id": session.id,
+            "terminal_outcome": "connector_failure",
+        });
+        // Status shows the terminal outcome as soon as the write backstop
+        // records it; the session is released only by a later sweep, after
+        // the killed browser has failed the wedged screenshot.
+        sweep_until(&sessions, || session.released() == 1);
+        assert_eq!(sessions.status("route", &clock, UNIX_EPOCH), terminal);
+        assert!(
+            call.recv_timeout(PROMPTLY).unwrap(),
+            "the killed browser fails the wedged write"
+        );
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(session.released(), 1, "custody is released after the reap");
+        let events = session.events();
+        assert!(events.contains(&"reap"), "{events:?}");
+        assert!(
+            !events.contains(&"graceful"),
+            "a CDP close was sent over the wedged pipe: {events:?}"
+        );
+        assert!(sessions.execution_quarantine("route").is_none());
+        assert!(matches!(
+            sessions.accept_dispatch("route", &clock),
+            DispatchAdmission::NoSession
+        ));
+        crate::browser::validate_browser_result(BROWSER_STATUS, &terminal).unwrap();
+    }
+
+    #[test]
+    fn write_backstop_holds_custody_when_the_wedged_browser_is_not_confirmed_dead() {
+        for refusing in [true, false] {
+            let sessions =
+                BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+            let clock = FakeClock::new();
+            let wedge = Arc::new(KillSwitch::default());
+            let session =
+                establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                    browser.killer = refusing
+                        .then(|| Arc::new(RefusingKiller::default()) as Arc<dyn BrowserKiller>);
+                    browser.wedged_write = Some(Arc::clone(&wedge));
+                });
+            let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+            else {
+                panic!("a ready session refused dispatch");
+            };
+            let call = screenshot_in_thread(operation, 5);
+
+            sweep_until(&sessions, || {
+                sessions.status("route", &clock, UNIX_EPOCH)["stage"] == "custody_held"
+            });
+            let status = sessions.status("route", &clock, UNIX_EPOCH);
+            assert_eq!(status["outcome"], "cleanup_failure", "{status}");
+            let close = sessions.close("route", &session.id, &config());
+            assert_eq!(
+                close,
+                json!({
+                    "outcome": "cleanup_failure",
+                    "browser_session_id": session.id,
+                    "stage": "custody_held",
+                })
+            );
+            for (capability, reply) in [(BROWSER_STATUS, &status), (BROWSER_CLOSE, &close)] {
+                crate::browser::validate_browser_result(capability, reply)
+                    .unwrap_or_else(|error| panic!("{capability}: {error} in {reply}"));
+            }
+            // The wedged screenshot still holds the driver lock, so the
+            // session is in execution quarantine: calls are refused at once
+            // rather than queued behind it.
+            assert_eq!(
+                sessions
+                    .execution_quarantine("route")
+                    .map(|quarantine| quarantine.call),
+                Some("Input.dispatchMouseEvent".to_string())
+            );
+            assert!(matches!(
+                sessions.accept_dispatch("route", &clock),
+                DispatchAdmission::NoSession
+            ));
+            assert_eq!(
+                session.released(),
+                0,
+                "custody released under a live browser"
+            );
+            assert!(!session.events().contains(&"graceful"));
+
+            kill(&wedge);
+            assert!(call.recv_timeout(PROMPTLY).unwrap());
+            assert!(sessions.execution_quarantine("route").is_none());
+            assert_eq!(
+                sessions.status("route", &clock, UNIX_EPOCH)["stage"],
+                "custody_held"
+            );
+            assert_eq!(session.released(), 0);
+        }
+    }
+
+    #[test]
+    fn several_in_bound_commands_in_sequence_never_trip_the_write_backstop() {
+        let sessions =
+            BrowserSessions::default().with_backstop_slack_for_test(Duration::from_millis(20));
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                // Four commands of 25 ms each under a 50 ms cap: each stays
+                // well within its cap, while their 100 ms total exceeds the
+                // cap plus the 20 ms slack.
+                browser.in_bound_commands =
+                    Some((4, Duration::from_millis(50), Duration::from_millis(25)));
+            });
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 40);
+        loop {
+            sessions.observe_exits_all(&config());
+            match call.recv_timeout(Duration::from_millis(2)) {
+                Ok(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        sessions.observe_exits_all(&config());
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            sessions.status("route", &clock, UNIX_EPOCH)["outcome"],
+            "ready"
+        );
+        assert_eq!(session.released(), 0);
+    }
+
+    #[test]
+    fn exit_sweep_skips_a_session_whose_operation_is_stuck_and_tears_it_down_after() {
+        let sessions = BrowserSessions::default();
+        let mut clock = FakeClock::new();
+        let stuck_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call_gate = Arc::new(Gate::default());
+        let stuck = establish_test_browser(&sessions, "stuck", &clock, Gate::opened(), |browser| {
+            browser.call_gate = Arc::clone(&call_gate);
+            browser.exited = Some(Arc::clone(&stuck_exited));
+        });
+        let other_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crashed =
+            establish_test_browser(&sessions, "crashed", &clock, Gate::opened(), |browser| {
+                browser.exited = Some(Arc::clone(&other_exited));
+            });
+        let idle = establish_test_browser(&sessions, "idle", &clock, Gate::opened(), |_| {});
+        let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("stuck", &clock)
+        else {
+            panic!("a ready session refused dispatch");
+        };
+        let call = screenshot_in_thread(operation, 3_600_000);
+        call_gate.wait_entered(1);
+
+        // The stuck session's browser exits under its operation; another
+        // browser crashes, and a third session's lease runs out.
+        stuck_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        other_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.advance(Duration::from_millis(config().browser_idle_timeout_ms + 1));
+        let sweeping = sessions.clone();
+        let sweep_clock = clock.clone();
+        let sweep = in_thread(move || {
+            sweeping.observe_exits_all(&config());
+            sweeping.expire_all(&sweep_clock, &config());
+        });
+        sweep
+            .recv_timeout(PROMPTLY)
+            .expect("one stuck session stalled the sweep for the others");
+        assert_eq!(
+            sessions.status("crashed", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": crashed.id, "terminal_outcome": "browser_crashed"})
+        );
+        assert_eq!(
+            sessions.status("idle", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": idle.id, "terminal_outcome": "idle_expired"})
+        );
+        assert_eq!(
+            sessions.status("stuck", &clock, UNIX_EPOCH)["outcome"],
+            "ready",
+            "the stuck session's terminal was recorded under its operation"
+        );
+        assert_eq!(stuck.released(), 0);
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        sessions.observe_exits_all(&config());
+        assert_eq!(
+            sessions.status("stuck", &clock, UNIX_EPOCH),
+            json!({"outcome": "terminal", "browser_session_id": stuck.id, "terminal_outcome": "browser_crashed"})
+        );
+        assert_eq!(stuck.released(), 1);
+    }
+
+    #[test]
+    fn an_operation_that_outlives_its_call_quarantines_its_session_until_it_ends() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let call_gate = Arc::new(Gate::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.call_gate = Arc::clone(&call_gate);
+            });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        assert_eq!(
+            sessions.execution_quarantine("route"),
+            None,
+            "a call still running is ordinary work, not quarantine"
+        );
+
+        terminal.stop(crate::TerminalCause::Deadline);
+        assert_eq!(
+            sessions.execution_quarantine("route"),
+            Some(ExecutionQuarantine {
+                browser_session_id: session.id.clone(),
+                call: "browser session operation".into(),
+            })
+        );
+        // Status takes no driver lock: it answers and reports the quarantine.
+        let status = sessions.status("route", &clock, UNIX_EPOCH);
+        assert_eq!(status["outcome"], "ready", "{status}");
+        assert!(
+            status["remedy"].as_str().unwrap().contains("target_busy"),
+            "{status}"
+        );
+        crate::browser::validate_browser_result(BROWSER_STATUS, &status).unwrap();
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(sessions.execution_quarantine("route"), None);
+        assert!(sessions
+            .status("route", &clock, UNIX_EPOCH)
+            .get("remedy")
+            .is_none());
+    }
+
+    #[test]
+    fn a_close_of_a_quarantined_session_kills_it_on_the_control_permit() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.wedged_write = Some(Arc::clone(&switch));
+            });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(
+            admit_in_call(&sessions, "route", &clock, &terminal),
+            3_600_000,
+        );
+        let deadline = Instant::now() + PROMPTLY;
+        while !session.events().contains(&"screenshot") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal.stop(crate::TerminalCause::Deadline);
+        assert!(sessions.execution_quarantine("route").is_some());
+
+        // Every control permit is held: the close is refused before it acts.
+        let held = sessions.control_permit.try_take().unwrap();
+        let refused = sessions.close("route", &session.id, &config());
+        assert_eq!(
+            refused["outcome"], "blocking_capacity_exhausted",
+            "{refused}"
+        );
+        assert_eq!(refused["detail"]["dispatched"], false, "{refused}");
+        crate::browser::validate_browser_result(BROWSER_CLOSE, &refused).unwrap();
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+
+        let closed = sessions.close("route", &session.id, &config());
+        assert_eq!(
+            closed,
+            json!({"outcome": "closed", "browser_session_id": session.id})
+        );
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(session.released(), 1);
+        let events = session.events();
+        assert!(events.contains(&"reap"), "{events:?}");
+        assert!(!events.contains(&"graceful"), "{events:?}");
+    }
+
+    #[test]
+    fn a_close_of_a_session_not_in_quarantine_waits_and_closes_gracefully() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let switch = Arc::new(KillSwitch::default());
+        let call_gate = Arc::new(Gate::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
+                browser.call_gate = Arc::clone(&call_gate);
+            });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        let closing = sessions.clone();
+        let id = session.id.clone();
+        let close = in_thread(move || closing.close("route", &id, &config()));
+        assert_still_running(&close, "a close behind a running call");
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(session.events().contains(&"graceful"));
+    }
+
+    fn held_click(session_id: &str) -> HeldPress {
+        let mut release = serde_json::Map::new();
+        release.insert("type".into(), json!("mouseReleased"));
+        release.insert("button".into(), json!("left"));
+        HeldPress {
+            session_id: Some(session_id.to_string()),
+            method: "Input.dispatchMouseEvent",
+            control: "left".into(),
+            release,
+        }
+    }
+
+    #[test]
+    fn a_later_input_call_releases_held_input_first_and_a_failed_release_keeps_quarantine() {
+        for release_ok in [false, true] {
+            let sessions = BrowserSessions::default();
+            let clock = FakeClock::new();
+            let session =
+                establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                    browser.release_ok = Some(release_ok);
+                });
+            let cell = sessions.active_cell_recovering("route").unwrap();
+            cell.watch.hold(held_click("cdp-session"));
+            assert!(sessions.held_input_unconfirmed("route"));
+            let status = sessions.status("route", &clock, UNIX_EPOCH);
+            assert_eq!(status["remedy"], HELD_INPUT_REMEDY, "{status}");
+
+            assert_eq!(sessions.retry_held_release("route", 10), release_ok);
+            assert_eq!(sessions.held_input_unconfirmed("route"), !release_ok);
+            assert_eq!(session.events(), ["release"]);
+        }
+    }
+
+    #[test]
+    fn held_input_is_not_released_while_a_worker_that_may_press_still_runs() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let call_gate = Arc::new(Gate::default());
+        let session =
+            establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
+                browser.call_gate = Arc::clone(&call_gate);
+                browser.release_ok = Some(true);
+            });
+        let terminal = call_terminal();
+        let call = screenshot_in_thread(admit_in_call(&sessions, "route", &clock, &terminal), 1);
+        call_gate.wait_entered(1);
+        terminal.stop(crate::TerminalCause::Deadline);
+        sessions
+            .active_cell_recovering("route")
+            .unwrap()
+            .watch
+            .hold(held_click("cdp-session"));
+
+        assert!(!sessions.retry_held_release("route", 10));
+        assert!(sessions.held_input_unconfirmed("route"));
+        assert!(!session.events().contains(&"release"));
+
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(sessions.retry_held_release("route", 10));
+        assert!(!sessions.held_input_unconfirmed("route"));
+    }
+
+    #[test]
+    fn shutdown_reports_a_teardown_that_outlives_its_plan_and_counts_it_in_health() {
+        let health = Arc::new(cerebellum_core::health::HealthState::new());
+        let sessions = BrowserSessions::default().with_health(Arc::clone(&health));
+        let clock = FakeClock::new();
+        let cleanup_gate = Arc::new(Gate::default());
+        let session = establish_test_browser(
+            &sessions,
+            "route",
+            &clock,
+            Arc::clone(&cleanup_gate),
+            |_| {},
+        );
+
+        let report = sessions.teardown_all_within(&config(), short_budget());
+        assert_eq!(
+            report,
+            ShutdownReport {
+                custody_held: vec![session.id.clone()],
+                operations_running: 0,
+                teardowns_running: 1,
+            },
+            "a teardown still running was reported as a clean stop"
+        );
+        assert_eq!(health.detached_workers(), 1);
+
+        cleanup_gate.open();
+        let deadline = Instant::now() + PROMPTLY;
+        while health.detached_workers() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the late teardown stayed counted"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.released(), 1);
+    }
+
+    #[test]
+    fn shutdown_reports_a_stuck_operation_and_a_clean_stop_reports_nothing() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let (session, call_gate, call) =
+            stuck_call_on(&sessions, "stuck", &clock, None, Gate::opened());
+        let _idle = establish_test_browser(&sessions, "idle", &clock, Gate::opened(), |_| {});
+
+        let report = sessions.teardown_all_within(&config(), short_budget());
+        assert_eq!(
+            report,
+            ShutdownReport {
+                custody_held: vec![session.id.clone()],
+                operations_running: 1,
+                teardowns_running: 0,
+            }
+        );
+        call_gate.open();
+        assert!(call.recv_timeout(PROMPTLY).unwrap());
+
+        let clean = BrowserSessions::default();
+        let _closed = establish_test_browser(&clean, "route", &clock, Gate::opened(), |_| {});
+        assert_eq!(
+            clean.teardown_all_within(&config(), short_budget()),
+            ShutdownReport::default()
         );
     }
 }

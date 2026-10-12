@@ -106,17 +106,25 @@ fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {
     );
 }
 
-/// A word counts as declared when `{"outcome": word}` alone passes one of the
-/// three schemas; `outcome` is their only required key.
+/// A word counts as declared when `{"outcome": word}` passes one of the three
+/// schemas, or does once given the empty `detail` that the bounded-call branch
+/// (deadline, unknown-dispatch, busy-target and capacity replies) requires
+/// beside `outcome`.
 fn declared_by_a_session_schema(word: &str) -> bool {
-    let reply = json!({"outcome": word});
     [
-        cerebellum::browser_session::BROWSER_LAUNCH,
-        cerebellum::browser_session::BROWSER_STATUS,
-        cerebellum::browser_session::BROWSER_CLOSE,
+        json!({"outcome": word}),
+        json!({"outcome": word, "detail": {}}),
     ]
     .iter()
-    .any(|capability| cerebellum::browser::validate_browser_result(capability, &reply).is_ok())
+    .any(|reply| {
+        [
+            cerebellum::browser_session::BROWSER_LAUNCH,
+            cerebellum::browser_session::BROWSER_STATUS,
+            cerebellum::browser_session::BROWSER_CLOSE,
+        ]
+        .iter()
+        .any(|capability| cerebellum::browser::validate_browser_result(capability, reply).is_ok())
+    })
 }
 
 /// Every `"outcome": "<word>"` literal on one line, spacing tolerated.

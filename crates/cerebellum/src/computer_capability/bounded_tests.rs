@@ -16,7 +16,8 @@ use serde_json::json;
 use subc_protocol::{Frame, FrameType};
 
 use super::held_input::{self, HeldInput, HeldPress};
-use super::quarantine::{self, CallWork, ExecutionQuarantine, PermitPool};
+use super::quarantine::{self, CallWork, ExecutionQuarantine};
+use crate::blocking_permits::PermitPool;
 use crate::{HeldState, TerminalArbiter, TerminalCause};
 
 const EDITOR: &str = "com.example.Editor";

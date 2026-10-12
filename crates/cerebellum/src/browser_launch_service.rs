@@ -2008,6 +2008,13 @@ fn platform_kill_exact_generation(generation: BrowserProcessGeneration) -> bool 
 }
 
 impl OwnedBrowserProcess for ProductionProcess {
+    fn release_held_input(&mut self, deadline_ms: u64) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .release_held_input(deadline_ms)
+    }
+
     fn present(&mut self, context_key: &str, deadline_ms: u64) -> Result<(), NavigationDriveError> {
         self.driver
             .as_mut()

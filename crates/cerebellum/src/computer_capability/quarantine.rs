@@ -24,8 +24,8 @@ use cerebellum_computer::app_state::person::{OwnInputLedger, Posting};
 use cerebellum_computer::dispatch::MutationGate;
 use cerebellum_computer::platform::ProcessGrant;
 use serde_json::{json, Value};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::blocking_permits::CallPermits;
 use crate::TerminalArbiter;
 
 /// The call's terminal decision as a dispatch gate for blocking workers.
@@ -44,63 +44,6 @@ impl MutationGate for ArbiterGate {
         self.0
             .as_ref()
             .is_some_and(|terminal| terminal.gate.stopped())
-    }
-}
-
-/// The blocking-worker pool of one plane.
-pub(crate) struct PermitPool {
-    permits: Arc<Semaphore>,
-}
-
-impl PermitPool {
-    pub(crate) fn new(size: usize) -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(size)),
-        }
-    }
-
-    /// One work permit and one release permit, taken together or not at all.
-    pub(crate) fn try_call(&self) -> Option<CallPermits> {
-        let mut both = Arc::clone(&self.permits).try_acquire_many_owned(2).ok()?;
-        let release = both.split(1)?;
-        Some(CallPermits {
-            _work: Arc::new(both),
-            release: Mutex::new(Some(release)),
-        })
-    }
-
-    /// One work permit for a target-resolution query.
-    pub(crate) fn try_resolution(&self) -> Option<Arc<OwnedSemaphorePermit>> {
-        Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .ok()
-            .map(Arc::new)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn available(&self) -> usize {
-        self.permits.available_permits()
-    }
-}
-
-impl Default for PermitPool {
-    fn default() -> Self {
-        Self::new(crate::budgets::MAX_BLOCKING_WORKERS_COMPUTER)
-    }
-}
-
-/// A call's permits. The work permit is shared by each of the call's blocking
-/// jobs, which run one after another, and is returned only when the last job
-/// holding it really ends. The release permit moves into the held-input
-/// release job, if the call registers one.
-pub(crate) struct CallPermits {
-    _work: Arc<OwnedSemaphorePermit>,
-    release: Mutex<Option<OwnedSemaphorePermit>>,
-}
-
-impl CallPermits {
-    pub(crate) fn take_release(&self) -> Option<OwnedSemaphorePermit> {
-        self.release.lock().unwrap().take()
     }
 }
 
