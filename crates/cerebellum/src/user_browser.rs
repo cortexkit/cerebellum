@@ -21,14 +21,21 @@ use crate::authorization::{self, Action, HazardClass, Severity};
 use crate::browser::navigation::{classify_flattened_document, snapshot_from_capture};
 use crate::browser::state_text::{self, Filters, RenderInput, Zoom};
 use crate::browser_standing_grants::{always_subject, RevokeTarget, StandingBrowserGrants};
+use crate::cingulate_client::card::{consent_request, CardKind};
+use crate::cingulate_client::desk::{Apply, ApplyFailed, Ending, InCall, RaisedCard};
+use crate::cingulate_client::subject;
+use crate::cingulate_client::wire::Record;
 use crate::classification::{
     canonical_grant_origin, canonical_origin_from_url, NonTypeClassificationRecord,
 };
+use crate::consent_drain::{AppliedSettlement, ConsentEffects};
 use crate::snapshot_store::{BackendNodeIdentity, CommittedDocument, FrameDocument};
 use crate::user_browser_bridge::{Route, Terminal, UserBrowserBridge};
 use crate::{AcceptedBindFacts, CancelHandle, Planes};
 
-const CONSENT_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a user-browser site card waits for the person. The card expires
+/// at the same moment, so it is never left open after the call stops waiting.
+pub(crate) const CONSENT_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_SNAPSHOTS: usize = 64;
 const NAVIGATION_READ_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -285,6 +292,167 @@ fn read_again(input_dispatched: bool) -> Value {
 
 fn invalid(field: &str, reason: &str) -> Value {
     json!({"browser":"user", "outcome":"invalid_request", "detail":{"field":field,"reason_code":reason}, "input_dispatched":false})
+}
+
+/// The site card's option ids: one invocation, always on this site, and the
+/// decline, which is also what the card picks when it expires unanswered.
+const SITE_ALLOW_ONCE: &str = "allow_once";
+const SITE_ALLOW_ALWAYS: &str = "allow_origin_always";
+const SITE_DENY: &str = "deny";
+
+/// The consent card asking the person whether the agent may use their own
+/// signed-in Chrome on `origin`, at severity `tier` with `hazards`. "Always
+/// on this site" is offered only when `standing`: this route's agent may hold
+/// standing grants and the grant store can record one.
+///
+/// `render` needs an envelope id, which is a fixed placeholder here: only the
+/// card's params are sent to Cingulate (see
+/// `cingulate_client::card::consent_request`), and the id the agent and the
+/// standing grant are given is the elicitation id Cingulate returns.
+pub(crate) fn site_question(
+    origin: &str,
+    tier: u8,
+    hazards: &BTreeSet<HazardClass>,
+    standing: bool,
+) -> Value {
+    use crate::consent_card::*;
+    let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
+    let mut options = vec![ConsentOption::grant(SITE_ALLOW_ONCE, "Allow once")
+        .with_detail("Only this invocation, including its landing-page read.")];
+    if standing {
+        options.push(ConsentOption::grant(
+            SITE_ALLOW_ALWAYS,
+            "Always on this site",
+        ));
+    }
+    ConsentCard {
+        title: format!("Allow access to {origin}?"),
+        prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
+        target: Target {
+            kind: TargetKind::Site,
+            label: origin.into(),
+        },
+        facts: vec![
+            Fact::new("Browser", "Your own Chrome, signed in as you"),
+            Fact::new("Site", origin),
+            Fact::new("Level", tier.to_string()),
+            Fact::new("Hazards", hazard_names.join(", ")),
+        ],
+        grants: options,
+        decline: ConsentOption::decline(SITE_DENY, "Don't allow"),
+        expires_in: CONSENT_DEADLINE,
+        material_damage: true,
+        urgency: Urgency::High,
+        scope: Scope::new()
+            .with("browser", "user")
+            .with("origins", json!([origin]))
+            .with("severity_tier", tier)
+            .with("hazards", json!(hazard_names)),
+        duration: None,
+    }
+    .render("user-browser-site")
+}
+
+/// The refusal when the site card ended without an answer, or could not be
+/// raised. The reason stays `consent_unavailable` whatever the ending; when no
+/// card could be raised at all, the remedy says what the caller can change.
+fn consent_unavailable(ending: &Ending) -> Value {
+    let mut reply = refusal("consent_unavailable");
+    if let Ending::NoCard(why) = ending {
+        if let Some(remedy) = why.remedy() {
+            reply["remedy"] = json!(remedy);
+        }
+    }
+    reply
+}
+
+/// The subjects of the site cards that calls in this process are raising or
+/// holding, each with how many calls are doing so.
+///
+/// A site card is answered only to the call that holds it. The session's
+/// next-call drain (`consent_drain`) must leave a card alone while a call
+/// holds it, but should withdraw one nobody holds any more: a card left over
+/// from before a restart, or from a call that was dropped mid-wait before it
+/// could withdraw its own card.
+#[derive(Default)]
+pub(crate) struct SiteCardHolders(Mutex<BTreeMap<String, usize>>);
+
+impl SiteCardHolders {
+    fn holds(&self, subject: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(subject)
+    }
+}
+
+/// One call raising or holding a site card, counted in [`SiteCardHolders`]
+/// until it is dropped, however the call ends.
+struct SiteCardHold<'a> {
+    holders: &'a SiteCardHolders,
+    subject: String,
+}
+
+impl<'a> SiteCardHold<'a> {
+    fn enter(holders: &'a SiteCardHolders, subject: &str) -> Self {
+        *holders
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(subject.to_string())
+            .or_default() += 1;
+        Self {
+            holders,
+            subject: subject.to_string(),
+        }
+    }
+}
+
+impl Drop for SiteCardHold<'_> {
+    fn drop(&mut self) {
+        let mut held = self
+            .holders
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&self.subject) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.subject);
+            }
+        }
+    }
+}
+
+/// What the next-call drain does with a site card's answer: nothing. The
+/// call holding the card acts on the answer itself, and a card no call holds
+/// has nobody left to act for, so its settlement is only acknowledged.
+struct SiteCardEffects(Arc<SiteCardHolders>);
+
+impl ConsentEffects for SiteCardEffects {
+    fn has_pending(&self, card: &RaisedCard) -> bool {
+        self.0.holds(&card.subject)
+    }
+
+    fn apply(
+        &self,
+        _card: &RaisedCard,
+        _record: &Record,
+        _ending: &Ending,
+    ) -> Result<AppliedSettlement, ApplyFailed> {
+        Ok(AppliedSettlement {
+            effect: Apply::Applied,
+            completion: None,
+        })
+    }
+}
+
+/// Register the site card's drain adapter with the session drain.
+pub(crate) fn register(planes: &Planes) {
+    planes.consent_drain.register(
+        CardKind::UserBrowserSite,
+        Arc::new(SiteCardEffects(Arc::clone(&planes.user_browser_cards))),
+    );
 }
 
 fn origin(url: &str) -> Result<String, Value> {
@@ -782,7 +950,6 @@ impl InvocationGrant {
 struct Context<'a> {
     planes: &'a Planes,
     facts: &'a AcceptedBindFacts,
-    writer: &'a mpsc::Sender<Frame>,
     route: Route,
     cancel: CancelHandle,
     connection: u64,
@@ -833,98 +1000,111 @@ impl Context<'_> {
         {
             return Ok(grant);
         }
-        if self.facts.flow_id.is_some() || !self.facts.declares_elicitation() {
+        if self.facts.flow_id.is_some() {
             return Err(refusal("consent_unavailable"));
         }
-        use crate::consent_card::*;
-        let ask_id = opaque("user-browser:");
         let standing =
             self.target().grants.can_record() && crate::standing_offer_agent(self.facts).is_some();
-        let mut options = vec![ConsentOption::grant("allow_once", "Allow once")
-            .with_detail("Only this invocation, including its landing-page read.")];
-        if standing {
-            options.push(ConsentOption::grant(
-                "allow_origin_always",
-                "Always on this site",
-            ));
-        }
-        let body = ConsentCard {
-            title: format!("Allow access to {origin}?"),
-            prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
-            target: Target {
-                kind: TargetKind::Site,
-                label: origin.into(),
-            },
-            facts: vec![
-                Fact::new("Browser", "Your own Chrome, signed in as you"),
-                Fact::new("Site", origin),
-                Fact::new("Level", severity.tier.to_string()),
-                Fact::new(
-                    "Hazards",
-                    grant
-                        .hazards
-                        .iter()
-                        .map(|hazard| hazard.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-            ],
-            grants: options,
-            decline: ConsentOption::decline("deny", "Don't allow"),
-            expires_in: CONSENT_DEADLINE,
-            material_damage: true,
-            urgency: Urgency::High,
-            scope: Scope::new()
-                .with("browser", "user")
-                .with("origins", json!([origin]))
-                .with("severity_tier", severity.tier)
-                .with(
-                    "hazards",
-                    json!(grant
-                        .hazards
-                        .iter()
-                        .map(|hazard| hazard.as_str())
-                        .collect::<Vec<_>>()),
-                ),
-            duration: None,
-        }
-        .render(&ask_id);
+        let body = site_question(origin, severity.tier, &grant.hazards, standing);
+        let card = consent_request(
+            CardKind::UserBrowserSite,
+            &body,
+            CONSENT_DEADLINE,
+            crate::elicit::current_call_key().as_deref(),
+            None,
+            None,
+        )
+        .map_err(|_| consent_unavailable(&Ending::DeliveryFailed))?;
+        let live = crate::browser_consent::live(
+            self.facts,
+            self.planes,
+            self.route.channel,
+            self.route.epoch,
+        )
+        .map_err(|ending| consent_unavailable(&ending))?;
+        let mut session = self
+            .planes
+            .consent
+            .session(&live)
+            .await
+            .map_err(|error| consent_unavailable(&Ending::of_refusal(&error)))?;
+        let subject = subject::user_browser_site(origin);
+        // Count this call as holding the card before raising it, so a drain
+        // run by another call of this session never mistakes the card for an
+        // abandoned one and withdraws it while this call raises or waits on
+        // it.
+        let _holding = SiteCardHold::enter(&self.planes.user_browser_cards, &subject);
+        let ask_id = session
+            .raise(card, &subject)
+            .await
+            .map_err(|ending| consent_unavailable(&ending))?;
         let mut drain = self.planes.drain_signal.subscribe();
-        let answer = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => return Err(refusal("cancelled")),
-            _ = self.planes.routes.closed(self.route.channel, self.route.epoch) => return Err(refusal("route_closed")),
-            _ = drain.wait_for(|draining| *draining) => return Err(refusal("module_draining")),
-            answer = self.planes.elicitor.ask_for_call(self.writer, self.route.channel, self.route.epoch, body, CONSENT_DEADLINE, crate::elicit::current_call_key()) => answer,
+        let cancel = &self.cancel;
+        let cancelled = async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = drain.wait_for(|draining| *draining) => {}
+            }
         };
-        let crate::elicit::AskOutcome::Answered(answer) = answer else {
-            return Err(refusal("consent_unavailable"));
+        let guard = crate::elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
+        let parked = guard.as_ref().map(|guard| guard.park_on_consent());
+        // Held, never detached: the answer is wanted only by this call, and
+        // any ending other than an answer withdraws the card and forgets it.
+        let ended = session.hold(&ask_id, CONSENT_DEADLINE, cancelled).await;
+        drop(parked);
+        let ending = match ended {
+            InCall::Settled(ending) => ending,
+            InCall::Cancelled if *self.planes.drain_signal.borrow() => {
+                return Err(refusal("module_draining"))
+            }
+            InCall::Cancelled => return Err(refusal("cancelled")),
+            InCall::RouteClosed => return Err(refusal("route_closed")),
+            // `hold` never detaches the card (leaves it open for a later
+            // answer), so it never reports one pending; read it as silence.
+            InCall::Pending { .. } => return Err(consent_unavailable(&Ending::NoAnswer)),
         };
-        match answer.get("decision").and_then(Value::as_str) {
-            Some("allow_once") => {
+        let decided = match &ending {
+            Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ONCE => {
                 grant.once = true;
                 Ok(grant)
             }
-            Some("allow_origin_always") if standing => {
-                self.target()
-                    .grants
-                    .record(
-                        self.agent(),
-                        always_subject(origin.into()),
-                        severity.tier,
-                        grant.hazards.iter().copied().collect(),
-                        None,
-                        &ask_id,
-                    )
-                    .map_err(|_| refusal("grant_storage_unavailable"))?;
-                Ok(grant)
-            }
-            _ => {
+            Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ALWAYS && standing => self
+                .target()
+                .grants
+                .record(
+                    self.agent(),
+                    always_subject(origin.into()),
+                    severity.tier,
+                    grant.hazards.iter().copied().collect(),
+                    None,
+                    &ask_id,
+                )
+                .map(|_| grant)
+                .map_err(|_| refusal("grant_storage_unavailable")),
+            Ending::Declined { choice_id } if choice_id == SITE_DENY => {
                 let mut reply = refusal("consent_declined");
                 reply["detail"] = json!({"decision":"deny"});
                 Err(reply)
             }
-        }
+            // A choice the card did not offer is never read as a refusal or
+            // as consent: nothing can be concluded from it.
+            Ending::Granted { .. } | Ending::Declined { .. } => {
+                let mut reply = refusal("unrecognized_answer");
+                reply["remedy"] =
+                    json!("The answer could not be read; retry this call to ask again.");
+                Err(reply)
+            }
+            // Silence, a card nobody was shown, or one that could not be
+            // carried: `hold` already withdrew and forgot the card.
+            ending => return Err(consent_unavailable(ending)),
+        };
+        // The answer has been acted on (a standing grant is stored first), so
+        // it is marked applied: later calls of this session then need not
+        // read it from Cingulate's answers feed. The result is ignored on
+        // purpose: if the registry cannot be saved, a later drain reads the
+        // card again, finds nothing to apply, and only acknowledges it.
+        let _ = self.planes.consent.mark_applied(&ask_id);
+        decided
     }
 
     async fn cdp(
@@ -972,7 +1152,7 @@ impl Context<'_> {
 async fn serve_inner(
     planes: &Planes,
     facts: &AcceptedBindFacts,
-    writer: &mpsc::Sender<Frame>,
+    _writer: &mpsc::Sender<Frame>,
     request: (u16, u32, u64),
     action: &str,
     args: &Value,
@@ -1035,7 +1215,6 @@ async fn serve_inner(
     let context = Context {
         planes,
         facts,
-        writer,
         route,
         cancel,
         connection,

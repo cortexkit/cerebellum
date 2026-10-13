@@ -57,6 +57,11 @@ fn snapshot_and_ref_reuse_is_scoped_to_route_tab_and_connection() {
         .is_err());
 }
 
+use crate::cingulate_client::desk::FileRegistryStore;
+use crate::cingulate_client::live_call::LiveCall;
+use crate::cingulate_client::route::{BoxFuture, CallError, CingulateOpener, CingulateRoute};
+use crate::cingulate_client::wire;
+use crate::cingulate_client::{Reply, ScriptedCingulate};
 use crate::user_browser_bridge::{Message, MessageBody};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -98,18 +103,106 @@ struct DoubleState {
     top_level_only: bool,
 }
 
+/// Cingulate as the site-card tests need it: every card is answered at once
+/// with the choice the current call was given, and the cards it was sent are
+/// kept for the tests to read. A withdrawn card reads as withdrawn.
+struct SiteCingulate {
+    state: Arc<Mutex<DoubleState>>,
+    decision: Mutex<String>,
+    cards: Mutex<Vec<Value>>,
+}
+
+struct SiteCingulateRoute(Arc<SiteCingulate>);
+
+impl CingulateOpener for Arc<SiteCingulate> {
+    fn open<'a>(
+        &'a self,
+        _live: &'a LiveCall,
+    ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
+        let route = SiteCingulateRoute(Arc::clone(self));
+        Box::pin(async move { Ok(Box::new(route) as Box<dyn CingulateRoute>) })
+    }
+}
+
+impl CingulateRoute for SiteCingulateRoute {
+    fn call<'a>(
+        &'a mut self,
+        method: &'a str,
+        params: Value,
+    ) -> BoxFuture<'a, Result<Value, CallError>> {
+        Box::pin(async move {
+            let id = params["elicitation_id"].clone();
+            match method {
+                wire::CONSENT_REQUEST => {
+                    let mut cards = self.0.cards.lock().unwrap();
+                    cards.push(params);
+                    let mut state = self.0.state.lock().unwrap();
+                    if state.remove_group_on_card {
+                        state.remove_group_on_card = false;
+                        state.tabs.get_mut("handed").unwrap().group = false;
+                    }
+                    Ok(json!({"elicitation_id": format!("el_site_{}", cards.len())}))
+                }
+                wire::CONSENT_AWAIT => {
+                    let choice = self.0.decision.lock().unwrap().clone();
+                    Ok(json!({"elicitation_id":id,"state":"answered","answered_choice_id":choice}))
+                }
+                wire::CONSENT_WITHDRAW => Ok(json!({"elicitation_id":id,"state":"withdrawn"})),
+                _ => panic!("a site card made an unexpected Cingulate call: {method}"),
+            }
+        })
+    }
+}
+
 struct Fixture {
     planes: Arc<Planes>,
     state: Arc<Mutex<DoubleState>>,
+    site: Arc<SiteCingulate>,
+    registry: std::path::PathBuf,
     epoch: u64,
     corr: AtomicU64,
     worker: tokio::task::JoinHandle<()>,
 }
 
+/// A call started with [`Fixture::start`] and still running.
+struct Started {
+    corr: u64,
+    replies: mpsc::Receiver<Frame>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 impl Fixture {
     fn new() -> Self {
+        Self::with_cingulate(None)
+    }
+
+    /// A fixture whose site cards go to `script` instead of the answering
+    /// [`SiteCingulate`].
+    fn scripted(script: &Arc<ScriptedCingulate>) -> Self {
+        Self::with_cingulate(Some(Arc::new(Arc::clone(script))))
+    }
+
+    fn with_cingulate(opener: Option<Arc<dyn CingulateOpener>>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let registry = std::env::temp_dir().join(format!(
+            "user-browser-cards-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&registry).unwrap();
+        let state = Arc::new(Mutex::new(DoubleState::default()));
+        let site = Arc::new(SiteCingulate {
+            state: Arc::clone(&state),
+            decision: Mutex::new(String::new()),
+            cards: Mutex::new(Vec::new()),
+        });
+        let opener = opener.unwrap_or_else(|| Arc::new(Arc::clone(&site)));
         let mut planes =
-            crate::isolated_test_planes(&Arc::new(cerebellum_core::health::HealthState::new()));
+            crate::isolated_test_planes(&Arc::new(cerebellum_core::health::HealthState::new()))
+                .with_cingulate(
+                    opener,
+                    Arc::new(FileRegistryStore::new(registry.join("registry.json"))),
+                );
         let grants = Arc::new(StandingBrowserGrants::open(
             Arc::new(crate::browser_standing_grants::InMemoryStandingGrantStorage::new()),
             Some("test-machine".into()),
@@ -120,11 +213,10 @@ impl Fixture {
             let frame = tool_frame(channel, 1, json!({"action":"status"}));
             crate::install_test_bind(&planes.routes, &frame);
             let mut facts = planes.routes.get(channel, 1).unwrap();
-            facts.consumer_capabilities = vec!["elicitation".into()];
+            facts = facts.with_scope(Some(crate::computer_grants::tests::stamp("test-project")));
             planes.routes.insert(channel, 1, facts);
         }
         let (epoch, mut commands) = planes.user_browser.connect_for_policy_test();
-        let state = Arc::new(Mutex::new(DoubleState::default()));
         state.lock().unwrap().tabs.insert(
             "handed".into(),
             DoubleTab {
@@ -220,57 +312,74 @@ impl Fixture {
         Self {
             planes,
             state,
+            site,
+            registry,
             epoch,
             corr: AtomicU64::new(10),
             worker,
         }
     }
 
-    async fn call(&self, channel: u16, args: Value, decision: &str) -> (Value, Vec<Value>) {
+    /// Send one tool call on `channel`, its site cards answered `decision`,
+    /// without waiting for its reply.
+    fn start(&self, channel: u16, args: Value, decision: &str) -> Started {
+        *self.site.decision.lock().unwrap() = decision.into();
         let corr = self.corr.fetch_add(1, Ordering::Relaxed);
         let frame = tool_frame(channel, corr, args);
-        let _registration = self.planes.cancellations.register((channel, 1, corr));
-        let (writer, mut replies) = mpsc::channel(16);
+        let registration = self.planes.cancellations.register((channel, 1, corr));
+        let (writer, replies) = mpsc::channel(16);
         let planes = self.planes.clone();
         let arrival = crate::browser_queue::arrive(&frame, &planes);
-        let task = tokio::spawn(async move {
+        // `with_live` puts an in-flight guard in scope, as the frame loop does
+        // for a real call; the consent desk opens a route to Cingulate only
+        // while such a guard shows the call is still held.
+        let task = tokio::spawn(crate::computer_grants::tests::with_live(async move {
+            let _registration = registration;
             crate::browser_queue::scope(
                 arrival,
                 crate::handle_tool_request(frame, &writer, &planes, &crate::CallObservation::new()),
             )
             .await
             .unwrap();
-        });
-        let mut cards = Vec::new();
-        let response = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let frame = replies.recv().await.expect("tool response");
-                let body: Value = serde_json::from_slice(&frame.body).unwrap();
-                if frame.header.ty == subc_protocol::FrameType::Request {
-                    cards.push(body);
-                    {
-                        let mut state = self.state.lock().unwrap();
-                        if state.remove_group_on_card {
-                            state.remove_group_on_card = false;
-                            state.tabs.get_mut("handed").unwrap().group = false;
-                        }
-                    }
-                    assert!(self.planes.elicitor.deliver(
-                        channel,
-                        frame.header.corr,
-                        json!({"decision":decision})
-                    ));
-                } else if matches!(
-                    frame.header.ty,
-                    subc_protocol::FrameType::Response | subc_protocol::FrameType::Error
-                ) {
-                    break body;
-                }
-            }
-        })
-        .await
-        .expect("bounded tool invocation");
-        task.await.unwrap();
+        }));
+        Started {
+            corr,
+            replies,
+            task,
+        }
+    }
+
+    /// The reply to a started call. Nothing but the reply may reach the
+    /// call's route: no consent question travels back along it.
+    async fn finish(&self, mut started: Started) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(5), started.replies.recv())
+            .await
+            .expect("bounded tool invocation")
+            .expect("tool response");
+        assert!(
+            matches!(
+                frame.header.ty,
+                subc_protocol::FrameType::Response | subc_protocol::FrameType::Error
+            ),
+            "a frame other than the reply reached the route: {:?}",
+            frame.header.ty
+        );
+        assert_eq!(frame.header.corr, started.corr);
+        started.task.await.unwrap();
+        assert!(
+            started.replies.try_recv().is_err(),
+            "more than one frame reached the route"
+        );
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    /// One tool call, its site cards answered `decision`: the reply and the
+    /// cards (`consent.request` params) it raised.
+    async fn call(&self, channel: u16, args: Value, decision: &str) -> (Value, Vec<Value>) {
+        let before = self.site.cards.lock().unwrap().len();
+        let started = self.start(channel, args, decision);
+        let response = self.finish(started).await;
+        let cards = self.site.cards.lock().unwrap()[before..].to_vec();
         (response, cards)
     }
 
@@ -300,6 +409,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.planes.user_browser.shutdown();
         self.worker.abort();
+        let _ = std::fs::remove_dir_all(&self.registry);
     }
 }
 
@@ -639,7 +749,7 @@ async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
         .await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     assert_eq!(cards.len(), 1, "{cards:?}");
-    assert_eq!(cards[0]["params"]["scope"]["severity_tier"], 2);
+    assert_eq!(cards[0]["scope"]["severity_tier"], 2);
 }
 
 #[tokio::test]
@@ -650,7 +760,7 @@ async fn per_site_ask_is_required_and_allow_once_is_one_invocation() {
         let (reply, cards) = fixture.snapshot(1, &tab, "allow_once").await;
         assert_eq!(reply["outcome"], "ok", "{reply}");
         assert_eq!(cards.len(), 1, "a skipped per-site ask exposed content");
-        let card = &cards[0]["params"];
+        let card = &cards[0];
         assert!(card["prompt"]
             .as_str()
             .unwrap()
@@ -1546,4 +1656,288 @@ async fn authority_changing_severity_is_never_grantable_in_the_user_browser() {
     assert_eq!(reply["reason"], "severity_ungrantable");
     assert!(cards.is_empty());
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+// --- the site card through Cingulate ----------------------------------------
+
+/// Wait until `check` holds, for a test that acts while a call is held.
+async fn until(mut check: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the call reached the awaited step");
+}
+
+fn snapshot_args(tab: &str) -> Value {
+    json!({"browser":"user","action":"snapshot","tab":tab})
+}
+
+fn this_session() -> crate::cingulate_client::live_call::SessionKey {
+    crate::computer_grants::tests::session_key("test-project")
+}
+
+/// Silence: the card's wait ends with it still pending. The call replies
+/// `consent_unavailable` as it always has; the card is withdrawn, never
+/// detached (nobody will want its answer later), and forgotten, so the
+/// session's next call has nothing to read from Cingulate and opens no route.
+#[tokio::test]
+async fn an_unanswered_site_card_is_withdrawn_never_detached_and_leaves_no_registry_entry() {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    let tab = fixture.claim(1).await;
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id":"el_site_silent"})),
+        )
+        .then(
+            wire::CONSENT_AWAIT,
+            Reply::Result(json!({"elicitation_id":"el_site_silent","state":"pending"})),
+        )
+        .then(
+            wire::CONSENT_WITHDRAW,
+            Reply::Result(json!({"elicitation_id":"el_site_silent","state":"expired"})),
+        );
+    let reply = fixture
+        .finish(fixture.start(1, snapshot_args(&tab), ""))
+        .await;
+    assert_eq!(reply["outcome"], "refused", "{reply}");
+    assert_eq!(reply["reason"], "consent_unavailable", "{reply}");
+    assert!(reply.get("state_text").is_none());
+    assert_eq!(
+        script.methods(),
+        [
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_WITHDRAW
+        ]
+    );
+    assert_eq!(script.calls()[1].1["timeout_ms"], 120_000);
+    assert!(fixture.planes.consent.raised("el_site_silent").is_none());
+    assert!(fixture.planes.consent.unapplied(&this_session()).is_empty());
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
+    let opens = script.opens();
+    crate::computer_grants::tests::drain_call(&fixture.planes, 1, 1).await;
+    assert_eq!(
+        script.opens(),
+        opens,
+        "the next call opened a consent route"
+    );
+}
+
+/// A cancel, the call's route closing, and the module draining each end the
+/// held call with its own word, withdraw the card rather than detach it, and
+/// leave nothing in the registry.
+#[tokio::test]
+async fn cancel_route_close_and_drain_withdraw_a_held_site_card() {
+    for (event, reason) in [
+        ("cancel", Some("cancelled")),
+        // A closed route gets no reply at all.
+        ("route_close", None),
+        ("drain", Some("module_draining")),
+    ] {
+        let script = ScriptedCingulate::new();
+        let fixture = Fixture::scripted(&script);
+        let tab = fixture.claim(1).await;
+        script
+            .then(
+                wire::CONSENT_REQUEST,
+                Reply::Result(json!({"elicitation_id":"el_site_held"})),
+            )
+            .then(wire::CONSENT_AWAIT, Reply::Hang)
+            .then(
+                wire::CONSENT_WITHDRAW,
+                Reply::Result(json!({"elicitation_id":"el_site_held","state":"withdrawn"})),
+            );
+        let started = fixture.start(1, snapshot_args(&tab), "");
+        until(|| script.methods().len() == 2).await;
+        match event {
+            "cancel" => fixture
+                .planes
+                .cancellations
+                .get((1, 1, started.corr))
+                .unwrap()
+                .cancel(),
+            "route_close" => {
+                fixture.planes.routes.remove(1, 1);
+            }
+            _ => {
+                fixture.planes.drain_signal.send_replace(true);
+            }
+        }
+        match reason {
+            Some(reason) => {
+                let reply = fixture.finish(started).await;
+                assert_eq!(reply["reason"], reason, "{event}: {reply}");
+            }
+            None => {
+                let mut started = started;
+                tokio::time::timeout(Duration::from_secs(5), &mut started.task)
+                    .await
+                    .expect("the call ends when its route closes")
+                    .unwrap();
+                assert!(
+                    started.replies.try_recv().is_err(),
+                    "{event}: a reply was sent"
+                );
+            }
+        }
+        assert_eq!(
+            script.methods(),
+            [
+                wire::CONSENT_REQUEST,
+                wire::CONSENT_AWAIT,
+                wire::CONSENT_WITHDRAW
+            ],
+            "{event}"
+        );
+        assert!(fixture.planes.consent.raised("el_site_held").is_none());
+        assert!(fixture.state.lock().unwrap().captures.is_empty());
+    }
+}
+
+/// "Always on this site" stores a standing row whose consent reference is the
+/// card's Cingulate id, and the answer is marked applied so no later call of
+/// the session reads it again.
+#[tokio::test]
+async fn an_always_answer_records_the_cingulate_card_id_and_is_applied() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (reply, cards) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(cards.len(), 1);
+    let rows = fixture
+        .planes
+        .user_browser
+        .target()
+        .grants
+        .live_rows("test-project");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].consent_ref, "el_site_1");
+    assert!(fixture.planes.consent.raised("el_site_1").unwrap().applied);
+    assert!(fixture.planes.consent.unapplied(&this_session()).is_empty());
+}
+
+/// A choice the card did not offer is not a refusal: no decision can be read
+/// from it, so the reply says `unrecognized_answer` and nothing is exposed.
+#[tokio::test]
+async fn a_choice_the_card_did_not_offer_is_unrecognized_never_declined() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (reply, cards) = fixture.snapshot(1, &tab, "approve_everything").await;
+    assert_eq!(cards.len(), 1);
+    assert_eq!(reply["reason"], "unrecognized_answer", "{reply}");
+    assert!(reply.get("state_text").is_none());
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
+}
+
+/// A call from no agent session raises no card and opens no route to
+/// Cingulate; the reply says where the call must come from.
+#[tokio::test]
+async fn a_call_without_an_agent_session_raises_no_site_card() {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    let tab = fixture.claim(1).await;
+    let facts = fixture.planes.routes.get(1, 1).unwrap();
+    fixture.planes.routes.insert(1, 1, facts.with_scope(None));
+    let reply = fixture
+        .finish(fixture.start(1, snapshot_args(&tab), ""))
+        .await;
+    assert_eq!(reply["reason"], "consent_unavailable", "{reply}");
+    assert_eq!(
+        reply["remedy"],
+        "call from the agent session that needs the permission; it can raise the card"
+    );
+    assert_eq!(script.opens(), 0);
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
+}
+
+/// The session drain leaves a site card alone while a call is holding it,
+/// and withdraws one that no call holds (such as a card left in the registry
+/// by a restart). Otherwise that card would stay on the person's phone, and
+/// as an unapplied registry entry it would make every later call of the
+/// session open a route to Cingulate to look for its answer.
+#[tokio::test]
+async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
+    use crate::cingulate_client::desk::RegistryStore;
+    let dir = std::env::temp_dir().join(format!(
+        "user-browser-drain-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(FileRegistryStore::new(dir.join("registry.json")));
+    let card = RaisedCard {
+        elicitation_id: "el_site_abandoned".into(),
+        session: this_session(),
+        kind: CardKind::UserBrowserSite,
+        subject: subject::user_browser_site("https://example.com"),
+        grant_ids: vec![SITE_ALLOW_ONCE.into()],
+        decline_id: SITE_DENY.into(),
+        next_steps: Default::default(),
+        applied: false,
+    };
+    store.save(std::slice::from_ref(&card)).unwrap();
+    let script = ScriptedCingulate::new();
+    let planes = Planes::with_cingulate_for_test(
+        Arc::new(cerebellum_core::health::HealthState::new()),
+        None,
+        Arc::new(script.clone()),
+        store.clone(),
+    );
+    crate::install_browser_test_bind(&planes.routes, 1, 1, &[]);
+    let facts = planes.routes.get(1, 1).unwrap();
+    planes.routes.insert(
+        1,
+        1,
+        facts.with_scope(Some(crate::computer_grants::tests::stamp("test-project"))),
+    );
+
+    script
+        .then(
+            wire::CONSENT_ANSWERS,
+            Reply::Result(json!({"records":[],"cursor":1})),
+        )
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
+    {
+        let _held = SiteCardHold::enter(&planes.user_browser_cards, &card.subject);
+        crate::computer_grants::tests::drain_call(&planes, 1, 1).await;
+    }
+    assert_eq!(
+        script.methods(),
+        [wire::CONSENT_ANSWERS, wire::CONSENT_ACK],
+        "a held card was read or withdrawn"
+    );
+    assert!(planes.consent.raised("el_site_abandoned").is_some());
+
+    script
+        .then(
+            wire::CONSENT_GET,
+            Reply::Result(json!({"elicitation_id":"el_site_abandoned","state":"pending"})),
+        )
+        .then(
+            wire::CONSENT_WITHDRAW,
+            Reply::Result(json!({"elicitation_id":"el_site_abandoned","state":"withdrawn"})),
+        )
+        .then(
+            wire::CONSENT_ANSWERS,
+            Reply::Result(json!({"records":[],"cursor":1})),
+        )
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
+    crate::computer_grants::tests::drain_call(&planes, 1, 1).await;
+    assert_eq!(
+        script.methods()[2..],
+        [
+            wire::CONSENT_GET,
+            wire::CONSENT_WITHDRAW,
+            wire::CONSENT_ANSWERS,
+            wire::CONSENT_ACK
+        ]
+    );
+    assert!(planes.consent.raised("el_site_abandoned").is_none());
+    assert!(store.load().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -5,7 +5,8 @@
 //! (`management::browser_grant_question`, `computer_grants::question_body`,
 //! `login_import::import_question`, `login_capture::consent_question`,
 //! `management::profile_root_rebind_question`,
-//! `management::launch_recovery_clear_question`), which render an
+//! `management::launch_recovery_clear_question`,
+//! `user_browser::site_question`), which render an
 //! `elicitation/create` body. This file lifts that body's `params` into
 //! Cingulate's generic `consent` request and changes only what Cingulate's
 //! closed request format requires, so the phone sees the same title, prompt,
