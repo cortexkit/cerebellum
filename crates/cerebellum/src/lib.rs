@@ -2689,8 +2689,9 @@ pub struct Planes {
     /// Serializes answer-feed reads per session and calls each flow's adapter
     /// to elect one caller to store the answer's permission or approval.
     pub consent_drain: Arc<consent_drain::ConsentDrain>,
-    /// The user-browser site cards calls are raising or holding, which the
-    /// session drain must leave to those calls.
+    /// The user-browser site cards that calls in this process are raising or
+    /// waiting on. Only the waiting call acts on such a card's answer, so the
+    /// session drain must not withdraw these cards as abandoned.
     pub(crate) user_browser_cards: Arc<user_browser::SiteCardHolders>,
     #[cfg(test)]
     pub(crate) consent_test: Option<Arc<computer_grants::tests::CardService>>,
@@ -10596,8 +10597,10 @@ mod tests {
             .question_open(pending["ask_id"].as_str().unwrap()));
     }
 
-    /// A refused requester ends at once as a card nobody was shown, not
-    /// silence from a person who never saw a prompt.
+    /// When Cingulate refuses to raise the card (the requester is refused),
+    /// the capture ends at once with `not_put_to_anyone`: nobody was shown
+    /// the card, which is not the same as a person who saw it and stayed
+    /// silent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_requester_refusal_ends_the_capture_as_not_put_to_anyone() {
         use login_capture::test_support::fixture;
@@ -12206,9 +12209,10 @@ mod login_import_consent_tests {
         CONSENT_REQUEST,
     };
 
-    /// Planes whose management route at channel 1 belongs to an admitted
-    /// agent session, raising cards with `consent`'s script. Built again over
-    /// the same `consent`, they are the planes a restarted module has.
+    /// Planes whose management route (channel 1, epoch 1) belongs to an
+    /// admitted agent session, and whose consent cards go to `consent`'s
+    /// scripted Cingulate. Building them again over the same `consent`
+    /// stands for a restarted module: same registry file, same Cingulate.
     fn planes(consent: &ScriptedConsent) -> Planes {
         consent.wire(super::tests::management_bound_planes(1, 1), 1, 1)
     }
@@ -12241,8 +12245,9 @@ mod login_import_consent_tests {
         (consent.cards().into_iter().nth(raised_before), reply)
     }
 
-    /// Apply a late answer through a call on the session, then check that
-    /// it was remembered for the retry.
+    /// Let one call on the session read a consent answer that arrived after
+    /// the import call returned, then check that it was stored for the next
+    /// import (as a single-use approval or a remembered refusal).
     async fn await_remembered(planes: &Planes) {
         computer_grants::tests::drain_call(planes, 1, 1).await;
         assert!(
@@ -12378,7 +12383,8 @@ mod login_import_consent_tests {
         assert_eq!(reply["outcome"], "denied", "{reply}");
     }
 
-    /// A card nobody was shown ends the import at once, as itself.
+    /// When Cingulate refuses to raise the card, so nobody is shown it, the
+    /// import ends at once with `not_put_to_anyone`.
     #[tokio::test]
     async fn a_card_nobody_was_shown_ends_the_import_at_once() {
         let consent = ScriptedConsent::new();
@@ -12396,8 +12402,9 @@ mod login_import_consent_tests {
         assert!(!planes.management.computer_grants().remembers_login_answer());
     }
 
-    /// Each way the import card can end without an answer is reported as
-    /// itself, and a choice the card did not offer is not read as a refusal.
+    /// Each way the import card can end without an answer gets its own
+    /// outcome, and a choice the card did not offer is reported as
+    /// `unrecognized_answer`, not as a refusal.
     #[test]
     fn every_unanswered_ending_concludes_as_itself() {
         use cingulate_client::desk::{Ending, NoCard};

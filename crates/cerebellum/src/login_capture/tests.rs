@@ -63,8 +63,10 @@ fn allow() -> Answer {
 }
 
 impl Answer {
-    /// Cingulate's replies for one capture card ending this way: the card is
-    /// raised, and the call's wait on it reads its ending at once.
+    /// A scripted Cingulate whose replies end one capture card as `self`
+    /// says. For `Refused` and `Transport` the `consent.request` itself fails
+    /// and no card is raised; otherwise the card is raised and the capture
+    /// call's wait on it (`consent.await`) returns its ending at once.
     fn script(self) -> Arc<ScriptedCingulate> {
         let script = ScriptedCingulate::new();
         let (id, mut record) = match self {
@@ -119,7 +121,9 @@ impl QuestionCarrier for Carrier {
     }
 }
 
-/// One capture call's consent need, its card raised with `script`.
+/// The consent request of one capture call: its card goes to `script`, and
+/// `scoped` says whether the call comes from an agent session (see
+/// [`Carrier`]).
 fn consent(
     script: &Arc<ScriptedCingulate>,
     request: &CaptureRequest,
@@ -703,8 +707,8 @@ async fn the_deposit_names_the_card_the_person_answered_as_its_consent() {
         fixture.vault.request_params()[0]["consent_ref"],
         "el_7Qx-relay.card:42"
     );
-    // The id this module renders the card body under never leaves it, so
-    // it cannot be what the deposit names.
+    // The card sent to Cingulate carries no id of this module's own, so the
+    // `consent_ref` above can only be the id Cingulate returned.
     assert!(question.unwrap().get("id").is_none());
 }
 

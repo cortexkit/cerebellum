@@ -330,8 +330,9 @@ impl Fixture {
         let (writer, replies) = mpsc::channel(16);
         let planes = self.planes.clone();
         let arrival = crate::browser_queue::arrive(&frame, &planes);
-        // The call's in-flight guard, in scope as the frame loop provides it,
-        // is what proves to the consent desk that the call is still held.
+        // `with_live` puts an in-flight guard in scope, as the frame loop does
+        // for a real call; the consent desk opens a route to Cingulate only
+        // while such a guard shows the call is still held.
         let task = tokio::spawn(crate::computer_grants::tests::with_live(async move {
             let _registration = registration;
             crate::browser_queue::scope(
@@ -1820,8 +1821,8 @@ async fn an_always_answer_records_the_cingulate_card_id_and_is_applied() {
     assert!(fixture.planes.consent.unapplied(&this_session()).is_empty());
 }
 
-/// A choice the card did not offer is not a refusal: nothing can be read
-/// from it, so it is reported as such and nothing is exposed.
+/// A choice the card did not offer is not a refusal: no decision can be read
+/// from it, so the reply says `unrecognized_answer` and nothing is exposed.
 #[tokio::test]
 async fn a_choice_the_card_did_not_offer_is_unrecognized_never_declined() {
     let fixture = Fixture::new();
@@ -1855,8 +1856,10 @@ async fn a_call_without_an_agent_session_raises_no_site_card() {
 }
 
 /// The session drain leaves a site card alone while a call is holding it,
-/// and withdraws one that no call holds, as after a restart, so it neither
-/// stays on the person's phone nor makes every later call open a route.
+/// and withdraws one that no call holds (such as a card left in the registry
+/// by a restart). Otherwise that card would stay on the person's phone, and
+/// as an unapplied registry entry it would make every later call of the
+/// session open a route to Cingulate to look for its answer.
 #[tokio::test]
 async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
     use crate::cingulate_client::desk::RegistryStore;

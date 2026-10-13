@@ -1029,9 +1029,10 @@ impl Context<'_> {
             .await
             .map_err(|error| consent_unavailable(&Ending::of_refusal(&error)))?;
         let subject = subject::user_browser_site(origin);
-        // Entered before the card exists, so a drain run by another call of
-        // this session never takes the card for one abandoned by a call that
-        // is still raising or holding it.
+        // Count this call as holding the card before raising it, so a drain
+        // run by another call of this session never mistakes the card for an
+        // abandoned one and withdraws it while this call raises or waits on
+        // it.
         let _holding = SiteCardHold::enter(&self.planes.user_browser_cards, &subject);
         let ask_id = session
             .raise(card, &subject)
@@ -1058,7 +1059,8 @@ impl Context<'_> {
             }
             InCall::Cancelled => return Err(refusal("cancelled")),
             InCall::RouteClosed => return Err(refusal("route_closed")),
-            // `hold` never detaches, so it never reports a card pending.
+            // `hold` never detaches the card (leaves it open for a later
+            // answer), so it never reports one pending; read it as silence.
             InCall::Pending { .. } => return Err(consent_unavailable(&Ending::NoAnswer)),
         };
         let decided = match &ending {
@@ -1097,10 +1099,10 @@ impl Context<'_> {
             ending => return Err(consent_unavailable(ending)),
         };
         // The answer has been acted on (a standing grant is stored first), so
-        // no later call of this session needs to read it from the answers
-        // feed. A registry that cannot be saved changes nothing here: the
-        // card is then read again by a later drain, which has nothing to
-        // apply for it and only acknowledges it.
+        // it is marked applied: later calls of this session then need not
+        // read it from Cingulate's answers feed. The result is ignored on
+        // purpose: if the registry cannot be saved, a later drain reads the
+        // card again, finds nothing to apply, and only acknowledges it.
         let _ = self.planes.consent.mark_applied(&ask_id);
         decided
     }
