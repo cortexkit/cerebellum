@@ -49,7 +49,8 @@ pub enum Ending {
     /// Cingulate will not put the card to anyone, and asking again goes the
     /// same way until something outside cerebellum changes: cerebellum is not
     /// an admitted requester for this kind, Cingulate refuses a card without
-    /// a safe default, or the agent is retired.
+    /// a safe default, the agent is retired, or a worker has no live head
+    /// agent to ask on behalf of.
     NotPutToAnyone,
     /// The card or its answer could not be carried: no route, a transport
     /// failure, the consent module being unavailable, or cerebellum building
@@ -154,7 +155,8 @@ impl Ending {
             CallError::Refused(refusal) => match refusal.code {
                 RefusalCode::RequesterRefused
                 | RefusalCode::FailClosedRequired
-                | RefusalCode::ConsentRetired => Self::NotPutToAnyone,
+                | RefusalCode::ConsentRetired
+                | RefusalCode::AccessNoHead => Self::NotPutToAnyone,
                 // Cerebellum built a card Cingulate cannot decode or accept:
                 // a defect here, which telling the agent "nobody is
                 // reachable" would hide.
@@ -168,6 +170,7 @@ impl Ending {
                 RefusalCode::NotOwner | RefusalCode::NotFound => Self::NoAnswer,
                 RefusalCode::UnknownMethod
                 | RefusalCode::ConsentUnavailable
+                | RefusalCode::AccessUnavailable
                 | RefusalCode::StoreError
                 | RefusalCode::Cancelled
                 | RefusalCode::InvalidExecution

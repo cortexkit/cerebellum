@@ -35,6 +35,10 @@ const GOLDEN_CALL_KEY: &str = "pf:card-golden";
 /// One card of each kind, built by the production builder with the deadline
 /// its call site enforces.
 fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
+    cards_with_standing(true)
+}
+
+fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Duration)> {
     use crate::authorization::{HazardClass, Severity};
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
     use crate::consent_card::{Urgency, LOGIN_CARD_LIFETIME};
@@ -48,10 +52,14 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             &hazards,
             Severity::new(4, true, false),
             urgency,
-            &[
-                BrowserGrantChoice::Conversation,
-                BrowserGrantChoice::OriginAlways,
-            ],
+            &if standing {
+                vec![
+                    BrowserGrantChoice::Conversation,
+                    BrowserGrantChoice::OriginAlways,
+                ]
+            } else {
+                vec![BrowserGrantChoice::Conversation]
+            },
         )
     };
     let app = GrantNeed::App {
@@ -121,7 +129,7 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
         "https://bank.example",
         3,
         &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
-        true,
+        standing,
     );
     vec![
         (
@@ -141,7 +149,11 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             "app-control.json",
             crate::computer_grants::question_body(
                 &app,
-                &["allow_conversation", "allow_always", "deny"],
+                if standing {
+                    &["allow_conversation", "allow_always", "deny"]
+                } else {
+                    &["allow_conversation", "deny"]
+                },
                 false,
                 Some(&team),
             ),
@@ -1092,11 +1104,12 @@ async fn a_crash_between_apply_and_ack_reapplies_once_without_duplicating() {
 #[test]
 fn every_refusal_code_maps_to_its_typed_ending() {
     use super::double::refusal;
-    let table: [(&str, Ending); 15] = [
+    let table: [(&str, Ending); 17] = [
         // Nobody can be reached.
         ("elicitation_requester_refused", Ending::NotPutToAnyone),
         ("elicitation_fail_closed_required", Ending::NotPutToAnyone),
         ("consent_retired", Ending::NotPutToAnyone),
+        ("access_no_head", Ending::NotPutToAnyone),
         // Cerebellum built a bad card.
         ("elicitation_invalid_request", Ending::DeliveryFailed),
         ("elicitation_unknown_kind", Ending::DeliveryFailed),
@@ -1105,6 +1118,7 @@ fn every_refusal_code_maps_to_its_typed_ending() {
         // The request could not be carried.
         ("unknown_method", Ending::DeliveryFailed),
         ("consent_unavailable", Ending::DeliveryFailed),
+        ("access_unavailable", Ending::DeliveryFailed),
         ("elicitation_store_error", Ending::DeliveryFailed),
         ("cancelled", Ending::DeliveryFailed),
         ("elicitation_invalid_execution", Ending::DeliveryFailed),
@@ -1894,3 +1908,5 @@ fn every_kind_has_one_subject_and_kinds_never_collide() {
     );
     assert_eq!(subject::login_parts(&by_kind[3].1), None);
 }
+
+mod worker_options;

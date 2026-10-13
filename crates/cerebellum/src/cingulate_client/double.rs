@@ -91,6 +91,7 @@ pub fn refusal(code: &str) -> CallError {
 pub struct ScriptedCingulate {
     pub opens: AtomicUsize,
     pub calls: Mutex<Vec<(String, Value)>>,
+    scopes: Mutex<Vec<subc_protocol::scope::ScopeSelector>>,
     script: Mutex<VecDeque<(&'static str, Reply)>>,
     /// When set, refuse every route.open with this daemon code, as a daemon
     /// would when core has not listed cerebellum as a carrier (a module
@@ -120,6 +121,10 @@ impl ScriptedCingulate {
     pub fn opens(&self) -> usize {
         self.opens.load(Ordering::SeqCst)
     }
+
+    pub fn scopes(&self) -> Vec<subc_protocol::scope::ScopeSelector> {
+        self.scopes.lock().unwrap().clone()
+    }
 }
 
 struct ScriptedRoute(Arc<ScriptedCingulate>);
@@ -127,10 +132,11 @@ struct ScriptedRoute(Arc<ScriptedCingulate>);
 impl CingulateOpener for Arc<ScriptedCingulate> {
     fn open<'a>(
         &'a self,
-        _live: &'a LiveCall,
+        live: &'a LiveCall,
     ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
         Box::pin(async move {
             self.opens.fetch_add(1, Ordering::SeqCst);
+            self.scopes.lock().unwrap().push(live.scope().clone());
             if let Some(code) = *self.refuse_open.lock().unwrap() {
                 return Err(CallError::Transport {
                     code: Some(code.into()),

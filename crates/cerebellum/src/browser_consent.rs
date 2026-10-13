@@ -56,11 +56,7 @@ pub(crate) fn live(
     channel: u16,
     epoch: u32,
 ) -> Result<LiveCall, Ending> {
-    let stamp = (facts.admits_session_calls()
-        && facts.agent_project_id_attested
-        && facts.flow_id.is_none())
-    .then_some(facts.scope.as_ref())
-    .flatten();
+    let stamp = crate::permission_scope::card_stamp(facts);
     if stamp.is_none() {
         return Err(Ending::NoCard(NoCard::NoAgentSession));
     }

@@ -82,7 +82,7 @@ pub fn is_requester_ref(value: &str) -> bool {
 }
 
 /// Every refusal code a requester can receive: the shared transport codes and
-/// the requester-specific ones of the v1 contract.
+/// the requester-specific ones of the v2 contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefusalCode {
     RequestTooLarge,
@@ -96,6 +96,8 @@ pub enum RefusalCode {
     UnknownKind,
     FailClosedRequired,
     ConsentRetired,
+    AccessNoHead,
+    AccessUnavailable,
     NotOwner,
     NotFound,
     InvalidExecution,
@@ -118,6 +120,8 @@ impl RefusalCode {
             "elicitation_unknown_kind" => Self::UnknownKind,
             "elicitation_fail_closed_required" => Self::FailClosedRequired,
             "consent_retired" => Self::ConsentRetired,
+            "access_no_head" => Self::AccessNoHead,
+            "access_unavailable" => Self::AccessUnavailable,
             "elicitation_not_owner" => Self::NotOwner,
             "elicitation_not_found" => Self::NotFound,
             "elicitation_invalid_execution" => Self::InvalidExecution,
