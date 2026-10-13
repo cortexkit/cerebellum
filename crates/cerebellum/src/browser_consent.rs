@@ -64,7 +64,7 @@ pub(crate) fn live(
     if stamp.is_none() {
         return Err(Ending::NoCard(NoCard::NoAgentSession));
     }
-    let guard = crate::elicit::ROUTE_GUARD
+    let guard = crate::call_context::ROUTE_GUARD
         .try_with(Arc::clone)
         .map_err(|_| Ending::NoCard(NoCard::CallEnded))?;
     LiveCall::from_inbound(
@@ -183,7 +183,7 @@ pub(crate) async fn raise(
         kind,
         &question.body,
         question.deadline,
-        crate::elicit::current_call_key().as_deref(),
+        crate::call_context::current_call_key().as_deref(),
         None,
         None,
     )

@@ -671,9 +671,11 @@ async fn only_an_affirmative_answer_proceeds() {
 
 #[test]
 fn the_question_names_the_holder_site_account_and_the_vault() {
-    let question = consent_question(&ollama(), "capture-login-test");
+    let question = consent_question(&ollama());
     crate::consent_card::assert_contract(&question, &["allow", "deny"], "deny");
-    assert_eq!(question["id"], "capture-login-test");
+    // Only the params are rendered: the id the deposit later names as its
+    // consent is the one Cingulate gives the card when it is raised.
+    assert!(question.get("id").is_none(), "{question}");
     assert_eq!(
         question["params"]["prompt"],
         "insula will hold a copy of your ollama.com login."

@@ -35,7 +35,7 @@ pub mod wire;
 #[doc(hidden)]
 pub mod double;
 #[doc(hidden)]
-pub use double::{vector, Reply, ScriptedCingulate};
+pub use double::{vector, Reply, ScriptedAnswer, ScriptedCingulate};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

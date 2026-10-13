@@ -7,8 +7,9 @@
 //!
 //! Budget: at most 180 seconds, plus up to 3 seconds for process cleanup. All
 //! generated state is under /tmp. The in-process scratch cerebellum uses an
-//! isolated journal and a local consent relay: only its loopback origin can be
-//! answered, with allow_once, and no phone or standing grants are involved.
+//! isolated journal and a scripted Cingulate (the consent module) in place of
+//! the real one: only a card for its loopback origin is answered, with
+//! allow_once, and no phone or standing grants are involved.
 //! See docs/user-browser.md for the pinned CfT version, probe feature and signing.
 //!
 //! This launches a headed browser with --no-startup-window, never activates it
@@ -203,10 +204,12 @@ impl Drop for Scratch {
     }
 }
 
+/// Whether `card`, a `consent.request` the scripted Cingulate received (as
+/// `{"id", "params"}`), is the per-site card for the probe's own fixture
+/// origin, so the probe may answer it allow_once.
 fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
     let p = &card["params"];
-    if card["method"] != "elicitation/create"
-        || p["kind"] != "consent"
+    if p["kind"] != "consent"
         || p["scope"]["browser"] != "user"
         || p["scope"]["origins"] != json!([origin])
         || p["target"]["label"] != origin
@@ -215,7 +218,7 @@ fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
             .as_array()
             .is_some_and(|options| options.iter().any(|o| o["id"] == "allow_once"))
     {
-        return Err("scratch relay refused a non-fixture or malformed site card".into());
+        return Err("scripted Cingulate refused a non-fixture or malformed site card".into());
     }
     Ok(())
 }
@@ -435,7 +438,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
     let input_severity = json!({"tier":2,"credential":false,"financial":false});
     let (navigated, asks) = driver.call(json!({"action":"navigate","tab":tab,"url":format!("{origin}/"),"wait":"settle","intent":"load loopback probe","severity":severity})).await?;
     check(
-        "navigation asks per site through scratch relay",
+        "navigation asks per site through scripted Cingulate",
         ok(&navigated) && asks == 1,
     )?;
     detached_and_unfocused(driver)?;
@@ -549,6 +552,15 @@ mod live {
         BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget, PROTOCOL_VERSION,
     };
     use tokio::sync::mpsc;
+
+    /// A scripted Cingulate, the consent module, shared with the integration
+    /// tests. The scratch cerebellum raises its per-site card there, and the
+    /// probe answers it; nothing is sent back on the probe's own route.
+    #[allow(dead_code)]
+    mod cingulate {
+        include!("../tests/support/cingulate.rs");
+    }
+    const PROBE_AGENT: &str = "pj-user-browser-probe";
 
     fn verify(path: &Path, requirement: &str) -> Result<(), String> {
         // codesign reads -R as a requirement FILE unless the text starts with
@@ -1067,6 +1079,7 @@ mod live {
 
     struct Live {
         planes: Planes,
+        consent: cingulate::ScriptedCarrier,
         cdp: Cdp,
         worker_session: String,
         worker_target: String,
@@ -1076,6 +1089,8 @@ mod live {
         page: Page,
         focus: Focus,
         corr: u64,
+        /// How many of the scripted Cingulate's cards have been answered.
+        cards_seen: usize,
         last_reply: LastReply,
     }
     const CHANNEL: u16 = 9;
@@ -1103,12 +1118,12 @@ mod live {
             },
             identity: BindIdentity::new(root.to_owned(), "probe", "user-browser-probe"),
             principal: cerebellum::session_caller_principal_for_test(),
-            consumer_capabilities: Some(vec!["elicitation".into()]),
-            admission_facts: Some(
-                json!({"agentProjectId":"pj-user-browser-probe","sessionKind":"primary",
-                "effectiveCapabilityScope":["*"],"browserControlOperations":["browser.launch","browser.status","browser.close"]}),
-            ),
-            scope: None,
+            consumer_capabilities: None,
+            admission_facts: Some(json!({"agentProjectId":PROBE_AGENT,"sessionKind":"primary",
+                "effectiveCapabilityScope":["*"],"browserControlOperations":["browser.launch","browser.status","browser.close"]})),
+            // The card is raised with Cingulate only from a call under an
+            // agent session's scope.
+            scope: Some(cingulate::stamp(PROBE_AGENT)),
         };
         let (writer, mut frames) = mpsc::channel(2);
         cerebellum::handle_control_request_for_test_with_bindings(
@@ -1228,11 +1243,12 @@ mod live {
             browser_exit_observation_deadline_ms: 2_000,
             navigation_settle_deadline_ms: 10_000,
         };
-        let planes = Planes::with_browser_config_journaling(
+        let consent = cingulate::ScriptedCarrier::default();
+        let planes = consent.install(Planes::with_browser_config_journaling(
             Arc::new(HealthState::new()),
             Some(config),
             JournalPersistence::Isolated,
-        );
+        ));
         bind(&planes, root).await?;
         let listener =
             BridgeListener::bind(planes.user_browser.clone()).map_err(|e| e.to_string())?;
@@ -1360,6 +1376,7 @@ mod live {
         let origin = page.origin.clone();
         let mut driver = Live {
             planes,
+            consent,
             cdp,
             worker_session,
             worker_target,
@@ -1369,6 +1386,7 @@ mod live {
             page,
             focus,
             corr: 10,
+            cards_seen: 0,
             last_reply: LastReply::default(),
         };
         let result = exercise(&mut driver, &origin).await;
@@ -1405,34 +1423,49 @@ mod live {
                 .await
                 .map_err(|e| e.to_string())?;
             let mut asks = 0;
+            let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                let response = tokio::time::timeout(Duration::from_secs(15), frames.recv())
-                    .await
-                    .map_err(|_| "scratch call timed out")?
-                    .ok_or("scratch route closed")?;
-                let body: Value =
-                    serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
-                if response.header.ty == FrameType::Request {
-                    consent_for_fixture(&body, &self.origin)?;
+                // Answer each card the call raised with the scripted
+                // Cingulate, after checking it is the fixture's own site card.
+                for card in self.consent.questions().into_iter().skip(self.cards_seen) {
+                    self.cards_seen += 1;
+                    consent_for_fixture(&card, &self.origin)?;
                     asks += 1;
                     println!(
                         "PASS per-site card: your own Chrome, signed in as you; {} -> allow_once",
                         self.origin
                     );
-                    let answer = Frame::build_with_version(
-                        PROTOCOL_VERSION,
-                        FrameType::Response,
-                        Flags::new(false, Priority::Interactive, false),
-                        response.header.channel,
-                        response.header.epoch,
-                        response.header.corr,
-                        serde_json::to_vec(&json!({"decision":"allow_once"})).unwrap(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    cerebellum::handle_frame_for_test(answer, &writer, &self.planes)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else if matches!(response.header.ty, FrameType::Response | FrameType::Error) {
+                    let id = card["id"].as_str().ok_or("the card has no id")?;
+                    if !self.consent.answer_id(
+                        id,
+                        cerebellum::cingulate_client::ScriptedAnswer::Answered(
+                            json!({"decision":"allow_once"}),
+                        ),
+                    ) {
+                        return Err(format!("the scripted Cingulate does not hold card {id}"));
+                    }
+                }
+                let response = match frames.try_recv() {
+                    Ok(response) => response,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        if Instant::now() > deadline {
+                            return Err("scratch call timed out".into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        return Err("scratch route closed".into())
+                    }
+                };
+                let body: Value =
+                    serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
+                if response.header.ty == FrameType::Request {
+                    return Err(format!(
+                        "the scratch cerebellum sent a request back on the probe's route: {body}"
+                    ));
+                }
+                if matches!(response.header.ty, FrameType::Response | FrameType::Error) {
                     // Beacons can arrive a turn after the tool reply. This is
                     // bounded observation, not an assumption that delivery worked.
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1773,9 +1806,9 @@ fn symlink_control() -> Result<(), String> {
     }
     Ok(())
 }
-fn relay_control() -> Result<(), String> {
+fn cingulate_answer_control() -> Result<(), String> {
     let origin = "http://127.0.0.1:12345";
-    let card = json!({"method":"elicitation/create","params":{"kind":"consent","scope":{"browser":"user","origins":[origin]},
+    let card = json!({"id":"el_1","params":{"kind":"consent","scope":{"browser":"user","origins":[origin]},
         "target":{"label":origin},"prompt":"Let the agent use your own Chrome, signed in as you, on this site?","options":[{"id":"allow_once"},{"id":"deny"}]}});
     consent_for_fixture(&card, origin)?;
     for mutation in ["origin", "target", "option"] {
@@ -1786,7 +1819,7 @@ fn relay_control() -> Result<(), String> {
             _ => other["params"]["options"] = json!([{"id":"allow_all"}]),
         }
         if consent_for_fixture(&other, origin).is_ok() {
-            return Err(format!("scratch relay accepted bad {mutation}"));
+            return Err(format!("scripted Cingulate accepted bad {mutation}"));
         }
     }
     Ok(())
@@ -1897,8 +1930,8 @@ async fn self_test() -> Result<(), String> {
     ));
     tests.push(("installer_refuses_symlink_escape", symlink_control()));
     tests.push((
-        "relay_answers_only_fixture_site_and_user_target",
-        relay_control(),
+        "cingulate_answers_only_fixture_site_and_user_target",
+        cingulate_answer_control(),
     ));
     tests.push(("cleanup_line_reports_cleanup_alone", cleanup_line_control()));
     tests.push((
@@ -2041,7 +2074,7 @@ async fn self_test() -> Result<(), String> {
         (
             "ask",
             "acceptance_rejects_skipped_per_site_ask",
-            "navigation asks per site through scratch relay",
+            "navigation asks per site through scripted Cingulate",
         ),
         (
             "epoch",

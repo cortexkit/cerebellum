@@ -52,8 +52,8 @@ use tokio::sync::mpsc;
 // assumes every request opens an elicitation: a capability answering without
 // one left the second recv waiting until its own timeout, reported as "the
 // consent question was not prompt" about a question that was never owed.
-#[path = "support/consent_relay.rs"]
-mod consent_relay;
+#[path = "support/cingulate_answer.rs"]
+mod cingulate_answer;
 
 #[cfg(target_os = "macos")]
 const MACOS_CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -438,8 +438,10 @@ async fn bind_route(
     route_channel: u16,
     epoch: u32,
     target: RouteTarget,
-    declares_elicitation: bool,
+    raises_cards: bool,
 ) {
+    let project =
+        std::env::var("CK_PROBE_PROJECT_ID").unwrap_or_else(|_| "pj-live-launch-probe".to_string());
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode: None,
@@ -448,10 +450,9 @@ async fn bind_route(
         target,
         identity: probe_identity(),
         principal: cerebellum::session_caller_principal_for_test(),
-        consumer_capabilities: declares_elicitation.then(|| vec!["elicitation".to_string()]),
+        consumer_capabilities: None,
         admission_facts: Some(json!({
-            "agentProjectId": std::env::var("CK_PROBE_PROJECT_ID")
-                .unwrap_or_else(|_| "pj-live-launch-probe".to_string()),
+            "agentProjectId": project,
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": [
@@ -460,7 +461,9 @@ async fn bind_route(
                 "browser.close"
             ]
         })),
-        scope: None,
+        // A permission card is raised with Cingulate only from a call under
+        // an agent session's scope.
+        scope: raises_cards.then(|| cingulate_answer::cingulate::stamp(&project)),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -502,7 +505,7 @@ async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
             }
         }),
     );
-    let pending = consent_relay::elicit_and_answer(
+    let pending = cingulate_answer::answer_cards(
         planes,
         opening,
         json!({"decision": "allow_conversation"}),

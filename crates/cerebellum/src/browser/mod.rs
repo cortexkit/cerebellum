@@ -5570,6 +5570,8 @@ pub(crate) fn validate_user_browser_result(
                 "image_width_px":integer_schema(), "image_height_px":integer_schema(),
                 "popup_activated_briefly":boolean_schema(),
                 "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"]),
+                    // Why no consent card could be raised, on `consent_unavailable`.
+                    closed_object(json!({"reason":string_schema()}), &["reason"]),
                     // A cdp_error refusal names the rejected plan command and
                     // Chrome's fixed error code and message, never page text.
                     closed_object(json!({"method":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"])]}

@@ -62,7 +62,6 @@ use crate::cingulate_client::desk::{
 use crate::cingulate_client::live_call::{LiveCall, NotLive};
 use crate::cingulate_client::wire::{Execution, Record};
 use crate::consent_drain::{AppliedSettlement, ConsentEffects};
-use crate::elicit::AskOutcome;
 use crate::CancelHandle;
 
 /// The file name of the "always" grant store, under the journal data home.
@@ -949,47 +948,6 @@ pub struct LoginAnswer {
     pub taken_approval: bool,
 }
 
-impl LoginAnswer {
-    /// Supply the decision and card id in the JSON answer format the login
-    /// implementations still consume.
-    pub fn legacy_answer(&self) -> AskOutcome {
-        match &self.ending {
-            CardEnding::Granted { choice_id } | CardEnding::Declined { choice_id } => {
-                AskOutcome::Answered(
-                    json!({"decision":choice_id, "elicitation_id":self.elicitation_id}),
-                )
-            }
-            CardEnding::NoAnswer | CardEnding::Withdrawn => AskOutcome::NoAnswer,
-            CardEnding::NotPutToAnyone => AskOutcome::NotPutToAnyone,
-            CardEnding::DeliveryFailed | CardEnding::NoCard(_) => AskOutcome::Undeliverable,
-        }
-    }
-}
-
-impl From<AskOutcome> for LoginConsent {
-    fn from(outcome: AskOutcome) -> Self {
-        let (ending, elicitation_id) = match outcome {
-            AskOutcome::Answered(body) => {
-                let choice_id = body["decision"].as_str().unwrap_or_default().to_string();
-                let ending = if choice_id == "allow" || choice_id == "allow_once" {
-                    CardEnding::Granted { choice_id }
-                } else {
-                    CardEnding::Declined { choice_id }
-                };
-                (ending, body["elicitation_id"].as_str().map(str::to_string))
-            }
-            AskOutcome::NoAnswer => (CardEnding::NoAnswer, None),
-            AskOutcome::NotPutToAnyone => (CardEnding::NotPutToAnyone, None),
-            AskOutcome::Undeliverable => (CardEnding::DeliveryFailed, None),
-        };
-        Self::Ended(LoginAnswer {
-            ending,
-            elicitation_id,
-            taken_approval: false,
-        })
-    }
-}
-
 /// The remedy a login call gives with `consent_pending`. The calling session
 /// is woken when the card settles, and the late answer is used only by a
 /// call with the same arguments.
@@ -1556,7 +1514,7 @@ impl ComputerGrants {
     pub async fn require_login(
         self: &Arc<Self>,
         request: LoginConsentRequest,
-        mut new_card: impl FnMut() -> (String, Value),
+        mut new_card: impl FnMut() -> Value,
     ) -> LoginConsent {
         let failed = |ending| {
             LoginConsent::Ended(LoginAnswer {
@@ -1610,7 +1568,7 @@ impl ComputerGrants {
                         grants: self,
                         subject: key.clone(),
                     };
-                    let (_, body) = new_card();
+                    let body = new_card();
                     let kind = match request.capability {
                         LoginCapability::ImportLogin => CardKind::LoginImport,
                         LoginCapability::CaptureLogin => CardKind::LoginCapture,
@@ -1841,7 +1799,7 @@ impl ComputerGrants {
         let ask_id = if let Some(card) = desk.open_card_for(live.session(), &key) {
             card.elicitation_id
         } else {
-            let body = question_body("", need, &offered, signature_changed, identity.as_ref());
+            let body = question_body(need, &offered, signature_changed, identity.as_ref());
             let card = consent_request(
                 kind,
                 &body,
@@ -2380,7 +2338,6 @@ fn wall_clock_ms() -> u64 {
 /// `identity` is the code-signing identity the grant will be recorded
 /// against, read for the process the call resolved.
 pub(crate) fn question_body(
-    ask_id: &str,
     need: &GrantNeed,
     offered: &[&'static str],
     signature_changed: bool,
@@ -2434,7 +2391,7 @@ pub(crate) fn question_body(
             Some(json!("conversation"))
         },
     }
-    .render(ask_id)
+    .render()
 }
 
 /// What an answer grants, named by the values the grant is recorded under.
@@ -2504,7 +2461,6 @@ mod consent_card_tests {
     #[test]
     fn takeover_card_has_a_decline_and_conversation_duration() {
         let body = question_body(
-            "takeover",
             &GrantNeed::Takeover,
             &[ALLOW_CONVERSATION, DENY],
             false,

@@ -430,9 +430,9 @@ fn zero_post_evidence(rows: &BTreeMap<String, Value>, before: &Value, after: &Va
 }
 
 #[cfg(target_os = "macos")]
-#[path = "support/consent_relay.rs"]
+#[path = "support/cingulate_answer.rs"]
 #[allow(dead_code)] // This probe uses the question-observing variant of the shared relay.
-mod consent_relay;
+mod cingulate_answer;
 
 #[cfg(target_os = "macos")]
 mod desk {
@@ -932,7 +932,7 @@ mod desk {
                 json!({"name":method,"arguments":args})
             };
             let mut questions = Vec::new();
-            let reply = super::consent_relay::elicit_and_answer_observing(
+            let reply = super::cingulate_answer::answer_cards_observing(
                 &self.planes,
                 frame(self.channel + u16::from(management), self.corr, body),
                 json!({"decision":answer}),

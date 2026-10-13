@@ -197,7 +197,9 @@ async fn bind(
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
         ),
-        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
+        scope: Some(cingulate_answer::cingulate::stamp(
+            "pj-browser-session-wire",
+        )),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

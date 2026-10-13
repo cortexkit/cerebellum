@@ -146,7 +146,7 @@ async fn wire_with_decision(
                 questions += 1;
                 let value: Value = serde_json::from_slice(&question.body).unwrap();
                 assert!(value.to_string().contains("app"), "{value}");
-                assert!(service.answer(question.header.corr, crate::elicit::AskOutcome::Answered(json!({"decision":decision}))));
+                assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision}))));
             }
             frame = rx.recv() => {
                 let frame = frame.unwrap();

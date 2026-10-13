@@ -1,8 +1,12 @@
 # Browser site-access card vectors
 
-The `params` of the `elicitation/create` request cerebellum sends for the
-browser site-access consent card, one file for each set of options the card
-can present, exactly as sent (the `expires_in_ms` is the one `Elicitor::ask` stamps).
+Each file holds the card body (the `params` object) that cerebellum's
+builder renders for the browser site-access consent card, one file for each
+set of options the card can present. The card is
+raised with Cingulate, the consent module, as a `consent.request` built from
+these params (`cingulate_client::card::consent_request`), which keeps every
+field the phone shows; its exact bytes are pinned per card kind in
+`../cingulate-consent-cards-v1/`.
 
 | File | Options offered | Case |
 |---|---|---|
@@ -18,8 +22,8 @@ grants is recorded by cerebellum against its id when the card is sent, and an
 answer is mapped back through that record, never through the id's spelling.
 
 `SHA256SUMS` pins each file. The test
-`consent_card::every_card_kind::browser_site_access_card_vectors_are_pinned_and_decode_in_core`
-rebuilds every card with the production builder, holds it to Prefrontal core's
-decode contract, and compares it with these files. After a deliberate change
+`consent_card::every_card_kind::browser_site_access_card_vectors_are_pinned`
+rebuilds every card with the production builder, compares it with these
+files, and checks the Cingulate request made from it offers the same options. After a deliberate change
 to the card, rerun that test with `CEREBELLUM_WRITE_SITE_CARD_VECTORS=1` to
 rewrite the files and the sums.

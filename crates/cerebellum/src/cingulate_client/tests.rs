@@ -44,7 +44,6 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
     let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
     let site = |urgency| {
         browser_grant_question(
-            "browser-grant",
             &origins,
             &hazards,
             Severity::new(4, true, false),
@@ -99,7 +98,7 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             generation_after: 8,
             record_count: 3,
         };
-        crate::management::profile_root_rebind_question("rebind", &new_identity.path, &preview)
+        crate::management::profile_root_rebind_question(&new_identity.path, &preview)
     };
     let clear = {
         use crate::launch_recovery::{
@@ -116,7 +115,7 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
                 singleton_lock: SingletonLockReading::Absent,
             },
         };
-        crate::management::launch_recovery_clear_question("clear", &preview)
+        crate::management::launch_recovery_clear_question(&preview)
     };
     let user_browser_site = crate::user_browser::site_question(
         "https://bank.example",
@@ -141,7 +140,6 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             CardKind::AppControl,
             "app-control.json",
             crate::computer_grants::question_body(
-                "app",
                 &app,
                 &["allow_conversation", "allow_always", "deny"],
                 false,
@@ -153,7 +151,6 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
             CardKind::Takeover,
             "takeover.json",
             crate::computer_grants::question_body(
-                "takeover",
                 &GrantNeed::Takeover,
                 &["allow_conversation", "deny"],
                 false,
@@ -164,13 +161,13 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
         (
             CardKind::LoginImport,
             "login-import.json",
-            crate::login_import::import_question("import", "https://x.com", "x.com", &[presence]),
+            crate::login_import::import_question("https://x.com", "x.com", &[presence]),
             LOGIN_CARD_LIFETIME,
         ),
         (
             CardKind::LoginCapture,
             "login-capture.json",
-            crate::login_capture::consent_question(&capture, "capture-login-test"),
+            crate::login_capture::consent_question(&capture),
             LOGIN_CARD_LIFETIME,
         ),
         (

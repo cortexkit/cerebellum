@@ -711,7 +711,7 @@ mod tests {
         tokio::time::sleep_until(arrived + consent_wait).await;
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            crate::elicit::AskOutcome::Answered(
+            crate::cingulate_client::ScriptedAnswer::Answered(
                 json!({"decision": "allow", "elicitation_id": "el_near_limit"})
             ),
         ));

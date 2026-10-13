@@ -848,9 +848,9 @@ async fn answer_rebind(
 ) {
     let body: Value = serde_json::from_slice(&question.body).unwrap();
     let outcome = if decision == "no_answer" {
-        cerebellum::elicit::AskOutcome::NoAnswer
+        cerebellum::cingulate_client::ScriptedAnswer::NoAnswer
     } else {
-        cerebellum::elicit::AskOutcome::Answered(json!({"decision":decision}))
+        cerebellum::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision}))
     };
     assert!(planes
         .service

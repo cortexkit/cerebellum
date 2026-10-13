@@ -305,8 +305,7 @@ const SITE_DENY: &str = "deny";
 /// on this site" is offered only when `standing`: this route's agent may hold
 /// standing grants and the grant store can record one.
 ///
-/// `render` needs an envelope id, which is a fixed placeholder here: only the
-/// card's params are sent to Cingulate (see
+/// The card's params are sent to Cingulate (see
 /// `cingulate_client::card::consent_request`), and the id the agent and the
 /// standing grant are given is the elicitation id Cingulate returns.
 pub(crate) fn site_question(
@@ -350,15 +349,20 @@ pub(crate) fn site_question(
             .with("hazards", json!(hazard_names)),
         duration: None,
     }
-    .render("user-browser-site")
+    .render()
 }
 
 /// The refusal when the site card ended without an answer, or could not be
 /// raised. The reason stays `consent_unavailable` whatever the ending; when no
-/// card could be raised at all, the remedy says what the caller can change.
+/// card could be raised at all, `detail.reason` names why, as the other
+/// flows' `consent_unavailable` replies do, and the remedy says what the
+/// caller can change.
 fn consent_unavailable(ending: &Ending) -> Value {
     let mut reply = refusal("consent_unavailable");
     if let Ending::NoCard(why) = ending {
+        if let Some(reason) = why.reason() {
+            reply["detail"] = json!({ "reason": reason });
+        }
         if let Some(remedy) = why.remedy() {
             reply["remedy"] = json!(remedy);
         }
@@ -1010,7 +1014,7 @@ impl Context<'_> {
             CardKind::UserBrowserSite,
             &body,
             CONSENT_DEADLINE,
-            crate::elicit::current_call_key().as_deref(),
+            crate::call_context::current_call_key().as_deref(),
             None,
             None,
         )
@@ -1046,7 +1050,7 @@ impl Context<'_> {
                 _ = drain.wait_for(|draining| *draining) => {}
             }
         };
-        let guard = crate::elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
+        let guard = crate::call_context::ROUTE_GUARD.try_with(Arc::clone).ok();
         let parked = guard.as_ref().map(|guard| guard.park_on_consent());
         // Held, never detached: the answer is wanted only by this call, and
         // any ending other than an answer withdraws the card and forgets it.

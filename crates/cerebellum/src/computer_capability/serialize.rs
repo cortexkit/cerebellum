@@ -1145,7 +1145,7 @@ mod tests {
         async fn allow(&mut self, question: &Frame) {
             assert!(self.planes.consent_test.as_ref().unwrap().answer(
                 question.header.corr,
-                crate::elicit::AskOutcome::Answered(
+                crate::cingulate_client::ScriptedAnswer::Answered(
                     serde_json::json!({"decision":"allow_conversation"})
                 )
             ));

@@ -269,7 +269,7 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
     // The local-service contrast proves the grant gate ran: public sites can
     // pass on the baseline, but an ungranted local service must ask.
     assert!(service.questions().is_empty());
-    service.queue(cerebellum::elicit::AskOutcome::Answered(
+    service.queue(cerebellum::cingulate_client::ScriptedAnswer::Answered(
         json!({"decision":"deny"}),
     ));
     let ungranted = frames_for(&planes, navigate(2, UNGRANTED_ORIGIN)).await;

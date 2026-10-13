@@ -64,6 +64,22 @@ pub enum Reply {
     Hang,
 }
 
+/// How a test ends a card it has a scripted Cingulate hold, in the terms a
+/// person or Cingulate would end it. Each test fixture turns this into the
+/// record or refusal Cingulate gives for that ending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptedAnswer {
+    /// The person chose an option. The body is `{"decision": <option id>}`,
+    /// and the option id becomes the record's `answered_choice_id`.
+    Answered(Value),
+    /// The card expired with nobody answering it.
+    NoAnswer,
+    /// Cingulate refused to put the card to anyone.
+    NotPutToAnyone,
+    /// The card or its answer could not be carried.
+    Undeliverable,
+}
+
 pub fn refusal(code: &str) -> CallError {
     CallError::Refused(Refusal {
         code: RefusalCode::parse(code),

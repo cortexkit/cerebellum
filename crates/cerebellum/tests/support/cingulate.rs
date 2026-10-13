@@ -4,7 +4,7 @@
 #[allow(unused_imports)]
 use super::*;
 use cerebellum::computer_grants::QuestionCarrier;
-use cerebellum::elicit::AskOutcome;
+use cerebellum::cingulate_client::ScriptedAnswer;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 const GRANTEE: &str = "pj-example";
@@ -39,7 +39,7 @@ impl Default for ScriptedCarrier {
 
 #[derive(Default)]
 struct ScriptState {
-    queued: std::collections::VecDeque<AskOutcome>,
+    queued: std::collections::VecDeque<ScriptedAnswer>,
     waiting: std::collections::VecDeque<(String, tokio::sync::oneshot::Sender<Value>)>,
     records: std::collections::BTreeMap<String, Value>,
     questions: Vec<Value>,
@@ -56,7 +56,7 @@ impl ScriptedCarrier {
     pub fn answering(decisions: &[&str]) -> Self {
         let carrier = Self::default();
         for decision in decisions {
-            carrier.queue(AskOutcome::Answered(json!({"decision": decision})));
+            carrier.queue(ScriptedAnswer::Answered(json!({"decision": decision})));
         }
         carrier
     }
@@ -90,12 +90,12 @@ impl ScriptedCarrier {
             Some(cerebellum::cingulate_client::double::refusal(code));
     }
 
-    pub fn queue(&self, outcome: AskOutcome) {
+    pub fn queue(&self, outcome: ScriptedAnswer) {
         self.state.lock().unwrap().queued.push_back(outcome);
     }
 
     /// Answer the oldest waiting question; return false if no question is waiting.
-    pub fn answer_next(&self, outcome: AskOutcome) -> bool {
+    pub fn answer_next(&self, outcome: ScriptedAnswer) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some((id, sender)) = state.waiting.pop_front() else {
             return false;
@@ -107,10 +107,10 @@ impl ScriptedCarrier {
     }
 
     pub fn answer_unraised(&self, id: &str, decision: &str) {
-        self.state.lock().unwrap().records.insert(id.into(), fixture_record(id, AskOutcome::Answered(json!({"decision":decision}))));
+        self.state.lock().unwrap().records.insert(id.into(), fixture_record(id, ScriptedAnswer::Answered(json!({"decision":decision}))));
     }
 
-    pub fn answer_id(&self, id: &str, outcome: AskOutcome) -> bool {
+    pub fn answer_id(&self, id: &str, outcome: ScriptedAnswer) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.records.contains_key(id) {
             return false;
@@ -295,14 +295,14 @@ impl cerebellum::cingulate_client::route::CingulateOpener for FixtureOpener {
     }
 }
 
-fn fixture_record(id: &str, outcome: AskOutcome) -> Value {
+fn fixture_record(id: &str, outcome: ScriptedAnswer) -> Value {
     match outcome {
-        AskOutcome::Answered(body) => {
+        ScriptedAnswer::Answered(body) => {
             json!({"elicitation_id":id,"state":"answered","answered_choice_id":body["decision"]})
         }
-        AskOutcome::NoAnswer => json!({"elicitation_id":id,"state":"expired"}),
-        AskOutcome::NotPutToAnyone => json!({"elicitation_id":id,"state":"not_put_to_anyone"}),
-        AskOutcome::Undeliverable => json!({"elicitation_id":id,"state":"delivery_failed"}),
+        ScriptedAnswer::NoAnswer => json!({"elicitation_id":id,"state":"expired"}),
+        ScriptedAnswer::NotPutToAnyone => json!({"elicitation_id":id,"state":"not_put_to_anyone"}),
+        ScriptedAnswer::Undeliverable => json!({"elicitation_id":id,"state":"delivery_failed"}),
     }
 }
 

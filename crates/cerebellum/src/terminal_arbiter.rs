@@ -9,8 +9,9 @@ use tokio::sync::mpsc;
 
 use crate::egress::{request_id, terminal_frame};
 use crate::{
-    budgets, control_flags, elicit, flat_tools, forward_recording_reply, send, settle_call_record,
-    wall_clock_ms, ModuleError, PendingSettlement, Planes, RequestCancellationGuard,
+    budgets, call_context, control_flags, flat_tools, forward_recording_reply, send,
+    settle_call_record, wall_clock_ms, ModuleError, PendingSettlement, Planes,
+    RequestCancellationGuard,
 };
 
 /// Tracks whether ordinary external mutations may start. Once a terminal
@@ -332,7 +333,7 @@ pub(crate) async fn run_arbitrated_route(
     let guarded = std::future::poll_fn(move |cx| {
         let guard = worker_execution.lock().unwrap().clone();
         match guard {
-            Some(guard) => elicit::ROUTE_GUARD.sync_scope(guard, || worker.as_mut().poll(cx)),
+            Some(guard) => call_context::ROUTE_GUARD.sync_scope(guard, || worker.as_mut().poll(cx)),
             None => worker.as_mut().poll(cx),
         }
     });
