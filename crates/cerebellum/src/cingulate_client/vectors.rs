@@ -1,6 +1,6 @@
 //! Cingulate's served test vectors for the requester contract, copied byte
 //! for byte from its `test-vectors/consent-requester-v2/` into
-//! `tests/vectors/consent-requester-v2/` (the README beside that directory
+//! `tests/vectors/consent-requester-v2/` (the README in that directory
 //! names the tag and commit): their integrity, and this client's requests and
 //! reply parsing checked byte for byte against them.
 
@@ -15,8 +15,10 @@ use super::route::CallError;
 use super::wire::{self, CardState, Record, Refusal, RefusalCode};
 
 /// The SHA-256 of the copied `SHA256SUMS`. The manifest covers every other
-/// file but cannot cover itself, so its own hash is pinned here.
-const MANIFEST_SHA256: &str = "23b231fbb08a9c51c661604e1781ce125f5c4c15c3695fb4c8ee54691caf754d";
+/// file but cannot cover itself, so its own hash is pinned here. The manifest
+/// also covers the local README's source-commit notes; it therefore differs
+/// from Cingulate's manifest even though the JSON vectors are unchanged.
+const MANIFEST_SHA256: &str = "d3498752af7de569b813c41121a8be9a40d298bc4098343116ee9c29804d3ad2";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -38,7 +40,7 @@ fn the_requester_vectors_are_the_ones_cingulate_published() {
     assert_eq!(
         sha256_hex(&manifest),
         MANIFEST_SHA256,
-        "SHA256SUMS is not the manifest Cingulate published"
+        "SHA256SUMS is not the pinned copied corpus manifest"
     );
     let mut listed = Vec::new();
     for line in String::from_utf8(manifest).unwrap().lines() {

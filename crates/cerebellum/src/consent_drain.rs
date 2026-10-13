@@ -163,19 +163,15 @@ impl ConsentDrain {
     }
 }
 
-/// Require the same prefrontal-core caller, attested agent project, and non-flow
-/// session as consent-raising calls. An operator's direct route cannot borrow
+/// Require the same admitted head or worker session as consent-raising calls.
+/// An operator's direct route cannot borrow
 /// the agent's permission to reach Cingulate merely by copying its scope stamp.
 pub fn live_call(
     frame: &Frame,
     facts: &AcceptedBindFacts,
     planes: &Planes,
 ) -> Result<LiveCall, NotLive> {
-    let stamp = (facts.admits_session_calls()
-        && facts.agent_project_id_attested
-        && facts.flow_id.is_none())
-    .then_some(facts.scope.as_ref())
-    .flatten();
+    let stamp = crate::permission_scope::card_stamp(facts);
     let guard = crate::call_context::ROUTE_GUARD
         .try_with(Arc::clone)
         .map_err(|_| NotLive::CallEnded)?;

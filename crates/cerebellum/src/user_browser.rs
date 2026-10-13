@@ -978,9 +978,10 @@ impl Context<'_> {
         once: Option<&InvocationGrant>,
     ) -> bool {
         once.is_some_and(|grant| grant.covers(origin, severity, hazards))
-            || self
-                .target()
-                .covers(self.agent(), origin, severity, hazards)
+            || (!crate::permission_scope::is_worker(self.facts)
+                && self
+                    .target()
+                    .covers(self.agent(), origin, severity, hazards))
     }
 
     async fn authorize(
@@ -998,9 +999,10 @@ impl Context<'_> {
         if severity.tier > 4 {
             return Err(refusal("severity_ungrantable"));
         }
-        if self
-            .target()
-            .covers(self.agent(), origin, severity, &grant.hazards)
+        if !crate::permission_scope::is_worker(self.facts)
+            && self
+                .target()
+                .covers(self.agent(), origin, severity, &grant.hazards)
         {
             return Ok(grant);
         }

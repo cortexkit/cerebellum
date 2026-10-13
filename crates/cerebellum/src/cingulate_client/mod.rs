@@ -40,3 +40,6 @@ pub use double::{vector, Reply, ScriptedAnswer, ScriptedCingulate};
 mod tests;
 #[cfg(test)]
 mod vectors;
+
+#[cfg(test)]
+pub(crate) mod worker_vectors;

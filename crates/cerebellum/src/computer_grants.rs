@@ -427,7 +427,8 @@ pub struct GrantCaller {
     pub conversation_key: String,
     pub agent_project_id: String,
     /// Whether the daemon attested both the agent project id and the session
-    /// kind. Only then may an "always" answer be offered, stored or honoured:
+    /// kind, and this is not a worker session. Only then may an "always"
+    /// answer be offered, stored or honoured:
     /// an unattested project id came from a caller-controlled fallback, and
     /// a durable grant keyed by it would be a permission anyone could claim.
     pub durable_identity_attested: bool,

@@ -57,6 +57,7 @@ mod management_bounds;
 pub mod manifest;
 pub mod network;
 mod open_app_history;
+mod permission_scope;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
@@ -1573,7 +1574,7 @@ impl computer_grants::RouteLiveness for BoundRoute {
     }
 }
 
-/// Cingulate routes require a live call from the attested agent session;
+/// Cingulate routes require a live call from an admitted head or worker session;
 /// permission to write replies to an inbound route grants no such authority.
 struct RouteCarrier {
     desk: Arc<cingulate_client::desk::ConsentDesk>,
@@ -1591,11 +1592,7 @@ impl computer_grants::QuestionCarrier for RouteCarrier {
         &self,
     ) -> Result<cingulate_client::live_call::LiveCall, cingulate_client::live_call::NotLive> {
         use cingulate_client::live_call::{LiveCall, NotLive};
-        let stamp = (self.facts.admits_session_calls()
-            && self.facts.agent_project_id_attested
-            && self.facts.flow_id.is_none())
-        .then_some(self.facts.scope.as_ref())
-        .flatten();
+        let stamp = permission_scope::card_stamp(&self.facts);
         if stamp.is_none() {
             return Err(NotLive::Unscoped);
         }
@@ -1681,7 +1678,8 @@ fn consent_context(
             agent_project_id: facts.identity.agent_project_id.clone(),
             durable_identity_attested: facts.agent_project_id_attested
                 && facts.session_kind_attested
-                && facts.acts_as_agent,
+                && facts.acts_as_agent
+                && !permission_scope::is_worker(facts),
         },
         carrier,
         Arc::new(BoundRoute {
@@ -7058,14 +7056,13 @@ async fn serve_browser_with_consent(
 }
 
 /// Standing browser rows may authorize this route only when its agent is
-/// daemon-attested and the route may act for that agent, never for an identity
-/// taken from the caller-controlled project-root fallback.
+/// daemon-attested and the route may act for that agent outside a worker session,
+/// never for an identity taken from the caller-controlled project-root fallback.
 fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingCaller> {
-    (facts.agent_project_id_attested && facts.acts_as_agent).then(|| {
-        authorization::StandingCaller {
+    (facts.agent_project_id_attested && facts.acts_as_agent && !permission_scope::is_worker(facts))
+        .then(|| authorization::StandingCaller {
             agent_id: facts.identity.agent_project_id.clone(),
-        }
-    })
+        })
 }
 
 /// The agent a site-access card on this route may offer standing answers for:
@@ -7073,6 +7070,7 @@ fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingC
 /// Worker and ephemeral sessions are offered this conversation only.
 fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
     (facts.flow_id.is_none()
+        && !permission_scope::is_worker(facts)
         && facts.agent_project_id_attested
         && facts.acts_as_agent
         && facts.session_kind_attested

@@ -646,6 +646,13 @@ impl Fixture {
                     let mut stamp = super::support::computer::cingulate::stamp(agent);
                     if session.kind == "subagent" {
                         stamp.kind = subc_protocol::scope::ScopeKind::Worker;
+                        stamp.scope_ref = format!("sc_worker_{}", session.conversation);
+                        stamp.attributes.agent_id = None;
+                        stamp.parent = Some(subc_protocol::scope::ScopeParent::new(
+                            stamp.owner.clone(),
+                            "sc_head_alf",
+                            7,
+                        ));
                     }
                     stamp
                 })
@@ -2407,3 +2414,5 @@ async fn codemode_missing_browser_grant_refuses_without_elicitation() {
     assert_eq!(refusal["detail"]["reason"], "agent_run");
     assert!(fixture.browser.effects().is_empty());
 }
+
+mod worker;

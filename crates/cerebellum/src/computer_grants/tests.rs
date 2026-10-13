@@ -1423,3 +1423,5 @@ pub(crate) fn scope_reply(question: &Frame) -> Option<Frame> {
     }
     Some(Frame::build_with_version(PROTOCOL_VERSION, FrameType::Response, Flags::new(false, Priority::Interactive, false), 0, 0, question.header.corr, serde_json::to_vec(&json!({"op":"scope.describe","status":"live","scope_epoch":1,"daemon_incarnation":"card-tests","owner_synced":true,"owner_configured":true})).unwrap()).unwrap())
 }
+
+mod worker;

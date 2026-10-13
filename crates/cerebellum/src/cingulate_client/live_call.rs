@@ -1,8 +1,9 @@
-//! Proof that cerebellum holds a live inbound call from an agent's session.
+//! Proof that cerebellum holds a live inbound call from a head or worker session.
 //!
-//! Core lists cerebellum as a carrier of the agent's session scope so that it
-//! can raise cards for a call that agent made, and for nothing else. The route
-//! to Cingulate is therefore opened only while such a call is held: a
+//! Core lists cerebellum as a carrier of head and worker session scopes so that it
+//! can raise cards for their calls, and for nothing else. Cingulate resolves a
+//! worker's stamped parent to the head agent; the request body names neither.
+//! The route to Cingulate is opened only while such a call is held: a
 //! [`LiveCall`] is made from the call's own in-flight guard and the route it
 //! arrived on, and `ConsentDesk::session` re-checks it immediately before
 //! every open. Once the call has returned (its guard dropped) or its route has
@@ -11,7 +12,7 @@
 use std::sync::{Arc, Weak};
 
 use cerebellum_core::dispatch::InFlightGuard;
-use subc_protocol::scope::{ScopeSelector, ScopeStamp};
+use subc_protocol::scope::{ScopeKind, ScopeSelector, ScopeStamp};
 
 use crate::computer_grants::RouteLiveness;
 
@@ -53,11 +54,11 @@ pub struct SessionKey {
     pub scope_epoch: u64,
 }
 
-/// A held inbound call under an agent's session scope.
+/// A held inbound call under a head or worker session scope.
 pub struct LiveCall {
     scope: ScopeSelector,
     session: SessionKey,
-    agent_id: String,
+    agent_id: Option<String>,
     hold: Arc<dyn CallHold>,
 }
 
@@ -77,8 +78,8 @@ pub enum NotLive {
     /// The call arrived on a route with no session scope: no agent session
     /// lists cerebellum as its carrier.
     Unscoped,
-    /// The scope names no agent, or names a flow. Cingulate requires a
-    /// carried agent, and a flow has no person to ask.
+    /// The scope names no agent and is not a worker with a parent, or names a flow.
+    /// Cingulate needs a head agent to ask, directly or through a worker's parent.
     NoAgent,
     /// The call is not held any more: its reply was sent or its route unbound.
     CallEnded,
@@ -111,8 +112,12 @@ impl LiveCall {
             .attributes
             .agent_id
             .clone()
-            .filter(|agent| !agent.trim().is_empty() && stamp.attributes.flow_id.is_none())
-            .ok_or(NotLive::NoAgent)?;
+            .filter(|agent| !agent.trim().is_empty());
+        if stamp.attributes.flow_id.is_some()
+            || (agent_id.is_none() && (stamp.kind != ScopeKind::Worker || stamp.parent.is_none()))
+        {
+            return Err(NotLive::NoAgent);
+        }
         if !hold.held() {
             return Err(NotLive::CallEnded);
         }

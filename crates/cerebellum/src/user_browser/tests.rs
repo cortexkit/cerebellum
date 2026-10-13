@@ -1944,3 +1944,5 @@ async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
     assert!(store.load().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+mod worker;

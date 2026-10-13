@@ -12,6 +12,14 @@ use the daemon-attested Callosum phone surface. Outcomes use core's route.
   including get, await, answers and outcomes carrying it unchanged, and phone
   get/list omitting it.
 - `cerebellum-non-consent-*`: a valid flow decision refused for Cerebellum.
+- `worker-*`: generic consent raised under a worker scope, whose live parent
+  supplies the subject agent while the worker remains the asker, plus missing
+  parent, ended head and unknown head liveness refusals.
+
+The `worker-*` JSON files were copied byte-for-byte from Cingulate main
+`6bb5f4d`. This README differs from Cingulate's to record that provenance,
+so SHA256SUMS was regenerated locally to cover it. The JSON files are unchanged
+replies and requests produced by Cingulate's handler.
 
 Regenerate the corpus and its SHA256SUMS using the existing generator:
 
