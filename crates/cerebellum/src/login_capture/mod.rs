@@ -1163,25 +1163,26 @@ impl CaptureModule {
             return record.ended("cancelled", None);
         }
         let question = consent_question(request);
-        // The question can wait minutes for a person, so a cancel is watched
-        // for alongside it rather than only after it ends. Stopping the wait
-        // leaves the card itself open.
+        // The consent wait owns detaching or withdrawing the card. A polling
+        // cancellation must signal that wait and keep it alive until cleanup
+        // finishes, even when Cingulate's detach reply is not ready yet.
         let answer = {
-            let asked = call
-                .grants
-                .require_login(call.consent, move || question.clone());
+            let mut consent = call.consent;
+            let cancel = consent
+                .cancel
+                .get_or_insert_with(crate::CancelHandle::pending)
+                .clone();
+            let asked = call.grants.require_login(consent, move || question.clone());
             tokio::pin!(asked);
             let check = self.env.poll_interval.min(CANCEL_CHECK_INTERVAL);
             loop {
-                // The consent wait is polled first: it watches the same
-                // cancel itself and lets go of its card (detaching or
-                // withdrawing it) as it ends, so when both are ready at
-                // once its ending is taken rather than dropped half-done.
                 tokio::select! {
                     biased;
                     answer = &mut asked => break Some(answer),
                     () = tokio::time::sleep(check) => {
                         if (call.cancelled)() {
+                            cancel.cancel();
+                            let _ = (&mut asked).await;
                             break None;
                         }
                     }
