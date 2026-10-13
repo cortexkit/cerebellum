@@ -1759,7 +1759,7 @@ async fn a_cancel_during_the_handoff_writes_nothing_and_deletes_the_profile() {
 }
 
 /// A cancel that arrives while the card is still open ends the capture
-/// without waiting for the person, and nothing is placed or launched.
+/// without waiting for the person, detaches the card, and launches nothing.
 #[tokio::test]
 async fn a_cancel_while_the_question_is_open_ends_the_capture() {
     let fixture = fixture();
@@ -1769,7 +1769,13 @@ async fn a_cancel_while_the_question_is_open_ends_the_capture() {
             wire::CONSENT_REQUEST,
             Reply::Result(json!({"elicitation_id": ELICITATION_ID})),
         )
-        .then(wire::CONSENT_AWAIT, Reply::Hang);
+        .then(wire::CONSENT_AWAIT, Reply::Hang)
+        .then(
+            wire::CONSENT_DETACH,
+            Reply::Result(
+                json!({"elicitation_id": ELICITATION_ID, "state": "pending", "detached": true}),
+            ),
+        );
     let waiting = Arc::clone(&script);
     let (outcome, _) = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1783,8 +1789,96 @@ async fn a_cancel_while_the_question_is_open_ends_the_capture() {
     .await
     .expect("the cancel ended the wait on the person");
     assert_eq!(outcome.reply["outcome"], "cancelled");
+    assert_eq!(
+        script.methods(),
+        [
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_DETACH
+        ]
+    );
     assert!(fixture.fs.contents().is_empty());
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+/// A detach can wait for Cingulate after cancellation. Expiring the capture's
+/// polling timer must not drop the consent future that owns that cleanup.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_keeps_a_slow_detach_alive_past_the_polling_timer() {
+    let fixture = fixture();
+    let request = ollama();
+    let script = ScriptedCingulate::new();
+    let (detach_called, mut detach_started) = tokio::sync::oneshot::channel();
+    let (detach_reply, detach_response) = tokio::sync::oneshot::channel();
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id": ELICITATION_ID})),
+        )
+        .then(wire::CONSENT_AWAIT, Reply::Hang)
+        .then(
+            wire::CONSENT_DETACH,
+            Reply::Controlled {
+                called: detach_called,
+                reply: detach_response,
+            },
+        );
+    let cancel = crate::CancelHandle::pending();
+    let mut consent = consent(&script, &request, true);
+    consent.cancel = Some(cancel.clone());
+    let grants = Arc::new(ComputerGrants::in_memory());
+    let facts = accepted();
+    let capture = fixture.module.run(
+        &request,
+        CaptureCall {
+            accepted: &facts,
+            grants: &grants,
+            consent,
+            cancelled: || cancel.is_cancelled(),
+        },
+    );
+    tokio::pin!(capture);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(capture.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        script.methods(),
+        [wire::CONSENT_REQUEST, wire::CONSENT_AWAIT]
+    );
+
+    cancel.cancel();
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(capture.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(detach_started.try_recv(), Ok(()));
+    tokio::time::advance(Duration::from_millis(10)).await;
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(capture.as_mut(), cx).is_pending(),
+            "cancellation must keep polling the unfinished detach"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(!detach_reply.is_closed(), "the detach was abandoned");
+    detach_reply
+        .send(json!({"elicitation_id": ELICITATION_ID, "state": "pending", "detached": true}))
+        .unwrap();
+    let outcome = capture.await;
+    assert_eq!(outcome.reply["outcome"], "cancelled");
+    assert_eq!(
+        script.methods(),
+        [
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_DETACH
+        ]
+    );
+    nothing_captured(&fixture);
 }
 
 #[tokio::test]

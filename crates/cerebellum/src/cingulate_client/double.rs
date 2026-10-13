@@ -62,6 +62,11 @@ pub enum Reply {
     Transport,
     /// Never answers: the call waits until the caller stops waiting.
     Hang,
+    /// Signal that the call started, then wait for the test to supply its reply.
+    Controlled {
+        called: tokio::sync::oneshot::Sender<()>,
+        reply: tokio::sync::oneshot::Receiver<Value>,
+    },
 }
 
 /// How a test ends a card it has a scripted Cingulate hold, in the terms a
@@ -171,6 +176,10 @@ impl CingulateRoute for ScriptedRoute {
                     .map_or(CallError::Transport { code: None }, CallError::Refused)),
                 Reply::Transport => Err(CallError::Transport { code: None }),
                 Reply::Hang => std::future::pending().await,
+                Reply::Controlled { called, reply } => {
+                    called.send(()).expect("the test is waiting for the call");
+                    Ok(reply.await.expect("the test supplies the reply"))
+                }
             }
         })
     }
