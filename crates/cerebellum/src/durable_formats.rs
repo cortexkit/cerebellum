@@ -25,6 +25,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         cerebellum_core::journal::AUDIT_JOURNAL_FORMAT,
         cerebellum_core::journal::REFUSAL_RING_FORMAT,
         crate::computer_grants::GRANT_STORE_FORMAT,
+        crate::agent_grants::AGENT_GRANT_STORE_FORMAT,
         crate::open_app_history::LAUNCH_HISTORY_FORMAT,
         crate::browser_standing_grants::STANDING_GRANT_STORE_FORMAT,
         crate::browser_launch::LAUNCH_ENTRY_FORMAT,

@@ -191,7 +191,7 @@ impl StandingBrowserGrant {
 
     /// The rules every row must satisfy. A file holding a row that breaks one
     /// is treated as corrupt rather than partly honoured.
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         if self.agent_id.is_empty() || self.consent_ref.is_empty() || self.machine_uuid.is_empty() {
             return Err("a row needs an agent_id, a consent_ref and a machine_uuid".into());
         }
@@ -239,6 +239,31 @@ impl StandingBrowserGrant {
 pub struct StandingGrantStoreState {
     pub version: u64,
     pub grants: Vec<StandingBrowserGrant>,
+}
+
+impl StandingGrantStoreState {
+    pub(crate) fn check(&self) -> Result<(), StandingGrantStoreError> {
+        if !(1..=STANDING_GRANT_STORE_VERSION).contains(&self.version) {
+            return Err(StandingGrantStoreError::UnknownVersion {
+                found: self.version,
+            });
+        }
+        if self.version == 1
+            && self
+                .grants
+                .iter()
+                .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
+        {
+            return Err(StandingGrantStoreError::Corrupt {
+                detail: "domain rows require version 2".into(),
+            });
+        }
+        for row in &self.grants {
+            row.check()
+                .map_err(|detail| StandingGrantStoreError::Corrupt { detail })?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for StandingGrantStoreState {
@@ -575,25 +600,7 @@ impl StandingBrowserGrants {
         let mut version = 1;
         let rows = storage.load().and_then(|state| {
             version = state.version;
-            if !(1..=STANDING_GRANT_STORE_VERSION).contains(&state.version) {
-                return Err(StandingGrantStoreError::UnknownVersion {
-                    found: state.version,
-                });
-            }
-            if state.version == 1
-                && state
-                    .grants
-                    .iter()
-                    .any(|row| matches!(row.subject, StandingSubject::Domain(_)))
-            {
-                return Err(StandingGrantStoreError::Corrupt {
-                    detail: "domain rows require version 2".into(),
-                });
-            }
-            for row in &state.grants {
-                row.check()
-                    .map_err(|detail| StandingGrantStoreError::Corrupt { detail })?;
-            }
+            state.check()?;
             Ok(state.grants)
         });
         Self {

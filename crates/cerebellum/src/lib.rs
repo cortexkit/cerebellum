@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_grants;
 pub mod authorization;
 mod blocking_permits;
 pub mod browser;
