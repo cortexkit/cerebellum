@@ -11,6 +11,7 @@ pub mod authorization;
 mod blocking_permits;
 pub mod browser;
 pub mod browser_config;
+mod browser_consent;
 pub mod browser_crash_reports;
 pub mod browser_executable_identity;
 pub mod browser_launch;
@@ -2819,6 +2820,7 @@ impl Planes {
         self.management
             .computer_grants()
             .register_drain(&self.consent_drain);
+        browser_consent::register(&self);
         self
     }
 
@@ -3442,6 +3444,9 @@ async fn handle_frame(
             *cancellation.handle.0.terminal.lock().unwrap() = Some(Arc::downgrade(&terminal));
             let (proxy, outgoing) = mpsc::channel(16);
             let worker_planes = planes.clone();
+            let browser_park_limit = BROWSER_CONSENT_PARK_LIMIT
+                .try_with(|limit| *limit)
+                .unwrap_or(Duration::from_secs(120));
             let worker = async move {
                 let planes = worker_planes;
                 #[cfg(test)]
@@ -3482,6 +3487,7 @@ async fn handle_frame(
                     browser_arrival,
                     Box::pin(handle_route_request(frame, &proxy, &planes)),
                 ));
+                let dispatch = BROWSER_CONSENT_PARK_LIMIT.scope(browser_park_limit, dispatch);
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -4269,13 +4275,9 @@ async fn handle_management_request_observed(
         return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
     }
 
-    enum Settlement {
-        BrowserGrant,
-        ProfileRootRebind,
-        LaunchRecoveryClear,
-    }
+    use cingulate_client::card::CardKind;
 
-    let (reply, question, settlement) = if method == management::OPEN_GRANT {
+    let (mut reply, question, settlement) = if method == management::OPEN_GRANT {
         if let Some(field) = params_object
             .keys()
             .filter(|field| !matches!(field.as_str(), "origins" | "hazards" | "severity_tier"))
@@ -4383,7 +4385,7 @@ async fn handle_management_request_observed(
                 origins,
                 hazards,
                 severity_tier,
-                facts.declares_elicitation(),
+                true,
                 standing_offer_agent(facts),
             )
             .await;
@@ -4448,7 +4450,7 @@ async fn handle_management_request_observed(
                 .await
             }
         };
-        (reply, question, Settlement::BrowserGrant)
+        (reply, question, CardKind::WebsiteAccessInAdvance)
     } else if method == management::CLEAR_LAUNCH_RECOVERY {
         if let Some(field) = params_object
             .keys()
@@ -4504,9 +4506,9 @@ async fn handle_management_request_observed(
         };
         let (reply, question) = planes
             .management
-            .open_launch_recovery_clear(agent_project_id, sequence, facts.declares_elicitation())
+            .open_launch_recovery_clear(agent_project_id, sequence, true)
             .await;
-        (reply, question, Settlement::LaunchRecoveryClear)
+        (reply, question, CardKind::StuckProfileClearance)
     } else {
         if let Some(field) = params_object.keys().min() {
             return send_invalid_request_response(
@@ -4522,57 +4524,46 @@ async fn handle_management_request_observed(
         }
         let (reply, question) = planes
             .management
-            .open_profile_root_rebind(
-                &facts.identity.conversation_key,
-                facts.declares_elicitation(),
-            )
+            .open_profile_root_rebind(&facts.identity.conversation_key, true)
             .await;
-        (reply, question, Settlement::ProfileRootRebind)
+        (reply, question, CardKind::ProfileReidentification)
     };
 
     if let Some(question) = question {
-        // Asked on its own task: the answer may be minutes away while this
-        // caller is owed a reply now. The reply already says the request is
-        // pending, so nothing is waiting on the question here.
-        let elicitor = Arc::clone(&planes.elicitor);
-        let management_plane = Arc::clone(&planes.management);
-        let writer = writer.clone();
-        let call_key = elicit::current_call_key();
-        tokio::spawn(async move {
-            let outcome = elicitor
-                .ask_for_call(
-                    &writer,
-                    channel,
-                    epoch,
-                    question.body,
-                    question.deadline,
-                    call_key,
-                )
-                .await;
-            // The whole ending is handed on, not just an answer or its absence:
-            // the next request reports a question nobody was shown differently
-            // from one a person left unanswered, and only the ending says which.
-            match settlement {
-                Settlement::BrowserGrant => {
-                    management_plane
-                        .settle_browser_grant_ending(&question.ask_id, Some(&outcome))
-                        .await;
-                }
-                Settlement::ProfileRootRebind => {
-                    management_plane
-                        .settle_profile_root_rebind_ending(&question.ask_id, Some(&outcome))
-                        .await;
-                }
-                Settlement::LaunchRecoveryClear => {
-                    // Settled on this task because the clear re-reads the
-                    // process table and writes the journal; the outcome is
-                    // kept by the plane and reported on the next request.
-                    management_plane
-                        .settle_launch_recovery_clear_ending(&question.ask_id, &outcome)
-                        .await;
-                }
+        let raised = async {
+            let live = browser_consent::live(facts, planes, channel, epoch)?;
+            let mut session = planes
+                .consent
+                .session(&live)
+                .await
+                .map_err(|error| cingulate_client::desk::Ending::of_refusal(&error))?;
+            browser_consent::raise(
+                &planes.management,
+                &planes.consent,
+                &live,
+                &mut session,
+                settlement,
+                &question,
+                true,
+            )
+            .await
+        }
+        .await;
+        match raised {
+            Ok((ask_id, _)) => reply["ask_id"] = json!(ask_id),
+            Err(ending) => {
+                browser_consent::settle_failed(&planes.management, settlement, &question, &ending);
+                browser_consent::unavailable(
+                    &mut reply,
+                    &ending,
+                    if settlement == CardKind::StuckProfileClearance {
+                        "keep"
+                    } else {
+                        management::BROWSER_GRANT_DECLINE
+                    },
+                );
             }
-        });
+        }
     }
 
     send_tool_response(writer, ver, channel, epoch, corr, reply).await
@@ -6957,10 +6948,9 @@ pub async fn handle_browser_consent_deadline_for_test(
     deadline: Duration,
 ) -> Result<(), ModuleError> {
     BROWSER_CONSENT_PARK_LIMIT
-        .scope(
-            deadline,
-            handle_tool_request_for_test_with_existing_planes(frame, writer, planes),
-        )
+        .scope(deadline, async {
+            handle_frame(frame, writer, planes).await.map(|_| ())
+        })
         .await
 }
 
@@ -6970,7 +6960,7 @@ pub async fn handle_browser_consent_deadline_for_test(
 async fn serve_browser_with_consent(
     planes: &Planes,
     facts: &AcceptedBindFacts,
-    writer: &mpsc::Sender<Frame>,
+    _writer: &mpsc::Sender<Frame>,
     request: (u16, u32, u64),
     capability: browser::BrowserCapability,
     arguments: &Value,
@@ -7003,9 +6993,6 @@ async fn serve_browser_with_consent(
         reply["remedy"] =
             json!("an unattended flow cannot ask a person; configure its owner's standing grant");
         return planes.browser.finish_reply(capability.name(), reply);
-    }
-    if !facts.declares_elicitation() {
-        return Ok(reply);
     }
     let Some(cancel) = planes.cancellations.get(request) else {
         return Ok(reply);
@@ -7045,70 +7032,107 @@ async fn serve_browser_with_consent(
     else {
         return Ok(reply);
     };
-    let elicitor = Arc::clone(&planes.elicitor);
-    let management = Arc::clone(&planes.management);
-    let writer = writer.clone();
-    let mut drain = planes.drain_signal.subscribe();
-    let routes = Arc::clone(&planes.routes);
-    let (channel, epoch, _) = request;
-    let call_key = elicit::current_call_key();
-    // Keep the question alive after the call's wait expires so a late approval
-    // still creates the browser grant. Cancellation, route closure and shutdown
-    // instead remove the pending question from the answer registry.
-    let mut settlement = tokio::spawn(async move {
-        // `Err` names how the question was withdrawn before it ended.
-        let ending = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err("cancelled"),
-            _ = routes.closed(channel, epoch) => Err("route_closed"),
-            _ = drain.wait_for(|draining| *draining) => Err("draining"),
-            outcome = elicitor.ask_for_call(&writer, channel, epoch, question.body, question.deadline, call_key) => Ok(outcome),
-        };
-        let settled = management
-            .settle_browser_grant_outcome(&question.ask_id, ending.as_ref().ok())
-            .await;
-        match (&ending, settled) {
-            (_, management::BrowserGrantSettlement::Granted(_)) => "allow",
-            // A granting answer whose grant was not recorded, or that came to
-            // a question no longer held (withdrawn with its conversation
-            // meanwhile), grants nothing.
-            (
-                _,
-                management::BrowserGrantSettlement::NotRecorded { .. }
-                | management::BrowserGrantSettlement::UnknownAsk,
-            ) => "unavailable",
-            (_, management::BrowserGrantSettlement::UnrecognizedAnswer) => "unrecognized_answer",
-            (Ok(outcome), management::BrowserGrantSettlement::NotGranted) => {
-                in_call_grant_decision(outcome)
-            }
-            (Err(withdrawn), management::BrowserGrantSettlement::NotGranted) => *withdrawn,
+    use cingulate_client::desk::{Ending, InCall, LetGo};
+    let live = match browser_consent::live(facts, planes, request.0, request.1) {
+        Ok(live) => live,
+        Err(ending) => {
+            browser_consent::settle_failed(
+                &planes.management,
+                cingulate_client::card::CardKind::WebsiteAccessInCall,
+                &question,
+                &ending,
+            );
+            browser_consent::in_call_refusal(&mut reply, &ending);
+            return planes.browser.finish_reply(capability.name(), reply);
         }
-    });
+    };
+    let mut session = match planes.consent.session(&live).await {
+        Ok(session) => session,
+        Err(error) => {
+            let ending = Ending::of_refusal(&error);
+            browser_consent::settle_failed(
+                &planes.management,
+                cingulate_client::card::CardKind::WebsiteAccessInCall,
+                &question,
+                &ending,
+            );
+            browser_consent::in_call_refusal(&mut reply, &ending);
+            return planes.browser.finish_reply(capability.name(), reply);
+        }
+    };
+    let (id, completion) = match browser_consent::raise(
+        &planes.management,
+        &planes.consent,
+        &live,
+        &mut session,
+        cingulate_client::card::CardKind::WebsiteAccessInCall,
+        &question,
+        false,
+    )
+    .await
+    {
+        Ok(raised) => raised,
+        Err(ending) => {
+            browser_consent::settle_failed(
+                &planes.management,
+                cingulate_client::card::CardKind::WebsiteAccessInCall,
+                &question,
+                &ending,
+            );
+            browser_consent::in_call_refusal(&mut reply, &ending);
+            return planes.browser.finish_reply(capability.name(), reply);
+        }
+    };
+    pending["ask_id"] = json!(id);
+    let mut drain = planes.drain_signal.subscribe();
+    let mut draining = false;
+    let cancelled = async {
+        tokio::select! {
+            biased;
+            _ = drain.wait_for(|value| *value) => { draining = true; LetGo::Withdraw },
+            _ = cancel.cancelled() => if planes.routes.get(request.0, request.1).is_some() && planes.routes.carries_conversation(&facts.identity.conversation_key) { LetGo::Detach } else { LetGo::Withdraw },
+        }
+    };
     let guard = elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
     let parked = guard.as_ref().map(|guard| guard.park_on_consent());
-    let answer = tokio::time::timeout(park_limit, &mut settlement).await;
+    let (ending, settled) =
+        browser_consent::park(planes, &mut session, &id, completion, park_limit, cancelled).await;
     drop(parked);
-    match answer {
-        Ok(Ok("allow")) => {
-            // Re-enter normal authorization, rather than treating the answer as
-            // authority: the session or its origin may have changed meanwhile.
+    match ending {
+        InCall::Settled(_) if matches!(settled, management::BrowserGrantSettlement::Granted(_)) => {
             authorization::with_standing_caller(
                 standing_caller(facts),
                 planes.browser.serve(&facts.identity, capability, arguments),
             )
             .await
         }
-        Ok(decision) => {
-            let decision = decision.unwrap_or("unavailable");
+        InCall::Pending { .. } => {
+            pending["context"] = reply["context"].clone();
+            planes.browser.finish_reply(capability.name(), pending)
+        }
+        ending => {
+            let decision = match &ending {
+                InCall::Settled(ending) => {
+                    if matches!(
+                        settled,
+                        management::BrowserGrantSettlement::NotRecorded { .. }
+                            | management::BrowserGrantSettlement::UnknownAsk
+                    ) {
+                        "unavailable"
+                    } else {
+                        in_call_grant_decision(ending)
+                    }
+                }
+                InCall::Cancelled if draining => "module_draining",
+                InCall::Cancelled => "cancelled",
+                InCall::RouteClosed => "route_closed",
+                InCall::Pending { .. } => unreachable!(),
+            };
             reply["detail"]["decision"] = json!(decision);
             if let Some(remedy) = in_call_grant_remedy(decision) {
                 reply["remedy"] = json!(remedy);
             }
             planes.browser.finish_reply(capability.name(), reply)
-        }
-        Err(_) => {
-            pending["context"] = reply["context"].clone();
-            planes.browser.finish_reply(capability.name(), pending)
         }
     }
 }
@@ -7142,16 +7166,8 @@ fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
 /// Each ending keeps its own word because each calls for a different next
 /// step; reporting a question nobody was shown the same way as one a person
 /// ignored would send the caller to wait for an answer that cannot come.
-fn in_call_grant_decision(ending: &elicit::AskOutcome) -> &'static str {
-    match ending {
-        elicit::AskOutcome::Answered(answer) => match answer["decision"].as_str() {
-            Some("deny") => "declined",
-            _ => "unrecognized_answer",
-        },
-        elicit::AskOutcome::NoAnswer => "no_answer",
-        elicit::AskOutcome::NotPutToAnyone => "not_put_to_anyone",
-        elicit::AskOutcome::Undeliverable => "undeliverable",
-    }
+fn in_call_grant_decision(ending: &cingulate_client::desk::Ending) -> &'static str {
+    browser_consent::word(ending, management::BROWSER_GRANT_DECLINE)
 }
 
 /// What the caller should do after each [`in_call_grant_decision`]. It replaces
@@ -7869,7 +7885,16 @@ pub async fn handle_tool_request_for_test_with_existing_planes(
         frame.header.epoch,
         frame.header.corr,
     ));
-    handle_keyed_tool_request(frame, writer, planes).await
+    if elicit::ROUTE_GUARD.try_with(|_| ()).is_ok() {
+        handle_keyed_tool_request(frame, writer, planes).await
+    } else {
+        elicit::ROUTE_GUARD
+            .scope(
+                Arc::new(planes.health.enter_request()),
+                handle_keyed_tool_request(frame, writer, planes),
+            )
+            .await
+    }
 }
 
 /// The planes the tool-request test helpers drive: `Planes::new`'s short test
@@ -8496,6 +8521,13 @@ mod tests {
             ),
         );
 
+        let planes = computer_grants::tests::CardService::install(planes, 4, 1);
+        let tool_facts = planes.routes.get(9, 3).unwrap();
+        planes.routes.insert(
+            9,
+            3,
+            tool_facts.with_scope(planes.routes.get(4, 1).unwrap().scope),
+        );
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let opening = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
@@ -8521,23 +8553,12 @@ mod tests {
             .await
             .expect("the grant request enters the production frame dispatcher");
 
-        let mut pending = None;
-        let mut question = None;
-        for _ in 0..2 {
-            let frame = tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
-                .await
-                .expect("the management reply and question are prompt")
-                .expect("the writer remains open");
-            let body: Value = serde_json::from_slice(&frame.body).unwrap();
-            if frame.header.ty == FrameType::Request {
-                question = Some((frame, body));
-            } else {
-                pending = Some(body);
-            }
-        }
-        let pending = pending.expect("the caller receives a pending reply");
+        let frame = next_frame(&mut writer_rx).await;
+        assert_ne!(frame.header.ty, FrameType::Request);
+        let pending: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(pending["outcome"], "consent_pending", "{pending}");
-        let (question_frame, question) = question.expect("the consumer receives a question");
+        let question_frame = planes.consent_test.as_ref().unwrap().card(4, 1).await;
+        let question: Value = serde_json::from_slice(&question_frame.body).unwrap();
         assert_eq!(
             question["params"]["scope"]["origins"],
             json!(["https://requested.example"])
@@ -8572,26 +8593,13 @@ mod tests {
         // question carries on the wire is the 30-minute one.
         assert_eq!(question["params"]["expires_in_ms"], json!(1_800_000));
 
-        let answer = Frame::build_with_version(
-            subc_protocol::PROTOCOL_VERSION,
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            question_frame.header.channel,
-            question_frame.header.epoch,
+        assert!(planes.consent_test.as_ref().unwrap().answer(
             question_frame.header.corr,
-            serde_json::to_vec(&json!({"decision": "allow_conversation"})).unwrap(),
-        )
-        .unwrap();
-        handle_frame(answer, &writer_tx, &planes)
-            .await
-            .expect("the affirmative answer reaches the elicitor");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while planes.browser.grant_count_for_test().await == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the answer mints a grant without blocking the original request");
+            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ));
+        assert_eq!(planes.browser.grant_count_for_test().await, 0);
+        computer_grants::tests::drain_call(&planes, 4, 1).await;
+        assert_eq!(planes.browser.grant_count_for_test().await, 1);
 
         let navigation = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
@@ -8906,8 +8914,8 @@ mod tests {
         }
     }
 
-    /// Planes with one management route (channel 4, epoch 1) whose consumer
-    /// declares it can relay a question to a person.
+    /// Planes with an admitted agent-session management route and an answerable
+    /// consent-service fixture (channel 4, epoch 1).
     fn open_grant_planes() -> Planes {
         let planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
@@ -8931,7 +8939,7 @@ mod tests {
                 },
             ),
         );
-        planes
+        computer_grants::tests::CardService::install(planes, 4, 1)
     }
 
     fn open_grant_frame(corr: u64) -> Frame {
@@ -8952,7 +8960,8 @@ mod tests {
     }
 
     /// One `browser.open_grant` through the production frame dispatcher: the
-    /// caller's immediate reply, and the question frame sent to the consumer.
+    /// caller's immediate reply, and a synthetic inspection of the question
+    /// received by the consent service.
     async fn open_grant_over_wire(
         planes: &Planes,
         writer: &mpsc::Sender<Frame>,
@@ -8962,62 +8971,62 @@ mod tests {
         handle_frame(open_grant_frame(corr), writer, planes)
             .await
             .unwrap();
-        let mut reply = None;
-        let mut question = None;
-        for _ in 0..2 {
-            let frame = next_frame(rx).await;
-            if frame.header.ty == FrameType::Request {
-                question = Some(frame);
-            } else {
-                reply = Some(serde_json::from_slice(&frame.body).unwrap());
-            }
-        }
-        (
-            reply.expect("a pending reply"),
-            question.expect("a question"),
-        )
+        let frame = next_frame(rx).await;
+        assert_ne!(frame.header.ty, FrameType::Request);
+        let reply = serde_json::from_slice(&frame.body).unwrap();
+        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
+        assert!(rx.try_recv().is_err(), "no reverse-lane question");
+        (reply, question)
     }
 
-    /// End `question` as described by `ending`: an answer carrying that
-    /// decision word, or for `refused` an error frame in place of an answer,
-    /// which is how a consumer with no handler for questions refuses one.
+    /// Script answers or expiry at the service, then apply them on a later call.
+    /// Refusals (`not_put_to_anyone`, `refused`, `undeliverable`) are not settled
+    /// feed records, so this helper updates their next-request notes directly.
+    /// The browser_consent tests send those refusals as RPC errors instead.
     async fn end_question(
         planes: &Planes,
         writer: &mpsc::Sender<Frame>,
         question: &Frame,
         ending: &str,
     ) {
-        let (ty, body) = if ending == "refused" {
-            (
-                FrameType::Error,
-                serde_json::to_vec(&ErrorBody {
-                    code: "REVERSE_REQUEST_UNHANDLED".to_string(),
-                    message: "no reverse-request handler is registered".to_string(),
-                    detail: None,
-                })
-                .unwrap(),
-            )
-        } else {
-            (
-                FrameType::Response,
-                serde_json::to_vec(&json!({"decision": ending})).unwrap(),
-            )
+        let outcome = match ending {
+            "no_answer" => elicit::AskOutcome::NoAnswer,
+            "not_put_to_anyone" | "refused" => elicit::AskOutcome::NotPutToAnyone,
+            "undeliverable" => elicit::AskOutcome::Undeliverable,
+            _ => elicit::AskOutcome::Answered(json!({"decision":ending})),
         };
-        let answer = Frame::build_with_version(
-            subc_protocol::PROTOCOL_VERSION,
-            ty,
-            Flags::new(false, Priority::Interactive, false),
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr,
-            body,
-        )
-        .unwrap();
-        handle_frame(answer, writer, planes).await.unwrap();
+        assert!(planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .answer(question.header.corr, outcome));
+        if matches!(ending, "not_put_to_anyone" | "refused" | "undeliverable") {
+            let ending = if ending == "undeliverable" {
+                cingulate_client::desk::Ending::DeliveryFailed
+            } else {
+                cingulate_client::desk::Ending::NotPutToAnyone
+            };
+            planes
+                .management
+                .settle_browser_grant_ending(
+                    &format!("el_test_{}", question.header.corr),
+                    Some(&ending),
+                )
+                .await;
+            planes
+                .consent
+                .mark_applied(&format!("el_test_{}", question.header.corr))
+                .unwrap();
+        } else if planes.routes.get(4, 1).is_some()
+            && !planes.draining.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            computer_grants::tests::drain_call(planes, 4, 1).await;
+        }
+        let _ = writer;
     }
 
     #[tokio::test]
-    async fn drain_ends_open_browser_card_with_correlated_cancel() {
+    async fn drain_leaves_an_already_detached_browser_card_answerable() {
         let planes = open_grant_planes();
         let (tx, mut rx) = mpsc::channel(8);
         let (_, question) = open_grant_over_wire(&planes, &tx, &mut rx, 900).await;
@@ -9028,53 +9037,41 @@ mod tests {
             0,
             0,
             serde_json::to_vec(
-                &json!({"op":"module.draining", "reason":"restart", "deadline_ms":123}),
+                &json!({"op":"module.draining","reason":"restart","deadline_ms":123}),
             )
             .unwrap(),
         )
         .unwrap();
         handle_frame(draining, &tx, &planes).await.unwrap();
-        let cancel = next_frame(&mut rx).await;
-        assert_eq!(cancel.header.ty, FrameType::Cancel);
-        assert_eq!(
-            (
-                cancel.header.channel,
-                cancel.header.epoch,
-                cancel.header.corr
-            ),
-            (
-                question.header.channel,
-                question.header.epoch,
-                question.header.corr
-            )
-        );
-        browser_grants_settled(&planes).await;
-        end_question(&planes, &tx, &question, "allow_conversation").await;
+        assert!(rx.try_recv().is_err());
+        assert!(planes.consent_test.as_ref().unwrap().answer(
+            question.header.corr,
+            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ));
         assert_eq!(planes.management.browser_grant_count().await, 0);
+        assert!(planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .calls()
+            .iter()
+            .all(|(method, _)| method != "consent.withdraw"));
     }
 
     #[tokio::test]
-    async fn scope_revocation_ends_open_browser_card_with_correlated_cancel() {
+    async fn scope_revocation_forgets_detached_browser_card_without_a_route() {
         let planes = open_grant_planes();
         let (tx, mut rx) = mpsc::channel(8);
         let (_, question) = open_grant_over_wire(&planes, &tx, &mut rx, 901).await;
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
+        let count = planes.consent_test.as_ref().unwrap().calls().len();
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
-        let cancel = next_frame(&mut rx).await;
-        assert_eq!(cancel.header.ty, FrameType::Cancel);
-        assert_eq!(
-            (
-                cancel.header.channel,
-                cancel.header.epoch,
-                cancel.header.corr
-            ),
-            (
-                question.header.channel,
-                question.header.epoch,
-                question.header.corr
-            )
-        );
-        end_question(&planes, &tx, &question, "allow_conversation").await;
+        assert!(rx.try_recv().is_err());
+        assert!(planes
+            .consent
+            .raised(&format!("el_test_{}", question.header.corr))
+            .is_none());
+        assert_eq!(planes.consent_test.as_ref().unwrap().calls().len(), count);
         assert_eq!(planes.management.browser_grant_count().await, 0);
     }
 
@@ -9110,20 +9107,11 @@ mod tests {
         for (ending, reported) in cases {
             let planes = open_grant_planes();
             let (writer, mut rx) = mpsc::channel::<Frame>(8);
-            let first_ask = if ending == "undeliverable" {
-                // A closed carrier: the question cannot be sent, and neither
-                // can the reply, so only the settlement is observable.
-                let (closed, mut closed_rx) = mpsc::channel::<Frame>(8);
-                closed_rx.close();
-                let _ = handle_frame(open_grant_frame(80), &closed, &planes).await;
-                None
-            } else {
-                let (first, question) = open_grant_over_wire(&planes, &writer, &mut rx, 80).await;
-                assert_eq!(first["outcome"], "consent_pending", "{first}");
-                assert!(first.get("previous_request").is_none(), "{first}");
-                end_question(&planes, &writer, &question, ending).await;
-                Some(first["ask_id"].as_str().unwrap().to_string())
-            };
+            let (first, question) = open_grant_over_wire(&planes, &writer, &mut rx, 80).await;
+            assert_eq!(first["outcome"], "consent_pending", "{first}");
+            assert!(first.get("previous_request").is_none(), "{first}");
+            end_question(&planes, &writer, &question, ending).await;
+            let first_ask = Some(first["ask_id"].as_str().unwrap().to_string());
             browser_grants_settled(&planes).await;
             assert_eq!(
                 planes.management.browser_grant_count().await,
@@ -9161,14 +9149,24 @@ mod tests {
     fn each_in_call_grant_ending_has_its_own_decision_and_remedy() {
         let cases = [
             (
-                elicit::AskOutcome::Answered(json!({"decision": "deny"})),
+                cingulate_client::desk::Ending::Declined {
+                    choice_id: "deny".into(),
+                },
                 "declined",
             ),
-            (elicit::AskOutcome::NoAnswer, "no_answer"),
-            (elicit::AskOutcome::NotPutToAnyone, "not_put_to_anyone"),
-            (elicit::AskOutcome::Undeliverable, "undeliverable"),
+            (cingulate_client::desk::Ending::NoAnswer, "no_answer"),
             (
-                elicit::AskOutcome::Answered(json!({"decision": "some_future_word"})),
+                cingulate_client::desk::Ending::NotPutToAnyone,
+                "not_put_to_anyone",
+            ),
+            (
+                cingulate_client::desk::Ending::DeliveryFailed,
+                "undeliverable",
+            ),
+            (
+                cingulate_client::desk::Ending::Declined {
+                    choice_id: "some_future_word".into(),
+                },
                 "unrecognized_answer",
             ),
         ];
@@ -9582,7 +9580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_management_route_without_elicitation_gets_no_browser_grant_question() {
+    async fn a_management_route_without_an_agent_session_gets_no_browser_grant_question() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = management_bound_planes(4, 1);
         let request = serde_json::json!({

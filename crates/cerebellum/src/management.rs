@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerebellum_computer::app_state::session::AppStateSessions;
@@ -30,13 +30,13 @@ use crate::browser_standing_grants::{
     origin_is_public, standing_browser_grant_covers, StandingBrowserGrants, StandingSubject,
     ALL_SITES_SHORT_GRANT_MS,
 };
+use crate::cingulate_client::desk::{ApplyFailed, Ending, NoCard};
 use crate::classification::canonical_grant_origin;
 use crate::computer_grants::{
     AppCode, ComputerGrants, ConsentContext, GrantNeed, NoIdentityReader,
 };
 #[cfg(target_os = "macos")]
 use crate::computer_grants::{AppIdentity, AppIdentityUnreadable};
-use crate::elicit::AskOutcome;
 use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
 use crate::CancelHandle;
@@ -358,22 +358,23 @@ pub struct ManagementPlane {
     /// with it.
     app_state_sessions: Arc<AppStateSessions>,
     resolver: Arc<dyn TargetResolver>,
+    pub(crate) browser_consent: crate::browser_consent::BrowserCards,
     browser_grants: Arc<Mutex<GrantStore>>,
     /// Standing per-agent browser rows; the same store `browser_grants`
     /// consults.
     standing_browser_grants: Arc<StandingBrowserGrants>,
     signed_in_domains: Arc<crate::browser_signed_in::SignedInDomains>,
-    pending_browser_grants: Mutex<BTreeMap<String, PendingBrowserGrant>>,
+    pending_browser_grants: SyncMutex<BTreeMap<String, PendingBrowserGrant>>,
     profile_lifecycle: Option<Arc<ProfileLifecycle>>,
     isolated_storage: bool,
-    pending_profile_root_rebinds: Mutex<BTreeMap<String, PendingProfileRootRebind>>,
+    pending_profile_root_rebinds: SyncMutex<BTreeMap<String, PendingProfileRootRebind>>,
     /// Where the launch service publishes what startup recovery kept.
     launch_recovery: Arc<LaunchRecoveryRegistry>,
-    pending_launch_recovery_clears: Mutex<BTreeMap<String, PendingLaunchRecoveryClear>>,
-    /// The last answer to a clear question, by project, reported on the next
-    /// request for that project. The answer arrives on a task nobody waits
-    /// on, so this is where an answer that did nothing says so.
-    launch_recovery_settlements: Mutex<BTreeMap<String, Value>>,
+    pending_launch_recovery_clears: SyncMutex<BTreeMap<String, PendingLaunchRecoveryClear>>,
+    /// The result of answering a question about clearing a stuck launch record,
+    /// by project. A later session call applies the answer, and another clear
+    /// request reports what that application did.
+    launch_recovery_settlements: SyncMutex<BTreeMap<String, Value>>,
     /// Browser grant questions that reached no person, by conversation and
     /// the sorted origins asked about, holding the ask id that was never put.
     ///
@@ -382,11 +383,11 @@ pub struct ManagementPlane {
     /// caller is told to wait for an answer nobody was offered the chance to
     /// give. Not a refusal: the question is still put each time, because a
     /// person who becomes reachable should simply be asked.
-    unreached_browser_grants: Mutex<BTreeMap<(String, Vec<String>), String>>,
+    unreached_browser_grants: SyncMutex<BTreeMap<(String, Vec<String>), String>>,
     /// Profile-root rebind questions that reached no person, by conversation,
     /// holding the ask id that was never put, so the next rebind request from
     /// that conversation can say the previous question was shown to nobody.
-    unreached_profile_root_rebinds: Mutex<BTreeMap<String, String>>,
+    unreached_profile_root_rebinds: SyncMutex<BTreeMap<String, String>>,
 }
 
 /// What a consent question settled by `ask_id` is reported as on the next
@@ -408,20 +409,20 @@ fn previous_request_not_put_to_anyone(ask_id: &str) -> Value {
 /// asked) clears an earlier note, since it is now stale. A question that could
 /// not be sent, or one withdrawn before it ended, says nothing about whether a
 /// person is reachable, so it leaves the note as it was.
-async fn note_reachability<K: Ord>(
-    unreached: &Mutex<BTreeMap<K, String>>,
+fn note_reachability<K: Ord>(
+    unreached: &SyncMutex<BTreeMap<K, String>>,
     key: K,
     ask_id: &str,
-    ending: Option<&AskOutcome>,
+    ending: Option<&Ending>,
 ) {
     match ending {
-        Some(AskOutcome::NotPutToAnyone) => {
-            unreached.lock().await.insert(key, ask_id.to_string());
+        Some(Ending::NotPutToAnyone) => {
+            unreached.lock().unwrap().insert(key, ask_id.to_string());
         }
-        Some(AskOutcome::Answered(_) | AskOutcome::NoAnswer) => {
-            unreached.lock().await.remove(&key);
+        Some(Ending::Granted { .. } | Ending::Declined { .. } | Ending::NoAnswer) => {
+            unreached.lock().unwrap().remove(&key);
         }
-        Some(AskOutcome::Undeliverable) | None => {}
+        Some(Ending::DeliveryFailed | Ending::Withdrawn | Ending::NoCard(_)) | None => {}
     }
 }
 
@@ -434,7 +435,7 @@ fn browser_grant_key(conversation_key: &str, origins: &[String]) -> (String, Vec
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingBrowserGrant {
+pub(crate) struct PendingBrowserGrant {
     conversation_key: String,
     authorized_origins: Vec<String>,
     disclosed_hazards: BTreeSet<HazardClass>,
@@ -524,27 +525,27 @@ pub enum BrowserGrantSettlement {
     NotRecorded { reason: &'static str },
 }
 
-/// The id of the card the person answered, from the answer's
-/// `elicitation_id`, when it can name the consent: printable ASCII with no
-/// whitespace, 1 to 128 bytes. The same rule the vault deposit applies to its
-/// `consent_ref`; anything else counts as absent.
-fn answered_elicitation_id(answer: &Value) -> Option<String> {
-    const MAX_CONSENT_REF_BYTES: usize = 128;
-    let id = answer.get("elicitation_id")?.as_str()?;
-    let usable = !id.is_empty()
-        && id.len() <= MAX_CONSENT_REF_BYTES
-        && id.bytes().all(|byte| byte.is_ascii_graphic());
-    usable.then(|| id.to_string())
+pub(crate) fn ending_choice(ending: &Ending) -> Option<&str> {
+    match ending {
+        Ending::Granted { choice_id } | Ending::Declined { choice_id } => Some(choice_id),
+        _ => None,
+    }
+}
+
+fn ending_from_answer(answer: &Value) -> Ending {
+    Ending::Granted {
+        choice_id: answer["decision"].as_str().unwrap_or_default().to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingProfileRootRebind {
+pub(crate) struct PendingProfileRootRebind {
     conversation_key: String,
     preview: RebindReport,
 }
 
-#[derive(Debug, Clone)]
-struct PendingLaunchRecoveryClear {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingLaunchRecoveryClear {
     preview: ClearPreview,
     /// The module startup that asked. An answer is acted on only by the same
     /// one: after a restart, recovery has run again and the question no
@@ -568,6 +569,8 @@ pub enum ClearSettlement {
     NotPutToAnyone,
     /// The question could not be sent.
     Undeliverable,
+    /// Withdrawn before an answer.
+    Withdrawn,
     /// An answer with a word the question did not offer.
     UnrecognizedAnswer,
     /// Answered after the question's deadline.
@@ -604,6 +607,7 @@ impl ClearSettlement {
                 "outcome": "undeliverable",
                 "remedy": "nothing was cleared; the question could not be sent. Retry once; if it fails again, the module needs attention",
             }),
+            Self::Withdrawn => json!({"outcome":"question_withdrawn"}),
             Self::UnrecognizedAnswer => json!({
                 "outcome": "unrecognized_answer",
                 "remedy": "nothing was cleared; the answer was not one this question offered. Ask again",
@@ -653,6 +657,7 @@ impl ManagementPlane {
             computer_grants,
             app_state_sessions: Arc::new(AppStateSessions::new()),
             resolver,
+            browser_consent: crate::browser_consent::BrowserCards::default(),
             browser_grants: Arc::new(Mutex::new(
                 GrantStore::default()
                     .with_standing_grants(Arc::clone(&standing_browser_grants))
@@ -660,15 +665,15 @@ impl ManagementPlane {
             )),
             standing_browser_grants,
             signed_in_domains,
-            pending_browser_grants: Mutex::new(BTreeMap::new()),
+            pending_browser_grants: SyncMutex::new(BTreeMap::new()),
             profile_lifecycle: None,
             isolated_storage: false,
-            pending_profile_root_rebinds: Mutex::new(BTreeMap::new()),
+            pending_profile_root_rebinds: SyncMutex::new(BTreeMap::new()),
             launch_recovery: Arc::new(LaunchRecoveryRegistry::new()),
-            pending_launch_recovery_clears: Mutex::new(BTreeMap::new()),
-            launch_recovery_settlements: Mutex::new(BTreeMap::new()),
-            unreached_browser_grants: Mutex::new(BTreeMap::new()),
-            unreached_profile_root_rebinds: Mutex::new(BTreeMap::new()),
+            pending_launch_recovery_clears: SyncMutex::new(BTreeMap::new()),
+            launch_recovery_settlements: SyncMutex::new(BTreeMap::new()),
+            unreached_browser_grants: SyncMutex::new(BTreeMap::new()),
+            unreached_profile_root_rebinds: SyncMutex::new(BTreeMap::new()),
         }
     }
 
@@ -793,7 +798,7 @@ impl ManagementPlane {
         let browser = self
             .pending_browser_grants
             .lock()
-            .await
+            .unwrap()
             .remove(ask_id)
             .is_some();
         computer || browser
@@ -965,14 +970,14 @@ impl ManagementPlane {
         conversation_key: &str,
         origins: Vec<String>,
         hazards: Vec<HazardClass>,
-        can_relay_to_a_person: bool,
+        can_raise_card: bool,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         self.open_browser_grant_at_tier(
             conversation_key,
             origins,
             hazards,
             None,
-            can_relay_to_a_person,
+            can_raise_card,
             None,
         )
         .await
@@ -997,7 +1002,7 @@ impl ManagementPlane {
         origins: Vec<String>,
         hazards: Vec<HazardClass>,
         severity_tier: Option<u8>,
-        can_relay_to_a_person: bool,
+        can_raise_card: bool,
         standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         let key = browser_grant_key(conversation_key, &origins);
@@ -1007,7 +1012,7 @@ impl ManagementPlane {
                 origins,
                 hazards,
                 severity_tier,
-                can_relay_to_a_person,
+                can_raise_card,
                 crate::consent_card::Urgency::Normal,
                 standing_agent,
             )
@@ -1017,7 +1022,7 @@ impl ManagementPlane {
         // action's closed result schema, and that question's ending is in its
         // own reply already.
         if question.is_some() {
-            if let Some(ask_id) = self.unreached_browser_grants.lock().await.get(&key) {
+            if let Some(ask_id) = self.unreached_browser_grants.lock().unwrap().get(&key) {
                 reply["previous_request"] = previous_request_not_put_to_anyone(ask_id);
             }
         }
@@ -1054,7 +1059,7 @@ impl ManagementPlane {
         origins: Vec<String>,
         hazards: Vec<HazardClass>,
         severity_tier: Option<u8>,
-        can_relay_to_a_person: bool,
+        can_raise_card: bool,
         urgency: crate::consent_card::Urgency,
         standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
@@ -1095,14 +1100,15 @@ impl ManagementPlane {
         let severity = browser_grant_minted_severity(&disclosed_hazards, severity_tier);
         let severity_value = browser_grant_severity_value(severity);
 
-        if !can_relay_to_a_person {
+        if !can_raise_card {
             return Ok((
                 json!({
                     "outcome": "consent_unavailable",
                     "origins": authorized_origins,
                     "hazards": disclosed_hazards_wire,
                     "severity_ceiling": severity_value,
-                    "remedy": "reconnect declaring the ability to relay a question to a person",
+                    "detail": {"reason": NoCard::NoAgentSession.reason()},
+                    "remedy": NoCard::NoAgentSession.remedy(),
                 }),
                 None,
             ));
@@ -1125,11 +1131,8 @@ impl ManagementPlane {
             choices: choices.clone(),
             standing_agent: standing_agent.map(str::to_string),
         };
-        self.pending_browser_grants
-            .lock()
-            .await
-            .insert(ask_id.clone(), pending);
         let question = Question {
+            prepared: PreparedConsent::Browser(pending),
             ask_id: ask_id.clone(),
             body: browser_grant_question(
                 &ask_id,
@@ -1160,7 +1163,7 @@ impl ManagementPlane {
     /// ended, use [`Self::settle_browser_grant_ending`], which also records
     /// whether anyone was asked.
     pub async fn settle_browser_grant(&self, ask_id: &str, answer: Option<&Value>) -> bool {
-        let answer = answer.map(|body| AskOutcome::Answered(body.clone()));
+        let answer = answer.map(ending_from_answer);
         self.settle_browser_grant_ending(ask_id, answer.as_ref())
             .await
     }
@@ -1170,11 +1173,7 @@ impl ManagementPlane {
     ///
     /// Returns false when no such question was open or the chosen grant could
     /// not be recorded; see [`Self::settle_browser_grant_outcome`] for which.
-    pub async fn settle_browser_grant_ending(
-        &self,
-        ask_id: &str,
-        ending: Option<&AskOutcome>,
-    ) -> bool {
+    pub async fn settle_browser_grant_ending(&self, ask_id: &str, ending: Option<&Ending>) -> bool {
         !matches!(
             self.settle_browser_grant_outcome(ask_id, ending).await,
             BrowserGrantSettlement::UnknownAsk | BrowserGrantSettlement::NotRecorded { .. }
@@ -1191,24 +1190,46 @@ impl ManagementPlane {
     pub async fn settle_browser_grant_outcome(
         &self,
         ask_id: &str,
-        ending: Option<&AskOutcome>,
+        ending: Option<&Ending>,
     ) -> BrowserGrantSettlement {
-        let Some(pending) = self.pending_browser_grants.lock().await.remove(ask_id) else {
-            return BrowserGrantSettlement::UnknownAsk;
+        self.settle_browser_grant_sync(ask_id, ending).unwrap_or(
+            BrowserGrantSettlement::NotRecorded {
+                reason: "grant_store_busy",
+            },
+        )
+    }
+
+    pub(crate) fn settle_browser_grant_sync(
+        &self,
+        ask_id: &str,
+        ending: Option<&Ending>,
+    ) -> Result<BrowserGrantSettlement, ApplyFailed> {
+        let mut grants = if ending.and_then(ending_choice)
+            == Some(BrowserGrantChoice::Conversation.option_id())
+        {
+            Some(
+                self.browser_grants
+                    .try_lock()
+                    .map_err(|_| ApplyFailed("the browser grant store is busy".into()))?,
+            )
+        } else {
+            None
+        };
+        let Some(pending) = self.pending_browser_grants.lock().unwrap().remove(ask_id) else {
+            return Ok(BrowserGrantSettlement::UnknownAsk);
         };
         note_reachability(
             &self.unreached_browser_grants,
             browser_grant_key(&pending.conversation_key, &pending.authorized_origins),
             ask_id,
             ending,
-        )
-        .await;
-        let Some(AskOutcome::Answered(answer)) = ending else {
-            return BrowserGrantSettlement::NotGranted;
-        };
-        let decision = answer.get("decision").and_then(Value::as_str);
+        );
+        let decision = ending.and_then(ending_choice);
+        if decision.is_none() {
+            return Ok(BrowserGrantSettlement::NotGranted);
+        }
         if decision == Some(BROWSER_GRANT_DECLINE) {
-            return BrowserGrantSettlement::NotGranted;
+            return Ok(BrowserGrantSettlement::NotGranted);
         }
         let Some(choice) = pending
             .choices
@@ -1216,7 +1237,7 @@ impl ManagementPlane {
             .copied()
             .find(|choice| Some(choice.option_id()) == decision)
         else {
-            return BrowserGrantSettlement::UnrecognizedAnswer;
+            return Ok(BrowserGrantSettlement::UnrecognizedAnswer);
         };
 
         if choice == BrowserGrantChoice::Conversation {
@@ -1228,27 +1249,26 @@ impl ManagementPlane {
                 pending.authorized_origins,
             )
             .with_disclosed_hazards(pending.disclosed_hazards);
-            return match self.browser_grants.lock().await.replace(grant) {
-                Ok(()) => BrowserGrantSettlement::Granted(choice),
-                Err(_) => BrowserGrantSettlement::NotRecorded {
-                    reason: "grant_store_invalid",
+            return Ok(
+                match grants
+                    .as_mut()
+                    .expect("conversation grant lock")
+                    .replace(grant)
+                {
+                    Ok(()) => BrowserGrantSettlement::Granted(choice),
+                    Err(_) => BrowserGrantSettlement::NotRecorded {
+                        reason: "grant_store_invalid",
+                    },
                 },
-            };
+            );
         }
 
         let Some(agent) = pending.standing_agent.as_deref() else {
-            return BrowserGrantSettlement::NotRecorded {
+            return Ok(BrowserGrantSettlement::NotRecorded {
                 reason: "agent_not_attested",
-            };
+            });
         };
-        // The row names the card the person answered, as the vault deposit
-        // does; an answer that does not say which card it was grants nothing
-        // lasting.
-        let Some(consent_ref) = answered_elicitation_id(answer) else {
-            return BrowserGrantSettlement::NotRecorded {
-                reason: "consent_not_linkable",
-            };
-        };
+        let consent_ref = ask_id;
         let (subjects, hazards, lifetime_ms) = match choice {
             BrowserGrantChoice::OriginAlways => (
                 pending
@@ -1277,14 +1297,103 @@ impl ManagementPlane {
                 pending.severity.tier,
                 hazards.clone(),
                 lifetime_ms,
-                &consent_ref,
+                consent_ref,
             ) {
-                return BrowserGrantSettlement::NotRecorded {
+                return Ok(BrowserGrantSettlement::NotRecorded {
                     reason: error.reason_code(),
-                };
+                });
             }
         }
-        BrowserGrantSettlement::Granted(choice)
+        Ok(BrowserGrantSettlement::Granted(choice))
+    }
+
+    pub(crate) fn record_prepared_consent(&self, question: &Question, id: &str) {
+        match &question.prepared {
+            PreparedConsent::Browser(pending) => {
+                self.pending_browser_grants
+                    .lock()
+                    .unwrap()
+                    .insert(id.into(), pending.clone());
+            }
+            PreparedConsent::Rebind(pending) => {
+                self.pending_profile_root_rebinds
+                    .lock()
+                    .unwrap()
+                    .insert(id.into(), pending.clone());
+            }
+            PreparedConsent::Clear(pending) => {
+                self.pending_launch_recovery_clears
+                    .lock()
+                    .unwrap()
+                    .insert(id.into(), pending.clone());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consent_subject(
+        &self,
+        kind: crate::cingulate_client::card::CardKind,
+        ask_id: &str,
+    ) -> Option<String> {
+        use crate::cingulate_client::{card::CardKind, subject};
+        match kind {
+            CardKind::WebsiteAccessInCall | CardKind::WebsiteAccessInAdvance => self
+                .pending_browser_grants
+                .lock()
+                .unwrap()
+                .get(ask_id)
+                .map(|p| {
+                    subject::website_access_in_call(&p.conversation_key, &p.authorized_origins)
+                }),
+            CardKind::ProfileReidentification => self
+                .pending_profile_root_rebinds
+                .lock()
+                .unwrap()
+                .get(ask_id)
+                .map(|p| subject::profile_reidentification(&p.conversation_key)),
+            CardKind::StuckProfileClearance => self
+                .pending_launch_recovery_clears
+                .lock()
+                .unwrap()
+                .get(ask_id)
+                .map(|p| {
+                    subject::stuck_profile_clearance(
+                        &p.preview.agent_project_id,
+                        p.preview.sequence,
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rekey_consent(
+        &self,
+        kind: crate::cingulate_client::card::CardKind,
+        old: &str,
+        new: Option<&str>,
+    ) {
+        fn rekey<T>(map: &SyncMutex<BTreeMap<String, T>>, old: &str, new: Option<&str>) {
+            let mut map = map.lock().unwrap();
+            if let Some(pending) = map.remove(old) {
+                if let Some(new) = new {
+                    map.insert(new.to_string(), pending);
+                }
+            }
+        }
+        use crate::cingulate_client::card::CardKind;
+        match kind {
+            CardKind::WebsiteAccessInCall | CardKind::WebsiteAccessInAdvance => {
+                rekey(&self.pending_browser_grants, old, new)
+            }
+            CardKind::ProfileReidentification => {
+                rekey(&self.pending_profile_root_rebinds, old, new)
+            }
+            CardKind::StuckProfileClearance => {
+                rekey(&self.pending_launch_recovery_clears, old, new)
+            }
+            _ => {}
+        }
     }
 
     pub async fn browser_grant_question_for_test(
@@ -1297,12 +1406,14 @@ impl ManagementPlane {
             .open_browser_grant(conversation_key, origins, hazards, true)
             .await
             .expect("test browser grant scope is valid");
-        question.expect("an elicitable browser grant produces a question")
+        let question = question.expect("an elicitable browser grant produces a question");
+        self.record_prepared_consent(&question, &question.ask_id);
+        question
     }
 
     /// How many browser grant questions are still waiting to be settled.
     pub async fn browser_grant_pending_count(&self) -> usize {
-        self.pending_browser_grants.lock().await.len()
+        self.pending_browser_grants.lock().unwrap().len()
     }
 
     pub async fn browser_grant_count(&self) -> usize {
@@ -1314,7 +1425,7 @@ impl ManagementPlane {
     pub async fn browser_grant_question_open(&self, ask_id: &str) -> bool {
         self.pending_browser_grants
             .lock()
-            .await
+            .unwrap()
             .contains_key(ask_id)
     }
 
@@ -1328,11 +1439,11 @@ impl ManagementPlane {
     pub async fn end_browser_conversation(&self, conversation_key: &str) {
         self.pending_browser_grants
             .lock()
-            .await
+            .unwrap()
             .retain(|_, pending| pending.conversation_key != conversation_key);
         self.unreached_browser_grants
             .lock()
-            .await
+            .unwrap()
             .retain(|(conversation, _), _| conversation != conversation_key);
         let mut grants = self.browser_grants.lock().await;
         let held: Vec<String> = grants
@@ -1410,7 +1521,7 @@ impl ManagementPlane {
     pub async fn open_profile_root_rebind(
         &self,
         conversation_key: &str,
-        can_relay_to_a_person: bool,
+        can_raise_card: bool,
     ) -> (Value, Option<Question>) {
         let lifecycle = match self.profile_lifecycle_for_rebind() {
             Ok(lifecycle) => lifecycle,
@@ -1437,7 +1548,7 @@ impl ManagementPlane {
             Err(refusal) => return (rebind_refusal_reply(refusal), None),
         };
 
-        if !can_relay_to_a_person {
+        if !can_raise_card {
             return (
                 json!({
                     "outcome": "consent_unavailable",
@@ -1446,22 +1557,20 @@ impl ManagementPlane {
                     "new_identity": preview.new_identity,
                     "generation": preview.generation_before,
                     "record_count": preview.record_count,
-                    "remedy": "reconnect declaring the ability to relay a question to a person",
+                    "detail": {"reason": NoCard::NoAgentSession.reason()},
+                    "remedy": NoCard::NoAgentSession.remedy(),
                 }),
                 None,
             );
         }
 
         let ask_id = new_profile_root_rebind_ask_id();
-        self.pending_profile_root_rebinds.lock().await.insert(
-            ask_id.clone(),
-            PendingProfileRootRebind {
-                conversation_key: conversation_key.to_string(),
-                preview: preview.clone(),
-            },
-        );
         let question = Question {
             ask_id: ask_id.clone(),
+            prepared: PreparedConsent::Rebind(PendingProfileRootRebind {
+                conversation_key: conversation_key.to_string(),
+                preview: preview.clone(),
+            }),
             body: profile_root_rebind_question(&ask_id, &root_path, &preview),
             deadline: PHONE_CONSENT_DEADLINE,
         };
@@ -1478,7 +1587,7 @@ impl ManagementPlane {
         if let Some(previous) = self
             .unreached_profile_root_rebinds
             .lock()
-            .await
+            .unwrap()
             .get(conversation_key)
         {
             reply["previous_request"] = previous_request_not_put_to_anyone(previous);
@@ -1491,7 +1600,7 @@ impl ManagementPlane {
     /// `None` is a question withdrawn without an ending. For a question that
     /// ended, use [`Self::settle_profile_root_rebind_ending`].
     pub async fn settle_profile_root_rebind(&self, ask_id: &str, answer: Option<&Value>) -> bool {
-        let answer = answer.map(|body| AskOutcome::Answered(body.clone()));
+        let answer = answer.map(ending_from_answer);
         self.settle_profile_root_rebind_ending(ask_id, answer.as_ref())
             .await
     }
@@ -1502,12 +1611,20 @@ impl ManagementPlane {
     pub async fn settle_profile_root_rebind_ending(
         &self,
         ask_id: &str,
-        ending: Option<&AskOutcome>,
+        ending: Option<&Ending>,
+    ) -> bool {
+        self.settle_profile_root_rebind_sync(ask_id, ending)
+    }
+
+    pub(crate) fn settle_profile_root_rebind_sync(
+        &self,
+        ask_id: &str,
+        ending: Option<&Ending>,
     ) -> bool {
         let Some(pending) = self
             .pending_profile_root_rebinds
             .lock()
-            .await
+            .unwrap()
             .remove(ask_id)
         else {
             return false;
@@ -1517,12 +1634,8 @@ impl ManagementPlane {
             pending.conversation_key.clone(),
             ask_id,
             ending,
-        )
-        .await;
-        let decision = match ending {
-            Some(AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
-            _ => None,
-        };
+        );
+        let decision = ending.and_then(ending_choice);
         if decision != Some("allow") {
             return true;
         }
@@ -1547,7 +1660,7 @@ impl ManagementPlane {
     }
 
     pub async fn profile_root_rebind_pending_count(&self) -> usize {
-        self.pending_profile_root_rebinds.lock().await.len()
+        self.pending_profile_root_rebinds.lock().unwrap().len()
     }
 
     /// The registry the launch service publishes its clear into once startup
@@ -1563,12 +1676,12 @@ impl ManagementPlane {
         &self,
         agent_project_id: &str,
         sequence: Option<u64>,
-        can_relay_to_a_person: bool,
+        can_raise_card: bool,
     ) -> (Value, Option<Question>) {
         let previous = self
             .launch_recovery_settlements
             .lock()
-            .await
+            .unwrap()
             .get(agent_project_id)
             .cloned();
         let with_previous = |mut reply: Value| {
@@ -1588,29 +1701,26 @@ impl ManagementPlane {
             "launched_at": preview.launched_at,
             "evidence": preview.evidence.as_json(),
         });
-        if !can_relay_to_a_person {
+        if !can_raise_card {
             let mut reply = described;
             reply["outcome"] = json!("consent_unavailable");
-            reply["remedy"] =
-                json!("reconnect declaring the ability to relay a question to a person");
+            reply["detail"] = json!({"reason": NoCard::NoAgentSession.reason()});
+            reply["remedy"] = json!(NoCard::NoAgentSession.remedy());
             return (with_previous(reply), None);
         }
 
         let incarnation = self.launch_recovery.incarnation().to_string();
-        let ask_id = new_launch_recovery_clear_ask_id(&incarnation);
+        let ask_id = new_launch_recovery_clear_ask_id();
         let question = Question {
             ask_id: ask_id.clone(),
+            prepared: PreparedConsent::Clear(PendingLaunchRecoveryClear {
+                preview: preview.clone(),
+                incarnation,
+                asked_at: Instant::now(),
+            }),
             body: launch_recovery_clear_question(&ask_id, &preview),
             deadline: PHONE_CONSENT_DEADLINE,
         };
-        self.pending_launch_recovery_clears.lock().await.insert(
-            ask_id.clone(),
-            PendingLaunchRecoveryClear {
-                preview,
-                incarnation,
-                asked_at: Instant::now(),
-            },
-        );
         let mut reply = described;
         reply["outcome"] = json!("consent_pending");
         reply["ask_id"] = json!(ask_id);
@@ -1638,9 +1748,7 @@ impl ManagementPlane {
         answer: Option<&Value>,
         answered_at: Instant,
     ) -> ClearSettlement {
-        let ending = answer.map_or(AskOutcome::NoAnswer, |body| {
-            AskOutcome::Answered(body.clone())
-        });
+        let ending = answer.map_or(Ending::NoAnswer, ending_from_answer);
         self.settle_launch_recovery_clear_ending_at(ask_id, &ending, answered_at)
             .await
     }
@@ -1651,7 +1759,7 @@ impl ManagementPlane {
     pub async fn settle_launch_recovery_clear_ending(
         &self,
         ask_id: &str,
-        ending: &AskOutcome,
+        ending: &Ending,
     ) -> ClearSettlement {
         self.settle_launch_recovery_clear_ending_at(ask_id, ending, Instant::now())
             .await
@@ -1663,30 +1771,26 @@ impl ManagementPlane {
     pub async fn settle_launch_recovery_clear_ending_at(
         &self,
         ask_id: &str,
-        ending: &AskOutcome,
+        ending: &Ending,
+        answered_at: Instant,
+    ) -> ClearSettlement {
+        self.settle_launch_recovery_clear_sync(ask_id, ending, answered_at)
+    }
+
+    pub(crate) fn settle_launch_recovery_clear_sync(
+        &self,
+        ask_id: &str,
+        ending: &Ending,
         answered_at: Instant,
     ) -> ClearSettlement {
         let incarnation = self.launch_recovery.incarnation();
         let pending = self
             .pending_launch_recovery_clears
             .lock()
-            .await
+            .unwrap()
             .remove(ask_id);
         let (settlement, project) = match pending {
-            // A question this start never asked. One whose identity names
-            // another start was asked before a restart: say so, since the
-            // person may believe they cleared something.
-            None => {
-                let settlement = if ask_id.starts_with(LAUNCH_RECOVERY_CLEAR_ASK_PREFIX)
-                    && !ask_id
-                        .starts_with(&format!("{LAUNCH_RECOVERY_CLEAR_ASK_PREFIX}{incarnation}-"))
-                {
-                    ClearSettlement::AskedByEarlierStart
-                } else {
-                    ClearSettlement::UnknownAsk
-                };
-                return settlement;
-            }
+            None => return ClearSettlement::UnknownAsk,
             Some(pending) => {
                 let project = pending.preview.agent_project_id.clone();
                 // A question that ended without an answer is reported as that
@@ -1697,17 +1801,20 @@ impl ManagementPlane {
                     ClearSettlement::AskedByEarlierStart
                 } else {
                     match ending {
-                        AskOutcome::NoAnswer => ClearSettlement::NoAnswer,
-                        AskOutcome::NotPutToAnyone => ClearSettlement::NotPutToAnyone,
-                        AskOutcome::Undeliverable => ClearSettlement::Undeliverable,
-                        AskOutcome::Answered(_)
+                        Ending::NoAnswer => ClearSettlement::NoAnswer,
+                        Ending::Withdrawn => ClearSettlement::Withdrawn,
+                        Ending::NotPutToAnyone => ClearSettlement::NotPutToAnyone,
+                        Ending::DeliveryFailed | Ending::NoCard(_) => {
+                            ClearSettlement::Undeliverable
+                        }
+                        Ending::Granted { .. } | Ending::Declined { .. }
                             if answered_at.saturating_duration_since(pending.asked_at)
                                 > PHONE_CONSENT_DEADLINE =>
                         {
                             ClearSettlement::Expired
                         }
-                        AskOutcome::Answered(body) => {
-                            match body.get("decision").and_then(Value::as_str) {
+                        Ending::Granted { choice_id } | Ending::Declined { choice_id } => {
+                            match Some(choice_id.as_str()) {
                                 Some("clear") => {
                                     match self.launch_recovery.clear(&pending.preview, ask_id) {
                                         Ok(()) => ClearSettlement::Cleared {
@@ -1727,13 +1834,33 @@ impl ManagementPlane {
         };
         self.launch_recovery_settlements
             .lock()
-            .await
+            .unwrap()
             .insert(project, settlement.as_json());
         settlement
     }
 
+    #[cfg(test)]
+    pub(crate) fn copy_pending_clear_for_test(
+        &self,
+        source: &Self,
+        source_id: &str,
+        target_id: &str,
+    ) {
+        let pending = source
+            .pending_launch_recovery_clears
+            .lock()
+            .unwrap()
+            .get(source_id)
+            .cloned()
+            .unwrap();
+        self.pending_launch_recovery_clears
+            .lock()
+            .unwrap()
+            .insert(target_id.to_string(), pending);
+    }
+
     pub async fn launch_recovery_clear_pending_count(&self) -> usize {
-        self.pending_launch_recovery_clears.lock().await.len()
+        self.pending_launch_recovery_clears.lock().unwrap().len()
     }
 }
 
@@ -2177,12 +2304,40 @@ fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
     }
 }
 
+/// A permission snapshot not yet filed under a consent-service card id.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PreparedConsent {
+    Browser(PendingBrowserGrant),
+    Rebind(PendingProfileRootRebind),
+    Clear(PendingLaunchRecoveryClear),
+}
+
 /// A question to put to the user, and how long it stays one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Question {
+    pub(crate) prepared: PreparedConsent,
     pub ask_id: String,
     pub body: Value,
     pub deadline: Duration,
+}
+
+impl Question {
+    pub(crate) fn subject(&self) -> String {
+        use crate::cingulate_client::subject;
+        match &self.prepared {
+            PreparedConsent::Browser(pending) => subject::website_access_in_call(
+                &pending.conversation_key,
+                &pending.authorized_origins,
+            ),
+            PreparedConsent::Rebind(pending) => {
+                subject::profile_reidentification(&pending.conversation_key)
+            }
+            PreparedConsent::Clear(pending) => subject::stuck_profile_clearance(
+                &pending.preview.agent_project_id,
+                pending.preview.sequence,
+            ),
+        }
+    }
 }
 
 /// Why an action on a named application did not proceed.
@@ -2235,15 +2390,13 @@ fn new_profile_root_rebind_ask_id() -> String {
     )
 }
 
-const LAUNCH_RECOVERY_CLEAR_ASK_PREFIX: &str = "browser-launch-recovery-clear-";
-
-/// Carries the asking start's identity, so an answer that reaches a later
-/// start is recognised as belonging to an earlier one.
-fn new_launch_recovery_clear_ask_id(incarnation: &str) -> String {
+/// A local preflight/failure correlation token. The returned card id and the
+/// module startup identifier are tracked separately when the question is filed.
+fn new_launch_recovery_clear_ask_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{LAUNCH_RECOVERY_CLEAR_ASK_PREFIX}{incarnation}-{}",
+        "browser-launch-recovery-clear-{}",
         NEXT.fetch_add(1, Ordering::Relaxed) + 1
     )
 }
@@ -2690,6 +2843,7 @@ mod tests {
             .await
             .unwrap();
         let question = question.unwrap();
+        plane.record_prepared_consent(&question, &question.ask_id);
         crate::consent_card::assert_contract(
             &question.body,
             &["allow_conversation", "deny"],
@@ -2793,6 +2947,7 @@ mod tests {
             .await
             .unwrap();
         let question = question.unwrap();
+        plane.record_prepared_consent(&question, &question.ask_id);
         assert_eq!(
             reply["severity_ceiling"],
             json!({"tier": 4, "name": "mutate_durable", "credential": false, "financial": false})
@@ -2888,7 +3043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_grant_refusal_and_no_relay_each_leave_the_store_empty() {
+    async fn browser_grant_refusal_and_no_agent_each_leave_the_store_empty() {
         let plane = plane(TargetResolution::NotRunning);
         let (reply, question) = plane
             .open_browser_grant(
@@ -2900,12 +3055,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply["outcome"], "consent_pending");
+        let question = question.unwrap();
+        plane.record_prepared_consent(&question, &question.ask_id);
         assert!(
             plane
-                .settle_browser_grant(
-                    &question.unwrap().ask_id,
-                    Some(&json!({"decision": "deny"}))
-                )
+                .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "deny"})))
                 .await
         );
         assert_eq!(plane.browser_grant_count().await, 0);

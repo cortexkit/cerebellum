@@ -624,21 +624,31 @@ impl Fixture {
             principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: session.asks.then(|| vec!["elicitation".to_string()]),
             admission_facts: Some(facts),
-            scope: (mode == subc_protocol::call_mode::CallMode::Codemode).then(|| {
-                subc_protocol::scope::ScopeStamp::new(
-                    cerebellum::session_caller_principal_for_test().unwrap(),
-                    "run",
-                    1,
-                    subc_protocol::scope::ScopeKind::Ephemeral,
+            scope: if mode == subc_protocol::call_mode::CallMode::Codemode {
+                Some(
+                    subc_protocol::scope::ScopeStamp::new(
+                        cerebellum::session_caller_principal_for_test().unwrap(),
+                        "run",
+                        1,
+                        subc_protocol::scope::ScopeKind::Ephemeral,
+                    )
+                    .with_attributes(
+                        subc_protocol::scope::ScopeAttributes::new()
+                            .with_agent_id(session.agent.map(str::to_owned))
+                            .with_delegates(true)
+                            .with_run_id(Some("run-test".into())),
+                    )
+                    .with_owner_authorized(true),
                 )
-                .with_attributes(
-                    subc_protocol::scope::ScopeAttributes::new()
-                        .with_agent_id(session.agent.map(str::to_owned))
-                        .with_delegates(true)
-                        .with_run_id(Some("run-test".into())),
-                )
-                .with_owner_authorized(true)
-            }),
+            } else {
+                session.agent.filter(|_| session.asks).map(|agent| {
+                    let mut stamp = super::support::computer::cingulate::stamp(agent);
+                    if session.kind == "subagent" {
+                        stamp.kind = subc_protocol::scope::ScopeKind::Worker;
+                    }
+                    stamp
+                })
+            },
         };
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,
@@ -829,8 +839,10 @@ fn assert_authorized(reply: &Value, what: &str) {
 }
 
 fn assert_refused(reply: &Value, what: &str) {
-    assert_eq!(
-        reply["outcome"], "authorization_denied",
+    assert!(
+        reply["outcome"] == "authorization_denied"
+            || (reply["outcome"] == "consent_unavailable"
+                && reply["detail"]["reason"] == "no_agent_session"),
         "{what} was not refused: {reply}"
     );
 }
@@ -873,13 +885,17 @@ async fn each_answered_option_mints_exactly_its_row() {
             .await;
         let consent_ref = format!("el_mapping_{index}");
         let mut offered = Vec::new();
+        let mut raised_id = String::new();
         let reply = fixture
             .call_answering(
                 &route,
                 "browser.navigate",
                 navigation(&format!("{PUBLIC}/"), 3),
                 json!({"decision": id, "elicitation_id": consent_ref}),
-                |question| offered.push(option_ids(question)),
+                |question| {
+                    offered.push(option_ids(question));
+                    raised_id = question["id"].as_str().unwrap().to_string();
+                },
             )
             .await;
         assert_eq!(
@@ -917,7 +933,7 @@ async fn each_answered_option_mints_exactly_its_row() {
                 assert_eq!(row.agent_id, AGENT);
                 assert_eq!(row.max_level, 3, "{id}");
                 assert!(row.hazards.is_empty(), "{id}");
-                assert_eq!(row.consent_ref, consent_ref);
+                assert_eq!(row.consent_ref, raised_id);
                 assert_eq!(row.granted_at_ms, now);
                 assert_eq!(row.revoked_at_ms, None);
                 let (subject, expires) = match id {
@@ -1045,8 +1061,14 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
                 |question| offered.push(option_ids(question)),
             )
             .await;
-        assert_eq!(reply["outcome"], "consent_pending", "{case}: {reply}");
-        assert_eq!(offered, vec![expected], "{case}");
+        if session.agent.is_none() {
+            assert_eq!(reply["outcome"], "consent_unavailable");
+            assert_eq!(reply["detail"]["reason"], "no_agent_session");
+            assert!(offered.is_empty());
+        } else {
+            assert_eq!(reply["outcome"], "consent_pending", "{case}: {reply}");
+            assert_eq!(offered, vec![expected], "{case}");
+        }
     }
 }
 
@@ -1136,7 +1158,7 @@ async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
 
 fn assert_hazard_refused(reply: &Value, what: &str) {
     assert_eq!(
-        reply["outcome"], "hazard_not_disclosed",
+        reply["outcome"], "consent_unavailable",
         "{what} was not refused for its hazard: {reply}"
     );
     assert_eq!(

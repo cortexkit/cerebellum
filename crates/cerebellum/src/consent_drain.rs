@@ -536,10 +536,13 @@ mod tests {
     async fn unadapted_answer_is_not_applied_or_acked() {
         let cingulate = ScriptedCingulate::new();
         feed(&cingulate);
-        let (planes, _dir, store) = planes(
+        let (mut planes, _dir, store) = planes(
             &[card(CardKind::WebsiteAccessInCall)],
             Arc::new(cingulate.clone()),
         );
+        // This test deliberately leaves the card's kind without an adapter,
+        // independent of the adapters installed by production constructors.
+        planes.consent_drain = Arc::new(ConsentDrain::default());
         let before = std::fs::read(store.path()).unwrap();
         ordinary_reply(&invoke(&planes, 1).await);
         assert_eq!(cingulate.methods(), [wire::CONSENT_ANSWERS]);

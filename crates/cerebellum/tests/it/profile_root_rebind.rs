@@ -700,7 +700,17 @@ impl TargetResolver for NothingRunning {
     }
 }
 
-fn management_planes(root: &Path) -> Planes {
+struct RebindPlanes {
+    planes: Planes,
+    service: super::support::computer::cingulate::ScriptedCarrier,
+}
+impl std::ops::Deref for RebindPlanes {
+    type Target = Planes;
+    fn deref(&self) -> &Planes {
+        &self.planes
+    }
+}
+fn management_planes(root: &Path) -> RebindPlanes {
     let lifecycle = Arc::new(
         ProfileLifecycle::open_with_config(root, registry_config())
             .expect("management registry opens"),
@@ -715,7 +725,11 @@ fn management_planes(root: &Path) -> Planes {
         JournalPersistence::Isolated,
     );
     planes.management = management;
-    planes
+    let service = super::support::computer::cingulate::ScriptedCarrier::default();
+    RebindPlanes {
+        planes: service.install(planes),
+        service,
+    }
 }
 
 async fn bind_management_route(
@@ -723,7 +737,13 @@ async fn bind_management_route(
     writer: &mpsc::Sender<Frame>,
     rx: &mut mpsc::Receiver<Frame>,
 ) {
-    bind_management_route_as(planes, writer, rx, Some(Principal::Direct)).await;
+    bind_management_route_as(
+        planes,
+        writer,
+        rx,
+        cerebellum::session_caller_principal_for_test(),
+    )
+    .await;
 }
 
 async fn bind_management_route_as(
@@ -745,14 +765,15 @@ async fn bind_management_route_as(
             "opencode".to_string(),
             "profile-root-rebind-conversation".to_string(),
         ),
-        principal,
+        principal: principal.clone(),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
             "agentProjectId": "profile-root-rebind-project",
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
         })),
-        scope: None,
+        scope: (principal == cerebellum::session_caller_principal_for_test())
+            .then(|| super::support::computer::cingulate::stamp("profile-root-rebind-project")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -790,58 +811,77 @@ fn rebind_request(corr: u64, params: Value) -> Frame {
 }
 
 async fn open_rebind_over_wire(
-    planes: &Planes,
+    planes: &RebindPlanes,
     writer: &mpsc::Sender<Frame>,
     rx: &mut mpsc::Receiver<Frame>,
 ) -> (Value, Frame, Value) {
+    let before = planes.service.questions().len();
     cerebellum::handle_frame_for_test(rebind_request(10, json!({})), writer, planes)
         .await
-        .expect("rebind request is handled");
-    let mut reply = None;
-    let mut question = None;
-    for _ in 0..2 {
-        let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("management reply and question are prompt")
-            .expect("writer stays open");
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        if frame.header.ty == FrameType::Request {
-            question = Some((frame, body));
-        } else {
-            reply = Some(body);
-        }
-    }
-    let reply = reply.expect("immediate reply");
-    let (question_frame, question) = question.expect("elicitation question");
-    (reply, question_frame, question)
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(frame.header.ty, FrameType::Request);
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    let question = planes.service.questions()[before].clone();
+    let synthetic = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        4,
+        1,
+        (before + 1) as u64,
+        serde_json::to_vec(&question).unwrap(),
+    )
+    .unwrap();
+    assert!(rx.try_recv().is_err(), "no reverse question");
+    (reply, synthetic, question)
 }
 
 async fn answer_rebind(
-    planes: &Planes,
+    planes: &RebindPlanes,
     writer: &mpsc::Sender<Frame>,
     question: &Frame,
     decision: &str,
 ) {
-    let answer = Frame::build_with_version(
+    let body: Value = serde_json::from_slice(&question.body).unwrap();
+    let outcome = if decision == "no_answer" {
+        cerebellum::elicit::AskOutcome::NoAnswer
+    } else {
+        cerebellum::elicit::AskOutcome::Answered(json!({"decision":decision}))
+    };
+    assert!(planes
+        .service
+        .answer_id(body["id"].as_str().unwrap(), outcome));
+    assert_eq!(
+        planes.management.profile_root_rebind_pending_count().await,
+        1
+    );
+    let (tx, mut rx) = mpsc::channel(4);
+    let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
-        FrameType::Response,
+        FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
-        question.header.channel,
-        question.header.epoch,
-        question.header.corr,
-        serde_json::to_vec(&json!({"decision": decision})).unwrap(),
+        4,
+        1,
+        991,
+        serde_json::to_vec(&json!({"method":"test.drain","params":{}})).unwrap(),
     )
     .unwrap();
-    cerebellum::handle_frame_for_test(answer, writer, planes)
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
         .await
-        .expect("elicitation answer is handled");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while planes.management.profile_root_rebind_pending_count().await != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("settlement completes");
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        planes.management.profile_root_rebind_pending_count().await,
+        0
+    );
+    let _ = writer;
 }
 
 #[tokio::test]
@@ -898,10 +938,7 @@ async fn management_wire_allows_rebinding_the_recreated_root() {
             .collect::<Vec<_>>(),
         ["allow", "deny"]
     );
-    assert_eq!(
-        question["params"]["requestedSchema"]["properties"]["decision"]["enum"],
-        json!(["allow", "deny"])
-    );
+    assert_eq!(question["params"].get("requestedSchema"), None);
 
     answer_rebind(&planes, &writer, &question_frame, "allow").await;
     let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
@@ -940,129 +977,51 @@ async fn management_wire_denial_writes_nothing_and_leaves_the_root_refused() {
 /// only repeat "not answered yet".
 #[tokio::test]
 async fn management_wire_names_a_rebind_question_nobody_was_asked() {
-    // The ending, and whether the next request reports it. `refused` is an
-    // error frame in place of an answer, which is how a consumer with no
-    // handler for questions refuses one.
-    let cases = [
+    for (ending, refused) in [
         ("deny", false),
         ("no_answer", false),
-        ("not_put_to_anyone", true),
-        ("refused", true),
-        ("undeliverable", false),
         ("some_future_word", false),
-    ];
-    for (ending, reported) in cases {
+        ("elicitation_requester_refused", true),
+        ("unknown_method", true),
+    ] {
         let root = TestRoot::new("wire-endings");
-        let project_id = "project-wire-endings";
-        mint_durable_record(root.path(), project_id);
+        mint_durable_record(root.path(), "project-wire-endings");
         recreate_root(root.path());
         let planes = management_planes(root.path());
         let (writer, mut rx) = mpsc::channel(8);
         bind_management_route(&planes, &writer, &mut rx).await;
-
-        let first_ask = if ending == "undeliverable" {
-            // A closed carrier: neither the question nor the reply can be
-            // sent, so only the settlement is observable.
-            let (closed, mut closed_rx) = mpsc::channel(8);
-            closed_rx.close();
-            let _ =
-                cerebellum::handle_frame_for_test(rebind_request(20, json!({})), &closed, &planes)
-                    .await;
-            None
+        if refused {
+            planes.service.refuse_next_request(ending);
+            cerebellum::handle_frame_for_test(rebind_request(20, json!({})), &writer, &planes)
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(reply["outcome"], "consent_unavailable");
+            assert_eq!(
+                reply["detail"]["reason"],
+                if ending == "unknown_method" {
+                    "undeliverable"
+                } else {
+                    "not_put_to_anyone"
+                }
+            );
         } else {
             let (reply, question, _) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
-            assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-            assert!(reply.get("previous_request").is_none(), "{reply}");
-            end_rebind_question(&planes, &writer, &question, ending).await;
-            Some(reply["ask_id"].as_str().unwrap().to_string())
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while planes.management.profile_root_rebind_pending_count().await != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("settlement completes");
-        let lifecycle = ProfileLifecycle::open_with_config(root.path(), registry_config()).unwrap();
-        assert_identity_mismatch(&lifecycle, project_id);
-        drop(lifecycle);
-        assert!(
-            !root.path().join(PROFILE_ROOT_REBINDS_FILE).exists(),
-            "{ending} rebound the root"
+            assert_eq!(reply["outcome"], "consent_pending");
+            answer_rebind(&planes, &writer, &question, ending).await;
+        }
+        assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+        let (next, _, _) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
+        assert_eq!(next["outcome"], "consent_pending");
+        assert_eq!(
+            next["previous_request"]["disposition"].as_str(),
+            (ending == "elicitation_requester_refused").then_some("not_put_to_anyone")
         );
-
-        cerebellum::handle_frame_for_test(rebind_request(21, json!({})), &writer, &planes)
-            .await
-            .expect("rebind request is handled");
-        let mut next = None;
-        for _ in 0..2 {
-            let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("management reply and question are prompt")
-                .expect("writer stays open");
-            if frame.header.ty != FrameType::Request {
-                next = Some(serde_json::from_slice::<Value>(&frame.body).unwrap());
-            }
-        }
-        let next = next.expect("immediate reply");
-        assert_eq!(next["outcome"], "consent_pending", "{ending}: {next}");
-        if reported {
-            let previous = &next["previous_request"];
-            assert_eq!(previous["ask_id"], json!(first_ask), "{ending}: {next}");
-            assert_eq!(previous["disposition"], "not_put_to_anyone", "{next}");
-            let remedy = previous["remedy"].as_str().unwrap().to_lowercase();
-            for loop_word in ["ask again", "retry", "wait"] {
-                assert!(
-                    !remedy.contains(loop_word),
-                    "a question nobody was shown sends the caller round a loop: {remedy}"
-                );
-            }
-        } else {
-            assert!(
-                next.get("previous_request").is_none(),
-                "{ending} was reported as unreached: {next}"
-            );
-        }
     }
-}
-
-/// End a rebind question with the decision word `ending`, or for `refused`
-/// with an error frame in place of an answer.
-async fn end_rebind_question(
-    planes: &Planes,
-    writer: &mpsc::Sender<Frame>,
-    question: &Frame,
-    ending: &str,
-) {
-    let (ty, body) = if ending == "refused" {
-        (
-            FrameType::Error,
-            serde_json::to_vec(&subc_protocol::ErrorBody {
-                code: "REVERSE_REQUEST_UNHANDLED".to_string(),
-                message: "no reverse-request handler is registered".to_string(),
-                detail: None,
-            })
-            .unwrap(),
-        )
-    } else {
-        (
-            FrameType::Response,
-            serde_json::to_vec(&json!({"decision": ending})).unwrap(),
-        )
-    };
-    let answer = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        ty,
-        Flags::new(false, Priority::Interactive, false),
-        question.header.channel,
-        question.header.epoch,
-        question.header.corr,
-        body,
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(answer, writer, planes)
-        .await
-        .expect("the ending is handled");
 }
 
 #[tokio::test]
@@ -1103,6 +1062,27 @@ async fn rebind_attributed_conversation(label: &str, principal: Option<Principal
     let planes = management_planes(root.path());
     let (writer, mut rx) = mpsc::channel(8);
     bind_management_route_as(&planes, &writer, &mut rx, principal).await;
+    if planes
+        .routes
+        .accepted_bind_for_test(4, 1)
+        .unwrap()
+        .scope
+        .is_none()
+    {
+        cerebellum::handle_frame_for_test(rebind_request(10, json!({})), &writer, &planes)
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(reply["outcome"], "consent_unavailable");
+        assert_eq!(reply["detail"]["reason"], "no_agent_session");
+        assert!(planes.service.questions().is_empty());
+        assert!(!root.path().join(PROFILE_ROOT_REBINDS_FILE).exists());
+        return json!("");
+    }
     let (reply, question_frame, _) = open_rebind_over_wire(&planes, &writer, &mut rx).await;
     assert_eq!(reply["outcome"], "consent_pending", "{label}: {reply}");
     answer_rebind(&planes, &writer, &question_frame, "allow").await;
@@ -1114,19 +1094,16 @@ async fn rebind_attributed_conversation(label: &str, principal: Option<Principal
     durable["elicited"]["conversation_key"].clone()
 }
 
-/// A `direct` desk route may rebind the profile root, and does so outside any
-/// conversation: the route names one, and the rebind is attributed to none.
-/// Prefrontal's core module, which acts in the conversation its route names,
-/// keeps the attribution.
-///
-/// The attribution is the one place a rebind reads the route's conversation,
-/// so it shows whether the operator's call saw that conversation at all.
+/// A direct operator request cannot ask for permission to re-identify a
+/// profile root, even when it names a conversation. Only the agent session
+/// can raise that question; its successful rebind records that conversation
+/// as the origin of the person's permission.
 #[tokio::test]
-async fn an_operator_rebind_runs_outside_the_conversation_its_route_names() {
+async fn an_operator_rebind_cannot_raise_a_card_for_its_named_conversation() {
     assert_eq!(
         rebind_attributed_conversation("operator-direct", Some(Principal::Direct)).await,
         "",
-        "an operator's rebind is attributed to no conversation"
+        "an operator route cannot rebind"
     );
     assert_eq!(
         rebind_attributed_conversation(

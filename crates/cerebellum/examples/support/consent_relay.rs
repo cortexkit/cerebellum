@@ -1,18 +1,11 @@
-//! The consent relay every live probe needs to answer its own elicitation.
-//!
-//! A probe that drives a capability requiring user consent has to play both
-//! parts: it sends the request, catches the reverse-request question the module
-//! emits on the same route, answers it, and reads the reply. That is scaffolding
-//! rather than measurement, and it was copied byte-for-byte into four probes --
-//! where a change to the consent path had four places to be missed and a probe
-//! carrying a stale relay MIS-MEASURES rather than failing.
-//!
-//! Included with `#[path = "support/consent_relay.rs"] mod consent_relay;`
-//! inside each probe's target-gated module. Cargo mints example targets from
-//! `examples/*.rs` and `examples/*/main.rs` only, so a file here is not built as
-//! an example of its own, and `scripts/module-wiring-gate.sh` scans the same
-//! shape and will not ask for it to be declared.
+//! Drive probe requests over a fixture for Cingulate, the consent service.
+//! Permission questions are inspected at that service; the agent route's writer
+//! carries only the probe's reply, never a question sent back to the agent.
 
+#[allow(dead_code)]
+pub mod cingulate {
+    include!("../../tests/support/cingulate.rs");
+}
 use std::time::Duration;
 
 use cerebellum::Planes;
@@ -20,13 +13,9 @@ use serde_json::Value;
 use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 
-/// Drive one request that may open an elicitation, answer it, return the reply.
-///
-/// Reads frames until the reply is in hand, answering any question that
-/// arrives on the way. Both orders happen on one route: a computer grant is
-/// asked while the request waits, so its question comes BEFORE the reply,
-/// while a browser grant replies `consent_pending` first and asks after. So a
-/// `consent_pending` reply is final only once its question has been answered.
+/// Drive a request that may ask a permission question, answer it, and return
+/// the reply. When the request replies before the answer, make another request
+/// to apply that answer so the probe can inspect the resulting permission.
 pub async fn elicit_and_answer(
     planes: &Planes,
     opening: Frame,
@@ -68,54 +57,72 @@ pub async fn elicit_and_answer_waiting(
     mut observe: impl FnMut(&Value),
     frame_wait: Duration,
 ) -> Result<Value, String> {
+    let service = cingulate::ScriptedCarrier::default();
+    let configured = service.install(planes.clone());
+    let channel = opening.header.channel;
+    let epoch = opening.header.epoch;
     let (writer, mut frames) = mpsc::channel(8);
-    // Returns once the request is spawned, so a request that waits for its
-    // answer is still running when the question is read below.
-    cerebellum::handle_frame_for_test(opening, &writer, planes)
+    cerebellum::handle_frame_for_test(opening, &writer, &configured)
         .await
         .map_err(|error| format!("{label} request failed: {error}"))?;
-
-    let mut reply = None;
-    let mut answered = false;
+    let deadline = tokio::time::Instant::now() + frame_wait;
+    let mut observed = 0;
     loop {
-        let frame = tokio::time::timeout(frame_wait, frames.recv())
-            .await
-            .map_err(|_| format!("{label} reply or question timed out"))?
-            .ok_or_else(|| format!("{label} relay closed"))?;
-        let body: Value = serde_json::from_slice(&frame.body)
-            .map_err(|error| format!("{label} frame was not JSON: {error}"))?;
-        if frame.header.ty == FrameType::Request {
-            observe(&body);
-            println!("{label} question: {body}");
-            println!("{label} answer: {answer_body}");
-            // Addressed to the QUESTION's channel, epoch and corr rather than
-            // the request's: the answer is correlated to the ask, and a reply
-            // built from the opening frame's header is silently never matched.
-            let answer = Frame::build_with_version(
-                PROTOCOL_VERSION,
-                FrameType::Response,
-                Flags::new(false, Priority::Interactive, false),
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                serde_json::to_vec(&answer_body).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-            cerebellum::handle_frame_for_test(answer, &writer, planes)
-                .await
-                .map_err(|error| format!("{label} answer failed: {error}"))?;
-            answered = true;
-        } else {
-            reply = Some(body);
+        for question in service.questions().iter().skip(observed) {
+            observe(question);
+            let id = question["id"].as_str().unwrap();
+            service.answer_id(
+                id,
+                cerebellum::elicit::AskOutcome::Answered(answer_body.clone()),
+            );
+            observed += 1;
         }
-        if let Some(reply) = reply.as_ref() {
-            let structured = reply.get("structuredContent").unwrap_or(reply);
-            if structured["outcome"] != "consent_pending" || answered {
-                break;
+        match frames.try_recv() {
+            Ok(frame) => {
+                if frame.header.ty == FrameType::Request {
+                    return Err(format!("{label} emitted a reverse request"));
+                }
+                let reply: Value =
+                    serde_json::from_slice(&frame.body).map_err(|error| error.to_string())?;
+                let structured = reply.get("structuredContent").unwrap_or(&reply);
+                if structured["outcome"] == "consent_pending" {
+                    // The original request returned before the person answered.
+                    // A new request applies the answer; no background task does it.
+                    for question in service.questions().iter().skip(observed) {
+                        observe(question);
+                        service.answer_id(
+                            question["id"].as_str().unwrap(),
+                            cerebellum::elicit::AskOutcome::Answered(answer_body.clone()),
+                        );
+                    }
+                    let frame = Frame::build_with_version(
+                        PROTOCOL_VERSION,
+                        FrameType::Request,
+                        Flags::new(false, Priority::Interactive, false),
+                        channel,
+                        epoch,
+                        99001,
+                        serde_json::to_vec(&serde_json::json!({"method":"test.drain","params":{}}))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    cerebellum::handle_frame_for_test(frame, &writer, &configured)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tokio::time::timeout_at(deadline, frames.recv())
+                        .await
+                        .map_err(|_| format!("{label} drain timed out"))?;
+                }
+                return Ok(reply);
             }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(format!("{label} writer closed"))
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{label} reply timed out"));
+        }
+        tokio::task::yield_now().await;
     }
-    let reply = reply.ok_or_else(|| format!("{label} returned no reply"))?;
-    println!("{label} reply: {reply}");
-    Ok(reply)
 }

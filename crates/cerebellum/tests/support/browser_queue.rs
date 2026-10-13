@@ -39,7 +39,11 @@ async fn held(rx: &mut mpsc::Receiver<Frame>) {
 
 async fn begin(planes: &Planes, tx: &mpsc::Sender<Frame>, rx: &mut mpsc::Receiver<Frame>) -> Frame {
     send(planes, tx, navigation()).await;
-    let question = consent_frame(rx).await;
+    let question = ScriptedCarrier::for_planes(planes).card(9, 3).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "the action remains parked on its unanswered card"
+    );
     assert_eq!(question.header.ty, FrameType::Request);
     question
 }
@@ -48,25 +52,18 @@ async fn replies(rx: &mut mpsc::Receiver<Frame>, count: usize) -> Vec<Frame> {
     let mut replies = Vec::new();
     while replies.len() < count {
         let frame = consent_frame(rx).await;
-        if frame.header.ty != FrameType::Cancel {
-            assert_eq!(frame.header.ty, FrameType::Response, "{}", body(&frame));
-            replies.push(frame);
-        }
+        assert_eq!(frame.header.ty, FrameType::Response, "{}", body(&frame));
+        replies.push(frame);
     }
     replies
 }
 
 async fn cancelled(rx: &mut mpsc::Receiver<Frame>) -> Frame {
-    loop {
-        let frame = consent_frame(rx).await;
-        if frame.header.ty == FrameType::Cancel {
-            continue;
-        }
-        assert_eq!(frame.header.ty, FrameType::Error);
-        let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(error.code, "cancelled");
-        return frame;
-    }
+    let frame = consent_frame(rx).await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(error.code, "cancelled");
+    frame
 }
 
 #[tokio::test]
@@ -137,7 +134,7 @@ async fn browser_queue_cancelled_head_releases_successor() {
     let (planes, launcher) = blocking_grant_fixture().await;
     grant_browser(&planes, "https://page.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
-    begin(&planes, &tx, &mut rx).await;
+    let question = begin(&planes, &tx, &mut rx).await;
     send(&planes, &tx, call(802, "snapshot", json!({}))).await;
     held(&mut rx).await;
     let mut cancel = navigation();
@@ -152,6 +149,12 @@ async fn browser_queue_cancelled_head_releases_successor() {
     assert_eq!(body(&results[0])["detail"]["decision"], "cancelled");
     assert_eq!(body(&results[1])["outcome"], "ok");
     assert_eq!(*launcher.effects.lock().unwrap(), ["snapshot"]);
+    let calls = ScriptedCarrier::for_planes(&planes).calls();
+    assert!(calls
+        .iter()
+        .any(|(method, params)| method == "consent.detach"
+            && params["elicitation_id"] == body(&question)["id"]));
+    assert!(calls.iter().all(|(method, _)| method != "consent.withdraw"));
 }
 
 #[tokio::test]
@@ -194,7 +197,7 @@ async fn bind(
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
         ),
-        scope: None,
+        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -312,7 +315,7 @@ async fn browser_queue_model_order_beats_reversed_arrival() {
     .await;
     held(&mut rx).await;
     send(&planes, &tx, positioned(navigation(), 0)).await;
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     held(&mut rx).await;
     assert!(launcher.effects.lock().unwrap().is_empty());
@@ -329,27 +332,77 @@ async fn browser_queue_model_order_beats_reversed_arrival() {
 #[tokio::test]
 async fn browser_queue_goodbye_removes_queued_call() {
     let (planes, launcher) = blocking_grant_fixture().await;
+    grant_browser(&planes, "https://page.example:8443", vec![]).await;
     let (tx, mut rx) = mpsc::channel(16);
     bind(&planes, &tx, &mut rx, 10, "test-session").await;
-    begin(&planes, &tx, &mut rx).await;
+    let question = begin(&planes, &tx, &mut rx).await;
     send(&planes, &tx, call(802, "screenshot", json!({}))).await;
     held(&mut rx).await;
     let mut goodbye = call(802, "screenshot", json!({}));
     goodbye.header.ty = FrameType::Goodbye;
     goodbye.body.clear();
     send(&planes, &tx, goodbye).await;
-    let cancelled = cancelled(&mut rx).await;
+    let cancelled = loop {
+        let frame = consent_frame(&mut rx).await;
+        if frame.header.ty == FrameType::Request {
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(body(&frame)["op"], "scope.describe");
+            answer_describe(
+                &planes,
+                &tx,
+                &frame,
+                FrameType::Response,
+                describe_answer("active", Some(1), true, true),
+            )
+            .await;
+            continue;
+        }
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(body(&frame)["code"], "cancelled");
+        break frame;
+    };
     assert_eq!(cancelled.header.corr, 802);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if ScriptedCarrier::for_planes(&planes)
+                .calls()
+                .iter()
+                .any(|(method, params)| {
+                    method == "consent.withdraw"
+                        && params["elicitation_id"] == body(&question)["id"]
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Goodbye withdraws the held card");
     assert!(!launcher.effects.lock().unwrap().contains(&"screenshot"));
-    let mut launch = call(803, "launch", json!({}));
-    launch.header.channel = 10;
-    send(&planes, &tx, launch).await;
-    let launched = consent_frame(&mut rx).await;
-    assert_eq!(launched.header.corr, 803);
-    assert_eq!(
-        body(&launched)["outcome"],
-        "launched",
-        "{}",
-        body(&launched)
-    );
+    // Route 10 keeps the session's browser after Goodbye closes route 9.
+    // Its snapshot must now pass through the per-conversation queue, proving
+    // that the closed navigation no longer blocks surviving requests.
+    let mut snapshot = call(803, "snapshot", json!({}));
+    snapshot.header.channel = 10;
+    send(&planes, &tx, snapshot).await;
+    let result = loop {
+        let frame = consent_frame(&mut rx).await;
+        if frame.header.ty == FrameType::Request {
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(body(&frame)["op"], "scope.describe");
+            answer_describe(
+                &planes,
+                &tx,
+                &frame,
+                FrameType::Response,
+                describe_answer("active", Some(1), true, true),
+            )
+            .await;
+            continue;
+        }
+        break frame;
+    };
+    assert_eq!(result.header.corr, 803);
+    assert_eq!(body(&result)["outcome"], "ok", "{}", body(&result));
 }

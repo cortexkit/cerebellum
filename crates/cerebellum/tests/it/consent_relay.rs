@@ -60,11 +60,7 @@ fn route_request(corr: u64, body: Value) -> Frame {
     .unwrap()
 }
 
-/// A module with one management route that declares it can be asked questions.
-///
-/// `consumer_capabilities: ["elicitation"]` is what makes the module willing to
-/// send a reverse request at all; without it `open_grant` answers rather than
-/// asking, which is a different path and would test nothing here.
+/// A management route admitted under an agent session, with an isolated journal.
 async fn management_planes() -> Planes {
     // Isolated, not because this test journals anything -- `open_grant` does
     // not -- but because the constructor decides where the journal WOULD go,
@@ -93,7 +89,7 @@ async fn management_planes() -> Planes {
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
-        scope: None,
+        scope: Some(consent_relay::cingulate::stamp("pj-consent-relay-test")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -190,35 +186,32 @@ async fn a_reply_that_opens_no_question_returns_without_waiting_for_one() {
     );
 }
 
-/// An answer correlated to the REQUEST rather than the question settles nothing.
-///
-/// Built by hand rather than through the relay, because this is the mistake the
-/// relay exists to prevent: the reply frame and the question frame carry
-/// different corrs, and answering on the wrong one is silently ignored. Without
-/// this arm, a relay that used the request's header would pass every other test
-/// here by returning the same `consent_pending` body.
+/// Neither a response on the original request nor a feed record for another
+/// card may grant permission. Only the id returned by the consent service can
+/// settle the permission snapshot this module filed.
 #[tokio::test]
-async fn an_answer_on_the_requests_correlation_settles_nothing() {
-    let planes = management_planes().await;
+async fn an_answer_for_a_different_card_id_settles_nothing() {
+    let service = consent_relay::cingulate::ScriptedCarrier::default();
+    let planes = service.install(management_planes().await);
     let before = planes.management.browser_grant_count().await;
     let (writer, mut frames) = mpsc::channel(8);
-
     cerebellum::handle_frame_for_test(open_grant(12), &writer, &planes)
         .await
-        .expect("the grant request is served");
-
-    let mut saw_question = false;
-    while let Ok(Some(frame)) =
-        tokio::time::timeout(std::time::Duration::from_millis(500), frames.recv()).await
-    {
-        saw_question |= frame.header.ty == FrameType::Request;
-    }
+        .unwrap();
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.header.ty, FrameType::Response);
+    let pending: Value = serde_json::from_slice(&pending.body).unwrap();
+    assert_eq!(pending["outcome"], "consent_pending");
+    let id = pending["ask_id"].as_str().unwrap();
+    assert_eq!(service.questions()[0]["id"], id);
     assert!(
-        saw_question,
-        "the module asked a question to answer wrongly"
+        frames.try_recv().is_err(),
+        "no reverse question on the agent route"
     );
 
-    // corr 12 is the REQUEST's; the question carries its own.
     let misaddressed = Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Response,
@@ -226,15 +219,51 @@ async fn an_answer_on_the_requests_correlation_settles_nothing() {
         MANAGEMENT_CHANNEL,
         MANAGEMENT_EPOCH,
         12,
-        serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+        serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
     )
     .unwrap();
-    let _ = cerebellum::handle_frame_for_test(misaddressed, &writer, &planes).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    cerebellum::handle_frame_for_test(misaddressed, &writer, &planes)
+        .await
+        .unwrap();
+    service.answer_unraised("el_not_the_raised_card", "allow_conversation");
+    let drain = |corr| route_request(corr, json!({"method":"test.drain","params":{}}));
+    cerebellum::handle_frame_for_test(drain(13), &writer, &planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert!(
+        service
+            .calls()
+            .iter()
+            .any(|(method, _)| method == "consent.answers"),
+        "the production drain read the wrong-id record"
+    );
     assert_eq!(
         planes.management.browser_grant_count().await,
         before,
-        "an answer on the request's correlation must mint nothing"
+        "an answer for another card must mint nothing"
+    );
+    assert_eq!(planes.management.browser_grant_pending_count().await, 1);
+
+    assert!(service.answer_id(
+        id,
+        cerebellum::elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+    ));
+    cerebellum::handle_frame_for_test(drain(14), &writer, &planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(
+        planes.management.browser_grant_count().await,
+        before + 1,
+        "the matching card's answer does grant"
     );
 }

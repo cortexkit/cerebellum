@@ -4251,7 +4251,7 @@ mod orphan_recovery_tests {
             ExecutableIdentityRecord, LaunchGenerationRecord, LaunchJournalPort,
             RecoveredBrowserProcess, RecoveryPendingReason,
         };
-        use crate::elicit::AskOutcome;
+        use crate::cingulate_client::desk::Ending;
         use crate::launch_recovery::{
             ClearFailure, ClearRefusal, ProcessFact, ProcessTable, ProcessUsers,
             SystemProcessTable, Unreadable,
@@ -4503,6 +4503,8 @@ mod orphan_recovery_tests {
                     .open_launch_recovery_clear(PROJECT, None, true)
                     .await;
                 let question = question.unwrap_or_else(|| panic!("no question: {reply}"));
+                self.plane
+                    .record_prepared_consent(&question, &question.ask_id);
                 assert_eq!(reply["outcome"], "consent_pending", "{reply}");
                 (question.body, question.ask_id)
             }
@@ -5069,23 +5071,27 @@ mod orphan_recovery_tests {
             let deadline_passed = Instant::now() + Duration::from_secs(31 * 60);
             let cases = [
                 (
-                    AskOutcome::Answered(json!({"decision": "keep"})),
+                    Ending::Declined {
+                        choice_id: "keep".into(),
+                    },
                     ClearSettlement::Kept,
                     "kept",
                 ),
-                (AskOutcome::NoAnswer, ClearSettlement::NoAnswer, "no_answer"),
+                (Ending::NoAnswer, ClearSettlement::NoAnswer, "no_answer"),
                 (
-                    AskOutcome::NotPutToAnyone,
+                    Ending::NotPutToAnyone,
                     ClearSettlement::NotPutToAnyone,
                     "not_put_to_anyone",
                 ),
                 (
-                    AskOutcome::Undeliverable,
+                    Ending::DeliveryFailed,
                     ClearSettlement::Undeliverable,
                     "undeliverable",
                 ),
                 (
-                    AskOutcome::Answered(json!({"decision": "some_future_word"})),
+                    Ending::Declined {
+                        choice_id: "some_future_word".into(),
+                    },
                     ClearSettlement::UnrecognizedAnswer,
                     "unrecognized_answer",
                 ),
@@ -5093,7 +5099,7 @@ mod orphan_recovery_tests {
             for (ending, settlement, outcome) in cases {
                 let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
                 let (_, ask_id) = fixture.ask().await;
-                let ended_at = if matches!(ending, AskOutcome::NoAnswer) {
+                let ended_at = if matches!(ending, Ending::NoAnswer) {
                     deadline_passed
                 } else {
                     Instant::now()
@@ -5151,13 +5157,24 @@ mod orphan_recovery_tests {
                 restarted
                     .settle_launch_recovery_clear(&ask_id, Some(&clear()))
                     .await,
-                ClearSettlement::AskedByEarlierStart
+                ClearSettlement::UnknownAsk
             );
             assert_eq!(
                 restarted
                     .settle_launch_recovery_clear("browser-grant-consent-1", Some(&clear()))
                     .await,
                 ClearSettlement::UnknownAsk
+            );
+            // The consent service's opaque card id does not encode which module
+            // start asked. The pending record carries the module's startup id,
+            // so an old answer cannot clear a launch record that the current
+            // startup recovery kept active.
+            restarted.copy_pending_clear_for_test(&fixture.plane, &ask_id, "el_previous_start");
+            assert_eq!(
+                restarted
+                    .settle_launch_recovery_clear("el_previous_start", Some(&clear()))
+                    .await,
+                ClearSettlement::AskedByEarlierStart
             );
             fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "restarted");
         }
