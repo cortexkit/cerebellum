@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 
 use crate::support::source_scan;
 
-/// Names only the reverse lane had: its question sender and its outcome
-/// type, the bookkeeping beneath them, the word a relay sent for silence, and
-/// the route fact that said a consumer could relay a question.
+/// Identifiers only the removed path used: the type that sent a question
+/// back on the agent's route and the type of its outcome, the queue of
+/// outstanding questions beneath it, the answer word a relaying client sent
+/// for silence, and the route-bind fact that said the client could relay a
+/// question to a person.
 const LANE_NAMES: &[&str] = &[
     "Elicitor",
     "ask_for_call",

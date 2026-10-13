@@ -9007,7 +9007,8 @@ mod tests {
         assert!(planes.consent.raised(&id).is_some());
         let old = planes.routes.get(4, 1).unwrap();
         let old_stamp = old.scope.clone().unwrap();
-        // The epoch-1 route was bound, and has closed since.
+        // The epoch-1 route was bound through the epoch check and has since
+        // closed, so no bound route names the ended session any more.
         planes
             .scopes
             .note_bind(&old_stamp, &old.identity.conversation_key);

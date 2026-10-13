@@ -149,10 +149,12 @@ pub(crate) struct ConsentCard {
 }
 
 impl ConsentCard {
-    /// The separate decline is always last, and silence selects it rather than a grant.
+    /// The separate decline is always the last option, and it is also the
+    /// card's `default` and `on_expiry` answer, so a card nobody answers
+    /// grants nothing.
     ///
-    /// The card is returned as `{"params": ...}`, the body `cingulate_client::card`
-    /// lifts into a `consent.request`.
+    /// The card is returned as `{"params": ...}`; `cingulate_client::card`
+    /// turns those params into the `consent.request` sent to Cingulate.
     pub fn render(self) -> Value {
         let default = &self.decline.id;
         let ids: Vec<_> = self
@@ -692,16 +694,18 @@ mod tests {
     }
 }
 
-/// Every kind of consent card this crate sends, built by the same function
-/// production calls and mapped to the Cingulate `consent.request` it is
-/// raised as, with the deadline its call site enforces (which is what stamps
-/// `expires_in_ms`).
+/// Every kind of consent card this crate sends. Each test builds its kind's
+/// card with the builder production calls, turns it into the Cingulate
+/// `consent.request` production sends (with the deadline the call site
+/// enforces as `expires_in_ms`), and checks:
 ///
-/// One test per kind, so a card Cingulate would refuse is named by the test
-/// that goes red. Each test holds the case its kind's pinned card in
-/// `tests/fixtures/cingulate-consent-cards-v1` was built from to that file's
-/// exact bytes, and also pins the urgency the kind was assigned and the scope
-/// it binds, built from the values its grant is keyed on.
+/// - for the same inputs as the kind's pinned file in
+///   `tests/fixtures/cingulate-consent-cards-v1`, that the request is
+///   byte-identical to that file;
+/// - for every case, the card's urgency and its `scope` (the values the
+///   resulting grant is keyed on).
+///
+/// One test per kind, so the test that goes red names the kind that changed.
 #[cfg(test)]
 mod every_card_kind {
     use super::*;
@@ -710,12 +714,14 @@ mod every_card_kind {
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
     use std::sync::Arc;
 
-    /// The call key the pinned cards carry as their `requester_ref`.
+    /// The key of the agent's tool call that raised a card. The pinned files
+    /// carry this one as their `requester_ref`.
     const GOLDEN_CALL_KEY: &str = "pf:card-golden";
 
-    /// The request exactly as it leaves this module for Cingulate, raised
-    /// from a call keyed [`GOLDEN_CALL_KEY`]. A keyless call's request is the
-    /// same apart from carrying no `requester_ref`.
+    /// The `consent.request` production sends to Cingulate for `body`, as
+    /// raised by a tool call whose key is [`GOLDEN_CALL_KEY`]. Also checks
+    /// that a call without a key sends the same request minus
+    /// `requester_ref`.
     fn as_sent(kind: CardKind, body: Value, deadline: Duration) -> CardRequest {
         let unkeyed = consent_request(kind, &body, deadline, None, None, None)
             .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
@@ -732,8 +738,10 @@ mod every_card_kind {
             stripped, unkeyed.params,
             "{kind:?}: the call key changed the rest of the card"
         );
-        // A next step is kept off the card for cerebellum's reply to the
-        // agent, where it must still read as one short sentence.
+        // `next_steps` holds, by option id, what the agent is told to do after
+        // that option is chosen (such as "call present"). Cingulate refuses it
+        // on the card, so cerebellum puts it in its own reply to the agent,
+        // where it must read as one short sentence.
         for step in keyed.next_steps.values() {
             assert!(!step.trim().is_empty() && step.chars().count() <= 200);
             assert!(
@@ -764,9 +772,9 @@ mod every_card_kind {
     }
 
     /// What every card promises Cingulate: a `consent` card whose scope is a
-    /// nonempty object (never a digest stand-in or prose), carrying none of
-    /// the fields only the reverse elicitation lane sent, which Cingulate's
-    /// closed request format refuses.
+    /// nonempty object (never a digest stand-in or prose), and none of
+    /// `requestedSchema`, `call_key` or an option's `next_step`, which
+    /// Cingulate's closed request format refuses.
     fn assert_cingulate_accepts(kind: &str, params: &Value) {
         assert_eq!(params["kind"], "consent", "{kind}: kind");
         assert!(
@@ -1041,8 +1049,9 @@ mod every_card_kind {
             if let Some(golden) = golden {
                 assert_golden(golden, params);
             }
-            // The hand-off's next step is kept for cerebellum's reply to the
-            // agent; it never rides the card.
+            // The "sign in yourself" option tells the agent to call present
+            // next. That instruction goes in cerebellum's reply to the agent,
+            // never on the card.
             assert_eq!(
                 request.next_steps,
                 std::collections::BTreeMap::from([(

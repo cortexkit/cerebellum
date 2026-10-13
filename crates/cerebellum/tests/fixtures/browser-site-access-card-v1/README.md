@@ -1,7 +1,8 @@
 # Browser site-access card vectors
 
-The `params` cerebellum's builder renders for the browser site-access consent
-card, one file for each set of options the card can present. The card is
+Each file holds the card body (the `params` object) that cerebellum's
+builder renders for the browser site-access consent card, one file for each
+set of options the card can present. The card is
 raised with Cingulate, the consent module, as a `consent.request` built from
 these params (`cingulate_client::card::consent_request`), which keeps every
 field the phone shows; its exact bytes are pinned per card kind in
