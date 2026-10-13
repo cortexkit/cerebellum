@@ -113,7 +113,10 @@ const MAX_ACCOUNT_BYTES: usize = 128;
 
 /// Every outcome the reply may carry. Declared once so the reply schema and
 /// the code that builds replies cannot disagree about the vocabulary.
-pub const OUTCOMES: [&str; 19] = [
+pub const OUTCOMES: [&str; 22] = [
+    "capture_pending",
+    "session_invalid",
+    "handoff_interrupted",
     "captured",
     "consent_pending",
     "no_login_observed",
@@ -147,6 +150,9 @@ pub fn reply_schema() -> Value {
             "credential_id": string(),
             "vault_outcome": {"type": "string", "enum": ["created", "replaced"]},
             "record_version": {"type": "integer"},
+            "origin": string(),
+            "expires_in_ms": {"type": "integer"},
+            "message": string(),
             // Only on `consent_pending`: the consent card still open.
             "ask_id": string(),
             // Only on the residue, placement and profile-deletion refusals:
@@ -936,6 +942,14 @@ pub struct CaptureOutcome {
     pub journal: LoginCapturePayload,
 }
 
+/// The window is ready, but observation waits until the caller has durably
+/// recorded who must receive its settlement. A failed write aborts the capture.
+pub(crate) struct CaptureHandoff {
+    pub origin: String,
+    pub expires_in_ms: u64,
+    pub proceed: tokio::sync::oneshot::Sender<bool>,
+}
+
 enum HandoffEnd {
     /// The heuristic held and a verification load showed the session works.
     LoginVerified,
@@ -1064,9 +1078,21 @@ impl CaptureModule {
     where
         Cancelled: Fn() -> bool,
     {
+        self.run_notifying(request, call, None).await
+    }
+
+    pub(crate) async fn run_notifying<Cancelled>(
+        &self,
+        request: &CaptureRequest,
+        call: CaptureCall<'_, Cancelled>,
+        handoff: Option<tokio::sync::oneshot::Sender<CaptureHandoff>>,
+    ) -> CaptureOutcome
+    where
+        Cancelled: Fn() -> bool,
+    {
         let carrier = Arc::clone(&call.consent.carrier);
         let mut taken = None;
-        let outcome = self.run_consented(request, call, &mut taken).await;
+        let outcome = self.run_consented(request, call, &mut taken, handoff).await;
         if let Some(answer) = taken {
             crate::computer_grants::report_login_execution(
                 &carrier,
@@ -1086,6 +1112,7 @@ impl CaptureModule {
         request: &CaptureRequest,
         call: CaptureCall<'_, Cancelled>,
         taken: &mut Option<LoginAnswer>,
+        handoff: Option<tokio::sync::oneshot::Sender<CaptureHandoff>>,
     ) -> CaptureOutcome
     where
         Cancelled: Fn() -> bool,
@@ -1353,7 +1380,7 @@ impl CaptureModule {
         };
 
         let (browser, end) = self
-            .hand_off(browser, request, &origin, &call.cancelled)
+            .hand_off(browser, request, &origin, &call.cancelled, handoff)
             .await;
         let end = match end {
             Ok(end) => end,
@@ -1514,9 +1541,9 @@ impl CaptureModule {
         Some(refusal)
     }
 
-    /// Hand the window to the person and wait until their session works,
-    /// parked as a consent wait so the Busy gauge and in-flight age do not
-    /// read a person's typing as a stuck module.
+    /// Hand the window to the person and observe it until their session works.
+    /// The handover notification lets a keyed caller detach this observation
+    /// from the request after durably recording its settlement obligation.
     ///
     /// Each poll first applies the login heuristic `browser.present` uses (a
     /// credential field came and went, the origin gained cookie names, the
@@ -1532,6 +1559,7 @@ impl CaptureModule {
         request: &CaptureRequest,
         origin: &str,
         cancelled: &Cancelled,
+        handoff: Option<tokio::sync::oneshot::Sender<CaptureHandoff>>,
     ) -> (
         Option<Box<dyn CaptureBrowser>>,
         Result<HandoffEnd, &'static str>,
@@ -1553,6 +1581,18 @@ impl CaptureModule {
         let Some(mut browser) = browser else {
             return (None, Err("present"));
         };
+
+        if let Some(handoff) = handoff {
+            let (proceed, saved) = tokio::sync::oneshot::channel();
+            let ready = CaptureHandoff {
+                origin: origin.to_owned(),
+                expires_in_ms: self.env.handoff_duration.as_millis() as u64,
+                proceed,
+            };
+            if handoff.send(ready).is_err() || saved.await != Ok(true) {
+                return (Some(browser), Ok(HandoffEnd::Cancelled));
+            }
+        }
 
         let guard = crate::call_context::ROUTE_GUARD.try_with(Arc::clone).ok();
         let _parked = guard.as_ref().map(|guard| guard.park_on_consent());

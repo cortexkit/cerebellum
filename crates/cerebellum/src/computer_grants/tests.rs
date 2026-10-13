@@ -730,7 +730,10 @@ async fn revoked_login_cards_cannot_reappear_after_registry_restart() {
         .computer_grants()
         .set_login_park_limit(Duration::from_millis(10));
     let service = planes.consent_test.as_ref().unwrap();
-    let request = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), 4, 1, 15, serde_json::to_vec(&json!({"method":"browser.capture_login","params":{"credential_domain":"ollama.com","account":"work","fetch_url":"https://ollama.com/settings","login_url":"https://ollama.com/signin"}})).unwrap()).unwrap();
+    let request = crate::tests::capture_request_frame(
+        15,
+        json!({"credential_domain":"ollama.com","account":"work","fetch_url":"https://ollama.com/settings","login_url":"https://ollama.com/signin"}),
+    );
     let (writer, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(request, &writer, &planes)
         .await
@@ -1073,7 +1076,7 @@ async fn execution_reports_cover_definite_nonexecution_and_indeterminate_results
 #[tokio::test]
 async fn capture_endings_keep_their_reply_words_and_no_agent_is_not_withheld() {
     for (ending, expected, reason) in [
-        ("allow", "captured", None),
+        ("allow", "capture_pending", None),
         ("deny", "capture_consent_not_given", Some("deny")),
         (
             "future-choice",
@@ -1106,7 +1109,10 @@ async fn capture_endings_keep_their_reply_words_and_no_agent_is_not_withheld() {
             facts.scope = None;
             planes.routes.insert(4, 1, facts);
         }
-        let request = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), 4, 1, 17, serde_json::to_vec(&json!({"method":"browser.capture_login","params":{"credential_domain":"ollama.com","account":"work","fetch_url":"https://ollama.com/settings","login_url":"https://ollama.com/signin"}})).unwrap()).unwrap();
+        let request = crate::tests::capture_request_frame(
+            17,
+            json!({"credential_domain":"ollama.com","account":"work","fetch_url":"https://ollama.com/settings","login_url":"https://ollama.com/signin"}),
+        );
         let (writer, mut rx) = tokio::sync::mpsc::channel(8);
         crate::handle_frame(request, &writer, &planes)
             .await
@@ -1148,6 +1154,11 @@ async fn capture_endings_keep_their_reply_words_and_no_agent_is_not_withheld() {
         );
         if ending != "allow" {
             assert!(fixture.vault.request_params().is_empty());
+        } else {
+            assert_eq!(
+                crate::tests::capture_late(&planes, 17).await["result"]["outcome"],
+                "captured"
+            );
         }
     }
 }

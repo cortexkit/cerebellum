@@ -8,7 +8,7 @@ use crate::management;
 pub const CONSENT_PARK_LIMIT_MS: u64 = 120_000;
 pub const HANDOFF_DURATION_MS: u64 = 600_000;
 pub const COMPUTER_MAX_PARK_MS: u64 = CONSENT_PARK_LIMIT_MS;
-pub const BROWSER_MAX_PARK_MS: u64 = CONSENT_PARK_LIMIT_MS + HANDOFF_DURATION_MS;
+pub const BROWSER_MAX_PARK_MS: u64 = CONSENT_PARK_LIMIT_MS;
 
 pub const TARGET_CHECK_MS: u64 = 2_000;
 pub const CODE_IDENTITY_MS: u64 = 2_000;
@@ -700,11 +700,12 @@ pub const COMPUTER_REPLY_MAX_MS: u64 = reply_max_ms(
     COMPUTER_MAX_PARK_MS,
     COMPUTER_MAX_WORK_MS,
 );
-// browser_use: 6,000 + 423,000 + 720,000 + 292,000 + 6,000 + 6,000
-// + 130,001 = 1,583,001 ms. capture_login holds the call open for the person's
-// sign-in (HANDOFF_DURATION_MS), the dominant park term. Egress adds 130,001 ms
-// for the current writer batch plus the queued channel buffer at the declared
-// byte-rate floor, including two flushes.
+// browser_use: 6,000 + 423,000 + 120,000 + 292,000 + 6,000 + 6,000
+// + 130,001 = 983,001 ms. Only waiting for the person's consent-card answer
+// parks the call. The sign-in window returns a pending reply; a later result
+// reports how sign-in ended. EGRESS_SEND_MS reserves 130,001 ms to send the
+// active reply batch and queued channel buffer at EGRESS_MIN_BYTES_PER_S,
+// including two flushes.
 pub const BROWSER_REPLY_MAX_MS: u64 = reply_max_ms(
     BROWSER_QUEUE_WAIT_LIMIT_MS,
     BROWSER_MAX_PARK_MS,
@@ -1066,10 +1067,7 @@ mod tests {
             CONSENT_PARK_LIMIT_MS + BROWSER_MAX_WORK_MS + RELEASE_BUDGET_MS + BOUNDARY_SLACK_MS
         );
         assert_eq!(COMPUTER_MAX_PARK_MS, CONSENT_PARK_LIMIT_MS);
-        assert_eq!(
-            BROWSER_MAX_PARK_MS,
-            CONSENT_PARK_LIMIT_MS + HANDOFF_DURATION_MS
-        );
+        assert_eq!(BROWSER_MAX_PARK_MS, CONSENT_PARK_LIMIT_MS);
         for (reply, queue, park, work, envelope) in [
             (
                 COMPUTER_REPLY_MAX_MS,
@@ -1099,7 +1097,7 @@ mod tests {
             assert_eq!(envelope, CALL_RECORD_BEGIN_MS + queue + park + work);
         }
         assert_eq!(COMPUTER_REPLY_MAX_MS, 685_001);
-        assert_eq!(BROWSER_REPLY_MAX_MS, 1_583_001);
+        assert_eq!(BROWSER_REPLY_MAX_MS, 983_001);
     }
 
     #[test]

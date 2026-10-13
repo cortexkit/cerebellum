@@ -78,9 +78,12 @@ pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 /// Version 3 adds text-free login handoff state and acknowledgements. Older
 /// files advance to version 3 only when a handoff is recorded; ordinary calls
 /// still use the version 2 format so placing a build does not close rollback.
-pub const CALL_RECORD_VERSION: u64 = 3;
+/// Version 4 adds capture handoffs and their closed settlement vocabulary.
+/// Only the first capture handoff requires reader 4; present remains reader 3.
+pub const CALL_RECORD_VERSION: u64 = 4;
 
 const ORDINARY_CALL_RECORD_VERSION: u64 = 2;
+const HANDOFF_CALL_RECORD_VERSION: u64 = 3;
 
 /// The oldest file version this build reads.
 const OLDEST_READ_CALL_RECORD_VERSION: u64 = 1;
@@ -214,10 +217,10 @@ pub struct CallRecord {
 
 impl CallRecord {
     fn required_version(&self) -> u64 {
-        if self.handoff.is_some() {
-            CALL_RECORD_VERSION
-        } else {
-            ORDINARY_CALL_RECORD_VERSION
+        match &self.handoff {
+            Some(handoff) if handoff.is_capture() => CALL_RECORD_VERSION,
+            Some(_) => HANDOFF_CALL_RECORD_VERSION,
+            None => ORDINARY_CALL_RECORD_VERSION,
         }
     }
 
@@ -762,7 +765,7 @@ fn parse_versioned(bytes: &[u8]) -> Result<(u64, Vec<CallRecord>), CallRecordErr
     lines.pop();
     let mut lines = lines.into_iter();
     let Some(first) = lines.next() else {
-        return Ok((CALL_RECORD_VERSION, Vec::new()));
+        return Ok((ORDINARY_CALL_RECORD_VERSION, Vec::new()));
     };
     let header: Value =
         serde_json::from_str(first).map_err(|error| CallRecordError::Corrupt(error.to_string()))?;
@@ -833,14 +836,17 @@ impl CallRecords {
     ///
     /// Files with headers 1 or 2 are left unchanged until a record is written.
     /// Ordinary writes keep version 2 (migrating v1 as before), which builds
-    /// with version 2 readers can still read. A handoff requires version 3:
-    /// its format floor records minimum reader 3, so staging rejects a build
-    /// that only reads version 2. Merely starting or polling must not prevent
-    /// returning to that compatible build. A crashed record can be reconciled
-    /// in memory again on the next start without rewriting the file.
+    /// with version 2 readers can still read. Present requires reader 3 and
+    /// capture requires reader 4. Saving that minimum reader in the format
+    /// floor makes staging reject an incompatible rollback build, and the file
+    /// header lets an older reader refuse before decoding unfamiliar state.
+    /// Starting or polling must not prevent returning to a compatible build.
+    /// A crashed record can be reconciled in memory again on the next start
+    /// without rewriting the file.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
+            Some(bytes) if bytes.is_empty() => Ok(None),
             Some(bytes) => parse_versioned(&bytes).map(Some),
         });
         let (records, existed, file_version) = match loaded {
@@ -900,7 +906,7 @@ impl CallRecords {
             }
             let dropped = Self::apply_retention(&mut inner, now_ms);
             if existed
-                && file_version == CALL_RECORD_VERSION
+                && file_version >= HANDOFF_CALL_RECORD_VERSION
                 && (reconciled || dropped || line_count != inner.entries.len())
             {
                 if let Err(error) = records.compact(&mut inner, file_version) {
@@ -1377,16 +1383,16 @@ mod tests {
 
         let newer = InMemoryCallRecordStorage::new();
         newer
-            .replace(b"{\"format\":\"call-records\",\"version\":4}\n", 4)
+            .replace(b"{\"format\":\"call-records\",\"version\":5}\n", 5)
             .unwrap();
         let records = CallRecords::open(Box::new(newer.clone()), 0);
         assert!(matches!(
             records.begin("direct", "k", "c", 0),
-            Begin::Unavailable(CallRecordError::UnknownVersion(4))
+            Begin::Unavailable(CallRecordError::UnknownVersion(5))
         ));
         assert_eq!(
             newer.contents().unwrap(),
-            b"{\"format\":\"call-records\",\"version\":4}\n",
+            b"{\"format\":\"call-records\",\"version\":5}\n",
             "a newer build's file was overwritten"
         );
     }
@@ -1585,6 +1591,20 @@ mod tests {
     fn a_fresh_ordinary_call_starts_in_version_2() {
         let storage = InMemoryCallRecordStorage::new();
         let records = CallRecords::open(Box::new(storage.clone()), 0);
+        let _ticket = executed(records.begin("reserved:prefrontal-core", "pf:ordinary", "c", 10));
+        let written = String::from_utf8(storage.contents().unwrap()).unwrap();
+        assert_eq!(
+            written.lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":2}")
+        );
+    }
+
+    #[test]
+    fn an_empty_journal_does_not_activate_the_capture_format() {
+        let storage = InMemoryCallRecordStorage::new();
+        storage.replace(b"", 2).unwrap();
+        let records = CallRecords::open(Box::new(storage.clone()), 0);
+        assert_eq!(storage.contents().unwrap(), b"");
         let _ticket = executed(records.begin("reserved:prefrontal-core", "pf:ordinary", "c", 10));
         let written = String::from_utf8(storage.contents().unwrap()).unwrap();
         assert_eq!(
