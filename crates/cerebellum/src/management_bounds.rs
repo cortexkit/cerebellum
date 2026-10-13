@@ -675,13 +675,10 @@ mod tests {
         .await;
     }
 
-    /// A capture whose consent is answered just inside the consent park, and
-    /// whose sign-in window then runs its whole duration, answers with its own
-    /// result: the route's backstop deadline for `browser.capture_login` (its
-    /// envelope, from `route_limits`) does not fire, and the reply comes
-    /// before the browser tool's reply deadline.
+    /// A person who answers near the consent deadline still gets the sign-in
+    /// window, but the call replies promptly without waiting for that sign-in.
     #[tokio::test(start_paused = true)]
-    async fn a_capture_with_near_limit_consent_and_handoff_answers_inside_its_envelope() {
+    async fn a_capture_with_near_limit_consent_replies_pending_before_sign_in_ends() {
         let fixture = login_capture::test_support::fixture_with(|env| {
             env.handoff_duration = Duration::from_millis(browser_session::HANDOFF_DURATION_MS);
             env.poll_interval = Duration::from_millis(browser_session::HANDOFF_POLL_INTERVAL_MS);
@@ -690,9 +687,8 @@ mod tests {
         // for its whole duration.
         fixture.launcher.script.lock().unwrap().logs_in = false;
         let planes = crate::tests::capture_planes(&fixture);
-        let frame = management_frame(
+        let frame = crate::tests::capture_request_frame(
             51,
-            management::CAPTURE_LOGIN,
             json!({
                 "credential_domain": "ollama.com",
                 "account": "work",
@@ -719,15 +715,21 @@ mod tests {
         let elapsed = arrived.elapsed();
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(reply.header.corr, 51);
-        assert_eq!(body["outcome"], "expired", "{body}");
+        assert_eq!(body["outcome"], "capture_pending", "{body}");
+        assert_eq!(body["expires_in_ms"], browser_session::HANDOFF_DURATION_MS);
         assert!(
-            elapsed >= consent_wait + Duration::from_millis(browser_session::HANDOFF_DURATION_MS),
-            "the handoff ended early: {elapsed:?}"
+            elapsed >= consent_wait && elapsed < consent_wait + Duration::from_secs(2),
+            "only consent, not sign-in, may hold the call: {elapsed:?}"
         );
         assert!(
             elapsed < Duration::from_millis(envelope_ms),
             "the envelope would have fired: {elapsed:?}"
         );
         assert!(elapsed < Duration::from_millis(budgets::BROWSER_REPLY_MAX_MS));
+        tokio::time::sleep(Duration::from_millis(browser_session::HANDOFF_DURATION_MS)).await;
+        assert_eq!(
+            crate::tests::capture_late(&planes, 51).await["result"]["outcome"],
+            "expired"
+        );
     }
 }

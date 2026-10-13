@@ -25,6 +25,9 @@ enum RetentionGroup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffEnding {
+    Captured,
+    SessionInvalid,
+    Expired,
     LoginObserved,
     HandoffExpired,
     ClosedByCaller,
@@ -34,6 +37,9 @@ pub enum HandoffEnding {
 impl HandoffEnding {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Captured => "captured",
+            Self::SessionInvalid => "session_invalid",
+            Self::Expired => "expired",
             Self::LoginObserved => "login_observed",
             Self::HandoffExpired => "handoff_expired",
             Self::ClosedByCaller => "closed_by_caller",
@@ -65,6 +71,19 @@ pub struct HeldHandoff {
     origin: String,
     scope: ScopeIdentity,
     phase: Phase,
+    // Omitted for present so its existing version-3 representation is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    capture: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+impl HeldHandoff {
+    pub(super) fn is_capture(&self) -> bool {
+        self.capture
+    }
 }
 
 pub(super) fn incarnation() -> String {
@@ -189,13 +208,46 @@ pub(super) fn settled_result(record: &CallRecord) -> Option<Value> {
 }
 
 impl CallRecords {
-    /// Sync the recovery obligation before returning `login_pending`. Without
+    /// Sync the recovery obligation before returning a pending handoff. Without
     /// this write, a crash could leave the custodian waiting for a result forever.
     pub fn hold_handoff(
         &self,
         principal: &str,
         call_key: &str,
         conversation: &str,
+        scope: ScopeIdentity,
+        origin: &str,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        self.hold_login(
+            principal,
+            call_key,
+            Some(conversation),
+            scope,
+            origin,
+            now_ms,
+        )
+    }
+
+    /// Capture sign-in uses a separate throwaway browser. `browser.resume`
+    /// ends the persistent browser's handoff, not the capture, so the capture's
+    /// later result must remain owed until its own sign-in has ended.
+    pub fn hold_capture(
+        &self,
+        principal: &str,
+        call_key: &str,
+        scope: ScopeIdentity,
+        origin: &str,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        self.hold_login(principal, call_key, None, scope, origin, now_ms)
+    }
+
+    fn hold_login(
+        &self,
+        principal: &str,
+        call_key: &str,
+        conversation: Option<&str>,
         scope: ScopeIdentity,
         origin: &str,
         now_ms: u64,
@@ -220,6 +272,7 @@ impl CallRecords {
             origin: origin.to_owned(),
             scope,
             phase: Phase::Pending,
+            capture: conversation.is_none(),
         });
         self.write(&mut inner, &record, now_ms)?;
         inner
@@ -227,7 +280,9 @@ impl CallRecords {
             .get_mut(&key)
             .expect("held record exists")
             .record = record;
-        inner.handoffs.insert(conversation.to_owned(), key);
+        if let Some(conversation) = conversation {
+            inner.handoffs.insert(conversation.to_owned(), key);
+        }
         Ok(())
     }
 

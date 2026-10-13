@@ -3997,8 +3997,25 @@ async fn handle_management_request_observed(
                 .await
             }
         };
-        let reply =
-            capture_browser_login(planes, facts, writer, channel, epoch, corr, &request).await;
+        let Some(call_key) = call_key else {
+            return send_tool_response(writer, ver, channel, epoch, corr, json!({
+                "outcome":"invalid_request",
+                "detail":{
+                    "field":"call_key",
+                    "reason_code":"required",
+                    "remedy":"capture_login needs a keyed call because its result arrives later as a notice; do not poll for it"
+                }
+            })).await;
+        };
+        let reply = capture_browser_login(
+            planes,
+            facts,
+            writer,
+            (channel, epoch, corr),
+            &request,
+            call_key,
+        )
+        .await;
         return match planes
             .browser
             .finish_reply(management::CAPTURE_LOGIN, reply)
@@ -4941,19 +4958,18 @@ async fn journal_login_import_result(
     result.to_value()
 }
 
-/// Run one `browser.capture_login` and journal it. The capture deletes its
-/// throwaway profile before returning, and the record is written before the
-/// reply, so neither a second copy of the session nor an unrecorded capture
-/// exists when the caller hears back.
+/// Wait for consent and window handover, not the person's sign-in. The durable
+/// obligation is saved before replying so a restart can settle it, and only
+/// closed outcome codes, never the captured header, enter the late entry.
 async fn capture_browser_login(
     planes: &Planes,
     facts: &AcceptedBindFacts,
     writer: &mpsc::Sender<Frame>,
-    channel: u16,
-    epoch: u32,
-    corr: u64,
+    address: (u16, u32, u64),
     request: &login_capture::CaptureRequest,
+    call_key: &str,
 ) -> Value {
+    let (channel, epoch, corr) = address;
     if !computer_grants::admits_consent(facts) {
         let why = if facts.flow_id.is_some() {
             return flow_consent_refusal("unattended_flow");
@@ -4962,46 +4978,135 @@ async fn capture_browser_login(
         };
         return json!({"outcome":"consent_unavailable","detail":{"reason":why.reason(),"remedy":why.remedy()}});
     }
-    // A cancel frame for this request, a Goodbye for its route, or the start
-    // of a drain all end the capture with nothing written.
+    // Before the sign-in window is handed to the person, cancellation of the
+    // request also cancels consent. Once replied, the capture belongs to its
+    // custodian, so closing the request must not stop sign-in. Module shutdown
+    // still interrupts the capture and disposes its throwaway profile.
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
     let cancel_for_capture = cancel.clone();
+    let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let detached_for_capture = Arc::clone(&detached);
     // The card is raised through the module's computer grants, which hold
     // the call for a bounded wait, leave the card open past it, and answer a
     // retry from a late approval; the capture reports to Cingulate what
     // became of an approval it used that way.
-    let outcome = planes
-        .capture
-        .run(
-            request,
-            login_capture::CaptureCall {
-                accepted: facts,
-                grants: planes.management.computer_grants(),
-                consent: login_consent_request(
-                    planes,
-                    facts,
-                    writer,
-                    (channel, epoch),
-                    computer_grants::LoginCapability::CaptureLogin,
-                    request.consent_parameters(),
-                    cancel,
-                ),
-                cancelled: move || {
-                    cancel_for_capture
-                        .as_ref()
-                        .is_some_and(CancelHandle::is_cancelled)
-                        || draining.load(std::sync::atomic::Ordering::Acquire)
+    let capture = Arc::clone(&planes.capture);
+    let request = request.clone();
+    let accepted = facts.clone();
+    let grants = Arc::clone(planes.management.computer_grants());
+    let consent = login_consent_request(
+        planes,
+        facts,
+        writer,
+        (channel, epoch),
+        computer_grants::LoginCapability::CaptureLogin,
+        request.consent_parameters(),
+        cancel,
+    );
+    let (ready, handed_over) = tokio::sync::oneshot::channel();
+    let mut handed_over = handed_over;
+    let mut running = Box::pin(async move {
+        capture
+            .run_notifying(
+                &request,
+                login_capture::CaptureCall {
+                    accepted: &accepted,
+                    grants: &grants,
+                    consent,
+                    cancelled: move || {
+                        (!detached_for_capture.load(std::sync::atomic::Ordering::Acquire)
+                            && cancel_for_capture
+                                .as_ref()
+                                .is_some_and(CancelHandle::is_cancelled))
+                            || draining.load(std::sync::atomic::Ordering::Acquire)
+                    },
                 },
-            },
-        )
+                Some(ready),
+            )
+            .await
+    });
+    let handoff = tokio::select! {
+        biased;
+        ready = &mut handed_over => ready.ok(),
+        outcome = &mut running => {
+            return journal_capture_outcome(&planes.browser, &facts.identity, outcome).await;
+        }
+    };
+    let Some(handoff) = handoff else {
+        return journal_capture_outcome(&planes.browser, &facts.identity, running.await).await;
+    };
+    let principal = journal::call_records::principal_label(facts.principal.as_ref());
+    let scope = facts
+        .scope
+        .as_ref()
+        .map(journal::call_records::ScopeIdentity::from_stamp)
+        .unwrap_or_else(|| journal::call_records::ScopeIdentity {
+            owner: principal.clone(),
+            reference: facts.identity.conversation_key.clone(),
+            scope_epoch: 0,
+        });
+    let calls = Arc::clone(&planes.calls);
+    let key = call_key.to_owned();
+    let (save_principal, save_key, origin) =
+        (principal.clone(), key.clone(), handoff.origin.clone());
+    let saved = tokio::task::spawn_blocking(move || {
+        calls.hold_capture(&save_principal, &save_key, scope, &origin, wall_clock_ms())
+    })
+    .await;
+    if !matches!(saved, Ok(Ok(()))) {
+        let _ = handoff.proceed.send(false);
+        let _ = journal_capture_outcome(&planes.browser, &facts.identity, running.await).await;
+        return json!({"outcome":"internal_failure","reason":"call_record_unavailable"});
+    }
+    detached.store(true, std::sync::atomic::Ordering::Release);
+    let _ = handoff.proceed.send(true);
+    let browser = Arc::clone(&planes.browser);
+    let identity = facts.identity.clone();
+    let calls = Arc::clone(&planes.calls);
+    tokio::spawn(async move {
+        let outcome = running.await;
+        let ending = capture_ending(&outcome.reply);
+        let _ = journal_capture_outcome(&browser, &identity, outcome).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            calls.finish_handoff(&principal, &key, ending, wall_clock_ms())
+        })
         .await;
+    });
+    json!({
+        "outcome":"capture_pending", "origin":handoff.origin,
+        "expires_in_ms":handoff.expires_in_ms,
+        "message":"The capture result will arrive later as a notice; do not poll for it."
+    })
+}
+
+fn capture_ending(reply: &Value) -> journal::call_records::HandoffEnding {
+    use journal::call_records::HandoffEnding;
+    match reply["outcome"].as_str() {
+        Some("captured") => HandoffEnding::Captured,
+        Some("expired") if reply["reason"] != login_capture::LOGIN_NOT_VERIFIED => {
+            HandoffEnding::Expired
+        }
+        Some(
+            "expired"
+            | "no_login_observed"
+            | "capture_no_cookies_for_url"
+            | "capture_header_unusable",
+        ) => HandoffEnding::SessionInvalid,
+        _ => HandoffEnding::HandoffInterrupted,
+    }
+}
+
+async fn journal_capture_outcome(
+    browser: &BrowserPlane,
+    identity: &RouteIdentity,
+    outcome: login_capture::CaptureOutcome,
+) -> Value {
     // A deposit already made stays in the vault when this record cannot be
     // written: the vault cannot be asked to withdraw it, and its own audit
     // row, bound to the consent card's id, still describes it.
-    if planes
-        .browser
-        .journal_login_capture(&facts.identity, outcome.journal)
+    if browser
+        .journal_login_capture(identity, outcome.journal)
         .await
         .is_err()
     {
@@ -9652,10 +9757,12 @@ mod tests {
             JournalPersistence::Isolated,
         );
         planes.capture = Arc::clone(&fixture.module);
+        planes.browser_config = Some(Planes::short_test_browser_config());
         let admission = json!({
             "agentProjectId": "test-project",
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
+            "browserControlOperations": ["browser.capture_login"],
         });
         planes.routes.insert(
             4,
@@ -9665,7 +9772,7 @@ mod tests {
                 session_caller_principal_for_test(),
                 Some(&admission),
                 Some(&["elicitation".to_string()]),
-                &subc_protocol::RouteTarget::ManagementSurface {
+                &subc_protocol::RouteTarget::ToolProvider {
                     module_id: "cerebellum".to_string(),
                 },
             ),
@@ -9673,7 +9780,9 @@ mod tests {
         computer_grants::tests::CardService::install(planes, 4, 1)
     }
 
-    fn capture_request_frame(correlation: u64, params: Value) -> Frame {
+    pub(super) fn capture_request_frame(correlation: u64, params: Value) -> Frame {
+        let mut arguments = params;
+        arguments["action"] = json!("capture_login");
         Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
             FrameType::Request,
@@ -9682,8 +9791,9 @@ mod tests {
             1,
             correlation,
             serde_json::to_vec(&json!({
-                "method": management::CAPTURE_LOGIN,
-                "params": params,
+                "name": flat_tools::BROWSER_USE,
+                "call_key": format!("pf:capture-{correlation}"),
+                "arguments": arguments,
             }))
             .unwrap(),
         )
@@ -9758,10 +9868,12 @@ mod tests {
                 JournalPersistence::Isolated,
             );
             planes.capture = Arc::clone(&fixture.module);
+            planes.browser_config = Some(Planes::short_test_browser_config());
             let admission = json!({
                 "agentProjectId": "test-project",
                 "sessionKind": "primary",
                 "effectiveCapabilityScope": ["*"],
+                "browserControlOperations": ["browser.capture_login"],
             });
             planes.routes.insert(
                 4,
@@ -9771,7 +9883,7 @@ mod tests {
                     session_caller_principal_for_test(),
                     Some(&admission),
                     None,
-                    &subc_protocol::RouteTarget::ManagementSurface {
+                    &subc_protocol::RouteTarget::ToolProvider {
                         module_id: "cerebellum".to_string(),
                     },
                 ),
@@ -9869,10 +9981,9 @@ mod tests {
         json!([{"elicitation_id": id, "state": "answered", "answered_choice_id": choice}])
     }
 
-    /// Send one capture request through the production frame dispatcher and
-    /// return its reply, which must be the only frame on the route: no
-    /// consent question travels back along it.
-    async fn capture_reply(
+    /// Consent uses Cingulate's card service, not the incoming request route;
+    /// that route receives only the initial reply, not the later settlement.
+    async fn capture_initial_reply(
         planes: &Planes,
         writer: &mpsc::Sender<Frame>,
         rx: &mut mpsc::Receiver<Frame>,
@@ -9893,14 +10004,461 @@ mod tests {
         body
     }
 
+    async fn capture_reply(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+        corr: u64,
+        params: Value,
+    ) -> Value {
+        let body = capture_initial_reply(planes, writer, rx, corr, params).await;
+        if body["outcome"] == "capture_pending" {
+            let late = capture_stored_late(planes, corr).await;
+            // Consent tests need the finished deposit and disposal result,
+            // not merely confirmation that the sign-in window was handed over.
+            let result = late["result"].clone();
+            let journal = planes.browser.journal_export_for_test().await;
+            if result["outcome"] == "captured" {
+                assert!(journal.contains("captured:"), "{journal}");
+            }
+            result
+        } else {
+            body
+        }
+    }
+
+    async fn capture_provider_op(
+        planes: &Planes,
+        channel: u16,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let mut arguments = arguments;
+        if name == "late_results" {
+            arguments["since"] = Value::Null;
+        }
+        let mut frame = capture_request_frame(90_000, ollama_capture_params());
+        frame.header.channel = channel;
+        frame.body = serde_json::to_vec(&json!({"name":name,"arguments":arguments})).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(frame, &tx, planes).await.unwrap();
+        let reply = next_frame(&mut rx).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        reply.get("structuredContent").cloned().unwrap_or(reply)
+    }
+
+    pub(super) async fn capture_late(planes: &Planes, corr: u64) -> Value {
+        capture_stored_late(planes, corr).await;
+        let reply = capture_provider_op(planes, 4, "late_results", json!({})).await;
+        reply["entries"]
+            .as_array()
+            .expect("late-results serves entries")
+            .iter()
+            .find(|entry| entry["call_key"] == format!("pf:capture-{corr}"))
+            .expect("the provider serves the stored settlement")
+            .clone()
+    }
+
+    async fn capture_stored_late(planes: &Planes, corr: u64) -> Value {
+        let principal = journal::call_records::principal_label(
+            planes.routes.get(4, 1).unwrap().principal.as_ref(),
+        );
+        // Wait on CallRecords first: a late_results request also reads the
+        // consent answer feed, which must not race the scripted Cingulate
+        // report that a consumed approval was executed.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let reply = planes
+                    .calls
+                    .late_results(
+                        &principal,
+                        &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+                        wall_clock_ms(),
+                    )
+                    .unwrap();
+                let reply = serde_json::to_value(reply).unwrap();
+                if let Some(entry) = reply["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["call_key"] == format!("pf:capture-{corr}"))
+                {
+                    break entry.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the handed-over capture settles")
+    }
+
+    async fn interrupt_capture(planes: &Planes, corr: u64) {
+        planes
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        let principal = journal::call_records::principal_label(
+            planes.routes.get(4, 1).unwrap().principal.as_ref(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let reply = planes
+                    .calls
+                    .late_results(
+                        &principal,
+                        &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+                        wall_clock_ms(),
+                    )
+                    .unwrap();
+                if reply
+                    .entries
+                    .iter()
+                    .any(|entry| entry.call_key == format!("pf:capture-{corr}"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drain disposes and settles the capture");
+        // A draining dispatcher admits no new pulls. Resume fixture admission
+        // only after the background capture has observed the drain and ended.
+        planes
+            .draining
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     fn this_session() -> cingulate_client::live_call::SessionKey {
         computer_grants::tests::session_key("test-project")
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_returns_pending_without_waiting_for_sign_in() {
+        let fixture = login_capture::test_support::fixture_with(|env| {
+            env.handoff_duration = Duration::from_secs(5);
+            env.poll_interval = Duration::from_millis(20);
+        });
+        fixture.launcher.script.lock().unwrap().logs_in = false;
+        let cingulate = ScriptedConsent::new();
+        cingulate
+            .raises("el_cap_prompt")
+            .answered_in_call("el_cap_prompt", "allow");
+        let planes = cingulate.planes(&fixture);
+        let (tx, mut rx) = mpsc::channel(8);
+        let reply = tokio::time::timeout(
+            Duration::from_millis(500),
+            capture_initial_reply(&planes, &tx, &mut rx, 340, ollama_capture_params()),
+        )
+        .await
+        .expect("consent was answered; sign-in must not hold the call");
+        assert_eq!(reply["outcome"], "capture_pending", "{reply}");
+        assert_eq!(reply["origin"], "https://ollama.com");
+        assert_eq!(reply["expires_in_ms"], 5_000);
+        assert!(reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("notice; do not poll"));
+        assert_eq!(
+            cingulate.methods().len(),
+            2,
+            "consent still completes in-call"
+        );
+        assert_eq!(fixture.vault.calls(), 0);
+        let placement = fixture.launcher.placements.lock().unwrap()[0].clone();
+        assert!(fixture.fs.exists(placement.profile_directory()));
+        assert!(
+            capture_provider_op(&planes, 4, "late_results", json!({})).await["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        interrupt_capture(&planes, 340).await;
+        assert_eq!(
+            capture_late(&planes, 340).await["result"]["outcome"],
+            "handoff_interrupted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_late_entries_cover_all_endings_ack_and_custodian_isolation() {
+        use login_capture::test_support::{fixture_with, ScriptedVerification};
+        for (corr, expected) in [
+            (341, "captured"),
+            (342, "session_invalid"),
+            (343, "expired"),
+            (344, "handoff_interrupted"),
+        ] {
+            let fixture = fixture_with(|env| {
+                env.handoff_duration = Duration::from_millis(150);
+                env.poll_interval = Duration::from_millis(10);
+            });
+            {
+                let mut script = fixture.launcher.script.lock().unwrap();
+                if expected == "session_invalid" {
+                    script.verifications = vec![ScriptedVerification::redirected_off_origin()];
+                } else if expected != "captured" {
+                    script.logs_in = false;
+                }
+            }
+            let cingulate = ScriptedConsent::new();
+            cingulate
+                .raises("el_cap_end")
+                .answered_in_call("el_cap_end", "allow");
+            let planes = cingulate.planes(&fixture);
+            let facts = planes.routes.get(4, 1).unwrap();
+            planes.routes.insert(5, 1, AcceptedBindFacts::from_bind(
+                &bind_identity_for_test(),
+                Some(subc_protocol::Principal::Reserved { module_id: "broca".into() }),
+                Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),
+                None,
+                &subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },
+            ).with_scope(facts.scope.clone()));
+            let (tx, mut rx) = mpsc::channel(8);
+            let reply =
+                capture_initial_reply(&planes, &tx, &mut rx, corr, ollama_capture_params()).await;
+            assert_eq!(reply["outcome"], "capture_pending", "{reply}");
+            if expected == "handoff_interrupted" {
+                interrupt_capture(&planes, corr).await;
+            }
+            let entry = capture_late(&planes, corr).await;
+            assert_eq!(
+                entry["result"],
+                json!({"outcome":expected,"origin":"https://ollama.com"})
+            );
+            assert_eq!(entry["kind"], "result");
+            assert_eq!(
+                entry["custodian"],
+                journal::call_records::principal_label(facts.principal.as_ref())
+            );
+            assert_eq!(entry["call_key"], format!("pf:capture-{corr}"));
+            assert!(entry["settled_at"].as_u64().unwrap() > 0);
+            browser::validate_browser_result(management::CAPTURE_LOGIN, &entry["result"]).unwrap();
+            assert!(
+                capture_provider_op(&planes, 5, "late_results", json!({})).await["entries"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "another custodian received the capture result"
+            );
+            let all = capture_provider_op(&planes, 4, "late_results", json!({})).await;
+            assert_eq!(
+                capture_provider_op(
+                    &planes,
+                    4,
+                    "late_results.ack",
+                    json!({"through":all["cursor"]})
+                )
+                .await,
+                json!({})
+            );
+            assert!(
+                capture_provider_op(&planes, 4, "late_results", json!({})).await["entries"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "ack must remove the entry"
+            );
+            let replay =
+                capture_initial_reply(&planes, &tx, &mut rx, corr, ollama_capture_params()).await;
+            assert_eq!(
+                replay["outcome"], expected,
+                "an acknowledged call must not recreate a pending capture"
+            );
+            assert_eq!(
+                fixture
+                    .launcher
+                    .launches
+                    .load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_v4_floor_is_lazy_and_present_remains_v3() {
+        use cerebellum_core::format_floor::{read_floors, DurableFormat, FormatFloor};
+        use journal::call_records::{
+            Begin, CallRecords, FilesystemCallRecordStorage, ScopeIdentity,
+        };
+        let fixture = login_capture::test_support::fixture();
+        fixture.launcher.script.lock().unwrap().logs_in = false;
+        let cingulate = ScriptedConsent::new();
+        cingulate
+            .raises("el_cap_floor")
+            .answered_in_call("el_cap_floor", "allow");
+        let path = cingulate.dir.join("call_records.jsonl");
+        let floor_path = cingulate.dir.join("format-floor.json");
+        let mut planes = cingulate.planes(&fixture);
+        planes.calls = Arc::new(CallRecords::open(
+            Box::new(
+                FilesystemCallRecordStorage::new(path.clone())
+                    .with_format_floor(FormatFloor::at(&floor_path)),
+            ),
+            wall_clock_ms(),
+        ));
+        assert!(!path.exists());
+        assert!(
+            !floor_path.exists(),
+            "starting the build must not close rollback"
+        );
+        let facts = planes.routes.get(4, 1).unwrap();
+        let principal = journal::call_records::principal_label(facts.principal.as_ref());
+        assert!(matches!(
+            planes.calls.begin(
+                &principal,
+                "pf:present-only",
+                &facts.identity.conversation_key,
+                wall_clock_ms()
+            ),
+            Begin::Execute(_)
+        ));
+        assert_eq!(
+            read_floors(&floor_path).unwrap().get("call-records"),
+            Some(&2)
+        );
+        planes
+            .calls
+            .hold_handoff(
+                &principal,
+                "pf:present-only",
+                &facts.identity.conversation_key,
+                ScopeIdentity::from_stamp(facts.scope.as_ref().unwrap()),
+                "https://ollama.com",
+                wall_clock_ms(),
+            )
+            .unwrap();
+        let present_only = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            present_only.lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":3}")
+        );
+        assert_eq!(
+            read_floors(&floor_path).unwrap().get("call-records"),
+            Some(&3)
+        );
+        assert!(!present_only.contains("\"capture\""));
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(
+            capture_initial_reply(&planes, &tx, &mut rx, 347, ollama_capture_params()).await
+                ["outcome"],
+            "capture_pending"
+        );
+        let captured = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            captured.lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":4}")
+        );
+        assert!(captured.contains("\"capture\":true"));
+        assert_eq!(
+            read_floors(&floor_path).unwrap().get("call-records"),
+            Some(&4)
+        );
+        let header: Value = serde_json::from_str(captured.lines().next().unwrap()).unwrap();
+        assert!(
+            DurableFormat::new("call-records", 3)
+                .refuse_newer(header["version"].as_u64().unwrap())
+                .is_err(),
+            "a v3 reader must refuse before decoding capture state"
+        );
+        assert!(crate::durable_formats::readable_formats()
+            .contains(&journal::call_records::CALL_RECORD_FORMAT));
+        interrupt_capture(&planes, 347).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_restart_settles_interrupted_and_preserves_retention_and_format() {
+        use journal::call_records::{CallRecords, FilesystemCallRecordStorage};
+        let fixture = login_capture::test_support::fixture();
+        fixture.launcher.script.lock().unwrap().logs_in = false;
+        let cingulate = ScriptedConsent::new();
+        cingulate
+            .raises("el_cap_restart")
+            .answered_in_call("el_cap_restart", "allow");
+        let path = cingulate.dir.join("call_records.jsonl");
+        let store = || {
+            CallRecords::open(
+                Box::new(FilesystemCallRecordStorage::new(path.clone())),
+                wall_clock_ms(),
+            )
+        };
+        let mut planes = cingulate.planes(&fixture);
+        planes.calls = Arc::new(store());
+        // Merely opening capture-capable planes does not write new state.
+        assert!(!path.exists());
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(
+            capture_initial_reply(&planes, &tx, &mut rx, 345, ollama_capture_params()).await
+                ["outcome"],
+            "capture_pending"
+        );
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            persisted
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line).unwrap()["version"] == 4),
+            "{persisted}"
+        );
+        assert!(!login_capture::test_support::contains_bytes(
+            &persisted.into_bytes(),
+            login_capture::test_support::PLANTED_VALUE
+        ));
+        let mut restarted = cingulate.planes(&fixture);
+        restarted.calls = Arc::new(store());
+        let entry = capture_late(&restarted, 345).await;
+        assert_eq!(entry["result"]["outcome"], "handoff_interrupted");
+        let principal = journal::call_records::principal_label(
+            restarted.routes.get(4, 1).unwrap().principal.as_ref(),
+        );
+        let settled_at = entry["settled_at"].as_u64().unwrap();
+        let request = cortexkit_role_tool_provider::late_results::LateResultsRequest::new();
+        let before = restarted
+            .calls
+            .late_results(&principal, &request, settled_at + 24 * 60 * 60 * 1_000 - 1)
+            .unwrap();
+        assert_eq!(before.entries[0].kind, "result");
+        let after = restarted
+            .calls
+            .late_results(&principal, &request, settled_at + 24 * 60 * 60 * 1_000 + 1)
+            .unwrap();
+        assert_eq!(after.entries[0].kind, "expired");
+        assert!(after.entries[0].result.is_none());
+        interrupt_capture(&planes, 345).await;
+        capture_late(&planes, 345).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unkeyed_capture_is_refused_before_consent_or_browser_launch() {
+        let fixture = login_capture::test_support::fixture();
+        let cingulate = ScriptedConsent::new();
+        let planes = cingulate.planes(&fixture);
+        let mut frame = capture_request_frame(346, ollama_capture_params());
+        let mut body: Value = serde_json::from_slice(&frame.body).unwrap();
+        body.as_object_mut().unwrap().remove("call_key");
+        frame.body = serde_json::to_vec(&body).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(frame, &tx, &planes).await.unwrap();
+        let reply: Value = serde_json::from_slice(&next_frame(&mut rx).await.body).unwrap();
+        assert_eq!(reply["outcome"], "invalid_request");
+        assert_eq!(reply["detail"]["field"], "call_key");
+        assert!(reply["detail"]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("result arrives later"));
+        assert!(cingulate.methods().is_empty());
+        assert_eq!(
+            fixture
+                .launcher
+                .launches
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
     /// Through the production frame dispatcher and the Withhold reply boundary:
     /// the planted cookie value reaches the vault request, and is absent from
-    /// the card put to the person, the wire reply, and every decoded journal
-    /// entry.
+    /// the card put to the person, the pending reply, the late entry and every
+    /// decoded journal entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capture_login_keeps_the_value_out_of_the_reply_the_journal_and_the_ask() {
         use login_capture::test_support::{contains_bytes, fixture, PLANTED_VALUE};
@@ -9910,9 +10468,16 @@ mod tests {
         cingulate
             .raises("el_cap_301")
             .answered_in_call("el_cap_301", "allow");
-        let planes = cingulate.planes(&fixture);
+        let mut planes = cingulate.planes(&fixture);
+        let call_record_path = cingulate.dir.join("call_records.jsonl");
+        planes.calls = Arc::new(journal::call_records::CallRecords::open(
+            Box::new(journal::call_records::FilesystemCallRecordStorage::new(
+                call_record_path.clone(),
+            )),
+            wall_clock_ms(),
+        ));
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        let body = capture_reply(
+        let body = capture_initial_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -9920,7 +10485,9 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert_eq!(body["outcome"], "captured", "{body}");
+        assert_eq!(body["outcome"], "capture_pending", "{body}");
+        let late = capture_late(&planes, 301).await;
+        assert_eq!(late["result"]["outcome"], "captured", "{late}");
         assert_eq!(
             cingulate.methods(),
             [
@@ -9958,6 +10525,14 @@ mod tests {
             !contains_bytes(&serde_json::to_vec(&body).unwrap(), PLANTED_VALUE),
             "the reply leaked it"
         );
+        assert!(
+            !contains_bytes(&serde_json::to_vec(&late).unwrap(), PLANTED_VALUE),
+            "the late entry leaked it"
+        );
+        assert!(
+            !contains_bytes(&std::fs::read(call_record_path).unwrap(), PLANTED_VALUE),
+            "the call-record journal leaked it"
+        );
         let export = planes.browser.journal_export_for_test().await;
         let entries = export
             .lines()
@@ -9985,11 +10560,10 @@ mod tests {
         }
     }
 
-    /// The reply leaves only after the throwaway profile is gone. The fake
-    /// deletion is slow, so a reply sent ahead of it arrives while the profile
-    /// still exists.
+    /// A successful settlement leaves only after the throwaway profile is
+    /// gone, even when deletion is slower than handing over the window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn capture_reply_is_sent_only_after_the_profile_is_deleted() {
+    async fn capture_settlement_is_served_only_after_the_profile_is_deleted() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
@@ -10201,7 +10775,7 @@ mod tests {
     /// An approval that arrives after the call returned is used by the next
     /// call with the same parameters, which captures without a second card,
     /// names the approved card as its consent, and tells Cingulate the
-    /// approved capture ran before it replies. A call with other parameters
+    /// approved capture ran before settlement. A call with other parameters
     /// does not use it, and once used it is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_late_capture_approval_is_used_once_by_a_retry_with_the_same_parameters() {
@@ -10243,7 +10817,7 @@ mod tests {
         assert!(planes.consent.has_single_use_approvals());
 
         // The same parameters: the approval is taken, the capture runs, and
-        // its execution is reported before the reply. The session's open
+        // its execution is reported before settlement. The session's open
         // card for the other account makes this call read the answers feed
         // first, which has nothing new.
         cingulate.feed(json!([])).takes_report("el_cap_320");
@@ -10260,7 +10834,7 @@ mod tests {
         assert_eq!(
             cingulate.methods()[before..],
             [CONSENT_ANSWERS, CONSENT_ACK, CONSENT_REPORT_EXECUTION],
-            "a taken approval must be reported before the reply, with no second card"
+            "a taken approval must be reported before settlement, with no second card"
         );
         assert_eq!(
             cingulate.script.calls().last().unwrap().1,

@@ -116,7 +116,7 @@ async fn bind_with_scope(
             "agentProjectId": "pj-session-admission",
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
-            "browserControlOperations": ["browser.launch", "browser.status", "browser.close"],
+            "browserControlOperations": ["browser.launch", "browser.status", "browser.close", "browser.capture_login"],
         })),
         scope,
     };
@@ -461,13 +461,6 @@ async fn an_unscoped_session_route_cannot_raise_login_cards() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let planes = planes_with_a_grant().await.with_cingulate(
-        Arc::new(script.clone()),
-        Arc::new(cerebellum::cingulate_client::desk::FileRegistryStore::new(
-            root.join("registry.json"),
-        )),
-    );
-    bind_acked(&planes, reserved("prefrontal-core"), management_route()).await;
     for (method, params) in [
         (
             "browser.import_login",
@@ -478,11 +471,31 @@ async fn an_unscoped_session_route_cannot_raise_login_cards() {
             json!({"credential_domain":"example.com","account":"work","fetch_url":"https://example.com/settings","login_url":"https://example.com/login"}),
         ),
     ] {
-        let frames = frames_for(
+        let capture = method == "browser.capture_login";
+        let planes = planes_with_a_grant().await.with_cingulate(
+            Arc::new(script.clone()),
+            Arc::new(cerebellum::cingulate_client::desk::FileRegistryStore::new(
+                root.join("registry.json"),
+            )),
+        );
+        bind_acked(
             &planes,
-            route_request(80, json!({"method":method,"params":params})),
+            reserved("prefrontal-core"),
+            if capture {
+                tool_route()
+            } else {
+                management_route()
+            },
         )
         .await;
+        let body = if capture {
+            let mut arguments = params;
+            arguments["action"] = json!("capture_login");
+            json!({"name":"browser_use", "call_key":"pf:unscoped-capture", "arguments":arguments})
+        } else {
+            json!({"method":method,"params":params})
+        };
+        let frames = frames_for(&planes, route_request(80, body)).await;
         assert_eq!(frames.len(), 1, "no reverse question frame");
         assert_eq!(frames[0].header.ty, FrameType::Response);
         let reply: Value = serde_json::from_slice(&frames[0].body).unwrap();
