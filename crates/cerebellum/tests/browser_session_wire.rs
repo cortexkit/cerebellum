@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 
 #[path = "../examples/support/consent_relay.rs"]
 mod consent_relay;
+use consent_relay::cingulate::ScriptedCarrier;
 
 #[path = "support/browser_stable_refs.rs"]
 mod stable_refs;
@@ -148,7 +149,7 @@ async fn bind_management_route(planes: &Planes) {
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
-        scope: None,
+        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1058,8 +1059,11 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     let navigated: Value = serde_json::from_slice(&navigated.body).unwrap();
     // A non-default port requires an explicit site grant. Public DNS sites on
     // the standard HTTP(S) ports can be navigated without asking a person.
-    assert_eq!(navigated["outcome"], "authorization_denied", "{navigated}");
-    assert_eq!(navigated["detail"]["reason"], "no_grant", "{navigated}");
+    assert_eq!(navigated["outcome"], "consent_unavailable", "{navigated}");
+    assert_eq!(
+        navigated["detail"]["reason"], "no_agent_session",
+        "{navigated}"
+    );
 
     // Implemented and deliberately not admitted. These are NOT unknown: naming
     // them that way tells a caller to stop asking for something we built and
@@ -1184,8 +1188,11 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
 
     let no_grant = invoke(&planes, 20, "browser.snapshot", json!({"mode": "ax"})).await;
     let no_grant: Value = serde_json::from_slice(&no_grant.body).unwrap();
-    assert_eq!(no_grant["outcome"], "authorization_denied", "{no_grant}");
-    assert_eq!(no_grant["detail"]["reason"], "no_grant", "{no_grant}");
+    assert_eq!(no_grant["outcome"], "consent_unavailable", "{no_grant}");
+    assert_eq!(
+        no_grant["detail"]["reason"], "no_agent_session",
+        "{no_grant}"
+    );
     assert!(launcher.effects.lock().unwrap().is_empty());
 
     grant_browser(&planes, "https://other.example", Vec::new()).await;
@@ -1193,11 +1200,11 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
     let wrong_origin = invoke(&planes, 21, "browser.snapshot", json!({"mode": "ax"})).await;
     let wrong_origin: Value = serde_json::from_slice(&wrong_origin.body).unwrap();
     assert_eq!(
-        wrong_origin["outcome"], "authorization_denied",
+        wrong_origin["outcome"], "consent_unavailable",
         "{wrong_origin}"
     );
     assert_eq!(
-        wrong_origin["detail"]["reason"], "origin_scope",
+        wrong_origin["detail"]["reason"], "no_agent_session",
         "{wrong_origin}"
     );
     // Compared as a set: the list follows grant-id order, and minted grant ids
@@ -1371,14 +1378,11 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
     )
     .await;
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
-    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
+    assert_eq!(clicked["outcome"], "consent_unavailable", "{clicked}");
     // The conversation holds a grant, just one whose ceiling is below a click,
     // so the refusal says the severity is short rather than that no grant
     // exists.
-    assert_eq!(
-        clicked["detail"]["reason"], "grant_severity_insufficient",
-        "{clicked}"
-    );
+    assert_eq!(clicked["detail"]["reason"], "no_agent_session", "{clicked}");
     assert_eq!(
         launcher.effects.lock().unwrap().as_slice(),
         ["snapshot"],
@@ -1427,11 +1431,8 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     // been withheld by result-schema enforcement instead of reaching here.
     let refused = invoke_existing(&planes, 62, "browser.click", click.clone()).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
-    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
-    assert_eq!(
-        refused["detail"]["reason"], "grant_severity_insufficient",
-        "{refused}"
-    );
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "no_agent_session", "{refused}");
     assert_eq!(
         refused["detail"]["required"],
         json!({"tier": 4, "credential": false, "financial": false}),
@@ -1453,7 +1454,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     );
     assert_eq!(
         refused["remedy"],
-        "call browser.open_grant with the arguments in detail.grant_request, then retry",
+        "call from the agent session that needs the permission; it can raise the card",
         "{refused}"
     );
     assert_eq!(
@@ -1466,7 +1467,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
     open_grant_and_allow(&planes, 63, refused["detail"]["grant_request"].clone()).await;
     let landing = invoke_existing(&planes, 64, "browser.click", click.clone()).await;
     let landing: Value = serde_json::from_slice(&landing.body).unwrap();
-    assert_eq!(landing["outcome"], "authorization_denied", "{landing}");
+    assert_eq!(landing["outcome"], "consent_unavailable", "{landing}");
     assert_eq!(
         landing["detail"]["attempted_origin"],
         "http://127.0.0.1:8080"
@@ -1499,8 +1500,8 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
 
     let refused = invoke_existing(&planes, 70, "browser.snapshot", json!({})).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
-    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
-    assert_eq!(refused["detail"]["reason"], "no_grant", "{refused}");
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "no_agent_session", "{refused}");
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://page.example:8443",
         "{refused}"
@@ -1690,8 +1691,8 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
     );
     launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let clicked = click_cross_site_link(&planes, 80).await;
-    assert_eq!(clicked["outcome"], "authorization_denied", "{clicked}");
-    assert_eq!(clicked["detail"]["reason"], "origin_scope", "{clicked}");
+    assert_eq!(clicked["outcome"], "consent_unavailable", "{clicked}");
+    assert_eq!(clicked["detail"]["reason"], "no_agent_session", "{clicked}");
     assert_eq!(
         clicked["detail"]["granted_origins"],
         json!(["https://other.example"]),
@@ -1713,10 +1714,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
     );
     launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let clicked = click_cross_site_link(&planes, 90).await;
-    assert_eq!(
-        clicked["detail"]["reason"], "grant_severity_insufficient",
-        "{clicked}"
-    );
+    assert_eq!(clicked["detail"]["reason"], "no_agent_session", "{clicked}");
     assert_eq!(
         clicked["detail"]["grant_request"],
         json!({"origins": ["https://page.example:8443"], "severity_tier": 4, "hazards": []}),
@@ -1769,7 +1767,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
     )
     .await;
     let clicked: Value = serde_json::from_slice(&clicked.body).unwrap();
-    assert_eq!(clicked["outcome"], "hazard_not_disclosed", "{clicked}");
+    assert_eq!(clicked["outcome"], "consent_unavailable", "{clicked}");
     assert_eq!(
         clicked["detail"]["missing_hazard"], "credential_form_submit",
         "{clicked}"
@@ -1783,7 +1781,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
     );
     assert_eq!(
         clicked["remedy"],
-        "call browser.open_grant with the arguments in detail.grant_request, then retry",
+        "call from the agent session that needs the permission; it can raise the card",
         "{clicked}"
     );
     assert_eq!(
@@ -4020,7 +4018,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
     // page, and reading it is refused under the grant for the old origin.
     let refused = invoke(&planes, 102, "browser.snapshot", json!({"mode": "ax"})).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
-    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://www.iana.org:8443",
         "{refused}"
@@ -4091,8 +4089,8 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     let read = json!({"mode": "ax"});
     let refused = invoke_existing(&planes, 113, "browser.snapshot", read.clone()).await;
     let refused: Value = serde_json::from_slice(&refused.body).unwrap();
-    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
-    assert_eq!(refused["detail"]["reason"], "origin_scope", "{refused}");
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
+    assert_eq!(refused["detail"]["reason"], "no_agent_session", "{refused}");
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://www.iana.org:8443",
         "{refused}"
@@ -4114,7 +4112,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
     );
     assert_eq!(
         refused["remedy"],
-        "call browser.open_grant with the arguments in detail.grant_request, then retry",
+        "call from the agent session that needs the permission; it can raise the card",
         "{refused}"
     );
 
@@ -4311,7 +4309,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
     for (corr, mode) in [(4, "ax"), (5, "dom_full")] {
         let refused = response_body(&planes, corr, "browser.snapshot", json!({"mode": mode})).await;
         assert_eq!(
-            refused["outcome"], "authorization_denied",
+            refused["outcome"], "consent_unavailable",
             "{mode}: {refused}"
         );
         assert_eq!(
@@ -4348,7 +4346,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screen
     launcher.page.commit("https://attacker.example:8443/moved");
 
     let refused = response_body(&planes, 4, "browser.screenshot", json!({})).await;
-    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
+    assert_eq!(refused["outcome"], "consent_unavailable", "{refused}");
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://attacker.example:8443",
         "{refused}"
@@ -4429,7 +4427,7 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
         // The page is now on the ungranted origin, so reading again is
         // refused before any capture rather than repeating the race.
         let again = response_body(&planes, corr + 1, tool, arguments).await;
-        assert_eq!(again["outcome"], "authorization_denied", "{again}");
+        assert_eq!(again["outcome"], "consent_unavailable", "{again}");
         assert_no_page_content(&again);
     }
 
@@ -4764,21 +4762,26 @@ async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
 }
 
 async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<RecordingLauncher>) {
+    let store = standing.then(|| {
+        Arc::new(
+            cerebellum::browser_standing_grants::StandingBrowserGrants::open(
+                Arc::new(cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new()),
+                Some("test-machine".into()),
+            ),
+        )
+    });
+    blocking_grant_fixture_with_store(store).await
+}
+
+async fn blocking_grant_fixture_with_store(
+    store: Option<Arc<cerebellum::browser_standing_grants::StandingBrowserGrants>>,
+) -> (Planes, Arc<RecordingLauncher>) {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
-        standing.then(|| {
-            Arc::new(
-                cerebellum::browser_standing_grants::StandingBrowserGrants::open(
-                    Arc::new(
-                        cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new(),
-                    ),
-                    Some("test-machine".into()),
-                ),
-            )
-        }),
+        store,
     );
     planes.launch_service = Some(launcher.clone());
     launch_at(&planes, &launcher.page, "https://page.example:8443").await;
@@ -4796,7 +4799,7 @@ async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<Re
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
-        scope: None,
+        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -4813,7 +4816,8 @@ async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<Re
         .await
         .unwrap();
     assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
-    (planes, launcher)
+    let service = ScriptedCarrier::default();
+    (service.install(planes), launcher)
 }
 
 fn blocking_navigation(tier: u8) -> Frame {
@@ -4825,6 +4829,55 @@ fn blocking_navigation(tier: u8) -> Frame {
         "browser.navigate",
         json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":tier,"credential":false,"financial":false}}),
     )
+}
+
+async fn drain_browser(planes: &Planes) {
+    let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
+    let bind = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        call_mode: None,
+        route_channel: 190,
+        epoch: 3,
+        target: RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new("/test/project", "test", "drain-conversation"),
+        principal: cerebellum::session_caller_principal_for_test(),
+        consumer_capabilities: None,
+        admission_facts: Some(
+            json!({"agentProjectId":facts.identity.agent_project_id,"sessionKind":"primary","effectiveCapabilityScope":["*"]}),
+        ),
+        scope: facts.scope,
+    };
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        9900,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    assert_eq!(consent_frame(&mut rx).await.header.ty, FrameType::Response);
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        190,
+        3,
+        9901,
+        serde_json::to_vec(&json!({"method":"test.drain","params":{}})).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(frame, &tx, planes)
+        .await
+        .unwrap();
+    assert_eq!(consent_frame(&mut rx).await.header.ty, FrameType::Error);
 }
 
 async fn consent_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
@@ -4840,19 +4893,15 @@ async fn answer_browser(
     question: &Frame,
     decision: &str,
 ) {
-    let answer = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        FrameType::Response,
-        Flags::new(false, Priority::Interactive, false),
-        9,
-        3,
-        question.header.corr,
-        serde_json::to_vec(&json!({"decision":decision})).unwrap(),
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(answer, tx, planes)
-        .await
-        .unwrap();
+    let outcome = match decision {
+        "no_answer" => cerebellum::elicit::AskOutcome::NoAnswer,
+        "not_put_to_anyone" | "refused" => cerebellum::elicit::AskOutcome::NotPutToAnyone,
+        "undeliverable" => cerebellum::elicit::AskOutcome::Undeliverable,
+        _ => cerebellum::elicit::AskOutcome::Answered(json!({"decision":decision})),
+    };
+    assert!(ScriptedCarrier::for_planes(planes)
+        .answer_id(body(question)["id"].as_str().unwrap(), outcome));
+    let _ = tx;
 }
 
 #[tokio::test]
@@ -4862,7 +4911,7 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let body: Value = serde_json::from_slice(&question.body).unwrap();
     assert_eq!(
@@ -4895,10 +4944,7 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
             .collect::<Vec<_>>(),
         ["allow_conversation", "deny"]
     );
-    assert_eq!(
-        p["requestedSchema"]["properties"]["decision"]["enum"],
-        json!(["allow_conversation", "deny"])
-    );
+    assert_eq!(p.get("requestedSchema"), None);
     assert_eq!(p["options"][0]["effect"], "grant");
     assert_eq!(p["options"][1]["effect"], "decline");
     assert!(launcher.effects.lock().unwrap().is_empty());
@@ -4920,7 +4966,7 @@ async fn blocking_browser_grant_deny_never_navigates() {
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     answer_browser(&planes, &tx, &question, "deny").await;
     let reply = consent_frame(&mut rx).await;
@@ -4967,30 +5013,9 @@ async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
         cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
             .await
             .unwrap();
-        let question = consent_frame(&mut rx).await;
+        let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
         assert_eq!(question.header.ty, FrameType::Request);
-        if ending == "refused" {
-            let refusal = Frame::build_with_version(
-                PROTOCOL_VERSION,
-                FrameType::Error,
-                Flags::new(false, Priority::Interactive, false),
-                9,
-                3,
-                question.header.corr,
-                serde_json::to_vec(&subc_protocol::ErrorBody {
-                    code: "REVERSE_REQUEST_UNHANDLED".to_string(),
-                    message: "no reverse-request handler is registered".to_string(),
-                    detail: None,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-            cerebellum::handle_frame_for_test(refusal, &tx, &planes)
-                .await
-                .unwrap();
-        } else {
-            answer_browser(&planes, &tx, &question, ending).await;
-        }
+        answer_browser(&planes, &tx, &question, ending).await;
         let reply = consent_frame(&mut rx).await;
         assert_eq!(reply.header.corr, 801);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -5020,7 +5045,7 @@ async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
     }
 }
 
-async fn late_in_call_answer(decision: &str, linkable: bool) {
+async fn late_in_call_answer(decision: &str, _linkable: bool) {
     let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
     let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
     assert!(facts.agent_project_id_attested && facts.acts_as_agent && facts.session_kind_attested);
@@ -5037,41 +5062,20 @@ async fn late_in_call_answer(decision: &str, linkable: bool) {
     )
     .await
     .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let pending = consent_frame(&mut rx).await;
     assert_eq!(body(&pending)["outcome"], "consent_pending");
-    let mut answer = json!({"decision": decision});
-    if linkable {
-        answer["elicitation_id"] = json!("el_test_late");
-    }
-    let response = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        FrameType::Response,
-        Flags::new(false, Priority::Interactive, false),
-        question.header.channel,
-        question.header.epoch,
-        question.header.corr,
-        serde_json::to_vec(&answer).unwrap(),
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(response, &tx, &planes)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while planes.management.browser_grant_pending_count().await != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    answer_browser(&planes, &tx, &question, decision).await;
+    assert_eq!(planes.management.browser_grant_count().await, 0);
+    drain_browser(&planes).await;
     let rows = planes
         .management
         .standing_browser_grants()
         .live_rows(&facts.identity.agent_project_id);
-    if decision == "allow_origin_always" && linkable {
+    if decision == "allow_origin_always" {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].consent_ref, "el_test_late");
+        assert_eq!(rows[0].consent_ref, body(&question)["id"].as_str().unwrap());
         // An "always" answer covers the registrable domain of an https origin
         // on the default port.
         assert_eq!(
@@ -5104,7 +5108,7 @@ async fn late_in_call_conversation_answer_records_conversation_grant() {
 }
 
 #[tokio::test]
-async fn late_in_call_always_without_elicitation_id_records_nothing() {
+async fn late_in_call_always_uses_the_raised_id_without_a_payload_id() {
     late_in_call_answer("allow_origin_always", false).await;
 }
 
@@ -5120,7 +5124,7 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
     )
     .await
     .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let reply = consent_frame(&mut rx).await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -5128,13 +5132,7 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
     assert!(body["ask_id"].as_str().is_some());
     assert!(launcher.effects.lock().unwrap().is_empty());
     answer_browser(&planes, &tx, &question, "allow_conversation").await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while planes.management.browser_grant_count().await == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert_eq!(planes.management.browser_grant_count().await, 0);
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
@@ -5150,52 +5148,35 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
 }
 
 #[tokio::test]
-async fn blocking_browser_grant_cancel_releases_registry() {
+async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound() {
     let (planes, launcher) = blocking_grant_fixture().await;
-    let baseline = planes.elicitor.outstanding();
     let (tx, mut rx) = mpsc::channel(8);
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
-    let question = consent_frame(&mut rx).await;
-    assert_eq!(question.header.ty, FrameType::Request);
-    assert_eq!(planes.elicitor.outstanding(), baseline + 1);
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     let mut cancel = blocking_navigation(1);
     cancel.header.ty = FrameType::Cancel;
     cancel.body.clear();
     cerebellum::handle_frame_for_test(cancel, &tx, &planes)
         .await
         .unwrap();
-    let mut reply = None;
-    let mut cancellation = None;
-    for _ in 0..2 {
-        let frame = consent_frame(&mut rx).await;
-        if frame.header.ty == FrameType::Cancel {
-            cancellation = Some(frame);
-        } else {
-            reply = Some(frame);
-        }
-    }
-    let cancel = cancellation.expect("cancellation ends the browser card at the carrier");
-    assert_eq!(
-        (
-            cancel.header.channel,
-            cancel.header.epoch,
-            cancel.header.corr
-        ),
-        (
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr
-        )
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&reply.unwrap().body).unwrap()["detail"]["decision"],
-        "cancelled"
-    );
-    assert_eq!(planes.elicitor.outstanding(), baseline);
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(body(&reply)["detail"]["decision"], "cancelled");
+    assert!(rx.try_recv().is_err(), "no reverse cancellation frame");
+    let service = ScriptedCarrier::for_planes(&planes);
+    assert!(service
+        .calls()
+        .iter()
+        .any(|(method, _)| method == "consent.detach"));
+    assert!(!service
+        .calls()
+        .iter()
+        .any(|(method, _)| method == "consent.withdraw"));
     answer_browser(&planes, &tx, &question, "allow_conversation").await;
     assert_eq!(planes.management.browser_grant_count().await, 0);
+    drain_browser(&planes).await;
+    assert_eq!(planes.management.browser_grant_count().await, 1);
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
@@ -5206,7 +5187,7 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let subc_protocol::session::ModuleControlResponse::HealthCheck {
         metrics: Some(metrics),
@@ -5268,7 +5249,7 @@ async fn blocking_browser_grant_unfixable_refusals_never_ask() {
 }
 
 #[tokio::test]
-async fn blocking_browser_grant_goodbye_and_drain_withdraw_even_after_timeout() {
+async fn blocking_browser_grant_goodbye_and_drain_withdraw_only_held_cards() {
     for timed_out in [false, true] {
         for draining in [false, true] {
             let (planes, _) = blocking_grant_fixture().await;
@@ -5287,7 +5268,7 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_even_after_timeout() 
                     .await
                     .unwrap();
             }
-            let question = consent_frame(&mut rx).await;
+            let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
             assert_eq!(question.header.ty, FrameType::Request);
             if timed_out {
                 assert_eq!(
@@ -5316,13 +5297,30 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_even_after_timeout() 
             cerebellum::handle_frame_for_test(ending, &tx, &planes)
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while planes.elicitor.outstanding() != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("ending must withdraw the question");
+            if !timed_out && draining {
+                consent_frame(&mut rx).await;
+            }
+            if !timed_out {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !ScriptedCarrier::for_planes(&planes)
+                        .calls()
+                        .iter()
+                        .any(|(method, _)| method == "consent.withdraw")
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("a held card is withdrawn");
+            } else {
+                assert!(
+                    !ScriptedCarrier::for_planes(&planes)
+                        .calls()
+                        .iter()
+                        .any(|(method, _)| method == "consent.withdraw"),
+                    "a detached card stays answerable"
+                );
+            }
             answer_browser(&planes, &tx, &question, "allow_conversation").await;
             assert_eq!(planes.management.browser_grant_count().await, 0);
         }
@@ -5379,10 +5377,20 @@ async fn exchange(
     rx: &mut mpsc::Receiver<Frame>,
     frame: Frame,
 ) -> Frame {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
     cerebellum::handle_frame_for_test(frame, tx, planes)
         .await
         .unwrap();
-    consent_frame(rx).await
+    if let Some(service) = ScriptedCarrier::find(planes) {
+        tokio::select! {
+            biased;
+            frame = consent_frame(rx) => frame,
+            card = service.card(channel, epoch) => card,
+        }
+    } else {
+        consent_frame(rx).await
+    }
 }
 
 async fn withdraw(
@@ -5510,7 +5518,7 @@ async fn keyed_call_consent_card_carries_the_dispatcher_key() {
     )
     .await;
     assert_eq!(question.header.ty, FrameType::Request);
-    assert_eq!(body(&question)["params"]["call_key"], "pf:card-link");
+    assert_eq!(body(&question)["params"]["requester_ref"], "pf:card-link");
     answer_browser(&planes, &tx, &question, "deny").await;
     assert_eq!(consent_frame(&mut rx).await.header.corr, 801);
 }
@@ -5704,7 +5712,7 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
     )
     .await
     .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let pending = consent_frame(&mut rx).await;
     assert_eq!(
@@ -5721,28 +5729,19 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
 
     // Withdrawing the navigation leaves its site-access question open, so the
     // later permission response can still record a grant without navigating.
-    let mut response = question.clone();
-    response.header.ty = FrameType::Response;
-    response.body = serde_json::to_vec(
-        &json!({"decision":"allow_origin_always", "elicitation_id":"el_withdrawn"}),
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(response, &tx, &planes)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while planes.management.browser_grant_pending_count().await != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    answer_browser(&planes, &tx, &question, "allow_origin_always").await;
+    assert!(planes
+        .management
+        .standing_browser_grants()
+        .live_rows("pj-browser-session-wire")
+        .is_empty());
+    drain_browser(&planes).await;
     let rows = planes
         .management
         .standing_browser_grants()
         .live_rows("pj-browser-session-wire");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].consent_ref, "el_withdrawn");
+    assert_eq!(rows[0].consent_ref, body(&question)["id"].as_str().unwrap());
     assert!(
         rx.try_recv().is_err(),
         "withdraw must not end the card or resume the call"
@@ -5753,6 +5752,7 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
 #[tokio::test]
 async fn withdrawing_an_unknown_key_is_unknown_call() {
     let (planes, _launcher) = blocking_grant_fixture().await;
+    bind_route(&planes, 9, reserved("prefrontal-core"), None).await;
     let (tx, mut rx) = mpsc::channel(8);
     let answer = withdraw(&planes, &tx, &mut rx, 9, 817, "pf:never-sent").await;
     assert_eq!(answer.header.ty, FrameType::Response);
@@ -6421,6 +6421,7 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
     grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    bind_route(&planes, 9, reserved("prefrontal-core"), None).await;
     let (tx, mut rx) = mpsc::channel(8);
     let refused = exchange(
         &planes,
@@ -6485,19 +6486,7 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
     )
     .await;
     if question.header.ty == FrameType::Request {
-        let answer = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            12,
-            3,
-            question.header.corr,
-            serde_json::to_vec(&json!({"decision":"deny"})).unwrap(),
-        )
-        .unwrap();
-        cerebellum::handle_frame_for_test(answer, &tx, &planes)
-            .await
-            .unwrap();
+        answer_browser(&planes, &tx, &question, "deny").await;
         consent_frame(&mut rx).await;
     }
     let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
@@ -7042,7 +7031,7 @@ async fn scope_epoch_replacement_cancels_late_in_call_card() {
     )
     .await
     .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     assert_eq!(
         body(&consent_frame(&mut rx).await)["outcome"],
@@ -7055,29 +7044,11 @@ async fn scope_epoch_replacement_cancels_late_in_call_card() {
             .ty,
         FrameType::Response
     );
-    let cancel = consent_frame(&mut rx).await;
-    assert_eq!(cancel.header.ty, FrameType::Cancel);
-    assert_eq!(
-        (
-            cancel.header.channel,
-            cancel.header.epoch,
-            cancel.header.corr
-        ),
-        (
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr
-        )
+    assert!(
+        rx.try_recv().is_err(),
+        "scope replacement has no reverse frame"
     );
-    let mut answer = question;
-    answer.header.ty = FrameType::Response;
-    answer.body = serde_json::to_vec(
-        &json!({"decision":"allow_origin_always", "elicitation_id":"el_replaced"}),
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(answer, &tx, &planes)
-        .await
-        .unwrap();
+    answer_browser(&planes, &tx, &question, "allow_origin_always").await;
     assert!(planes
         .management
         .standing_browser_grants()
@@ -7715,7 +7686,7 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
     cerebellum::handle_frame_for_test(call.clone(), &tx, &planes)
         .await
         .unwrap();
-    let question = consent_frame(&mut rx).await;
+    let question = ScriptedCarrier::for_planes(&planes).card(9, 3).await;
     assert_eq!(question.header.ty, FrameType::Request);
     let mut cancel = call;
     cancel.header.ty = FrameType::Cancel;
@@ -7723,36 +7694,19 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
     cerebellum::handle_frame_for_test(cancel, &tx, &planes)
         .await
         .unwrap();
-    let mut reply = None;
-    let mut cancellation = None;
-    for _ in 0..2 {
-        let frame = consent_frame(&mut rx).await;
-        if frame.header.ty == FrameType::Cancel {
-            cancellation = Some(frame);
-        } else {
-            reply = Some(frame);
-        }
-    }
-    let cancel = cancellation.expect("the relayed call's card is ended at the carrier");
-    assert_eq!(
-        (
-            cancel.header.channel,
-            cancel.header.epoch,
-            cancel.header.corr
-        ),
-        (
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr
-        )
-    );
-    let reply = reply.unwrap();
+    let reply = consent_frame(&mut rx).await;
     assert_eq!(
         body(&reply)["detail"]["decision"],
         "cancelled",
         "{}",
         body(&reply)
     );
+    assert!(rx.try_recv().is_err());
+    assert!(ScriptedCarrier::for_planes(&planes)
+        .calls()
+        .iter()
+        .any(|(method, params)| method == "consent.detach"
+            && params["elicitation_id"] == body(&question)["id"]));
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
@@ -9015,7 +8969,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
         assert_eq!(fixture.lock().unwrap().readable.len(), 2);
         let click = invoke(&planes, 901, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"check embedded action origin","severity":{"tier":2,"credential":false,"financial":false}})).await;
         let click: Value = serde_json::from_slice(&click.body).unwrap();
-        assert_eq!(click["outcome"], "authorization_denied", "{click}");
+        assert_eq!(click["outcome"], "consent_unavailable", "{click}");
         assert_eq!(
             click["detail"]["attempted_origin"],
             "https://payment.example:8443"
@@ -9027,7 +8981,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
         assert!(click["remedy"]
             .as_str()
             .unwrap()
-            .contains("detail.grant_request"));
+            .contains("call from the agent session"));
         let zoom = invoke(
             &planes,
             902,
@@ -9049,7 +9003,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
     assert!(launcher.effects.lock().unwrap().contains(&"screenshot"));
     let point = invoke(&planes, 904, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":image["snapshot_id"],"intent":"check point action origin","severity":{"tier":4,"credential":false,"financial":true}})).await;
     let point: Value = serde_json::from_slice(&point.body).unwrap();
-    assert_eq!(point["outcome"], "authorization_denied", "{point}");
+    assert_eq!(point["outcome"], "consent_unavailable", "{point}");
     assert_eq!(
         point["detail"]["attempted_origin"],
         "https://payment.example:8443"
@@ -9061,7 +9015,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
     assert!(point["remedy"]
         .as_str()
         .unwrap()
-        .contains("detail.grant_request"));
+        .contains("call from the agent session"));
     assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
 }
 
@@ -9089,7 +9043,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     let snapshot: Value = serde_json::from_slice(&snapshot.body).unwrap();
     let reply = invoke(&planes, 911, "browser.click", json!({"ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],"intent":"exercise the frame authorization boundary","severity":{"tier":2,"credential":false,"financial":false}})).await;
     let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     assert_eq!(
         reply["detail"]["attempted_origin"],
         "https://other-frame.example:8443"
@@ -9098,7 +9052,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     let screenshot: Value = serde_json::from_slice(&screenshot.body).unwrap();
     let point = invoke(&planes, 913, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":screenshot["snapshot_id"],"intent":"exercise point frame authorization","severity":{"tier":4,"credential":false,"financial":true}})).await;
     let point: Value = serde_json::from_slice(&point.body).unwrap();
-    assert_eq!(point["outcome"], "authorization_denied", "{point}");
+    assert_eq!(point["outcome"], "consent_unavailable", "{point}");
     assert_eq!(
         point["detail"]["attempted_origin"],
         "https://other-frame.example:8443"
@@ -9199,7 +9153,7 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
         let point_reply = invoke(&planes, 933, "browser.click_point", json!({"x_px":0,"y_px":0,"image_width_px":1,"image_height_px":1,"snapshot_id":screenshot["snapshot_id"],"intent":"exercise frame point submit policy","severity":severity})).await;
         for reply in [ref_reply, point_reply] {
             let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(reply["outcome"], "hazard_not_disclosed", "{reply}");
+            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
             assert_eq!(reply["detail"]["missing_hazard"], missing_hazard);
             assert_eq!(
                 reply["detail"]["attempted_origin"],
@@ -9392,7 +9346,7 @@ async fn wire_type_ungranted_frame_names_its_origin() {
     })
     .await;
     let reply = type_wire(&planes, &reference, "hello", false).await;
-    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     assert!(
         reply.to_string().contains("https://ungranted.example"),
         "{reply}"
@@ -9910,4 +9864,143 @@ fn only_profile_creation_marks_signed_in_coverage_complete() {
     );
     assert!(persisted.is_signed_in("legacy-agent", "default", "https://never-signed.example"));
     assert!(!persisted.is_signed_in("fresh-agent", "default", "https://never-signed.example"));
+}
+
+struct HeldStandingSave {
+    inner: cerebellum::browser_standing_grants::InMemoryStandingGrantStorage,
+    started: tokio::sync::Notify,
+    release: (Mutex<bool>, std::sync::Condvar),
+    saves: std::sync::atomic::AtomicUsize,
+}
+impl HeldStandingSave {
+    fn new() -> Self {
+        Self {
+            inner: Default::default(),
+            started: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), std::sync::Condvar::new()),
+            saves: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+impl cerebellum::browser_standing_grants::StandingGrantStorage for HeldStandingSave {
+    fn load(
+        &self,
+    ) -> Result<
+        cerebellum::browser_standing_grants::StandingGrantStoreState,
+        cerebellum::browser_standing_grants::StandingGrantStoreError,
+    > {
+        self.inner.load()
+    }
+    fn save(
+        &self,
+        state: &cerebellum::browser_standing_grants::StandingGrantStoreState,
+    ) -> Result<(), cerebellum::browser_standing_grants::StandingGrantStoreError> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.notify_one();
+        let released = self.release.0.lock().unwrap();
+        let (_released, wait) = self
+            .release
+            .1
+            .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+            .unwrap();
+        assert!(
+            !wait.timed_out(),
+            "test must release the standing-grant write"
+        );
+        self.inner.save(state)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect() {
+    let storage = Arc::new(HeldStandingSave::new());
+    let standing = Arc::new(
+        cerebellum::browser_standing_grants::StandingBrowserGrants::open(
+            storage.clone(),
+            Some("test-machine".into()),
+        ),
+    );
+    let (planes, launcher) = blocking_grant_fixture_with_store(Some(standing.clone())).await;
+    bind_management_route(&planes).await;
+    let service = ScriptedCarrier::for_planes(&planes);
+    let (tx, mut rx) = mpsc::channel(8);
+    let opening = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), MANAGEMENT_CHANNEL, MANAGEMENT_EPOCH, 9800, serde_json::to_vec(&json!({"method":"browser.open_grant","params":{"origins":["https://requested.example"],"hazards":[],"severity_tier":3}})).unwrap()).unwrap();
+    cerebellum::handle_frame_for_test(opening, &tx, &planes)
+        .await
+        .unwrap();
+    let pending = consent_frame(&mut rx).await;
+    assert_eq!(body(&pending)["outcome"], "consent_pending");
+    let card = service.card(MANAGEMENT_CHANNEL, MANAGEMENT_EPOCH).await;
+    assert_eq!(body(&pending)["ask_id"], body(&card)["id"]);
+    service.defer_awaits();
+    cerebellum::handle_frame_for_test(blocking_navigation(3), &tx, &planes)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !service
+            .calls()
+            .iter()
+            .any(|(method, _)| method == "consent.await")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        service
+            .calls()
+            .iter()
+            .filter(|(method, _)| method == "consent.request")
+            .count(),
+        1,
+        "navigate joins the same subject"
+    );
+    assert!(launcher.effects.lock().unwrap().is_empty());
+    answer_browser(&planes, &tx, &card, "allow_origin_always").await;
+    let drainer = {
+        let planes = planes.clone();
+        tokio::spawn(async move {
+            drain_browser(&planes).await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), storage.started.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .calls()
+            .iter()
+            .filter(|(method, _)| method == "consent.answers")
+            .count(),
+        2,
+        "the competing drain reaches the answer feed before the held write"
+    );
+    let before_store = tokio::time::timeout(Duration::from_millis(75), rx.recv()).await;
+    // Always release the blocked writer before asserting, so a failing guard
+    // does not leave a runtime worker trapped inside the test store.
+    storage.release();
+    assert!(
+        before_store.is_err(),
+        "a losing holder replied before the winner stored the permission"
+    );
+    drainer.await.unwrap();
+    service.resume_awaits();
+    let reply = consent_frame(&mut rx).await;
+    assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
+    assert_eq!(
+        storage.saves.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the election winner stores the answer"
+    );
+    assert_eq!(standing.live_rows("pj-browser-session-wire").len(), 1);
+    assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
+    assert!(
+        rx.try_recv().is_err(),
+        "no reverse frame or duplicate reply"
+    );
 }

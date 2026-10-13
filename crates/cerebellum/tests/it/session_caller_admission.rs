@@ -90,10 +90,19 @@ fn management_route() -> RouteTarget {
 }
 
 /// Send a real `route.bind` naming [`CONVERSATION`], with fully attested
-/// admission facts and the ability to relay a question to a person, so that
+/// admission facts, so that
 /// nothing but the principal stands between the route and the grant. Returns
 /// the control reply.
 async fn bind(planes: &Planes, principal: Option<Principal>, target: RouteTarget) -> Frame {
+    bind_with_scope(planes, principal, target, None).await
+}
+
+async fn bind_with_scope(
+    planes: &Planes,
+    principal: Option<Principal>,
+    target: RouteTarget,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+) -> Frame {
     let request = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode: None,
@@ -109,7 +118,7 @@ async fn bind(planes: &Planes, principal: Option<Principal>, target: RouteTarget
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.launch", "browser.status", "browser.close"],
         })),
-        scope: None,
+        scope,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -169,7 +178,7 @@ fn navigate(corr: u64, origin: &str) -> Frame {
 }
 
 /// Send one request on the bound route and collect every frame it produces
-/// within a short window: its reply, and any question it put to a person.
+/// within a short window. Permission questions must not appear on this writer.
 async fn frames_for(planes: &Planes, request: Frame) -> Vec<Frame> {
     let (tx, mut rx) = mpsc::channel(8);
     cerebellum::handle_frame_for_test(request, &tx, planes)
@@ -179,8 +188,8 @@ async fn frames_for(planes: &Planes, request: Frame) -> Vec<Frame> {
         .await
         .expect("the request is answered promptly")
         .expect("the writer stays open")];
-    // A question is sent before, or instead of, the reply; the window is long
-    // enough for one queued behind a reply to arrive too.
+    // Keep extra frames so tests can reject a request sent back to the caller
+    // (including a permission question), or a duplicate reply.
     while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
         frames.push(frame);
     }
@@ -238,8 +247,18 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
 /// running, while the ungranted site is put to the person instead.
 #[tokio::test]
 async fn the_session_caller_acts_on_its_conversations_grant() {
-    let planes = planes_with_a_grant().await;
-    bind_acked(&planes, reserved("prefrontal-core"), tool_route()).await;
+    let service = super::support::computer::cingulate::ScriptedCarrier::default();
+    let planes = service.install(planes_with_a_grant().await);
+    let bound = bind_with_scope(
+        &planes,
+        reserved("prefrontal-core"),
+        tool_route(),
+        Some(super::support::computer::cingulate::stamp(
+            "pj-session-admission",
+        )),
+    )
+    .await;
+    assert_eq!(bound.header.ty, FrameType::Response);
 
     let granted = frames_for(&planes, navigate(1, GRANTED_ORIGIN)).await;
     assert_eq!(granted.len(), 1, "no question for a granted site");
@@ -249,12 +268,32 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
 
     // The local-service contrast proves the grant gate ran: public sites can
     // pass on the baseline, but an ungranted local service must ask.
+    assert!(service.questions().is_empty());
+    service.queue(cerebellum::elicit::AskOutcome::Answered(
+        json!({"decision":"deny"}),
+    ));
     let ungranted = frames_for(&planes, navigate(2, UNGRANTED_ORIGIN)).await;
-    assert!(
-        ungranted
-            .iter()
-            .any(|frame| frame.header.ty == FrameType::Request),
-        "an ungranted site is put to the person"
+    assert_eq!(ungranted.len(), 1);
+    assert_eq!(
+        ungranted[0].header.ty,
+        FrameType::Response,
+        "no reverse request"
+    );
+    let reply: Value = serde_json::from_slice(&ungranted[0].body).unwrap();
+    assert_eq!(reply["detail"]["decision"], "declined");
+    assert_eq!(
+        service.questions().len(),
+        1,
+        "an ungranted site is put to the person through Cingulate"
+    );
+    assert_eq!(
+        service.questions()[0]["params"]["scope"]["origins"],
+        json!([UNGRANTED_ORIGIN])
+    );
+    assert_eq!(
+        planes.management.browser_grant_count().await,
+        1,
+        "declining grants nothing more"
     );
 }
 
