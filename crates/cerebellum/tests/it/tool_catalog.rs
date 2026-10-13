@@ -500,7 +500,8 @@ async fn unknown_mode_refused_before_grants_and_argument_dispatch() {
 #[tokio::test]
 async fn codemode_never_elicits_a_consent_card() {
     use subc_protocol::call_mode::CallMode;
-    let planes = planes(true);
+    let service = super::support::computer::cingulate::ScriptedCarrier::default();
+    let planes = service.install(planes(true));
     let typed = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode: Some(CallMode::Codemode),
@@ -531,6 +532,14 @@ async fn codemode_never_elicits_a_consent_card() {
     assert_eq!(reply["structuredContent"]["detail"]["reason"], "agent_run");
     assert_eq!(reply["isError"], true);
     assert_eq!(reply["errorCode"], "consent_unavailable");
+    assert!(
+        service.questions().is_empty(),
+        "codemode raises no permission card"
+    );
+    assert!(
+        service.calls().is_empty(),
+        "codemode opens no consent request"
+    );
 }
 
 #[tokio::test]
@@ -559,7 +568,8 @@ async fn flow_still_refuses_consent_on_the_production_handler() {
 
 #[tokio::test]
 async fn classic_still_elicits_a_consent_card() {
-    let planes = planes(true);
+    let service = super::support::computer::cingulate::ScriptedCarrier::default();
+    let planes = service.install(planes(true));
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode: Some(subc_protocol::call_mode::CallMode::Classic),
@@ -576,7 +586,7 @@ async fn classic_still_elicits_a_consent_card() {
             "elicitation".into(),
             cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
         ]),
-        scope: None,
+        scope: Some(super::support::computer::cingulate::stamp("catalog-test")),
         admission_facts: Some(
             json!({"agentProjectId":"catalog-test", "sessionKind":"primary", "effectiveCapabilityScope":["*"]}),
         ),
@@ -595,26 +605,31 @@ async fn classic_still_elicits_a_consent_card() {
     cerebellum::handle_frame_for_test(request, &tx, &planes)
         .await
         .unwrap();
-    let mut elicited = false;
-    let mut replied = false;
-    for _ in 0..2 {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match frame.header.ty {
-            FrameType::Request => elicited = true,
-            FrameType::Response => {
-                replied = true;
-                assert_eq!(
-                    body(&frame)["structuredContent"]["outcome"],
-                    "consent_pending"
-                );
-            }
-            other => panic!("unexpected frame {other:?}"),
-        }
-    }
-    assert!(elicited && replied);
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "the agent receives no permission Request frame"
+    );
+    let reply = body(&frame);
+    assert_eq!(reply["structuredContent"]["outcome"], "consent_pending");
+    let card = service.card(9, 3).await;
+    assert_eq!(reply["structuredContent"]["ask_id"], body(&card)["id"]);
+    assert_eq!(
+        service
+            .calls()
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>(),
+        ["consent.request", "consent.detach"]
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no reverse request or duplicate reply"
+    );
 }
 
 #[tokio::test]
