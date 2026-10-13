@@ -34,7 +34,6 @@
 //! daemon.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +43,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::{json, Map, Value};
 
-use crate::computer_grants::LoginConsent;
-use crate::elicit::AskOutcome;
+use crate::cingulate_client::desk::{Ending, NoCard};
+use crate::computer_grants::{ComputerGrants, LoginAnswer, LoginConsent, LoginConsentRequest};
 use crate::journal::LoginCapturePayload;
 
 pub mod vault;
@@ -914,14 +913,16 @@ pub struct CaptureModule {
 }
 
 /// Everything a capture call needs from the route that made it.
-pub struct CaptureCall<'a, Ask, Cancelled> {
+pub struct CaptureCall<'a, Cancelled> {
     pub accepted: &'a AcceptedBindFacts,
-    pub declares_elicitation: bool,
-    /// Put one question to the person. The deadline is the ask's own. The
-    /// answer is either how the question ended or, from the module's consent
-    /// registry, that the person has not answered yet (see
-    /// [`crate::computer_grants::ComputerGrants::require_login`]).
-    pub ask: Ask,
+    /// The module's computer grants, which hold the login card: a call
+    /// joins a card already open for the same capture, takes a late approval
+    /// once, or raises the card with Cingulate and waits a bounded time in the
+    /// call (see [`ComputerGrants::require_login`]).
+    pub grants: &'a Arc<ComputerGrants>,
+    /// This call's need for consent, with the live agent call the card is
+    /// raised under.
+    pub consent: LoginConsentRequest,
     /// Whether the caller cancelled the request, its route went away, or the
     /// module began draining.
     pub cancelled: Cancelled,
@@ -1051,15 +1052,42 @@ impl CaptureModule {
     /// Run one capture to its end. The throwaway profile is deleted before
     /// the login is deposited and before this returns, so the session exists
     /// in one place, the vault, by the time a caller hears back.
-    pub async fn run<Ask, AskFuture, Answer, Cancelled>(
+    ///
+    /// A late approval this call took (an answer the person gave after an
+    /// earlier capture call had stopped waiting) can be used only once, so
+    /// Cingulate is told what became of it before this returns.
+    pub async fn run<Cancelled>(
         &self,
         request: &CaptureRequest,
-        call: CaptureCall<'_, Ask, Cancelled>,
+        call: CaptureCall<'_, Cancelled>,
     ) -> CaptureOutcome
     where
-        Ask: FnOnce(Value, Duration) -> AskFuture,
-        AskFuture: Future<Output = Answer>,
-        Answer: Into<LoginConsent>,
+        Cancelled: Fn() -> bool,
+    {
+        let carrier = Arc::clone(&call.consent.carrier);
+        let mut taken = None;
+        let outcome = self.run_consented(request, call, &mut taken).await;
+        if let Some(answer) = taken {
+            crate::computer_grants::report_login_execution(
+                &carrier,
+                &answer,
+                &outcome.reply,
+                "captured",
+            )
+            .await;
+        }
+        outcome
+    }
+
+    /// The capture itself. `taken` is set once the call has taken a late
+    /// approval, whatever happens after.
+    async fn run_consented<Cancelled>(
+        &self,
+        request: &CaptureRequest,
+        call: CaptureCall<'_, Cancelled>,
+        taken: &mut Option<LoginAnswer>,
+    ) -> CaptureOutcome
+    where
         Cancelled: Fn() -> bool,
     {
         let record = Record::new(request);
@@ -1089,10 +1117,12 @@ impl CaptureModule {
                 json!({"remedy": "run the capture on macOS, the only platform whose backup exclusion this module can prove"}),
             );
         }
-        if !call.declares_elicitation {
+        // Only a live call from an admitted agent session can raise the card.
+        if let Err(not_live) = call.consent.carrier.live() {
+            let why = NoCard::of_not_live(not_live);
             return record.refused(
                 "consent_unavailable",
-                json!({"detail":{"reason":"no_agent_session","remedy":"call from the agent session that needs the permission; it can raise the card"}}),
+                json!({"detail":{"reason":why.reason(), "remedy":why.remedy()}}),
             );
         }
         let Some(launcher) = self.launcher() else {
@@ -1137,11 +1167,18 @@ impl CaptureModule {
         // for alongside it rather than only after it ends. Stopping the wait
         // leaves the card itself open.
         let answer = {
-            let asked = (call.ask)(question, crate::consent_card::LOGIN_CARD_LIFETIME);
+            let asked = call
+                .grants
+                .require_login(call.consent, move || (String::new(), question.clone()));
             tokio::pin!(asked);
             let check = self.env.poll_interval.min(CANCEL_CHECK_INTERVAL);
             loop {
+                // The consent wait is polled first: it watches the same
+                // cancel itself and lets go of its card (detaching or
+                // withdrawing it) as it ends, so when both are ready at
+                // once its ending is taken rather than dropped half-done.
                 tokio::select! {
+                    biased;
                     answer = &mut asked => break Some(answer),
                     () = tokio::time::sleep(check) => {
                         if (call.cancelled)() {
@@ -1154,18 +1191,21 @@ impl CaptureModule {
         let Some(answer) = answer else {
             return record.ended("cancelled", None);
         };
-        let answer = match answer.into() {
+        let answer = match answer {
             LoginConsent::Ended(answer) => {
-                if let crate::cingulate_client::desk::Ending::NoCard(why) = answer.ending {
+                if let Ending::NoCard(why) = answer.ending {
                     return record.refused(
                         "consent_unavailable",
                         json!({"detail":{"reason":why.reason(), "remedy":why.remedy()}}),
                     );
                 }
-                if answer.ending == crate::cingulate_client::desk::Ending::Withdrawn {
+                if answer.ending == Ending::Withdrawn {
                     return record.refused("capture_consent_not_given", json!({"reason":"question_withdrawn", "remedy":"retry this call to ask again"}));
                 }
-                answer.legacy_answer()
+                if answer.taken_approval {
+                    *taken = Some(answer.clone());
+                }
+                answer
             }
             // Nothing was launched: the capture runs only on a call made
             // while the person is at hand, so a later approval is kept for
@@ -1183,27 +1223,25 @@ impl CaptureModule {
         if (call.cancelled)() {
             return record.ended("cancelled", None);
         }
-        if let Some(reason) = consent_refusal(&answer) {
+        if let Some(reason) = consent_refusal(&answer.ending) {
             return record.refused(
                 "capture_consent_not_given",
                 json!({"reason": reason, "remedy": consent_refusal_remedy(reason)}),
             );
         }
-        // The deposit's `consent_ref` is the id of the card the person
-        // tapped, as the consent relay reports it, so the vault's audit row
-        // names a consent the relay recorded. An approval that carries no
-        // such id cannot be linked to the stored login, so it is refused
-        // here, before the person is asked to sign in for nothing. This
-        // module's own request id for the card is never used instead: an
-        // older relay records it nowhere, so a reference built from it could
-        // not be traced.
+        // The deposit's `consent_ref` is the Cingulate id of the card the
+        // person approved, so the vault's audit row names a consent Cingulate
+        // recorded. An id that cannot be a `consent_ref` is refused here,
+        // before the person is asked to sign in for nothing. This module's own
+        // id for the rendered card is never used instead: it is never sent,
+        // so nothing could trace a reference built from it.
         let Some(consent_ref) = answered_elicitation_id(&answer) else {
             return record.refused(
                 "capture_not_stored",
                 json!({
                     "credential_id": request.credential_id(),
                     "reason": CONSENT_NOT_LINKABLE,
-                    "remedy": "nothing was captured: the person approved, but the consent relay is too old to say which card they approved, so the approval cannot be linked to the vault record. Update the consent relay before capturing again.",
+                    "remedy": "nothing was captured: the person approved, but the approved card's id cannot serve as the vault's consent reference, so the approval cannot be linked to the stored login. Retry; if it happens again, the module needs attention.",
                 }),
             );
         };
@@ -1821,27 +1859,27 @@ fn new_capture_id() -> String {
     )
 }
 
-/// A fresh JSON-RPC id for one capture's consent card, which the reverse
-/// request to the caller needs. It is never the deposit's `consent_ref`:
-/// that comes from the answer (see [`answered_elicitation_id`]).
+/// The id `consent_question` renders the card body under. Only the body's
+/// params are sent to Cingulate, so this id is never sent, and it is never
+/// the deposit's `consent_ref`: that is the Cingulate id of the approved card
+/// (see [`answered_elicitation_id`]).
 fn new_card_request_id() -> String {
     format!("capture-login-{}", new_capture_id())
 }
 
 /// The `capture_not_stored` reason when an approval carries no usable id of
-/// the card the person tapped, so the deposit could not name its consent.
+/// the card the person approved, so the deposit could not name its consent.
 pub const CONSENT_NOT_LINKABLE: &str = "consent_not_linkable";
 
-/// The id of the card the person answered, from the answer's
-/// `elicitation_id`, when it can be a `consent_ref`: printable ASCII with no
-/// whitespace, 1 to [`vault_wire::MAX_CONSENT_REF_BYTES`] bytes. Anything else
-/// counts as absent rather than being trimmed or truncated into an id the
-/// relay never issued. Other keys in the answer are ignored.
-fn answered_elicitation_id(answer: &AskOutcome) -> Option<String> {
-    let AskOutcome::Answered(body) = answer else {
+/// The Cingulate id of the card the person approved, when it can be a
+/// `consent_ref`: printable ASCII with no whitespace, 1 to
+/// [`vault_wire::MAX_CONSENT_REF_BYTES`] bytes. Anything else counts as absent
+/// rather than being trimmed or truncated into an id Cingulate never issued.
+fn answered_elicitation_id(answer: &LoginAnswer) -> Option<String> {
+    if !matches!(answer.ending, Ending::Granted { .. }) {
         return None;
-    };
-    let id = body.get("elicitation_id")?.as_str()?;
+    }
+    let id = answer.elicitation_id.as_deref()?;
     let usable = !id.is_empty()
         && id.len() <= vault_wire::MAX_CONSENT_REF_BYTES
         && id.bytes().all(|byte| byte.is_ascii_graphic());
@@ -1899,19 +1937,19 @@ pub fn consent_question(request: &CaptureRequest, ask_id: &str) -> Value {
 }
 
 /// `None` only for an affirmative answer. Every other ending -- a refusal,
-/// silence, a question nobody was shown, one that never left, or a word this
-/// module does not know -- is a refusal, named so the caller can tell them
+/// silence, a card nobody was shown, one that never left, or a choice the
+/// card did not offer -- is a refusal, named so the caller can tell them
 /// apart.
-fn consent_refusal(answer: &AskOutcome) -> Option<&'static str> {
-    match answer {
-        AskOutcome::Answered(body) => match body.get("decision").and_then(Value::as_str) {
-            Some(ALLOW_DECISION) => None,
-            Some(DENY_DECISION) => Some("deny"),
-            _ => Some("unrecognized_answer"),
-        },
-        AskOutcome::NoAnswer => Some("no_answer"),
-        AskOutcome::NotPutToAnyone => Some("not_put_to_anyone"),
-        AskOutcome::Undeliverable => Some("undeliverable"),
+fn consent_refusal(ending: &Ending) -> Option<&'static str> {
+    match ending {
+        Ending::Granted { choice_id } if choice_id == ALLOW_DECISION => None,
+        Ending::Declined { choice_id } if choice_id == DENY_DECISION => Some("deny"),
+        Ending::Granted { .. } | Ending::Declined { .. } => Some("unrecognized_answer"),
+        Ending::NoAnswer => Some("no_answer"),
+        Ending::NotPutToAnyone => Some("not_put_to_anyone"),
+        Ending::DeliveryFailed => Some("undeliverable"),
+        Ending::Withdrawn => Some("question_withdrawn"),
+        Ending::NoCard(why) => Some(why.reason().unwrap_or("undeliverable")),
     }
 }
 

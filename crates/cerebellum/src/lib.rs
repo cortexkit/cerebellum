@@ -2689,6 +2689,9 @@ pub struct Planes {
     /// Serializes answer-feed reads per session and calls each flow's adapter
     /// to elect one caller to store the answer's permission or approval.
     pub consent_drain: Arc<consent_drain::ConsentDrain>,
+    /// The user-browser site cards calls are raising or holding, which the
+    /// session drain must leave to those calls.
+    pub(crate) user_browser_cards: Arc<user_browser::SiteCardHolders>,
     #[cfg(test)]
     pub(crate) consent_test: Option<Arc<computer_grants::tests::CardService>>,
     /// The computer plane or the single typed reason it was withheld.
@@ -2821,6 +2824,7 @@ impl Planes {
             .computer_grants()
             .register_drain(&self.consent_drain);
         browser_consent::register(&self);
+        user_browser::register(&self);
         self
     }
 
@@ -3073,6 +3077,7 @@ impl Planes {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            user_browser_cards: Arc::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: computer_capability::computer_audit(journal).map(|audit| {
                 // One idle estimator for the plane's lifetime: it exists to
@@ -3183,6 +3188,7 @@ impl Clone for Planes {
             management: Arc::clone(&self.management),
             consent: Arc::clone(&self.consent),
             consent_drain: Arc::clone(&self.consent_drain),
+            user_browser_cards: Arc::clone(&self.user_browser_cards),
             #[cfg(test)]
             consent_test: self.consent_test.clone(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -4824,7 +4830,7 @@ async fn complete_login_import(
             if answer.taken_approval {
                 execution = Some(answer.clone());
             }
-            Some(answer.legacy_answer())
+            Some(answer.ending)
         }
         computer_grants::LoginConsent::Pending { ask_id } => {
             return journal_login_import_result(planes, &facts.identity, plan.pending(ask_id))
@@ -4841,16 +4847,19 @@ async fn complete_login_import(
     let mut execution_result = json!({"outcome":"not_run"});
     let reply = async {
         let decision = match &answer {
-        Some(elicit::AskOutcome::Answered(body)) => body.get("decision").and_then(Value::as_str),
-        // None of these permits a transfer, and they are listed rather than
-        // wildcarded so a future outcome has to be decided about here.
-        Some(
-            elicit::AskOutcome::NoAnswer
-            | elicit::AskOutcome::NotPutToAnyone
-            | elicit::AskOutcome::Undeliverable,
-        )
-        | None => None,
-    };
+            Some(cingulate_client::desk::Ending::Granted { choice_id }) => Some(choice_id.as_str()),
+            // None of these permits a transfer, and they are listed rather
+            // than wildcarded so a future ending has to be decided about here.
+            Some(
+                cingulate_client::desk::Ending::Declined { .. }
+                | cingulate_client::desk::Ending::NoAnswer
+                | cingulate_client::desk::Ending::NotPutToAnyone
+                | cingulate_client::desk::Ending::DeliveryFailed
+                | cingulate_client::desk::Ending::Withdrawn
+                | cingulate_client::desk::Ending::NoCard(_),
+            )
+            | None => None,
+        };
     let mut reopen = None;
     if plan.permits_transfer(decision) {
         let status = planes.sessions.status(
@@ -5002,53 +5011,27 @@ async fn capture_browser_login(
     // of a drain all end the capture with nothing written.
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
-    let execution = std::sync::Mutex::new(None);
-    let report_carrier = login_consent_request(
-        planes,
-        facts,
-        writer,
-        (channel, epoch),
-        computer_grants::LoginCapability::CaptureLogin,
-        request.consent_parameters(),
-        cancel.clone(),
-    )
-    .carrier;
     let cancel_for_capture = cancel.clone();
+    // The card is raised through the module's computer grants, which hold
+    // the call for a bounded wait, leave the card open past it, and answer a
+    // retry from a late approval; the capture reports to Cingulate what
+    // became of an approval it used that way.
     let outcome = planes
         .capture
         .run(
             request,
             login_capture::CaptureCall {
                 accepted: facts,
-                declares_elicitation: computer_grants::admits_consent(facts),
-                // The card is filed through the module's consent registry,
-                // which holds the call for a bounded wait, keeps the card
-                // open past it, and answers a retry from a late answer. The
-                // deadline is the card's lifetime, which the registry owns.
-                ask: |question: Value, _deadline| {
-                    let consent = planes.management.computer_grants().require_login(
-                        login_consent_request(
-                            planes,
-                            facts,
-                            writer,
-                            (channel, epoch),
-                            computer_grants::LoginCapability::CaptureLogin,
-                            request.consent_parameters(),
-                            cancel.clone(),
-                        ),
-                        move || (String::new(), question.clone()),
-                    );
-                    let execution = &execution;
-                    async move {
-                        let consent = consent.await;
-                        if let computer_grants::LoginConsent::Ended(answer) = &consent {
-                            if answer.taken_approval {
-                                *execution.lock().unwrap() = Some(answer.clone());
-                            }
-                        }
-                        consent
-                    }
-                },
+                grants: planes.management.computer_grants(),
+                consent: login_consent_request(
+                    planes,
+                    facts,
+                    writer,
+                    (channel, epoch),
+                    computer_grants::LoginCapability::CaptureLogin,
+                    request.consent_parameters(),
+                    cancel,
+                ),
                 cancelled: move || {
                     cancel_for_capture
                         .as_ref()
@@ -5058,15 +5041,6 @@ async fn capture_browser_login(
             },
         )
         .await;
-    if let Some(answer) = execution.into_inner().unwrap() {
-        computer_grants::report_login_execution(
-            &report_carrier,
-            &answer,
-            &outcome.reply,
-            "captured",
-        )
-        .await;
-    }
     // A deposit already made stays in the vault when this record cannot be
     // written: the vault cannot be asked to withdraw it, and its own audit
     // row, bound to the consent card's id, still describes it.
@@ -9448,6 +9422,7 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
             #[cfg(target_os = "macos")]
@@ -9513,6 +9488,7 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
             #[cfg(target_os = "macos")]
@@ -9806,47 +9782,239 @@ mod tests {
             .expect("the writer stays open")
     }
 
+    /// One test's Cingulate and consent registry: a scripted Cingulate and a
+    /// registry file of the test's own, so planes can be built again over the
+    /// same file and the same Cingulate, as a restarted module would be.
+    pub(super) struct ScriptedConsent {
+        pub(super) script: Arc<cingulate_client::ScriptedCingulate>,
+        dir: PathBuf,
+    }
+
+    impl ScriptedConsent {
+        pub(super) fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let dir = std::env::temp_dir().join(format!(
+                "scripted-consent-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                script: cingulate_client::ScriptedCingulate::new(),
+                dir,
+            }
+        }
+
+        pub(super) fn store(&self) -> cingulate_client::desk::FileRegistryStore {
+            cingulate_client::desk::FileRegistryStore::new(self.dir.join("cingulate_raised.json"))
+        }
+
+        /// `planes` with their consent desk raising cards with the script and
+        /// keeping its registry in the test's file, and the route at
+        /// `channel` bound to an admitted agent session.
+        pub(super) fn wire(&self, planes: Planes, channel: u16, epoch: u32) -> Planes {
+            let planes =
+                planes.with_cingulate(Arc::new(Arc::clone(&self.script)), Arc::new(self.store()));
+            let facts = planes.routes.get(channel, epoch).unwrap();
+            planes.routes.insert(
+                channel,
+                epoch,
+                facts.with_scope(Some(computer_grants::tests::stamp("test-project"))),
+            );
+            planes
+        }
+
+        /// Planes running the fixture's capture module behind the production
+        /// frame dispatcher, on the route at channel 4. Each call builds them
+        /// anew over the same registry.
+        fn planes(&self, fixture: &login_capture::test_support::Fixture) -> Planes {
+            let mut planes = Planes::with_browser_config_journaling(
+                Arc::new(HealthState::default()),
+                None,
+                JournalPersistence::Isolated,
+            );
+            planes.capture = Arc::clone(&fixture.module);
+            let admission = json!({
+                "agentProjectId": "test-project",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+            });
+            planes.routes.insert(
+                4,
+                1,
+                AcceptedBindFacts::from_bind(
+                    &bind_identity_for_test(),
+                    session_caller_principal_for_test(),
+                    Some(&admission),
+                    None,
+                    &subc_protocol::RouteTarget::ManagementSurface {
+                        module_id: "cerebellum".to_string(),
+                    },
+                ),
+            );
+            self.wire(planes, 4, 1)
+        }
+
+        /// Cingulate raises the next card under `id`.
+        pub(super) fn raises(&self, id: &str) -> &Self {
+            self.script.then(
+                cingulate_client::wire::CONSENT_REQUEST,
+                cingulate_client::Reply::Result(json!({"elicitation_id": id})),
+            );
+            self
+        }
+
+        /// The person answers `choice` while the call holds card `id`.
+        fn answered_in_call(&self, id: &str, choice: &str) -> &Self {
+            self.script.then(
+                cingulate_client::wire::CONSENT_AWAIT,
+                cingulate_client::Reply::Result(
+                    json!({"elicitation_id": id, "state": "answered", "answered_choice_id": choice}),
+                ),
+            );
+            self
+        }
+
+        /// Card `id` is still open when the call stops holding it, and is
+        /// detached.
+        pub(super) fn unanswered(&self, id: &str) -> &Self {
+            self.script
+                .then(
+                    cingulate_client::wire::CONSENT_AWAIT,
+                    cingulate_client::Reply::Result(
+                        json!({"elicitation_id": id, "state": "pending"}),
+                    ),
+                )
+                .then(
+                    cingulate_client::wire::CONSENT_DETACH,
+                    cingulate_client::Reply::Result(
+                        json!({"elicitation_id": id, "state": "pending", "detached": true}),
+                    ),
+                );
+            self
+        }
+
+        /// The session's next call reads `records` from the answers feed and
+        /// acknowledges them.
+        pub(super) fn feed(&self, records: Value) -> &Self {
+            self.script
+                .then(
+                    cingulate_client::wire::CONSENT_ANSWERS,
+                    cingulate_client::Reply::Result(json!({"records": records, "cursor": 1})),
+                )
+                .then(
+                    cingulate_client::wire::CONSENT_ACK,
+                    cingulate_client::Reply::Result(json!({"cursor": 1})),
+                );
+            self
+        }
+
+        /// Cingulate takes a report of what became of approved card `id`.
+        pub(super) fn takes_report(&self, id: &str) -> &Self {
+            self.script.then(
+                cingulate_client::wire::CONSENT_REPORT_EXECUTION,
+                cingulate_client::Reply::Result(
+                    json!({"elicitation_id": id, "state": "answered", "answered_choice_id": "allow"}),
+                ),
+            );
+            self
+        }
+
+        pub(super) fn methods(&self) -> Vec<String> {
+            self.script.methods()
+        }
+
+        /// The cards raised so far, as `consent.request` params.
+        pub(super) fn cards(&self) -> Vec<Value> {
+            self.script
+                .calls()
+                .into_iter()
+                .filter(|(method, _)| method == cingulate_client::wire::CONSENT_REQUEST)
+                .map(|(_, params)| params)
+                .collect()
+        }
+    }
+
+    impl Drop for ScriptedConsent {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    pub(super) fn late_answer(id: &str, choice: &str) -> Value {
+        json!([{"elicitation_id": id, "state": "answered", "answered_choice_id": choice}])
+    }
+
+    /// Send one capture request through the production frame dispatcher and
+    /// return its reply, which must be the only frame on the route: no
+    /// consent question travels back along it.
+    async fn capture_reply(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+        rx: &mut mpsc::Receiver<Frame>,
+        corr: u64,
+        params: Value,
+    ) -> Value {
+        handle_frame(capture_request_frame(corr, params), writer, planes)
+            .await
+            .unwrap();
+        let frame = next_frame(rx).await;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "a frame other than the reply reached the route: {body}"
+        );
+        assert_eq!(frame.header.corr, corr);
+        body
+    }
+
+    fn this_session() -> cingulate_client::live_call::SessionKey {
+        computer_grants::tests::session_key("test-project")
+    }
+
     /// Through the production frame dispatcher and the Withhold reply boundary:
     /// the planted cookie value reaches the vault request, and is absent from
-    /// the question put to the person, the wire reply, and every decoded
-    /// journal entry.
+    /// the card put to the person, the wire reply, and every decoded journal
+    /// entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capture_login_keeps_the_value_out_of_the_reply_the_journal_and_the_ask() {
         use login_capture::test_support::{contains_bytes, fixture, PLANTED_VALUE};
 
         let fixture = fixture();
-        let planes = capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate
+            .raises("el_cap_301")
+            .answered_in_call("el_cap_301", "allow");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        handle_frame(
-            capture_request_frame(301, ollama_capture_params()),
-            &writer_tx,
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            301,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-
-        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
-        assert_eq!(question.header.ty, FrameType::Request);
-        let asked: Value = serde_json::from_slice(&question.body).unwrap();
+        .await;
+        assert_eq!(body["outcome"], "captured", "{body}");
         assert_eq!(
-            asked["params"]["prompt"],
+            cingulate.methods(),
+            [
+                cingulate_client::wire::CONSENT_REQUEST,
+                cingulate_client::wire::CONSENT_AWAIT
+            ]
+        );
+        let asked = cingulate.cards().remove(0);
+        assert_eq!(
+            asked["prompt"],
             "insula will hold a copy of your ollama.com login."
         );
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_dispatch_301"})
-            )
-        ));
-        let reply = next_frame(&mut writer_rx).await;
-        assert_eq!(reply.header.corr, 301);
-        let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(body["outcome"], "captured", "{body}");
         // The Cingulate card id becomes the deposit's consent reference.
         assert_eq!(
             fixture.vault.request_params()[0]["consent_ref"],
-            "el_test_1"
+            "el_cap_301"
         );
+        assert!(planes.consent.unapplied(&this_session()).is_empty());
 
         // Positive control: the scanner finds the value where it was planted.
         let requests = fixture.vault.requests.lock().unwrap().clone();
@@ -9859,11 +10027,11 @@ mod tests {
             .len() as u64;
 
         assert!(
-            !contains_bytes(&question.body, PLANTED_VALUE),
-            "the ask leaked it"
+            !contains_bytes(&serde_json::to_vec(&asked).unwrap(), PLANTED_VALUE),
+            "the card leaked it"
         );
         assert!(
-            !contains_bytes(&reply.body, PLANTED_VALUE),
+            !contains_bytes(&serde_json::to_vec(&body).unwrap(), PLANTED_VALUE),
             "the reply leaked it"
         );
         let export = planes.browser.journal_export_for_test().await;
@@ -9902,24 +10070,20 @@ mod tests {
 
         let fixture = fixture();
         *fixture.fs.removal_delay.lock().unwrap() = Duration::from_millis(200);
-        let planes = capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate
+            .raises("el_cap_302")
+            .answered_in_call("el_cap_302", "allow");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        handle_frame(
-            capture_request_frame(302, ollama_capture_params()),
-            &writer_tx,
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            302,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
-        planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_dispatch_302"}),
-            ),
-        );
-        let reply = next_frame(&mut writer_rx).await;
-        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        .await;
         assert_eq!(body["outcome"], "captured", "{body}");
         let placement = fixture.launcher.placements.lock().unwrap()[0].clone();
         assert!(
@@ -9932,16 +10096,30 @@ mod tests {
             .contains(&"profile_deleted".to_string()));
     }
 
-    /// A cancel frame for the request, arriving while the question is open,
-    /// ends the capture with nothing written. The card stays open: the person
-    /// may still answer it, and that answer is kept for a retry rather than
-    /// acted on.
+    /// A cancel frame for the request, arriving while the card is open, ends
+    /// the capture with nothing written. The card is detached rather than
+    /// withdrawn, since the conversation is still there: the person may still
+    /// answer it, and that answer is kept for a retry rather than acted on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancel_during_consent_ends_the_capture_and_leaves_its_card_open() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_303");
+        cingulate
+            .script
+            .then(
+                cingulate_client::wire::CONSENT_AWAIT,
+                cingulate_client::Reply::Hang,
+            )
+            .then(
+                cingulate_client::wire::CONSENT_DETACH,
+                cingulate_client::Reply::Result(
+                    json!({"elicitation_id": "el_cap_303", "state": "pending", "detached": true}),
+                ),
+            );
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         handle_frame(
             capture_request_frame(303, ollama_capture_params()),
@@ -9950,8 +10128,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
-        assert_eq!(question.header.ty, FrameType::Request);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cingulate.methods().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the call waits on its card");
         let cancel = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
             FrameType::Cancel,
@@ -9966,22 +10149,29 @@ mod tests {
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "cancelled", "{body}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cingulate.methods().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the cancelled call lets go of its card");
+        assert_eq!(
+            cingulate.methods(),
+            [
+                cingulate_client::wire::CONSENT_REQUEST,
+                cingulate_client::wire::CONSENT_AWAIT,
+                cingulate_client::wire::CONSENT_DETACH
+            ]
+        );
         // The card outlives the cancelled call, so an answer to it is still
         // received; it is remembered, and nothing runs on it.
         assert_eq!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .len(),
+            planes.consent.unapplied(&this_session()).len(),
             1,
             "the cancelled capture closed its card"
         );
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_cancelled"})
-            )
-        ));
+        cingulate.feed(late_answer("el_cap_303", "allow"));
         await_remembered(&planes, true).await;
         assert!(fixture.fs.contents().is_empty());
         assert_eq!(
@@ -10004,62 +10194,6 @@ mod tests {
         );
     }
 
-    /// The next frame, which must be the reply to request `corr` and not a
-    /// new consent card.
-    async fn reply_without_a_card(rx: &mut mpsc::Receiver<Frame>, corr: u64) -> Value {
-        let frame = next_frame(rx).await;
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(
-            frame.header.ty,
-            FrameType::Response,
-            "a card was filed where none was expected: {body}"
-        );
-        assert_eq!(frame.header.corr, corr);
-        body
-    }
-
-    /// The next frame, which must be a new consent card.
-    async fn card(planes: &Planes) -> (Frame, Value) {
-        let frame = planes.consent_test.as_ref().unwrap().card(4, 1).await;
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(
-            frame.header.ty,
-            FrameType::Request,
-            "no card was filed: {body}"
-        );
-        (frame, body)
-    }
-
-    /// Send one capture request and run it until it replies
-    /// `consent_pending`, returning the card it filed and the reply.
-    async fn capture_until_pending(
-        planes: &Planes,
-        writer: &mpsc::Sender<Frame>,
-        rx: &mut mpsc::Receiver<Frame>,
-        corr: u64,
-        params: Value,
-    ) -> (Frame, Value) {
-        handle_frame(capture_request_frame(corr, params), writer, planes)
-            .await
-            .unwrap();
-        let (question, _) = card(planes).await;
-        let reply = reply_without_a_card(rx, corr).await;
-        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-        (question, reply)
-    }
-
-    /// Capture planes whose login calls wait a fraction of a second in place
-    /// instead of the production two minutes. The card's own life is
-    /// unchanged.
-    fn short_wait_capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
-        let planes = capture_planes(fixture);
-        planes
-            .management
-            .computer_grants()
-            .set_login_park_limit(Duration::from_millis(300));
-        planes
-    }
-
     /// The capture card goes out with a thirty-minute life, and asks core
     /// only to notify the agent when it settles.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10067,85 +10201,98 @@ mod tests {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = capture_planes(&fixture);
-        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(8);
-        handle_frame(
-            capture_request_frame(310, ollama_capture_params()),
-            &writer_tx,
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_310").unanswered("el_cap_310");
+        let planes = cingulate.planes(&fixture);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            310,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let (_, asked) = card(&planes).await;
-        assert_eq!(asked["params"]["expires_in_ms"], 1_800_000, "{asked}");
-        assert_eq!(asked["params"]["late_execution"], "notify_only", "{asked}");
+        .await;
+        assert_eq!(body["outcome"], "consent_pending", "{body}");
+        let asked = cingulate.cards().remove(0);
+        assert_eq!(asked["expires_in_ms"], 1_800_000, "{asked}");
+        assert_eq!(asked["late_execution"], "notify_only", "{asked}");
     }
 
-    /// Unanswered, the capture call is held for the park and then replies
-    /// `consent_pending` naming the card, which stays registered so a later
-    /// answer is still received. The park is shortened here; production's
-    /// is the two minutes pinned at the end.
+    /// Unanswered, the capture call holds the card for the park (Cingulate
+    /// is asked to wait that long), then detaches it and replies
+    /// `consent_pending` naming it. The card stays registered, so a later
+    /// answer is still received.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unanswered_capture_replies_consent_pending_after_the_park_and_keeps_its_card() {
         use login_capture::test_support::fixture;
 
-        let production = capture_planes(&login_capture::test_support::fixture());
+        let fixture = fixture();
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_311").unanswered("el_cap_311");
+        let planes = cingulate.planes(&fixture);
         assert_eq!(
-            production.management.computer_grants().login_park_limit(),
+            planes.management.computer_grants().login_park_limit(),
             Duration::from_secs(120)
         );
-        let fixture = fixture();
-        let planes = short_wait_capture_planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        let started = std::time::Instant::now();
-        handle_frame(
-            capture_request_frame(311, ollama_capture_params()),
-            &writer_tx,
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            311,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let (question, asked) = card(&planes).await;
-        let reply = next_frame(&mut writer_rx).await;
-        assert_eq!(reply.header.corr, 311);
-        assert!(started.elapsed() >= Duration::from_millis(300));
-        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        .await;
         assert_eq!(body["outcome"], "consent_pending", "{body}");
-        assert_eq!(body["ask_id"], asked["id"], "{body}");
+        assert_eq!(body["ask_id"], "el_cap_311", "{body}");
         assert_eq!(
             body["remedy"],
             computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
             "{body}"
         );
         assert_eq!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .len(),
+            cingulate.methods(),
+            [
+                cingulate_client::wire::CONSENT_REQUEST,
+                cingulate_client::wire::CONSENT_AWAIT,
+                cingulate_client::wire::CONSENT_DETACH
+            ]
+        );
+        let held_for = cingulate.script.calls()[1].1["timeout_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            (110_000..=120_000).contains(&held_for),
+            "the call held its card for {held_for} ms, not the park"
+        );
+        assert_eq!(
+            planes.consent.unapplied(&this_session()).len(),
             1,
             "the card was closed when the call returned"
         );
         assert!(fixture.fs.contents().is_empty());
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_late_311"})
-            )
-        ));
     }
 
     /// An approval that arrives after the call returned is used by the next
-    /// call with the same parameters, which captures without a second card
-    /// and names the approved card as its consent. A call with other
-    /// parameters does not use it, and once used it is gone.
+    /// call with the same parameters, which captures without a second card,
+    /// names the approved card as its consent, and tells Cingulate the
+    /// approved capture ran before it replies. A call with other parameters
+    /// does not use it, and once used it is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_late_capture_approval_is_used_once_by_a_retry_with_the_same_parameters() {
+        use cingulate_client::wire::{
+            CONSENT_ACK, CONSENT_ANSWERS, CONSENT_AWAIT, CONSENT_DETACH, CONSENT_REPORT_EXECUTION,
+            CONSENT_REQUEST,
+        };
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = short_wait_capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_320").unanswered("el_cap_320");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
-        let (question, _) = capture_until_pending(
+        let first = capture_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -10153,12 +10300,8 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_late_320"})
-            )
-        ));
+        assert_eq!(first["outcome"], "consent_pending", "{first}");
+        cingulate.feed(late_answer("el_cap_320", "allow"));
         await_remembered(&planes, true).await;
         assert_eq!(
             fixture.vault.request_params().len(),
@@ -10170,43 +10313,38 @@ mod tests {
         // its own.
         let mut other = ollama_capture_params();
         other["account"] = json!("personal");
-        let (other_card, _) =
-            capture_until_pending(&planes, &writer_tx, &mut writer_rx, 321, other).await;
-        assert_ne!(other_card.header.corr, question.header.corr);
-        assert!(
-            (planes.consent.has_single_use_approvals()
-                || planes.management.computer_grants().remembers_login_answer())
-        );
+        cingulate.raises("el_cap_321").unanswered("el_cap_321");
+        let second = capture_reply(&planes, &writer_tx, &mut writer_rx, 321, other).await;
+        assert_eq!(second["ask_id"], "el_cap_321", "{second}");
+        assert!(planes.consent.has_single_use_approvals());
 
-        handle_frame(
-            capture_request_frame(322, ollama_capture_params()),
-            &writer_tx,
+        // The same parameters: the approval is taken, the capture runs, and
+        // its execution is reported before the reply. The session's open
+        // card for the other account makes this call read the answers feed
+        // first, which has nothing new.
+        cingulate.feed(json!([])).takes_report("el_cap_320");
+        let before = cingulate.methods().len();
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            322,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let body = reply_without_a_card(&mut writer_rx, 322).await;
+        .await;
         assert_eq!(body["outcome"], "captured", "{body}");
-        let reports: Vec<_> = planes
-            .consent_test
-            .as_ref()
-            .unwrap()
-            .calls()
-            .into_iter()
-            .filter(|(method, _)| method == "consent.report_execution")
-            .collect();
         assert_eq!(
-            reports.len(),
-            1,
-            "a taken approval must be reported before the reply"
+            cingulate.methods()[before..],
+            [CONSENT_ANSWERS, CONSENT_ACK, CONSENT_REPORT_EXECUTION],
+            "a taken approval must be reported before the reply, with no second card"
         );
         assert_eq!(
-            reports[0].1,
-            json!({"elicitation_id":"el_test_1", "execution":"executed"})
+            cingulate.script.calls().last().unwrap().1,
+            json!({"elicitation_id":"el_cap_320", "execution":"executed"})
         );
         assert_eq!(
             fixture.vault.request_params()[0]["consent_ref"],
-            "el_test_1"
+            "el_cap_320"
         );
         assert!(
             !(planes.consent.has_single_use_approvals()
@@ -10214,14 +10352,98 @@ mod tests {
         );
 
         // Used once: the next call asks again.
-        handle_frame(
-            capture_request_frame(323, ollama_capture_params()),
-            &writer_tx,
+        cingulate
+            .feed(json!([]))
+            .raises("el_cap_323")
+            .unanswered("el_cap_323");
+        let before = cingulate.methods().len();
+        let again = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            323,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        card(&planes).await;
+        .await;
+        assert_eq!(again["outcome"], "consent_pending", "{again}");
+        assert_eq!(
+            cingulate.methods()[before..],
+            [
+                CONSENT_ANSWERS,
+                CONSENT_ACK,
+                CONSENT_REQUEST,
+                CONSENT_AWAIT,
+                CONSENT_DETACH
+            ]
+        );
+        assert_eq!(fixture.vault.request_params().len(), 1);
+    }
+
+    /// A capture approval given after its call returned survives a module
+    /// restart: the restarted module's next call on the session reads it
+    /// from the answers feed, acknowledges it, uses it once and reports that
+    /// the capture ran, all before it replies. A second restart has nothing
+    /// left to apply and opens no route to Cingulate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_capture_approval_survives_a_restart_and_is_applied_once() {
+        use cingulate_client::desk::RegistryStore;
+        use cingulate_client::wire::{CONSENT_ACK, CONSENT_ANSWERS, CONSENT_REPORT_EXECUTION};
+        use login_capture::test_support::fixture;
+
+        let fixture = fixture();
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_360").unanswered("el_cap_360");
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
+        {
+            let planes = cingulate.planes(&fixture);
+            let first = capture_reply(
+                &planes,
+                &writer_tx,
+                &mut writer_rx,
+                360,
+                ollama_capture_params(),
+            )
+            .await;
+            assert_eq!(first["outcome"], "consent_pending", "{first}");
+        }
+        assert_eq!(cingulate.store().load().unwrap().len(), 1);
+
+        // The person approves while the module is down.
+        let restarted = cingulate.planes(&fixture);
+        cingulate
+            .feed(late_answer("el_cap_360", "allow"))
+            .takes_report("el_cap_360");
+        let before = cingulate.methods().len();
+        let body = capture_reply(
+            &restarted,
+            &writer_tx,
+            &mut writer_rx,
+            361,
+            ollama_capture_params(),
+        )
+        .await;
+        assert_eq!(body["outcome"], "captured", "{body}");
+        assert_eq!(
+            cingulate.methods()[before..],
+            [CONSENT_ANSWERS, CONSENT_ACK, CONSENT_REPORT_EXECUTION]
+        );
+        assert_eq!(
+            cingulate.script.calls().last().unwrap().1,
+            json!({"elicitation_id":"el_cap_360", "execution":"executed"})
+        );
+        assert_eq!(fixture.vault.request_params().len(), 1);
+        assert_eq!(
+            fixture.vault.request_params()[0]["consent_ref"],
+            "el_cap_360"
+        );
+        assert!(cingulate.store().load().unwrap().is_empty());
+        assert!(!restarted.consent.has_single_use_approvals());
+
+        let again = cingulate.planes(&fixture);
+        let opens = cingulate.script.opens();
+        computer_grants::tests::drain_call(&again, 4, 1).await;
+        assert_eq!(cingulate.script.opens(), opens, "nothing was left to apply");
+        assert!(!again.consent.has_single_use_approvals());
         assert_eq!(fixture.vault.request_params().len(), 1);
     }
 
@@ -10232,9 +10454,11 @@ mod tests {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = short_wait_capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_330").unanswered("el_cap_330");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
-        let (question, _) = capture_until_pending(
+        let first = capture_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -10242,23 +10466,25 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "deny", "elicitation_id": "el_late_330"})
-            )
-        ));
+        assert_eq!(first["outcome"], "consent_pending", "{first}");
+        cingulate.feed(late_answer("el_cap_330", "deny"));
         await_remembered(&planes, true).await;
-        handle_frame(
-            capture_request_frame(331, ollama_capture_params()),
-            &writer_tx,
+        let before = cingulate.methods().len();
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            331,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let body = reply_without_a_card(&mut writer_rx, 331).await;
+        .await;
         assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
         assert_eq!(body["reason"], "deny", "{body}");
+        assert_eq!(
+            cingulate.methods().len(),
+            before,
+            "a second card was raised"
+        );
         assert_eq!(
             fixture
                 .launcher
@@ -10272,12 +10498,15 @@ mod tests {
     /// than filing a second one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_capture_retry_while_its_card_is_open_rejoins_it() {
+        use cingulate_client::wire::{CONSENT_ACK, CONSENT_ANSWERS, CONSENT_AWAIT, CONSENT_DETACH};
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = short_wait_capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_340").unanswered("el_cap_340");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
-        let (question, first) = capture_until_pending(
+        let first = capture_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -10285,30 +10514,26 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        handle_frame(
-            capture_request_frame(341, ollama_capture_params()),
-            &writer_tx,
+        cingulate.feed(json!([])).unanswered("el_cap_340");
+        let before = cingulate.methods().len();
+        let second = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            341,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let second = reply_without_a_card(&mut writer_rx, 341).await;
+        .await;
         assert_eq!(second["outcome"], "consent_pending", "{second}");
         assert_eq!(second["ask_id"], first["ask_id"], "{second}");
         assert_eq!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .len(),
-            1
+            cingulate.methods()[before..],
+            [CONSENT_ANSWERS, CONSENT_ACK, CONSENT_AWAIT, CONSENT_DETACH],
+            "the retry raised a second card"
         );
+        assert_eq!(planes.consent.unapplied(&this_session()).len(), 1);
         // The one card still answers the agent's next retry.
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_late_340"})
-            )
-        ));
+        cingulate.feed(late_answer("el_cap_340", "allow"));
         await_remembered(&planes, true).await;
     }
 
@@ -10319,9 +10544,11 @@ mod tests {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = short_wait_capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.raises("el_cap_350").unanswered("el_cap_350");
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(16);
-        let (question, _) = capture_until_pending(
+        capture_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -10329,12 +10556,7 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "allow", "elicitation_id": "el_late_350"})
-            )
-        ));
+        cingulate.feed(late_answer("el_cap_350", "allow"));
         await_remembered(&planes, true).await;
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
@@ -10342,7 +10564,8 @@ mod tests {
             !(planes.consent.has_single_use_approvals()
                 || planes.management.computer_grants().remembers_login_answer())
         );
-        let (open_question, pending) = capture_until_pending(
+        cingulate.raises("el_cap_351").unanswered("el_cap_351");
+        let pending = capture_reply(
             &planes,
             &writer_tx,
             &mut writer_rx,
@@ -10350,75 +10573,58 @@ mod tests {
             ollama_capture_params(),
         )
         .await;
+        assert_eq!(pending["outcome"], "consent_pending", "{pending}");
         assert_eq!(fixture.vault.request_params().len(), 0);
-        // The revocation also closes a card still open, so its answer is
-        // received by nothing.
-        assert_eq!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .len(),
-            1,
-            "{pending}"
-        );
+        assert_eq!(planes.consent.unapplied(&this_session()).len(), 1);
+        // The revocation also forgets a card still open, so its answer is
+        // received by nothing, and it opens no route to Cingulate.
+        let calls = cingulate.methods().len();
         let conversation = planes.routes.get(4, 1).unwrap().identity.conversation_key;
         revoke_scope(&planes, &std::collections::BTreeSet::from([conversation])).await;
         assert!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .is_empty(),
+            planes.consent.unapplied(&this_session()).is_empty(),
             "the open card was not forgotten"
         );
+        assert_eq!(cingulate.methods().len(), calls);
         assert!(
             writer_rx.try_recv().is_err(),
-            "revocation opens no route and sends no reverse frame"
+            "revocation sends nothing on the route"
         );
         assert!(!planes
             .management
             .computer_grants()
             .question_open(pending["ask_id"].as_str().unwrap()));
-        let _ = open_question;
     }
 
-    /// A refused requester ends at once as a question nobody was shown, not
+    /// A refused requester ends at once as a card nobody was shown, not
     /// silence from a person who never saw a prompt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_requester_refusal_ends_the_capture_as_not_put_to_anyone() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
-        let planes = capture_planes(&fixture);
+        let cingulate = ScriptedConsent::new();
+        cingulate.script.then(
+            cingulate_client::wire::CONSENT_REQUEST,
+            cingulate_client::Reply::Refused("elicitation_requester_refused"),
+        );
+        let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        handle_frame(
-            capture_request_frame(304, ollama_capture_params()),
-            &writer_tx,
+        let body = capture_reply(
             &planes,
+            &writer_tx,
+            &mut writer_rx,
+            304,
+            ollama_capture_params(),
         )
-        .await
-        .unwrap();
-        let question = planes.consent_test.as_ref().unwrap().card(4, 1).await;
-        assert_eq!(question.header.ty, FrameType::Request);
-        assert!(planes
-            .consent_test
-            .as_ref()
-            .unwrap()
-            .answer(question.header.corr, elicit::AskOutcome::NotPutToAnyone));
-        // `next_frame` gives up after ten seconds; the question's own deadline
-        // is thirty minutes and the call's wait two, so a reply inside that
-        // window is the error ending it.
-        let reply = next_frame(&mut writer_rx).await;
-        assert_eq!(reply.header.corr, 304);
-        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        .await;
         assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
         assert_eq!(body["reason"], "not_put_to_anyone", "{body}");
         assert_eq!(
-            planes
-                .consent
-                .unapplied(&computer_grants::tests::session_key("test-project"))
-                .len(),
-            0
+            cingulate.methods(),
+            [cingulate_client::wire::CONSENT_REQUEST]
         );
+        assert!(planes.consent.unapplied(&this_session()).is_empty());
         assert!(fixture.fs.contents().is_empty());
     }
 
@@ -10535,6 +10741,7 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
             #[cfg(target_os = "macos")]
@@ -10614,6 +10821,7 @@ mod tests {
                 consent_drain::UnconfiguredCingulate,
             ))),
             consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
+            user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
             #[cfg(target_os = "macos")]
@@ -11992,27 +12200,28 @@ mod login_import_consent_tests {
         root
     }
 
-    fn short_wait_planes() -> Planes {
-        let planes = computer_grants::tests::CardService::install(
-            super::tests::management_bound_planes(1, 1),
-            1,
-            1,
-        );
-        planes
-            .management
-            .computer_grants()
-            .set_login_park_limit(Duration::from_millis(300));
-        planes
+    use super::tests::{late_answer, ScriptedConsent};
+    use cingulate_client::wire::{
+        CONSENT_ACK, CONSENT_ANSWERS, CONSENT_AWAIT, CONSENT_DETACH, CONSENT_REPORT_EXECUTION,
+        CONSENT_REQUEST,
+    };
+
+    /// Planes whose management route at channel 1 belongs to an admitted
+    /// agent session, raising cards with `consent`'s script. Built again over
+    /// the same `consent`, they are the planes a restarted module has.
+    fn planes(consent: &ScriptedConsent) -> Planes {
+        consent.wire(super::tests::management_bound_planes(1, 1), 1, 1)
     }
 
-    /// Run one import until it replies, returning the card it filed (if any)
-    /// and the reply.
+    /// Run one import until it replies, returning the card it raised (its
+    /// `consent.request` params), if any, and the reply.
     async fn import(
         planes: &Planes,
+        consent: &ScriptedConsent,
         root: &std::path::Path,
-        _rx: &mut mpsc::Receiver<Frame>,
         writer: &mpsc::Sender<Frame>,
-    ) -> (Option<Frame>, Value) {
+    ) -> (Option<Value>, Value) {
+        let raised_before = consent.cards().len();
         let facts = planes.routes.get(1, 1).unwrap();
         let running = {
             let planes = planes.clone();
@@ -12029,17 +12238,11 @@ mod login_import_consent_tests {
             .await
             .expect("the import replies")
             .unwrap();
-        (
-            tokio::time::timeout(
-                Duration::from_millis(10),
-                planes.consent_test.as_ref().unwrap().card(1, 1),
-            )
-            .await
-            .ok(),
-            reply,
-        )
+        (consent.cards().into_iter().nth(raised_before), reply)
     }
 
+    /// Apply a late answer through a call on the session, then check that
+    /// it was remembered for the retry.
     async fn await_remembered(planes: &Planes) {
         computer_grants::tests::drain_call(planes, 1, 1).await;
         assert!(
@@ -12050,20 +12253,25 @@ mod login_import_consent_tests {
 
     #[tokio::test]
     async fn the_import_card_is_sent_for_thirty_minutes_notify_only() {
-        let planes = short_wait_planes();
+        let consent = ScriptedConsent::new();
+        consent.raises("el_imp_1").unanswered("el_imp_1");
+        let planes = planes(&consent);
         let root = root();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (question, reply) = import(&planes, &root, &mut rx, &tx).await;
-        let question = question.expect("a card was filed");
-        let asked: Value = serde_json::from_slice(&question.body).unwrap();
-        assert_eq!(asked["params"]["expires_in_ms"], 1_800_000, "{asked}");
-        assert_eq!(asked["params"]["late_execution"], "notify_only", "{asked}");
+        let (tx, _rx) = mpsc::channel(8);
+        let (asked, reply) = import(&planes, &consent, &root, &tx).await;
+        let asked = asked.expect("a card was raised");
+        assert_eq!(asked["expires_in_ms"], 1_800_000, "{asked}");
+        assert_eq!(asked["late_execution"], "notify_only", "{asked}");
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-        assert_eq!(reply["ask_id"], asked["id"], "{reply}");
+        assert_eq!(reply["ask_id"], "el_imp_1", "{reply}");
         assert_eq!(
             reply["remedy"],
             computer_grants::LOGIN_CONSENT_PENDING_REMEDY,
             "{reply}"
+        );
+        assert_eq!(
+            consent.methods(),
+            [CONSENT_REQUEST, CONSENT_AWAIT, CONSENT_DETACH]
         );
         assert_eq!(
             planes
@@ -12075,85 +12283,154 @@ mod login_import_consent_tests {
     }
 
     /// A granting answer that arrives after the call returned is used by the
-    /// retry with the same origin, with no second card, and only once.
+    /// retry with the same origin, with no second card, and only once. The
+    /// retry tells Cingulate what became of the approval before it replies.
     #[tokio::test]
     async fn a_late_import_approval_is_used_once_by_the_retry() {
-        let planes = short_wait_planes();
+        let consent = ScriptedConsent::new();
+        consent.raises("el_imp_2").unanswered("el_imp_2");
+        let planes = planes(&consent);
         let root = root();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (question, reply) = import(&planes, &root, &mut rx, &tx).await;
-        let question = question.expect("a card was filed");
+        let (tx, _rx) = mpsc::channel(8);
+        let (_, reply) = import(&planes, &consent, &root, &tx).await;
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "hand_off", "elicitation_id": "el_import"})
-            )
-        ));
+        consent.feed(late_answer("el_imp_2", "hand_off"));
         await_remembered(&planes).await;
-        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
-        assert!(card.is_none(), "a second card was filed");
+        consent.takes_report("el_imp_2");
+        let (card, reply) = import(&planes, &consent, &root, &tx).await;
+        assert!(card.is_none(), "a second card was raised");
         assert_eq!(reply["outcome"], "hand_off", "{reply}");
-        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
+        assert_eq!(consent.methods().last().unwrap(), CONSENT_REPORT_EXECUTION);
+        assert_eq!(
+            consent.script.calls().last().unwrap().1["elicitation_id"],
+            "el_imp_2"
+        );
+        consent.raises("el_imp_3").unanswered("el_imp_3");
+        let (card, reply) = import(&planes, &consent, &root, &tx).await;
         assert!(card.is_some(), "the approval was used twice");
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    }
+
+    /// An import approval given after its call returned survives a module
+    /// restart: on the restarted module, the session's next call reads it
+    /// from the answers feed and acknowledges it, and the retry uses it once
+    /// and reports it to Cingulate before replying. A second restart has
+    /// nothing left to apply and opens no route to Cingulate.
+    #[tokio::test]
+    async fn a_late_import_approval_survives_a_restart_and_is_applied_once() {
+        use cingulate_client::desk::RegistryStore;
+
+        let consent = ScriptedConsent::new();
+        consent
+            .raises("el_imp_restart")
+            .unanswered("el_imp_restart");
+        let root = root();
+        let (tx, _rx) = mpsc::channel(8);
+        {
+            let planes = planes(&consent);
+            let (_, reply) = import(&planes, &consent, &root, &tx).await;
+            assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        }
+        assert_eq!(consent.store().load().unwrap().len(), 1);
+
+        // The person approves while the module is down.
+        let restarted = planes(&consent);
+        consent.feed(late_answer("el_imp_restart", "hand_off"));
+        let before = consent.methods().len();
+        computer_grants::tests::drain_call(&restarted, 1, 1).await;
+        assert_eq!(consent.methods()[before..], [CONSENT_ANSWERS, CONSENT_ACK]);
+        assert!(consent.store().load().unwrap().is_empty());
+        consent.takes_report("el_imp_restart");
+        let (card, reply) = import(&restarted, &consent, &root, &tx).await;
+        assert!(card.is_none(), "a second card was raised");
+        assert_eq!(reply["outcome"], "hand_off", "{reply}");
+        assert_eq!(
+            consent.methods()[before..],
+            [CONSENT_ANSWERS, CONSENT_ACK, CONSENT_REPORT_EXECUTION]
+        );
+        assert_eq!(
+            consent.script.calls().last().unwrap().1["elicitation_id"],
+            "el_imp_restart"
+        );
+        assert!(!restarted.consent.has_single_use_approvals());
+
+        let again = planes(&consent);
+        let opens = consent.script.opens();
+        computer_grants::tests::drain_call(&again, 1, 1).await;
+        assert_eq!(consent.script.opens(), opens, "nothing was left to apply");
+        assert!(!again.consent.has_single_use_approvals());
     }
 
     /// A refusal that arrives after the call returned refuses the retry as
     /// denied, with no second card.
     #[tokio::test]
     async fn a_late_import_refusal_denies_the_retry() {
-        let planes = short_wait_planes();
+        let consent = ScriptedConsent::new();
+        consent.raises("el_imp_4").unanswered("el_imp_4");
+        let planes = planes(&consent);
         let root = root();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (question, _) = import(&planes, &root, &mut rx, &tx).await;
-        let question = question.expect("a card was filed");
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            elicit::AskOutcome::Answered(
-                json!({"decision": "deny", "elicitation_id": "el_import"})
-            )
-        ));
+        let (tx, _rx) = mpsc::channel(8);
+        import(&planes, &consent, &root, &tx).await;
+        consent.feed(late_answer("el_imp_4", "deny"));
         await_remembered(&planes).await;
-        let (card, reply) = import(&planes, &root, &mut rx, &tx).await;
-        assert!(card.is_none(), "a second card was filed");
+        let (card, reply) = import(&planes, &consent, &root, &tx).await;
+        assert!(card.is_none(), "a second card was raised");
         assert_eq!(reply["outcome"], "denied", "{reply}");
     }
 
-    /// A question nobody was shown still ends the import at once, as itself.
+    /// A card nobody was shown ends the import at once, as itself.
     #[tokio::test]
     async fn a_card_nobody_was_shown_ends_the_import_at_once() {
-        let planes = computer_grants::tests::CardService::install(
-            super::tests::management_bound_planes(1, 1),
-            1,
-            1,
+        let consent = ScriptedConsent::new();
+        consent.script.then(
+            CONSENT_REQUEST,
+            cingulate_client::Reply::Refused("elicitation_requester_refused"),
         );
+        let planes = planes(&consent);
         let root = root();
         let (tx, _rx) = mpsc::channel(8);
-        let facts = planes.routes.get(1, 1).unwrap();
-        let running = {
-            let planes = planes.clone();
-            let writer = tx.clone();
-            let plan = plan(&root);
-            tokio::spawn(async move {
-                computer_grants::tests::with_live(complete_login_import(
-                    &planes, &facts, &writer, 1, 1, plan, None,
-                ))
-                .await
-            })
-        };
-        let question = planes.consent_test.as_ref().unwrap().card(1, 1).await;
-        assert!(planes
-            .consent_test
-            .as_ref()
-            .unwrap()
-            .answer(question.header.corr, elicit::AskOutcome::NotPutToAnyone));
-        let reply = tokio::time::timeout(Duration::from_secs(5), running)
-            .await
-            .expect("refused at once, not held for the park")
-            .unwrap();
+        let (card, reply) = import(&planes, &consent, &root, &tx).await;
+        assert!(card.is_some());
         assert_eq!(reply["outcome"], "not_put_to_anyone", "{reply}");
+        assert_eq!(consent.methods(), [CONSENT_REQUEST]);
         assert!(!planes.management.computer_grants().remembers_login_answer());
+    }
+
+    /// Each way the import card can end without an answer is reported as
+    /// itself, and a choice the card did not offer is not read as a refusal.
+    #[test]
+    fn every_unanswered_ending_concludes_as_itself() {
+        use cingulate_client::desk::{Ending, NoCard};
+        let root = root();
+        for (ending, outcome) in [
+            (
+                Ending::Declined {
+                    choice_id: "deny".into(),
+                },
+                "denied",
+            ),
+            (
+                Ending::Declined {
+                    choice_id: "maybe".into(),
+                },
+                "unrecognized_answer",
+            ),
+            (Ending::NoAnswer, "no_answer"),
+            (Ending::NotPutToAnyone, "not_put_to_anyone"),
+            (Ending::DeliveryFailed, "undeliverable"),
+            (Ending::Withdrawn, "question_withdrawn"),
+            (
+                Ending::NoCard(NoCard::NoAgentSession),
+                "consent_unavailable",
+            ),
+        ] {
+            let result = plan(&root).conclude(&ending);
+            assert_eq!(result.outcome, outcome, "{ending:?}");
+            assert_eq!(result.remedy.is_some(), outcome != "denied", "{ending:?}");
+            assert_eq!(result.rows, 0, "{ending:?}");
+        }
+        let result = plan(&root).conclude(&Ending::NoCard(NoCard::NoAgentSession));
+        assert_eq!(result.reason, Some("no_agent_session"));
     }
 }
 

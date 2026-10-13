@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::elicit::AskOutcome;
+use crate::cingulate_client::desk::Ending;
 use crate::profile_custody::{
     ProfileCustodyAcquisition, ProfileCustodyKey, ProfileCustodyLocks, ProfileCustodyRelease,
 };
@@ -313,23 +313,32 @@ impl LoginImportPlan {
             })
     }
 
-    /// The result for however the consent question ended.
+    /// The result for however the consent card ended.
     ///
-    /// Only an answer is read as a decision. The other three endings are
-    /// reported as themselves rather than as `denied`: a refusal tells the
-    /// caller not to ask again, which is wrong for a person who was asked and
-    /// stayed silent, and wrong in the other direction for a question nobody
-    /// was shown, where asking again reaches nobody again.
-    pub fn conclude(self, answer: &AskOutcome) -> ImportResult {
-        let ending = match answer {
-            AskOutcome::Answered(body) => {
-                return self.decide(body.get("decision").and_then(Value::as_str))
+    /// Only an answer is read as a decision. The other endings are reported
+    /// as themselves rather than as `denied`: a refusal tells the caller not
+    /// to ask again, which is wrong for a person who was asked and stayed
+    /// silent, and wrong in the other direction for a card nobody was shown,
+    /// where asking again reaches nobody again. A choice the card did not
+    /// offer is not read as a refusal either.
+    pub fn conclude(self, ending: &Ending) -> ImportResult {
+        let word = match ending {
+            Ending::Granted { choice_id } => return self.decide(Some(choice_id)),
+            Ending::Declined { choice_id } if choice_id == IMPORT_DECLINE => {
+                return self.decide(Some(choice_id))
             }
-            AskOutcome::NoAnswer => "no_answer",
-            AskOutcome::NotPutToAnyone => "not_put_to_anyone",
-            AskOutcome::Undeliverable => "undeliverable",
+            Ending::Declined { .. } => "unrecognized_answer",
+            Ending::NoAnswer => "no_answer",
+            Ending::NotPutToAnyone => "not_put_to_anyone",
+            Ending::DeliveryFailed => "undeliverable",
+            Ending::Withdrawn => "question_withdrawn",
+            Ending::NoCard(why) => {
+                let mut result = self.result("consent_unavailable", None, 0, why.remedy());
+                result.reason = why.reason();
+                return result;
+            }
         };
-        self.result(ending, None, 0, Some(unanswered_remedy(ending)))
+        self.result(word, None, 0, Some(unanswered_remedy(word)))
     }
 
     pub fn decide(self, decision: Option<&str>) -> ImportResult {
@@ -479,9 +488,14 @@ fn unanswered_remedy(ending: &str) -> &'static str {
     match ending {
         "no_answer" => "nothing was copied; the person was asked but did not answer in time. Ask again when they are available.",
         "not_put_to_anyone" => "nothing was copied; the question was shown to no one, and putting it again reaches no one either until the caller's consent route can put it to a person.",
+        "unrecognized_answer" => "nothing was copied; the answer was not one the card offered. Retry this call to ask again.",
+        "question_withdrawn" => "nothing was copied; the card was withdrawn before it was answered. Retry this call to ask again.",
         _ => "nothing was copied; the question could not be sent. Retry once; if it fails again, the module needs attention.",
     }
 }
+
+/// The import card's decline option, which is also its default.
+const IMPORT_DECLINE: &str = "deny";
 
 /// The consent card for copying a login for `origin` into the agent's browser.
 ///
@@ -546,7 +560,7 @@ pub(crate) fn import_question(
         },
         facts,
         grants,
-        decline: ConsentOption::decline("deny", "Don't allow"),
+        decline: ConsentOption::decline(IMPORT_DECLINE, "Don't allow"),
         expires_in: crate::consent_card::LOGIN_CARD_LIFETIME,
         material_damage: true,
         // The import call waits on the answer (up to

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cerebellum_core::identity::AcceptedBindFacts;
@@ -13,14 +13,18 @@ use super::test_support::{
 };
 use super::vault::VaultReachError;
 use super::*;
-use crate::elicit::AskOutcome;
+use crate::cingulate_client::desk::ConsentDesk;
+use crate::cingulate_client::live_call::{LiveCall, NotLive};
+use crate::cingulate_client::wire;
+use crate::cingulate_client::{Reply, ScriptedCingulate};
+use crate::computer_grants::{AlwaysOpenRoute, LoginCapability, QuestionCarrier};
 
 fn accepted() -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
         &subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string()),
         Some(Principal::Direct),
         None,
-        Some(&["elicitation".to_string()]),
+        None,
         &subc_protocol::RouteTarget::ManagementSurface {
             module_id: "cerebellum".to_string(),
         },
@@ -36,11 +40,113 @@ fn ollama() -> CaptureRequest {
     }
 }
 
-/// The card id the default approval reports, as a current consent relay does.
+/// The Cingulate id the scripted capture card is raised under, which an
+/// approval names as the deposit's consent.
 const ELICITATION_ID: &str = "el_test_approval_1";
 
-fn allow() -> AskOutcome {
-    AskOutcome::Answered(json!({"decision": "allow", "elicitation_id": ELICITATION_ID}))
+/// How the scripted Cingulate ends the capture card.
+enum Answer {
+    /// The person chose this option on the card raised as [`ELICITATION_ID`].
+    Chose(&'static str),
+    /// The person chose this option on a card Cingulate raised under this id.
+    ChoseOn(String, &'static str),
+    /// The card expired unanswered.
+    Expired,
+    /// Cingulate refused to raise the card, with this refusal code.
+    Refused(&'static str),
+    /// The route to Cingulate failed while the card was being raised.
+    Transport,
+}
+
+fn allow() -> Answer {
+    Answer::Chose("allow")
+}
+
+impl Answer {
+    /// Cingulate's replies for one capture card ending this way: the card is
+    /// raised, and the call's wait on it reads its ending at once.
+    fn script(self) -> Arc<ScriptedCingulate> {
+        let script = ScriptedCingulate::new();
+        let (id, mut record) = match self {
+            Answer::Refused(code) => {
+                script.then(wire::CONSENT_REQUEST, Reply::Refused(code));
+                return script;
+            }
+            Answer::Transport => {
+                script.then(wire::CONSENT_REQUEST, Reply::Transport);
+                return script;
+            }
+            Answer::Chose(choice) => (
+                ELICITATION_ID.to_string(),
+                json!({"state":"answered","answered_choice_id":choice}),
+            ),
+            Answer::ChoseOn(id, choice) => {
+                (id, json!({"state":"answered","answered_choice_id":choice}))
+            }
+            Answer::Expired => (ELICITATION_ID.to_string(), json!({"state":"expired"})),
+        };
+        record["elicitation_id"] = json!(id);
+        script
+            .then(
+                wire::CONSENT_REQUEST,
+                Reply::Result(json!({"elicitation_id": id})),
+            )
+            .then(wire::CONSENT_AWAIT, Reply::Result(record));
+        script
+    }
+}
+
+/// The agent call the capture card is raised under: a live call from an
+/// admitted agent session, or, when `scoped` is false, a call that carries no
+/// agent session and so can raise no card.
+struct Carrier {
+    desk: Arc<ConsentDesk>,
+    guard: Arc<cerebellum_core::dispatch::InFlightGuard>,
+    scoped: bool,
+}
+
+impl QuestionCarrier for Carrier {
+    fn desk(&self) -> Arc<ConsentDesk> {
+        Arc::clone(&self.desk)
+    }
+    fn live(&self) -> Result<LiveCall, NotLive> {
+        let stamp = crate::computer_grants::tests::stamp("test-project");
+        LiveCall::from_inbound(
+            self.scoped.then_some(&stamp),
+            &self.guard,
+            Arc::new(AlwaysOpenRoute),
+        )
+    }
+}
+
+/// One capture call's consent need, its card raised with `script`.
+fn consent(
+    script: &Arc<ScriptedCingulate>,
+    request: &CaptureRequest,
+    scoped: bool,
+) -> LoginConsentRequest {
+    let clock = cerebellum_core::clock::FakeClock::new();
+    let timing = Arc::new(cerebellum_core::dispatch::DispatchTimingState::new(&clock));
+    let carrier = Arc::new(Carrier {
+        desk: Arc::new(ConsentDesk::new(Arc::new(Arc::clone(script)))),
+        guard: Arc::new(timing.enter(&clock)),
+        scoped,
+    });
+    // The module never drains during these tests. The sender is kept alive
+    // on purpose: a wait on a closed drain signal ends at once, which the
+    // consent wait would read as the module draining.
+    let (drain_signal, drain) = tokio::sync::watch::channel(false);
+    std::mem::forget(drain_signal);
+    LoginConsentRequest {
+        conversation_key: "conversation".into(),
+        capability: LoginCapability::CaptureLogin,
+        parameters: request.consent_parameters(),
+        carrier,
+        cancel: None,
+        drain,
+        route: Arc::new(AlwaysOpenRoute),
+        park_guard: None,
+    }
 }
 
 /// The header the fake browser's default cookies make.
@@ -48,12 +154,12 @@ fn planted_header() -> String {
     format!("session={PLANTED_VALUE}; csrf=t0k3n")
 }
 
-/// Run one capture, answering the consent question with `answer`. Returns the
-/// outcome and the question that was put, if one was.
+/// Run one capture, its card ending as `answer`. Returns the outcome and the
+/// card (`consent.request` params) that was raised, if one was.
 async fn capture(
     fixture: &Fixture,
     request: &CaptureRequest,
-    answer: AskOutcome,
+    answer: Answer,
 ) -> (CaptureOutcome, Option<Value>) {
     capture_cancelling(fixture, request, answer, || false).await
 }
@@ -61,11 +167,20 @@ async fn capture(
 async fn capture_cancelling(
     fixture: &Fixture,
     request: &CaptureRequest,
-    answer: AskOutcome,
+    answer: Answer,
     cancelled: impl Fn() -> bool,
 ) -> (CaptureOutcome, Option<Value>) {
-    let asked = Arc::new(Mutex::new(None));
-    let recorded = Arc::clone(&asked);
+    capture_with(fixture, request, &answer.script(), true, cancelled).await
+}
+
+async fn capture_with(
+    fixture: &Fixture,
+    request: &CaptureRequest,
+    script: &Arc<ScriptedCingulate>,
+    scoped: bool,
+    cancelled: impl Fn() -> bool,
+) -> (CaptureOutcome, Option<Value>) {
+    let grants = Arc::new(ComputerGrants::in_memory());
     let facts = accepted();
     let outcome = fixture
         .module
@@ -73,16 +188,17 @@ async fn capture_cancelling(
             request,
             CaptureCall {
                 accepted: &facts,
-                declares_elicitation: true,
-                ask: move |question: Value, _deadline: Duration| {
-                    *recorded.lock().unwrap() = Some(question);
-                    async move { answer }
-                },
+                grants: &grants,
+                consent: consent(script, request, scoped),
                 cancelled,
             },
         )
         .await;
-    let question = asked.lock().unwrap().take();
+    let question = script
+        .calls()
+        .into_iter()
+        .find(|(method, _)| method == wire::CONSENT_REQUEST)
+        .map(|(_, params)| params);
     (outcome, question)
 }
 
@@ -511,23 +627,16 @@ async fn a_second_concurrent_capture_refuses() {
 #[tokio::test]
 async fn only_an_affirmative_answer_proceeds() {
     let cases = [
-        (AskOutcome::Answered(json!({"decision": "deny"})), "deny"),
-        (AskOutcome::NoAnswer, "no_answer"),
-        (AskOutcome::NotPutToAnyone, "not_put_to_anyone"),
-        (AskOutcome::Undeliverable, "undeliverable"),
+        (Answer::Chose("deny"), "deny"),
+        (Answer::Expired, "no_answer"),
         (
-            AskOutcome::Answered(json!({"decision": "no_answer"})),
-            "unrecognized_answer",
+            Answer::Refused("elicitation_requester_refused"),
+            "not_put_to_anyone",
         ),
-        (
-            AskOutcome::Answered(json!({"decision": "not_put_to_anyone"})),
-            "unrecognized_answer",
-        ),
-        (
-            AskOutcome::Answered(json!({"decision": "yes"})),
-            "unrecognized_answer",
-        ),
-        (AskOutcome::Answered(json!({})), "unrecognized_answer"),
+        (Answer::Transport, "undeliverable"),
+        (Answer::Chose("no_answer"), "unrecognized_answer"),
+        (Answer::Chose("not_put_to_anyone"), "unrecognized_answer"),
+        (Answer::Chose("yes"), "unrecognized_answer"),
     ];
     for (answer, reason) in cases {
         let fixture = fixture();
@@ -581,17 +690,12 @@ fn the_question_names_the_holder_site_account_and_the_vault() {
     assert!(!text.contains("ck auth"), "{text}");
 }
 
-/// The deposit names the card the person tapped, as the consent relay reports
-/// it in the answer's `elicitation_id`; the vault binds that id into its audit
-/// row. A key the answer carries beyond those two is ignored.
+/// The deposit names the card the person approved by the id Cingulate raised
+/// it under; the vault binds that id into its audit row.
 #[tokio::test]
 async fn the_deposit_names_the_card_the_person_answered_as_its_consent() {
     let fixture = fixture();
-    let answer = AskOutcome::Answered(json!({
-        "decision": "allow",
-        "elicitation_id": "el_7Qx-relay.card:42",
-        "answered_on": "phone",
-    }));
+    let answer = Answer::ChoseOn("el_7Qx-relay.card:42".into(), "allow");
     let (outcome, question) = capture(&fixture, &ollama(), answer).await;
     assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
     validate(&outcome.reply);
@@ -599,45 +703,31 @@ async fn the_deposit_names_the_card_the_person_answered_as_its_consent() {
         fixture.vault.request_params()[0]["consent_ref"],
         "el_7Qx-relay.card:42"
     );
-    // The card's own request id is a different value and is not what the
-    // deposit names.
-    let card_id = question.unwrap()["id"].as_str().unwrap().to_string();
-    assert!(card_id.starts_with("capture-login-"), "{card_id}");
+    // The id this module renders the card body under never leaves it, so
+    // it cannot be what the deposit names.
+    assert!(question.unwrap().get("id").is_none());
 }
 
-/// An approval whose answer cannot name the card the person tapped is refused
-/// right after consent: no browser is launched, nothing is placed or written,
-/// and the vault is never opened.
+/// An approval of a card whose Cingulate id cannot serve as the deposit's
+/// consent reference is refused right after consent: no browser is
+/// launched, nothing is placed or written, and the vault is never opened.
 #[tokio::test]
 async fn an_approval_without_a_usable_elicitation_id_refuses_before_launch() {
     let long = "x".repeat(129);
-    for (case, answer) in [
-        ("absent", json!({"decision": "allow"})),
-        ("empty", json!({"decision": "allow", "elicitation_id": ""})),
-        (
-            "whitespace",
-            json!({"decision": "allow", "elicitation_id": "el 1"}),
-        ),
-        (
-            "tab",
-            json!({"decision": "allow", "elicitation_id": "el\t1"}),
-        ),
-        (
-            "too long",
-            json!({"decision": "allow", "elicitation_id": long}),
-        ),
-        (
-            "non-ASCII",
-            json!({"decision": "allow", "elicitation_id": "el_é"}),
-        ),
-        (
-            "not a string",
-            json!({"decision": "allow", "elicitation_id": 7}),
-        ),
-        ("null", json!({"decision": "allow", "elicitation_id": null})),
+    for (case, id) in [
+        ("empty", ""),
+        ("whitespace", "el 1"),
+        ("tab", "el\t1"),
+        ("too long", long.as_str()),
+        ("non-ASCII", "el_é"),
     ] {
         let fixture = fixture();
-        let (outcome, _) = capture(&fixture, &ollama(), AskOutcome::Answered(answer)).await;
+        let (outcome, _) = capture(
+            &fixture,
+            &ollama(),
+            Answer::ChoseOn(id.to_string(), "allow"),
+        )
+        .await;
         let reply = &outcome.reply;
         assert_eq!(reply["outcome"], "capture_not_stored", "{case}: {reply}");
         assert_eq!(reply["reason"], CONSENT_NOT_LINKABLE, "{case}: {reply}");
@@ -645,7 +735,7 @@ async fn an_approval_without_a_usable_elicitation_id_refuses_before_launch() {
             reply["remedy"]
                 .as_str()
                 .unwrap()
-                .contains("consent relay is too old"),
+                .contains("cannot serve as the vault's consent reference"),
             "{case}: {reply}"
         );
         validate(reply);
@@ -669,50 +759,32 @@ async fn an_approval_without_a_usable_elicitation_id_refuses_before_launch() {
 #[tokio::test]
 async fn a_module_without_a_vault_refuses_before_asking() {
     let fixture = super::test_support::fixture_without_vault();
-    let facts = accepted();
-    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let raised = Arc::clone(&asked);
-    let outcome = fixture
-        .module
-        .run(
-            &ollama(),
-            CaptureCall {
-                accepted: &facts,
-                declares_elicitation: true,
-                ask: move |_: Value, _: Duration| {
-                    raised.store(true, Ordering::SeqCst);
-                    async { AskOutcome::Answered(json!({"decision": "allow"})) }
-                },
-                cancelled: || false,
-            },
-        )
-        .await;
+    let script = allow().script();
+    let (outcome, question) = capture_with(&fixture, &ollama(), &script, true, || false).await;
     assert_eq!(outcome.reply["outcome"], "capture_not_stored");
     assert_eq!(outcome.reply["reason"], VAULT_UNREACHABLE);
-    assert!(!asked.load(Ordering::SeqCst), "the person was asked anyway");
+    assert!(question.is_none(), "the person was asked anyway");
+    assert_eq!(script.opens(), 0);
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
 }
 
+/// A call from no agent session raises no card: no route to Cingulate is
+/// opened, and the reply says where the call must come from.
 #[tokio::test]
 async fn a_call_without_consent_admission_is_refused_without_asking() {
     let fixture = fixture();
-    let facts = accepted();
-    let outcome = fixture
-        .module
-        .run(
-            &ollama(),
-            CaptureCall {
-                accepted: &facts,
-                declares_elicitation: false,
-                ask: |_: Value, _: Duration| async { AskOutcome::Undeliverable },
-                cancelled: || false,
-            },
-        )
-        .await;
+    let script = allow().script();
+    let (outcome, question) = capture_with(&fixture, &ollama(), &script, false, || false).await;
     assert_eq!(outcome.reply["outcome"], "consent_unavailable");
     assert_eq!(outcome.reply["detail"]["reason"], "no_agent_session");
+    assert_eq!(
+        outcome.reply["detail"]["remedy"],
+        "call from the agent session that needs the permission; it can raise the card"
+    );
     crate::browser::validate_browser_result(crate::management::CAPTURE_LOGIN, &outcome.reply)
         .unwrap();
+    assert!(question.is_none());
+    assert_eq!(script.opens(), 0);
     assert!(fixture.fs.contents().is_empty());
 }
 
@@ -1680,28 +1752,27 @@ async fn a_cancel_during_the_handoff_writes_nothing_and_deletes_the_profile() {
     assert!(fixture.events.contains_prefix("profile_deleted"));
 }
 
-/// A cancel that arrives while the question is still open ends the capture
+/// A cancel that arrives while the card is still open ends the capture
 /// without waiting for the person, and nothing is placed or launched.
 #[tokio::test]
 async fn a_cancel_while_the_question_is_open_ends_the_capture() {
     let fixture = fixture();
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let raise = Arc::clone(&cancelled);
-    let facts = accepted();
-    let outcome = tokio::time::timeout(
+    let script = ScriptedCingulate::new();
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id": ELICITATION_ID})),
+        )
+        .then(wire::CONSENT_AWAIT, Reply::Hang);
+    let waiting = Arc::clone(&script);
+    let (outcome, _) = tokio::time::timeout(
         Duration::from_secs(5),
-        fixture.module.run(
-            &ollama(),
-            CaptureCall {
-                accepted: &facts,
-                declares_elicitation: true,
-                ask: move |_: Value, _: Duration| {
-                    raise.store(true, Ordering::SeqCst);
-                    std::future::pending::<AskOutcome>()
-                },
-                cancelled: move || cancelled.load(Ordering::SeqCst),
-            },
-        ),
+        capture_with(&fixture, &ollama(), &script, true, move || {
+            waiting
+                .methods()
+                .iter()
+                .any(|method| method == wire::CONSENT_AWAIT)
+        }),
     )
     .await
     .expect("the cancel ended the wait on the person");

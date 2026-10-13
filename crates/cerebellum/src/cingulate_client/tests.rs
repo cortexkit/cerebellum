@@ -118,10 +118,10 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
         };
         crate::management::launch_recovery_clear_question("clear", &preview)
     };
-    let user_browser_site = user_browser_site_card(
+    let user_browser_site = crate::user_browser::site_question(
         "https://bank.example",
         3,
-        &[HazardClass::CredentialFormSubmit],
+        &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
         true,
     );
     vec![
@@ -194,57 +194,8 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
     ]
 }
 
-/// How long the user-browser site card waits, as `user_browser` enforces it
-/// (its `CONSENT_DEADLINE`, which is private to that module).
-const USER_BROWSER_SITE_DEADLINE: Duration = Duration::from_secs(120);
-
-/// The site card `user_browser`'s `authorize` builds inline, written out
-/// field for field because that card has no named builder `todays_cards`
-/// could call. Its golden (`user-browser-site.json`) pins the bytes, so
-/// whatever builds it later must render exactly this card.
-fn user_browser_site_card(
-    origin: &str,
-    tier: u8,
-    hazards: &[crate::authorization::HazardClass],
-    standing: bool,
-) -> Value {
-    use crate::consent_card::*;
-    let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
-    let mut options = vec![ConsentOption::grant("allow_once", "Allow once")
-        .with_detail("Only this invocation, including its landing-page read.")];
-    if standing {
-        options.push(ConsentOption::grant(
-            "allow_origin_always",
-            "Always on this site",
-        ));
-    }
-    ConsentCard {
-        title: format!("Allow access to {origin}?"),
-        prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
-        target: Target {
-            kind: TargetKind::Site,
-            label: origin.into(),
-        },
-        facts: vec![
-            Fact::new("Browser", "Your own Chrome, signed in as you"),
-            Fact::new("Site", origin),
-            Fact::new("Level", tier.to_string()),
-            Fact::new("Hazards", hazard_names.join(", ")),
-        ],
-        grants: options,
-        decline: ConsentOption::decline("deny", "Don't allow"),
-        expires_in: USER_BROWSER_SITE_DEADLINE,
-        material_damage: true,
-        urgency: Urgency::High,
-        scope: Scope::new()
-            .with("browser", "user")
-            .with("origins", json!([origin]))
-            .with("severity_tier", tier)
-            .with("hazards", json!(hazard_names)),
-        duration: None,
-    }
-    .render("user-browser")
-}
+/// How long the user-browser site card waits, as `user_browser` enforces it.
+const USER_BROWSER_SITE_DEADLINE: Duration = crate::user_browser::CONSENT_DEADLINE;
 
 fn request_for(kind: CardKind, body: &Value, deadline: Duration) -> CardRequest {
     consent_request(kind, body, deadline, Some(GOLDEN_CALL_KEY), None, None)
