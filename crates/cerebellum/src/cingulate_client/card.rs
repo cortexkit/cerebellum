@@ -6,8 +6,8 @@
 //! `login_import::import_question`, `login_capture::consent_question`,
 //! `management::profile_root_rebind_question`,
 //! `management::launch_recovery_clear_question`,
-//! `user_browser::site_question`), which render an
-//! `elicitation/create` body. This file lifts that body's `params` into
+//! `user_browser::site_question`), which render a `{"params": ...}` body
+//! holding the card as that lane sent it. This file lifts those `params` into
 //! Cingulate's generic `consent` request and changes only what Cingulate's
 //! closed request format requires, so the phone sees the same title, prompt,
 //! target, facts, options, default, urgency, scope, lifetime and duration as

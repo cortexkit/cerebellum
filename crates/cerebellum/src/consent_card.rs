@@ -150,7 +150,10 @@ pub(crate) struct ConsentCard {
 
 impl ConsentCard {
     /// The separate decline is always last, and silence selects it rather than a grant.
-    pub fn render(self, ask_id: &str) -> Value {
+    ///
+    /// The card is returned as `{"params": ...}`, the body `cingulate_client::card`
+    /// lifts into a `consent.request`.
+    pub fn render(self) -> Value {
         let default = &self.decline.id;
         let ids: Vec<_> = self
             .grants
@@ -178,7 +181,7 @@ impl ConsentCard {
         if let Some(duration) = self.duration {
             params["duration"] = duration;
         }
-        json!({"jsonrpc": "2.0", "method": "elicitation/create", "id": ask_id, "params": params})
+        json!({ "params": params })
     }
 }
 
@@ -507,7 +510,7 @@ mod tests {
             ConsentOption::grant("first", "First"),
             ConsentOption::grant("second", "Second"),
         ])
-        .render("order");
+        .render();
         assert_contract(&body, &["first", "second", "deny"], "deny");
         assert_eq!(body["params"]["options"][2]["effect"], "decline");
         assert_eq!(
@@ -517,7 +520,7 @@ mod tests {
     }
     #[test]
     fn default_is_the_decline_not_a_grant() {
-        let body = card(vec![ConsentOption::grant("allow", "Allow")]).render("default");
+        let body = card(vec![ConsentOption::grant("allow", "Allow")]).render();
         assert_contract(&body, &["allow", "deny"], "deny");
     }
 
@@ -526,7 +529,7 @@ mod tests {
         let body = card(vec![ConsentOption::grant("allow", "Allow").with_next_step(
             "Call browser_use with action present for https://example.test.",
         )])
-        .render("schema");
+        .render();
         let mut params = body["params"].clone();
         params["call_key"] = json!("pf:schema");
         assert_eq!(core_verdict(&params), Ok(()));
@@ -690,124 +693,164 @@ mod tests {
 }
 
 /// Every kind of consent card this crate sends, built by the same function
-/// production calls, put through `Elicitor::ask` with the deadline its call
-/// site uses (which is what stamps `expires_in_ms` on the wire), and held to
-/// Prefrontal core's decode contract in [`core_verdict`].
+/// production calls and mapped to the Cingulate `consent.request` it is
+/// raised as, with the deadline its call site enforces (which is what stamps
+/// `expires_in_ms`).
 ///
-/// One test per kind, so a card core would refuse is named by the test that
-/// goes red. Each test also pins the urgency the kind was assigned and the
-/// scope it binds, built from the values its grant is keyed on.
+/// One test per kind, so a card Cingulate would refuse is named by the test
+/// that goes red. Each test holds the case its kind's pinned card in
+/// `tests/fixtures/cingulate-consent-cards-v1` was built from to that file's
+/// exact bytes, and also pins the urgency the kind was assigned and the scope
+/// it binds, built from the values its grant is keyed on.
 #[cfg(test)]
 mod every_card_kind {
     use super::*;
     use crate::authorization::{HazardClass, Severity};
+    use crate::cingulate_client::card::{consent_request, CardKind, CardRequest};
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
-    use crate::elicit::Elicitor;
     use std::sync::Arc;
 
-    /// The `params` exactly as they leave this module, with the
-    /// `expires_in_ms` that `Elicitor::ask` writes from `deadline` in place of
-    /// the builder's.
-    async fn as_sent(body: Value, deadline: Duration) -> Value {
-        let unkeyed = send_card(body.clone(), deadline, None).await;
+    /// The call key the pinned cards carry as their `requester_ref`.
+    const GOLDEN_CALL_KEY: &str = "pf:card-golden";
+
+    /// The request exactly as it leaves this module for Cingulate, raised
+    /// from a call keyed [`GOLDEN_CALL_KEY`]. A keyless call's request is the
+    /// same apart from carrying no `requester_ref`.
+    fn as_sent(kind: CardKind, body: Value, deadline: Duration) -> CardRequest {
+        let unkeyed = consent_request(kind, &body, deadline, None, None, None)
+            .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
         assert!(
-            unkeyed.get("call_key").is_none(),
-            "a keyless card gained a key"
+            unkeyed.params.get("requester_ref").is_none(),
+            "{kind:?}: a keyless card gained a key"
         );
-        let mut keyed = send_card(body, deadline, Some("pf:card-contract".into())).await;
-        assert_eq!(keyed["call_key"], "pf:card-contract");
-        assert_core_accepts("a keyed card", &keyed);
-        keyed.as_object_mut().unwrap().remove("call_key");
-        assert_eq!(keyed, unkeyed, "the call key changed the rest of the card");
-        unkeyed
-    }
-
-    async fn send_card(body: Value, deadline: Duration, call_key: Option<String>) -> Value {
-        let elicitor = Arc::new(Elicitor::new());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let asking = {
-            let elicitor = Arc::clone(&elicitor);
-            tokio::spawn(async move {
-                let ask = elicitor.ask(&tx, 1, 1, body, deadline);
-                match call_key {
-                    Some(key) => crate::elicit::CALL_KEY.scope(key, ask).await,
-                    None => ask.await,
-                }
-            })
-        };
-        let frame = rx.recv().await.expect("the card is sent");
-        asking.abort();
-        let sent: Value = serde_json::from_slice(&frame.body).unwrap();
-        sent["params"].clone()
-    }
-
-    /// Core's contract, plus what this crate promises on top of it: a scope
-    /// that is a nonempty object (never a digest stand-in or prose) and the
-    /// MCP answer schema beside the options.
-    fn assert_core_accepts(kind: &str, params: &Value) {
-        if let Err(refusal) = core_verdict(params) {
-            panic!("{kind}: Prefrontal core would refuse this card: {refusal}\n{params:#}");
+        let keyed = consent_request(kind, &body, deadline, Some(GOLDEN_CALL_KEY), None, None)
+            .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
+        assert_eq!(keyed.params["requester_ref"], GOLDEN_CALL_KEY);
+        let mut stripped = keyed.params.clone();
+        stripped.as_object_mut().unwrap().remove("requester_ref");
+        assert_eq!(
+            stripped, unkeyed.params,
+            "{kind:?}: the call key changed the rest of the card"
+        );
+        // A next step is kept off the card for cerebellum's reply to the
+        // agent, where it must still read as one short sentence.
+        for step in keyed.next_steps.values() {
+            assert!(!step.trim().is_empty() && step.chars().count() <= 200);
+            assert!(
+                !step.contains(['\n', '\r']),
+                "next_step must be one sentence"
+            );
         }
+        keyed
+    }
+
+    /// The pinned Cingulate card for one kind, as the bytes on disk.
+    fn golden(name: &str) -> String {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cingulate-consent-cards-v1"
+        ))
+        .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    /// `params` are byte-identical to the pinned card `name`.
+    fn assert_golden(name: &str, params: &Value) {
+        assert_eq!(
+            format!("{}\n", serde_json::to_string_pretty(params).unwrap()),
+            golden(name),
+            "{name}: the card changed from its pinned bytes"
+        );
+    }
+
+    /// What every card promises Cingulate: a `consent` card whose scope is a
+    /// nonempty object (never a digest stand-in or prose), carrying none of
+    /// the fields only the reverse elicitation lane sent, which Cingulate's
+    /// closed request format refuses.
+    fn assert_cingulate_accepts(kind: &str, params: &Value) {
+        assert_eq!(params["kind"], "consent", "{kind}: kind");
         assert!(
             params["scope"].as_object().is_some_and(|s| !s.is_empty()),
             "{kind}: scope is not a nonempty object: {}",
             params["scope"]
         );
-        assert!(
-            params["requestedSchema"].is_object(),
-            "{kind}: no requestedSchema"
-        );
+        for field in ["requestedSchema", "call_key"] {
+            assert!(params.get(field).is_none(), "{kind}: carries {field}");
+        }
         for option in params["options"].as_array().unwrap() {
-            if let Some(step) = option.get("next_step") {
-                let step = step.as_str().expect("next_step is plain text");
-                assert!(!step.trim().is_empty() && step.chars().count() <= 200);
-                assert!(
-                    !step.contains(['\n', '\r']),
-                    "next_step must be one sentence"
-                );
-            }
+            assert!(
+                option.get("next_step").is_none(),
+                "{kind}: an option carries next_step"
+            );
         }
     }
 
     fn assert_card(kind: &str, params: &Value, urgency: &str, scope: Value) {
-        assert_core_accepts(kind, params);
+        assert_cingulate_accepts(kind, params);
         assert_eq!(params["urgency"], urgency, "{kind}: urgency");
         assert_eq!(params["scope"], scope, "{kind}: scope");
     }
 
     #[tokio::test]
     async fn browser_site_access_cards_decode_in_core() {
+        use crate::management::BrowserGrantChoice;
         let origins = vec!["https://login.example".to_string()];
         let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
-        for (path, urgency, wire) in [
-            ("asked ahead by open_grant", Urgency::Normal, "normal"),
-            ("held open in the browser call", Urgency::High, "high"),
+        for (path, kind, urgency, wire, golden) in [
+            (
+                "asked ahead by open_grant",
+                CardKind::WebsiteAccessInAdvance,
+                Urgency::Normal,
+                "normal",
+                "website-access-in-advance.json",
+            ),
+            (
+                "held open in the browser call",
+                CardKind::WebsiteAccessInCall,
+                Urgency::High,
+                "high",
+                "website-access-in-call.json",
+            ),
         ] {
-            let body = crate::management::browser_grant_question(
-                "browser-grant",
-                &origins,
-                &hazards,
-                Severity::new(4, true, false),
-                urgency,
-                &[crate::management::BrowserGrantChoice::Conversation],
-            );
-            let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
-            assert_card(
-                path,
-                &params,
-                wire,
-                json!({"origins": origins, "tier": 4, "hazards": hazards}),
-            );
+            for choices in [
+                &[BrowserGrantChoice::Conversation][..],
+                &[
+                    BrowserGrantChoice::Conversation,
+                    BrowserGrantChoice::OriginAlways,
+                ][..],
+            ] {
+                let body = crate::management::browser_grant_question(
+                    &origins,
+                    &hazards,
+                    Severity::new(4, true, false),
+                    urgency,
+                    choices,
+                );
+                let params = as_sent(kind, body, crate::management::PHONE_CONSENT_DEADLINE).params;
+                assert_card(
+                    path,
+                    &params,
+                    wire,
+                    json!({"origins": origins, "tier": 4, "hazards": hazards}),
+                );
+                if choices.len() == 2 {
+                    assert_golden(golden, &params);
+                }
+            }
         }
         let body = crate::management::browser_grant_question(
-            "browser-grant",
             &origins,
             &[],
             Severity::new(2, false, false),
             Urgency::Normal,
-            &[crate::management::BrowserGrantChoice::Conversation],
+            &[BrowserGrantChoice::Conversation],
         );
-        let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
+        let params = as_sent(
+            CardKind::WebsiteAccessInAdvance,
+            body,
+            crate::management::PHONE_CONSENT_DEADLINE,
+        )
+        .params;
         assert_card(
             "no hazards",
             &params,
@@ -817,17 +860,17 @@ mod every_card_kind {
     }
 
     /// The site-access card for each option set it can offer, pinned as the
-    /// exact `params` sent, so the phone app and core can check their decoders
-    /// against the same bytes.
+    /// exact `params` the production builder renders, so the phone app can
+    /// check its decoder against the same bytes.
     ///
     /// Each card is built by the production builder from the option set the
-    /// production offering rule picks for its case, put through
-    /// `Elicitor::ask`, held to core's contract, and compared with the pinned
-    /// file. `SHA256SUMS` beside the files pins each file's hash. Run with
-    /// `CEREBELLUM_WRITE_SITE_CARD_VECTORS=1` to rewrite the files and the sums
-    /// after a deliberate change to the card.
+    /// production offering rule picks for its case, compared with the pinned
+    /// file, and mapped to the Cingulate request it is raised as, which must
+    /// keep every option the card offers. `SHA256SUMS` beside the files pins
+    /// each file's hash. Run with `CEREBELLUM_WRITE_SITE_CARD_VECTORS=1` to
+    /// rewrite the files and the sums after a deliberate change to the card.
     #[tokio::test]
-    async fn browser_site_access_card_vectors_are_pinned_and_decode_in_core() {
+    async fn browser_site_access_card_vectors_are_pinned() {
         use crate::management::{offered_browser_grant_choices, BrowserGrantChoice};
         use std::collections::BTreeSet;
         const DIR: &str = concat!(
@@ -914,16 +957,25 @@ mod every_card_kind {
                 .map(|hazard| hazard.as_str().to_string())
                 .collect();
             let body = crate::management::browser_grant_question(
-                "browser-site-access-vector",
                 origins,
                 &hazards_wire,
                 severity,
                 Urgency::High,
                 &choices,
             );
-            let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
-            assert_core_accepts(name, &params);
-            // Core's option is `{id, label, effect, detail?}` and nothing else.
+            let params = body["params"].clone();
+            let sent = as_sent(
+                CardKind::WebsiteAccessInCall,
+                body,
+                crate::management::PHONE_CONSENT_DEADLINE,
+            )
+            .params;
+            assert_cingulate_accepts(name, &sent);
+            assert_eq!(
+                sent["options"], params["options"],
+                "{name}: Cingulate is offered other options than the card"
+            );
+            // An option is `{id, label, effect, detail?}` and nothing else.
             for option in params["options"].as_array().unwrap() {
                 let keys: BTreeSet<&str> = option
                     .as_object()
@@ -973,25 +1025,32 @@ mod every_card_kind {
             transfer,
             reason: None,
         };
-        for (case, presence) in [
-            ("a copyable login", vec![presence("available")]),
-            ("nothing copyable", vec![presence("unsupported")]),
+        for (case, presence, golden) in [
+            (
+                "a copyable login",
+                vec![presence("available")],
+                Some("login-import.json"),
+            ),
+            ("nothing copyable", vec![presence("unsupported")], None),
         ] {
-            let body =
-                crate::login_import::import_question("import", "https://x.com", "x.com", &presence);
-            let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
-            assert_card(case, &params, "high", json!({"origin": "https://x.com"}));
-            assert_login_card_life(case, &params);
-            for option in params["options"].as_array().unwrap() {
-                if option["id"] == "hand_off" {
-                    assert_eq!(
-                        option["next_step"],
-                        "Call browser_use with action present for https://x.com."
-                    );
-                } else {
-                    assert!(option.get("next_step").is_none());
-                }
+            let body = crate::login_import::import_question("https://x.com", "x.com", &presence);
+            let request = as_sent(CardKind::LoginImport, body, super::LOGIN_CARD_LIFETIME);
+            let params = &request.params;
+            assert_card(case, params, "high", json!({"origin": "https://x.com"}));
+            assert_login_card_life(case, params);
+            if let Some(golden) = golden {
+                assert_golden(golden, params);
             }
+            // The hand-off's next step is kept for cerebellum's reply to the
+            // agent; it never rides the card.
+            assert_eq!(
+                request.next_steps,
+                std::collections::BTreeMap::from([(
+                    "hand_off".to_string(),
+                    "Call browser_use with action present for https://x.com.".to_string()
+                )]),
+                "{case}: next steps"
+            );
         }
     }
 
@@ -1003,9 +1062,10 @@ mod every_card_kind {
             "b".repeat(60),
             "c".repeat(60)
         );
-        let body = crate::login_import::import_question("import-long", &origin, &origin[8..], &[]);
-        let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
-        let step = params["options"][0]["next_step"].as_str().unwrap();
+        let body = crate::login_import::import_question(&origin, &origin[8..], &[]);
+        let request = as_sent(CardKind::LoginImport, body, super::LOGIN_CARD_LIFETIME);
+        let params = &request.params;
+        let step = request.next_steps["hand_off"].as_str();
         assert_eq!(
             step,
             "Call browser_use with action present for the origin in this consent card's scope."
@@ -1022,8 +1082,8 @@ mod every_card_kind {
             fetch_url: "https://ollama.com/settings".into(),
             login_url: "https://ollama.com/signin".into(),
         };
-        let body = crate::login_capture::consent_question(&request, "capture-login-test");
-        let params = as_sent(body, super::LOGIN_CARD_LIFETIME).await;
+        let body = crate::login_capture::consent_question(&request);
+        let params = as_sent(CardKind::LoginCapture, body, super::LOGIN_CARD_LIFETIME).params;
         assert_card(
             "capture_login",
             &params,
@@ -1031,6 +1091,7 @@ mod every_card_kind {
             json!({"credential_domain": "ollama.com", "account": "work"}),
         );
         assert_login_card_life("capture_login", &params);
+        assert_golden("login-capture.json", &params);
     }
 
     /// A login card stays open for thirty minutes, and core only notifies the
@@ -1096,29 +1157,41 @@ mod every_card_kind {
             ),
         ] {
             let body = crate::computer_grants::question_body(
-                "app",
                 &need,
                 offered,
                 signature_changed,
                 Some(identity),
             );
-            let params = as_sent(body, crate::computer_grants::APP_QUESTION_DEADLINE).await;
+            let params = as_sent(
+                CardKind::AppControl,
+                body,
+                crate::computer_grants::APP_QUESTION_DEADLINE,
+            )
+            .params;
             assert_card(case, &params, "high", scope);
             assert_eq!(params["target"]["label"], "Editor", "{case}");
+            if case == "always offered" {
+                assert_golden("app-control.json", &params);
+            }
         }
     }
 
     #[tokio::test]
     async fn takeover_card_decodes_in_core() {
         let body = crate::computer_grants::question_body(
-            "takeover",
             &GrantNeed::Takeover,
             &["allow_conversation", "deny"],
             false,
             None,
         );
-        let params = as_sent(body, crate::computer_grants::TAKEOVER_QUESTION_DEADLINE).await;
+        let params = as_sent(
+            CardKind::Takeover,
+            body,
+            crate::computer_grants::TAKEOVER_QUESTION_DEADLINE,
+        )
+        .params;
         assert_card("takeover", &params, "high", json!({"takeover": "machine"}));
+        assert_golden("takeover.json", &params);
     }
 
     #[tokio::test]
@@ -1157,9 +1230,13 @@ mod every_card_kind {
                 generation_after: 8,
                 record_count: 3,
             };
-            let body =
-                crate::management::profile_root_rebind_question("rebind", root_path, &preview);
-            let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
+            let body = crate::management::profile_root_rebind_question(root_path, &preview);
+            let params = as_sent(
+                CardKind::ProfileReidentification,
+                body,
+                crate::management::PHONE_CONSENT_DEADLINE,
+            )
+            .params;
             assert_card(
                 case,
                 &params,
@@ -1174,6 +1251,9 @@ mod every_card_kind {
                 !params["scope"].to_string().contains("/Users"),
                 "{case}: the scope names a filesystem path"
             );
+            if case == "hash-only identity" {
+                assert_golden("profile-reidentification.json", &params);
+            }
         }
     }
 
@@ -1193,13 +1273,37 @@ mod every_card_kind {
                 singleton_lock: SingletonLockReading::Absent,
             },
         };
-        let body = crate::management::launch_recovery_clear_question("clear", &preview);
-        let params = as_sent(body, crate::management::PHONE_CONSENT_DEADLINE).await;
+        let body = crate::management::launch_recovery_clear_question(&preview);
+        let params = as_sent(
+            CardKind::StuckProfileClearance,
+            body,
+            crate::management::PHONE_CONSENT_DEADLINE,
+        )
+        .params;
+        assert_golden("stuck-profile-clearance.json", &params);
         assert_card(
             "stuck-profile clear",
             &params,
             "normal",
             json!({"profile_uuid": "7f0c2a8e-0000-4000-8000-000000000001", "sequence": 12}),
         );
+    }
+
+    #[tokio::test]
+    async fn user_browser_site_card_decodes_in_core() {
+        let body = crate::user_browser::site_question(
+            "https://bank.example",
+            3,
+            &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
+            true,
+        );
+        let params = as_sent(
+            CardKind::UserBrowserSite,
+            body,
+            crate::user_browser::CONSENT_DEADLINE,
+        )
+        .params;
+        assert_cingulate_accepts("user-browser site", &params);
+        assert_golden("user-browser-site.json", &params);
     }
 }

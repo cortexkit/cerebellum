@@ -1135,7 +1135,6 @@ impl ManagementPlane {
             prepared: PreparedConsent::Browser(pending),
             ask_id: ask_id.clone(),
             body: browser_grant_question(
-                &ask_id,
                 &authorized_origins,
                 &disclosed_hazards_wire,
                 severity,
@@ -1571,7 +1570,7 @@ impl ManagementPlane {
                 conversation_key: conversation_key.to_string(),
                 preview: preview.clone(),
             }),
-            body: profile_root_rebind_question(&ask_id, &root_path, &preview),
+            body: profile_root_rebind_question(&root_path, &preview),
             deadline: PHONE_CONSENT_DEADLINE,
         };
         let mut reply = json!({
@@ -1718,7 +1717,7 @@ impl ManagementPlane {
                 incarnation,
                 asked_at: Instant::now(),
             }),
-            body: launch_recovery_clear_question(&ask_id, &preview),
+            body: launch_recovery_clear_question(&preview),
             deadline: PHONE_CONSENT_DEADLINE,
         };
         let mut reply = described;
@@ -2044,7 +2043,6 @@ fn browser_grant_option(
 }
 
 pub(crate) fn browser_grant_question(
-    ask_id: &str,
     origins: &[String],
     hazards: &[String],
     severity: Severity,
@@ -2120,7 +2118,7 @@ pub(crate) fn browser_grant_question(
         scope: browser_grant_scope(origins, hazards, severity),
         duration: None,
     }
-    .render(ask_id)
+    .render()
 }
 
 /// The values `settle_browser_grant` mints the grant from: its authorized
@@ -2142,11 +2140,7 @@ fn browser_grant_scope(
     }
 }
 
-pub(crate) fn profile_root_rebind_question(
-    ask_id: &str,
-    root_path: &str,
-    preview: &RebindReport,
-) -> Value {
+pub(crate) fn profile_root_rebind_question(root_path: &str, preview: &RebindReport) -> Value {
     use crate::consent_card::*;
     ConsentCard {
         title: "Re-identify browser profiles?".into(),
@@ -2173,7 +2167,7 @@ pub(crate) fn profile_root_rebind_question(
         scope: profile_root_rebind_scope(preview),
         duration: None,
     }
-    .render(ask_id)
+    .render()
 }
 
 /// The registry transition an allowing answer applies only if it still holds:
@@ -2199,7 +2193,7 @@ fn profile_root_rebind_scope(preview: &RebindReport) -> crate::consent_card::Sco
 }
 
 /// Evidence is checked again before clearing; consent is not proof the browser exited.
-pub(crate) fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPreview) -> Value {
+pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
     use crate::consent_card::*;
     ConsentCard {
         title: "Clear the stuck browser record?".into(),
@@ -2249,7 +2243,7 @@ pub(crate) fn launch_recovery_clear_question(ask_id: &str, preview: &ClearPrevie
             .with("sequence", preview.sequence),
         duration: None,
     }
-    .render(ask_id)
+    .render()
 }
 
 fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
@@ -2784,7 +2778,6 @@ mod tests {
         ] {
             let origins = origins.into_iter().map(str::to_string).collect::<Vec<_>>();
             let body = browser_grant_question(
-                "sites",
                 &origins,
                 &[],
                 Severity::new(2, false, false),
@@ -2799,7 +2792,6 @@ mod tests {
                 .any(|f| f["label"] == "Exact sites" && f["value"] == origins.join(", ")));
         }
         let body = browser_grant_question(
-            "site",
             &["https://github.com".into()],
             &[],
             Severity::new(2, false, false),

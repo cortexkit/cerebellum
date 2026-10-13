@@ -45,8 +45,9 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
-// The probes' consent relay, as the suite's consent_relay module includes it.
-use crate::consent_relay::consent_relay;
+// The probes' scripted Cingulate answering helper.
+#[path = "../../examples/support/cingulate_answer.rs"]
+mod cingulate_answer;
 
 /// The machine every store in these tests is bound to.
 const MACHINE: &str = "machine-under-test";
@@ -769,7 +770,7 @@ impl Fixture {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
-        let reply = consent_relay::elicit_and_answer_observing(
+        let reply = cingulate_answer::answer_cards_observing(
             &self.planes,
             frame,
             answer,

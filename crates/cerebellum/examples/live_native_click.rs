@@ -65,8 +65,8 @@ async fn main() {
 // `examples/<inline-mod-name>/`, a directory that does not exist, and POSIX
 // will not resolve `..` out of a missing component.
 #[cfg(target_os = "macos")]
-#[path = "support/consent_relay.rs"]
-mod consent_relay;
+#[path = "support/cingulate_answer.rs"]
+mod cingulate_answer;
 
 #[cfg(target_os = "macos")]
 mod macos_probe {
@@ -97,7 +97,7 @@ mod macos_probe {
     };
     use tokio::sync::mpsc;
 
-    use super::consent_relay::elicit_and_answer;
+    use super::cingulate_answer::answer_cards;
 
     use super::display_value_changed;
 
@@ -953,7 +953,7 @@ mod macos_probe {
     }
 
     async fn mint_target_lease(planes: &Planes) -> Result<ProcessGrant, String> {
-        let pending = elicit_and_answer(
+        let pending = answer_cards(
             planes,
             route_request(
                 MANAGEMENT_CHANNEL,
@@ -1008,7 +1008,7 @@ mod macos_probe {
         route_channel: u16,
         epoch: u32,
         target: RouteTarget,
-        declares_elicitation: bool,
+        raises_cards: bool,
     ) -> Result<(), String> {
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
@@ -1018,13 +1018,15 @@ mod macos_probe {
             target,
             identity: probe_identity(),
             principal: cerebellum::session_caller_principal_for_test(),
-            consumer_capabilities: declares_elicitation.then(|| vec!["elicitation".to_string()]),
+            consumer_capabilities: None,
             admission_facts: Some(json!({
                 "agentProjectId": GRANTEE,
                 "sessionKind": "primary",
                 "effectiveCapabilityScope": ["*"]
             })),
-            scope: None,
+            // A permission card is raised with Cingulate only from a call
+            // under an agent session's scope.
+            scope: raises_cards.then(|| super::cingulate_answer::cingulate::stamp(GRANTEE)),
         };
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,

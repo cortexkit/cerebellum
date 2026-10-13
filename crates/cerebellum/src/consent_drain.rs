@@ -176,7 +176,7 @@ pub fn live_call(
         && facts.flow_id.is_none())
     .then_some(facts.scope.as_ref())
     .flatten();
-    let guard = crate::elicit::ROUTE_GUARD
+    let guard = crate::call_context::ROUTE_GUARD
         .try_with(Arc::clone)
         .map_err(|_| NotLive::CallEnded)?;
     LiveCall::from_inbound(
@@ -800,7 +800,7 @@ mod tests {
             .consent_drain
             .register(CardKind::AppControl, Effects::new(false));
         let guard = Arc::new(planes.health.enter_request());
-        crate::elicit::ROUTE_GUARD
+        crate::call_context::ROUTE_GUARD
             .scope(guard, async {
                 let live = live_call(&request(1), &facts(), &planes).unwrap();
                 let report = planes
@@ -822,7 +822,7 @@ mod tests {
             planes(&[card(CardKind::AppControl)], Arc::new(cingulate.clone()));
         let terminal = Arc::new(TerminalArbiter::new(request(1)));
         let guard = Arc::new(planes.health.enter_request());
-        crate::elicit::ROUTE_GUARD
+        crate::call_context::ROUTE_GUARD
             .scope(
                 guard,
                 CALL_TERMINAL.scope(terminal.clone(), async {

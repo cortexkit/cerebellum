@@ -16,25 +16,27 @@ use tokio::sync::mpsc;
 /// Drive a request that may ask a permission question, answer it, and return
 /// the reply. When the request replies before the answer, make another request
 /// to apply that answer so the probe can inspect the resulting permission.
-pub async fn elicit_and_answer(
+#[allow(dead_code)]
+pub async fn answer_cards(
     planes: &Planes,
     opening: Frame,
     answer_body: Value,
     label: &str,
 ) -> Result<Value, String> {
-    elicit_and_answer_observing(planes, opening, answer_body, label, |_| {}).await
+    answer_cards_observing(planes, opening, answer_body, label, |_| {}).await
 }
 
 /// Drive a consent-capable request, observing each question before answering it.
 /// The observer lets probes verify the choices the production relay offered.
-pub async fn elicit_and_answer_observing(
+#[allow(dead_code)]
+pub async fn answer_cards_observing(
     planes: &Planes,
     opening: Frame,
     answer_body: Value,
     label: &str,
     observe: impl FnMut(&Value),
 ) -> Result<Value, String> {
-    elicit_and_answer_waiting(
+    answer_cards_waiting(
         planes,
         opening,
         answer_body,
@@ -45,11 +47,11 @@ pub async fn elicit_and_answer_observing(
     .await
 }
 
-/// As [`elicit_and_answer_observing`], waiting up to `frame_wait` for each
+/// As [`answer_cards_observing`], waiting up to `frame_wait` for each
 /// frame. For a request that holds its reply open on purpose after the answer,
 /// such as a login capture waiting out its handoff.
 #[allow(dead_code)]
-pub async fn elicit_and_answer_waiting(
+pub async fn answer_cards_waiting(
     planes: &Planes,
     opening: Frame,
     answer_body: Value,
@@ -73,7 +75,7 @@ pub async fn elicit_and_answer_waiting(
             let id = question["id"].as_str().unwrap();
             service.answer_id(
                 id,
-                cerebellum::elicit::AskOutcome::Answered(answer_body.clone()),
+                cerebellum::cingulate_client::ScriptedAnswer::Answered(answer_body.clone()),
             );
             observed += 1;
         }
@@ -92,7 +94,9 @@ pub async fn elicit_and_answer_waiting(
                         observe(question);
                         service.answer_id(
                             question["id"].as_str().unwrap(),
-                            cerebellum::elicit::AskOutcome::Answered(answer_body.clone()),
+                            cerebellum::cingulate_client::ScriptedAnswer::Answered(
+                                answer_body.clone(),
+                            ),
                         );
                     }
                     let frame = Frame::build_with_version(

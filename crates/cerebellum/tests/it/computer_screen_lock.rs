@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerebellum::cingulate_client::ScriptedAnswer;
 use cerebellum::computer_capability::{
     servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
 };
 use cerebellum::computer_grants::{AppCode, ConsentContext, GrantNeed};
-use cerebellum::elicit::AskOutcome;
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::app_state::image::ImageMapping;
 use cerebellum_computer::app_state::session::RegisteredImage;
@@ -397,7 +397,7 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
             async move {
                 until(|| carrier.questions().len() == 1).await;
                 lock.set(Some(true));
-                assert!(carrier.answer_next(AskOutcome::Answered(
+                assert!(carrier.answer_next(ScriptedAnswer::Answered(
                     json!({"decision": "allow_conversation"})
                 )));
             }
@@ -431,7 +431,7 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
 async fn lock_then_allow(carrier: &ScriptedCarrier, lock: &LockState, question: usize) {
     until(|| carrier.questions().len() == question).await;
     lock.set(Some(true));
-    assert!(carrier.answer_next(AskOutcome::Answered(
+    assert!(carrier.answer_next(ScriptedAnswer::Answered(
         json!({"decision": "allow_conversation"})
     )));
 }
@@ -543,7 +543,7 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
         async move {
             until(|| carrier.questions().len() == 1).await;
             lock.set(Some(true));
-            assert!(carrier.answer_next(AskOutcome::Answered(
+            assert!(carrier.answer_next(ScriptedAnswer::Answered(
                 json!({"decision": "allow_conversation"})
             )));
         }

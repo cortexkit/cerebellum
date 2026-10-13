@@ -491,19 +491,6 @@ impl AcceptedBindFacts {
         None
     }
 
-    /// Used by reverse-lane cards until those flows move to Cingulate.
-    /// Whether the consumer declared it can relay a question to a human.
-    ///
-    /// True means asking is worth attempting, never that an answer will arrive.
-    pub fn declares_elicitation(&self) -> bool {
-        self.flow_id.is_none()
-            && self.call_mode == subc_protocol::call_mode::CallMode::Classic
-            && self
-                .consumer_capabilities
-                .iter()
-                .any(|family| family == ELICITATION_CAPABILITY)
-    }
-
     /// Consumer declarations retained from the daemon's accepted route bind.
     /// An absent or empty list declares no reverse requests or result readers.
     pub fn consumer_capabilities(&self) -> Option<&[String]> {
@@ -698,10 +685,6 @@ impl AdmissionFactsRefusal {
         }
     }
 }
-
-/// The reverse-request family that carries a question to a human, as spelled on
-/// the wire.
-pub const ELICITATION_CAPABILITY: &str = "elicitation";
 
 /// Read one admission fact by its single exact name, at the root of the facts
 /// object and nowhere else.
@@ -1613,7 +1596,7 @@ mod tests {
                 "effectiveCapabilityScope": ["*"],
                 "browserControlOperations": ["browser.launch"],
             })),
-            Some(&[ELICITATION_CAPABILITY.to_string()]),
+            Some(&["elicitation".to_string()]),
             &RouteTarget::ManagementSurface {
                 module_id: "cerebellum".to_string(),
             },
@@ -1627,11 +1610,9 @@ mod tests {
         assert!(!operator.session_kind_attested);
         assert!(!operator.allows_control_operation("browser.launch"));
         assert!(!operator.allows_capability("browser.status"));
-        // Kept: who opened the route, which surface it reaches, and whether
-        // it can relay the operator's question to a person.
+        // Kept: who opened the route and which surface it reaches.
         assert_eq!(operator.principal, Some(Principal::Direct));
         assert_eq!(operator.surface, RouteSurface::Management);
-        assert!(operator.declares_elicitation());
     }
 
     #[test]

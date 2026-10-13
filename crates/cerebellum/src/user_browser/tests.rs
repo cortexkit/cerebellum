@@ -1847,6 +1847,9 @@ async fn a_call_without_an_agent_session_raises_no_site_card() {
         .finish(fixture.start(1, snapshot_args(&tab), ""))
         .await;
     assert_eq!(reply["reason"], "consent_unavailable", "{reply}");
+    // The reply schema admits the reason, so the reply is not replaced by a
+    // `result_schema_violation` refusal on its way out.
+    assert_eq!(reply["detail"]["reason"], "no_agent_session", "{reply}");
     assert_eq!(
         reply["remedy"],
         "call from the agent session that needs the permission; it can raise the card"

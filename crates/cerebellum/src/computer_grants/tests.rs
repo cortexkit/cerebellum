@@ -4,6 +4,7 @@ use super::*;
 use crate::cingulate_client::desk::RegistryStore;
 use crate::cingulate_client::route::{BoxFuture, CallError, CingulateOpener, CingulateRoute};
 use crate::cingulate_client::wire;
+use crate::cingulate_client::ScriptedAnswer;
 use crate::{Frame, FrameType, Planes};
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
 use subc_protocol::{Flags, Principal, Priority, PROTOCOL_VERSION};
@@ -95,31 +96,31 @@ impl CardService {
         }
     }
 
-    pub(crate) fn answer(&self, corr: u64, outcome: AskOutcome) -> bool {
+    pub(crate) fn answer(&self, corr: u64, outcome: ScriptedAnswer) -> bool {
         self.answer_id(&format!("el_test_{corr}"), outcome)
     }
 
-    pub(crate) fn answer_id(&self, id: &str, outcome: AskOutcome) -> bool {
+    pub(crate) fn answer_id(&self, id: &str, outcome: ScriptedAnswer) -> bool {
         let mut state = lock(&self.state);
         if !state.records.contains_key(id) {
             return false;
         }
         match outcome {
-            AskOutcome::Answered(body) => {
+            ScriptedAnswer::Answered(body) => {
                 state.records.insert(id.into(), json!({"elicitation_id":id,"state":"answered","answered_choice_id":body["decision"]}));
             }
-            AskOutcome::NoAnswer => {
+            ScriptedAnswer::NoAnswer => {
                 state
                     .records
                     .insert(id.into(), json!({"elicitation_id":id,"state":"expired"}));
             }
-            AskOutcome::NotPutToAnyone => {
+            ScriptedAnswer::NotPutToAnyone => {
                 state.errors.insert(
                     id.into(),
                     crate::cingulate_client::double::refusal("elicitation_requester_refused"),
                 );
             }
-            AskOutcome::Undeliverable => {
+            ScriptedAnswer::Undeliverable => {
                 state
                     .errors
                     .insert(id.into(), CallError::Transport { code: None });
@@ -259,7 +260,7 @@ pub(crate) fn session_key(agent: &str) -> crate::cingulate_client::live_call::Se
 pub(crate) async fn with_live<T>(future: impl std::future::Future<Output = T>) -> T {
     let clock = cerebellum_core::clock::FakeClock::new();
     let timing = Arc::new(cerebellum_core::dispatch::DispatchTimingState::new(&clock));
-    crate::elicit::ROUTE_GUARD
+    crate::call_context::ROUTE_GUARD
         .scope(Arc::new(timing.enter(&clock)), future)
         .await
 }
@@ -490,7 +491,7 @@ async fn app_holder_loses_to_the_session_drain_only_after_the_grant_exists() {
     .await;
     assert!(service.answer(
         question.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
     ));
     drain_call(&planes, 1, 1).await;
     assert_eq!(
@@ -543,7 +544,7 @@ async fn two_app_holders_elect_exactly_one_execution() {
     .await;
     assert!(service.answer(
         question.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
     ));
     let mut outcomes = vec![
         wire_reply(&mut rx).await["outcome"]
@@ -646,7 +647,7 @@ async fn late_import_approval_copies_the_selected_browser_and_reports_execution(
     let card = service.card(1, 1).await;
     assert!(service.answer(
         card.header.corr,
-        AskOutcome::Answered(json!({"decision":"transfer:second"}))
+        ScriptedAnswer::Answered(json!({"decision":"transfer:second"}))
     ));
     drain_call(&planes, 1, 1).await;
     let reply = invoke_plan(&planes, two_browser_plan(&service.root), 11).await;
@@ -705,7 +706,7 @@ async fn new_import_endings_pass_result_schema_enforcement() {
             if ending == "unrecognized_answer" {
                 assert!(service.answer(
                     card.header.corr,
-                    AskOutcome::Answered(json!({"decision":"future-choice"}))
+                    ScriptedAnswer::Answered(json!({"decision":"future-choice"}))
                 ));
             } else {
                 let conversation = planes.routes.get(1, 1).unwrap().identity.conversation_key;
@@ -738,7 +739,7 @@ async fn revoked_login_cards_cannot_reappear_after_registry_restart() {
     let card = service.card(4, 1).await;
     assert!(service.answer(
         card.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow"}))
     ));
     let facts = planes.routes.get(4, 1).unwrap();
     crate::revoke_scope(
@@ -852,7 +853,7 @@ async fn takeover_holders_elect_one_and_the_drain_winner_makes_holds_true() {
         .await;
         assert!(service.answer(
             card.header.corr,
-            AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+            ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
         ));
         if drain_wins {
             let drain = crate::consent_drain::ConsentDrain::default();
@@ -900,19 +901,13 @@ fn login_request(carrier: Arc<dyn QuestionCarrier>) -> LoginConsentRequest {
     }
 }
 
-fn login_body() -> (String, Value) {
-    (
-        String::new(),
-        crate::login_capture::consent_question(
-            &crate::login_capture::CaptureRequest {
-                credential_domain: "ollama.com".into(),
-                account: "work".into(),
-                fetch_url: "https://ollama.com/settings".into(),
-                login_url: "https://ollama.com/signin".into(),
-            },
-            "",
-        ),
-    )
+fn login_body() -> Value {
+    crate::login_capture::consent_question(&crate::login_capture::CaptureRequest {
+        credential_domain: "ollama.com".into(),
+        account: "work".into(),
+        fetch_url: "https://ollama.com/settings".into(),
+        login_url: "https://ollama.com/signin".into(),
+    })
 }
 
 #[tokio::test]
@@ -935,7 +930,7 @@ async fn login_holder_takes_the_drain_approval_without_a_second_request() {
     .await;
     assert!(service.answer(
         card.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow"}))
     ));
     let drain = crate::consent_drain::ConsentDrain::default();
     grants.register_drain(&drain);
@@ -1000,7 +995,7 @@ async fn a_login_call_that_loses_its_approval_parks_no_longer_than_one_allowance
     tokio::time::sleep(Duration::from_secs(100)).await;
     assert!(service.answer(
         card.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow"}))
     ));
     let results = [first.await.unwrap(), second.await.unwrap()];
     let pending = results
@@ -1124,10 +1119,10 @@ async fn capture_endings_keep_their_reply_words_and_no_agent_is_not_withheld() {
                 service.changed.notify_waiters();
             } else {
                 let outcome = match ending {
-                    "no_answer" => AskOutcome::NoAnswer,
-                    "not_put_to_anyone" => AskOutcome::NotPutToAnyone,
-                    "undeliverable" => AskOutcome::Undeliverable,
-                    _ => AskOutcome::Answered(json!({"decision":ending})),
+                    "no_answer" => ScriptedAnswer::NoAnswer,
+                    "not_put_to_anyone" => ScriptedAnswer::NotPutToAnyone,
+                    "undeliverable" => ScriptedAnswer::Undeliverable,
+                    _ => ScriptedAnswer::Answered(json!({"decision":ending})),
                 };
                 assert!(service.answer(card.header.corr, outcome));
             }
@@ -1232,7 +1227,7 @@ async fn a_losing_holder_cannot_reply_before_the_winner_stores_the_effect() {
     .await;
     assert!(service.answer(
         card.header.corr,
-        AskOutcome::Answered(json!({"decision":"allow_always"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow_always"}))
     ));
     saved.await.unwrap();
     let drain = crate::consent_drain::ConsentDrain::default();
@@ -1294,7 +1289,7 @@ async fn a_raising_card_is_not_swept_before_its_memory_record_is_registered() {
     let mut session = carrier.desk.session(&live).await.unwrap();
     let card = consent_request(
         CardKind::Takeover,
-        &question_body("", &need, &[ALLOW_CONVERSATION, DENY], false, None),
+        &question_body(&need, &[ALLOW_CONVERSATION, DENY], false, None),
         TAKEOVER_QUESTION_DEADLINE,
         None,
         None,
@@ -1349,7 +1344,6 @@ async fn retained_accounting_guard_cannot_authorize_a_card_after_terminal_finali
             let card = consent_request(
                 CardKind::Takeover,
                 &question_body(
-                    "",
                     &GrantNeed::Takeover,
                     &[ALLOW_CONVERSATION, DENY],
                     false,

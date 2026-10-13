@@ -642,6 +642,27 @@ impl ConsentDesk {
         self.save()
     }
 
+    /// Remove the cards and unused approvals of every session of one session
+    /// scope (`owner`, `scope_ref`) at an epoch below `epoch`, as
+    /// [`Self::forget_session`] does for one session. A bind at a higher epoch
+    /// means every lower epoch's session has ended, including those with no
+    /// route still bound to say so. No route to the consent service is opened.
+    pub fn forget_sessions_before(
+        &self,
+        owner: &str,
+        scope_ref: &str,
+        epoch: u64,
+    ) -> Result<(), String> {
+        let ended = |session: &SessionKey| {
+            session.owner == owner && session.scope_ref == scope_ref && session.scope_epoch < epoch
+        };
+        lock(&self.registry).retain(|_, card| !ended(&card.session));
+        lock(&self.single_use)
+            .approvals
+            .retain(|(session, _), _| !ended(session));
+        self.save()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_single_use_approvals(&self) -> bool {
         !lock(&self.single_use).approvals.is_empty()

@@ -1162,14 +1162,14 @@ impl CaptureModule {
         if (call.cancelled)() {
             return record.ended("cancelled", None);
         }
-        let question = consent_question(request, &new_card_request_id());
+        let question = consent_question(request);
         // The question can wait minutes for a person, so a cancel is watched
         // for alongside it rather than only after it ends. Stopping the wait
         // leaves the card itself open.
         let answer = {
             let asked = call
                 .grants
-                .require_login(call.consent, move || (String::new(), question.clone()));
+                .require_login(call.consent, move || question.clone());
             tokio::pin!(asked);
             let check = self.env.poll_interval.min(CANCEL_CHECK_INTERVAL);
             loop {
@@ -1553,7 +1553,7 @@ impl CaptureModule {
             return (None, Err("present"));
         };
 
-        let guard = crate::elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
+        let guard = crate::call_context::ROUTE_GUARD.try_with(Arc::clone).ok();
         let _parked = guard.as_ref().map(|guard| guard.park_on_consent());
         // The runtime's clock, so tests can run a full-length handoff in
         // paused time; in production it is the same monotonic clock.
@@ -1859,14 +1859,6 @@ fn new_capture_id() -> String {
     )
 }
 
-/// The id `consent_question` renders the card body under. Only the body's
-/// params are sent to Cingulate, so this id is never sent, and it is never
-/// the deposit's `consent_ref`: that is the Cingulate id of the approved card
-/// (see [`answered_elicitation_id`]).
-fn new_card_request_id() -> String {
-    format!("capture-login-{}", new_capture_id())
-}
-
 /// The `capture_not_stored` reason when an approval carries no usable id of
 /// the card the person approved, so the deposit could not name its consent.
 pub const CONSENT_NOT_LINKABLE: &str = "consent_not_linkable";
@@ -1893,8 +1885,7 @@ fn answered_elicitation_id(answer: &LoginAnswer) -> Option<String> {
 const CAPTURE_CONSENT_URGENCY: crate::consent_card::Urgency = crate::consent_card::Urgency::High;
 
 /// Built before a browser exists so no captured cookie can enter the question.
-/// `ask_id` is the card's id, which the deposit later names as its consent.
-pub fn consent_question(request: &CaptureRequest, ask_id: &str) -> Value {
+pub fn consent_question(request: &CaptureRequest) -> Value {
     use crate::consent_card::*;
     let site = &request.credential_domain;
     ConsentCard {
@@ -1933,7 +1924,7 @@ pub fn consent_question(request: &CaptureRequest, ask_id: &str) -> Value {
             .with("account", request.account.as_str()),
         duration: None,
     }
-    .render(ask_id)
+    .render()
 }
 
 /// `None` only for an affirmative answer. Every other ending -- a refusal,

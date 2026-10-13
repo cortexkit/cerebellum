@@ -24,6 +24,7 @@ pub mod browser_signed_in;
 pub mod browser_standing_grants;
 pub mod browser_type;
 pub mod budgets;
+mod call_context;
 #[cfg(test)]
 mod call_mode_tests;
 mod call_queue;
@@ -43,7 +44,6 @@ pub mod coordinate;
 pub mod custody;
 pub mod durable_formats;
 mod egress;
-pub mod elicit;
 pub mod flat_tools;
 pub mod journal;
 pub mod journal_admin;
@@ -89,7 +89,6 @@ pub use cerebellum_computer as computer;
 use crate::call_record_supervisor::{
     begin_call_record, call_record_unavailable, settle_call_record, CallRecordWorkers,
 };
-use crate::elicit::{Elicitor, SharedElicitor};
 use crate::management::ManagementPlane;
 use crate::management_bounds::{
     close_idle_for_import_off_task, on_call_blocking_pool, spawn_handoff_poll, HandoffSettle,
@@ -1445,13 +1444,20 @@ async fn scope_epoch_admits_bind(
         scope_watch::BindEpoch::Advanced {
             ended_conversations,
         } => {
+            // Every lower epoch's session has ended, whether or not a route of
+            // it is still bound: forget the cards they raised, here only.
+            let _ = planes.consent.forget_sessions_before(
+                &serde_json::to_string(&stamp.owner).unwrap_or_default(),
+                &stamp.scope_ref,
+                stamp.scope_epoch,
+            );
             for conversation_key in &ended_conversations {
                 planes
                     .management
                     .end_browser_conversation(conversation_key)
                     .await;
                 planes.management.end_conversation(conversation_key);
-                cancel_conversation_cards(planes, conversation_key).await;
+                forget_conversation_cards(planes, conversation_key);
                 if let Some(config) = planes.browser_config.as_ref() {
                     if let Some(finish) = planes.sessions.begin_teardown_route(
                         conversation_key,
@@ -1484,7 +1490,14 @@ async fn scope_epoch_admits_bind(
     }
 }
 
-async fn cancel_conversation_cards(planes: &Planes, conversation_key: &str) {
+/// Forget the consent cards an ended conversation's sessions have open, here
+/// only: the in-memory computer questions and every raised-card registry
+/// entry of the sessions its still-bound routes carry. No route to Cingulate
+/// is opened, because a route may be opened only while a live call from that
+/// session is held, and an ended session has none. A late answer for a
+/// forgotten card is then ignored by the next drain instead of granting
+/// anything; Cingulate expires the card on the person's phone by itself.
+fn forget_conversation_cards(planes: &Planes, conversation_key: &str) {
     planes
         .management
         .computer_grants()
@@ -1506,16 +1519,6 @@ async fn cancel_conversation_cards(planes: &Planes, conversation_key: &str) {
     for session in sessions {
         let _ = planes.consent.forget_session(&session);
     }
-
-    planes
-        .elicitor
-        .cancel_where(|channel, epoch| {
-            planes
-                .routes
-                .get(channel, epoch)
-                .is_some_and(|facts| facts.identity.conversation_key == conversation_key)
-        })
-        .await;
 }
 
 /// End what a session scope that definitively ended was allowed, for each
@@ -1535,7 +1538,7 @@ async fn revoke_scope(planes: &Planes, conversations: &std::collections::BTreeSe
             .end_browser_conversation(conversation_key)
             .await;
         planes.management.end_conversation(conversation_key);
-        cancel_conversation_cards(planes, conversation_key).await;
+        forget_conversation_cards(planes, conversation_key);
         if let Some(config) = planes.browser_config.clone() {
             let sessions = planes.sessions.clone();
             let conversation_key = conversation_key.clone();
@@ -1628,8 +1631,8 @@ fn login_consent_request(
                 epoch,
                 conversation_key: facts.identity.conversation_key.clone(),
             }),
-            guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
-            call_key: elicit::current_call_key(),
+            guard: call_context::ROUTE_GUARD.try_with(Arc::clone).ok(),
+            call_key: call_context::current_call_key(),
         }),
         cancel,
         drain: planes.drain_signal.subscribe(),
@@ -1639,7 +1642,7 @@ fn login_consent_request(
             epoch,
             conversation_key: facts.identity.conversation_key.clone(),
         }),
-        park_guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+        park_guard: call_context::ROUTE_GUARD.try_with(Arc::clone).ok(),
     }
 }
 
@@ -1669,8 +1672,8 @@ fn consent_context(
             epoch,
             conversation_key: facts.identity.conversation_key.clone(),
         }),
-        guard: elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
-        call_key: elicit::current_call_key(),
+        guard: call_context::ROUTE_GUARD.try_with(Arc::clone).ok(),
+        call_key: call_context::current_call_key(),
     }));
     let mut context = computer_grants::ConsentContext::new(
         computer_grants::GrantCaller {
@@ -1688,7 +1691,7 @@ fn consent_context(
             conversation_key: facts.identity.conversation_key.clone(),
         }),
         planes.drain_signal.subscribe(),
-        elicit::ROUTE_GUARD.try_with(Arc::clone).ok(),
+        call_context::ROUTE_GUARD.try_with(Arc::clone).ok(),
     );
     #[cfg(test)]
     if let Ok(limit) = COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST.try_with(|limit| *limit) {
@@ -2713,8 +2716,6 @@ pub struct Planes {
     /// capability a caller names directly.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub computer_admitted: Arc<std::collections::BTreeSet<String>>,
-    /// Questions this module has put to whoever is on the other end of a route.
-    pub elicitor: SharedElicitor,
     /// `browser.capture_login`: one capture at a time, and its residue.
     pub capture: Arc<login_capture::CaptureModule>,
     /// One record per call that arrived with a `call_key`, so a resend is
@@ -3142,7 +3143,6 @@ impl Planes {
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
-            elicitor: Arc::new(Elicitor::new()),
             capture,
             calls,
             call_record_workers: Arc::new(CallRecordWorkers::default()),
@@ -3196,7 +3196,6 @@ impl Clone for Planes {
             computer: self.computer.clone(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::clone(&self.computer_admitted),
-            elicitor: Arc::clone(&self.elicitor),
             capture: Arc::clone(&self.capture),
             calls: Arc::clone(&self.calls),
             call_record_workers: Arc::clone(&self.call_record_workers),
@@ -3231,9 +3230,11 @@ async fn handle_frame(
         // connection (`scope.describe`). The daemon's requests to the module
         // arrive as requests, so a response or error on channel 0 can only be
         // one of these; it is handed to whoever asked, or dropped if nobody
-        // still waits. Without this arm such an answer would be dropped by the
-        // branches below, which know only questions asked on route channels,
-        // so every describe would wait out its deadline as if unanswered.
+        // still waits. Without this arm such an answer would fall to the
+        // catch-all and be dropped, so every describe would wait out its
+        // deadline as if unanswered. A response or error on a route channel
+        // answers nothing this module sent (it never sends requests on a
+        // route), so the catch-all drops those.
         FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
             let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
             let answer = if frame.header.ty == FrameType::Response {
@@ -3242,40 +3243,6 @@ async fn handle_frame(
                 scope_watch::ControlAnswer::Error(body)
             };
             planes.scopes.control.deliver(frame.header.corr, answer);
-            Ok(true)
-        }
-        // An answer to a question this module asked. Requests are what we
-        // ANSWER and responses are what we RECEIVE, so an inbound response can
-        // only belong to an exchange we opened; the direction settles ownership
-        // without a private correlation space.
-        //
-        // Without this arm the frame fell through to the catch-all and was
-        // dropped, so a question waited out its whole deadline and reported that
-        // nobody replied. That is indistinguishable from a consumer ignoring it,
-        // which is why the absence could not have been noticed from the outside.
-        FrameType::Response => {
-            let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
-            if !planes
-                .elicitor
-                .deliver(frame.header.channel, frame.header.corr, body)
-            {
-                // Nobody was waiting: an answer that arrived after its deadline,
-                // or a correlation this module never sent. Dropped deliberately
-                // rather than acted on, because there is no exchange to complete
-                // and a late answer must not revive an abandoned one.
-            }
-            Ok(true)
-        }
-        // An error frame in place of an answer: the consumer refused the
-        // question instead of relaying it. The frame type settles direction,
-        // as for a response: an error can only answer a request this module
-        // sent, and on a route channel the only requests it sends are
-        // questions. Ending it here keeps the question from waiting out its
-        // whole deadline, up to half an hour, for an answer that cannot come.
-        FrameType::Error if frame.header.channel != 0 => {
-            planes
-                .elicitor
-                .refuse(frame.header.channel, frame.header.corr);
             Ok(true)
         }
         FrameType::Push if frame.header.channel == 0 => {
@@ -3290,7 +3257,6 @@ async fn handle_frame(
                         .store(true, std::sync::atomic::Ordering::Release);
                     planes.drain_signal.send_replace(true);
                     planes.cancellations.stop_all(TerminalCause::Draining);
-                    planes.elicitor.cancel_where(|_, _| true).await;
                     // Spend the drain window flushing profiles, not waiting for the
                     // deadline. It is only an upper bound, never a scheduled start.
                     if let Some(config) = planes.browser_config.clone() {
@@ -3307,18 +3273,12 @@ async fn handle_frame(
                 channel: frame.header.channel,
                 epoch: frame.header.epoch,
             });
-            planes
-                .elicitor
-                .forget_route(frame.header.channel, frame.header.epoch);
             // Unbound before its requests are cancelled, so a call waiting on a
             // person sees the route gone when it wakes and answers
             // `route_closed` rather than a caller-requested cancel.
             let removed = planes
                 .routes
                 .remove(frame.header.channel, frame.header.epoch);
-            planes
-                .elicitor
-                .set_unattended(frame.header.channel, frame.header.epoch, false);
             planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
@@ -3390,7 +3350,6 @@ async fn handle_frame(
                     writer,
                     &planes.health,
                     &planes.routes,
-                    &planes.elicitor,
                     Some(&planes.call_record_workers),
                 )
                 .await?;
@@ -4802,11 +4761,7 @@ async fn complete_login_import(
     let consent = planes
         .management
         .computer_grants()
-        .require_login(request, || {
-            let ask_id = login_import::new_ask_id();
-            let question = plan.question(&ask_id, &facts.identity.agent_project_id);
-            (ask_id, question)
-        });
+        .require_login(request, || plan.question(&facts.identity.agent_project_id));
     let consent = consent.await;
     let mut execution = None;
     let answer = match consent {
@@ -5237,7 +5192,6 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
-    elicitor: &elicit::Elicitor,
     call_record_workers: Option<&CallRecordWorkers>,
 ) -> Result<(), ModuleError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
@@ -5340,15 +5294,6 @@ async fn handle_control_request(
             .with_scope(scope);
             accepted_facts.call_mode =
                 call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic);
-            elicitor.set_unattended(
-                route_channel,
-                epoch,
-                accepted_facts.call_mode != subc_protocol::call_mode::CallMode::Classic
-                    || accepted_facts
-                        .scope
-                        .as_ref()
-                        .is_some_and(|stamp| stamp.attributes.flow_id.is_some()),
-            );
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
@@ -5781,7 +5726,7 @@ async fn handle_keyed_tool_request_inner(
             .await;
             return Ok(());
         }
-        return elicit::CALL_KEY
+        return call_context::CALL_KEY
             .scope(
                 call_key,
                 Box::pin(handle_tool_request(call, writer, planes, &observation)),
@@ -5804,7 +5749,7 @@ async fn handle_keyed_tool_request_inner(
     };
     let result = {
         let observation = pending.observation.clone();
-        let call = elicit::CALL_KEY.scope(
+        let call = call_context::CALL_KEY.scope(
             call_key,
             Box::pin(handle_tool_request(call, &proxy, planes, &observation)),
         );
@@ -7068,7 +7013,7 @@ async fn serve_browser_with_consent(
             _ = cancel.cancelled() => if planes.routes.get(request.0, request.1).is_some() && planes.routes.carries_conversation(&facts.identity.conversation_key) { LetGo::Detach } else { LetGo::Withdraw },
         }
     };
-    let guard = elicit::ROUTE_GUARD.try_with(Arc::clone).ok();
+    let guard = call_context::ROUTE_GUARD.try_with(Arc::clone).ok();
     let parked = guard.as_ref().map(|guard| guard.park_on_consent());
     let (ending, settled) =
         browser_consent::park(planes, &mut session, &id, completion, park_limit, cancelled).await;
@@ -7667,15 +7612,7 @@ pub async fn handle_control_request_for_test(
     health_state: &Arc<HealthState>,
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
-    handle_control_request(
-        frame,
-        writer,
-        health_state,
-        &route_bindings,
-        &elicit::Elicitor::new(),
-        None,
-    )
-    .await
+    handle_control_request(frame, writer, health_state, &route_bindings, None).await
 }
 
 pub async fn handle_control_request_for_test_with_bindings(
@@ -7684,15 +7621,7 @@ pub async fn handle_control_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    handle_control_request(
-        frame,
-        writer,
-        health_state,
-        route_bindings,
-        &elicit::Elicitor::new(),
-        None,
-    )
-    .await
+    handle_control_request(frame, writer, health_state, route_bindings, None).await
 }
 
 /// The principal a test bind carries when it stands for a session's calls:
@@ -7860,10 +7789,10 @@ pub async fn handle_tool_request_for_test_with_existing_planes(
         frame.header.epoch,
         frame.header.corr,
     ));
-    if elicit::ROUTE_GUARD.try_with(|_| ()).is_ok() {
+    if call_context::ROUTE_GUARD.try_with(|_| ()).is_ok() {
         handle_keyed_tool_request(frame, writer, planes).await
     } else {
-        elicit::ROUTE_GUARD
+        call_context::ROUTE_GUARD
             .scope(
                 Arc::new(planes.health.enter_request()),
                 handle_keyed_tool_request(frame, writer, planes),
@@ -7964,6 +7893,22 @@ pub async fn handle_tool_request_for_test_with_bindings(
         planes.computer_admitted = test_admitted_computer_capabilities();
     }
     handle_tool_request_for_test_with_existing_planes(frame, writer, &planes).await
+}
+
+/// No permission card was raised: the planes' scripted Cingulate, when one is
+/// installed, received no `consent.request`. Planes without one cannot raise a
+/// card at all, because their Cingulate opener refuses every route.
+#[cfg(test)]
+fn assert_no_card_raised(planes: &Planes) {
+    if let Some(consent) = planes.consent_test.as_ref() {
+        assert!(
+            consent
+                .calls()
+                .iter()
+                .all(|(method, _)| method != "consent.request"),
+            "a permission card was raised"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8570,7 +8515,7 @@ mod tests {
 
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question_frame.header.corr,
-            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
         ));
         assert_eq!(planes.browser.grant_count_for_test().await, 0);
         computer_grants::tests::drain_call(&planes, 4, 1).await;
@@ -8651,7 +8596,7 @@ mod tests {
             handle_frame(frame, &tx, planes).await.unwrap();
             let reply = next_frame(&mut rx).await;
             assert_ne!(reply.header.ty, FrameType::Request, "query raised a card");
-            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert_no_card_raised(planes);
             assert!(rx.try_recv().is_err(), "unexpected extra frame");
             serde_json::from_slice(&reply.body).unwrap()
         }
@@ -8965,10 +8910,10 @@ mod tests {
         ending: &str,
     ) {
         let outcome = match ending {
-            "no_answer" => elicit::AskOutcome::NoAnswer,
-            "not_put_to_anyone" | "refused" => elicit::AskOutcome::NotPutToAnyone,
-            "undeliverable" => elicit::AskOutcome::Undeliverable,
-            _ => elicit::AskOutcome::Answered(json!({"decision":ending})),
+            "no_answer" => cingulate_client::ScriptedAnswer::NoAnswer,
+            "not_put_to_anyone" | "refused" => cingulate_client::ScriptedAnswer::NotPutToAnyone,
+            "undeliverable" => cingulate_client::ScriptedAnswer::Undeliverable,
+            _ => cingulate_client::ScriptedAnswer::Answered(json!({"decision":ending})),
         };
         assert!(planes
             .consent_test
@@ -9021,7 +8966,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
         ));
         assert_eq!(planes.management.browser_grant_count().await, 0);
         assert!(planes
@@ -9048,6 +8993,74 @@ mod tests {
             .is_none());
         assert_eq!(planes.consent_test.as_ref().unwrap().calls().len(), count);
         assert_eq!(planes.management.browser_grant_count().await, 0);
+    }
+
+    /// A bind at a higher epoch of the same session scope forgets the cards
+    /// the ended epoch raised, even after that epoch's route has closed, and
+    /// opens no route to Cingulate to do it.
+    #[tokio::test]
+    async fn an_advanced_epoch_bind_forgets_the_ended_sessions_cards_without_a_route() {
+        let planes = open_grant_planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_, question) = open_grant_over_wire(&planes, &tx, &mut rx, 902).await;
+        let id = format!("el_test_{}", question.header.corr);
+        assert!(planes.consent.raised(&id).is_some());
+        let old = planes.routes.get(4, 1).unwrap();
+        let old_stamp = old.scope.clone().unwrap();
+        // The epoch-1 route was bound, and has closed since.
+        planes
+            .scopes
+            .note_bind(&old_stamp, &old.identity.conversation_key);
+        planes.routes.remove(4, 1);
+        let count = planes.consent_test.as_ref().unwrap().calls().len();
+
+        let mut stamp = old_stamp;
+        stamp.scope_epoch = 2;
+        let bind = ModuleControlRequest::RouteBind {
+            role_versions: None,
+            call_mode: None,
+            route_channel: 5,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "cerebellum".into(),
+            },
+            identity: bind_identity_for_test(),
+            principal: session_caller_principal_for_test(),
+            consumer_capabilities: None,
+            admission_facts: Some(json!({
+                "agentProjectId": "test-project",
+                "sessionKind": "primary",
+                "effectiveCapabilityScope": ["*"],
+            })),
+            scope: Some(stamp),
+        };
+        let frame = Frame::build_with_version(
+            subc_protocol::PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            5,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap();
+        assert!(handle_frame(frame, &tx, &planes).await.unwrap());
+        let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert!(
+            planes.consent.raised(&id).is_none(),
+            "the ended epoch's card is still in the registry"
+        );
+        assert_eq!(planes.consent_test.as_ref().unwrap().calls().len(), count);
+        assert!(rx.try_recv().is_err());
     }
 
     async fn browser_grants_settled(planes: &Planes) {
@@ -9357,119 +9370,16 @@ mod tests {
         assert!(!remedy.contains("enclosing element"));
     }
 
-    /// An answer arriving on a route reaches the question that asked it.
+    /// A response or error frame on a route channel is dropped without
+    /// disturbing the loop.
     ///
-    /// The frame dispatcher previously had no arm for a response: it fell through
-    /// to the catch-all and was dropped, so a question waited out its whole
-    /// deadline and reported that nobody replied. That is indistinguishable from
-    /// a consumer ignoring the question, which is why nothing outside the module
-    /// could have detected the missing arm.
-    ///
-    /// Driven through `handle_frame` rather than through the elicitor directly,
-    /// because the elicitor's own tests already pass with no arm at all. What is
-    /// under test is the dispatcher routing the frame there.
-    #[tokio::test]
-    async fn a_response_frame_reaches_the_question_that_asked_it() {
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        let elicitor: SharedElicitor = Arc::new(Elicitor::new());
-        let health = Arc::new(HealthState::default());
-        let routes = Arc::new(RouteBindings::new());
-        let browser = Arc::new(BrowserPlane::new());
-
-        // A question is outstanding, so there is something for the answer to
-        // reach. Asked on its own task because it waits for the reply.
-        let asking = {
-            let elicitor = Arc::clone(&elicitor);
-            let writer_tx = writer_tx.clone();
-            tokio::spawn(async move {
-                elicitor
-                    .ask(
-                        &writer_tx,
-                        4,
-                        1,
-                        json!({"method": "elicitation/create"}),
-                        Duration::from_secs(5),
-                    )
-                    .await
-            })
-        };
-        let question = writer_rx.recv().await.expect("the question is sent");
-
-        let answer = Frame::build(
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            question.header.channel,
-            question.header.epoch,
-            question.header.corr,
-            br#"{"decision":"allow"}"#.to_vec(),
-        )
-        .unwrap();
-
-        let planes = Planes {
-            cancellations: RequestCancellations::default(),
-            browser_queue: Arc::new(call_queue::ConversationQueue::default()),
-            #[cfg(target_os = "macos")]
-            computer_admitted: test_admitted_computer_capabilities(),
-            health,
-            routes,
-            browser,
-            browser_config: None,
-            sessions: browser_session::BrowserSessions::default(),
-            user_browser: user_browser_bridge::UserBrowserBridge::new(),
-            lease_clock: Arc::new(cerebellum_core::clock::SystemClock::new()),
-            launch_service: None,
-            management: test_management_plane(),
-            consent: Arc::new(cingulate_client::desk::ConsentDesk::new(Arc::new(
-                consent_drain::UnconfiguredCingulate,
-            ))),
-            consent_drain: Arc::new(consent_drain::ConsentDrain::default()),
-            user_browser_cards: Arc::default(),
-            #[cfg(test)]
-            consent_test: None,
-            #[cfg(target_os = "macos")]
-            computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
-            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
-            drain_notice: Arc::new(std::sync::OnceLock::new()),
-            route_test_handler: None,
-            elicitor: Arc::clone(&elicitor),
-            capture: login_capture::test_support::fixture().module,
-            calls: Arc::new(journal::call_records::CallRecords::in_memory()),
-            call_record_workers: Arc::new(CallRecordWorkers::default()),
-            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
-            scopes: Arc::new(scope_watch::ScopeRevocation::default()),
-        };
-        let keep_going = handle_frame(answer, &writer_tx, &planes)
-            .await
-            .expect("an answer is handled");
-        assert!(keep_going, "handling an answer closed the connection");
-
-        assert_eq!(
-            asking.await.unwrap(),
-            crate::elicit::AskOutcome::Answered(json!({"decision": "allow"})),
-            "the answer did not reach the question"
-        );
-    }
-
-    /// An answer nobody is waiting for is dropped without disturbing the loop.
-    ///
-    /// A late reply, or a correlation this module never sent. It must neither
-    /// revive an abandoned question nor take the connection down: an unsolicited
-    /// frame is a normal event on a shared route.
+    /// This module sends no requests on a route channel (permission cards go
+    /// to Cingulate, the consent module, over a route of their own), so such a
+    /// frame answers nothing here. It must neither be acted on nor take the
+    /// connection down, and nothing is written back.
     #[tokio::test]
     async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
-        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(8);
-        let elicitor: SharedElicitor = Arc::new(Elicitor::new());
-
-        let answer = Frame::build(
-            FrameType::Response,
-            Flags::new(false, Priority::Interactive, false),
-            4,
-            1,
-            9_999,
-            br#"{"decision":"allow"}"#.to_vec(),
-        )
-        .unwrap();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
 
         let planes = Planes {
             cancellations: RequestCancellations::default(),
@@ -9498,18 +9408,31 @@ mod tests {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
-            elicitor: Arc::clone(&elicitor),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
             egress_deadlines: Arc::new(ConnectionDeadlines::default()),
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
         };
-        let keep_going = handle_frame(answer, &writer_tx, &planes)
-            .await
-            .expect("an unsolicited answer is handled");
-        assert!(keep_going, "an unsolicited answer closed the connection");
-        assert_eq!(elicitor.outstanding(), 0);
+        for ty in [FrameType::Response, FrameType::Error] {
+            let answer = Frame::build(
+                ty,
+                Flags::new(false, Priority::Interactive, false),
+                4,
+                1,
+                9_999,
+                br#"{"decision":"allow"}"#.to_vec(),
+            )
+            .unwrap();
+            let keep_going = handle_frame(answer, &writer_tx, &planes)
+                .await
+                .expect("an unsolicited answer is handled");
+            assert!(keep_going, "an unsolicited {ty:?} closed the connection");
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "an unsolicited {ty:?} was answered"
+            );
+        }
     }
 
     /// A management route is served by the management surface, not the tool one.
@@ -10754,7 +10677,6 @@ mod tests {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
-            elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
@@ -10834,7 +10756,6 @@ mod tests {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
-            elicitor: Arc::new(Elicitor::new()),
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
@@ -12839,7 +12760,7 @@ mod computer_consent_wire_tests {
         assert_eq!(withdrawn["answer"], "withdrawn");
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
         ));
         computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
         let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
@@ -12941,7 +12862,7 @@ mod computer_consent_wire_tests {
 
         let _ = planes.consent_test.as_ref().unwrap().answer_id(
             &ask_id,
-            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"})),
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"})),
         );
         let caller = computer_grants::GrantCaller {
             conversation_key: facts.identity.conversation_key.clone(),
@@ -13192,7 +13113,7 @@ mod relayed_computer_call_tests {
             .await;
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
         ));
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -13480,7 +13401,7 @@ mod relayed_computer_call_tests {
                     "a refused computer action must not create an action journal record"
                 );
             }
-            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert_no_card_raised(&planes);
             assert!(rx.try_recv().is_err());
             if granted {
                 planes
@@ -13516,7 +13437,7 @@ mod relayed_computer_call_tests {
                     1,
                     "fronting keys must refuse before another app read"
                 );
-                assert_eq!(planes.elicitor.outstanding(), 0);
+                assert_no_card_raised(&planes);
                 assert!(rx.try_recv().is_err());
             }
         }
@@ -13594,7 +13515,7 @@ mod relayed_computer_call_tests {
             let body: Value = serde_json::from_slice(&reply.body).unwrap();
             assert_eq!(body["outcome"], "consent_unavailable", "{body}");
             assert_eq!(body["detail"]["reason"], "takeover_not_for_flows", "{body}");
-            assert_eq!(planes.elicitor.outstanding(), 0);
+            assert_no_card_raised(&planes);
             assert!(rx.try_recv().is_err());
         }
     }
@@ -13702,7 +13623,7 @@ mod relayed_computer_call_tests {
                     })
                 );
                 assert_eq!(reads.load(Ordering::SeqCst), 0);
-                assert_eq!(planes.elicitor.outstanding(), 0);
+                assert_no_card_raised(&planes);
                 assert!(
                     rx.try_recv().is_err(),
                     "a flow must not send an elicitation"
@@ -13715,7 +13636,9 @@ mod relayed_computer_call_tests {
                 );
                 assert!(planes.consent_test.as_ref().unwrap().answer(
                     reply.header.corr,
-                    elicit::AskOutcome::Answered(json!({"decision":"allow_conversation"})),
+                    cingulate_client::ScriptedAnswer::Answered(
+                        json!({"decision":"allow_conversation"})
+                    ),
                 ));
                 reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                     .await

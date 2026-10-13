@@ -273,8 +273,8 @@ impl LoginImportPlan {
         &self.domains
     }
 
-    pub fn question(&self, ask_id: &str, _agent: &str) -> Value {
-        import_question(ask_id, &self.origin, &self.host, &self.presence)
+    pub fn question(&self, _agent: &str) -> Value {
+        import_question(&self.origin, &self.host, &self.presence)
     }
 
     pub fn refusal(&self, code: &'static str, remedy: &'static str) -> ImportResult {
@@ -502,12 +502,7 @@ const IMPORT_DECLINE: &str = "deny";
 /// One grant per browser the login can be copied from, plus signing in by
 /// hand; `presence` says which browsers hold a login and why the others can't
 /// give one.
-pub(crate) fn import_question(
-    ask_id: &str,
-    origin: &str,
-    host: &str,
-    presence: &[BrowserPresence],
-) -> Value {
+pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPresence]) -> Value {
     use crate::consent_card::*;
     let mut grants: Vec<_> = presence
         .iter()
@@ -572,7 +567,7 @@ pub(crate) fn import_question(
         scope: Scope::new().with("origin", origin),
         duration: None,
     }
-    .render(ask_id)
+    .render()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1493,10 +1488,12 @@ mod tests {
                 return;
             }
             let ending = match decision {
-                "no_answer" => crate::elicit::AskOutcome::NoAnswer,
-                "not_put_to_anyone" => crate::elicit::AskOutcome::NotPutToAnyone,
-                "undeliverable" => crate::elicit::AskOutcome::Undeliverable,
-                _ => crate::elicit::AskOutcome::Answered(json!({"decision":decision})),
+                "no_answer" => crate::cingulate_client::ScriptedAnswer::NoAnswer,
+                "not_put_to_anyone" => crate::cingulate_client::ScriptedAnswer::NotPutToAnyone,
+                "undeliverable" => crate::cingulate_client::ScriptedAnswer::Undeliverable,
+                _ => {
+                    crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision}))
+                }
             };
             assert!(planes
                 .consent_test
@@ -2088,7 +2085,7 @@ mod tests {
         assert_eq!(plan.presence()[0].persistent_rows, 0);
         assert_eq!(plan.presence()[0].session_rows, 1);
         assert_eq!(plan.presence()[0].reason, Some("session_only"));
-        let question = plan.question("ask", "agent-1").to_string();
+        let question = plan.question("agent-1").to_string();
         assert!(!question.contains("transfer:chrome"));
         assert!(question.contains("hand_off"));
     }
@@ -2133,7 +2130,7 @@ mod tests {
         assert_eq!(plan.presence()[0].browser, "brave");
         assert_eq!(plan.presence()[0].reason, Some("different_keychain_item"));
         assert!(!plan
-            .question("ask", "agent-1")
+            .question("agent-1")
             .to_string()
             .contains("transfer:brave"));
     }
@@ -2309,7 +2306,7 @@ mod tests {
         assert_eq!(plan.presence().len(), 2);
         assert_eq!(plan.presence()[0].transfer, "available");
         assert_eq!(plan.presence()[1].reason, Some("unreadable"));
-        let card = plan.question("unreadable-card", "agent");
+        let card = plan.question("agent");
         assert_eq!(
             card["params"]["facts"][1]["value"],
             "can't read saved logins"
@@ -2375,7 +2372,7 @@ mod tests {
             assert_eq!(presence.reason, Some("os_protected"));
             assert_eq!(presence.transfer, "unsupported");
         }
-        let card = plan.question("protected-card", "agent");
+        let card = plan.question("agent");
         for fact in card["params"]["facts"].as_array().unwrap().iter().take(2) {
             assert_eq!(fact["value"], "macOS protects this browser's data");
         }
@@ -2521,7 +2518,7 @@ mod tests {
                     reason: Some(reason),
                 });
             }
-            let card = plan.question("import-card", "agent_private");
+            let card = plan.question("agent_private");
             let facts = &card["params"]["facts"];
             assert_eq!(facts[0]["value"], "login available");
             assert_eq!(facts[1]["value"], "can't be copied (different keychain)");
@@ -2644,7 +2641,7 @@ mod tests {
             Some("safari_transfer_unsupported")
         );
         assert!(!plan
-            .question("ask", "agent")
+            .question("agent")
             .to_string()
             .contains("transfer:safari"));
     }

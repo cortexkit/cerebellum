@@ -9,13 +9,13 @@ use super::support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerebellum::cingulate_client::ScriptedAnswer;
 use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
 use cerebellum::computer_grants::{
     AlwaysGrantRecord, AppIdentity, AppIdentityUnreadable, ComputerGrants, ConsentContext,
     ConsentRefusal, FilesystemGrantStorage, GrantCaller, GrantNeed, GrantStorage, GrantStoreError,
     GrantStoreState, InMemoryGrantStorage, QuestionCarrier, GRANT_STORE_VERSION,
 };
-use cerebellum::elicit::AskOutcome;
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
@@ -234,8 +234,8 @@ fn decisions(question: &Value) -> Vec<String> {
         .collect()
 }
 
-fn answer(decision: &str) -> AskOutcome {
-    AskOutcome::Answered(json!({"decision": decision}))
+fn answer(decision: &str) -> ScriptedAnswer {
+    ScriptedAnswer::Answered(json!({"decision": decision}))
 }
 
 async fn until(mut condition: impl FnMut() -> bool) {
@@ -940,8 +940,8 @@ async fn nobody_asked_and_nobody_answered_are_not_reported_as_pending() {
     let plane = plane(&driver);
     let management = in_memory_management();
     let carrier = ScriptedCarrier::default();
-    carrier.queue(AskOutcome::NotPutToAnyone);
-    carrier.queue(AskOutcome::NoAnswer);
+    carrier.queue(ScriptedAnswer::NotPutToAnyone);
+    carrier.queue(ScriptedAnswer::NoAnswer);
 
     let unreached = serve(
         &plane,

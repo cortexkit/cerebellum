@@ -39,9 +39,9 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
-#[path = "../examples/support/consent_relay.rs"]
-mod consent_relay;
-use consent_relay::cingulate::ScriptedCarrier;
+#[path = "../examples/support/cingulate_answer.rs"]
+mod cingulate_answer;
+use cingulate_answer::cingulate::ScriptedCarrier;
 
 #[path = "support/browser_stable_refs.rs"]
 mod stable_refs;
@@ -149,7 +149,9 @@ async fn bind_management_route(planes: &Planes) {
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
-        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
+        scope: Some(cingulate_answer::cingulate::stamp(
+            "pj-browser-session-wire",
+        )),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -193,7 +195,7 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
         .unwrap(),
     )
     .unwrap();
-    let reply = consent_relay::elicit_and_answer(
+    let reply = cingulate_answer::answer_cards(
         planes,
         opening,
         json!({"decision": "allow_conversation"}),
@@ -4799,7 +4801,9 @@ async fn blocking_grant_fixture_with_store(
         admission_facts: Some(
             json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
-        scope: Some(consent_relay::cingulate::stamp("pj-browser-session-wire")),
+        scope: Some(cingulate_answer::cingulate::stamp(
+            "pj-browser-session-wire",
+        )),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -4894,10 +4898,12 @@ async fn answer_browser(
     decision: &str,
 ) {
     let outcome = match decision {
-        "no_answer" => cerebellum::elicit::AskOutcome::NoAnswer,
-        "not_put_to_anyone" | "refused" => cerebellum::elicit::AskOutcome::NotPutToAnyone,
-        "undeliverable" => cerebellum::elicit::AskOutcome::Undeliverable,
-        _ => cerebellum::elicit::AskOutcome::Answered(json!({"decision":decision})),
+        "no_answer" => cerebellum::cingulate_client::ScriptedAnswer::NoAnswer,
+        "not_put_to_anyone" | "refused" => {
+            cerebellum::cingulate_client::ScriptedAnswer::NotPutToAnyone
+        }
+        "undeliverable" => cerebellum::cingulate_client::ScriptedAnswer::Undeliverable,
+        _ => cerebellum::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision})),
     };
     assert!(ScriptedCarrier::for_planes(planes)
         .answer_id(body(question)["id"].as_str().unwrap(), outcome));
@@ -4955,7 +4961,6 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     assert_eq!(body["outcome"], "ok", "{body}");
     assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
     assert!(rx.try_recv().is_err(), "only one question and one reply");
-    assert_eq!(planes.elicitor.outstanding(), 0);
     assert!(planes.browser.result_schema_findings().is_empty());
 }
 
@@ -5244,7 +5249,6 @@ async fn blocking_browser_grant_unfixable_refusals_never_ask() {
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(body["detail"]["attempted_origin"], "null", "{body}");
     assert!(rx.try_recv().is_err());
-    assert_eq!(planes.elicitor.outstanding(), 0);
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
@@ -8411,7 +8415,6 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
         let record: Value = serde_json::from_str(stored.lines().last().unwrap()).unwrap();
         assert_eq!(record["state"], "refused", "{stored}");
         assert_eq!(record["refusal_reason"], "consent_unavailable", "{stored}");
-        assert_eq!(planes.elicitor.outstanding(), 0);
         assert!(
             rx.try_recv().is_err(),
             "no elicitation or reverse request was sent"
@@ -8534,7 +8537,6 @@ async fn flow_wire_call(planes: &Planes, corr: u64, action: Value) -> Value {
         FrameType::Response,
         "no flow may elicit: {reply:?}"
     );
-    assert_eq!(planes.elicitor.outstanding(), 0);
     assert!(rx.try_recv().is_err(), "unexpected elicitation frame");
     serde_json::from_slice(&reply.body).unwrap()
 }
@@ -8673,26 +8675,6 @@ async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
 }
 
 #[tokio::test]
-async fn flow_elicitation_chokepoint_refuses_future_cards() {
-    let (planes, _) = flow_planes();
-    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
-    let (tx, mut rx) = mpsc::channel(8);
-    let ending = planes
-        .elicitor
-        .ask(
-            &tx,
-            9,
-            3,
-            json!({"method":"elicitation/create","params":{}}),
-            Duration::from_millis(10),
-        )
-        .await;
-    assert_eq!(ending, cerebellum::elicit::AskOutcome::Undeliverable);
-    assert_eq!(planes.elicitor.outstanding(), 0);
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
 async fn flow_recovery_and_profile_rebind_consent_sites_never_open_cards() {
     let (planes, launcher) = flow_planes();
     bind_flow_wire_target(
@@ -8726,7 +8708,6 @@ async fn flow_recovery_and_profile_rebind_consent_sites_never_open_cards() {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "consent_unavailable", "{body}");
         assert_eq!(body["detail"]["reason"], "unattended_flow");
-        assert_eq!(planes.elicitor.outstanding(), 0);
         assert!(rx.try_recv().is_err());
     }
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
@@ -8766,7 +8747,6 @@ async fn flow_basal_bind_requires_admitted_carrier() {
         assert_eq!(body["code"], "principal_denied", "{body}");
         assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
         assert_eq!(*launcher.launches.lock().unwrap(), 0);
-        assert_eq!(planes.elicitor.outstanding(), 0);
     }
 }
 
@@ -8853,7 +8833,6 @@ async fn flow_operator_operations_cannot_list_or_revoke_app_grants() {
             body.get("grants").is_none(),
             "operator records must not be disclosed"
         );
-        assert_eq!(planes.elicitor.outstanding(), 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(
             planes.management.computer_grants().list()["grants"]
@@ -8865,55 +8844,6 @@ async fn flow_operator_operations_cannot_list_or_revoke_app_grants() {
         assert_eq!(storage.load().unwrap(), state);
     }
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
-}
-
-#[tokio::test]
-async fn flow_goodbye_clears_unattended_elicitation_state() {
-    let (planes, _) = flow_planes();
-    bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
-    let (tx, mut rx) = mpsc::channel(8);
-    let question = json!({"method":"elicitation/create","params":{}});
-    assert_eq!(
-        planes
-            .elicitor
-            .ask(&tx, 9, 3, question.clone(), Duration::from_millis(10))
-            .await,
-        cerebellum::elicit::AskOutcome::Undeliverable
-    );
-    assert!(rx.try_recv().is_err());
-    cerebellum::handle_frame_for_test(
-        Frame::build(
-            FrameType::Goodbye,
-            Flags::new(false, Priority::Passive, false),
-            9,
-            3,
-            0,
-            vec![],
-        )
-        .unwrap(),
-        &tx,
-        &planes,
-    )
-    .await
-    .unwrap();
-    assert!(planes.routes.accepted_bind_for_test(9, 3).is_none());
-    // Probe the elicitor directly to check that this route's Goodbye cleared its
-    // no-person setting. Rebinding would clear it too and hide missing Goodbye cleanup.
-    assert_eq!(
-        planes
-            .elicitor
-            .ask(&tx, 9, 3, question, Duration::from_millis(10))
-            .await,
-        cerebellum::elicit::AskOutcome::NoAnswer
-    );
-    let mut saw_question = false;
-    while let Ok(frame) = rx.try_recv() {
-        if frame.header.channel == 9 && frame.header.ty == FrameType::Request {
-            saw_question = true;
-        }
-    }
-    assert!(saw_question, "the route's unattended entry was not cleared");
-    assert_eq!(planes.elicitor.outstanding(), 0);
 }
 
 fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
@@ -9674,7 +9604,6 @@ async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Val
         .unwrap()
         .unwrap();
     assert_ne!(reply.header.ty, FrameType::Request);
-    assert_eq!(planes.elicitor.outstanding(), 0);
     assert!(rx.try_recv().is_err());
     serde_json::from_slice(&reply.body).unwrap()
 }
