@@ -836,6 +836,55 @@ impl OwnedBrowserProcess for RecordingProcess {
         Ok(observation)
     }
 
+    fn snapshot_subtree_classified(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: &RefRecord,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.effects.lock().unwrap().push("snapshot_subtree");
+        let mut observation = if let Some(dropdowns) = &self.dropdowns {
+            dropdowns
+                .lock()
+                .unwrap()
+                .observation(document_epoch, current_origin)
+        } else {
+            self.snapshot_classified(context, mode, document_epoch, current_origin, deadline_ms)?
+        };
+        let target = observation
+            .refs
+            .iter()
+            .find(|fresh| fresh.backend_identity == reference.backend_identity)
+            .map(|fresh| fresh.captured.reference.clone());
+        if let Some(start) = target.as_ref().and_then(|target| {
+            observation
+                .records
+                .iter()
+                .position(|record| record.reference.as_ref() == Some(target))
+        }) {
+            let depth = observation.records[start].depth;
+            let end = observation.records[start + 1..]
+                .iter()
+                .position(|record| record.depth <= depth)
+                .map(|offset| start + 1 + offset)
+                .unwrap_or(observation.records.len());
+            observation.records = observation.records[start..end].to_vec();
+            for record in &mut observation.records {
+                record.depth -= depth;
+            }
+            observation.refs.retain(|reference| {
+                observation
+                    .records
+                    .iter()
+                    .any(|record| record.reference.as_ref() == Some(&reference.captured.reference))
+            });
+        }
+        Ok(observation)
+    }
+
     fn screenshot(
         &mut self,
         _: &str,

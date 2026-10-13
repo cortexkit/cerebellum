@@ -598,6 +598,20 @@ pub trait OwnedBrowserProcess: Send {
         self.snapshot(context_key, mode, deadline_ms)
     }
 
+    /// Capture only a retained element's subtree, with fresh classification.
+    /// Adapters without identity-directed capture must not silently walk the page.
+    fn snapshot_subtree_classified(
+        &mut self,
+        _context_key: &str,
+        _mode: SnapshotKind,
+        _reference: &crate::snapshot_store::RefRecord,
+        _document_epoch: u64,
+        _current_origin: &str,
+        _deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Enumerate identities without returning frame content.
     fn frame_documents(
         &mut self,
@@ -1748,6 +1762,30 @@ impl OperationGuard {
                 process.snapshot_classified(
                     context_key,
                     mode,
+                    document_epoch,
+                    current_origin,
+                    deadline_ms,
+                )
+            },
+        )
+    }
+
+    pub(crate) fn snapshot_subtree_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        reference: &crate::snapshot_store::RefRecord,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| {
+                process.snapshot_subtree_classified(
+                    context_key,
+                    mode,
+                    reference,
                     document_epoch,
                     current_origin,
                     deadline_ms,
