@@ -561,6 +561,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             SnapshotKind::Ax,
             deadline_ms,
             Some((0, "null")),
+            None,
             &mut clock,
         )?;
         Ok(observation.refs.iter().any(|reference| {
@@ -603,7 +604,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
-        self.snapshot_with_clock(context_key, mode, deadline_ms, None, &mut clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, &mut clock)
     }
 
     pub fn snapshot_classified(
@@ -620,7 +621,30 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             mode,
             deadline_ms,
             Some((document_epoch, current_origin)),
+            None,
             &mut clock,
+        )
+    }
+
+    /// Resolve the referenced element's backend node afresh, then traverse only
+    /// its accessibility subtree. Classify the captured nodes using the live DOM
+    /// rather than trusting the retained ref's form and field facts.
+    pub fn snapshot_subtree_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        reference: &RefRecord,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.snapshot_with_clock(
+            context_key,
+            mode,
+            deadline_ms,
+            Some((document_epoch, current_origin)),
+            Some(reference),
+            &mut SystemNavigationClock,
         )
     }
 
@@ -838,7 +862,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        self.snapshot_with_clock(context_key, mode, deadline_ms, None, clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, clock)
     }
 
     #[cfg(test)]
@@ -1783,6 +1807,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         mode: SnapshotKind,
         deadline_ms: u64,
         classification_context: Option<(u64, &str)>,
+        subtree: Option<&RefRecord>,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         if self.read_frames.is_some() {
@@ -1791,9 +1816,32 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 mode,
                 deadline_ms,
                 classification_context,
+                subtree,
                 clock,
             );
         }
+        self.snapshot_frame_with_clock(
+            context_key,
+            mode,
+            deadline_ms,
+            classification_context,
+            subtree,
+            subtree.is_some(),
+            clock,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_frame_with_clock<C: NavigationClock>(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        deadline_ms: u64,
+        classification_context: Option<(u64, &str)>,
+        subtree: Option<&RefRecord>,
+        bounded: bool,
+        clock: &mut C,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         if mode == SnapshotKind::Screenshot {
             return Err(NavigationDriveError::CdpFailure.at_step("Accessibility.enable"));
         }
@@ -1812,29 +1860,107 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         if let Some(frame) = &self.active_frame {
             attachment.session_id = frame.session_id.clone();
         }
+        let ax_phase = crate::budgets::PhaseDeadline::new(
+            clock.now(),
+            crate::budgets::AX_CHILDREN_PHASE_MS,
+            deadline,
+        );
         self.command(
             "Accessibility.enable",
             None,
             Some(attachment.session_id.clone()),
-            deadline,
+            snapshot_step_deadline(deadline, bounded, clock.now()),
             None,
             clock,
         )?;
-        let root_result = self.command(
-            "Accessibility.getRootAXNode",
-            self.active_frame.as_ref().map(|frame| {
-                serde_json::json!({"frameId":frame.frame_id})
+        // A page-wide bounded prefix can omit the requested element entirely.
+        // Resolve its backend identity directly so unrelated siblings consume
+        // neither the traversal budget nor the output cap.
+        let root = if let Some(reference) = subtree {
+            let identity = reference.backend_identity.as_ref().ok_or_else(|| {
+                NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
+            })?;
+            if identity.target_id != attachment.target_id
+                || self.active_frame.as_ref().is_some_and(|frame| {
+                    frame.frame_id != identity.frame_id
+                        || reference
+                            .frame_document
+                            .as_ref()
+                            .is_some_and(|expected| !frame.same_document(expected))
+                })
+            {
+                return Err(
+                    NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
+                );
+            }
+            let result = self.command(
+                "Accessibility.getPartialAXTree",
+                Some(
+                    serde_json::json!({
+                        "backendNodeId": identity.backend_node_id,
+                        "fetchRelatives": false,
+                    })
                     .as_object()
                     .unwrap()
-                    .clone()
-            }),
-            Some(attachment.session_id.clone()),
-            deadline,
-            None,
-            clock,
-        )?;
-        let root = required_ax_node(&root_result, "node")
-            .map_err(|error| error.at_step("Accessibility.getRootAXNode"))?;
+                    .clone(),
+                ),
+                Some(attachment.session_id.clone()),
+                ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
+                None,
+                clock,
+            );
+            let nodes = match result {
+                Ok(result) => required_ax_nodes(&result)
+                    .map_err(|error| error.at_step("Accessibility.getPartialAXTree"))?,
+                Err(NavigationDriveError::NodeUnavailable { .. }) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let Some(mut root) = nodes.into_iter().find(|node| {
+                node.backend_node_id == Some(identity.backend_node_id) && !node.ignored
+            }) else {
+                // If the element was removed or hidden, capture the outline so
+                // the renderer can report that the ref is missing and offer new
+                // refs. Never select a replacement by role or name.
+                return self.snapshot_frame_with_clock(
+                    context_key,
+                    mode,
+                    deadline.saturating_duration_since(clock.now()).as_millis() as u64,
+                    classification_context,
+                    None,
+                    bounded,
+                    clock,
+                );
+            };
+            if root
+                .frame_id
+                .as_ref()
+                .is_some_and(|frame| frame != &identity.frame_id)
+            {
+                return Err(
+                    NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
+                );
+            }
+            // Partial AX replies need not repeat the frame id. Descendants inherit
+            // the frame in which this backend identity was resolved.
+            root.frame_id = Some(identity.frame_id.clone());
+            root
+        } else {
+            let root_result = self.command(
+                "Accessibility.getRootAXNode",
+                self.active_frame.as_ref().map(|frame| {
+                    serde_json::json!({"frameId":frame.frame_id})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                }),
+                Some(attachment.session_id.clone()),
+                snapshot_step_deadline(deadline, bounded, clock.now()),
+                None,
+                clock,
+            )?;
+            required_ax_node(&root_result, "node")
+                .map_err(|error| error.at_step("Accessibility.getRootAXNode"))?
+        };
         let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
         let mut observation = traverse_ax_tree(
@@ -1852,7 +1978,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     "Accessibility.getChildAXNodes",
                     Some(params),
                     Some(session_id.clone()),
-                    deadline,
+                    if bounded {
+                        ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
+                    } else {
+                        deadline
+                    },
                     None,
                     clock,
                 )?;
@@ -1869,8 +1999,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Some(Err(ClassificationUnavailable::NotCaptured))
         } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
             Some(
-                self.flattened_dom_nodes_before(&attachment, deadline, clock)
-                    .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
+                self.flattened_dom_nodes_before(
+                    &attachment,
+                    snapshot_step_deadline(deadline, bounded, clock.now()),
+                    clock,
+                )
+                .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
             )
         } else {
             None
@@ -4412,6 +4546,14 @@ where
     })
 }
 
+fn snapshot_step_deadline(deadline: Instant, subtree: bool, now: Instant) -> Instant {
+    if subtree {
+        deadline.min(now + Duration::from_millis(crate::budgets::CDP_STEP_MS))
+    } else {
+        deadline
+    }
+}
+
 fn cdp_node_disappeared(method: &str, error: &Map<String, Value>) -> bool {
     if !matches!(
         error.get("code").and_then(Value::as_i64),
@@ -4427,7 +4569,7 @@ fn cdp_node_disappeared(method: &str, error: &Map<String, Value>) -> bool {
     // including invalid parameters and detached sessions, must still fail.
     matches!(
         method,
-        "Accessibility.getChildAXNodes" | "DOM.getFrameOwner"
+        "Accessibility.getChildAXNodes" | "Accessibility.getPartialAXTree" | "DOM.getFrameOwner"
     ) && (matches!(
         message.as_str(),
         "invalid id"
@@ -4776,6 +4918,50 @@ mod tests {
             context_key: "route-own".into(),
         });
         driver
+    }
+
+    #[test]
+    fn zoom_child_read_obeys_the_cdp_step_cap_and_retains_a_truncated_subtree() {
+        let reference = RefRecord {
+            captured: SnapshotRef::new("e1", "row", "Tail", 0).unwrap(),
+            frame_path: vec!["frame-own".into()],
+            backend_identity: Some(
+                BackendNodeIdentity::new("target-own", "frame-own", 90).unwrap(),
+            ),
+            frame_document: None,
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        };
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"nodes":[
+                ax_node("tail", "row", "Tail", &["child"], 90, None)
+            ]}}),
+        ]);
+        let mut clock = FakeClock::new();
+        let started = clock.now;
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Actionable,
+                120_000,
+                Some((7, "https://page.example")),
+                Some(&reference),
+                &mut clock,
+            )
+            .unwrap();
+        assert_eq!(
+            clock.now.duration_since(started),
+            Duration::from_millis(crate::budgets::CDP_STEP_MS)
+        );
+        assert_eq!(observation.records.len(), 1);
+        assert_eq!(observation.records[0].name, "Tail");
+        assert!(observation.ax_truncated && observation.refs_truncated);
+        assert_eq!(
+            observation.refs[0].backend_identity,
+            reference.backend_identity
+        );
     }
 
     #[test]
@@ -5211,6 +5397,7 @@ mod tests {
                 SnapshotKind::Ax,
                 1_000,
                 context,
+                None,
                 &mut FakeClock::new(),
             )
             .expect("the AX tree is coherent")
@@ -5750,6 +5937,7 @@ mod tests {
                 SnapshotKind::Ax,
                 1_000,
                 Some((7, "https://login.example")),
+                None,
                 &mut FakeClock::new(),
             )
             .unwrap();
@@ -6759,6 +6947,7 @@ mod tests {
                 SnapshotKind::Actionable,
                 1000,
                 Some((7, &url)),
+                None,
                 &mut FakeClock::new(),
             )
             .unwrap();
@@ -8557,6 +8746,7 @@ mod signed_in_page_read_tests {
                 SnapshotKind::Actionable,
                 5_000,
                 Some((1, before.url.as_str())),
+                None,
                 clock,
             )
             .expect("the capture reads the page");

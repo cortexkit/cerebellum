@@ -2093,6 +2093,28 @@ impl OwnedBrowserProcess for ProductionProcess {
             .snapshot(context_key, mode, deadline_ms)
     }
 
+    fn snapshot_subtree_classified(
+        &mut self,
+        context_key: &str,
+        mode: SnapshotKind,
+        reference: &crate::snapshot_store::RefRecord,
+        document_epoch: u64,
+        current_origin: &str,
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .snapshot_subtree_classified(
+                context_key,
+                mode,
+                reference,
+                document_epoch,
+                current_origin,
+                deadline_ms,
+            )
+    }
+
     fn frame_documents(
         &mut self,
         context: &str,

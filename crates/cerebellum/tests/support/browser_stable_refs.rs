@@ -193,6 +193,20 @@ async fn stable_refs_wire_insertions_keep_later_refs_and_old_clicks() {
 }
 
 #[tokio::test]
+async fn stable_refs_wire_zoom_routes_the_retained_identity_to_subtree_capture() {
+    let (planes, launcher, _) = fixture().await;
+    let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
+    let later = ref_named(&before, "Access: Permission 39");
+    launcher.effects.lock().unwrap().clear();
+    let zoom = call(&planes, "snapshot", json!({"zoom":later})).await;
+    assert_eq!(zoom["outcome"], "ok", "{zoom}");
+    let text = zoom["state_text"].as_str().unwrap();
+    assert!(text.contains("Access: Permission 39"), "{text}");
+    assert!(!text.contains("Access: Permission 00"), "{text}");
+    assert_eq!(*launcher.effects.lock().unwrap(), vec!["snapshot_subtree"]);
+}
+
+#[tokio::test]
 async fn stable_refs_wire_removed_zoom_shows_outline_and_click_refuses_without_reassignment() {
     let (planes, launcher, dropdowns) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;

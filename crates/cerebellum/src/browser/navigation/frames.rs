@@ -285,6 +285,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         mode: SnapshotKind,
         deadline_ms: u64,
         classification: Option<(u64, &str)>,
+        subtree: Option<&RefRecord>,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let allowed = self
@@ -293,24 +294,90 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
         let before = self.frame_documents.clone();
         let mut omitted_frames = HashSet::new();
+        // A zoom can include nested frame documents, but each must share one
+        // absolute capture allowance rather than renew it for every frame.
+        let subtree_deadline = subtree.map(|_| {
+            clock.now()
+                + Duration::from_millis(deadline_ms.min(crate::budgets::FRAME_SNAPSHOT_PHASE_MS))
+        });
         let result = (|| {
             let main = before
                 .iter()
-                .find(|f| f.parent_id.is_none())
+                .find(
+                    |f| match subtree.and_then(|r| r.backend_identity.as_ref()) {
+                        Some(identity) => f.frame_id == identity.frame_id,
+                        None => f.parent_id.is_none(),
+                    },
+                )
                 .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
+            if let Some(expected) = subtree.and_then(|r| r.frame_document.as_ref()) {
+                if !main.same_document(expected) {
+                    return Err(NavigationDriveError::FrameChanged {
+                        authorized_origin: expected.origin.clone(),
+                        live_origin: main.origin.clone(),
+                    });
+                }
+            }
+            // Starting inside a frame must not bypass an unread ancestor document.
+            let root_readable = std::iter::successors(Some(main), |frame| {
+                frame.parent_id.as_ref().and_then(|parent| {
+                    before
+                        .iter()
+                        .find(|candidate| &candidate.frame_id == parent)
+                })
+            })
+            .all(|frame| allowed.contains(frame));
+            if subtree.is_some() && !root_readable {
+                // A previously printed ref is not permission to read a now
+                // withheld embedded document. Return the permitted page's outline
+                // so the caller can request a new ref without exposing that frame.
+                self.read_frames = Some(allowed.clone());
+                return self.snapshot_all_frames(
+                    context,
+                    mode,
+                    deadline_ms,
+                    classification,
+                    None,
+                    clock,
+                );
+            }
+            if subtree.is_some() {
+                let mut descendants = HashSet::from([main.frame_id.clone()]);
+                for frame in &before {
+                    if frame
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|p| descendants.contains(p))
+                    {
+                        descendants.insert(frame.frame_id.clone());
+                    }
+                }
+                omitted_frames.extend(
+                    before
+                        .iter()
+                        .filter(|f| !descendants.contains(&f.frame_id))
+                        .map(|f| f.frame_id.clone()),
+                );
+            }
             self.active_frame = Some(main.clone());
             let epoch = classification.map(|c| c.0);
             let mut observation = self.snapshot_with_clock(
                 context,
                 mode,
-                deadline_ms,
+                subtree_deadline
+                    .map(|end| end.saturating_duration_since(clock.now()).as_millis() as u64)
+                    .unwrap_or(deadline_ms),
                 epoch.map(|e| (e, main.origin.as_str())),
+                subtree,
                 clock,
             )?;
             for reference in &mut observation.refs {
                 reference.frame_document = Some(main.clone());
             }
             for frame in before.iter().filter(|f| f.parent_id.is_some()) {
+                if frame.frame_id == main.frame_id || omitted_frames.contains(&frame.frame_id) {
+                    continue;
+                }
                 if frame
                     .parent_id
                     .as_ref()
@@ -341,7 +408,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_ref()
                     .and_then(|id| before.iter().find(|f| &f.frame_id == id))
                     .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
-                let deadline = clock.now() + Duration::from_millis(deadline_ms);
+                let deadline = subtree_deadline
+                    .map(|end| snapshot_step_deadline(end, true, clock.now()))
+                    .unwrap_or_else(|| clock.now() + Duration::from_millis(deadline_ms));
                 let params = serde_json::json!({"frameId":frame.frame_id})
                     .as_object()
                     .unwrap()
@@ -402,18 +471,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 let Some(owner_index) = owner_index else {
                     // A hidden or replaced iframe has no visible owner to insert
                     // its content under. Skip its subtree rather than lose the page.
-                    observation.ax_truncated = true;
-                    observation.refs_truncated = true;
+                    if subtree.is_none() {
+                        observation.ax_truncated = true;
+                        observation.refs_truncated = true;
+                    }
                     omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 };
                 let depth = observation.records[owner_index].depth + 1;
                 self.active_frame = Some(frame.clone());
-                let mut child = self.snapshot_with_clock(
+                let mut child = self.snapshot_frame_with_clock(
                     context,
                     mode,
-                    deadline_ms,
+                    subtree_deadline
+                        .map(|end| end.saturating_duration_since(clock.now()).as_millis() as u64)
+                        .unwrap_or(deadline_ms),
                     epoch.map(|e| (e, frame.origin.as_str())),
+                    None,
+                    subtree.is_some(),
                     clock,
                 )?;
                 let remaining_nodes = MAX_AX_NODES.saturating_sub(observation.records.len());
@@ -497,6 +572,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             // Descendants of an omitted frame are also outside this observation.
             while let Some(frame) = after.iter().find(|frame| {
                 !omitted_frames.contains(&frame.frame_id)
+                    // A subtree may start inside an embedded document whose
+                    // ancestors were not read. Its own identity still needs checking.
+                    && frame.frame_id != main.frame_id
                     && frame
                         .parent_id
                         .as_ref()
@@ -864,6 +942,8 @@ mod tests {
         move_during_read: bool,
         changed: bool,
         inputs: Vec<(String, f64, f64)>,
+        requests: Vec<Value>,
+        huge_page: bool,
     }
     fn ax(
         id: &str,
@@ -888,6 +968,7 @@ mod tests {
             let session = request["sessionId"].as_str().unwrap_or("");
             let method = request["method"].as_str().unwrap();
             let cross = session == "cross-session";
+            self.requests.push(request.clone());
             if method == "Input.dispatchMouseEvent" {
                 self.inputs.push((
                     session.into(),
@@ -895,7 +976,13 @@ mod tests {
                     request["params"]["y"].as_f64().unwrap(),
                 ));
             }
-            if self.move_during_read && cross && method == "Accessibility.getChildAXNodes" {
+            if self.move_during_read
+                && cross
+                && matches!(
+                    method,
+                    "Accessibility.getChildAXNodes" | "Accessibility.getPartialAXTree"
+                )
+            {
                 self.changed = true;
             }
             let result = match method {
@@ -921,7 +1008,27 @@ mod tests {
                         "cross" => ("cross-root", 30, vec!["card", "pay"]),
                         _ => ("main-root", 1, vec!["same-owner", "cross-owner"]),
                     };
-                    json!({"node":ax(id,backend,"RootWebArea","",children,Some(frame))})
+                    let mut root = ax(id, backend, "RootWebArea", "", children, Some(frame));
+                    if self.huge_page && frame == "main" {
+                        root["childIds"] =
+                            json!((0..20_000).map(|n| format!("row-{n}")).collect::<Vec<_>>());
+                    }
+                    json!({"node":root})
+                }
+                "Accessibility.getPartialAXTree" => {
+                    assert_eq!(request["params"]["fetchRelatives"], false);
+                    let node = match request["params"]["backendNodeId"].as_u64().unwrap() {
+                        21 => ax("same-button", 21, "button", "Same button", vec![], None),
+                        32 => {
+                            let mut card = ax("card", 32, "textbox", "Card number", vec![], None);
+                            card["value"] = json!({"value":"4111111111111111"});
+                            card
+                        }
+                        11 => ax("cross-owner", 11, "Iframe", "Payment frame", vec![], None),
+                        20_009 => ax("row-19999", 20_009, "row", "Event 19999", vec![], None),
+                        _ => panic!("unexpected subtree identity"),
+                    };
+                    json!({"nodes":[node]})
                 }
                 "Accessibility.getChildAXNodes" => {
                     let nodes = match request["params"]["id"].as_str().unwrap() {
@@ -981,9 +1088,13 @@ mod tests {
             Ok(())
         }
         fn read(&mut self, output: &mut [u8]) -> io::Result<PipeRead> {
-            let Some(bytes) = self.responses.pop_front() else {
+            let Some(mut bytes) = self.responses.pop_front() else {
                 return Ok(PipeRead::WouldBlock);
             };
+            if bytes.len() > output.len() {
+                let remainder = bytes.split_off(output.len());
+                self.responses.push_front(remainder);
+            }
             output[..bytes.len()].copy_from_slice(&bytes);
             Ok(PipeRead::Bytes(bytes.len()))
         }
@@ -995,6 +1106,8 @@ mod tests {
                 move_during_read: false,
                 changed: false,
                 inputs: Vec::new(),
+                requests: Vec::new(),
+                huge_page: false,
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
@@ -1002,6 +1115,192 @@ mod tests {
         let frames = driver.frame_documents("isolated-fixture", 1000).unwrap();
         assert_eq!(frames.len(), 3);
         (driver, frames)
+    }
+
+    fn reference(frame: &FrameDocument, backend: u64) -> RefRecord {
+        RefRecord {
+            captured: SnapshotRef::new("e1", "row", "", 0).unwrap(),
+            frame_path: vec![frame.frame_id.clone()],
+            backend_identity: Some(
+                BackendNodeIdentity::new("target", &frame.frame_id, backend).unwrap(),
+            ),
+            frame_document: Some(frame.clone()),
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        }
+    }
+
+    #[test]
+    fn zoom_reads_a_late_row_without_walking_the_twenty_thousand_row_page() {
+        let (mut driver, frames) = fixture();
+        driver.pipe.huge_page = true;
+        driver.set_read_frames(frames.clone());
+        let main = frames.iter().find(|f| f.frame_id == "main").unwrap();
+        let full = driver
+            .snapshot_classified(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                7,
+                &main.url,
+                1000,
+            )
+            .unwrap();
+        assert!(full.ax_truncated);
+        assert!(!full.records.iter().any(|r| r.name == "Event 19999"));
+        driver.pipe.requests.clear();
+        let zoom = driver
+            .snapshot_subtree_classified(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                &reference(main, 20_009),
+                7,
+                &main.url,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(zoom.records.len(), 1);
+        assert_eq!(zoom.records[0].name, "Event 19999");
+        assert!(!zoom.ax_truncated);
+        assert!(!driver
+            .pipe
+            .requests
+            .iter()
+            .any(|r| r["method"] == "Accessibility.getRootAXNode"));
+        let partial: Vec<_> = driver
+            .pipe
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "Accessibility.getPartialAXTree")
+            .collect();
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0]["sessionId"], "main-session");
+        assert_eq!(partial[0]["params"]["backendNodeId"], 20_009);
+    }
+
+    #[test]
+    fn zoom_embedded_element_uses_its_session_and_fresh_payment_masking() {
+        let (mut driver, frames) = fixture();
+        driver.set_read_frames(frames.clone());
+        let cross = frames.iter().find(|f| f.frame_id == "cross").unwrap();
+        driver.pipe.requests.clear();
+        let zoom = driver
+            .snapshot_subtree_classified(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                &reference(cross, 32),
+                7,
+                &cross.url,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(zoom.records.len(), 1);
+        assert_eq!(zoom.refs[0].frame_document.as_ref(), Some(cross));
+        let classification = zoom.refs[0].classification.as_ref().unwrap();
+        assert_eq!(classification.current_top_level_origin, cross.origin);
+        assert!(classification
+            .target_autocomplete_tokens
+            .iter()
+            .any(|t| t == "cc-number"));
+        assert_eq!(zoom.facts["e1"].credential, Some(true));
+        let text = state_text::render(&state_text::RenderInput {
+            records: &zoom.records,
+            facts: &zoom.facts,
+            filters: &state_text::Filters::default(),
+            page_url: &cross.url,
+            snapshot_id: "0123456789abcdef0123456789abcdef",
+            zoom: Some(state_text::Zoom {
+                requested: "e1",
+                target: Some("e1"),
+            }),
+            max_bytes: 65536,
+        })
+        .text;
+        assert!(text.contains("Card number"));
+        assert!(!text.contains("4111111111111111"));
+        assert!(driver
+            .pipe
+            .requests
+            .iter()
+            .filter(|r| r["method"].as_str().unwrap().starts_with("Accessibility."))
+            .all(|r| r["sessionId"] == "cross-session"));
+    }
+
+    #[test]
+    fn zoom_withheld_embedded_element_never_reads_its_subtree() {
+        let (mut driver, frames) = fixture();
+        let cross = frames.iter().find(|f| f.frame_id == "cross").unwrap();
+        for withheld_frame in ["cross", "main"] {
+            driver.set_read_frames(
+                frames
+                    .iter()
+                    .filter(|f| f.frame_id != withheld_frame)
+                    .cloned()
+                    .collect(),
+            );
+            driver.pipe.requests.clear();
+            let zoom = driver
+                .snapshot_subtree_classified(
+                    "isolated-fixture",
+                    SnapshotKind::Actionable,
+                    &reference(cross, 32),
+                    7,
+                    &cross.url,
+                    1000,
+                )
+                .unwrap();
+            assert!(!zoom.records.iter().any(|r| r.name == "Card number"));
+            assert!(!driver
+                .pipe
+                .requests
+                .iter()
+                .any(|r| r["method"] == "Accessibility.getPartialAXTree"));
+            assert!(!driver
+                .pipe
+                .requests
+                .iter()
+                .any(|r| r["sessionId"] == "cross-session"
+                    && r["method"].as_str().unwrap().starts_with("Accessibility.")));
+        }
+    }
+
+    #[test]
+    fn zoom_embedded_frame_navigation_during_read_discards_capture() {
+        let (mut driver, frames) = fixture();
+        let cross = frames.iter().find(|f| f.frame_id == "cross").unwrap();
+        driver.set_read_frames(frames.clone());
+        driver.pipe.move_during_read = true;
+        assert!(matches!(
+            driver.snapshot_subtree_classified(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                &reference(cross, 32),
+                7,
+                &cross.url,
+                1000
+            ),
+            Err(NavigationDriveError::FrameChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn zoom_iframe_owner_keeps_only_its_permitted_embedded_contents() {
+        let (mut driver, frames) = fixture();
+        let main = frames.iter().find(|f| f.frame_id == "main").unwrap();
+        driver.set_read_frames(frames.clone());
+        let zoom = driver
+            .snapshot_subtree_classified(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                &reference(main, 11),
+                7,
+                &main.url,
+                1000,
+            )
+            .unwrap();
+        assert!(zoom.records.iter().any(|r| r.name == "Card number"));
+        assert!(!zoom.records.iter().any(|r| r.name == "Same button"));
+        assert!(!zoom.ax_truncated);
     }
     #[test]
     fn stable_refs_frame_revision_also_moves_on_same_document_events() {

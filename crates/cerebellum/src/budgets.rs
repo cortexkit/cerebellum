@@ -353,6 +353,8 @@ budget!(
         ("committed_document", CDP_STEP_MS, 2),
         ("prepare_frame", FRAME_DISCOVERY_PHASE_MS, 1),
         ("Accessibility.enable", CDP_STEP_MS, 1),
+        // An element-directed snapshot uses getPartialAXTree instead of
+        // getRootAXNode. Both root lookups share this one CDP setup allowance.
         ("Accessibility.getRootAXNode", CDP_STEP_MS, 1),
         ("AX_children", AX_CHILDREN_PHASE_MS, 1),
         ("DOM.enable", CDP_STEP_MS, 1),

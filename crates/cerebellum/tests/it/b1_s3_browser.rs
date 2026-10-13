@@ -342,6 +342,47 @@ impl OwnedBrowserProcess for SnapshotProcess {
         Ok(self.observation.clone())
     }
 
+    fn snapshot_subtree_classified(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        reference: &RefRecord,
+        _: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let mut observation = self.observation.clone();
+        let target = observation
+            .refs
+            .iter()
+            .find(|fresh| fresh.backend_identity == reference.backend_identity)
+            .map(|fresh| &fresh.captured.reference);
+        if let Some(start) = target.and_then(|target| {
+            observation
+                .records
+                .iter()
+                .position(|record| record.reference.as_ref() == Some(target))
+        }) {
+            let depth = observation.records[start].depth;
+            let end = observation.records[start + 1..]
+                .iter()
+                .position(|record| record.depth <= depth)
+                .map(|offset| start + 1 + offset)
+                .unwrap_or(observation.records.len());
+            observation.records = observation.records[start..end].to_vec();
+            for record in &mut observation.records {
+                record.depth -= depth;
+            }
+            observation.refs.retain(|reference| {
+                observation
+                    .records
+                    .iter()
+                    .any(|record| record.reference.as_ref() == Some(&reference.captured.reference))
+            });
+        }
+        Ok(observation)
+    }
+
     fn click(
         &mut self,
         _: &str,

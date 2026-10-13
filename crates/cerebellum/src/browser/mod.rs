@@ -2928,22 +2928,26 @@ impl BrowserPlane {
         })?;
         session_operation = operation;
         let frames = frames.map_err(map_navigation_drive_error)?;
-        let zoom_frame = if let Some(requested) = zoom {
+        let zoom_reference = if let Some(requested) = zoom {
             let state = self.state.lock().await;
-            state
+            let context = state
                 .contexts
                 .get(&identity.conversation_key)
-                .and_then(|context| {
-                    context
-                        .refs
-                        .shown(requested)
-                        .and_then(|reference| reference.record.frame_document.clone())
-                })
+                .ok_or(BrowserError::NoSession)?;
+            // Reject refs from another document before looking up their backend
+            // node. Before printing, also compare the freshly captured target,
+            // frame, backend id, loader, session and origin with the retained ref.
+            zoom_target(context, requested, &[], Some(&source_document))?;
+            context
+                .refs
+                .shown(requested)
+                .map(|shown| shown.record.clone())
         } else {
             None
         };
-        if zoom_frame
+        if zoom_reference
             .as_ref()
+            .and_then(|reference| reference.frame_document.as_ref())
             .is_some_and(|frame| !frames.iter().any(|live| live.same_document(frame)))
         {
             return Err(BrowserError::StaleSnapshot {
@@ -2978,13 +2982,24 @@ impl BrowserPlane {
         let route_key = identity.conversation_key.clone();
         let authorized_url = source_document.url.clone();
         let driven = tokio::task::spawn_blocking(move || {
-            let result = session_operation.snapshot_classified(
-                &route_key,
-                kind,
-                document_epoch,
-                &authorized_url,
-                deadline_ms,
-            );
+            let result = if let Some(reference) = zoom_reference.as_ref() {
+                session_operation.snapshot_subtree_classified(
+                    &route_key,
+                    kind,
+                    reference,
+                    document_epoch,
+                    &authorized_url,
+                    deadline_ms,
+                )
+            } else {
+                session_operation.snapshot_classified(
+                    &route_key,
+                    kind,
+                    document_epoch,
+                    &authorized_url,
+                    deadline_ms,
+                )
+            };
             // Read which document the page shows once the capture has
             // returned, on the same admitted operation, so nothing this module
             // issues can sit between the capture and this check.
