@@ -1076,6 +1076,11 @@ mod tests {
                 "DOM.getOuterHTML" => {
                     json!({"outerHTML":if cross {"<input autocomplete='cc-number'>"} else {"<button>Same button</button>"}})
                 }
+                "DOM.pushNodesByBackendIdsToFrontend" => {
+                    json!({"nodeIds": request["params"]["backendNodeIds"]})
+                }
+                "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+                "DOM.querySelector" => json!({"nodeId": 100}),
                 _ => json!({}),
             };
             let mut response = json!({"id":request["id"],"result":result});

@@ -1,5 +1,12 @@
+mod capture;
+#[cfg(test)]
+mod classification_golden;
+mod classification_index;
 mod frames;
+mod scroll;
 mod typing;
+pub use capture::SnapshotTimings;
+use classification_index::{classify_refs, CountedNodes, DomClassificationBatch, DomIndexes};
 
 use std::cmp;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -329,6 +336,8 @@ pub struct CdpNavigationDriver<IO> {
     point_frame: Option<crate::snapshot_store::FrameDocument>,
     point_target: Option<(String, BrowserClickPosition)>,
     downloads_denied: bool,
+    prefer_bulk_ax: bool,
+    last_snapshot_timings: Option<SnapshotTimings>,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -358,7 +367,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             point_frame: None,
             point_target: None,
             downloads_denied: false,
+            prefer_bulk_ax: true,
+            last_snapshot_timings: None,
         }
+    }
+
+    /// Use the incremental AX protocol when an adapter supplies only child reads.
+    pub fn with_incremental_ax_snapshots(mut self) -> Self {
+        self.prefer_bulk_ax = false;
+        self
+    }
+
+    pub fn last_snapshot_timings(&self) -> Option<&SnapshotTimings> {
+        self.last_snapshot_timings.as_ref()
     }
 
     pub fn present(
@@ -1860,6 +1881,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         if let Some(frame) = &self.active_frame {
             attachment.session_id = frame.session_id.clone();
         }
+        self.last_snapshot_timings = None;
+        let mut timings = SnapshotTimings::default();
+        let ax_started = Instant::now();
         let ax_phase = crate::budgets::PhaseDeadline::new(
             clock.now(),
             crate::budgets::AX_CHILDREN_PHASE_MS,
@@ -1963,35 +1987,52 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         };
         let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
-        let mut observation = traverse_ax_tree(
-            root,
-            &attachment.target_id,
-            MAX_AX_NODES,
-            MAX_AX_DEPTH,
-            |node_id, frame_id| {
-                let mut params = Map::new();
-                params.insert("id".into(), Value::String(node_id.to_string()));
-                if let Some(frame_id) = frame_id {
-                    params.insert("frameId".into(), Value::String(frame_id.to_string()));
-                }
-                let result = self.command(
-                    "Accessibility.getChildAXNodes",
-                    Some(params),
-                    Some(session_id.clone()),
-                    if bounded {
-                        ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
-                    } else {
-                        deadline
-                    },
-                    None,
-                    clock,
-                )?;
-                required_ax_nodes(&result)
-                    .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
-            },
-        )
-        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
+        let bulk = if self.prefer_bulk_ax {
+            self.bulk_ax_capture(
+                &attachment,
+                &root,
+                subtree,
+                ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
+                clock,
+            )
+        } else {
+            None
+        };
+        let mut observation = if let Some(observation) = bulk {
+            observation
+        } else {
+            traverse_ax_tree(
+                root,
+                &attachment.target_id,
+                MAX_AX_NODES,
+                MAX_AX_DEPTH,
+                |node_id, frame_id| {
+                    let mut params = Map::new();
+                    params.insert("id".into(), Value::String(node_id.to_string()));
+                    if let Some(frame_id) = frame_id {
+                        params.insert("frameId".into(), Value::String(frame_id.to_string()));
+                    }
+                    let result = self.command(
+                        "Accessibility.getChildAXNodes",
+                        Some(params),
+                        Some(session_id.clone()),
+                        if bounded {
+                            ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
+                        } else {
+                            deadline
+                        },
+                        None,
+                        clock,
+                    )?;
+                    required_ax_nodes(&result)
+                        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
+                },
+            )
+            .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
+        };
 
+        timings.ax_ms = ax_started.elapsed().as_millis();
+        let dom_started = Instant::now();
         // A bounded AX prefix must not start another unbounded DOM read on the
         // same oversized page. Refs remain observable, with explicitly unknown
         // classification and withheld field values rather than weaker permission.
@@ -2009,6 +2050,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
+        timings.dom_read_ms = dom_started.elapsed().as_millis();
+        let classification_started = Instant::now();
         if let Some((document_epoch, document_url)) = classification_context {
             // One DOM read serves every ref. A failure here leaves each ref
             // with the same named reason rather than failing the snapshot:
@@ -2021,20 +2064,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .map(|nodes| (origin, nodes))
                     .map_err(Clone::clone)
             });
-            for reference in &mut observation.refs {
-                let Some(identity) = reference.backend_identity.as_ref() else {
-                    continue;
-                };
-                reference.classification = match &projection {
-                    Ok((origin, nodes)) => {
-                        build_non_type_classification(nodes, identity, document_epoch, origin)
-                            .map(Box::new)
+            match projection {
+                Ok((origin, nodes)) => {
+                    classify_refs(&mut observation.refs, nodes, document_epoch, &origin)
+                }
+                Err(reason) => {
+                    for reference in &mut observation.refs {
+                        if reference.backend_identity.is_some() {
+                            reference.classification = Err(reason.clone());
+                        }
                     }
-                    Err(reason) => Err(reason.clone()),
-                };
+                }
             }
         }
 
+        timings.classification_ms = classification_started.elapsed().as_millis();
+        let facts_started = Instant::now();
         if mode == SnapshotKind::Actionable {
             // Without the DOM the page text still prints every element; it
             // only loses field values and placeholders, which stay withheld.
@@ -2049,44 +2094,67 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 );
             }
         }
-        if mode == SnapshotKind::DomFull && self.active_frame.is_some() {
-            let params = serde_json::json!({"backendNodeId":root_backend_id.ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Accessibility.getRootAXNode"))?}).as_object().unwrap().clone();
-            let outer = self.command(
-                "DOM.getOuterHTML",
-                Some(params),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                clock,
-            )?;
-            observation.dom_text = Some(
-                required_result_string(&outer, "outerHTML")
-                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
-            );
-        } else if mode == SnapshotKind::DomFull {
-            let mut params = Map::new();
-            params.insert("depth".into(), Value::Number(0.into()));
-            params.insert("pierce".into(), Value::Bool(true));
+        timings.dom_facts_ms = facts_started.elapsed().as_millis();
+        let body_started = Instant::now();
+        if mode == SnapshotKind::DomFull {
+            // Resolve the captured document, not the session's default document:
+            // same-process iframes share a session but have different bodies.
             let document = self.command(
                 "DOM.getDocument",
-                Some(params),
+                Some(
+                    serde_json::json!({"depth":0,"pierce":true})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
                 Some(attachment.session_id.clone()),
                 deadline,
                 None,
                 clock,
             )?;
-            let node_id = document
+            document
                 .get("root")
-                .and_then(Value::as_object)
                 .and_then(|root| root.get("nodeId"))
                 .and_then(Value::as_u64)
-                .filter(|node_id| *node_id > 0)
+                .filter(|id| *id > 0)
                 .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getDocument"))?;
-            let mut params = Map::new();
-            params.insert("nodeId".into(), Value::Number(node_id.into()));
+            let pushed = self.command("DOM.pushNodesByBackendIdsToFrontend", Some(serde_json::json!({"backendNodeIds":[root_backend_id.ok_or(NavigationDriveError::CdpFailure)?]}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), deadline, None, clock)?;
+            let document_id = pushed
+                .get("nodeIds")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    NavigationDriveError::CdpFailure.at_step("DOM.pushNodesByBackendIdsToFrontend")
+                })?;
+            let selected = self.command(
+                "DOM.querySelector",
+                Some(
+                    serde_json::json!({"nodeId":document_id,"selector":"body"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            let body_id = selected
+                .get("nodeId")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.querySelector"))?;
+            // A non-HTML document (for example SVG) need not have a body.
+            let node_id = if body_id == 0 { document_id } else { body_id };
             let outer_html = self.command(
                 "DOM.getOuterHTML",
-                Some(params),
+                Some(
+                    serde_json::json!({"nodeId":node_id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
                 Some(attachment.session_id),
                 deadline,
                 None,
@@ -2098,6 +2166,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             );
         }
 
+        timings.body_ms = body_started.elapsed().as_millis();
+        self.last_snapshot_timings = Some(timings);
         Ok(observation)
     }
 
@@ -3298,15 +3368,16 @@ pub(crate) fn snapshot_from_capture(
     })?;
     let projected = parse_flattened_dom_nodes(dom);
     let origin = document_origin(document_url);
-    for reference in &mut observation.refs {
-        if let Some(identity) = reference.backend_identity.as_ref() {
-            reference.classification = match (&projected, &origin) {
-                (Ok(nodes), Ok(origin)) => {
-                    build_non_type_classification(nodes, identity, document_epoch, origin)
-                        .map(Box::new)
+    match (&projected, &origin) {
+        (Ok(nodes), Ok(origin)) => {
+            classify_refs(&mut observation.refs, nodes, document_epoch, origin)
+        }
+        (Err(reason), _) | (_, Err(reason)) => {
+            for reference in &mut observation.refs {
+                if reference.backend_identity.is_some() {
+                    reference.classification = Err(reason.clone());
                 }
-                (Err(reason), _) | (_, Err(reason)) => Err(reason.clone()),
-            };
+            }
         }
     }
     if let Ok(nodes) = projected {
@@ -3542,60 +3613,16 @@ fn build_non_type_classification(
     document_epoch: u64,
     current_origin: &str,
 ) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
-    // Form ids and label targets are document-scoped even when CDP flattens
-    // several same-process frame documents into one response.
-    let raw_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.node_id, node)).collect();
-    let document_root = |node: &RawDomNode| {
-        let mut current = node;
-        let mut seen = HashSet::new();
-        while current.local_name != "#document" {
-            if !seen.insert(current.node_id) {
-                return 0;
-            }
-            let Some(parent) = current.parent_id.and_then(|id| raw_by_id.get(&id).copied()) else {
-                break;
-            };
-            current = parent;
-        }
-        current.node_id
-    };
-    let target_root = nodes
-        .iter()
-        .find(|n| n.backend_node_id == target_identity.backend_node_id)
-        .map(document_root);
-    let scoped: Vec<_> = nodes
-        .iter()
-        .filter(|node| Some(document_root(node)) == target_root)
-        .cloned()
-        .collect();
-    let nodes = scoped.as_slice();
-    let mut by_node_id = HashMap::with_capacity(nodes.len());
-    let mut by_backend_id = HashMap::with_capacity(nodes.len());
-    for (index, node) in nodes.iter().enumerate() {
-        if by_node_id.insert(node.node_id, index).is_some() {
-            return Err(ClassificationUnavailable::DuplicateNodeId {
-                node_id: node.node_id,
-            });
-        }
-        if by_backend_id.insert(node.backend_node_id, index).is_some() {
-            return Err(ClassificationUnavailable::DuplicateBackendNodeId {
-                backend_node_id: node.backend_node_id,
-            });
-        }
-    }
-    let target_index = *by_backend_id.get(&target_identity.backend_node_id).ok_or(
-        ClassificationUnavailable::TargetNotInDocument {
-            backend_node_id: target_identity.backend_node_id,
-        },
-    )?;
-    let context = DomClassificationContext {
-        nodes,
-        by_node_id: &by_node_id,
-        by_backend_id: &by_backend_id,
-        target_id: &target_identity.target_id,
-        frame_id: &target_identity.frame_id,
-        current_origin,
-    };
+    DomClassificationBatch::new(nodes).classify(target_identity, document_epoch, current_origin)
+}
+
+fn classify_indexed(
+    context: &DomClassificationContext<'_>,
+    target_index: usize,
+    document_epoch: u64,
+    target_identity: &BackendNodeIdentity,
+) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
+    let nodes = &context.nodes;
     // Text has no independent hit-test surface: Chrome returns an element at
     // its coordinates. Classify that element (including any link, label or
     // submit boundary), but retain the original node identity for ref validation.
@@ -3614,7 +3641,7 @@ fn build_non_type_classification(
         )?;
     }
     let target = context.element(element_index, true);
-    let mut input = NonTypeClassificationInput::new(document_epoch, target, current_origin);
+    let mut input = NonTypeClassificationInput::new(document_epoch, target, context.current_origin);
     let mut current = element_index;
     let mut visited = HashSet::from([current]);
     while let Some(parent) = context.composed_parent(current) {
@@ -3637,7 +3664,8 @@ fn build_non_type_classification(
 }
 
 struct DomClassificationContext<'a> {
-    nodes: &'a [RawDomNode],
+    nodes: CountedNodes<'a>,
+    indexes: &'a DomIndexes,
     by_node_id: &'a HashMap<u64, usize>,
     by_backend_id: &'a HashMap<u64, usize>,
     target_id: &'a str,
@@ -3664,60 +3692,12 @@ impl DomClassificationContext<'_> {
             })
     }
 
-    fn dom_parent(&self, index: usize) -> Option<usize> {
-        self.nodes
-            .get(index)?
-            .parent_id
-            .and_then(|parent| self.by_node_id.get(&parent).copied())
-    }
-
     fn form_owner(&self, index: usize) -> Option<usize> {
-        if let Some(form_id) = self.nodes[index].attributes.get("form") {
-            return self.nodes.iter().position(|node| {
-                node.local_name == "form"
-                    && node.attributes.get("id").is_some_and(|id| id == form_id)
-            });
-        }
-        let mut current = self.dom_parent(index);
-        let mut visited = HashSet::new();
-        while let Some(parent) = current {
-            if !visited.insert(parent) {
-                return None;
-            }
-            if self.nodes[parent].local_name == "form" {
-                return Some(parent);
-            }
-            current = self.dom_parent(parent);
-        }
-        None
+        self.indexes.form_owners[index]
     }
 
     fn label_control(&self, label_index: usize) -> Option<usize> {
-        if let Some(control_id) = self.nodes[label_index].attributes.get("for") {
-            return self.nodes.iter().position(|node| {
-                is_labelable(&node.local_name)
-                    && node.attributes.get("id").is_some_and(|id| id == control_id)
-            });
-        }
-        self.nodes.iter().enumerate().find_map(|(index, node)| {
-            (is_labelable(&node.local_name) && self.is_dom_descendant(index, label_index))
-                .then_some(index)
-        })
-    }
-
-    fn is_dom_descendant(&self, candidate: usize, ancestor: usize) -> bool {
-        let mut current = self.dom_parent(candidate);
-        let mut visited = HashSet::new();
-        while let Some(parent) = current {
-            if parent == ancestor {
-                return true;
-            }
-            if !visited.insert(parent) {
-                return false;
-            }
-            current = self.dom_parent(parent);
-        }
-        false
+        self.indexes.label_controls.get(&label_index).copied()
     }
 
     /// Every index reaching here came from `by_node_id` / `by_backend_id`,
@@ -3755,12 +3735,14 @@ impl DomClassificationContext<'_> {
         }
         if let Some(owner) = self.form_owner(index) {
             element = element.form_owner(self.identity(owner));
-            for (control_index, control) in self.nodes.iter().enumerate() {
-                if !is_form_control(&control.local_name)
-                    || self.form_owner(control_index) != Some(owner)
-                {
-                    continue;
-                }
+            for &control_index in self
+                .indexes
+                .controls_by_form
+                .get(&owner)
+                .into_iter()
+                .flatten()
+            {
+                let control = &self.nodes[control_index];
                 let mut associated = AssociatedFormControlInput::new(self.identity(control_index));
                 let tokens = autocomplete_tokens(control.attributes.get("autocomplete"));
                 if !tokens.is_empty() {
@@ -3813,11 +3795,7 @@ impl DomClassificationContext<'_> {
         }
         // Relative paths and fragments keep the document origin. Only the origin
         // is used for authorization; the browser resolves the full landing path.
-        let base = self
-            .nodes
-            .iter()
-            .find(|node| node.local_name == "base" && node.attributes.contains_key("href"))
-            .and_then(|node| node.attributes.get("href"));
+        let base = self.indexes.base_href.as_deref();
         let base_origin = match base {
             Some(base) if base.starts_with("//") => {
                 self.current_origin.split_once(':').and_then(|(scheme, _)| {
@@ -3931,15 +3909,15 @@ enum CommandEffect {
 const MOUSE_EVENT: &str = "Input.dispatchMouseEvent";
 const KEY_EVENT: &str = "Input.dispatchKeyEvent";
 
-/// The typing path changes the selection with `select()`,
-/// `setSelectionRange`, `removeAllRanges` and `collapse`; its other
-/// `Runtime.callFunctionOn` calls only read focus and value.
-fn selection_mutating(function: &str) -> bool {
+/// Runtime helpers that change selection or the viewport must pass the
+/// dispatch gate even though their command is not in CDP's Input domain.
+fn runtime_function_mutating(function: &str) -> bool {
     [
         ".select()",
         "setSelectionRange",
         "removeAllRanges",
         "collapse(",
+        ".scrollBy(",
     ]
     .iter()
     .any(|mutation| function.contains(mutation))
@@ -3993,9 +3971,9 @@ fn command_effect(
                 _ => CommandEffect::Mutation,
             }
         }
-        "Page.navigate" | "DOM.focus" => CommandEffect::Mutation,
+        "Page.navigate" | "DOM.focus" | "DOM.scrollIntoViewIfNeeded" => CommandEffect::Mutation,
         "Runtime.callFunctionOn"
-            if param("functionDeclaration").is_some_and(selection_mutating) =>
+            if param("functionDeclaration").is_some_and(runtime_function_mutating) =>
         {
             CommandEffect::Mutation
         }
@@ -4529,7 +4507,10 @@ where
             stack.push(PendingAxNode {
                 node: Some(child),
                 node_id: child_id,
-                depth: pending.depth + 1,
+                // Ignored AX containers have no record. Count only represented
+                // ancestors so a later sibling cannot appear beneath an earlier
+                // sibling's text just because its DOM wrappers were ignored.
+                depth: pending.depth + usize::from(!node.ignored),
                 frame_path: frame_path.clone(),
                 ancestors: ancestors.clone(),
             });
@@ -4819,13 +4800,13 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakePipe {
-        writes: Vec<Value>,
+    pub(super) struct FakePipe {
+        pub(super) writes: Vec<Value>,
         reads: VecDeque<Vec<u8>>,
     }
 
     impl FakePipe {
-        fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
+        pub(super) fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
             let reads = frames
                 .into_iter()
                 .map(|frame| {
@@ -4849,20 +4830,23 @@ mod tests {
         }
 
         fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
-            let Some(bytes) = self.reads.pop_front() else {
+            let Some(mut bytes) = self.reads.pop_front() else {
                 return Ok(PipeRead::WouldBlock);
             };
+            if bytes.len() > destination.len() {
+                self.reads.push_front(bytes.split_off(destination.len()));
+            }
             destination[..bytes.len()].copy_from_slice(&bytes);
             Ok(PipeRead::Bytes(bytes.len()))
         }
     }
 
-    struct FakeClock {
+    pub(super) struct FakeClock {
         now: Instant,
     }
 
     impl FakeClock {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 now: Instant::now(),
             }
@@ -4885,6 +4869,7 @@ mod tests {
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         )
+        .with_incremental_ax_snapshots()
     }
 
     fn driver_with_download_denial(
@@ -4901,7 +4886,9 @@ mod tests {
         driver(replies)
     }
 
-    fn attached_driver(frames: impl IntoIterator<Item = Value>) -> CdpNavigationDriver<FakePipe> {
+    pub(super) fn attached_driver(
+        frames: impl IntoIterator<Item = Value>,
+    ) -> CdpNavigationDriver<FakePipe> {
         let mut driver = driver(frames);
         driver
             .identities
@@ -5024,7 +5011,7 @@ mod tests {
         }
     }
 
-    fn ax_node(
+    pub(super) fn ax_node(
         node_id: &str,
         role: &str,
         name: &str,
@@ -5046,7 +5033,7 @@ mod tests {
         node
     }
 
-    fn raw_node(
+    pub(super) fn raw_node(
         node_id: &str,
         role: &str,
         name: &str,
@@ -5063,6 +5050,191 @@ mod tests {
             frame_id,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn settings_forms_survive_ignored_wrappers_and_output_cap() {
+        let specs = [
+            (
+                "root",
+                "RootWebArea",
+                "Settings",
+                vec!["nav", "outer"],
+                false,
+            ),
+            (
+                "nav",
+                "navigation",
+                "Settings navigation",
+                vec!["links"],
+                false,
+            ),
+            ("links", "list", "", vec![], false),
+            ("outer", "none", "", vec!["inner"], true),
+            ("inner", "none", "", vec!["main"], true),
+            (
+                "main",
+                "main",
+                "Branch protection",
+                vec!["heading", "div1"],
+                false,
+            ),
+            (
+                "heading",
+                "heading",
+                "Settings: fixture/repository",
+                vec!["heading-text"],
+                false,
+            ),
+            (
+                "heading-text",
+                "StaticText",
+                "Settings: fixture/repository",
+                vec!["inline"],
+                false,
+            ),
+            (
+                "inline",
+                "InlineTextBox",
+                "Settings: fixture/repository",
+                vec![],
+                false,
+            ),
+            ("div1", "none", "", vec!["div2"], true),
+            ("div2", "none", "", vec!["form"], true),
+            ("form", "form", "", vec!["fieldset"], false),
+            (
+                "fieldset",
+                "group",
+                "Protect matching branches",
+                vec!["legend", "details", "presentation"],
+                false,
+            ),
+            ("legend", "Legend", "", vec!["legend-text"], false),
+            (
+                "legend-text",
+                "StaticText",
+                "Protect matching branches",
+                vec![],
+                false,
+            ),
+            ("details", "group", "", vec!["ignored-summary"], false),
+            ("ignored-summary", "none", "", vec!["summary"], true),
+            (
+                "summary",
+                "DisclosureTriangle",
+                "Additional restrictions",
+                vec![],
+                false,
+            ),
+            ("presentation", "none", "", vec!["checks"], true),
+            (
+                "checks",
+                "group",
+                "Protect branches",
+                vec!["shadow", "label"],
+                false,
+            ),
+            ("shadow", "generic", "", vec!["shadow-root"], false),
+            ("shadow-root", "none", "", vec!["shadow-check"], true),
+            ("shadow-check", "checkbox", "Shadow check", vec![], false),
+            ("label", "none", "", vec!["target"], true),
+            (
+                "target",
+                "checkbox",
+                "Require status checks to pass before merging",
+                vec![],
+                false,
+            ),
+        ];
+        let mut nodes = specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, role, name, children, ignored))| {
+                let mut node = raw_node(id, role, name, &children, i as u64 + 1, Some("frame-own"));
+                node.ignored = ignored;
+                (id.to_string(), node)
+            })
+            .collect::<HashMap<_, _>>();
+        for n in 0..600 {
+            let id = format!("link-{n}");
+            nodes.get_mut("links").unwrap().child_ids.push(id.clone());
+            nodes.insert(
+                id.clone(),
+                raw_node(
+                    &id,
+                    "link",
+                    &format!("Repository setting {n}"),
+                    &[],
+                    1000 + n,
+                    None,
+                ),
+            );
+        }
+        let root = nodes["root"].clone();
+        let observation =
+            traverse_ax_tree(root, "target-own", MAX_AX_NODES, MAX_AX_DEPTH, |id, _| {
+                Ok(nodes[id]
+                    .child_ids
+                    .iter()
+                    .map(|child| nodes[child].clone())
+                    .collect())
+            })
+            .unwrap();
+        assert!(!observation.ax_truncated);
+        let main = observation
+            .records
+            .iter()
+            .find(|r| r.role == "main")
+            .unwrap();
+        let form = observation
+            .records
+            .iter()
+            .find(|r| r.role == "form")
+            .unwrap();
+        assert_eq!(form.depth, main.depth + 1);
+        let render = |filters: &state_text::Filters, zoom| {
+            state_text::render(&state_text::RenderInput {
+                records: &observation.records,
+                facts: &observation.facts,
+                filters,
+                page_url: "https://github.com/fixture/settings",
+                snapshot_id: "s1",
+                zoom,
+                max_bytes: 2000,
+            })
+        };
+        let plain = render(&state_text::Filters::default(), None).text;
+        assert!(
+            plain.find("main Branch protection").unwrap()
+                < plain.find("navigation Settings navigation").unwrap()
+        );
+        for filters in [
+            state_text::Filters {
+                text: None,
+                roles: vec!["checkbox".into()],
+            },
+            state_text::Filters {
+                text: Some("Require status checks".into()),
+                roles: vec![],
+            },
+        ] {
+            let text = render(&filters, None).text;
+            assert!(
+                text.contains("Require status checks to pass before merging"),
+                "{text}"
+            );
+        }
+        let zoom = state_text::Zoom {
+            requested: main.reference.as_deref().unwrap(),
+            target: main.reference.as_deref(),
+        };
+        let text = render(&state_text::Filters::default(), Some(zoom)).text;
+        assert!(
+            text.contains("Require status checks to pass before merging"),
+            "{text}"
+        );
+        assert!(text.contains("Shadow check"), "{text}");
     }
 
     fn flattened_dom_node(
@@ -7344,7 +7516,9 @@ mod tests {
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","DOM fixture", &[], 10, Some("frame-main"))}}),
             json!({"id":3,"sessionId":"session-own","result":{"root":{"nodeId":42}}}),
-            json!({"id":4,"sessionId":"session-own","result":{"outerHTML":"<main><h1>DOM fixture</h1></main>"}}),
+            json!({"id":4,"sessionId":"session-own","result":{"nodeIds":[42]}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodeId":43}}),
+            json!({"id":6,"sessionId":"session-own","result":{"outerHTML":"<body><main><h1>DOM fixture</h1></main></body>"}}),
         ];
         let mut driver = attached_driver(frames);
         let observation = driver
@@ -7358,7 +7532,7 @@ mod tests {
 
         assert_eq!(
             observation.dom_text.as_deref(),
-            Some("<main><h1>DOM fixture</h1></main>")
+            Some("<body><main><h1>DOM fixture</h1></main></body>")
         );
         assert_eq!(observation.records[0].name, "DOM fixture");
         assert_eq!(observation.refs[0].captured.reference, "e1");
@@ -7373,9 +7547,20 @@ mod tests {
                 "Accessibility.enable",
                 "Accessibility.getRootAXNode",
                 "DOM.getDocument",
+                "DOM.pushNodesByBackendIdsToFrontend",
+                "DOM.querySelector",
                 "DOM.getOuterHTML",
             ]
         );
+        assert_eq!(
+            driver.pipe.writes[3]["params"],
+            json!({"backendNodeIds":[10]})
+        );
+        assert_eq!(
+            driver.pipe.writes[4]["params"],
+            json!({"nodeId":42,"selector":"body"})
+        );
+        assert_eq!(driver.pipe.writes[5]["params"], json!({"nodeId":43}));
     }
 
     #[test]
@@ -8242,7 +8427,8 @@ mod tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         let mut clock = FakeClock::new();
         let deadline = clock.now() + Duration::from_millis(10);
         driver
@@ -8425,7 +8611,8 @@ mod verification_tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         // The person's own sign-in page, attached the way a capture attaches
         // it, so the test can show nothing is sent to it.
         driver
@@ -8709,7 +8896,8 @@ mod signed_in_page_read_tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         driver
             .identities
             .attach(Attachment {

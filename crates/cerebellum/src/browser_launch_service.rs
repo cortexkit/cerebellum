@@ -2172,6 +2172,18 @@ impl OwnedBrowserProcess for ProductionProcess {
             )
     }
 
+    fn scroll(
+        &mut self,
+        context_key: &str,
+        target: &crate::browser_session::BrowserScrollTarget,
+        deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .scroll(context_key, target, deadline_ms)
+    }
+
     fn screenshot(
         &mut self,
         context_key: &str,

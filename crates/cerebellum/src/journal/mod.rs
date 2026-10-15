@@ -150,6 +150,8 @@ pub enum Capability {
     Type,
     #[serde(rename = "browser.click_point")]
     ClickPoint,
+    #[serde(rename = "browser.scroll")]
+    Scroll,
     // The observations. Added in v3 because the four above are exactly the
     // capabilities that mutate or inject input, and the reads were being folded
     // onto Navigate -- so a snapshot of a logged-in profile persisted as a page
@@ -183,6 +185,7 @@ impl Capability {
             Self::Click => "browser.click",
             Self::Type => "browser.type",
             Self::ClickPoint => "browser.click_point",
+            Self::Scroll => "browser.scroll",
             Self::Snapshot => "browser.snapshot",
             Self::Screenshot => "browser.screenshot",
             Self::WaitFor => "browser.wait_for",
@@ -405,6 +408,7 @@ impl GoverningObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    Scroll,
     Navigate {
         url_redacted: String,
         wait: NavigateWait,

@@ -1,4 +1,4 @@
-//! This module implements the six browser capabilities exposed by the browser plane.
+//! Browser capabilities exposed by the browser plane.
 //!
 //! This module integrates route admission, journal and context interfaces, CDP
 //! transport, and browser geometry, extraction, and screenshot primitives.
@@ -9,6 +9,7 @@ pub mod extraction;
 pub mod geometry;
 pub mod navigation;
 mod refs;
+mod scroll;
 pub mod state_text;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -55,16 +56,18 @@ pub const SNAPSHOT: &str = "browser.snapshot";
 pub const CLICK: &str = "browser.click";
 pub const TYPE: &str = "browser.type";
 pub const SCREENSHOT: &str = "browser.screenshot";
+pub const SCROLL: &str = "browser.scroll";
 pub const CLICK_POINT: &str = "browser.click_point";
 pub const WAIT_FOR: &str = "browser.wait_for";
 /// The wire refusal code shared with the computer plane for a result-schema violation.
 pub const RESULT_SCHEMA_VIOLATION_CODE: &str = "computer_result_schema_violation";
-pub const ALL_TOOLS: [&str; 7] = [
+pub const ALL_TOOLS: [&str; 8] = [
     NAVIGATE,
     SNAPSHOT,
     CLICK,
     TYPE,
     SCREENSHOT,
+    SCROLL,
     CLICK_POINT,
     WAIT_FOR,
 ];
@@ -82,6 +85,7 @@ pub fn has_wire_dispatch_route(name: &str) -> bool {
             | CLICK
             | TYPE
             | SCREENSHOT
+            | SCROLL
             | CLICK_POINT
             | crate::management::PRESENT
             | crate::management::RESUME
@@ -101,6 +105,7 @@ pub enum BrowserCapability {
     Click,
     Type,
     Screenshot,
+    Scroll,
     ClickPoint,
     WaitFor,
 }
@@ -112,6 +117,7 @@ impl BrowserCapability {
             Self::Click => CLICK,
             Self::Type => TYPE,
             Self::Screenshot => SCREENSHOT,
+            Self::Scroll => SCROLL,
             Self::ClickPoint => CLICK_POINT,
             Self::WaitFor => WAIT_FOR,
         }
@@ -119,7 +125,7 @@ impl BrowserCapability {
     pub const fn is_unfenceable(self) -> bool {
         matches!(
             self,
-            Self::Navigate | Self::Click | Self::Type | Self::ClickPoint
+            Self::Navigate | Self::Click | Self::Type | Self::ClickPoint | Self::Scroll
         )
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -129,6 +135,7 @@ impl BrowserCapability {
             CLICK => Self::Click,
             TYPE => Self::Type,
             SCREENSHOT => Self::Screenshot,
+            SCROLL => Self::Scroll,
             CLICK_POINT => Self::ClickPoint,
             WAIT_FOR => Self::WaitFor,
             _ => return None,
@@ -1219,6 +1226,7 @@ pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
             text_bytes_utf8: 0,
             replace: false,
         },
+        JournalCapability::Scroll => JournalAction::Scroll,
         JournalCapability::Snapshot
         | JournalCapability::Screenshot
         | JournalCapability::WaitFor
@@ -2101,6 +2109,7 @@ impl BrowserPlane {
             BrowserCapability::Click => self.click(identity, args).await,
             BrowserCapability::Type => self.type_text(identity, args).await,
             BrowserCapability::Screenshot => self.screenshot(identity, args).await,
+            BrowserCapability::Scroll => self.scroll(identity, args).await,
             BrowserCapability::ClickPoint => self.click_point(identity, args).await,
             BrowserCapability::WaitFor => self.wait_for(identity, args).await,
         }
@@ -4506,6 +4515,16 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
             result_schema: screenshot_result_schema(),
         },
         BrowserToolDefinition {
+            name: SCROLL,
+            description: "Scroll a previously printed ref into view, or scroll by direction and amount (CSS pixels, default 600). Tier 1; never fronts the window. Choose ref or direction, not both. Unsupported on the user-browser target.",
+            request_schema: json!({"type":"object","properties":{
+                "ref":{"type":"string","description":"A previously printed ref to bring into view. Do not combine with direction or amount."},
+                "direction":{"type":"string","enum":["up","down","left","right"],"description":"Use instead of ref."},
+                "amount":{"type":"integer","minimum":1,"maximum":10000,"default":600,"description":"CSS pixels; direction only."}
+            },"additionalProperties":false}),
+            result_schema: reply_schema(json!({"scroll_dispatched":boolean_schema()}), &[]),
+        },
+        BrowserToolDefinition {
             name: CLICK_POINT,
             description: "Click a retained screenshot pixel. Coordinates address the image this module declared; pass its image_width_px and image_height_px so a coordinate taken from a resized copy is refused rather than mis-clicked. The reply reports navigation as browser.click does.",
             request_schema: json!({"type":"object","properties":{"snapshot_id":{"type":"string"},"x_px":{"type":"integer"},"y_px":{"type":"integer"},"image_width_px":{"type":"integer"},"image_height_px":{"type":"integer"},"intent":{"type":"string"},"severity":severity_schema()},"required":["snapshot_id","x_px","y_px","image_width_px","image_height_px","intent","severity"],"additionalProperties":false}),
@@ -5949,6 +5968,7 @@ fn journal_capability(capability: BrowserCapability) -> JournalCapability {
         BrowserCapability::ClickPoint => JournalCapability::ClickPoint,
         BrowserCapability::Snapshot => JournalCapability::Snapshot,
         BrowserCapability::Screenshot => JournalCapability::Screenshot,
+        BrowserCapability::Scroll => JournalCapability::Scroll,
         BrowserCapability::WaitFor => JournalCapability::WaitFor,
     }
 }
@@ -6291,6 +6311,7 @@ mod tests {
             (BrowserCapability::ClickPoint, JournalCapability::ClickPoint),
             (BrowserCapability::Snapshot, JournalCapability::Snapshot),
             (BrowserCapability::Screenshot, JournalCapability::Screenshot),
+            (BrowserCapability::Scroll, JournalCapability::Scroll),
             (BrowserCapability::WaitFor, JournalCapability::WaitFor),
         ];
 
@@ -6308,7 +6329,7 @@ mod tests {
         }
         assert_eq!(
             journaled.len(),
-            6,
+            7,
             "a browser capability was added without a journal name of its own"
         );
     }
@@ -6335,6 +6356,7 @@ mod tests {
             JournalCapability::Click,
             JournalCapability::ClickPoint,
             JournalCapability::Type,
+            JournalCapability::Scroll,
         ] {
             assert!(
                 journal_action(capability).is_some(),
@@ -6867,9 +6889,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seven_tools_have_closed_descriptors_including_browser_type() {
+    async fn eight_tools_have_closed_descriptors_including_browser_type_and_scroll() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
+        assert!(tools.iter().any(|(name, _, _)| *name == SCROLL));
         assert!(tools.iter().any(|(name, _, _)| *name == TYPE));
         assert!(tools
             .iter()
@@ -6905,6 +6928,7 @@ mod tests {
                 | BrowserCapability::Click
                 | BrowserCapability::Type
                 | BrowserCapability::Screenshot
+                | BrowserCapability::Scroll
                 | BrowserCapability::ClickPoint
                 | BrowserCapability::WaitFor => capability,
             }
@@ -6916,6 +6940,7 @@ mod tests {
             BrowserCapability::Click,
             BrowserCapability::Type,
             BrowserCapability::Screenshot,
+            BrowserCapability::Scroll,
             BrowserCapability::ClickPoint,
             BrowserCapability::WaitFor,
         ]
@@ -7093,7 +7118,7 @@ mod tests {
     #[test]
     fn browser_bounded_call_vocabulary_is_frozen() {
         let definitions = browser_tool_definitions();
-        assert_eq!(definitions.len(), 16);
+        assert_eq!(definitions.len(), 17);
         for definition in definitions {
             let terminal = &definition.result_schema["anyOf"][1];
             assert_eq!(terminal["additionalProperties"], false);
@@ -7181,7 +7206,7 @@ mod tests {
         // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "d6f78a0bdbed1dee158245e329cb6609f1df867442f70fefbcad3e2aeaf8ce71"
+            "7aeb871c5106ffbca83afbc46c5ef24b73868aadeae0c722566f7c98310938d3"
         );
     }
 

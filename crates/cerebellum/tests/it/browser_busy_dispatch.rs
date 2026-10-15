@@ -133,6 +133,9 @@ impl CdpPipeIo for FixturePipe {
                 document
             }
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+            "Accessibility.getFullAXTree" | "Accessibility.queryAXTree" => json!({"nodes":[]}),
+            "DOM.pushNodesByBackendIdsToFrontend" => json!({"nodeIds":[1]}),
+            "DOM.querySelector" => json!({"nodeId":2}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),
             "Page.getFrameTree" => {
                 let mut tree = json!({"frameTree":{"frame":{"id":"frame-main","loaderId":if self.main_loader_changed { "loader-new" } else { "loader-page" },"url":"https://requested.example/page","securityOrigin":"https://requested.example"}}});
@@ -790,6 +793,8 @@ async fn snapshot_cdp_response_error_names_step_and_recovers() {
         "Accessibility.getChildAXNodes",
         "DOM.getFrameOwner",
         "DOM.getDocument",
+        "DOM.pushNodesByBackendIdsToFrontend",
+        "DOM.querySelector",
         "DOM.getOuterHTML",
     ] {
         let frames = matches!(
@@ -833,6 +838,8 @@ async fn snapshot_incomplete_cdp_results_name_the_producing_method() {
             "Accessibility.getChildAXNodes",
             "DOM.getFrameOwner",
             "DOM.getDocument",
+            "DOM.pushNodesByBackendIdsToFrontend",
+            "DOM.querySelector",
             "DOM.getOuterHTML",
         ] {
             let frames = matches!(

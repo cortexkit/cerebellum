@@ -105,6 +105,33 @@ async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
 }
 
 #[tokio::test]
+async fn browser_queue_scroll_waits_for_navigation_consent() {
+    let (planes, launcher) = blocking_grant_fixture().await;
+    grant_browser(&planes, "https://landed.example:8443", vec![]).await;
+    let (tx, mut rx) = mpsc::channel(16);
+    let question = begin(&planes, &tx, &mut rx).await;
+    send(
+        &planes,
+        &tx,
+        call(802, "scroll", json!({"direction":"down"})),
+    )
+    .await;
+    held(&mut rx).await;
+    assert!(launcher.effects.lock().unwrap().is_empty());
+    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    let results = replies(&mut rx, 2).await;
+    assert_eq!(
+        results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
+        [801, 802]
+    );
+    assert_eq!(body(&results[1])["outcome"], "ok", "{}", body(&results[1]));
+    assert_eq!(
+        *launcher.effects.lock().unwrap(),
+        ["navigate", "scroll_page"]
+    );
+}
+
+#[tokio::test]
 async fn browser_queue_cancelled_queued_call_never_runs() {
     let (planes, launcher) = blocking_grant_fixture().await;
     grant_browser(&planes, "https://landed.example:8443", vec![]).await;
