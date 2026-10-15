@@ -255,10 +255,15 @@ pub(super) async fn exercise(pipe: Pipe, url: &str, child: Child) -> Result<(), 
     let result = async {
         invoke(&planes, &mut corr, "navigate", json!({"url":url,"intent":"open local fixture","wait":"settle","severity":{"tier":3,"credential":false,"financial":false}})).await?;
         let counts_before = observer.counts.lock().unwrap().clone();
+        let timing_start = observer.timings.lock().unwrap().completed.len();
         let start = Instant::now();
         let outline = invoke(&planes, &mut corr, "snapshot", json!({"max_bytes":8000})).await?;
         let counts = observer.counts.lock().unwrap().iter().map(|(method, count)| (method.clone(), count-counts_before.get(method).unwrap_or(&0))).collect::<BTreeMap<_,_>>();
         println!("capture elapsed: {} ms; CDP commands: {counts:?}", start.elapsed().as_millis());
+        let timings = observer.timings.lock().unwrap().completed[timing_start..].to_vec();
+        let wire_ms = timings.iter().map(|(_, ms)| ms).sum::<u128>();
+        for (method, ms) in timings { println!("capture command {method}: {ms} ms"); }
+        println!("capture CDP total: {wire_ms} ms; non-CDP work: {} ms", start.elapsed().as_millis().saturating_sub(wire_ms));
         let text = outline["state_text"].as_str().ok_or("missing outline")?;
         println!("OUTLINE:\n{text}");
         let main = reference(&outline,"main Branch protection")?;
@@ -276,22 +281,23 @@ pub(super) async fn exercise(pipe: Pipe, url: &str, child: Child) -> Result<(), 
         let session = observer.session.lock().unwrap().clone().ok_or("missing main session")?;
         // A background page may suspend requestAnimationFrame indefinitely.
         // Synchronous geometry forces layout without requiring an active window.
-        let rect = "({rect:document.getElementById('target').getBoundingClientRect().toJSON(),width:innerWidth,height:innerHeight,scrollY})";
+        let rect = "({rect:document.getElementById('target').getBoundingClientRect().toJSON(),width:innerWidth,height:innerHeight,scrollY,scrollHeight:document.scrollingElement.scrollHeight,clientHeight:document.scrollingElement.clientHeight})";
         let before = observer.evaluate(&session,1_000_001,rect)?;
         println!("checkbox rect before scroll: {before}");
         checks.push(("settings_target_starts_below_fold", before["rect"]["top"].as_f64().unwrap() > before["height"].as_f64().unwrap()));
+        invoke(&planes,&mut corr,"scroll",json!({"direction":"down","amount":400})).await?;
+        let down = observer.evaluate(&session,1_000_002,rect)?;
+        println!("page scroll down 400 from top: {down}");
+        invoke(&planes,&mut corr,"scroll",json!({"direction":"up","amount":400})).await?;
+        let up = observer.evaluate(&session,1_000_003,rect)?;
+        println!("page scroll up 400 to top: {up}");
+        checks.push(("settings_scroll_page_moves_viewport", before["scrollY"].as_f64()==Some(0.0) && down["scrollY"].as_f64()==Some(400.0) && up["scrollY"].as_f64()==Some(0.0)));
         invoke(&planes,&mut corr,"scroll",json!({"ref":target})).await?;
-        let after = observer.evaluate(&session,1_000_002,rect)?;
+        let after = observer.evaluate(&session,1_000_004,rect)?;
         println!("checkbox rect after scroll: {after}");
         let inside = after["rect"]["top"].as_f64().unwrap()>=0.0 && after["rect"]["bottom"].as_f64().unwrap()<=after["height"].as_f64().unwrap()
             && after["rect"]["left"].as_f64().unwrap()>=0.0 && after["rect"]["right"].as_f64().unwrap()<=after["width"].as_f64().unwrap();
         checks.push(("settings_scroll_ref_brings_checkbox_into_viewport",inside));
-        invoke(&planes,&mut corr,"scroll",json!({"direction":"down","amount":400})).await?;
-        let page_before = observer.evaluate(&session,1_000_003,rect)?;
-        invoke(&planes,&mut corr,"scroll",json!({"direction":"up","amount":400})).await?;
-        let page_after = observer.evaluate(&session,1_000_004,rect)?;
-        println!("checkbox rect after page scroll down/up 400: {page_after}");
-        checks.push(("settings_scroll_page_moves_viewport",page_after["scrollY"].as_f64().unwrap()<page_before["scrollY"].as_f64().unwrap()));
         let dom = invoke(&planes,&mut corr,"snapshot",json!({"mode":"dom_full","max_bytes":8000})).await?;
         let text = dom["state_text"].as_str().ok_or("missing DOM body")?;
         println!("dom_full: {} bytes, starts {:?}",text.len(),&text[..text.len().min(100)]);

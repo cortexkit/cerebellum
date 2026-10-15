@@ -45,42 +45,54 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 )
             }
             BrowserScrollTarget::Page { x, y } => {
-                let metrics = self.command(
-                    "Page.getLayoutMetrics",
+                let tree = self.command(
+                    "Page.getFrameTree",
                     None,
                     Some(attachment.session_id.clone()),
                     snapshot_step_deadline(deadline, true, clock.now()),
                     None,
                     clock,
                 )?;
-                let viewport = metrics
-                    .get("cssVisualViewport")
-                    .and_then(Value::as_object)
-                    .ok_or(NavigationDriveError::CdpFailure)?;
-                let width = viewport
-                    .get("clientWidth")
-                    .and_then(Value::as_f64)
-                    .filter(|n| n.is_finite() && *n > 0.0)
-                    .ok_or(NavigationDriveError::CdpFailure)?;
-                let height = viewport
-                    .get("clientHeight")
-                    .and_then(Value::as_f64)
-                    .filter(|n| n.is_finite() && *n > 0.0)
-                    .ok_or(NavigationDriveError::CdpFailure)?;
-                // CDP gesture distances describe the finger's movement, opposite
-                // to the content offset requested by the caller.
+                let frame = tree
+                    .get("frameTree")
+                    .and_then(|tree| tree.get("frame"))
+                    .and_then(|frame| frame.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
+                // Native scrolling in an isolated world works on background
+                // pages and cannot be replaced by page-authored scrollBy code.
+                let world = self.command(
+                    "Page.createIsolatedWorld",
+                    Some(
+                        serde_json::json!({"frameId":frame,"worldName":"cerebellum-scroll"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    snapshot_step_deadline(deadline, true, clock.now()),
+                    None,
+                    clock,
+                )?;
+                let context = world
+                    .get("executionContextId")
+                    .and_then(Value::as_u64)
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        NavigationDriveError::CdpFailure.at_step("Page.createIsolatedWorld")
+                    })?;
                 (
-                    "Input.synthesizeScrollGesture",
+                    "Runtime.callFunctionOn",
                     serde_json::json!({
-                        "x": width / 2.0, "y": height / 2.0,
-                        "xDistance": -i64::from(*x), "yDistance": -i64::from(*y), "speed": 10000,
-                        "gestureSourceType": "mouse", "preventFling": true,
+                        "executionContextId":context,
+                        "functionDeclaration":"function(x, y) { window.scrollBy({left:x, top:y, behavior:'instant'}); }",
+                        "arguments":[{"value":x},{"value":y}], "returnByValue":true,
                     }),
                     attachment.session_id,
                 )
             }
         };
-        self.command(
+        let result = self.command(
             method,
             params.as_object().cloned(),
             Some(session),
@@ -88,6 +100,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
+        if result.contains_key("exceptionDetails") {
+            return Err(NavigationDriveError::CdpFailure.at_step(method));
+        }
         Ok(())
     }
 }
@@ -116,10 +131,11 @@ mod tests {
     }
 
     #[test]
-    fn scroll_page_uses_css_viewport_and_signed_distance() {
+    fn scroll_page_uses_native_isolated_world_without_fronting() {
         let mut driver = attached_driver([
-            json!({"id":1,"sessionId":"session-own","result":{"cssVisualViewport":{"clientWidth":800,"clientHeight":600}}}),
-            json!({"id":2,"sessionId":"session-own","result":{}}),
+            json!({"id":1,"sessionId":"session-own","result":{"frameTree":{"frame":{"id":"frame-own"}}}}),
+            json!({"id":2,"sessionId":"session-own","result":{"executionContextId":7}}),
+            json!({"id":3,"sessionId":"session-own","result":{"result":{"type":"undefined"}}}),
         ]);
         driver
             .scroll_with_clock(
@@ -130,14 +146,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            driver.pipe.writes[1]["method"],
-            "Input.synthesizeScrollGesture"
+            driver
+                .pipe
+                .writes
+                .iter()
+                .map(|command| command["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Page.getFrameTree",
+                "Page.createIsolatedWorld",
+                "Runtime.callFunctionOn"
+            ]
         );
-        assert_eq!(driver.pipe.writes[1]["params"]["yDistance"], -600);
-        assert_eq!(driver.pipe.writes[1]["params"]["y"], 300.0);
+        assert_eq!(driver.pipe.writes[1]["params"]["frameId"], "frame-own");
+        let params = &driver.pipe.writes[2]["params"];
+        assert_eq!(params["executionContextId"], 7);
+        assert_eq!(params["arguments"], json!([{"value":0},{"value":600}]));
+        assert!(params["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("window.scrollBy"));
+        assert_eq!(
+            command_effect("Runtime.callFunctionOn", params.as_object(), None),
+            CommandEffect::Mutation
+        );
         assert_eq!(
             command_effect("DOM.scrollIntoViewIfNeeded", None, None),
             CommandEffect::Mutation
+        );
+    }
+
+    #[test]
+    fn scroll_page_refuses_a_runtime_exception() {
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{"frameTree":{"frame":{"id":"frame-own"}}}}),
+            json!({"id":2,"sessionId":"session-own","result":{"executionContextId":7}}),
+            json!({"id":3,"sessionId":"session-own","result":{"exceptionDetails":{}}}),
+        ]);
+        assert_eq!(
+            driver.scroll_with_clock(
+                "route-own",
+                &BrowserScrollTarget::Page { x: 0, y: 600 },
+                1000,
+                &mut FakeClock::new()
+            ),
+            Err(NavigationDriveError::CdpFailure.at_step("Runtime.callFunctionOn"))
         );
     }
 

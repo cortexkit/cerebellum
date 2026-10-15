@@ -3977,15 +3977,15 @@ enum CommandEffect {
 const MOUSE_EVENT: &str = "Input.dispatchMouseEvent";
 const KEY_EVENT: &str = "Input.dispatchKeyEvent";
 
-/// The typing path changes the selection with `select()`,
-/// `setSelectionRange`, `removeAllRanges` and `collapse`; its other
-/// `Runtime.callFunctionOn` calls only read focus and value.
-fn selection_mutating(function: &str) -> bool {
+/// Runtime helpers that change selection or the viewport must pass the
+/// dispatch gate even though their command is not in CDP's Input domain.
+fn runtime_function_mutating(function: &str) -> bool {
     [
         ".select()",
         "setSelectionRange",
         "removeAllRanges",
         "collapse(",
+        ".scrollBy(",
     ]
     .iter()
     .any(|mutation| function.contains(mutation))
@@ -4041,7 +4041,7 @@ fn command_effect(
         }
         "Page.navigate" | "DOM.focus" | "DOM.scrollIntoViewIfNeeded" => CommandEffect::Mutation,
         "Runtime.callFunctionOn"
-            if param("functionDeclaration").is_some_and(selection_mutating) =>
+            if param("functionDeclaration").is_some_and(runtime_function_mutating) =>
         {
             CommandEffect::Mutation
         }

@@ -40,6 +40,14 @@ mod probe {
         responses: UnixStream,
         counts: Arc<Mutex<BTreeMap<String, usize>>>,
         session: Arc<Mutex<Option<String>>>,
+        timings: Arc<Mutex<Timings>>,
+    }
+
+    #[derive(Default)]
+    struct Timings {
+        decoder: cerebellum::cdp::CdpFrameDecoder,
+        issued: BTreeMap<u64, (String, Instant)>,
+        completed: Vec<(String, u128)>,
     }
 
     impl CdpPipeIo for Pipe {
@@ -51,12 +59,34 @@ mod probe {
                 .unwrap()
                 .entry(command["method"].as_str().unwrap().to_string())
                 .or_default() += 1;
+            self.timings.lock().unwrap().issued.insert(
+                command["id"].as_u64().unwrap(),
+                (
+                    command["method"].as_str().unwrap().to_string(),
+                    Instant::now(),
+                ),
+            );
             self.commands.write_all(bytes)
         }
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<PipeRead> {
             match self.responses.read(bytes) {
                 Ok(0) => Ok(PipeRead::Closed),
-                Ok(n) => Ok(PipeRead::Bytes(n)),
+                Ok(n) => {
+                    let mut timings = self.timings.lock().unwrap();
+                    for frame in timings.decoder.push(&bytes[..n]) {
+                        if let Ok(reply) = serde_json::from_slice::<Value>(&frame) {
+                            if let Some((method, start)) = reply["id"]
+                                .as_u64()
+                                .and_then(|id| timings.issued.remove(&id))
+                            {
+                                timings
+                                    .completed
+                                    .push((method, start.elapsed().as_millis()));
+                            }
+                        }
+                    }
+                    Ok(PipeRead::Bytes(n))
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PipeRead::WouldBlock),
                 Err(error) => Err(error),
             }
@@ -70,6 +100,7 @@ mod probe {
                 responses: self.responses.try_clone().unwrap(),
                 counts: self.counts.clone(),
                 session: self.session.clone(),
+                timings: self.timings.clone(),
             }
         }
 
@@ -195,6 +226,7 @@ mod probe {
                     responses,
                     counts: Arc::default(),
                     session: Arc::default(),
+                    timings: Arc::default(),
                 },
                 &url,
                 browser.clone(),
