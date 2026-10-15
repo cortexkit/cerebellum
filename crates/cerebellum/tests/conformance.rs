@@ -1084,6 +1084,7 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "browser.click",
         "browser.screenshot",
         "browser.click_point",
+        "browser.scroll",
         "browser_use",
     ] {
         assert!(
@@ -1106,8 +1107,8 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
     // measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
-        10,
-        "expected nine browser tools and the flat browser_use adapter: {registered:?}"
+        11,
+        "expected ten browser tools and the flat browser_use adapter: {registered:?}"
     );
 
     // Close the client before the daemon and module guards are dropped so the
@@ -1864,6 +1865,7 @@ fn every_advertised_browser_tool_is_dispatchable_and_no_other_is() {
         "browser.click_point",
         "browser.snapshot",
         "browser.type",
+        "browser.scroll",
     ] {
         if !advertised.iter().any(|a| a == name) {
             assert!(
