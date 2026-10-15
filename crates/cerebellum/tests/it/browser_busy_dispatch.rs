@@ -133,6 +133,7 @@ impl CdpPipeIo for FixturePipe {
                 document
             }
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+            "Accessibility.getFullAXTree" | "Accessibility.queryAXTree" => json!({"nodes":[]}),
             "DOM.pushNodesByBackendIdsToFrontend" => json!({"nodeIds":[1]}),
             "DOM.querySelector" => json!({"nodeId":2}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),

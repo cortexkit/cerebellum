@@ -842,7 +842,8 @@ impl CdpNavigationProcess {
                 NavigationPipe::with_frames(frames),
                 CdpTransport::new(),
                 CdpFrameDecoder::default(),
-            ),
+            )
+            .with_incremental_ax_snapshots(),
         }
     }
 }
@@ -1184,7 +1185,8 @@ fn click_point_process(commands: Arc<std::sync::Mutex<Vec<Value>>>) -> ClickPoin
             RecordingClickPointPipe::new(commands),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        ),
+        )
+        .with_incremental_ax_snapshots(),
     }
 }
 
@@ -1196,7 +1198,8 @@ fn dialog_click_point_process(
             DialogClickPointPipe::new(commands),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        ),
+        )
+        .with_incremental_ax_snapshots(),
     }
 }
 
@@ -1243,7 +1246,8 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
             ScreenshotPipe::with_frames(frames),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        ),
+        )
+        .with_incremental_ax_snapshots(),
         captures,
         page_url: "https://requested.example/page",
     }
@@ -1330,7 +1334,8 @@ fn screenshot_process_with_capture(
             ScreenshotPipe::with_frames(frames),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        ),
+        )
+        .with_incremental_ax_snapshots(),
         captures,
         page_url: "https://requested.example/page",
     }

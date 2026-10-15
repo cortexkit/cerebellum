@@ -3581,6 +3581,9 @@ impl CdpPipeIo for ChromeLikePipe {
         }
         match command["method"].as_str().unwrap() {
             "Browser.setDownloadBehavior" => self.queue(json!({"id":id,"result":{}})),
+            "Accessibility.getFullAXTree" | "Accessibility.queryAXTree" => {
+                self.reply(id, json!({"nodes":[]}))
+            }
             "Page.navigate" => {
                 self.page.commit(command["params"]["url"].as_str().unwrap());
                 self.reply(id, json!({"frameId":MAIN_FRAME}));

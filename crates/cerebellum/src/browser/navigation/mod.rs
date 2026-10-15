@@ -1,3 +1,4 @@
+mod capture;
 mod frames;
 mod scroll;
 mod typing;
@@ -330,6 +331,7 @@ pub struct CdpNavigationDriver<IO> {
     point_frame: Option<crate::snapshot_store::FrameDocument>,
     point_target: Option<(String, BrowserClickPosition)>,
     downloads_denied: bool,
+    prefer_bulk_ax: bool,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -359,7 +361,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             point_frame: None,
             point_target: None,
             downloads_denied: false,
+            prefer_bulk_ax: true,
         }
+    }
+
+    /// Use the incremental AX protocol when an adapter supplies only child reads.
+    pub fn with_incremental_ax_snapshots(mut self) -> Self {
+        self.prefer_bulk_ax = false;
+        self
     }
 
     pub fn present(
@@ -1964,34 +1973,49 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         };
         let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
-        let mut observation = traverse_ax_tree(
-            root,
-            &attachment.target_id,
-            MAX_AX_NODES,
-            MAX_AX_DEPTH,
-            |node_id, frame_id| {
-                let mut params = Map::new();
-                params.insert("id".into(), Value::String(node_id.to_string()));
-                if let Some(frame_id) = frame_id {
-                    params.insert("frameId".into(), Value::String(frame_id.to_string()));
-                }
-                let result = self.command(
-                    "Accessibility.getChildAXNodes",
-                    Some(params),
-                    Some(session_id.clone()),
-                    if bounded {
-                        ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
-                    } else {
-                        deadline
-                    },
-                    None,
-                    clock,
-                )?;
-                required_ax_nodes(&result)
-                    .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
-            },
-        )
-        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
+        let bulk = if self.prefer_bulk_ax {
+            self.bulk_ax_capture(
+                &attachment,
+                &root,
+                subtree,
+                ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
+                clock,
+            )
+        } else {
+            None
+        };
+        let mut observation = if let Some(observation) = bulk {
+            observation
+        } else {
+            traverse_ax_tree(
+                root,
+                &attachment.target_id,
+                MAX_AX_NODES,
+                MAX_AX_DEPTH,
+                |node_id, frame_id| {
+                    let mut params = Map::new();
+                    params.insert("id".into(), Value::String(node_id.to_string()));
+                    if let Some(frame_id) = frame_id {
+                        params.insert("frameId".into(), Value::String(frame_id.to_string()));
+                    }
+                    let result = self.command(
+                        "Accessibility.getChildAXNodes",
+                        Some(params),
+                        Some(session_id.clone()),
+                        if bounded {
+                            ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
+                        } else {
+                            deadline
+                        },
+                        None,
+                        clock,
+                    )?;
+                    required_ax_nodes(&result)
+                        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
+                },
+            )
+            .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
+        };
 
         // A bounded AX prefix must not start another unbounded DOM read on the
         // same oversized page. Refs remain observable, with explicitly unknown
@@ -4850,7 +4874,7 @@ mod tests {
     }
 
     impl FakePipe {
-        fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
+        pub(super) fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
             let reads = frames
                 .into_iter()
                 .map(|frame| {
@@ -4874,9 +4898,12 @@ mod tests {
         }
 
         fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
-            let Some(bytes) = self.reads.pop_front() else {
+            let Some(mut bytes) = self.reads.pop_front() else {
                 return Ok(PipeRead::WouldBlock);
             };
+            if bytes.len() > destination.len() {
+                self.reads.push_front(bytes.split_off(destination.len()));
+            }
             destination[..bytes.len()].copy_from_slice(&bytes);
             Ok(PipeRead::Bytes(bytes.len()))
         }
@@ -4910,6 +4937,7 @@ mod tests {
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         )
+        .with_incremental_ax_snapshots()
     }
 
     fn driver_with_download_denial(
@@ -5051,7 +5079,7 @@ mod tests {
         }
     }
 
-    fn ax_node(
+    pub(super) fn ax_node(
         node_id: &str,
         role: &str,
         name: &str,
@@ -5073,7 +5101,7 @@ mod tests {
         node
     }
 
-    fn raw_node(
+    pub(super) fn raw_node(
         node_id: &str,
         role: &str,
         name: &str,
@@ -8467,7 +8495,8 @@ mod tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         let mut clock = FakeClock::new();
         let deadline = clock.now() + Duration::from_millis(10);
         driver
@@ -8650,7 +8679,8 @@ mod verification_tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         // The person's own sign-in page, attached the way a capture attaches
         // it, so the test can show nothing is sent to it.
         driver
@@ -8934,7 +8964,8 @@ mod signed_in_page_read_tests {
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
-        );
+        )
+        .with_incremental_ax_snapshots();
         driver
             .identities
             .attach(Attachment {
