@@ -91,6 +91,7 @@ pub(crate) fn spawn_handoff_poll(
         let interval = Duration::from_millis(browser_session::HANDOFF_POLL_INTERVAL_MS);
         let stop_at = tokio::time::Instant::now()
             + Duration::from_millis(browser_session::HANDOFF_DURATION_MS);
+        let mut journal_close = None;
         loop {
             let next = tokio::time::Instant::now() + interval;
             let last = next >= stop_at;
@@ -107,19 +108,23 @@ pub(crate) fn spawn_handoff_poll(
                 Ok(browser_session::HandoffPollResult::Open) if last => break,
                 Ok(browser_session::HandoffPollResult::Open) => continue,
                 Ok(browser_session::HandoffPollResult::Closed(close)) => {
+                    let ending = handoff_ending(close.outcome);
                     if close.should_journal {
-                        let _ = planes
-                            .browser
-                            .journal_handoff_closed(&identity, &close)
-                            .await;
+                        journal_close = Some(close);
                     }
-                    handoff_ending(close.outcome)
+                    ending
                 }
                 Ok(browser_session::HandoffPollResult::Gone) | Err(_) => {
                     journal::call_records::HandoffEnding::HandoffInterrupted
                 }
             };
             let Some(settle) = &settle else {
+                if let Some(close) = journal_close {
+                    let _ = planes
+                        .browser
+                        .journal_handoff_closed(&identity, &close)
+                        .await;
+                }
                 break;
             };
             let written = Arc::new(std::sync::OnceLock::new());
@@ -136,8 +141,18 @@ pub(crate) fn spawn_handoff_poll(
                 // Written; or failed on the last turn; or still running past
                 // its bound, in which case the late write is left to finish
                 // on its own rather than started a second time.
-                Some(_) | None => break,
+                Some(_) | None => {}
             }
+            // A caller needs the handoff's final result even when an unrelated
+            // audit write holds the browser journal. Publish the late result
+            // before waiting for that journal; no more CDP reads are needed.
+            if let Some(close) = journal_close {
+                let _ = planes
+                    .browser
+                    .journal_handoff_closed(&identity, &close)
+                    .await;
+            }
+            break;
         }
     })
 }

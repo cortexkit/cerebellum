@@ -1372,6 +1372,40 @@ async fn no_reply_names_a_capture_file_or_a_command() {
 // --- handoff endings --------------------------------------------------------
 
 #[tokio::test]
+async fn a_login_before_the_first_capture_poll_uses_the_opening_credential_baseline() {
+    let fixture = fixture();
+    fixture.launcher.script.lock().unwrap().login_poll = 1;
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "captured");
+    let events = fixture.events.snapshot();
+    let before_verification = events
+        .iter()
+        .take_while(|event| !event.starts_with("verify:"));
+    assert_eq!(
+        before_verification
+            .filter(|event| event.starts_with("cookie_names:"))
+            .count(),
+        2
+    );
+    assert_eq!(fixture.launcher.verifications.count(), 1);
+    assert_eq!(fixture.vault.calls(), 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_opening_field_cannot_nominate_a_capture_login() {
+    let fixture = fixture();
+    *fixture.launcher.script.lock().unwrap() = BrowserScript {
+        login_poll: 1,
+        opening_credential_unreadable: true,
+        ..BrowserScript::default()
+    };
+    let (outcome, _) = capture(&fixture, &ollama(), allow()).await;
+    assert_eq!(outcome.reply["outcome"], "expired");
+    assert_eq!(fixture.launcher.verifications.count(), 0);
+    nothing_captured(&fixture);
+}
+
+#[tokio::test]
 async fn a_closed_window_ends_with_no_login_observed_and_nothing_written() {
     let fixture = fixture();
     *fixture.launcher.script.lock().unwrap() = BrowserScript {

@@ -1570,11 +1570,15 @@ impl CaptureModule {
         let (browser, opened) = on_browser(browser, move |browser| {
             browser.navigate(&login_url, deadline_ms)?;
             browser.present(deadline_ms)?;
-            browser.cookie_names_for_origin(&opening_origin, deadline_ms)
+            let names = browser.cookie_names_for_origin(&opening_origin, deadline_ms)?;
+            // Preserve the credential step even if sign-in finishes before the
+            // first poll after the window is handed to the person.
+            let credential_field = browser.has_credential_field(deadline_ms).unwrap_or(false);
+            Ok((names, credential_field))
         })
         .await;
-        let opening_cookie_names = match opened {
-            Some(Ok(names)) => names,
+        let (opening_cookie_names, mut saw_credential_field) = match opened {
+            Some(Ok(baseline)) => baseline,
             Some(Err(CaptureDriveError)) => return (browser, Err("present")),
             None => return (browser, Err("present")),
         };
@@ -1599,7 +1603,6 @@ impl CaptureModule {
         // The runtime's clock, so tests can run a full-length handoff in
         // paused time; in production it is the same monotonic clock.
         let started = tokio::time::Instant::now();
-        let mut saw_credential_field = false;
         let mut verification = VerificationRecord::default();
         loop {
             if cancelled() {

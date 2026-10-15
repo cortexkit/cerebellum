@@ -379,6 +379,9 @@ pub(crate) async fn serve(
             }
             let calls = Arc::clone(&planes.calls);
             if name == ops::LATE_RESULTS {
+                let reads_content = cortexkit_role_tool_provider::consumer_reads_content_v1(
+                    facts.consumer_capabilities(),
+                );
                 let request = match serde_json::from_value::<LateResultsRequest>(Value::Object(
                     arguments.clone(),
                 )) {
@@ -396,15 +399,27 @@ pub(crate) async fn serve(
                         .await
                     }
                 };
-                tokio::task::spawn_blocking(move || {
-                    calls
-                        .late_results(&principal, &request, wall_clock_ms())
-                        .map(|reply| {
-                            serde_json::to_value(reply).expect("published reply serializes")
-                        })
+                let mut reply = tokio::task::spawn_blocking(move || {
+                    calls.late_results(&principal, &request, wall_clock_ms())
                 })
                 .await
-                .map_err(|error| ModuleError::Message(error.to_string()))?
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+                // Wrap results in content/v1 only for readers that declare it.
+                // Store outcome/origin unchanged so legacy pulls and replays
+                // can still receive their original JSON.
+                if reads_content {
+                    if let Ok(reply) = &mut reply {
+                        for entry in &mut reply.entries {
+                            if let Some(result) = entry.result.take() {
+                                entry.result = Some(
+                                    serde_json::from_slice(&crate::tool_result::encode(result)?)
+                                        .map_err(ModuleError::Json)?,
+                                );
+                            }
+                        }
+                    }
+                }
+                reply.map(|reply| serde_json::to_value(reply).expect("published reply serializes"))
             } else {
                 let request =
                     match serde_json::from_value::<AckRequest>(Value::Object(arguments.clone())) {

@@ -1874,10 +1874,8 @@ async fn observed_fixture_login(
     assert_eq!(presented["outcome"], "presented", "{presented}");
     use cerebellum::browser_session::{HandoffOutcome, HandoffPollResult};
     let sessions = &fixture.planes.sessions;
-    assert!(matches!(
-        sessions.poll_handoff(conversation, 1, 100, fixture.planes.lease_clock.as_ref()),
-        HandoffPollResult::Open
-    ));
+    // Present already read the scripted credential step at handover, so the
+    // first poll can observe its disappearance and the new session cookie.
     let closed = sessions.poll_handoff(conversation, 1, 100, fixture.planes.lease_clock.as_ref());
     assert!(
         matches!(closed, HandoffPollResult::Closed(ref close) if close.outcome == HandoffOutcome::LoginObserved),
