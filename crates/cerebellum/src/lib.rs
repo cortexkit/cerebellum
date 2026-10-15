@@ -5067,11 +5067,12 @@ async fn capture_browser_login(
     tokio::spawn(async move {
         let outcome = running.await;
         let ending = capture_ending(&outcome.reply);
-        let _ = journal_capture_outcome(&browser, &identity, outcome).await;
         let _ = tokio::task::spawn_blocking(move || {
             calls.finish_handoff(&principal, &key, ending, wall_clock_ms())
         })
         .await;
+        // Audit congestion must not hold back the capture's already-known result.
+        let _ = journal_capture_outcome(&browser, &identity, outcome).await;
     });
     json!({
         "outcome":"capture_pending", "origin":handoff.origin,

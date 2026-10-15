@@ -134,6 +134,19 @@ fn is_success(code: &str) -> bool {
     )
 }
 
+fn login_notice(object: &Map<String, Value>) -> Option<String> {
+    let origin = object.get("origin")?.as_str()?;
+    Some(match object.get("outcome")?.as_str()? {
+        "login_observed" => format!("Sign-in on {origin} was observed. Continue with snapshot."),
+        "expired" | "handoff_expired" => format!("The sign-in window on {origin} expired before a login was seen. Call present again if still needed."),
+        "handoff_interrupted" => format!("The sign-in handoff on {origin} was interrupted by a restart. Call present again."),
+        "captured" => format!("Sign-in on {origin} was captured in the vault. Continue with the authenticated request."),
+        "session_invalid" => format!("The captured sign-in on {origin} could not be verified. Call capture_login again."),
+        "closed_by_caller" => format!("The sign-in handoff on {origin} was closed by the caller."),
+        _ => return None,
+    })
+}
+
 fn project(reply: Value) -> ToolResult {
     let Some(object) = reply.as_object() else {
         return ToolResult::new(vec![ContentPart::text(reply.to_string())]);
@@ -162,7 +175,11 @@ fn project(reply: Value) -> ToolResult {
             serde_json::to_string(key).expect("key serializes")
         ));
     }
-    content.push(ContentPart::text(format!("{{{}}}", members.join(","))));
+    // State the sign-in outcome and next step in plain text, retaining the
+    // original fields in structuredContent for both live replies and late pulls.
+    content.push(ContentPart::text(
+        login_notice(object).unwrap_or_else(|| format!("{{{}}}", members.join(","))),
+    ));
     let image = projected_image.and_then(|(_, image, note)| {
         if let Some(note) = note {
             content.push(ContentPart::text(note));

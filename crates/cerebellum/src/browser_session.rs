@@ -2327,7 +2327,7 @@ impl BrowserSessions {
             self.admit(&cell, &mut meta, true)
         };
 
-        let opening_cookie_names = {
+        let (opening_cookie_names, saw_credential_field) = {
             let mut driver = cell.driver().map_err(|_| PresentRefusal::NoSession)?;
             let process = driver.as_mut().ok_or(PresentRefusal::NoSession)?;
             let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
@@ -2345,11 +2345,19 @@ impl BrowserSessions {
                     error_text: navigation_drive_error_text(error),
                 }
             })?;
-            process
+            let cookie_names = process
                 .cookie_names_for_origin(route_key, origin, deadline_ms)
                 .map_err(|error| PresentRefusal::PresentFailed {
                     error_text: navigation_drive_error_text(error),
-                })?
+                })?;
+            // A quick sign-in can finish before the first background tick. Keep
+            // the credential step seen at handover as the classifier's baseline.
+            // An unreadable field is not evidence of a credential step; later
+            // polls can still observe it without refusing the window handover.
+            let credential_field = process
+                .has_credential_field(route_key, deadline_ms)
+                .unwrap_or(false);
+            (cookie_names, credential_field)
         };
 
         let mut meta = cell.meta().map_err(|_| PresentRefusal::NoSession)?;
@@ -2369,7 +2377,7 @@ impl BrowserSessions {
             opened_at,
             expires_at,
             opening_cookie_names,
-            saw_credential_field: false,
+            saw_credential_field,
             cookie_names_added: 0,
         }));
         admission.release_locked(&mut meta);
@@ -2379,6 +2387,18 @@ impl BrowserSessions {
             generation,
             expires_in_ms: HANDOFF_DURATION_MS,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn expire_handoff_for_test<C: MonotonicClock>(&self, route_key: &str, clock: &C) {
+        let cell = self.active_cell(route_key).unwrap().unwrap();
+        let Ok(mut meta) = cell.meta() else {
+            panic!("handoff metadata lock is poisoned");
+        };
+        let Some(HandoffState::Open(handoff)) = meta.handoff.as_mut() else {
+            panic!("no open handoff to expire");
+        };
+        handoff.expires_at = clock.now();
     }
 
     pub fn resume<C: MonotonicClock>(

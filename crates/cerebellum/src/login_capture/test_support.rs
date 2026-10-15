@@ -399,8 +399,13 @@ impl VaultRoute for FakeRoute {
 /// How the fake browser behaves once handed to the person.
 #[derive(Clone)]
 pub(crate) struct BrowserScript {
-    /// Show a credential field and then log in on the next poll.
+    /// Show a credential field before the scripted login poll.
     pub(crate) logs_in: bool,
+    /// Login becomes observable at this poll (1-based); 1 leaves only the
+    /// opening read to observe the credential field.
+    pub(crate) login_poll: usize,
+    /// Fail only the opening credential read, before any poll has run.
+    pub(crate) opening_credential_unreadable: bool,
     /// Report the process gone at this poll (1-based).
     pub(crate) exits_at_poll: Option<usize>,
     /// Answer every other liveness check with a failed reading instead of
@@ -421,6 +426,8 @@ impl Default for BrowserScript {
     fn default() -> Self {
         Self {
             logs_in: true,
+            login_poll: 2,
+            opening_credential_unreadable: false,
             exits_at_poll: None,
             liveness_unreadable: false,
             cookies: vec![
@@ -497,8 +504,10 @@ impl CaptureBrowser for FakeBrowser {
     }
 
     fn has_credential_field(&mut self, _deadline_ms: u64) -> Result<bool, CaptureDriveError> {
-        // Shown on the first poll, gone from the second: a completed login.
-        Ok(self.script.logs_in && self.polls == 1)
+        if self.polls == 0 && self.script.opening_credential_unreadable {
+            return Err(CaptureDriveError);
+        }
+        Ok(self.script.logs_in && self.polls + 1 == self.script.login_poll)
     }
 
     fn cookie_names_for_origin(
@@ -508,9 +517,8 @@ impl CaptureBrowser for FakeBrowser {
     ) -> Result<BTreeSet<String>, CaptureDriveError> {
         self.name_reads += 1;
         self.events.push(format!("cookie_names:{origin}"));
-        // The opening read and the first poll see no session cookie; it
-        // appears once the person has submitted the form.
-        if self.script.logs_in && self.name_reads >= 3 {
+        // The opening read has no session cookie; the login poll adds it.
+        if self.script.logs_in && self.name_reads > self.script.login_poll {
             let mut names = BTreeSet::from(["session".to_string()]);
             if self.script.cookie_names_churn {
                 names.insert(format!("tracker-{}", self.name_reads));

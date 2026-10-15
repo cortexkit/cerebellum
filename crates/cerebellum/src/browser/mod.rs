@@ -1589,6 +1589,11 @@ impl BrowserPlane {
         usize::from(self.journal.lock().await.store.is_some())
     }
 
+    #[doc(hidden)]
+    pub async fn hold_journal_for_test(&self) -> impl Drop + '_ {
+        self.journal.lock().await
+    }
+
     /// Bytes still held by reservations that have not reached a terminal state.
     ///
     /// The export cannot answer this: it merges finalized entries with
