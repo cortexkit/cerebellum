@@ -1403,6 +1403,21 @@ async fn screenshot_returns_a_liftable_image_object_without_flat_base64() {
 }
 
 #[tokio::test]
+async fn scroll_on_user_browser_is_typed_unsupported_without_extension_commands() {
+    let fixture = Fixture::new();
+    let (reply, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"scroll","direction":"down"}),
+            "deny",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "refused", "{reply}");
+    assert_eq!(reply["reason"], "unsupported_on_user_browser", "{reply}");
+    assert!(fixture.state.lock().unwrap().commands.is_empty());
+}
+
+#[tokio::test]
 async fn new_tab_actions_have_exactly_launch_admission_and_user_refusals_are_tagged() {
     let admitted = vec![crate::browser_session::BROWSER_STATUS.to_owned()];
     let tool = crate::flat_tools::browser_tool(&admitted).unwrap();

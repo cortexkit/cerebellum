@@ -795,6 +795,9 @@ async fn serve_scoped(
 }
 
 fn validate(action: &str, args: &Value) -> Result<(), Value> {
+    if action == "scroll" {
+        return Err(refusal("unsupported_on_user_browser"));
+    }
     let object = args
         .as_object()
         .ok_or_else(|| invalid("arguments", "wrong_type"))?;

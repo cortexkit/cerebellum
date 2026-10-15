@@ -360,6 +360,8 @@ budget!(
         ("DOM.enable", CDP_STEP_MS, 1),
         ("DOM.getFlattenedDocument", CDP_STEP_MS, 1),
         ("DOM.getDocument", CDP_STEP_MS, 1),
+        ("DOM.pushNodesByBackendIdsToFrontend", CDP_STEP_MS, 1),
+        ("DOM.querySelector", CDP_STEP_MS, 1),
         ("DOM.getOuterHTML", CDP_STEP_MS, 1),
         ("frame_snapshots", FRAME_SNAPSHOT_PHASE_MS, 1),
         ("journal", STORE_MS, 1),
@@ -478,7 +480,19 @@ budget!(
         ("journal", STORE_MS, 1),
     ]
 );
-pub const BROWSER_ACTIONS: [ActionBudget; 11] = [
+budget!(
+    BROWSER_SCROLL,
+    "scroll",
+    [
+        ("preflight", PREFLIGHT_MS, 1),
+        ("attachment", CDP_STEP_MS, 3),
+        ("committed_document", CDP_STEP_MS, 2),
+        ("prepare_frame", FRAME_DISCOVERY_PHASE_MS, 1),
+        ("scroll", CDP_STEP_MS, 2),
+        ("journal", STORE_MS, 1),
+    ]
+);
+pub const BROWSER_ACTIONS: [ActionBudget; 12] = [
     BROWSER_LAUNCH,
     BROWSER_OPEN_TAB,
     BROWSER_CLAIM_TAB,
@@ -487,6 +501,7 @@ pub const BROWSER_ACTIONS: [ActionBudget; 11] = [
     BROWSER_NAVIGATE,
     BROWSER_SNAPSHOT,
     BROWSER_SCREENSHOT,
+    BROWSER_SCROLL,
     BROWSER_CLICK,
     BROWSER_TYPE,
     BROWSER_CLICK_POINT,
@@ -906,6 +921,15 @@ mod tests {
             (BROWSER_OPEN_TAB, PREFLIGHT_MS + 60_000 + STORE_MS),
             (BROWSER_CLAIM_TAB, PREFLIGHT_MS + 60_000 + STORE_MS),
             (BROWSER_STATUS, GRANT_LOOKUP_MS),
+            (
+                BROWSER_SCROLL,
+                PREFLIGHT_MS
+                    + ATTACHMENT_MS
+                    + COMMITTED_DOCUMENT_MS
+                    + FRAME_DISCOVERY_PHASE_MS
+                    + 2 * CDP_STEP_MS
+                    + STORE_MS,
+            ),
             (BROWSER_CLOSE, PREFLIGHT_MS + TEARDOWN_MS + STORE_MS),
             (
                 BROWSER_NAVIGATE_ONLY,
@@ -926,7 +950,7 @@ mod tests {
                     + ATTACHMENT_MS
                     + COMMITTED_DOCUMENT_MS
                     + FRAME_DISCOVERY_PHASE_MS
-                    + 6 * CDP_STEP_MS
+                    + 8 * CDP_STEP_MS
                     + AX_CHILDREN_PHASE_MS
                     + FRAME_SNAPSHOT_PHASE_MS
                     + STORE_MS,

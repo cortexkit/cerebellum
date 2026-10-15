@@ -22,26 +22,37 @@ mod probe {
     use cerebellum::browser::state_text::{self, Filters, RenderInput, Zoom};
     use cerebellum::browser::Tracker;
     use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead};
-    use cerebellum::browser_session::NavigationWait;
+    use cerebellum::browser_session::{BrowserScrollTarget, NavigationWait};
     use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
     use cerebellum::snapshot_store::{RefRecord, SnapshotKind};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::{self, Read, Write};
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     const DEADLINE: u64 = 30_000;
 
     struct Pipe {
         commands: UnixStream,
         responses: UnixStream,
+        counts: Arc<Mutex<BTreeMap<String, usize>>>,
     }
 
     impl CdpPipeIo for Pipe {
         fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
+            *self
+                .counts
+                .lock()
+                .unwrap()
+                .entry(command["method"].as_str().unwrap().to_string())
+                .or_default() += 1;
             self.commands.write_all(bytes)
         }
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<PipeRead> {
@@ -54,7 +65,50 @@ mod probe {
         }
     }
 
-    fn page(_label: &str, _iframe: &str) -> String {
+    impl Pipe {
+        fn duplicate(&self) -> Self {
+            Self {
+                commands: self.commands.try_clone().unwrap(),
+                responses: self.responses.try_clone().unwrap(),
+                counts: self.counts.clone(),
+            }
+        }
+
+        // Probe reads run only between driver calls, with disjoint command ids.
+        // They measure the fixture's geometry without exposing script to tools.
+        fn evaluate(&mut self, session: &str, id: u64, expression: &str) -> Result<Value, String> {
+            let mut command = serde_json::to_vec(&json!({"id":id,"sessionId":session,"method":"Runtime.evaluate","params":{"expression":expression,"returnByValue":true,"awaitPromise":true}})).unwrap();
+            command.push(0);
+            self.commands
+                .write_all(&command)
+                .map_err(|e| e.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut buffer = Vec::new();
+            let mut chunk = [0; 65536];
+            while Instant::now() < deadline {
+                match self.responses.read(&mut chunk) {
+                    Ok(0) => return Err("Chrome closed the probe pipe".into()),
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                    Err(e) => return Err(e.to_string()),
+                }
+                while let Some(end) = buffer.iter().position(|b| *b == 0) {
+                    let response: Value =
+                        serde_json::from_slice(&buffer[..end]).map_err(|e| e.to_string())?;
+                    buffer.drain(..=end);
+                    if response["id"] == id {
+                        return response
+                            .pointer("/result/result/value")
+                            .cloned()
+                            .ok_or_else(|| format!("probe evaluate: {response}"));
+                    }
+                }
+            }
+            Err("probe evaluate deadline".into())
+        }
+    }
+
+    fn page() -> String {
         let links = (0..600)
             .map(|n| format!("<li><a href='#setting-{n}'>Repository setting {n}</a></li>"))
             .collect::<String>();
@@ -89,14 +143,8 @@ mod probe {
 
     pub fn run() -> Result<(), String> {
         let main = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let child = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let url = format!("http://127.0.0.1:{}/", main.local_addr().unwrap().port());
-        let iframe = format!(
-            "<iframe src='http://localhost:{}/' title='Embedded events'></iframe>",
-            child.local_addr().unwrap().port()
-        );
-        serve(main, page("Event", &iframe));
-        serve(child, page("Embedded event", ""));
+        serve(main, page());
         let profile = PathBuf::from(format!("/tmp/ck-browser-settings-{}", std::process::id()));
         std::fs::create_dir(&profile).map_err(|e| e.to_string())?;
         let chrome = std::env::var_os("CK_CHROME")
@@ -143,6 +191,7 @@ mod probe {
                 Pipe {
                     commands,
                     responses,
+                    counts: Arc::default(),
                 },
                 &url,
             )
@@ -187,6 +236,7 @@ mod probe {
     }
 
     fn exercise(pipe: Pipe, url: &str) -> Result<(), String> {
+        let mut observer = pipe.duplicate();
         let mut driver =
             CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default());
         driver
@@ -198,6 +248,15 @@ mod probe {
                 &mut Tracker::default(),
             )
             .map_err(|e| format!("navigate: {e:?}"))?;
+        let frames = driver
+            .frame_documents("settings-probe", DEADLINE)
+            .map_err(|e| format!("frames: {e:?}"))?;
+        let session = &frames
+            .iter()
+            .find(|f| f.parent_id.is_none())
+            .unwrap()
+            .session_id;
+        let counts_before = observer.counts.lock().unwrap().clone();
         let start = Instant::now();
         let observation = driver
             .snapshot_classified("settings-probe", SnapshotKind::Actionable, 1, url, DEADLINE)
@@ -209,16 +268,29 @@ mod probe {
             observation.refs.len(),
             observation.ax_truncated
         );
+        let counts = observer
+            .counts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, count)| {
+                (
+                    method.clone(),
+                    count - counts_before.get(method).unwrap_or(&0),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        println!("capture CDP commands: {counts:?}");
         println!(
             "last records: {:?}",
             &observation.records[observation.records.len().saturating_sub(5)..]
         );
         println!(
-            "settings form records: {:?}",
+            "FORM RECORDS: {:?}",
             observation
                 .records
                 .iter()
-                .filter(|r| r.role == "main" || r.role == "checkbox")
+                .skip_while(|r| r.role != "main")
                 .collect::<Vec<_>>()
         );
         let render_filtered = |filters: &Filters| {
@@ -232,7 +304,15 @@ mod probe {
                 max_bytes: 8000,
             })
         };
-        println!("OUTLINE:\n{}", render_filtered(&Filters::default()).text);
+        let outline = render_filtered(&Filters::default()).text;
+        println!("OUTLINE:\n{outline}");
+        let mut checks = vec![(
+            "settings_outline_main_before_nav",
+            outline
+                .find("main Branch protection")
+                .zip(outline.find("navigation Settings"))
+                .is_some_and(|(main, nav)| main < nav),
+        )];
         for (name, filters) in [
             (
                 "settings_role_filter_finds_below_fold",
@@ -251,10 +331,10 @@ mod probe {
         ] {
             let text = render_filtered(&filters).text;
             println!("{name}:\n{text}");
-            println!(
-                "{name}: found={}",
-                text.contains("Require status checks to pass before merging")
-            );
+            checks.push((
+                name,
+                text.contains("Require status checks to pass before merging"),
+            ));
         }
         let main = named(&observation, "Branch protection");
         let zoom = driver
@@ -267,12 +347,55 @@ mod probe {
                 DEADLINE,
             )
             .map_err(|e| format!("zoom: {e:?}"))?;
-        println!(
-            "settings_zoom_main_lists_checkbox: found={}",
-            render(&zoom, &main, 8000)
-                .text
-                .contains("Require status checks to pass before merging")
-        );
+        let zoom_text = render(&zoom, &main, 8000).text;
+        println!("MAIN ZOOM:\n{zoom_text}");
+        checks.push((
+            "settings_zoom_main_lists_checkbox",
+            zoom_text.contains("Require status checks to pass before merging"),
+        ));
+        let rect = "new Promise(requestAnimationFrame).then(()=>({rect:document.getElementById('target').getBoundingClientRect().toJSON(),width:innerWidth,height:innerHeight,scrollY}))";
+        let before = observer.evaluate(session, 1_000_001, rect)?;
+        println!("checkbox rect before scroll: {before}");
+        checks.push((
+            "settings_target_starts_below_fold",
+            before["rect"]["top"].as_f64().unwrap() > before["height"].as_f64().unwrap(),
+        ));
+        let target = named(&observation, "Require status checks to pass before merging");
+        driver
+            .scroll(
+                "settings-probe",
+                &BrowserScrollTarget::Element(target.backend_identity.unwrap()),
+                DEADLINE,
+            )
+            .map_err(|e| format!("scroll ref: {e:?}"))?;
+        let after = observer.evaluate(session, 1_000_002, rect)?;
+        println!("checkbox rect after scroll: {after}");
+        let inside = after["rect"]["top"].as_f64().unwrap() >= 0.0
+            && after["rect"]["bottom"].as_f64().unwrap() <= after["height"].as_f64().unwrap()
+            && after["rect"]["left"].as_f64().unwrap() >= 0.0
+            && after["rect"]["right"].as_f64().unwrap() <= after["width"].as_f64().unwrap();
+        checks.push(("settings_scroll_ref_brings_checkbox_into_viewport", inside));
+        driver
+            .scroll(
+                "settings-probe",
+                &BrowserScrollTarget::Page { x: 0, y: 400 },
+                DEADLINE,
+            )
+            .map_err(|e| format!("scroll page down: {e:?}"))?;
+        let page_before = observer.evaluate(session, 1_000_003, rect)?;
+        driver
+            .scroll(
+                "settings-probe",
+                &BrowserScrollTarget::Page { x: 0, y: -400 },
+                DEADLINE,
+            )
+            .map_err(|e| format!("scroll page: {e:?}"))?;
+        let page_after = observer.evaluate(session, 1_000_004, rect)?;
+        println!("checkbox rect after page scroll up 400: {page_after}");
+        checks.push((
+            "settings_scroll_page_moves_viewport",
+            page_after["scrollY"].as_f64().unwrap() < page_before["scrollY"].as_f64().unwrap(),
+        ));
         let dom = driver
             .snapshot("settings-probe", SnapshotKind::DomFull, DEADLINE)
             .map_err(|e| format!("dom: {e:?}"))?
@@ -283,10 +406,22 @@ mod probe {
             dom.len(),
             &dom[..dom.len().min(100)]
         );
+        checks.push((
+            "settings_dom_full_starts_at_body",
+            dom.starts_with("<body") && !dom.contains("<head>"),
+        ));
+        for (name, passed) in &checks {
+            println!("{name}: {}", if *passed { "PASS" } else { "FAIL" });
+        }
         println!(
-            "settings_dom_full_starts_at_body: {}",
-            !dom.contains("<head>")
+            "{} checks, {} failed",
+            checks.len(),
+            checks.iter().filter(|(_, passed)| !passed).count()
         );
-        Ok(())
+        if checks.iter().all(|(_, passed)| *passed) {
+            Ok(())
+        } else {
+            Err("settings fixture regressions failed".into())
+        }
     }
 }

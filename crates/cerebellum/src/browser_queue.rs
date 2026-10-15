@@ -132,12 +132,13 @@ struct SessionCall {
 /// Capabilities that drive the session's browser. Other calls that share
 /// the lane (launch, grants, the person's own browser) are not refused for a
 /// quarantined session.
-const SESSION_CAPABILITIES: [&str; 11] = [
+const SESSION_CAPABILITIES: [&str; 12] = [
     crate::browser::NAVIGATE,
     crate::browser::SNAPSHOT,
     crate::browser::CLICK,
     crate::browser::TYPE,
     crate::browser::SCREENSHOT,
+    crate::browser::SCROLL,
     crate::browser::CLICK_POINT,
     crate::browser::WAIT_FOR,
     crate::browser_session::BROWSER_CLOSE,
@@ -211,6 +212,7 @@ fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
             crate::browser::CLICK,
             crate::browser::TYPE,
             crate::browser::CLICK_POINT,
+            crate::browser::SCROLL,
         ]
         .contains(&capability),
         close_session: (capability == crate::browser_session::BROWSER_CLOSE)

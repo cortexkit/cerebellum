@@ -501,6 +501,13 @@ impl From<NavigationDriveError> for ClickPointDriveError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A document-bound element, or a CSS-pixel content offset for a page gesture.
+pub enum BrowserScrollTarget {
+    Element(BackendNodeIdentity),
+    Page { x: i32, y: i32 },
+}
+
 pub trait OwnedBrowserProcess: Send {
     /// Front the process-owned page without exposing a general CDP command seam.
     fn present(
@@ -640,6 +647,16 @@ pub trait OwnedBrowserProcess: Send {
     }
     fn point_frame_document(&mut self) -> Option<crate::snapshot_store::FrameDocument> {
         None
+    }
+
+    /// Scroll through the process-owned CDP driver without fronting its window.
+    fn scroll(
+        &mut self,
+        _context_key: &str,
+        _target: &BrowserScrollTarget,
+        _deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
     }
 
     /// Capture one visual viewport through the process-owned CDP driver.
@@ -1837,6 +1854,18 @@ impl OperationGuard {
         self.drive(
             |error| error,
             |process| process.screenshot(context_key, document_epoch, deadline_ms, full),
+        )
+    }
+
+    pub(crate) fn scroll(
+        &mut self,
+        context_key: &str,
+        target: &BrowserScrollTarget,
+        deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.scroll(context_key, target, deadline_ms),
         )
     }
 

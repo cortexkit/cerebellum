@@ -608,6 +608,24 @@ impl RecordingProcess {
 }
 
 impl OwnedBrowserProcess for RecordingProcess {
+    fn scroll(
+        &mut self,
+        _: &str,
+        target: &cerebellum::browser_session::BrowserScrollTarget,
+        _: u64,
+    ) -> Result<(), NavigationDriveError> {
+        use cerebellum::browser_session::BrowserScrollTarget;
+        let effect = match target {
+            BrowserScrollTarget::Element(identity) if identity.backend_node_id == 42 => {
+                "scroll_ref"
+            }
+            BrowserScrollTarget::Page { x: 0, y: 600 } => "scroll_page",
+            _ => "unexpected_scroll",
+        };
+        self.effects.lock().unwrap().push(effect);
+        Ok(())
+    }
+
     fn frame_documents(
         &mut self,
         _: &str,
@@ -1055,6 +1073,7 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
             // Both admitted after being driven through this wire path against
             // Chrome 151, THROUGH their authorization gates.
             "browser.screenshot",
+            "browser.scroll",
             // click_point addresses a retained screenshot, so its risk is the
             // pixel-to-css mapping rather than the dispatch: a click that lands
             // somewhere plausible is worse than one that fails, because nothing
@@ -1688,6 +1707,77 @@ fn planes_with_installed_grants(
         .with_grants_installed(GrantStore::new(grants)),
     );
     planes
+}
+
+#[tokio::test]
+async fn scroll_wire_uses_observe_grant_and_retained_ref_without_fronting() {
+    let launcher = Arc::new(RecordingLauncher {
+        hazardous_target: true,
+        ..RecordingLauncher::default()
+    });
+    launcher.page.commit("https://page.example:8443/settings");
+    let planes = planes_with_installed_grants(
+        &launcher,
+        vec![ActionGrant::new(
+            "observe",
+            1,
+            "test-session",
+            Severity::new(OBSERVE, false, false),
+            ["https://page.example:8443"],
+        )],
+    );
+    let launched = response_body(&planes, 1, "browser.launch", json!({})).await;
+    assert_eq!(launched["outcome"], "launched", "{launched}");
+    let snapshot = response_body(&planes, 2, "browser.snapshot", json!({})).await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let reference = first_ref(&snapshot);
+    launcher.effects.lock().unwrap().clear();
+    for (corr, args) in [
+        (3, json!({"action":"scroll","ref":reference})),
+        (4, json!({"action":"scroll","direction":"down"})),
+    ] {
+        let reply = response_body(&planes, corr, "browser_use", args).await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert_eq!(reply["scroll_dispatched"], true, "{reply}");
+        assert!(cerebellum::browser::validate_browser_result("browser.scroll", &reply).is_ok());
+    }
+    assert_eq!(
+        *launcher.effects.lock().unwrap(),
+        ["scroll_ref", "scroll_page"]
+    );
+    launcher
+        .page
+        .commit("https://page.example:8443/replacement");
+    let stale = response_body(
+        &planes,
+        5,
+        "browser_use",
+        json!({"action":"scroll","ref":reference}),
+    )
+    .await;
+    assert_eq!(stale["outcome"], "stale_snapshot", "{stale}");
+    assert_eq!(
+        *launcher.effects.lock().unwrap(),
+        ["scroll_ref", "scroll_page"]
+    );
+}
+
+#[tokio::test]
+async fn scroll_wire_validates_target_alternatives_before_dispatch() {
+    let planes = planes_with_installed_grants(&Arc::new(RecordingLauncher::default()), vec![]);
+    for (corr, args) in [
+        (1, json!({"action":"scroll"})),
+        (2, json!({"action":"scroll","ref":"e1","direction":"down"})),
+        (3, json!({"action":"scroll","direction":"down","amount":0})),
+        (
+            4,
+            json!({"action":"scroll","direction":"down","amount":10001}),
+        ),
+        (5, json!({"action":"scroll","direction":"sideways"})),
+    ] {
+        let reply = response_body(&planes, corr, "browser_use", args).await;
+        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    }
 }
 
 async fn click_cross_site_link(planes: &Planes, corr: u64) -> Value {

@@ -1131,17 +1131,15 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &common_only.provides[0] else {
             panic!("expected tool provider");
         };
-        // Three controls, navigate, screenshot, and their flat adapter. Screenshot needs no
-        // extraction evidence because it runs none of the logic that evidence
-        // attests: it captures pixels and reads viewport geometry, where
-        // snapshot and click turn a page into structured data and address a
-        // ref within it. A capture can be wrong about a rectangle; it cannot
-        // be wrong about a corpus it never consults.
+        // Structured page readers need evidence that the connector passes its
+        // extraction corpus tests. Screenshot and viewport scroll do not use
+        // that structured-data projection: they capture pixels or move the
+        // viewport without classifying or activating a form control.
         assert_eq!(
             tools.len(),
-            7,
+            8,
             "three controls, navigate, the extraction-free capture, the coordinate \
-             click whose mapping is verified against a live browser, and browser_use"
+             click whose mapping is verified against a live browser, viewport scroll, and browser_use"
         );
         assert!(!tools.iter().any(|tool| tool.name == BROWSER_TYPE_TOOL));
 
@@ -1156,7 +1154,7 @@ mod tests {
         };
         assert_eq!(
             tools.len(),
-            10,
+            11,
             "three controls, navigate, screenshot, snapshot, click, type, the coordinate \
              click, and browser_use"
         );

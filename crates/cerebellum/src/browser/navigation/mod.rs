@@ -1,4 +1,5 @@
 mod frames;
+mod scroll;
 mod typing;
 
 use std::cmp;
@@ -2049,44 +2050,65 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 );
             }
         }
-        if mode == SnapshotKind::DomFull && self.active_frame.is_some() {
-            let params = serde_json::json!({"backendNodeId":root_backend_id.ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Accessibility.getRootAXNode"))?}).as_object().unwrap().clone();
-            let outer = self.command(
-                "DOM.getOuterHTML",
-                Some(params),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                clock,
-            )?;
-            observation.dom_text = Some(
-                required_result_string(&outer, "outerHTML")
-                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
-            );
-        } else if mode == SnapshotKind::DomFull {
-            let mut params = Map::new();
-            params.insert("depth".into(), Value::Number(0.into()));
-            params.insert("pierce".into(), Value::Bool(true));
+        if mode == SnapshotKind::DomFull {
+            // Resolve the captured document, not the session's default document:
+            // same-process iframes share a session but have different bodies.
             let document = self.command(
                 "DOM.getDocument",
-                Some(params),
+                Some(
+                    serde_json::json!({"depth":0,"pierce":true})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
                 Some(attachment.session_id.clone()),
                 deadline,
                 None,
                 clock,
             )?;
-            let node_id = document
+            document
                 .get("root")
-                .and_then(Value::as_object)
                 .and_then(|root| root.get("nodeId"))
                 .and_then(Value::as_u64)
-                .filter(|node_id| *node_id > 0)
+                .filter(|id| *id > 0)
                 .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getDocument"))?;
-            let mut params = Map::new();
-            params.insert("nodeId".into(), Value::Number(node_id.into()));
+            let pushed = self.command("DOM.pushNodesByBackendIdsToFrontend", Some(serde_json::json!({"backendNodeIds":[root_backend_id.ok_or(NavigationDriveError::CdpFailure)?]}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), deadline, None, clock)?;
+            let document_id = pushed
+                .get("nodeIds")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    NavigationDriveError::CdpFailure.at_step("DOM.pushNodesByBackendIdsToFrontend")
+                })?;
+            let selected = self.command(
+                "DOM.querySelector",
+                Some(
+                    serde_json::json!({"nodeId":document_id,"selector":"body"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            let body_id = selected
+                .get("nodeId")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.querySelector"))?;
+            // A non-HTML document (for example SVG) need not have a body.
+            let node_id = if body_id == 0 { document_id } else { body_id };
             let outer_html = self.command(
                 "DOM.getOuterHTML",
-                Some(params),
+                Some(
+                    serde_json::json!({"nodeId":node_id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
                 Some(attachment.session_id),
                 deadline,
                 None,
@@ -3993,7 +4015,7 @@ fn command_effect(
                 _ => CommandEffect::Mutation,
             }
         }
-        "Page.navigate" | "DOM.focus" => CommandEffect::Mutation,
+        "Page.navigate" | "DOM.focus" | "DOM.scrollIntoViewIfNeeded" => CommandEffect::Mutation,
         "Runtime.callFunctionOn"
             if param("functionDeclaration").is_some_and(selection_mutating) =>
         {
@@ -4529,7 +4551,10 @@ where
             stack.push(PendingAxNode {
                 node: Some(child),
                 node_id: child_id,
-                depth: pending.depth + 1,
+                // Ignored AX containers have no record. Count only represented
+                // ancestors so a later sibling cannot appear beneath an earlier
+                // sibling's text just because its DOM wrappers were ignored.
+                depth: pending.depth + usize::from(!node.ignored),
                 frame_path: frame_path.clone(),
                 ancestors: ancestors.clone(),
             });
@@ -4819,8 +4844,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakePipe {
-        writes: Vec<Value>,
+    pub(super) struct FakePipe {
+        pub(super) writes: Vec<Value>,
         reads: VecDeque<Vec<u8>>,
     }
 
@@ -4857,12 +4882,12 @@ mod tests {
         }
     }
 
-    struct FakeClock {
+    pub(super) struct FakeClock {
         now: Instant,
     }
 
     impl FakeClock {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 now: Instant::now(),
             }
@@ -4901,7 +4926,9 @@ mod tests {
         driver(replies)
     }
 
-    fn attached_driver(frames: impl IntoIterator<Item = Value>) -> CdpNavigationDriver<FakePipe> {
+    pub(super) fn attached_driver(
+        frames: impl IntoIterator<Item = Value>,
+    ) -> CdpNavigationDriver<FakePipe> {
         let mut driver = driver(frames);
         driver
             .identities
@@ -5063,6 +5090,191 @@ mod tests {
             frame_id,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn settings_forms_survive_ignored_wrappers_and_output_cap() {
+        let specs = [
+            (
+                "root",
+                "RootWebArea",
+                "Settings",
+                vec!["nav", "outer"],
+                false,
+            ),
+            (
+                "nav",
+                "navigation",
+                "Settings navigation",
+                vec!["links"],
+                false,
+            ),
+            ("links", "list", "", vec![], false),
+            ("outer", "none", "", vec!["inner"], true),
+            ("inner", "none", "", vec!["main"], true),
+            (
+                "main",
+                "main",
+                "Branch protection",
+                vec!["heading", "div1"],
+                false,
+            ),
+            (
+                "heading",
+                "heading",
+                "Settings: fixture/repository",
+                vec!["heading-text"],
+                false,
+            ),
+            (
+                "heading-text",
+                "StaticText",
+                "Settings: fixture/repository",
+                vec!["inline"],
+                false,
+            ),
+            (
+                "inline",
+                "InlineTextBox",
+                "Settings: fixture/repository",
+                vec![],
+                false,
+            ),
+            ("div1", "none", "", vec!["div2"], true),
+            ("div2", "none", "", vec!["form"], true),
+            ("form", "form", "", vec!["fieldset"], false),
+            (
+                "fieldset",
+                "group",
+                "Protect matching branches",
+                vec!["legend", "details", "presentation"],
+                false,
+            ),
+            ("legend", "Legend", "", vec!["legend-text"], false),
+            (
+                "legend-text",
+                "StaticText",
+                "Protect matching branches",
+                vec![],
+                false,
+            ),
+            ("details", "group", "", vec!["ignored-summary"], false),
+            ("ignored-summary", "none", "", vec!["summary"], true),
+            (
+                "summary",
+                "DisclosureTriangle",
+                "Additional restrictions",
+                vec![],
+                false,
+            ),
+            ("presentation", "none", "", vec!["checks"], true),
+            (
+                "checks",
+                "group",
+                "Protect branches",
+                vec!["shadow", "label"],
+                false,
+            ),
+            ("shadow", "generic", "", vec!["shadow-root"], false),
+            ("shadow-root", "none", "", vec!["shadow-check"], true),
+            ("shadow-check", "checkbox", "Shadow check", vec![], false),
+            ("label", "none", "", vec!["target"], true),
+            (
+                "target",
+                "checkbox",
+                "Require status checks to pass before merging",
+                vec![],
+                false,
+            ),
+        ];
+        let mut nodes = specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, role, name, children, ignored))| {
+                let mut node = raw_node(id, role, name, &children, i as u64 + 1, Some("frame-own"));
+                node.ignored = ignored;
+                (id.to_string(), node)
+            })
+            .collect::<HashMap<_, _>>();
+        for n in 0..600 {
+            let id = format!("link-{n}");
+            nodes.get_mut("links").unwrap().child_ids.push(id.clone());
+            nodes.insert(
+                id.clone(),
+                raw_node(
+                    &id,
+                    "link",
+                    &format!("Repository setting {n}"),
+                    &[],
+                    1000 + n,
+                    None,
+                ),
+            );
+        }
+        let root = nodes["root"].clone();
+        let observation =
+            traverse_ax_tree(root, "target-own", MAX_AX_NODES, MAX_AX_DEPTH, |id, _| {
+                Ok(nodes[id]
+                    .child_ids
+                    .iter()
+                    .map(|child| nodes[child].clone())
+                    .collect())
+            })
+            .unwrap();
+        assert!(!observation.ax_truncated);
+        let main = observation
+            .records
+            .iter()
+            .find(|r| r.role == "main")
+            .unwrap();
+        let form = observation
+            .records
+            .iter()
+            .find(|r| r.role == "form")
+            .unwrap();
+        assert_eq!(form.depth, main.depth + 1);
+        let render = |filters: &state_text::Filters, zoom| {
+            state_text::render(&state_text::RenderInput {
+                records: &observation.records,
+                facts: &observation.facts,
+                filters,
+                page_url: "https://github.com/fixture/settings",
+                snapshot_id: "s1",
+                zoom,
+                max_bytes: 2000,
+            })
+        };
+        let plain = render(&state_text::Filters::default(), None).text;
+        assert!(
+            plain.find("main Branch protection").unwrap()
+                < plain.find("navigation Settings navigation").unwrap()
+        );
+        for filters in [
+            state_text::Filters {
+                text: None,
+                roles: vec!["checkbox".into()],
+            },
+            state_text::Filters {
+                text: Some("Require status checks".into()),
+                roles: vec![],
+            },
+        ] {
+            let text = render(&filters, None).text;
+            assert!(
+                text.contains("Require status checks to pass before merging"),
+                "{text}"
+            );
+        }
+        let zoom = state_text::Zoom {
+            requested: main.reference.as_deref().unwrap(),
+            target: main.reference.as_deref(),
+        };
+        let text = render(&state_text::Filters::default(), Some(zoom)).text;
+        assert!(
+            text.contains("Require status checks to pass before merging"),
+            "{text}"
+        );
+        assert!(text.contains("Shadow check"), "{text}");
     }
 
     fn flattened_dom_node(
@@ -7344,7 +7556,9 @@ mod tests {
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","DOM fixture", &[], 10, Some("frame-main"))}}),
             json!({"id":3,"sessionId":"session-own","result":{"root":{"nodeId":42}}}),
-            json!({"id":4,"sessionId":"session-own","result":{"outerHTML":"<main><h1>DOM fixture</h1></main>"}}),
+            json!({"id":4,"sessionId":"session-own","result":{"nodeIds":[42]}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodeId":43}}),
+            json!({"id":6,"sessionId":"session-own","result":{"outerHTML":"<body><main><h1>DOM fixture</h1></main></body>"}}),
         ];
         let mut driver = attached_driver(frames);
         let observation = driver
@@ -7358,7 +7572,7 @@ mod tests {
 
         assert_eq!(
             observation.dom_text.as_deref(),
-            Some("<main><h1>DOM fixture</h1></main>")
+            Some("<body><main><h1>DOM fixture</h1></main></body>")
         );
         assert_eq!(observation.records[0].name, "DOM fixture");
         assert_eq!(observation.refs[0].captured.reference, "e1");
@@ -7373,9 +7587,20 @@ mod tests {
                 "Accessibility.enable",
                 "Accessibility.getRootAXNode",
                 "DOM.getDocument",
+                "DOM.pushNodesByBackendIdsToFrontend",
+                "DOM.querySelector",
                 "DOM.getOuterHTML",
             ]
         );
+        assert_eq!(
+            driver.pipe.writes[3]["params"],
+            json!({"backendNodeIds":[10]})
+        );
+        assert_eq!(
+            driver.pipe.writes[4]["params"],
+            json!({"nodeId":42,"selector":"body"})
+        );
+        assert_eq!(driver.pipe.writes[5]["params"], json!({"nodeId":43}));
     }
 
     #[test]

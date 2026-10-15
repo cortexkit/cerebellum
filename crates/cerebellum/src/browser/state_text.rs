@@ -765,14 +765,10 @@ impl<'a> Tree<'a> {
         let line = self.element_text(node, self.name_chars(node));
         let text_match = filters.text.as_ref().is_none_or(|wanted| {
             let wanted = wanted.to_lowercase();
-            cap_chars(self.names[node].clone(), self.name_chars(node))
-                .to_lowercase()
-                .contains(&wanted)
-                || self.shown_value(node).is_some_and(|value| {
-                    cap_chars(value, NAME_CHARS)
-                        .to_lowercase()
-                        .contains(&wanted)
-                })
+            self.names[node].to_lowercase().contains(&wanted)
+                || self
+                    .shown_value(node)
+                    .is_some_and(|value| value.to_lowercase().contains(&wanted))
         });
         let matched = role_match && text_match;
         let labelled = !self.names[node].is_empty();
@@ -1116,6 +1112,26 @@ fn cut_report(lines: &[Line], keep: &[bool], tree: &Tree<'_>, max_bytes: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_text_filter_searches_the_label_beyond_its_printed_prefix() {
+        let name = format!("{} Require status checks", "Long label ".repeat(100));
+        let records = vec![record(0, "checkbox", &name, Some("e1"))];
+        let found = render(&RenderInput {
+            records: &records,
+            facts: &HashMap::new(),
+            filters: &Filters {
+                text: Some("Require status checks".into()),
+                roles: vec!["checkbox".into()],
+            },
+            page_url: "https://example.com",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 1000,
+        });
+        assert!(found.printed_refs.contains("e1"), "{}", found.text);
+        assert!(!found.text.contains("No matches"));
+    }
 
     #[test]
     fn stable_refs_filters_cannot_match_withheld_field_values() {
