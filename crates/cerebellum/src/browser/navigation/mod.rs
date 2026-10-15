@@ -1,8 +1,12 @@
 mod capture;
+#[cfg(test)]
+mod classification_golden;
+mod classification_index;
 mod frames;
 mod scroll;
 mod typing;
 pub use capture::SnapshotTimings;
+use classification_index::{classify_refs, CountedNodes, DomClassificationBatch, DomIndexes};
 
 use std::cmp;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -2060,17 +2064,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .map(|nodes| (origin, nodes))
                     .map_err(Clone::clone)
             });
-            for reference in &mut observation.refs {
-                let Some(identity) = reference.backend_identity.as_ref() else {
-                    continue;
-                };
-                reference.classification = match &projection {
-                    Ok((origin, nodes)) => {
-                        build_non_type_classification(nodes, identity, document_epoch, origin)
-                            .map(Box::new)
+            match projection {
+                Ok((origin, nodes)) => {
+                    classify_refs(&mut observation.refs, nodes, document_epoch, &origin)
+                }
+                Err(reason) => {
+                    for reference in &mut observation.refs {
+                        if reference.backend_identity.is_some() {
+                            reference.classification = Err(reason.clone());
+                        }
                     }
-                    Err(reason) => Err(reason.clone()),
-                };
+                }
             }
         }
 
@@ -3364,15 +3368,16 @@ pub(crate) fn snapshot_from_capture(
     })?;
     let projected = parse_flattened_dom_nodes(dom);
     let origin = document_origin(document_url);
-    for reference in &mut observation.refs {
-        if let Some(identity) = reference.backend_identity.as_ref() {
-            reference.classification = match (&projected, &origin) {
-                (Ok(nodes), Ok(origin)) => {
-                    build_non_type_classification(nodes, identity, document_epoch, origin)
-                        .map(Box::new)
+    match (&projected, &origin) {
+        (Ok(nodes), Ok(origin)) => {
+            classify_refs(&mut observation.refs, nodes, document_epoch, origin)
+        }
+        (Err(reason), _) | (_, Err(reason)) => {
+            for reference in &mut observation.refs {
+                if reference.backend_identity.is_some() {
+                    reference.classification = Err(reason.clone());
                 }
-                (Err(reason), _) | (_, Err(reason)) => Err(reason.clone()),
-            };
+            }
         }
     }
     if let Ok(nodes) = projected {
@@ -3608,60 +3613,16 @@ fn build_non_type_classification(
     document_epoch: u64,
     current_origin: &str,
 ) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
-    // Form ids and label targets are document-scoped even when CDP flattens
-    // several same-process frame documents into one response.
-    let raw_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.node_id, node)).collect();
-    let document_root = |node: &RawDomNode| {
-        let mut current = node;
-        let mut seen = HashSet::new();
-        while current.local_name != "#document" {
-            if !seen.insert(current.node_id) {
-                return 0;
-            }
-            let Some(parent) = current.parent_id.and_then(|id| raw_by_id.get(&id).copied()) else {
-                break;
-            };
-            current = parent;
-        }
-        current.node_id
-    };
-    let target_root = nodes
-        .iter()
-        .find(|n| n.backend_node_id == target_identity.backend_node_id)
-        .map(document_root);
-    let scoped: Vec<_> = nodes
-        .iter()
-        .filter(|node| Some(document_root(node)) == target_root)
-        .cloned()
-        .collect();
-    let nodes = scoped.as_slice();
-    let mut by_node_id = HashMap::with_capacity(nodes.len());
-    let mut by_backend_id = HashMap::with_capacity(nodes.len());
-    for (index, node) in nodes.iter().enumerate() {
-        if by_node_id.insert(node.node_id, index).is_some() {
-            return Err(ClassificationUnavailable::DuplicateNodeId {
-                node_id: node.node_id,
-            });
-        }
-        if by_backend_id.insert(node.backend_node_id, index).is_some() {
-            return Err(ClassificationUnavailable::DuplicateBackendNodeId {
-                backend_node_id: node.backend_node_id,
-            });
-        }
-    }
-    let target_index = *by_backend_id.get(&target_identity.backend_node_id).ok_or(
-        ClassificationUnavailable::TargetNotInDocument {
-            backend_node_id: target_identity.backend_node_id,
-        },
-    )?;
-    let context = DomClassificationContext {
-        nodes,
-        by_node_id: &by_node_id,
-        by_backend_id: &by_backend_id,
-        target_id: &target_identity.target_id,
-        frame_id: &target_identity.frame_id,
-        current_origin,
-    };
+    DomClassificationBatch::new(nodes).classify(target_identity, document_epoch, current_origin)
+}
+
+fn classify_indexed(
+    context: &DomClassificationContext<'_>,
+    target_index: usize,
+    document_epoch: u64,
+    target_identity: &BackendNodeIdentity,
+) -> Result<NonTypeClassificationRecord, ClassificationUnavailable> {
+    let nodes = &context.nodes;
     // Text has no independent hit-test surface: Chrome returns an element at
     // its coordinates. Classify that element (including any link, label or
     // submit boundary), but retain the original node identity for ref validation.
@@ -3680,7 +3641,7 @@ fn build_non_type_classification(
         )?;
     }
     let target = context.element(element_index, true);
-    let mut input = NonTypeClassificationInput::new(document_epoch, target, current_origin);
+    let mut input = NonTypeClassificationInput::new(document_epoch, target, context.current_origin);
     let mut current = element_index;
     let mut visited = HashSet::from([current]);
     while let Some(parent) = context.composed_parent(current) {
@@ -3703,7 +3664,8 @@ fn build_non_type_classification(
 }
 
 struct DomClassificationContext<'a> {
-    nodes: &'a [RawDomNode],
+    nodes: CountedNodes<'a>,
+    indexes: &'a DomIndexes,
     by_node_id: &'a HashMap<u64, usize>,
     by_backend_id: &'a HashMap<u64, usize>,
     target_id: &'a str,
@@ -3730,60 +3692,12 @@ impl DomClassificationContext<'_> {
             })
     }
 
-    fn dom_parent(&self, index: usize) -> Option<usize> {
-        self.nodes
-            .get(index)?
-            .parent_id
-            .and_then(|parent| self.by_node_id.get(&parent).copied())
-    }
-
     fn form_owner(&self, index: usize) -> Option<usize> {
-        if let Some(form_id) = self.nodes[index].attributes.get("form") {
-            return self.nodes.iter().position(|node| {
-                node.local_name == "form"
-                    && node.attributes.get("id").is_some_and(|id| id == form_id)
-            });
-        }
-        let mut current = self.dom_parent(index);
-        let mut visited = HashSet::new();
-        while let Some(parent) = current {
-            if !visited.insert(parent) {
-                return None;
-            }
-            if self.nodes[parent].local_name == "form" {
-                return Some(parent);
-            }
-            current = self.dom_parent(parent);
-        }
-        None
+        self.indexes.form_owners[index]
     }
 
     fn label_control(&self, label_index: usize) -> Option<usize> {
-        if let Some(control_id) = self.nodes[label_index].attributes.get("for") {
-            return self.nodes.iter().position(|node| {
-                is_labelable(&node.local_name)
-                    && node.attributes.get("id").is_some_and(|id| id == control_id)
-            });
-        }
-        self.nodes.iter().enumerate().find_map(|(index, node)| {
-            (is_labelable(&node.local_name) && self.is_dom_descendant(index, label_index))
-                .then_some(index)
-        })
-    }
-
-    fn is_dom_descendant(&self, candidate: usize, ancestor: usize) -> bool {
-        let mut current = self.dom_parent(candidate);
-        let mut visited = HashSet::new();
-        while let Some(parent) = current {
-            if parent == ancestor {
-                return true;
-            }
-            if !visited.insert(parent) {
-                return false;
-            }
-            current = self.dom_parent(parent);
-        }
-        false
+        self.indexes.label_controls.get(&label_index).copied()
     }
 
     /// Every index reaching here came from `by_node_id` / `by_backend_id`,
@@ -3821,12 +3735,14 @@ impl DomClassificationContext<'_> {
         }
         if let Some(owner) = self.form_owner(index) {
             element = element.form_owner(self.identity(owner));
-            for (control_index, control) in self.nodes.iter().enumerate() {
-                if !is_form_control(&control.local_name)
-                    || self.form_owner(control_index) != Some(owner)
-                {
-                    continue;
-                }
+            for &control_index in self
+                .indexes
+                .controls_by_form
+                .get(&owner)
+                .into_iter()
+                .flatten()
+            {
+                let control = &self.nodes[control_index];
                 let mut associated = AssociatedFormControlInput::new(self.identity(control_index));
                 let tokens = autocomplete_tokens(control.attributes.get("autocomplete"));
                 if !tokens.is_empty() {
@@ -3879,11 +3795,7 @@ impl DomClassificationContext<'_> {
         }
         // Relative paths and fragments keep the document origin. Only the origin
         // is used for authorization; the browser resolves the full landing path.
-        let base = self
-            .nodes
-            .iter()
-            .find(|node| node.local_name == "base" && node.attributes.contains_key("href"))
-            .and_then(|node| node.attributes.get("href"));
+        let base = self.indexes.base_href.as_deref();
         let base_origin = match base {
             Some(base) if base.starts_with("//") => {
                 self.current_origin.split_once(':').and_then(|(scheme, _)| {
