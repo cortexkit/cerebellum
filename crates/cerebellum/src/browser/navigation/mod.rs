@@ -2,6 +2,7 @@ mod capture;
 mod frames;
 mod scroll;
 mod typing;
+pub use capture::SnapshotTimings;
 
 use std::cmp;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -332,6 +333,7 @@ pub struct CdpNavigationDriver<IO> {
     point_target: Option<(String, BrowserClickPosition)>,
     downloads_denied: bool,
     prefer_bulk_ax: bool,
+    last_snapshot_timings: Option<SnapshotTimings>,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -362,6 +364,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             point_target: None,
             downloads_denied: false,
             prefer_bulk_ax: true,
+            last_snapshot_timings: None,
         }
     }
 
@@ -369,6 +372,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     pub fn with_incremental_ax_snapshots(mut self) -> Self {
         self.prefer_bulk_ax = false;
         self
+    }
+
+    pub fn last_snapshot_timings(&self) -> Option<&SnapshotTimings> {
+        self.last_snapshot_timings.as_ref()
     }
 
     pub fn present(
@@ -1870,6 +1877,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         if let Some(frame) = &self.active_frame {
             attachment.session_id = frame.session_id.clone();
         }
+        self.last_snapshot_timings = None;
+        let mut timings = SnapshotTimings::default();
+        let ax_started = Instant::now();
         let ax_phase = crate::budgets::PhaseDeadline::new(
             clock.now(),
             crate::budgets::AX_CHILDREN_PHASE_MS,
@@ -2017,6 +2027,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
         };
 
+        timings.ax_ms = ax_started.elapsed().as_millis();
+        let dom_started = Instant::now();
         // A bounded AX prefix must not start another unbounded DOM read on the
         // same oversized page. Refs remain observable, with explicitly unknown
         // classification and withheld field values rather than weaker permission.
@@ -2034,6 +2046,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
+        timings.dom_read_ms = dom_started.elapsed().as_millis();
+        let classification_started = Instant::now();
         if let Some((document_epoch, document_url)) = classification_context {
             // One DOM read serves every ref. A failure here leaves each ref
             // with the same named reason rather than failing the snapshot:
@@ -2060,6 +2074,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
+        timings.classification_ms = classification_started.elapsed().as_millis();
+        let facts_started = Instant::now();
         if mode == SnapshotKind::Actionable {
             // Without the DOM the page text still prints every element; it
             // only loses field values and placeholders, which stay withheld.
@@ -2074,6 +2090,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 );
             }
         }
+        timings.dom_facts_ms = facts_started.elapsed().as_millis();
+        let body_started = Instant::now();
         if mode == SnapshotKind::DomFull {
             // Resolve the captured document, not the session's default document:
             // same-process iframes share a session but have different bodies.
@@ -2144,6 +2162,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             );
         }
 
+        timings.body_ms = body_started.elapsed().as_millis();
+        self.last_snapshot_timings = Some(timings);
         Ok(observation)
     }
 

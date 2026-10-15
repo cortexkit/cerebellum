@@ -1,5 +1,15 @@
 use super::*;
 
+/// Wall-clock phases of the most recent frame capture, excluding wire encoding.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotTimings {
+    pub ax_ms: u128,
+    pub dom_read_ms: u128,
+    pub classification_ms: u128,
+    pub dom_facts_ms: u128,
+    pub body_ms: u128,
+}
+
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     pub(super) fn bulk_ax_capture<C: NavigationClock>(
         &mut self,

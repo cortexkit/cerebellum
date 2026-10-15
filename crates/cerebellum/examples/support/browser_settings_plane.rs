@@ -88,11 +88,11 @@ impl OwnedBrowserProcess for Process {
         url: &str,
         deadline: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        observed(
-            "capture",
-            self.driver
-                .snapshot_classified(context, kind, epoch, url, deadline),
-        )
+        let result = self
+            .driver
+            .snapshot_classified(context, kind, epoch, url, deadline);
+        println!("capture phases: {:?}", self.driver.last_snapshot_timings());
+        observed("capture", result)
     }
     fn snapshot_subtree_classified(
         &mut self,
@@ -103,11 +103,11 @@ impl OwnedBrowserProcess for Process {
         url: &str,
         deadline: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        observed(
-            "zoom capture",
-            self.driver
-                .snapshot_subtree_classified(context, kind, reference, epoch, url, deadline),
-        )
+        let result = self
+            .driver
+            .snapshot_subtree_classified(context, kind, reference, epoch, url, deadline);
+        println!("zoom phases: {:?}", self.driver.last_snapshot_timings());
+        observed("zoom capture", result)
     }
     fn scroll(
         &mut self,
