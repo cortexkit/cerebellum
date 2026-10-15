@@ -73,6 +73,7 @@ fn main() {
         // the grant is refused `consent_unavailable` rather than asked.
         let consent = cerebellum::computer_grants::ConsentContext::without_carrier(
             cerebellum::computer_grants::GrantCaller {
+                holder: None,
                 conversation_key: "live-probe".to_string(),
                 agent_project_id: grantee.to_string(),
                 durable_identity_attested: false,

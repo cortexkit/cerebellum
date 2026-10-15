@@ -9,12 +9,17 @@ use super::support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cerebellum::agent_grants::{
+    AgentGrantStorage, AgentGrantStoreError, AgentGrantStoreState, AgentGrants,
+    FilesystemAgentGrantStorage, InMemoryAgentGrantStorage, LegacyGrantSource,
+    AGENT_GRANT_STORE_FORMAT,
+};
 use cerebellum::cingulate_client::ScriptedAnswer;
 use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
 use cerebellum::computer_grants::{
     AlwaysGrantRecord, AppIdentity, AppIdentityUnreadable, ComputerGrants, ConsentContext,
-    ConsentRefusal, FilesystemGrantStorage, GrantCaller, GrantNeed, GrantStorage, GrantStoreError,
-    GrantStoreState, InMemoryGrantStorage, QuestionCarrier, GRANT_STORE_VERSION,
+    ConsentRefusal, FilesystemGrantStorage, GrantCaller, GrantNeed, GrantStorage, GrantStoreState,
+    InMemoryGrantStorage, QuestionCarrier, GRANT_STORE_VERSION,
 };
 use cerebellum::management::{ManagementPlane, TargetResolver};
 use cerebellum_computer::capture::InMemoryCaptureBackend;
@@ -161,11 +166,7 @@ fn plane(driver: &CountingDriver) -> TestPlane {
 }
 
 fn caller(conversation: &str, attested: bool) -> GrantCaller {
-    GrantCaller {
-        conversation_key: conversation.to_string(),
-        agent_project_id: GRANTEE.to_string(),
-        durable_identity_attested: attested,
-    }
+    GrantCaller::new(conversation.to_string(), GRANTEE.to_string(), attested)
 }
 
 /// A consent context asking through `carrier`, whose route never closes and
@@ -192,6 +193,21 @@ fn management_over(grants: ComputerGrants) -> Arc<ManagementPlane> {
 
 fn in_memory_management() -> Arc<ManagementPlane> {
     management_over(ComputerGrants::in_memory())
+}
+
+struct EmptyLegacy;
+impl LegacyGrantSource for EmptyLegacy {
+    fn load(&self) -> Result<AgentGrantStoreState, AgentGrantStoreError> {
+        Ok(AgentGrantStoreState::default())
+    }
+}
+
+fn agent_grants_over(storage: Arc<dyn AgentGrantStorage>) -> ComputerGrants {
+    ComputerGrants::in_memory().with_agent_grants(Arc::new(AgentGrants::open(
+        storage,
+        &EmptyLegacy,
+        Some(MACHINE.into()),
+    )))
 }
 
 async fn serve(
@@ -256,15 +272,10 @@ fn app_need() -> GrantNeed {
     }
 }
 
-/// One question per application per conversation, and an answer inside the
-/// wait returns the call's real result with no second call.
-///
-/// The person answers five seconds in. The same call then posts its
-/// keystrokes and returns their result. Typing again, pressing keys and
-/// waiting in the same application raise no second question; the same
-/// application in another conversation gets its own.
+/// One app permission covers the same agent across conversations and returns
+/// the waiting call's real result. A different agent needs a separate answer.
 #[tokio::test]
-async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_result() {
+async fn one_question_per_app_per_holder_survives_conversation_changes() {
     let driver = CountingDriver::default();
     let plane = plane(&driver);
     let management = in_memory_management();
@@ -357,8 +368,23 @@ async fn one_question_per_app_per_conversation_and_an_answer_returns_the_real_re
     assert_eq!(elsewhere["outcome"], "delivery_unconfirmed", "{elsewhere}");
     assert_eq!(
         carrier.questions().len(),
+        1,
+        "the same head's row did not cover another conversation"
+    );
+    let another_head = GrantCaller::new("conversation-3".into(), "another-head".into(), false);
+    let separate = serve(
+        &plane,
+        "computer.type",
+        type_request(),
+        &management,
+        asking(&carrier, another_head),
+    )
+    .await;
+    assert_eq!(separate["outcome"], "delivery_unconfirmed", "{separate}");
+    assert_eq!(
+        carrier.questions().len(),
         2,
-        "another conversation was admitted by this conversation's grant"
+        "another head borrowed this head's grant"
     );
 }
 
@@ -471,15 +497,11 @@ async fn admit(
         .map_err(|refusal| refusal.reply(APP))
 }
 
-/// An "always" answer is written to the store and honoured by a module that
-/// reopens it: a new conversation of the same attested agent is not asked.
+/// An "always" answer lasts until revoked and survives reopening the agent store.
 #[tokio::test]
 async fn an_always_answer_survives_a_module_restart() {
-    let storage = InMemoryGrantStorage::new();
-    let first = management_over(ComputerGrants::open(
-        Arc::new(storage.clone()),
-        Some(MACHINE.to_string()),
-    ));
+    let storage = InMemoryAgentGrantStorage::default();
+    let first = management_over(agent_grants_over(Arc::new(storage.clone())));
     let carrier = ScriptedCarrier::answering(&["allow_always"]);
     let admission = admit(&first, &carrier, caller("conversation-1", true))
         .await
@@ -493,15 +515,6 @@ async fn an_always_answer_survives_a_module_restart() {
     assert_eq!(params["scope"]["app"], APP);
     assert!(params.get("duration").is_none());
     assert_eq!(
-        params["options"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|o| o["id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["allow_conversation", "allow_always", "deny"]
-    );
-    assert_eq!(
         decisions(&questions[0]),
         ["allow_conversation", "allow_always", "deny"]
     );
@@ -509,21 +522,16 @@ async fn an_always_answer_survives_a_module_restart() {
     assert_eq!(params["options"][1]["label"], "Always allow");
     assert_eq!(params["options"][2]["effect"], "decline");
     assert_eq!(admission.persisted, Some(Ok(())));
-    let mut reply = json!({"outcome": "completed"});
+    let mut reply = json!({"outcome":"completed"});
     admission.decorate(&mut reply);
     assert_eq!(reply["grant_persisted"], true);
-
-    let stored = storage.load().unwrap();
-    assert_eq!(stored.version, GRANT_STORE_VERSION);
-    assert_eq!(stored.records.len(), 1);
-    assert_eq!(stored.records[0].machine_uuid, MACHINE);
-    assert_eq!(stored.records[0].agent_project_id, GRANTEE);
-
-    // A second plane over the same storage is the module after a restart.
-    let restarted = management_over(ComputerGrants::open(
-        Arc::new(storage.clone()),
-        Some(MACHINE.to_string()),
-    ));
+    let stored = storage.load().unwrap().unwrap();
+    assert_eq!(stored.version, AGENT_GRANT_STORE_FORMAT.version);
+    assert_eq!(stored.grants.len(), 1);
+    assert_eq!(stored.grants[0].machine_uuid, MACHINE);
+    assert_eq!(stored.grants[0].holder.agent_id(), GRANTEE);
+    assert_eq!(stored.grants[0].expires_at_ms, None);
+    let restarted = management_over(agent_grants_over(Arc::new(storage)));
     let silent = ScriptedCarrier::default();
     admit(&restarted, &silent, caller("conversation-9", true))
         .await
@@ -534,9 +542,8 @@ async fn an_always_answer_survives_a_module_restart() {
     );
 }
 
-/// A record naming another machine grants nothing here, and the listing
-/// reports it apart. A backup restored onto a different machine therefore
-/// cannot carry the person's trust across.
+/// A foreign-machine record is inert and hidden from the local inventory.
+/// A restored backup cannot lend another machine's permission.
 #[tokio::test]
 async fn a_record_naming_another_machine_grants_nothing() {
     let storage = InMemoryGrantStorage::new();
@@ -568,7 +575,11 @@ async fn a_record_naming_another_machine_grants_nothing() {
 
     let listing = management.computer_grants().list();
     assert_eq!(listing["grants"], json!([]));
-    assert_eq!(listing["other_machine_grants"][0]["bundle_identity"], APP);
+    assert_eq!(
+        listing["other_machine_grants"],
+        json!([]),
+        "foreign-machine rows are hidden as well as inert"
+    );
 }
 
 /// "Always" is offered only to a bind whose agent and session kind the daemon
@@ -578,7 +589,7 @@ async fn an_unattested_bind_is_not_offered_always() {
     let storage = InMemoryGrantStorage::new();
     let management = management_over(ComputerGrants::open(
         Arc::new(storage.clone()),
-        Some(MACHINE.to_string()),
+        Some(MACHINE.into()),
     ));
 
     let unattested = ScriptedCarrier::answering(&["allow_always"]);
@@ -613,57 +624,46 @@ fn scratch_directory(label: &str) -> std::path::PathBuf {
     directory
 }
 
-/// A store that cannot be read withholds every "always" grant, says so, and is
-/// never written over: not by a later answer, not by a revoke.
+/// Unreadable unified storage withholds all grants and is never overwritten.
 #[tokio::test]
 async fn a_corrupt_store_fails_closed_and_is_disclosed() {
     let directory = scratch_directory("corrupt-grants");
-    let path = directory.join("computer_grants.json");
+    let path = directory.join("agent-grants.json");
     std::fs::write(&path, b"{ not json").unwrap();
-    let grants = ComputerGrants::open(
-        Arc::new(FilesystemGrantStorage::new(&path)),
-        Some(MACHINE.to_string()),
-    );
+    let grants = agent_grants_over(Arc::new(FilesystemAgentGrantStorage::new(&path)));
     assert!(matches!(
-        grants.store_error(),
-        Some(GrantStoreError::Corrupt { .. })
+        grants.agent_grants().store_error(),
+        Some(AgentGrantStoreError::Corrupt { .. })
     ));
     let listing = grants.list();
     assert_eq!(listing["store"]["state"], "unreadable");
-    assert_eq!(listing["store"]["reason"], "grant_store_corrupt");
+    assert_eq!(listing["store"]["reason"], "grant_store_unreadable");
     assert_eq!(
         grants.revoke(GRANTEE, APP, false)["outcome"],
         "store_unavailable"
     );
-
     let management = management_over(grants);
     let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
-    admit(&management, &carrier, caller("conversation-1", true))
+    let refused = admit(&management, &carrier, caller("conversation-1", true))
         .await
-        .expect("a conversation answer still admits");
+        .unwrap_err();
+    assert_eq!(refused["reason"], "grant_not_recorded");
     assert_eq!(
         decisions(&carrier.questions()[0]),
         ["allow_conversation", "deny"],
         "always was offered over a store that could not be read"
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
-
-    // A version this build does not read is withheld the same way. The
-    // version is one past the current one, so this keeps meaning "a newer
-    // build wrote it" whenever the format moves on.
-    let newer_version = GRANT_STORE_VERSION + 1;
+    let newer_version = AGENT_GRANT_STORE_FORMAT.version + 1;
     std::fs::write(
         &path,
-        format!(r#"{{"version": {newer_version}, "records": []}}"#),
+        format!(r#"{{"version": {newer_version}, "grants": []}}"#),
     )
     .unwrap();
-    let newer = ComputerGrants::open(
-        Arc::new(FilesystemGrantStorage::new(&path)),
-        Some(MACHINE.to_string()),
-    );
+    let newer = agent_grants_over(Arc::new(FilesystemAgentGrantStorage::new(&path)));
     assert_eq!(
-        newer.store_error(),
-        Some(GrantStoreError::UnknownVersion {
+        newer.agent_grants().store_error(),
+        Some(AgentGrantStoreError::UnknownVersion {
             found: newer_version
         })
     );
@@ -673,66 +673,55 @@ async fn a_corrupt_store_fails_closed_and_is_disclosed() {
 /// Storage whose writes always fail.
 struct UnwritableStorage;
 
-impl GrantStorage for UnwritableStorage {
-    fn load(&self) -> Result<GrantStoreState, GrantStoreError> {
-        Ok(GrantStoreState::default())
+impl AgentGrantStorage for UnwritableStorage {
+    fn load(&self) -> Result<Option<AgentGrantStoreState>, AgentGrantStoreError> {
+        Ok(None)
     }
-    fn save(&self, _state: &GrantStoreState) -> Result<(), GrantStoreError> {
-        Err(GrantStoreError::WriteFailed {
-            detail: "read-only file system".to_string(),
+    fn save(&self, _state: &AgentGrantStoreState) -> Result<(), AgentGrantStoreError> {
+        Err(AgentGrantStoreError::WriteFailed {
+            detail: "read-only file system".into(),
         })
     }
 }
 
-/// When an "always" answer cannot be written, the person's yes still holds for
-/// this conversation and the call proceeds, and the reply says the answer was
-/// not stored and why.
+/// A failed durable write must not create an unrevocable conversation fallback.
 #[tokio::test]
-async fn a_failed_always_write_grants_the_conversation_and_says_so() {
+async fn a_failed_always_write_refuses_without_dispatch_or_fallback_grant() {
     let driver = CountingDriver::default();
     let plane = plane(&driver);
-    let management = management_over(ComputerGrants::open(
-        Arc::new(UnwritableStorage),
-        Some(MACHINE.to_string()),
-    ));
-    let carrier = ScriptedCarrier::answering(&["allow_always"]);
-    let reply = serve(
-        &plane,
-        "computer.type",
-        type_request(),
-        &management,
-        asking(&carrier, caller("conversation-1", true)),
-    )
-    .await;
-    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
-    assert_eq!(reply["grant_persisted"], false, "{reply}");
-    assert_eq!(reply["reason"], "grant_store_write_failed", "{reply}");
-    assert_eq!(driver.0.lock().unwrap().len(), 1);
-
-    let again = serve(
-        &plane,
-        "computer.type",
-        type_request(),
-        &management,
-        asking(&carrier, caller("conversation-1", true)),
-    )
-    .await;
-    assert_eq!(again["outcome"], "delivery_unconfirmed", "{again}");
-    assert!(again.get("grant_persisted").is_none(), "{again}");
-    assert_eq!(carrier.questions().len(), 1);
-    assert_eq!(management.computer_grants().list()["grants"], json!([]));
+    let management = management_over(agent_grants_over(Arc::new(UnwritableStorage)));
+    let carrier = ScriptedCarrier::answering(&["allow_always", "allow_always"]);
+    for _ in 0..2 {
+        let reply = serve(
+            &plane,
+            "computer.type",
+            type_request(),
+            &management,
+            asking(&carrier, caller("conversation-1", true)),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+        assert_eq!(reply["reason"], "grant_not_recorded", "{reply}");
+        assert!(driver.0.lock().unwrap().is_empty());
+        assert_eq!(management.computer_grants().list()["grants"], json!([]));
+    }
+    assert_eq!(
+        carrier.questions().len(),
+        2,
+        "failed writes cannot admit a retry"
+    );
 }
 
 /// Storage whose writes take long enough that a call released early would be
 /// seen acting before the write finished.
 #[derive(Clone, Default)]
-struct SlowStorage(InMemoryGrantStorage);
+struct SlowStorage(InMemoryAgentGrantStorage);
 
-impl GrantStorage for SlowStorage {
-    fn load(&self) -> Result<GrantStoreState, GrantStoreError> {
+impl AgentGrantStorage for SlowStorage {
+    fn load(&self) -> Result<Option<AgentGrantStoreState>, AgentGrantStoreError> {
         self.0.load()
     }
-    fn save(&self, state: &GrantStoreState) -> Result<(), GrantStoreError> {
+    fn save(&self, state: &AgentGrantStoreState) -> Result<(), AgentGrantStoreError> {
         std::thread::sleep(Duration::from_millis(300));
         self.0.save(state)
     }
@@ -746,10 +735,7 @@ async fn an_always_answer_is_stored_before_the_waiting_call_is_released() {
     let driver = CountingDriver::default();
     let plane = plane(&driver);
     let storage = SlowStorage::default();
-    let management = management_over(ComputerGrants::open(
-        Arc::new(storage.clone()),
-        Some(MACHINE.to_string()),
-    ));
+    let management = management_over(agent_grants_over(Arc::new(storage.clone())));
     let carrier = ScriptedCarrier::answering(&["allow_always"]);
     let reply = serve(
         &plane,
@@ -762,7 +748,7 @@ async fn an_always_answer_is_stored_before_the_waiting_call_is_released() {
     assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert_eq!(reply["grant_persisted"], true, "{reply}");
     assert_eq!(
-        storage.0.load().unwrap().records.len(),
+        storage.0.load().unwrap().unwrap().grants.len(),
         1,
         "the call acted before its always answer was stored"
     );
@@ -817,7 +803,11 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
          application on the screen."
     );
     assert!(grants.holds(&attested, &GrantNeed::Takeover));
-    assert!(!grants.holds(&caller("conversation-2", true), &GrantNeed::Takeover));
+    assert!(grants.holds(&caller("conversation-2", true), &GrantNeed::Takeover));
+    assert!(!grants.holds(
+        &GrantCaller::new("another".into(), "another-head".into(), true),
+        &GrantNeed::Takeover
+    ));
 }
 
 /// An "always" answer to a takeover question grants nothing: the question
@@ -899,30 +889,31 @@ async fn two_concurrent_calls_raise_exactly_one_question() {
     ));
 }
 
-/// Revoking a durable grant removes the record, and the next call asks again.
-/// A dry run changes nothing.
+/// The app revoke operation uses the same store as dispatch authorization;
+/// dry-run counts the matching rows without changing them.
 #[tokio::test]
 async fn a_revoked_always_grant_is_asked_for_again() {
-    let storage = InMemoryGrantStorage::new();
-    let management = management_over(ComputerGrants::open(
-        Arc::new(storage.clone()),
-        Some(MACHINE.to_string()),
-    ));
+    let storage = InMemoryAgentGrantStorage::default();
+    let management = management_over(agent_grants_over(Arc::new(storage.clone())));
     let carrier = ScriptedCarrier::answering(&["allow_always", "deny"]);
     admit(&management, &carrier, caller("conversation-1", true))
         .await
         .expect("the always answer admits");
-
     let grants = management.computer_grants();
-    assert_eq!(grants.revoke(GRANTEE, APP, true)["outcome"], "would_revoke");
-    assert_eq!(storage.load().unwrap().records.len(), 1);
-    assert_eq!(grants.revoke(GRANTEE, APP, false)["outcome"], "revoked");
-    assert!(storage.load().unwrap().records.is_empty());
+    assert_eq!(
+        grants.revoke(GRANTEE, APP, true),
+        json!({"outcome":"would_revoke","records":1})
+    );
+    assert_eq!(storage.load().unwrap().unwrap().grants.len(), 1);
+    assert_eq!(
+        grants.revoke(GRANTEE, APP, false),
+        json!({"outcome":"revoked","records":1})
+    );
+    assert!(storage.load().unwrap().unwrap().grants.is_empty());
     assert_eq!(
         grants.revoke(GRANTEE, APP, false)["outcome"],
         "grant_not_found"
     );
-
     let _ = admit(&management, &carrier, caller("conversation-1", true)).await;
     assert_eq!(
         carrier.questions().len(),
@@ -1009,182 +1000,122 @@ fn question_message(question: &Value) -> String {
 
 const SIGNATURE_CHANGED: &str = "code signature has changed since it was approved";
 
-/// A grant made for one signature admits later calls from a process with
-/// that same signature without asking again, and both kinds of grant record
-/// the signature they were made for.
+/// Both grant lifetimes retain the verified app code-signing requirement and
+/// admit that app for the same agent in later conversations without asking again.
 #[tokio::test]
 async fn the_signature_a_grant_was_made_for_is_admitted_without_asking_again() {
-    let code = InjectedCode::default();
-    let storage = InMemoryGrantStorage::new();
-    let management = signed_management(&code, &storage);
-    let carrier = ScriptedCarrier::answering(&["allow_conversation", "allow_always"]);
-
-    admit(&management, &carrier, caller("conversation-1", false))
-        .await
-        .expect("the conversation answer admits");
-    admit(&management, &carrier, caller("conversation-1", false))
-        .await
-        .expect("the same signature is admitted again");
-    assert_eq!(
-        carrier.questions().len(),
-        1,
-        "the same signature was asked again"
-    );
-
-    admit(&management, &carrier, caller("conversation-2", true))
-        .await
-        .expect("the always answer admits");
-    let stored = storage.load().unwrap();
-    assert_eq!(stored.records.len(), 1);
-    let expected = team_identity(FIXTURE_TEAM);
-    assert_eq!(stored.records[0].team_id, expected.team_id);
-    assert_eq!(
-        stored.records[0].designated_requirement,
-        Some(expected.designated_requirement)
-    );
-    admit(&management, &carrier, caller("conversation-3", true))
-        .await
-        .expect("the stored always grant admits the same signature");
-    assert_eq!(
-        carrier.questions().len(),
-        2,
-        "the always grant was asked again"
-    );
+    for decision in ["allow_conversation", "allow_always"] {
+        let code = InjectedCode::default();
+        let storage = InMemoryAgentGrantStorage::default();
+        let management = signed_agent_management(&code, &storage);
+        let carrier = ScriptedCarrier::answering(&[decision]);
+        admit(&management, &carrier, caller("conversation-1", true))
+            .await
+            .expect("the granting answer admits");
+        admit(&management, &carrier, caller("conversation-2", true))
+            .await
+            .expect("the same signature is admitted again");
+        let stored = storage.load().unwrap().unwrap();
+        assert_eq!(stored.grants.len(), 1);
+        let expected = team_identity(FIXTURE_TEAM);
+        assert_eq!(stored.grants[0].team_id, expected.team_id);
+        assert_eq!(
+            stored.grants[0].designated_requirement,
+            Some(expected.designated_requirement)
+        );
+        assert_eq!(
+            stored.grants[0].expires_at_ms.is_none(),
+            decision == "allow_always"
+        );
+        assert_eq!(
+            carrier.questions().len(),
+            1,
+            "the same holder and signature was asked again"
+        );
+    }
 }
 
-/// Another application declaring the same bundle identity holds none of the
-/// grants the real one was given. A different Team ID fails a conversation
-/// grant, and a different requirement under the same Team ID fails an
-/// "always" record; each time the person is asked again and told the
-/// signature changed, and a deny leaves nothing granted to the impostor. The
-/// stored record still admits the real application afterwards.
+/// A changed signer or designated code-signing requirement prompts again for
+/// both lifetimes. Declining preserves the grant for the original app signature.
 #[tokio::test]
 async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
-    let code = InjectedCode::default();
-    let storage = InMemoryGrantStorage::new();
-    let management = signed_management(&code, &storage);
-    let grants = Arc::clone(management.computer_grants());
-    let carrier =
-        ScriptedCarrier::answering(&["allow_conversation", "deny", "allow_always", "deny"]);
-
-    // A conversation grant, then a process signed by another team.
-    let conversation = caller("conversation-1", false);
-    admit(&management, &carrier, conversation.clone())
-        .await
-        .expect("the conversation answer admits");
-    code.replace(Ok(team_identity("IMPOSTOR01")));
-    assert!(
-        !grants.holds(&conversation, &need_for(&code)),
-        "a grant made for one team admitted another team's process"
-    );
-    let refused = admit(&management, &carrier, conversation.clone()).await;
-    assert_eq!(refused.unwrap_err()["outcome"], "consent_denied");
-    let questions = carrier.questions();
-    assert_eq!(
-        questions.len(),
-        2,
-        "the changed signature was not asked about"
-    );
-    assert!(
-        !question_message(&questions[0]).contains(SIGNATURE_CHANGED),
-        "{}",
-        question_message(&questions[0])
-    );
-    assert!(
-        question_message(&questions[1]).contains(SIGNATURE_CHANGED),
-        "{}",
-        question_message(&questions[1])
-    );
-    assert!(!grants.holds(&conversation, &need_for(&code)));
-
-    // An "always" record, then a process under the same team with another
-    // requirement (another program the team signs, claiming this identity).
-    code.replace(Ok(team_identity(FIXTURE_TEAM)));
-    admit(&management, &carrier, caller("conversation-2", true))
-        .await
-        .expect("the always answer admits");
-    let mut other_program = team_identity(FIXTURE_TEAM);
-    other_program.designated_requirement = format!(
-        "identifier \"com.example.Other\" and anchor apple generic and \
-         certificate leaf[subject.OU] = \"{FIXTURE_TEAM}\""
-    );
-    code.replace(Ok(other_program));
-    let attested = caller("conversation-3", true);
-    let refused = admit(&management, &carrier, attested.clone()).await;
-    assert_eq!(refused.unwrap_err()["outcome"], "consent_denied");
-    let questions = carrier.questions();
-    assert_eq!(
-        questions.len(),
-        4,
-        "the changed requirement was not asked about"
-    );
-    assert!(question_message(&questions[3]).contains(SIGNATURE_CHANGED));
-    for (kind, question, ids, team) in [
-        (
-            "signature-changed conversation app",
-            &questions[1],
-            &["allow_conversation", "deny"][..],
-            "IMPOSTOR01",
-        ),
-        (
-            "signature-changed persistent app",
-            &questions[3],
-            &["allow_conversation", "allow_always", "deny"][..],
-            FIXTURE_TEAM,
-        ),
-    ] {
-        let p = &question["params"];
-        assert_eq!(p["kind"], "consent", "{kind}");
-        assert_eq!(p["target"]["kind"], "app", "{kind}");
-        // The call waits on the answer, so urgency is high. The scope names the
-        // bundle identity and the Team ID of the process this question was
-        // raised for, the signer the grant would be bound to.
-        assert_eq!(p["urgency"], "high", "{kind}");
-        assert_eq!(p["scope"], json!({"app": APP, "team_id": team}), "{kind}");
-        assert!(
-            p["prompt"].as_str().unwrap().contains(SIGNATURE_CHANGED),
-            "{kind}"
-        );
-        assert_eq!(p["default"], "deny", "{kind}");
-        assert_eq!(p["on_expiry"], "deny", "{kind}");
-        assert_eq!(p["expires_in_ms"], 1_800_000, "{kind}");
-        let options = p["options"].as_array().unwrap();
+    for permanent in [false, true] {
+        let code = InjectedCode::default();
+        let storage = InMemoryAgentGrantStorage::default();
+        let management = signed_agent_management(&code, &storage);
+        let grants = management.computer_grants();
+        let decision = if permanent {
+            "allow_always"
+        } else {
+            "allow_conversation"
+        };
+        let carrier = ScriptedCarrier::answering(&[decision, "deny"]);
+        let owner = caller("conversation-1", permanent);
+        admit(&management, &carrier, owner.clone())
+            .await
+            .expect("the original code is approved");
+        let mut replacement = team_identity(if permanent {
+            FIXTURE_TEAM
+        } else {
+            "IMPOSTOR01"
+        });
+        if permanent {
+            replacement.designated_requirement = format!("identifier \"com.example.Other\" and anchor apple generic and certificate leaf[subject.OU] = \"{FIXTURE_TEAM}\"");
+        }
+        code.replace(Ok(replacement));
+        assert!(!grants.holds(&owner, &need_for(&code)));
+        let refused = admit(&management, &carrier, owner.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refused["outcome"], "consent_denied");
+        let questions = carrier.questions();
         assert_eq!(
-            options
-                .iter()
-                .map(|o| o["id"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ids,
-            "{kind}"
+            questions.len(),
+            2,
+            "the changed signature was not asked about"
         );
-        assert!(
-            p.get("requestedSchema").is_none(),
-            "Cingulate receives options, not a reverse-lane schema"
+        assert!(!question_message(&questions[0]).contains(SIGNATURE_CHANGED));
+        assert!(question_message(&questions[1]).contains(SIGNATURE_CHANGED));
+        let p = &questions[1]["params"];
+        assert_eq!(p["kind"], "consent");
+        assert_eq!(p["target"]["kind"], "app");
+        assert_eq!(p["urgency"], "high");
+        assert_eq!(
+            p["scope"],
+            json!({"app":APP,"team_id":if permanent { FIXTURE_TEAM } else { "IMPOSTOR01" }})
         );
-        for option in options {
+        assert_eq!(p["default"], "deny");
+        assert_eq!(p["on_expiry"], "deny");
+        assert_eq!(p["expires_in_ms"], 1_800_000);
+        let expected = if permanent {
+            vec!["allow_conversation", "allow_always", "deny"]
+        } else {
+            vec!["allow_conversation", "deny"]
+        };
+        assert_eq!(decisions(&questions[1]), expected);
+        assert!(p.get("requestedSchema").is_none());
+        for option in p["options"].as_array().unwrap() {
             assert_eq!(
                 option["effect"],
                 if option["id"] == "deny" {
                     "decline"
                 } else {
                     "grant"
-                },
-                "{kind}"
+                }
             );
         }
+        assert!(!grants.holds(&owner, &need_for(&code)));
+        assert_eq!(
+            storage.load().unwrap().unwrap().grants.len(),
+            1,
+            "the original record was lost"
+        );
+        code.replace(Ok(team_identity(FIXTURE_TEAM)));
+        admit(&management, &carrier, caller("conversation-2", true))
+            .await
+            .expect("the original signature remains approved");
+        assert_eq!(carrier.questions().len(), 2);
     }
-    assert!(!grants.holds(&attested, &need_for(&code)));
-    assert_eq!(
-        storage.load().unwrap().records.len(),
-        1,
-        "the real application's record was lost"
-    );
-
-    code.replace(Ok(team_identity(FIXTURE_TEAM)));
-    admit(&management, &carrier, caller("conversation-4", true))
-        .await
-        .expect("the record still admits the real application");
-    assert_eq!(carrier.questions().len(), 4);
 }
 
 /// A process whose signature cannot be read is refused with a declared
@@ -1264,19 +1195,17 @@ async fn an_ad_hoc_or_teamless_application_is_not_offered_always() {
     }
 }
 
-/// Apple's own applications carry no Team ID, and are still offered
-/// "always": their signature chains to Apple's root, which no other
-/// developer can satisfy. The record keeps the requirement and no team.
+/// Apple-anchored apps keep their designated requirement without a Team ID.
 #[tokio::test]
 async fn an_apple_anchored_application_is_offered_always() {
     let code = InjectedCode::new(Ok(AppIdentity {
         team_id: None,
-        designated_requirement: "identifier \"com.apple.TextEdit\" and anchor apple".to_string(),
+        designated_requirement: "identifier \"com.apple.TextEdit\" and anchor apple".into(),
         ad_hoc: false,
         apple_anchored: true,
     }));
-    let storage = InMemoryGrantStorage::new();
-    let management = signed_management(&code, &storage);
+    let storage = InMemoryAgentGrantStorage::default();
+    let management = signed_agent_management(&code, &storage);
     let carrier = ScriptedCarrier::answering(&["allow_always"]);
     admit(&management, &carrier, caller("conversation-1", true))
         .await
@@ -1285,10 +1214,10 @@ async fn an_apple_anchored_application_is_offered_always() {
         decisions(&carrier.questions()[0]),
         ["allow_conversation", "allow_always", "deny"]
     );
-    let stored = storage.load().unwrap();
-    assert_eq!(stored.records[0].team_id, None);
+    let stored = storage.load().unwrap().unwrap();
+    assert_eq!(stored.grants[0].team_id, None);
     assert_eq!(
-        stored.records[0].designated_requirement.as_deref(),
+        stored.grants[0].designated_requirement.as_deref(),
         Some("identifier \"com.apple.TextEdit\" and anchor apple")
     );
 }
@@ -1345,11 +1274,11 @@ async fn a_record_without_a_signing_identity_grants_nothing() {
         Arc::new(FilesystemGrantStorage::new(&path)),
         Some(MACHINE.to_string()),
     );
-    assert_eq!(
-        old.store_error(),
-        Some(GrantStoreError::UnknownVersion { found: 1 })
-    );
-    assert_eq!(old.list()["store"]["reason"], "grant_store_version_unknown");
+    assert!(matches!(
+        old.agent_grants().store_error(),
+        Some(AgentGrantStoreError::Legacy { store: "apps", .. })
+    ));
+    assert_eq!(old.list()["store"]["reason"], "grant_store_unreadable");
     let old = Arc::new(ManagementPlane::with_computer_grants(
         Arc::new(FixedWithCode(TargetResolution::Resolved(grant()), code)),
         Arc::new(old),
@@ -1553,4 +1482,17 @@ async fn a_same_signed_process_swapped_in_during_the_wait_is_admitted() {
         1,
         "the same signature was asked again"
     );
+}
+
+fn signed_agent_management(
+    code: &InjectedCode,
+    storage: &InMemoryAgentGrantStorage,
+) -> Arc<ManagementPlane> {
+    Arc::new(ManagementPlane::with_computer_grants(
+        Arc::new(FixedWithCode(
+            TargetResolution::Resolved(grant()),
+            code.clone(),
+        )),
+        Arc::new(agent_grants_over(Arc::new(storage.clone()))),
+    ))
 }

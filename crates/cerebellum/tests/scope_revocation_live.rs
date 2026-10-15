@@ -335,7 +335,7 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_the_daemon() {
+async fn a_scope_end_closes_its_browser_and_questions_without_minting_unattested_grants() {
     let directory = cortexkit_test_support::ScratchDir::new("cerebellum-scope-live");
     let data = cortexkit_test_support::fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
     // Before anything reads them: the module in this process resolves its
@@ -481,7 +481,9 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
     .await
     .expect("a route under the scope opens");
 
-    // A grant held and a question open for the session's conversation.
+    // This fixture's scope names no admitted agent. Answering its helper
+    // question cannot mint a row, but scope teardown must still close its
+    // browser and any pending questions.
     let granted = management
         .browser_grant_question_for_test(
             CONVERSATION,
@@ -490,7 +492,7 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         )
         .await;
     assert!(
-        management
+        !management
             .settle_browser_grant(
                 &granted.ask_id,
                 Some(&json!({"decision": "allow_conversation"}))
@@ -525,7 +527,11 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         sessions.has_open_session(CONVERSATION),
         "an ordinary close closed the browser"
     );
-    assert_eq!(management.browser_grant_count().await, 1);
+    assert!(management
+        .agent_grants()
+        .live_rows(None, management.agent_grants().now_ms())
+        .unwrap()
+        .is_empty());
     assert!(management.browser_grant_question_open(&open.ask_id).await);
     assert!(
         scopes.is_watching(&key),
@@ -551,7 +557,11 @@ async fn a_scope_its_owner_ends_closes_its_browser_and_drops_its_grants_through_
         Some(BrowserSessionTerminalOutcome::ScopeRevoked)
     );
     assert!(!sessions.has_open_session(CONVERSATION));
-    assert_eq!(management.browser_grant_count().await, 0);
+    assert!(management
+        .agent_grants()
+        .live_rows(None, management.agent_grants().now_ms())
+        .unwrap()
+        .is_empty());
     assert!(!management.browser_grant_question_open(&open.ask_id).await);
     assert!(
         !management

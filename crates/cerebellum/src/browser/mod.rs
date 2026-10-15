@@ -2353,6 +2353,11 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
     ) -> Result<(), BrowserError> {
+        if !crate::grant_enforcement::commit_current() {
+            return Err(BrowserError::AuthorizationDenied {
+                reason: "grant_revoked",
+            });
+        }
         if self.journal_mode.is_enabled() {
             let mut journal = self.journal.lock().await;
             let grant_decision = journal
@@ -7397,3 +7402,6 @@ mod resource_busy_schema_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod agent_enforcement_tests;

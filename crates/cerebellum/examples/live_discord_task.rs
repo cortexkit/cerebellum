@@ -1142,11 +1142,11 @@ mod macos_probe {
         let (drain_sender, drain) = tokio::sync::watch::channel(false);
         std::mem::forget(drain_sender);
         ConsentContext::new(
-            GrantCaller {
-                conversation_key: identity().conversation_key,
-                agent_project_id: identity().agent_project_id,
-                durable_identity_attested: false,
-            },
+            GrantCaller::new(
+                identity().conversation_key,
+                identity().agent_project_id,
+                false,
+            ),
             Some(Arc::new(AnsweringCarrier::new()) as Arc<dyn QuestionCarrier>),
             Arc::new(AlwaysOpenRoute),
             drain,

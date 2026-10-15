@@ -1059,11 +1059,7 @@ async fn written_and_typed_text_never_reach_the_journal() {
         let (drain_sender, drain) = tokio::sync::watch::channel(false);
         std::mem::forget(drain_sender);
         ConsentContext::new(
-            GrantCaller {
-                conversation_key: identity().conversation_key,
-                agent_project_id: GRANTEE.into(),
-                durable_identity_attested: false,
-            },
+            GrantCaller::new(identity().conversation_key, GRANTEE.into(), false),
             Some(Arc::new(carrier.clone()) as Arc<dyn QuestionCarrier>),
             Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
             drain,
@@ -1369,11 +1365,7 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
     let (drain_sender, drain) = tokio::sync::watch::channel(false);
     std::mem::forget(drain_sender);
     let consent = ConsentContext::new(
-        GrantCaller {
-            conversation_key: identity().conversation_key,
-            agent_project_id: GRANTEE.into(),
-            durable_identity_attested: false,
-        },
+        GrantCaller::new(identity().conversation_key, GRANTEE.into(), false),
         Some(Arc::new(carrier) as Arc<dyn QuestionCarrier>),
         Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
         drain,

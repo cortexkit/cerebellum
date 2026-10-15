@@ -16,16 +16,18 @@ fn worker_planes(attested: bool, parent: bool) -> (Planes, Arc<InMemoryGrantStor
     ));
     let mut facts = planes.routes.get(1, 1).unwrap();
     let mut stamp = crate::cingulate_client::worker_vectors::worker_stamp();
+    if attested {
+        stamp.attributes.agent_id = Some("test-project".into());
+    }
     if !parent {
         stamp.parent = None;
     }
-    facts.scope = Some(stamp);
-    facts.agent_project_id_attested = attested;
+    facts = facts.with_scope(Some(stamp));
     planes.routes.insert(1, 1, facts);
     (planes, storage)
 }
 
-fn scripted(planes: Planes, choice: &str) -> (Planes, Arc<ScriptedCingulate>) {
+pub(super) fn scripted(planes: Planes, choice: &str) -> (Planes, Arc<ScriptedCingulate>) {
     let script = ScriptedCingulate::new();
     script
         .then(wire::CONSENT_REQUEST, Reply::Result(json!({"elicitation_id":"el_worker"})))
@@ -47,6 +49,7 @@ fn scripted(planes: Planes, choice: &str) -> (Planes, Arc<ScriptedCingulate>) {
 fn caller(planes: &Planes) -> GrantCaller {
     let facts = planes.routes.get(1, 1).unwrap();
     GrantCaller {
+        holder: crate::permission_scope::authorizing_holder(&facts),
         conversation_key: facts.identity.conversation_key,
         agent_project_id: facts.identity.agent_project_id,
         durable_identity_attested: false,
@@ -62,8 +65,8 @@ fn need() -> GrantNeed {
 }
 
 #[tokio::test]
-async fn worker_app_card_grants_only_the_calling_conversation() {
-    let (planes, _) = worker_planes(false, true);
+async fn worker_app_card_grants_only_the_calling_holder_across_conversations() {
+    let (planes, _) = worker_planes(true, true);
     let (planes, script) = scripted(planes, "allow_conversation");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(app_request(1), &tx, &planes)
@@ -81,6 +84,9 @@ async fn worker_app_card_grants_only_the_calling_conversation() {
     );
     let worker = caller(&planes);
     let head = GrantCaller {
+        holder: Some(crate::agent_grants::GrantHolder::Head {
+            agent_id: worker.agent_project_id.clone(),
+        }),
         conversation_key: "head-conversation".into(),
         ..worker.clone()
     };
@@ -88,10 +94,15 @@ async fn worker_app_card_grants_only_the_calling_conversation() {
     assert!(grants.holds(&worker, &need()));
     assert!(!grants.holds(&head, &need()));
     grants.end_conversation(&worker.conversation_key);
-    grants.grant_conversation(
-        &Subject::of(&head, &need()),
-        Some(&SignedByFixtureTeam.identity().unwrap()),
+    assert!(
+        grants.holds(&worker, &need()),
+        "conversation closure cannot revoke an agent grant"
     );
+    let store = grants.agent_grants();
+    let mut row = store.live_rows(None, store.now_ms()).unwrap().remove(0);
+    store.revoke(&row.id, store.now_ms()).unwrap();
+    row.holder = head.holder.clone().unwrap();
+    store.upsert(row, store.now_ms()).unwrap();
     assert!(grants.holds(&head, &need()), "the head has a usable grant");
     assert!(
         !grants.holds(&worker, &need()),

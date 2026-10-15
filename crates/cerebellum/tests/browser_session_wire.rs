@@ -10075,3 +10075,6 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
         "no reverse frame or duplicate reply"
     );
 }
+
+#[path = "it/agent_holder_enforcement.rs"]
+mod agent_holder_enforcement;

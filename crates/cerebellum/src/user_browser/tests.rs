@@ -183,6 +183,13 @@ impl Fixture {
     }
 
     fn with_cingulate(opener: Option<Arc<dyn CingulateOpener>>) -> Self {
+        Self::with_agent_grants(opener, None)
+    }
+
+    fn with_agent_grants(
+        opener: Option<Arc<dyn CingulateOpener>>,
+        agent_grants: Option<Arc<crate::agent_grants::AgentGrants>>,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let registry = std::env::temp_dir().join(format!(
             "user-browser-cards-{}-{}",
@@ -208,6 +215,14 @@ impl Fixture {
             Some("test-machine".into()),
         ));
         planes.user_browser = UserBrowserBridge::with_user_grants(grants);
+        if let Some(grants) = agent_grants {
+            planes.management = Arc::new(
+                crate::management::ManagementPlane::new(Arc::new(
+                    crate::management::PlatformResolver::new(),
+                ))
+                .with_agent_grants(grants),
+            );
+        }
         let planes = Arc::new(planes);
         for channel in [1, 2] {
             let frame = tool_frame(channel, 1, json!({"action":"status"}));
@@ -1961,3 +1976,5 @@ async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
 }
 
 mod worker;
+
+mod agent_enforcement;

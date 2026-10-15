@@ -499,11 +499,11 @@ async fn app_holder_loses_to_the_session_drain_only_after_the_grant_exists() {
         "consent_granted_not_executed"
     );
     let facts = planes.routes.get(1, 1).unwrap();
-    let caller = GrantCaller {
-        conversation_key: facts.identity.conversation_key,
-        agent_project_id: "test-project".into(),
-        durable_identity_attested: true,
-    };
+    let caller = GrantCaller::new(
+        facts.identity.conversation_key,
+        facts.identity.agent_project_id,
+        true,
+    );
     let need = GrantNeed::App {
         bundle_identity: "com.example.Editor".into(),
         display_name: "Editor".into(),
@@ -812,11 +812,7 @@ fn context(carrier: Arc<dyn QuestionCarrier>) -> ConsentContext {
     let (tx, drain) = watch::channel(false);
     std::mem::forget(tx);
     ConsentContext::new(
-        GrantCaller {
-            conversation_key: "conversation".into(),
-            agent_project_id: "test-project".into(),
-            durable_identity_attested: true,
-        },
+        GrantCaller::new("conversation".into(), "test-project".into(), true),
         Some(carrier),
         Arc::new(AlwaysOpenRoute),
         drain,
@@ -1184,6 +1180,27 @@ impl GrantStorage for BlockingStore {
     }
 }
 
+impl crate::agent_grants::AgentGrantStorage for BlockingStore {
+    fn load(
+        &self,
+    ) -> Result<
+        Option<crate::agent_grants::AgentGrantStoreState>,
+        crate::agent_grants::AgentGrantStoreError,
+    > {
+        Ok(Some(crate::agent_grants::AgentGrantStoreState::default()))
+    }
+    fn save(
+        &self,
+        _: &crate::agent_grants::AgentGrantStoreState,
+    ) -> Result<(), crate::agent_grants::AgentGrantStoreError> {
+        <Self as GrantStorage>::save(self, &GrantStoreState::default()).map_err(|error| {
+            crate::agent_grants::AgentGrantStoreError::WriteFailed {
+                detail: error.to_string(),
+            }
+        })
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_losing_holder_cannot_reply_before_the_winner_stores_the_effect() {
     let service = CardService::new();
@@ -1194,10 +1211,23 @@ async fn a_losing_holder_cannot_reply_before_the_winner_stores_the_effect() {
         released: Mutex::new(false),
         changed: std::sync::Condvar::new(),
     });
-    let grants = Arc::new(ComputerGrants::open(
-        storage.clone(),
-        Some("fixture-machine".into()),
-    ));
+    let grants = Arc::new(
+        ComputerGrants::open(storage.clone(), Some("fixture-machine".into())).with_agent_grants(
+            Arc::new(crate::agent_grants::AgentGrants::open(
+                storage.clone(),
+                &crate::agent_grants::LegacyGrantStores {
+                    apps: Arc::new(InMemoryGrantStorage::new()),
+                    browser: Arc::new(
+                        crate::browser_standing_grants::InMemoryStandingGrantStorage::new(),
+                    ),
+                    user_browser: Arc::new(
+                        crate::browser_standing_grants::InMemoryStandingGrantStorage::new(),
+                    ),
+                },
+                Some("fixture-machine".into()),
+            )),
+        ),
+    );
     let call = || {
         let grants = grants.clone();
         let consent = context(carrier.clone());
@@ -1240,7 +1270,10 @@ async fn a_losing_holder_cannot_reply_before_the_winner_stores_the_effect() {
         card.header.corr,
         ScriptedAnswer::Answered(json!({"decision":"allow_always"}))
     ));
-    saved.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), saved)
+        .await
+        .expect("the agent grant store write began")
+        .unwrap();
     let drain = crate::consent_drain::ConsentDrain::default();
     grants.register_drain(&drain);
     let report = drain
@@ -1436,3 +1469,7 @@ pub(crate) fn scope_reply(question: &Frame) -> Option<Frame> {
 }
 
 mod worker;
+
+mod holders;
+
+mod agent_app_ops;

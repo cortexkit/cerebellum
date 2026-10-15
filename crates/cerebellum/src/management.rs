@@ -350,6 +350,7 @@ impl TargetResolver for PlatformResolver {
 
 /// The state a management route needs.
 pub struct ManagementPlane {
+    unified_grants: Option<Arc<crate::agent_grants::AgentGrants>>,
     /// The computer plane's app and takeover grants, and the questions out
     /// for them.
     computer_grants: Arc<ComputerGrants>,
@@ -436,6 +437,7 @@ fn browser_grant_key(conversation_key: &str, origins: &[String]) -> (String, Vec
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingBrowserGrant {
+    holder: Option<crate::agent_grants::GrantHolder>,
     conversation_key: String,
     authorized_origins: Vec<String>,
     disclosed_hazards: BTreeSet<HazardClass>,
@@ -639,6 +641,26 @@ impl ClearSettlement {
 }
 
 impl ManagementPlane {
+    pub fn with_agent_grants(mut self, grants: Arc<crate::agent_grants::AgentGrants>) -> Self {
+        self.unified_grants = Some(Arc::clone(&grants));
+        self.computer_grants =
+            Arc::new(ComputerGrants::in_memory().with_agent_grants(Arc::clone(&grants)));
+        self.browser_grants = Arc::new(Mutex::new(
+            GrantStore::default()
+                .with_standing_grants(Arc::clone(&self.standing_browser_grants))
+                .with_public_web_baseline(Arc::clone(&self.signed_in_domains))
+                .with_agent_grants(grants),
+        ));
+        self
+    }
+
+    pub fn agent_grants(&self) -> &Arc<crate::agent_grants::AgentGrants> {
+        self.computer_grants.agent_grants()
+    }
+
+    pub(crate) fn unified_agent_grants(&self) -> Option<&Arc<crate::agent_grants::AgentGrants>> {
+        self.unified_grants.as_ref()
+    }
     /// A plane whose computer grants live in memory and are never offered
     /// "always". For tests and isolated callers.
     pub fn new(resolver: Arc<dyn TargetResolver>) -> Self {
@@ -654,6 +676,7 @@ impl ManagementPlane {
         let standing_browser_grants = Arc::new(StandingBrowserGrants::in_memory());
         let signed_in_domains = Arc::new(crate::browser_signed_in::SignedInDomains::default());
         Self {
+            unified_grants: None,
             computer_grants,
             app_state_sessions: Arc::new(AppStateSessions::new()),
             resolver,
@@ -694,7 +717,7 @@ impl ManagementPlane {
                         grant["subject"]["origin"].as_str().map(str::to_owned).unwrap_or_else(|| format!("https://{}", grant["subject"]["domain"].as_str().unwrap()))
                     } else { grant["target"].as_str().unwrap().to_owned() };
                     let (verdict, reason) = if tool == "browser_use" {
-                        browser_token_grant_answer(&self.standing_browser_grants, &self.signed_in_domains, &request.agent_id, grant, &target)
+                        if self.unified_grants.is_some() { self.agent_browser_answer(&request.agent_id, &target, grant["level"].as_u64(), grant["subject"]["domain"].as_str()) } else { browser_token_grant_answer(&self.standing_browser_grants, &self.signed_in_domains, &request.agent_id, grant, &target) }
                     } else if self.computer_grants.has_exact_standing_app_grant(&request.agent_id, &target, grant["signer"].as_str().unwrap()) {
                         ("yes", "standing_grant")
                     } else { ("would_ask", "no_standing_grant") };
@@ -713,13 +736,14 @@ impl ManagementPlane {
                 let (verdict, reason) = if !valid {
                     ("no", "invalid_target")
                 } else if item.tool == "browser_use" {
+                    if self.unified_grants.is_some() { self.agent_browser_answer(&request.agent_id, target, item.level, None) } else {
                     browser_standing_grant_answer(
                         &self.standing_browser_grants,
                         &self.signed_in_domains,
                         &request.agent_id,
                         target,
                         item.level,
-                    )
+                    ) }
                 } else if self
                     .computer_grants
                     .has_standing_app_grant(&request.agent_id, target)
@@ -1114,8 +1138,13 @@ impl ManagementPlane {
             ));
         }
 
-        let standing_agent = standing_agent
-            .filter(|agent| !agent.is_empty() && self.standing_browser_grants.can_record());
+        let standing_agent = standing_agent.filter(|agent| {
+            !agent.is_empty()
+                && self.unified_grants.as_ref().map_or_else(
+                    || self.standing_browser_grants.can_record(),
+                    |store| store.can_record(),
+                )
+        });
         let choices = offered_browser_grant_choices(
             &authorized_origins,
             &disclosed_hazards,
@@ -1124,6 +1153,9 @@ impl ManagementPlane {
         );
         let ask_id = new_browser_grant_ask_id();
         let pending = PendingBrowserGrant {
+            holder: standing_agent.map(|agent| crate::agent_grants::GrantHolder::Head {
+                agent_id: agent.into(),
+            }),
             conversation_key: conversation_key.to_string(),
             authorized_origins: authorized_origins.clone(),
             disclosed_hazards,
@@ -1238,6 +1270,10 @@ impl ManagementPlane {
         else {
             return Ok(BrowserGrantSettlement::UnrecognizedAnswer);
         };
+
+        if self.unified_grants.is_some() {
+            return Ok(self.record_agent_browser_answer(&pending, ask_id, choice));
+        }
 
         if choice == BrowserGrantChoice::Conversation {
             let grant = ActionGrant::new(
@@ -3094,3 +3130,5 @@ mod tests {
         assert_eq!(ahead.unwrap().body["params"]["urgency"], "normal");
     }
 }
+
+mod agent_enforcement;
