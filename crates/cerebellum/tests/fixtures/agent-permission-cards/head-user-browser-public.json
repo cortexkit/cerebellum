@@ -1,0 +1,75 @@
+{
+  "default": "deny",
+  "expires_in_ms": 120000,
+  "facts": [
+    {
+      "label": "Browser",
+      "value": "Your own Chrome, signed in as you"
+    },
+    {
+      "label": "Site",
+      "value": "https://example.com"
+    },
+    {
+      "label": "Level",
+      "value": "3"
+    },
+    {
+      "label": "Hazards",
+      "value": ""
+    }
+  ],
+  "kind": "consent",
+  "late_execution": "notify_only",
+  "material_damage": true,
+  "on_expiry": "deny",
+  "options": [
+    {
+      "detail": "Up to filling in forms and other changes that can be undone.",
+      "effect": "grant",
+      "id": "allow_30m",
+      "label": "Allow on example.com for 30 minutes"
+    },
+    {
+      "detail": "Up to filling in forms and other changes that can be undone.",
+      "effect": "grant",
+      "id": "allow_origin_always",
+      "label": "Always allow on example.com and its subdomains"
+    },
+    {
+      "detail": "Up to filling in forms and other changes that can be undone. Covers public websites only. Sign-in and payment pages still ask per site. Password and card fields stay blocked. To withdraw it, ask the agent to remove its browser access.",
+      "effect": "grant",
+      "group": "danger",
+      "id": "allow_all_sites_30m",
+      "label": "Allow on all sites for 30 minutes"
+    },
+    {
+      "detail": "Up to filling in forms and other changes that can be undone. Covers public websites only. Sign-in and payment pages still ask per site. Password and card fields stay blocked. To withdraw it, ask the agent to remove its browser access.",
+      "effect": "grant",
+      "group": "danger",
+      "id": "allow_all_sites_always",
+      "label": "Always allow on all sites"
+    },
+    {
+      "effect": "decline",
+      "id": "deny",
+      "label": "Don't allow"
+    }
+  ],
+  "prompt": "Let the agent use your own Chrome, signed in as you, on this site?",
+  "requester_ref": "pf:card-golden",
+  "scope": {
+    "browser": "user",
+    "hazards": [],
+    "origins": [
+      "https://example.com"
+    ],
+    "severity_tier": 3
+  },
+  "target": {
+    "kind": "site",
+    "label": "https://example.com"
+  },
+  "title": "Allow access to https://example.com?",
+  "urgency": "high"
+}

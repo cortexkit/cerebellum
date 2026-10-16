@@ -25,15 +25,16 @@
   "on_expiry": "deny",
   "options": [
     {
-      "detail": "Only this invocation, including its landing-page read.",
+      "detail": "Up to filling in forms and other changes that can be undone.",
       "effect": "grant",
-      "id": "allow_once",
-      "label": "Allow once"
+      "id": "allow_30m",
+      "label": "Allow on bank.example for 30 minutes"
     },
     {
+      "detail": "Up to filling in forms and other changes that can be undone.",
       "effect": "grant",
       "id": "allow_origin_always",
-      "label": "Always on this site"
+      "label": "Always allow on bank.example and its subdomains"
     },
     {
       "effect": "decline",

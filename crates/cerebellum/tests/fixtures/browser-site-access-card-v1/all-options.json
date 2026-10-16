@@ -23,8 +23,8 @@
     {
       "detail": "Up to clicking ordinary links and buttons.",
       "effect": "grant",
-      "id": "allow_conversation",
-      "label": "Allow for this conversation"
+      "id": "allow_30m",
+      "label": "Allow on news.example for 30 minutes"
     },
     {
       "detail": "Up to clicking ordinary links and buttons.",
@@ -33,14 +33,16 @@
       "label": "Always allow on news.example and its subdomains"
     },
     {
-      "detail": "Up to clicking ordinary links and buttons. Covers every public website, including ones where you're signed in. To withdraw it, ask the agent to remove its browser access.",
+      "detail": "Up to clicking ordinary links and buttons. Covers public websites only. Sign-in and payment pages still ask per site. Password and card fields stay blocked. To withdraw it, ask the agent to remove its browser access.",
       "effect": "grant",
-      "id": "allow_all_sites_10m",
-      "label": "Allow on all sites for 10 minutes"
+      "group": "danger",
+      "id": "allow_all_sites_30m",
+      "label": "Allow on all sites for 30 minutes"
     },
     {
-      "detail": "Up to clicking ordinary links and buttons. Covers every public website, including ones where you're signed in. To withdraw it, ask the agent to remove its browser access.",
+      "detail": "Up to clicking ordinary links and buttons. Covers public websites only. Sign-in and payment pages still ask per site. Password and card fields stay blocked. To withdraw it, ask the agent to remove its browser access.",
       "effect": "grant",
+      "group": "danger",
       "id": "allow_all_sites_always",
       "label": "Always allow on all sites"
     },
@@ -56,9 +58,9 @@
     "properties": {
       "decision": {
         "enum": [
-          "allow_conversation",
+          "allow_30m",
           "allow_origin_always",
-          "allow_all_sites_10m",
+          "allow_all_sites_30m",
           "allow_all_sites_always",
           "deny"
         ],
