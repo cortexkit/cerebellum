@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 7,
+    "corr": 43,
+    "epoch": 1,
+    "type": "Cancel",
+    "wire_hex": "000000000206000700010000002b00000000000000"
+  },
+  "case": "computer-queued",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 89,
+    "body_utf8": "{\"outcome\":\"cancelled\",\"remedy\":\"the call was cancelled before it ran; nothing was done\"}",
+    "channel": 7,
+    "corr": 43,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "590000000201020700010000002b000000000000007b226f7574636f6d65223a2263616e63656c6c6564222c2272656d656479223a227468652063616c6c207761732063616e63656c6c6564206265666f72652069742072616e3b206e6f7468696e672077617320646f6e65227d"
+  },
+  "request": {
+    "body_length": 89,
+    "body_utf8": "{\"arguments\":{\"action\":\"read_state\",\"target\":\"com.example.Editor\"},\"name\":\"computer_use\"}",
+    "channel": 7,
+    "corr": 43,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "590000000200000700010000002b000000000000007b22617267756d656e7473223a7b22616374696f6e223a22726561645f7374617465222c22746172676574223a22636f6d2e6578616d706c652e456469746f72227d2c226e616d65223a22636f6d70757465725f757365227d"
+  },
+  "state": "read_state queued behind another call's app card"
+}

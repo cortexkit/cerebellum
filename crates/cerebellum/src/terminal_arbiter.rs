@@ -231,9 +231,20 @@ impl TerminalArbiter {
         state.chosen = Some(result.unwrap_or_else(|| {
             let possible = dispatched || committed;
             let body = if possible {
+                // Consent can be the last checkpoint even after its approval
+                // starts a mutation. The gate/witness is stronger evidence:
+                // never describe a possibly dispatched action as still queued
+                // or waiting for permission.
+                let step = match state.step {
+                    CallStep::Admission
+                    | CallStep::Queue
+                    | CallStep::Consent
+                    | CallStep::Preflight => CallStep::Dispatch,
+                    step => step,
+                };
                 json!({"outcome":"dispatch_outcome_unknown",
                     "effect_status":"effect_indeterminate", "detail":{
-                        "reason":cause.name(), "dispatched":true, "step":state.step.name(),
+                        "reason":cause.name(), "dispatched":true, "step":step.name(),
                         "held_state":if state.release.is_some() { "unknown" } else { "none_held" }},
                     "remedy":"read the state before retrying"})
             } else if matches!(cause, TerminalCause::Deadline) {
@@ -731,7 +742,14 @@ mod arbiter_egress_tests {
                 unknown.witness.mark_committed();
                 unknown.stop(cause);
                 let reply = body(&unknown);
-                assert_eq!(reply["detail"]["step"], step.name());
+                assert_eq!(
+                    reply["detail"]["step"],
+                    if matches!(step, CallStep::Release) {
+                        "release"
+                    } else {
+                        "dispatch"
+                    }
+                );
                 browser::validate_browser_result("browser.navigate", &reply).unwrap();
                 browser::validate_browser_result(management::CAPTURE_LOGIN, &reply).unwrap();
                 computer::platform::vocabulary::validate_capability_result(

@@ -50,6 +50,10 @@ mod stable_refs;
 mod browser_queue;
 #[path = "support/permissions.rs"]
 mod permission_support;
+#[path = "support/turn_stop_browser.rs"]
+mod turn_stop_browser;
+#[path = "support/turn_stop_vectors.rs"]
+mod turn_stop_vectors;
 
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";

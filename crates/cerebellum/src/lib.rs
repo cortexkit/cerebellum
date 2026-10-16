@@ -74,6 +74,9 @@ pub mod snapshot_store;
 mod terminal_arbiter;
 mod tool_provider;
 mod tool_result;
+#[cfg(test)]
+#[path = "../tests/support/turn_stop_vectors.rs"]
+mod turn_stop_vectors;
 mod user_browser;
 pub mod user_browser_bridge;
 pub mod wire;
@@ -10750,13 +10753,10 @@ mod tests {
             );
         let planes = cingulate.planes(&fixture);
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
-        handle_frame(
-            capture_request_frame(303, ollama_capture_params()),
-            &writer_tx,
-            &planes,
-        )
-        .await
-        .unwrap();
+        let request = capture_request_frame(303, ollama_capture_params());
+        handle_frame_for_test(request.clone(), &writer_tx, &planes)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while cingulate.methods().len() < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -10774,10 +10774,19 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        handle_frame(cancel, &writer_tx, &planes).await.unwrap();
+        handle_frame_for_test(cancel.clone(), &writer_tx, &planes)
+            .await
+            .unwrap();
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "cancelled", "{body}");
+        crate::turn_stop_vectors::check(
+            "capture-login-card",
+            "parked awaiting the 30-minute capture card before login handoff",
+            &request,
+            &cancel,
+            Some(&reply),
+        );
         tokio::time::timeout(Duration::from_secs(10), async {
             while cingulate.methods().len() < 3 {
                 tokio::time::sleep(Duration::from_millis(5)).await;

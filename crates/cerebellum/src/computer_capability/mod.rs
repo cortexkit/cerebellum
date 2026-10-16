@@ -49,8 +49,12 @@ use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
 use cerebellum_computer::platform::AccessibilityElementName;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::MacOs26PlatformDriver;
+#[cfg(all(target_os = "macos", test))]
+pub(crate) mod turn_stop_driver;
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use turn_stop_driver::Driver as NativeComputerPlatformDriver;
 #[cfg(target_os = "windows")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::WindowsPlatformDriver;
 #[cfg(target_os = "macos")]
