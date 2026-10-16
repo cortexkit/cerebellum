@@ -533,7 +533,7 @@ mod tests {
         async fn open(&self) -> Value {
             self.call(
                 crate::management::OPEN_GRANT,
-                json!({"origins":["https://requested.example"],"hazards":[]}),
+                json!({"origins":["https://requested.example.com"],"hazards":[]}),
             )
             .await
         }
@@ -691,7 +691,7 @@ mod tests {
         fixture
             .service
             .then("consent.ack", Reply::Result(json!({"cursor":1})));
-        let frame = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), 4, 1, 99, serde_json::to_vec(&json!({"method":"browser.open_grant","params":{"origins":["https://requested.example"],"hazards":[]}})).unwrap()).unwrap();
+        let frame = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), 4, 1, 99, serde_json::to_vec(&json!({"method":"browser.open_grant","params":{"origins":["https://requested.example.com"],"hazards":[]}})).unwrap()).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         crate::handle_frame_for_test(frame.clone(), &tx, &fixture.planes)
             .await
@@ -811,10 +811,7 @@ mod tests {
     #[tokio::test]
     async fn open_grant_expired_thirty_minute_grant_asks_again() {
         let fixture = Fixture::new(false);
-        fixture.grant(
-            GrantSubject::Domain("requested.example".into()),
-            Some(1_800_100),
-        );
+        fixture.grant(GrantSubject::Domain("example.com".into()), Some(1_800_100));
         fixture.clock.advance_ms(1_800_001);
         fixture.raised("el_expired_retry");
         let reply = fixture.open().await;
@@ -919,10 +916,7 @@ mod tests {
             let store = fixture.planes.management.agent_grants();
             let rows = store.live_rows(None, store.now_ms()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].subject,
-                GrantSubject::Domain("requested.example".into())
-            );
+            assert_eq!(rows[0].subject, GrantSubject::Domain("example.com".into()));
             assert_eq!(rows[0].expires_at_ms, None);
             assert_eq!(rows[0].card_ref.as_deref(), Some("el_late_always"));
         }
