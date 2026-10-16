@@ -8030,6 +8030,7 @@ fn assert_no_card_raised(planes: &Planes) {
 
 #[cfg(test)]
 mod tests {
+    mod capture_audit_tests;
     #[tokio::test]
     async fn isolated_plane_without_profile_lifecycle_refuses_rebind_without_touching_data_home() {
         use super::*;
@@ -10024,15 +10025,32 @@ mod tests {
         corr: u64,
         params: Value,
     ) -> Value {
+        let credential_id = params["credential_domain"]
+            .as_str()
+            .zip(params["account"].as_str())
+            .map(|(domain, account)| format!("cookie:{domain}:{account}"));
+        let captured_before = match credential_id.as_deref() {
+            Some(id) => capture_audit_tests::captured_count(planes, id).await,
+            None => 0,
+        };
         let body = capture_initial_reply(planes, writer, rx, corr, params).await;
         if body["outcome"] == "capture_pending" {
             let late = capture_stored_late(planes, corr).await;
             // Consent tests need the finished deposit and disposal result,
             // not merely confirmation that the sign-in window was handed over.
             let result = late["result"].clone();
-            let journal = planes.browser.journal_export_for_test().await;
             if result["outcome"] == "captured" {
-                assert!(journal.contains("captured:"), "{journal}");
+                // Late results intentionally publish before the asynchronous
+                // audit write. Wait for this capture's new row, not a row left
+                // by an earlier successful request for the same credential.
+                capture_audit_tests::wait_for_new_capture(
+                    planes,
+                    credential_id
+                        .as_deref()
+                        .expect("a captured request names a credential"),
+                    captured_before,
+                )
+                .await;
             }
             result
         } else {
