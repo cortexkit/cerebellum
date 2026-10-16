@@ -14,6 +14,38 @@ pub(crate) fn is_operation(method: &str) -> bool {
     matches!(method, LIST | REVOKE)
 }
 
+pub(crate) fn bind_admitted(
+    principal: &Option<subc_protocol::Principal>,
+    target: &subc_protocol::RouteTarget,
+) -> bool {
+    // Cingulate collects permissions and revocations for the operator. Give it
+    // a management route without first-party membership, which would also
+    // expose unrelated operator operations, tools and sessions.
+    is_aggregator(principal)
+        && matches!(target, subc_protocol::RouteTarget::ManagementSurface { module_id } if module_id == "cerebellum")
+}
+
+fn is_aggregator(principal: &Option<subc_protocol::Principal>) -> bool {
+    matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "cingulate")
+}
+
+pub(crate) fn refused_method(frame: &Frame, facts: &AcceptedBindFacts) -> Option<String> {
+    if !is_aggregator(&facts.principal) {
+        return None;
+    }
+    let request: Value = serde_json::from_slice(&frame.body).ok()?;
+    // Processing pending consent answers can mint grants before an operation's
+    // handler runs. Reject unrelated names before that processing or any other
+    // handler's grant lookup, even if the handler would eventually refuse.
+    if let Some(method) = request.get("method").and_then(Value::as_str) {
+        return (!is_operation(method)).then(|| method.to_string());
+    }
+    request
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 pub(crate) async fn handle(
     frame: &Frame,
     writer: &tokio::sync::mpsc::Sender<Frame>,
@@ -30,8 +62,7 @@ pub(crate) async fn handle(
     );
     // A direct route identifies an OS user, not a person: agent shells have
     // that identity too. Only the permissions aggregator may administer rows.
-    if !matches!(&facts.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "cingulate")
-    {
+    if !is_aggregator(&facts.principal) {
         return crate::send_route_error(
             writer,
             ver,

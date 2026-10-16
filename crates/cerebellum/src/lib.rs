@@ -3508,6 +3508,11 @@ async fn handle_route_request(
         )
         .await;
     };
+    if let Some(method) = permissions::refused_method(&frame, &facts) {
+        return send_route_error(writer, ver, channel, epoch, corr, "principal_denied",
+            &format!("reserved:cingulate may call only permissions.list or permissions.revoke, not '{method}'"))
+            .await;
+    }
     // A route of a session that a newer epoch has replaced, whose close has
     // not reached this module yet. Serving it could mint a grant under the
     // conversation the new session now holds.
@@ -5405,16 +5410,16 @@ async fn handle_control_request(
             role_versions: _,
             call_mode,
         } => {
-            // Refuse non-first-party principals at bind; the only exception is a
-            // Basal route that passes `flow_carrier_admitted`. The subc-mcp gateway
-            // also keeps these tools off MCP surfaces. Whether a first-party caller
-            // may act in a conversation is checked per call in
-            // `send_session_caller_not_admitted`.
+            // Basal needs verified flow delegation. Cingulate may bind only to
+            // this module's management surface, where its calls are limited to
+            // permissions.list/revoke before any grant lookup. Neither needs
+            // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
             if !trust.is_first_party()
                 && !scope.as_ref().is_some_and(|stamp| {
                     cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
                 })
+                && !permissions::bind_admitted(&principal, &target)
             {
                 return send_principal_denied(
                     writer,

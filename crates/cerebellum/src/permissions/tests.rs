@@ -13,6 +13,7 @@ use subc_protocol::{FrameType, Principal, RouteTarget};
 use tokio::sync::mpsc;
 
 mod retained;
+mod routes;
 
 const MACHINE: &str = "fixture-machine";
 const NOW: u64 = 1_060_000;

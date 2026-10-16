@@ -76,7 +76,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::LIST_APP_GRANTS,
             json!({})
         )
@@ -87,7 +87,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::LIST_GRANTS,
             json!({"agent_id":"agent-alf"})
         )
@@ -103,7 +103,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::REVOKE_APP_GRANT,
             json!({"grantee":"agent-alf","bundle_identity":"editor","dry_run":true})
         )
@@ -115,7 +115,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::REVOKE_APP_GRANT,
             json!({"grantee":"agent-alf","bundle_identity":"editor"})
         )
@@ -142,7 +142,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::REVOKE_APP_GRANT,
             json!({"grantee":"agent-alf","bundle_identity":"temporary","dry_run":true})
         )
@@ -153,7 +153,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::REVOKE_GRANT,
             json!({"agent_id":"agent-alf","domain":"example.com"})
         )
@@ -177,7 +177,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
     assert_eq!(
         call(
             &planes,
-            aggregator(),
+            facts(Principal::Direct),
             management::LIST_GRANTS,
             json!({"agent_id":"agent-alf"})
         )
