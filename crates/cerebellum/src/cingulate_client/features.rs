@@ -3,6 +3,8 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CingulateFeatures {
     pub option_group: bool,
+    /// Cingulate 0.7.1 understands this marker; older versions reject it.
+    pub single_use: bool,
 }
 
 pub(crate) fn negotiated(reported: Option<CingulateFeatures>) -> CingulateFeatures {
@@ -23,6 +25,15 @@ pub(crate) fn from_catalog(body: &[u8]) -> Option<CingulateFeatures> {
                         .provides
                         .iter()
                         .any(|capability| capability == "consent-option-group/v1")
+                })
+        }),
+        single_use: modules.iter().any(|module| {
+            module.module_id == "cingulate"
+                && module.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|capability| capability == "consent-single-use/v1")
                 })
         }),
     })
@@ -63,8 +74,22 @@ pub(crate) async fn discover(stream: &mut tokio::net::TcpStream) -> Option<Cingu
 
 impl super::card::CardRequest {
     pub(crate) fn for_features(mut self, features: CingulateFeatures) -> Self {
+        let single_use = features.single_use
+            && matches!(
+                self.kind,
+                super::card::CardKind::LoginCapture | super::card::CardKind::LoginImport
+            );
+        let params = self.params.as_object_mut().expect("mapped card params");
+        if single_use {
+            params.insert("single_use".into(), serde_json::Value::Bool(true));
+        } else {
+            // Cingulate rejects this field on older versions and on other card kinds.
+            params.remove("single_use");
+        }
         if !features.option_group {
-            let options = self.params["options"]
+            let options = params
+                .get_mut("options")
+                .expect("mapped card options")
                 .as_array_mut()
                 .expect("mapped card options");
             options.retain(|option| option["group"] != "danger");

@@ -111,6 +111,7 @@ impl ScriptedCingulate {
         let service = Arc::new(Self::default());
         service.report_features(Some(super::features::CingulateFeatures {
             option_group: true,
+            single_use: false,
         }));
         service
     }

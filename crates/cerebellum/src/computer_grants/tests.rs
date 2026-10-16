@@ -183,7 +183,10 @@ impl CingulateOpener for Arc<CardService> {
 struct ServiceRoute(Arc<CardService>);
 impl CingulateRoute for ServiceRoute {
     fn features(&self) -> Option<crate::cingulate_client::features::CingulateFeatures> {
-        Some(crate::cingulate_client::features::CingulateFeatures { option_group: true })
+        Some(crate::cingulate_client::features::CingulateFeatures {
+            option_group: true,
+            single_use: false,
+        })
     }
     fn call<'a>(
         &'a mut self,

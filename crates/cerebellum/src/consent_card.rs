@@ -268,7 +268,7 @@ const CORE_REQUIRED_KEYS: [&str; 11] = [
     "expires_in_ms",
 ];
 #[cfg(test)]
-const CORE_OPTIONAL_KEYS: [&str; 13] = [
+const CORE_OPTIONAL_KEYS: [&str; 14] = [
     "requester_ref",
     "binding",
     "at_console",
@@ -282,6 +282,7 @@ const CORE_OPTIONAL_KEYS: [&str; 13] = [
     "facts",
     "preview",
     "requestedSchema",
+    "single_use",
 ];
 
 /// The longest a consent request may stay open in Prefrontal core: a day.
@@ -378,6 +379,12 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
             "invalid type: `material_damage` is not a bool",
         ));
     }
+    if params
+        .get("single_use")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(core_invalid("single_use must be a boolean"));
+    }
     let Some(expires_in_ms) = params["expires_in_ms"].as_i64() else {
         return Err(core_invalid("invalid type: `expires_in_ms` is not an i64"));
     };
@@ -423,6 +430,9 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
     // below was checked for its type above.
     let text = |key: &str| params[key].as_str().unwrap_or_default();
     let blank = |value: &Value| value.as_str().unwrap_or_default().trim().is_empty();
+    if params.get("single_use").is_some() && text("kind") != "consent" {
+        return Err(core_invalid("single_use requires consent kind"));
+    }
     if text("kind") != "consent" {
         return Err(CoreRefusal {
             code: "elicitation_unknown_kind",
@@ -574,6 +584,26 @@ mod tests {
             .unwrap_err()
             .message
             .contains("unknown field"));
+    }
+
+    #[test]
+    fn single_use_is_an_optional_boolean_only_for_consent_requests() {
+        let body = card(vec![ConsentOption::grant("allow", "Allow")]).render();
+        let mut params = body["params"].clone();
+        assert_eq!(core_verdict(&params), Ok(()));
+        params["single_use"] = json!(true);
+        assert_eq!(core_verdict(&params), Ok(()));
+        params["single_use"] = json!(false);
+        assert_eq!(core_verdict(&params), Ok(()));
+        params["single_use"] = json!("yes");
+        let invalid_type = core_verdict(&params).unwrap_err();
+        assert_eq!(invalid_type.code, "elicitation_invalid_request");
+        assert!(invalid_type.message.contains("single_use"));
+        params["single_use"] = json!(true);
+        params["kind"] = json!("browser");
+        let invalid_kind = core_verdict(&params).unwrap_err();
+        assert_eq!(invalid_kind.code, "elicitation_invalid_request");
+        assert!(invalid_kind.message.contains("single_use"));
     }
 
     /// Prefrontal's consent request vectors, copied byte for byte from

@@ -244,7 +244,7 @@ fn as_the_reverse_lane_sent_it(body: &Value, deadline: Duration) -> Value {
 
 /// The keys Cingulate accepts in a `consent.request` and in an option. It
 /// refuses any other, so a card carrying one would be shown to nobody.
-const REQUEST_KEYS: [&str; 22] = [
+const REQUEST_KEYS: [&str; 23] = [
     "kind",
     "title",
     "prompt",
@@ -267,6 +267,7 @@ const REQUEST_KEYS: [&str; 22] = [
     "session_ref",
     "parent_session_ref",
     "requester_ref",
+    "single_use",
 ];
 const OPTION_KEYS: [&str; 5] = ["id", "label", "effect", "detail", "group"];
 
@@ -320,6 +321,33 @@ fn every_card_kind_shows_the_phone_what_it_showed_before() {
             .unwrap(),
             "{name}: the phone-visible fields are not byte-identical"
         );
+    }
+}
+
+#[test]
+fn single_use_is_negotiated_only_for_login_cards_across_all_kinds() {
+    for standing in [true, false] {
+        for (kind, name, body, deadline) in cards_with_standing(standing) {
+            for features in [
+                super::features::CingulateFeatures::default(),
+                super::features::CingulateFeatures {
+                    option_group: true,
+                    single_use: true,
+                },
+            ] {
+                let card = request_for(kind, &body, deadline).for_features(features);
+                let expected = features.single_use
+                    && matches!(kind, CardKind::LoginCapture | CardKind::LoginImport);
+                if expected {
+                    assert_eq!(card.params["single_use"], true, "{name}");
+                } else {
+                    assert!(
+                        card.params.get("single_use").is_none(),
+                        "{name}: non-login or unsupported card carries single_use"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -634,6 +662,94 @@ async fn an_unanswered_park_detaches_and_is_pending_with_a_wake() {
     assert_eq!(reply["outcome"], "consent_pending");
     assert_eq!(reply["ask_id"], "el_1");
     assert!(reply["remedy"].as_str().unwrap().contains("woken"));
+}
+
+#[tokio::test]
+async fn single_use_login_answers_stay_attached_and_timeouts_detach_before_pending() {
+    let create_reply: Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/consent-outcomes-refs-v1/single-use-reply.json"
+    ))
+    .unwrap();
+    let capture_card = || {
+        cards_with_standing(true)
+            .into_iter()
+            .find(|(kind, _, _, _)| *kind == CardKind::LoginCapture)
+            .map(|(kind, name, body, deadline)| (request_for(kind, &body, deadline), name))
+            .unwrap()
+    };
+    let features = Some(super::features::CingulateFeatures {
+        option_group: true,
+        single_use: true,
+    });
+
+    let cingulate = ScriptedCingulate::new();
+    cingulate.report_features(features);
+    cingulate
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(create_reply["result"].clone()),
+        )
+        .then(
+            wire::CONSENT_AWAIT,
+            Reply::Result(json!({
+                "elicitation_id": "el_1",
+                "state": "answered",
+                "answered_choice_id": "allow"
+            })),
+        );
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let (request, name) = capture_card();
+    let id = session.raise(request, name).await.unwrap();
+    assert_eq!(cingulate.calls()[0].1["single_use"], true);
+    assert_eq!(id, "el_1");
+    let ending = session
+        .park(&id, Duration::from_secs(600), std::future::pending())
+        .await;
+    assert_eq!(
+        ending,
+        InCall::Settled(Ending::Granted {
+            choice_id: "allow".into()
+        })
+    );
+    assert_eq!(
+        cingulate.methods(),
+        vec![wire::CONSENT_REQUEST, wire::CONSENT_AWAIT],
+        "an answer consumed while waiting must stay attached"
+    );
+
+    let cingulate = ScriptedCingulate::new();
+    cingulate.report_features(features);
+    cingulate
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(create_reply["result"].clone()),
+        )
+        .then(wire::CONSENT_AWAIT, Reply::Result(pending()))
+        .then(wire::CONSENT_DETACH, Reply::Result(detached()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let (live, _) = live_call("sc_head_alf");
+    let mut session = desk.session(&live).await.unwrap();
+    let (request, name) = capture_card();
+    let id = session.raise(request, name).await.unwrap();
+    assert_eq!(cingulate.calls()[0].1["single_use"], true);
+    let ending = session
+        .park(&id, Duration::from_secs(120), std::future::pending())
+        .await;
+    assert_eq!(ending, InCall::Pending { ask_id: id.clone() });
+    assert_eq!(
+        cingulate.methods(),
+        vec![
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_DETACH
+        ],
+        "the card must detach before its call reports pending"
+    );
+    let reply = pending_reply(&id);
+    assert_eq!(reply["outcome"], "consent_pending");
+    assert_eq!(reply["ask_id"], id);
 }
 
 /// A card that settled before the detach landed is answered in the call:
