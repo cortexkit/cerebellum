@@ -13,6 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::support::permissions as permission_support;
+use cerebellum::agent_grants::{
+    AgentGrantStorage, AgentGrants, FilesystemAgentGrantStorage, GrantSubject,
+    InMemoryAgentGrantStorage,
+};
 use cerebellum::authorization::HazardClass;
 use cerebellum::browser::navigation::{BrowserScreenshotObservation, BrowserSnapshotObservation};
 use cerebellum::browser::Tracker;
@@ -22,10 +27,7 @@ use cerebellum::browser_session::{
     CleanupStage, ClickDriveError, ClickNavigation, LaunchedBrowser, NavigationDriveError,
     NavigationWait, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
 };
-use cerebellum::browser_standing_grants::{
-    FilesystemStandingGrantStorage, InMemoryStandingGrantStorage, ManualWallClock,
-    StandingBrowserGrants, StandingGrantStorage, StandingSubject, ALL_SITES_SHORT_GRANT_MS,
-};
+use cerebellum::browser_standing_grants::{ManualWallClock, ALL_SITES_SHORT_GRANT_MS};
 use cerebellum::classification::{
     canonical_origin_from_url, classify_click, AssociatedFormControlInput,
     ClassificationUnavailable, ElementClassificationInput, NodeIdentityInput,
@@ -496,19 +498,16 @@ impl SessionCleanup for Cleanup {
 
 /// A standing grant store on [`MACHINE`] over `storage`, stamped by `clock`.
 fn store_over(
-    storage: impl StandingGrantStorage + 'static,
+    storage: impl AgentGrantStorage + 'static,
     clock: &ManualWallClock,
-) -> Arc<StandingBrowserGrants> {
-    Arc::new(
-        StandingBrowserGrants::open(Arc::new(storage), Some(MACHINE.to_string()))
-            .with_clock(Arc::new(clock.clone())),
-    )
+) -> Arc<AgentGrants> {
+    permission_support::store(Arc::new(storage), MACHINE, Arc::new(clock.clone()))
 }
 
 struct Fixture {
     planes: Planes,
     browser: Browser,
-    store: Arc<StandingBrowserGrants>,
+    store: Arc<AgentGrants>,
     clock: ManualWallClock,
     next_channel: u16,
     signed_in: Arc<cerebellum::browser_signed_in::SignedInDomains>,
@@ -517,16 +516,16 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let clock = ManualWallClock::at(1_700_000_000_000);
-        let store = store_over(InMemoryStandingGrantStorage::new(), &clock);
+        let store = store_over(InMemoryAgentGrantStorage::default(), &clock);
         Self::with_store(store, clock)
     }
 
-    fn with_store(store: Arc<StandingBrowserGrants>, clock: ManualWallClock) -> Self {
+    fn with_store(store: Arc<AgentGrants>, clock: ManualWallClock) -> Self {
         Self::with_login_store(store, clock, None)
     }
 
     fn with_login_store(
-        store: Arc<StandingBrowserGrants>,
+        store: Arc<AgentGrants>,
         clock: ManualWallClock,
         signed_in: Option<Arc<cerebellum::browser_signed_in::SignedInDomains>>,
     ) -> Self {
@@ -537,9 +536,10 @@ impl Fixture {
             Arc::new(HealthState::new()),
             Some(config()),
             JournalPersistence::Isolated,
-            Some(Arc::clone(&store)),
+            None,
             Some(Arc::clone(&signed_in)),
         );
+        planes = permission_support::attach(planes, store.clone(), Some(signed_in.clone()));
         planes.launch_service = Some(Arc::new(browser.clone()));
         Self {
             planes,
@@ -552,10 +552,16 @@ impl Fixture {
     }
 
     /// Record a standing row directly, as an answered card would.
-    fn seed(&self, agent: &str, subject: StandingSubject, level: u8, hazards: &[HazardClass]) {
-        self.store
-            .record(agent, subject, level, hazards.to_vec(), None, "el_seeded")
-            .expect("the seeded row is recorded");
+    fn seed(&self, agent: &str, subject: GrantSubject, level: u8, hazards: &[HazardClass]) {
+        permission_support::seed(
+            &self.store,
+            agent,
+            subject,
+            level,
+            hazards.to_vec(),
+            None,
+            "el_seeded",
+        );
     }
 
     /// Bind a fresh tool route with real `route.bind` admission facts.
@@ -869,9 +875,9 @@ fn option_ids(question: &Value) -> Vec<String> {
 }
 
 const ALL_OPTIONS: [&str; 5] = [
-    "allow_conversation",
+    "allow_30m",
     "allow_origin_always",
-    "allow_all_sites_10m",
+    "allow_all_sites_30m",
     "allow_all_sites_always",
     "deny",
 ];
@@ -880,8 +886,7 @@ const ALL_OPTIONS: [&str; 5] = [
 // The card and its answers
 // ---------------------------------------------------------------------------
 
-/// Each option of the full card, answered on a fresh module, mints exactly
-/// what it names and nothing else; an id the card did not offer mints nothing.
+/// Each offered answer writes exactly its named row; an unoffered answer writes none.
 #[tokio::test]
 async fn each_answered_option_mints_exactly_its_row() {
     for (index, id) in ALL_OPTIONS
@@ -894,7 +899,6 @@ async fn each_answered_option_mints_exactly_its_row() {
         let route = fixture
             .route(Session::primary("conversation-mapping", AGENT).asking())
             .await;
-        let consent_ref = format!("el_mapping_{index}");
         let mut offered = Vec::new();
         let mut raised_id = String::new();
         let reply = fixture
@@ -902,7 +906,7 @@ async fn each_answered_option_mints_exactly_its_row() {
                 &route,
                 "browser.navigate",
                 navigation(&format!("{PUBLIC}/"), 3),
-                json!({"decision": id, "elicitation_id": consent_ref}),
+                json!({"decision": id, "elicitation_id": format!("el_mapping_{index}")}),
                 |question| {
                     offered.push(option_ids(question));
                     raised_id = question["id"].as_str().unwrap().to_string();
@@ -914,51 +918,46 @@ async fn each_answered_option_mints_exactly_its_row() {
             vec![ALL_OPTIONS.map(str::to_string).to_vec()],
             "{id}"
         );
-
-        let conversation_grants = fixture.planes.management.browser_grant_count().await;
-        let rows = fixture.store.live_rows(AGENT);
-        let now = fixture.clock_now();
-        match id {
-            "allow_conversation" => {
-                assert_authorized(&reply, id);
-                assert_eq!(conversation_grants, 1, "{id}");
-                assert!(rows.is_empty(), "{id}: {rows:?}");
-            }
-            "allow" => {
-                assert_refused(&reply, id);
-                assert_eq!(
-                    reply["detail"]["decision"], "unrecognized_answer",
-                    "{reply}"
-                );
-                assert_eq!(conversation_grants, 0, "{id}");
-                assert!(rows.is_empty(), "{id}: {rows:?}");
-            }
-            _ => {
-                assert_authorized(&reply, id);
-                assert_eq!(
-                    conversation_grants, 0,
-                    "{id} also minted a conversation grant"
-                );
-                assert_eq!(rows.len(), 1, "{id}: {rows:?}");
-                let row = &rows[0];
-                assert_eq!(row.agent_id, AGENT);
-                assert_eq!(row.max_level, 3, "{id}");
-                assert!(row.hazards.is_empty(), "{id}");
-                assert_eq!(row.consent_ref, raised_id);
-                assert_eq!(row.granted_at_ms, now);
-                assert_eq!(row.revoked_at_ms, None);
-                let (subject, expires) = match id {
-                    "allow_origin_always" => (StandingSubject::Domain("news.example".into()), None),
-                    "allow_all_sites_10m" => (
-                        StandingSubject::AllSites,
-                        Some(now + ALL_SITES_SHORT_GRANT_MS),
-                    ),
-                    _ => (StandingSubject::AllSites, None),
-                };
-                assert_eq!(row.subject, subject, "{id}");
-                assert_eq!(row.expires_at_ms, expires, "{id}");
-            }
+        let rows = permission_support::rows(&fixture.store, AGENT);
+        if id == "allow" {
+            assert_refused(&reply, id);
+            assert_eq!(
+                reply["detail"]["decision"], "unrecognized_answer",
+                "{reply}"
+            );
+            assert!(rows.is_empty());
+            assert_eq!(permission_support::count(&fixture.planes), 0);
+            continue;
         }
+        assert_authorized(&reply, id);
+        assert_eq!(permission_support::count(&fixture.planes), 1);
+        assert_eq!(rows.len(), 1, "{id}: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.holder,
+            cerebellum::agent_grants::GrantHolder::Head {
+                agent_id: AGENT.into()
+            }
+        );
+        assert_eq!(
+            row.browser_target,
+            Some(cerebellum::agent_grants::BrowserTarget::AgentProfile)
+        );
+        assert_eq!(row.max_level, 3);
+        assert!(row.hazards.is_empty());
+        assert_eq!(row.card_ref.as_deref(), Some(raised_id.as_str()));
+        assert_eq!(row.granted_at_ms, fixture.clock_now());
+        let subject = if matches!(id, "allow_30m" | "allow_origin_always") {
+            GrantSubject::Domain("news.example".into())
+        } else {
+            GrantSubject::AllSites
+        };
+        assert_eq!(row.subject, subject);
+        assert_eq!(
+            row.expires_at_ms,
+            id.ends_with("30m")
+                .then_some(fixture.clock_now() + ALL_SITES_SHORT_GRANT_MS)
+        );
     }
 }
 
@@ -969,14 +968,12 @@ impl Fixture {
     }
 }
 
-/// Which options a card offers follows the session and the request: a worker
-/// or an unattested session is offered this conversation only, and the
-/// all-sites options are withheld from a lasting-change request, a request
-/// disclosing a hazard, and a site that is not public.
+/// Workers receive only thirty-minute choices. All-sites choices are withheld
+/// for tier-four changes, form hazards and non-public addresses.
 #[tokio::test]
 async fn the_card_offers_only_what_the_session_and_request_allow() {
-    let conversation_only = vec!["allow_conversation", "deny"];
-    let no_all_sites = vec!["allow_conversation", "allow_origin_always", "deny"];
+    let worker_options = vec!["allow_30m", "allow_all_sites_30m", "deny"];
+    let no_all_sites = vec!["allow_30m", "allow_origin_always", "deny"];
     let cases: [(&str, Session<'_>, &str, u8, Vec<&str>); 5] = [
         (
             "primary, public, ordinary",
@@ -1014,7 +1011,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
             },
             "https://news.example/",
             3,
-            conversation_only.clone(),
+            worker_options,
         ),
     ];
     for (case, session, url, tier, expected) in cases {
@@ -1035,14 +1032,13 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
     }
 
     // The advance card follows the same rules: a disclosed hazard withholds
-    // the all-sites options, and an unattested session (which cannot launch
-    // a browser, so asks only ahead) is offered this conversation only.
+    // the all-sites choices, while an unattested session cannot raise a card.
     for (case, session, hazards, expected) in [
         (
             "hazard asked ahead",
             Session::primary("c-hazard", AGENT).asking(),
             json!(["credential_form_submit"]),
-            vec!["allow_conversation", "allow_origin_always", "deny"],
+            vec!["allow_30m", "allow_origin_always", "deny"],
         ),
         (
             "ordinary request asked ahead",
@@ -1057,7 +1053,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
                 ..Session::primary("c-unattested", AGENT).asking()
             },
             json!([]),
-            vec!["allow_conversation", "deny"],
+            vec!["deny"],
         ),
     ] {
         let mut fixture = Fixture::new();
@@ -1132,7 +1128,7 @@ async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other()
 #[tokio::test]
 async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     let route = fixture.route(Session::primary("c-all", AGENT)).await;
     for public in ["https://news.example/", "https://shop.example/item"] {
         assert_authorized(&fixture.navigate(&route, public).await, public);
@@ -1155,7 +1151,7 @@ async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     }
     fixture.seed(
         AGENT,
-        StandingSubject::Origin("https://shop.example:8443".into()),
+        GrantSubject::Origin("https://shop.example:8443".into()),
         3,
         &[],
     );
@@ -1173,7 +1169,12 @@ fn assert_hazard_refused(reply: &Value, what: &str) {
         "{what} was not refused for its hazard: {reply}"
     );
     assert_eq!(
-        reply["detail"]["missing_hazard"], "credential_form_submit",
+        reply["detail"]["grant_request"]["hazards"],
+        json!(["credential_form_submit"]),
+        "{what}: {reply}"
+    );
+    assert_eq!(
+        reply["detail"]["required"]["credential"], true,
         "{what}: {reply}"
     );
 }
@@ -1204,7 +1205,7 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
 
     // All sites, at the highest level an all-sites row can carry.
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     let route = fixture.route(Session::primary("c-hazard-all", AGENT)).await;
     assert_authorized(
         &fixture.navigate(&route, &format!("{PUBLIC}/")).await,
@@ -1224,7 +1225,7 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
     let mut fixture = Fixture::new();
     fixture.seed(
         AGENT,
-        StandingSubject::Origin(PUBLIC.into()),
+        GrantSubject::Origin(PUBLIC.into()),
         4,
         &[
             HazardClass::FinancialFormSubmit,
@@ -1252,7 +1253,7 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
     let mut fixture = Fixture::new();
     fixture.seed(
         AGENT,
-        StandingSubject::Origin(PUBLIC.into()),
+        GrantSubject::Origin(PUBLIC.into()),
         4,
         &[HazardClass::CredentialFormSubmit],
     );
@@ -1271,10 +1272,10 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
         .contains(&"click_point".to_string()));
 }
 
-/// The ten-minute answer covers for ten minutes of the store's clock and
+/// The thirty-minute answer covers for thirty minutes of the store's clock and
 /// nothing after.
 #[tokio::test]
-async fn the_ten_minute_all_sites_row_expires() {
+async fn the_thirty_minute_all_sites_row_expires() {
     let mut fixture = Fixture::new();
     let asking = fixture
         .route(Session::primary("c-short", AGENT).asking())
@@ -1284,7 +1285,7 @@ async fn the_ten_minute_all_sites_row_expires() {
             &asking,
             "browser.navigate",
             navigation(&format!("{PUBLIC}/"), 3),
-            json!({"decision": "allow_all_sites_10m", "elicitation_id": "el_short"}),
+            json!({"decision": "allow_all_sites_30m", "elicitation_id": "el_short"}),
             |_| {},
         )
         .await;
@@ -1303,7 +1304,7 @@ async fn the_ten_minute_all_sites_row_expires() {
         &fixture.navigate(&route, "https://other.example/").await,
         "at expiry",
     );
-    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
 }
 
 /// A public page that redirects into a private address is re-authorized
@@ -1311,7 +1312,7 @@ async fn the_ten_minute_all_sites_row_expires() {
 #[tokio::test]
 async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     fixture
         .browser
         .redirect("https://news.example/go", "http://10.0.0.5/admin");
@@ -1336,10 +1337,10 @@ async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
 #[tokio::test]
 async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     fixture.seed(
         AGENT,
-        StandingSubject::Origin(PUBLIC.into()),
+        GrantSubject::Origin(PUBLIC.into()),
         4,
         &HazardClass::ALL,
     );
@@ -1384,15 +1385,15 @@ async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
 #[tokio::test]
 async fn revoke_access_removes_the_calling_agents_rows_only() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
+    fixture.seed(AGENT, GrantSubject::Origin(PUBLIC.into()), 3, &[]);
     fixture.seed(
         AGENT,
-        StandingSubject::Origin("https://docs.example".into()),
+        GrantSubject::Origin("https://docs.example".into()),
         3,
         &[],
     );
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
-    fixture.seed(OTHER_AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
+    fixture.seed(OTHER_AGENT, GrantSubject::Origin(PUBLIC.into()), 3, &[]);
     let route = fixture.route(Session::primary("c-revoke", AGENT)).await;
 
     let one = fixture
@@ -1403,18 +1404,21 @@ async fn revoke_access_removes_the_calling_agents_rows_only() {
         )
         .await;
     assert_eq!(one, json!({"outcome": "revoked", "revoked": 1}));
-    assert_eq!(fixture.store.live_rows(AGENT).len(), 2);
+    assert_eq!(permission_support::rows(&fixture.store, AGENT).len(), 2);
 
     let rest = fixture
         .call(&route, "browser_use", json!({"action": "revoke_access"}))
         .await;
     assert_eq!(rest, json!({"outcome": "revoked", "revoked": 2}));
-    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
     assert_refused(
         &fixture.navigate(&route, &format!("{PUBLIC}/")).await,
         "after revoking",
     );
-    assert_eq!(fixture.store.live_rows(OTHER_AGENT).len(), 1);
+    assert_eq!(
+        permission_support::rows(&fixture.store, OTHER_AGENT).len(),
+        1
+    );
 
     let again = fixture
         .call(&route, "browser_use", json!({"action": "revoke_access"}))
@@ -1444,7 +1448,10 @@ async fn revoke_access_removes_the_calling_agents_rows_only() {
         )
         .await;
     assert_eq!(refused["outcome"], "agent_not_attested", "{refused}");
-    assert_eq!(fixture.store.live_rows(OTHER_AGENT).len(), 1);
+    assert_eq!(
+        permission_support::rows(&fixture.store, OTHER_AGENT).len(),
+        1
+    );
 }
 
 /// The operator lists an agent's standing access with its always-allow app
@@ -1452,15 +1459,15 @@ async fn revoke_access_removes_the_calling_agents_rows_only() {
 #[tokio::test]
 async fn the_operator_lists_and_revokes_an_agents_standing_access() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::Origin(PUBLIC.into()), 3, &[]);
+    fixture.seed(AGENT, GrantSubject::Origin(PUBLIC.into()), 3, &[]);
     fixture.seed(
         AGENT,
-        StandingSubject::Origin("https://docs.example".into()),
+        GrantSubject::Origin("https://docs.example".into()),
         4,
         &[HazardClass::CredentialFormSubmit],
     );
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
-    fixture.seed(OTHER_AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
+    fixture.seed(OTHER_AGENT, GrantSubject::AllSites, 3, &[]);
     let desk = fixture.management_route().await;
 
     let listed = fixture
@@ -1510,8 +1517,11 @@ async fn the_operator_lists_and_revokes_an_agents_standing_access() {
         .operate(&desk, "browser.revoke_grant", json!({"agent_id": AGENT}))
         .await;
     assert_eq!(everything, json!({"outcome": "revoked", "revoked": 1}));
-    assert!(fixture.store.live_rows(AGENT).is_empty());
-    assert_eq!(fixture.store.live_rows(OTHER_AGENT).len(), 1);
+    assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
+    assert_eq!(
+        permission_support::rows(&fixture.store, OTHER_AGENT).len(),
+        1
+    );
 
     for (params, field) in [
         (
@@ -1542,8 +1552,8 @@ impl Scratch {
         )))
     }
 
-    fn storage(&self) -> FilesystemStandingGrantStorage {
-        FilesystemStandingGrantStorage::new(self.0.join("browser_standing_grants.json"))
+    fn storage(&self) -> FilesystemAgentGrantStorage {
+        FilesystemAgentGrantStorage::new(self.0.join("browser_standing_grants.json"))
             .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(
                 self.0
                     .join(cerebellum_core::format_floor::FORMAT_FLOOR_FILE),
@@ -1551,35 +1561,42 @@ impl Scratch {
     }
 }
 
-/// Replacing an origin answer keeps the earlier consent row as revoked history.
+/// Re-answering changes the existing grant, so revoking its original id still works.
 #[tokio::test]
-async fn replacing_an_origin_row_keeps_the_old_consent_as_revoked_history() {
+async fn reanswering_an_origin_keeps_one_row_and_its_original_id() {
     let scratch = Scratch::new("superseded");
     let clock = ManualWallClock::at(1_700_000_000_000);
-    let storage = scratch.storage();
-    let store = store_over(storage, &clock);
-    let subject = StandingSubject::Origin(PUBLIC.into());
-    store
-        .record(AGENT, subject.clone(), 3, vec![], None, "el_first")
-        .unwrap();
+    let store = store_over(scratch.storage(), &clock);
+    let subject = GrantSubject::Origin(PUBLIC.into());
+    let first_id = permission_support::seed(
+        &store,
+        AGENT,
+        subject.clone(),
+        3,
+        vec![],
+        Some(1_800_000),
+        "el_first",
+    );
     clock.advance_ms(18_000);
-    store
-        .record(AGENT, subject, 3, vec![], None, "el_second")
-        .unwrap();
-
+    let replaced_id =
+        permission_support::seed(&store, AGENT, subject, 3, vec![], None, "el_second");
+    assert_eq!(replaced_id, first_id);
     let file: Value = serde_json::from_slice(
         &std::fs::read(scratch.0.join("browser_standing_grants.json")).unwrap(),
     )
     .unwrap();
     let rows = file["grants"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["consent_ref"], "el_first");
-    assert_eq!(rows[0]["revoked_at_ms"], 1_700_000_018_000_u64);
-    assert_eq!(rows[1]["consent_ref"], "el_second");
-    assert_eq!(rows[1]["revoked_at_ms"], Value::Null);
-    assert_eq!(store.live_rows(AGENT).len(), 1);
-    assert_eq!(store.live_rows(AGENT)[0].consent_ref, "el_second");
-
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], first_id);
+    assert_eq!(rows[0]["card_ref"], "el_second");
+    assert_eq!(rows[0]["expires_at_ms"], Value::Null);
+    assert_eq!(permission_support::rows(&store, AGENT).len(), 1);
+    assert_eq!(
+        permission_support::rows(&store, AGENT)[0]
+            .card_ref
+            .as_deref(),
+        Some("el_second")
+    );
     let mut fixture = Fixture::with_store(store, clock);
     let desk = fixture.management_route().await;
     let listed = fixture
@@ -1626,21 +1643,21 @@ async fn a_standing_row_survives_a_module_restart() {
 /// standing answer to be written over it, and lists nothing.
 #[tokio::test]
 async fn a_row_bound_to_another_machine_grants_nothing() {
-    let storage = InMemoryStandingGrantStorage::new();
+    let storage = InMemoryAgentGrantStorage::default();
     let clock = ManualWallClock::at(1_700_000_000_000);
-    store_over(storage.clone(), &clock)
-        .record(
-            AGENT,
-            StandingSubject::AllSites,
-            3,
-            Vec::new(),
-            None,
-            "el_elsewhere",
-        )
-        .unwrap();
-    let restored = Arc::new(
-        StandingBrowserGrants::open(Arc::new(storage), Some("another-machine".to_string()))
-            .with_clock(Arc::new(clock.clone())),
+    permission_support::seed(
+        &store_over(storage.clone(), &clock),
+        AGENT,
+        GrantSubject::AllSites,
+        3,
+        Vec::new(),
+        None,
+        "el_elsewhere",
+    );
+    let restored = permission_support::store(
+        Arc::new(storage),
+        "another-machine",
+        Arc::new(clock.clone()),
     );
     let mut fixture = Fixture::with_store(restored, clock);
     let route = fixture.route(Session::primary("c-restored", AGENT)).await;
@@ -1648,7 +1665,7 @@ async fn a_row_bound_to_another_machine_grants_nothing() {
         &fixture.navigate(&route, &format!("{PUBLIC}/")).await,
         "a row from another machine",
     );
-    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
 }
 
 /// A file this build cannot read withholds every standing grant, offers no
@@ -1674,7 +1691,7 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
             |question| offered.push(option_ids(question)),
         )
         .await;
-    assert_eq!(offered, vec![vec!["allow_conversation", "deny"]]);
+    assert_eq!(offered, vec![vec!["deny"]]);
     let revoke = fixture
         .call(&route, "browser_use", json!({"action": "revoke_access"}))
         .await;
@@ -1706,8 +1723,8 @@ async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
         .await;
     assert_authorized(&reply, "domain answer");
     assert_eq!(
-        fixture.store.live_rows(AGENT)[0].subject.to_value(),
-        json!({"domain":"ovhcloud.com"})
+        permission_support::rows(&fixture.store, AGENT)[0].subject,
+        GrantSubject::Domain("ovhcloud.com".into())
     );
     let reply = fixture
         .call(
@@ -1749,12 +1766,7 @@ async fn suffix_localhost_and_ip_cards_remain_host_only() {
 #[tokio::test]
 async fn domain_rows_never_cover_http() {
     let mut fixture = Fixture::new();
-    fixture.seed(
-        AGENT,
-        StandingSubject::Domain("ovhcloud.com".into()),
-        3,
-        &[],
-    );
+    fixture.seed(AGENT, GrantSubject::Domain("ovhcloud.com".into()), 3, &[]);
     let route = fixture.route(Session::primary("c-http", AGENT)).await;
     let reply = fixture
         .call(
@@ -1769,12 +1781,7 @@ async fn domain_rows_never_cover_http() {
 #[tokio::test]
 async fn domain_rows_never_cover_sibling_domains() {
     let mut fixture = Fixture::new();
-    fixture.seed(
-        AGENT,
-        StandingSubject::Domain("ovhcloud.com".into()),
-        3,
-        &[],
-    );
+    fixture.seed(AGENT, GrantSubject::Domain("ovhcloud.com".into()), 3, &[]);
     let route = fixture.route(Session::primary("c-sibling", AGENT)).await;
     let reply = fixture
         .call(
@@ -1791,7 +1798,7 @@ async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
     let mut fixture = Fixture::new();
     fixture.seed(
         AGENT,
-        StandingSubject::Domain("ovhcloud.com".into()),
+        GrantSubject::Domain("ovhcloud.com".into()),
         4,
         &[HazardClass::CredentialFormSubmit],
     );
@@ -1811,12 +1818,7 @@ async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
         )
         .await;
     assert_eq!(revoked["revoked"], 1);
-    fixture.seed(
-        AGENT,
-        StandingSubject::Domain("ovhcloud.com".into()),
-        3,
-        &[],
-    );
+    fixture.seed(AGENT, GrantSubject::Domain("ovhcloud.com".into()), 3, &[]);
     let route = fixture.route(Session::primary("c-withdraw", AGENT)).await;
     let revoked = fixture
         .call(
@@ -1913,8 +1915,8 @@ async fn baseline_public_reads_and_ordinary_clicks_need_no_card() {
         let clicked = fixture.call(&route, "browser.click", json!({"ref":named_ref(&snapshot, name),"snapshot_id":snapshot["snapshot_id"],"intent":"follow an ordinary control","severity":{"tier":2,"credential":false,"financial":false}})).await;
         assert_authorized(&clicked, name);
     }
-    assert_eq!(fixture.planes.management.browser_grant_count().await, 0);
-    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert_eq!(permission_support::count(&fixture.planes), 0);
+    assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
     assert_eq!(
         fixture
             .browser
@@ -2069,7 +2071,7 @@ async fn baseline_login_record_survives_plane_restart() {
     let path = scratch.join("browser/signed-in-domains.json");
     let floor_path = scratch.join("browser/format-floor.json");
     let clock = ManualWallClock::at(1_700_000_000_000);
-    let store = store_over(InMemoryStandingGrantStorage::new(), &clock);
+    let store = store_over(InMemoryAgentGrantStorage::default(), &clock);
     let signed_in = Arc::new(
         cerebellum::browser_signed_in::SignedInDomains::open(path.clone())
             .with_format_floor(cerebellum_core::format_floor::FormatFloor::at(&floor_path)),
@@ -2252,19 +2254,19 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
             &route,
             "browser_use",
             json!({"action":"open_grant","origins":[PUBLIC],"hazards":[]}),
-            json!({"decision":"allow_conversation"}),
+            json!({"decision":"allow_30m"}),
             |question| cards.push(question.clone()),
         )
         .await;
     assert_eq!(cards.len(), 1);
     tokio::time::timeout(Duration::from_secs(2), async {
-        while fixture.planes.management.browser_grant_count().await == 0 {
+        while permission_support::count(&fixture.planes) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(fixture.planes.management.browser_grant_count().await, 1);
+    assert_eq!(permission_support::count(&fixture.planes), 1);
     for mode in ["actionable", "ax", "dom_full"] {
         let snapshot = fixture
             .call(&route, "browser.snapshot", json!({"mode":mode}))
@@ -2336,7 +2338,7 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
 #[tokio::test]
 async fn codemode_borrows_the_head_browser_and_standing_grants_without_a_card() {
     let mut fixture = Fixture::new();
-    fixture.seed(AGENT, StandingSubject::AllSites, 2, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 2, &[]);
     let head = fixture
         .route(Session::primary("head-conversation", AGENT))
         .await;
@@ -2387,7 +2389,7 @@ async fn codemode_borrows_the_head_browser_and_standing_grants_without_a_card() 
         still_ready["browser_session_id"],
         head_status["browser_session_id"]
     );
-    assert_eq!(fixture.store.live_rows(AGENT).len(), 1);
+    assert_eq!(permission_support::rows(&fixture.store, AGENT).len(), 1);
 }
 
 #[tokio::test]

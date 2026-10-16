@@ -41,7 +41,7 @@ fn worker(conversation: &str) -> Session<'_> {
 }
 
 #[tokio::test]
-async fn worker_website_card_grants_only_the_worker_conversation() {
+async fn worker_website_card_grants_only_the_worker_scope() {
     let mut fixture = Fixture::new();
     let route = fixture.route(worker("worker-granted")).await;
     let mut offered = Vec::new();
@@ -50,14 +50,26 @@ async fn worker_website_card_grants_only_the_worker_conversation() {
             &route,
             "browser.navigate",
             navigation(&format!("{PUBLIC}/"), 3),
-            json!({"decision":"allow_conversation"}),
+            json!({"decision":"allow_30m"}),
             |card| offered.push(option_ids(card)),
         )
         .await;
     assert_authorized(&reply, "worker conversation answer");
-    assert_eq!(offered, [vec!["allow_conversation", "deny"]]);
-    assert_eq!(fixture.planes.management.browser_grant_count().await, 1);
-    assert!(fixture.store.live_rows(AGENT).is_empty());
+    assert_eq!(offered, [vec!["allow_30m", "allow_all_sites_30m", "deny"]]);
+    assert_eq!(permission_support::count(&fixture.planes), 1);
+    let rows = permission_support::rows(&fixture.store, AGENT);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].holder,
+        cerebellum::agent_grants::GrantHolder::Worker {
+            agent_id: AGENT.into(),
+            scope_ref: "sc_worker_worker-granted".into()
+        }
+    );
+    assert_eq!(
+        rows[0].expires_at_ms,
+        Some(rows[0].granted_at_ms + 1_800_000)
+    );
 
     let head = fixture
         .route(Session::primary("head-without-grant", AGENT).asking())
@@ -76,7 +88,7 @@ async fn worker_website_card_grants_only_the_worker_conversation() {
     assert_eq!(head_cards, 1);
 
     // A head's standing row must not authorize a new worker either.
-    fixture.seed(AGENT, StandingSubject::AllSites, 3, &[]);
+    fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     let standing_head = fixture
         .route(Session::primary("head-standing", AGENT).asking())
         .await;
@@ -108,13 +120,9 @@ async fn worker_website_card_grants_only_the_worker_conversation() {
 }
 
 #[tokio::test]
-async fn worker_website_cards_never_offer_or_apply_standing_or_all_sites() {
+async fn worker_website_cards_never_offer_or_apply_permanent_grants() {
     for in_advance in [false, true] {
-        for id in [
-            "allow_origin_always",
-            "allow_all_sites_10m",
-            "allow_all_sites_always",
-        ] {
+        for id in ["allow_origin_always", "allow_all_sites_always"] {
             let mut fixture = Fixture::new();
             let route = fixture.route(worker("worker-unknown-choice")).await;
             let (name, arguments) = if in_advance {
@@ -133,7 +141,7 @@ async fn worker_website_cards_never_offer_or_apply_standing_or_all_sites() {
                 .await;
             assert_eq!(
                 offered,
-                [vec!["allow_conversation", "deny"]],
+                [vec!["allow_30m", "allow_all_sites_30m", "deny"]],
                 "{id}, advance={in_advance}"
             );
             if !in_advance {
@@ -143,12 +151,11 @@ async fn worker_website_cards_never_offer_or_apply_standing_or_all_sites() {
                     "{reply}"
                 );
             }
-            assert_eq!(
-                fixture.planes.management.browser_grant_count().await,
-                0,
+            assert_eq!(permission_support::count(&fixture.planes), 0, "{id}");
+            assert!(
+                permission_support::rows(&fixture.store, AGENT).is_empty(),
                 "{id}"
             );
-            assert!(fixture.store.live_rows(AGENT).is_empty(), "{id}");
         }
     }
 }

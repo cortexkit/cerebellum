@@ -1054,7 +1054,7 @@ async fn written_and_typed_text_never_reach_the_journal() {
     )
     .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk().source());
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     let consent = || {
         let (drain_sender, drain) = tokio::sync::watch::channel(false);
         std::mem::forget(drain_sender);
@@ -1361,7 +1361,7 @@ async fn list_apps_is_served_without_a_grant_and_journals_only_the_count() {
     );
 
     // A granted read journals the bundle identity it was granted for.
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     let (drain_sender, drain) = tokio::sync::watch::channel(false);
     std::mem::forget(drain_sender);
     let consent = ConsentContext::new(

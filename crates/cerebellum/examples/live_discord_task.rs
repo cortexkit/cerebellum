@@ -1102,7 +1102,7 @@ mod macos_probe {
                 );
                 let script = ScriptedCingulate::new();
                 script.then("consent.request", Reply::Result(json!({"elicitation_id":id})))
-                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_conversation"})));
+                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_30m"})));
                 Ok(Box::new(AnsweringRoute(script.open(live).await?)) as Box<dyn CingulateRoute>)
             })
         }

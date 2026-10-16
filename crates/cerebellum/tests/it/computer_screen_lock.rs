@@ -341,7 +341,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
 #[tokio::test]
 async fn a_locked_screen_refuses_every_row_before_resolving_asking_or_posting() {
     let rig = rig(Some(true));
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"; 20]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"; 20]);
     let journal_before = rig.plane.journal_entry_count().await;
 
     for (name, arguments) in every_row() {
@@ -397,9 +397,9 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
             async move {
                 until(|| carrier.questions().len() == 1).await;
                 lock.set(Some(true));
-                assert!(carrier.answer_next(ScriptedAnswer::Answered(
-                    json!({"decision": "allow_conversation"})
-                )));
+                assert!(
+                    carrier.answer_next(ScriptedAnswer::Answered(json!({"decision": "allow_30m"})))
+                );
             }
         };
         let (reply, ()) = tokio::join!(serve(&rig, name, &arguments, relayed(&carrier)), answering);
@@ -428,12 +428,15 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
 }
 
 /// Lock the screen once the pending question appears, then answer it allow.
-async fn lock_then_allow(carrier: &ScriptedCarrier, lock: &LockState, question: usize) {
+async fn lock_then_allow(
+    carrier: &ScriptedCarrier,
+    lock: &LockState,
+    question: usize,
+    choice: &str,
+) {
     until(|| carrier.questions().len() == question).await;
     lock.set(Some(true));
-    assert!(carrier.answer_next(ScriptedAnswer::Answered(
-        json!({"decision": "allow_conversation"})
-    )));
+    assert!(carrier.answer_next(ScriptedAnswer::Answered(json!({"decision": choice}))));
 }
 
 /// The element- and point-addressed rows ask for their application's grant
@@ -489,7 +492,7 @@ async fn a_lock_during_the_wait_of_an_element_or_point_action_refuses_before_act
         let carrier = ScriptedCarrier::default();
         let (reply, ()) = tokio::join!(
             serve(&rig, name, &arguments, relayed(&carrier)),
-            lock_then_allow(&carrier, &rig.lock, 1)
+            lock_then_allow(&carrier, &rig.lock, 1, "allow_30m")
         );
         assert_screen_locked(name, &reply);
         let desk = rig.desk.state();
@@ -500,9 +503,9 @@ async fn a_lock_during_the_wait_of_an_element_or_point_action_refuses_before_act
     }
 }
 
-/// Shortcut delivery requires a takeover already held by the conversation.
-/// A grant answered while the screen locks does not authorize posting through
-/// the lock when the next shortcut arrives.
+/// A shortcut sent to a background app can temporarily bring it to the front,
+/// requiring whole-computer permission. That approval still never permits
+/// synthesizing keystrokes while the screen is locked.
 #[tokio::test]
 async fn a_lock_after_takeover_is_granted_refuses_background_chords_before_posting() {
     let rig = rig(Some(false));
@@ -515,7 +518,7 @@ async fn a_lock_after_takeover_is_granted_refuses_background_chords_before_posti
         rig.management
             .computer_grants()
             .require(&GrantNeed::Takeover, &consent, &cancel),
-        lock_then_allow(&carrier, &rig.lock, 1)
+        lock_then_allow(&carrier, &rig.lock, 1, "computer_30m")
     );
     admitted.unwrap();
     let reply = serve(
@@ -544,7 +547,7 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
             until(|| carrier.questions().len() == 1).await;
             lock.set(Some(true));
             assert!(carrier.answer_next(ScriptedAnswer::Answered(
-                json!({"decision": "allow_conversation"})
+                json!({"decision": "computer_30m"})
             )));
         }
     };
@@ -571,7 +574,7 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
 /// A state read as unlocked carries no such disclosure.
 #[tokio::test]
 async fn an_unreadable_lock_state_proceeds_and_is_disclosed() {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"; 4]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"; 4]);
     for (state, disclosed) in [(None, true), (Some(false), false)] {
         let rig = rig(state);
         let read = serve(

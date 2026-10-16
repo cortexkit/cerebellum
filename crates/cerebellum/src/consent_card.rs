@@ -35,6 +35,8 @@ pub(crate) struct ConsentOption {
     /// original call. Omitted when retrying that call is the right next step.
     #[serde(skip_serializing_if = "Option::is_none")]
     next_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -52,10 +54,15 @@ impl ConsentOption {
             effect: Effect::Grant,
             detail: None,
             next_step: None,
+            group: None,
         }
     }
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+    pub fn danger(mut self) -> Self {
+        self.group = Some("danger");
         self
     }
     pub fn with_next_step(mut self, next_step: impl Into<String>) -> Self {
@@ -261,7 +268,10 @@ const CORE_REQUIRED_KEYS: [&str; 11] = [
     "expires_in_ms",
 ];
 #[cfg(test)]
-const CORE_OPTIONAL_KEYS: [&str; 10] = [
+const CORE_OPTIONAL_KEYS: [&str; 13] = [
+    "requester_ref",
+    "binding",
+    "at_console",
     "call_key",
     "dedup_key",
     "scope",
@@ -319,27 +329,17 @@ fn core_decode_strings(value: &Value, keys: &[&str], optional: bool) -> Result<(
     Ok(())
 }
 
-/// Prefrontal core's verdict on these consent `params`: `Ok` when core would
-/// accept them, otherwise the first refusal core would give.
+/// Local test checks for closed consent shapes and fail-closed option defaults.
 ///
-/// Core decodes the `params` of every `elicitation/create` whose `kind` is
-/// `consent` and answers `not_put_to_anyone` when it cannot. The person never
-/// sees that card, and the agent only learns that nobody was asked. This
-/// mirrors `ConsentRequest::decode` (serde with `deny_unknown_fields` on every
-/// struct) and `ConsentRequest::validate`, in their order, from prefrontal's
-/// `crates/prefrontal-core-store/src/elicitation.rs` at commit
-/// d15391996594ce24ba53aa42fd1c31bb85922745. The mirror also accepts the optional
-/// `call_key` (link to a tool call) and option `next_step` (late-answer
-/// instruction) introduced by prefrontal main a59fa3ad1.
-/// Refusal codes are core's, and each message contains core's wording;
-/// serde's own wording is only approximated (`unknown field `x``,
-/// `missing field `x``).
+/// Unknown option groups, danger defaults and danger-only grants are rejected:
+/// removing broad choices must leave a usable, non-dangerous consent card.
+/// These rules are checked against the copied `danger-option-group-v1` vectors
+/// from Cingulate commit 6bb5f4d. Historical Prefrontal request vectors also
+/// remain checked so the legacy renderer's field shapes do not regress.
 ///
-/// It is the only place that contract is written down in this crate. It is
-/// held to Prefrontal's published request vectors (see
-/// `the_contract_mirror_agrees_with_core_on_every_request_vector`), so it
-/// cannot accept a body core refuses among those vectors, and every rendered
-/// card is held to it.
+/// This is not Cingulate's production validator. It checks both the renderer's
+/// legacy fields (`requestedSchema`, `call_key`, `next_step`) and the mapped
+/// wire's fields (`requester_ref`, `binding`, `at_console`).
 #[cfg(test)]
 pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
     // Decoding: shape, unknown and missing fields, and types.
@@ -389,10 +389,16 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
             option,
             "an option",
             &["id", "label", "effect"],
-            &["detail", "next_step"],
+            &["detail", "next_step", "group"],
         )?;
         core_decode_strings(option, &["id", "label", "effect"], false)?;
         core_decode_strings(option, &["detail", "next_step"], true)?;
+        if option
+            .get("group")
+            .is_some_and(|group| !group.is_null() && group != "danger")
+        {
+            return Err(core_invalid("unknown option group"));
+        }
     }
     let target = &params["target"];
     core_decode_struct(target, "target", &["kind", "label"], &[])?;
@@ -464,6 +470,21 @@ pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
             code: "elicitation_fail_closed_required",
             message: "consent requires a decline default and on_expiry deny".into(),
         });
+    }
+    if default["group"] == "danger" {
+        return Err(CoreRefusal {
+            code: "elicitation_fail_closed_required",
+            message: "the default must not be in the danger group".into(),
+        });
+    }
+    let grants: Vec<_> = options
+        .iter()
+        .filter(|option| option["effect"] == "grant")
+        .collect();
+    if !grants.is_empty() && grants.iter().all(|option| option["group"] == "danger") {
+        return Err(core_invalid(
+            "at least one grant must be outside the danger group",
+        ));
     }
     if !matches!(text("urgency"), "low" | "normal" | "high")
         || !matches!(text("late_execution"), "execute" | "notify_only")
@@ -821,9 +842,9 @@ mod every_card_kind {
             ),
         ] {
             for choices in [
-                &[BrowserGrantChoice::Conversation][..],
+                &[BrowserGrantChoice::SiteThirtyMinutes][..],
                 &[
-                    BrowserGrantChoice::Conversation,
+                    BrowserGrantChoice::SiteThirtyMinutes,
                     BrowserGrantChoice::OriginAlways,
                 ][..],
             ] {
@@ -851,7 +872,7 @@ mod every_card_kind {
             &[],
             Severity::new(2, false, false),
             Urgency::Normal,
-            &[BrowserGrantChoice::Conversation],
+            &[BrowserGrantChoice::SiteThirtyMinutes],
         );
         let params = as_sent(
             CardKind::WebsiteAccessInAdvance,
@@ -915,9 +936,9 @@ mod every_card_kind {
                 Severity::new(2, false, false),
                 true,
                 &[
-                    "allow_conversation",
+                    "allow_30m",
                     "allow_origin_always",
-                    "allow_all_sites_10m",
+                    "allow_all_sites_30m",
                     "allow_all_sites_always",
                     "deny",
                 ],
@@ -928,7 +949,7 @@ mod every_card_kind {
                 &none,
                 Severity::new(4, false, false),
                 true,
-                &["allow_conversation", "allow_origin_always", "deny"],
+                &["allow_30m", "allow_origin_always", "deny"],
             ),
             (
                 "no-all-sites-hazard.json",
@@ -936,7 +957,7 @@ mod every_card_kind {
                 &credential,
                 Severity::new(4, true, false),
                 true,
-                &["allow_conversation", "allow_origin_always", "deny"],
+                &["allow_30m", "allow_origin_always", "deny"],
             ),
             (
                 "no-all-sites-private-origin.json",
@@ -944,21 +965,34 @@ mod every_card_kind {
                 &none,
                 Severity::new(2, false, false),
                 true,
-                &["allow_conversation", "allow_origin_always", "deny"],
+                &["allow_30m", "allow_origin_always", "deny"],
             ),
             (
-                "conversation-only-worker.json",
+                "worker-options.json",
                 &public,
                 &none,
                 Severity::new(2, false, false),
                 false,
-                &["allow_conversation", "deny"],
+                &["allow_30m", "allow_all_sites_30m", "deny"],
             ),
         ];
         let write = std::env::var_os("CEREBELLUM_WRITE_SITE_CARD_VECTORS").is_some();
         let mut sums = String::new();
         for (name, origins, hazards, severity, standing, expected_ids) in cases {
-            let choices = offered_browser_grant_choices(origins, hazards, severity, standing);
+            let choices = if standing {
+                offered_browser_grant_choices(origins, hazards, severity, true)
+            } else {
+                crate::permission_cards::browser_choices(
+                    origins,
+                    hazards,
+                    severity,
+                    Some(&crate::agent_grants::GrantHolder::Worker {
+                        agent_id: "head".into(),
+                        scope_ref: "worker".into(),
+                    }),
+                    true,
+                )
+            };
             assert_eq!(all(&choices), expected_ids, "{name}: offered options");
             let hazards_wire: Vec<String> = hazards
                 .iter()
@@ -983,7 +1017,7 @@ mod every_card_kind {
                 sent["options"], params["options"],
                 "{name}: Cingulate is offered other options than the card"
             );
-            // An option is `{id, label, effect, detail?}` and nothing else.
+            // The closed option shape permits the optional `group: "danger"` field.
             for option in params["options"].as_array().unwrap() {
                 let keys: BTreeSet<&str> = option
                     .as_object()
@@ -992,7 +1026,9 @@ mod every_card_kind {
                     .map(String::as_str)
                     .collect();
                 assert!(
-                    keys.is_subset(&BTreeSet::from(["id", "label", "effect", "detail"])),
+                    keys.is_subset(&BTreeSet::from([
+                        "id", "label", "effect", "detail", "group"
+                    ])),
                     "{name}: option carries {keys:?}"
                 );
             }
@@ -1133,8 +1169,14 @@ mod every_card_kind {
             ad_hoc: false,
             apple_anchored: true,
         };
-        let with_always: &[&'static str] = &["allow_conversation", "allow_always", "deny"];
-        let conversation_only: &[&'static str] = &["allow_conversation", "deny"];
+        let with_always: &[&'static str] = &[
+            "allow_30m",
+            "allow_always",
+            "computer_30m",
+            "computer_always",
+            "deny",
+        ];
+        let temporary_only: &[&'static str] = &["allow_30m", "computer_30m", "deny"];
         for (case, offered, signature_changed, identity, scope) in [
             (
                 "always offered",
@@ -1145,14 +1187,14 @@ mod every_card_kind {
             ),
             (
                 "always not offered",
-                conversation_only,
+                temporary_only,
                 false,
                 &team,
                 json!({"app": "com.example.Editor", "team_id": "ABCDE12345"}),
             ),
             (
                 "signature changed",
-                conversation_only,
+                temporary_only,
                 true,
                 &team,
                 json!({"app": "com.example.Editor", "team_id": "ABCDE12345"}),
@@ -1189,7 +1231,7 @@ mod every_card_kind {
     async fn takeover_card_decodes_in_core() {
         let body = crate::computer_grants::question_body(
             &GrantNeed::Takeover,
-            &["allow_conversation", "deny"],
+            &["allow_once", "computer_30m", "computer_always", "deny"],
             false,
             None,
         );

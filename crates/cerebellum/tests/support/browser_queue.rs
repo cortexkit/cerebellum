@@ -86,7 +86,7 @@ async fn browser_queue_consent_holds_snapshot_and_click_on_navigated_page() {
         launcher.effects.lock().unwrap().is_empty(),
         "no CDP work before consent"
     );
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let results = replies(&mut rx, 3).await;
     assert_eq!(
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
@@ -118,7 +118,7 @@ async fn browser_queue_scroll_waits_for_navigation_consent() {
     .await;
     held(&mut rx).await;
     assert!(launcher.effects.lock().unwrap().is_empty());
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let results = replies(&mut rx, 2).await;
     assert_eq!(
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
@@ -146,7 +146,7 @@ async fn browser_queue_cancelled_queued_call_never_runs() {
     let cancelled = cancelled(&mut rx).await;
     assert_eq!(cancelled.header.corr, 802);
     held(&mut rx).await;
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let results = replies(&mut rx, 2).await;
     assert_eq!(
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
@@ -222,11 +222,9 @@ async fn bind(
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
         ),
-        scope: Some(cingulate_answer::cingulate::stamp(
-            "pj-browser-session-wire",
-        )),
+        scope: Some(cingulate_answer::cingulate::stamp("test-project")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -320,7 +318,7 @@ async fn browser_queue_waits_through_normal_consent_on_wire() {
         "successor must wait through consent"
     );
     assert!(launcher.effects.lock().unwrap().is_empty());
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let results = replies(&mut rx, 2).await;
     assert_eq!(
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
@@ -348,7 +346,7 @@ async fn browser_queue_model_order_beats_reversed_arrival() {
     assert_eq!(question.header.ty, FrameType::Request);
     held(&mut rx).await;
     assert!(launcher.effects.lock().unwrap().is_empty());
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let results = replies(&mut rx, 2).await;
     assert_eq!(
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),

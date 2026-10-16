@@ -966,7 +966,7 @@ mod macos_probe {
                     }
                 }),
             ),
-            json!({"decision": "allow_conversation"}),
+            json!({"decision": "allow_30m"}),
             "target lease",
         )
         .await?;

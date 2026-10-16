@@ -294,10 +294,7 @@ fn invalid(field: &str, reason: &str) -> Value {
     json!({"browser":"user", "outcome":"invalid_request", "detail":{"field":field,"reason_code":reason}, "input_dispatched":false})
 }
 
-/// The site card's option ids: one invocation, always on this site, and the
-/// decline, which is also what the card picks when it expires unanswered.
-const SITE_ALLOW_ONCE: &str = "allow_once";
-const SITE_ALLOW_ALWAYS: &str = "allow_origin_always";
+/// An unanswered user-browser site card chooses `deny`.
 const SITE_DENY: &str = "deny";
 
 /// The consent card asking the person whether the agent may use their own
@@ -308,22 +305,65 @@ const SITE_DENY: &str = "deny";
 /// The card's params are sent to Cingulate (see
 /// `cingulate_client::card::consent_request`), and the id the agent and the
 /// standing grant are given is the elicitation id Cingulate returns.
+#[cfg(test)]
 pub(crate) fn site_question(
     origin: &str,
     tier: u8,
     hazards: &BTreeSet<HazardClass>,
     standing: bool,
 ) -> Value {
+    let mut choices = crate::management::offered_browser_grant_choices(
+        &[origin.into()],
+        hazards,
+        Severity::new(tier, false, false),
+        standing,
+    );
+    choices.retain(|choice| {
+        matches!(
+            choice,
+            crate::management::BrowserGrantChoice::SiteThirtyMinutes
+                | crate::management::BrowserGrantChoice::OriginAlways
+        )
+    });
+    site_question_with_choices(origin, tier, hazards, &choices)
+}
+
+pub(crate) fn site_question_with_choices(
+    origin: &str,
+    tier: u8,
+    hazards: &BTreeSet<HazardClass>,
+    choices: &[crate::management::BrowserGrantChoice],
+) -> Value {
     use crate::consent_card::*;
     let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
-    let mut options = vec![ConsentOption::grant(SITE_ALLOW_ONCE, "Allow once")
-        .with_detail("Only this invocation, including its landing-page read.")];
-    if standing {
-        options.push(ConsentOption::grant(
-            SITE_ALLOW_ALWAYS,
-            "Always on this site",
-        ));
-    }
+    let host = crate::login_import::origin_host(origin).unwrap_or_else(|| origin.into());
+    let scope = crate::browser_standing_grants::domain_scope(origin).map_or_else(
+        || host.clone(),
+        |domain| format!("{domain} and its subdomains"),
+    );
+    let options = choices
+        .iter()
+        .filter(|choice| {
+            matches!(
+                choice,
+                crate::management::BrowserGrantChoice::SiteThirtyMinutes
+                    | crate::management::BrowserGrantChoice::OriginAlways
+            )
+        })
+        .map(|choice| {
+            crate::management::browser_grant_option(
+                *choice,
+                &[
+                    if *choice == crate::management::BrowserGrantChoice::SiteThirtyMinutes {
+                        host.clone()
+                    } else {
+                        scope.clone()
+                    },
+                ],
+                Severity::new(tier, false, false),
+            )
+        })
+        .collect();
     ConsentCard {
         title: format!("Allow access to {origin}?"),
         prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
@@ -1066,11 +1106,19 @@ impl Context<'_> {
         if self.facts.flow_id.is_some() {
             return Err(refusal("consent_unavailable"));
         }
-        let standing = self.planes.management.unified_agent_grants().map_or_else(
+        let can_record = self.planes.management.unified_agent_grants().map_or_else(
             || self.target().grants.can_record(),
             |store| store.can_record(),
-        ) && crate::standing_offer_agent(self.facts).is_some();
-        let body = site_question(origin, severity.tier, &grant.hazards, standing);
+        );
+        let holder = crate::permission_scope::minting_holder(self.facts);
+        let choices = crate::permission_cards::user_browser_choices(
+            &[origin.into()],
+            &grant.hazards,
+            severity,
+            holder.as_ref(),
+            can_record,
+        );
+        let body = site_question_with_choices(origin, severity.tier, &grant.hazards, &choices);
         let card = consent_request(
             CardKind::UserBrowserSite,
             &body,
@@ -1129,33 +1177,15 @@ impl Context<'_> {
             InCall::Pending { .. } => return Err(consent_unavailable(&Ending::NoAnswer)),
         };
         let decided = match &ending {
-            Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ONCE => {
-                if self.planes.management.unified_agent_grants().is_some() {
-                    return self.record_agent_answer(grant, &ask_id, false);
-                }
-                grant.once = true;
-                Ok(grant)
-            }
             Ending::Granted { choice_id }
-                if choice_id == SITE_ALLOW_ALWAYS
-                    && standing
-                    && self.planes.management.unified_agent_grants().is_some() =>
+                if choices.iter().any(|choice| choice.option_id() == choice_id) =>
             {
-                return self.record_agent_answer(grant, &ask_id, true);
+                let choice = choices
+                    .iter()
+                    .find(|choice| choice.option_id() == choice_id)
+                    .unwrap();
+                return self.record_agent_answer(grant, &ask_id, *choice);
             }
-            Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ALWAYS && standing => self
-                .target()
-                .grants
-                .record(
-                    self.agent(),
-                    always_subject(origin.into()),
-                    severity.tier,
-                    grant.hazards.iter().copied().collect(),
-                    None,
-                    &ask_id,
-                )
-                .map(|_| grant)
-                .map_err(|_| refusal("grant_storage_unavailable")),
             Ending::Declined { choice_id } if choice_id == SITE_DENY => {
                 let mut reply = refusal("consent_declined");
                 reply["detail"] = json!({"decision":"deny"});
@@ -1264,9 +1294,17 @@ async fn serve_inner(
             },
             None => RevokeTarget::Everything,
         };
-        let mut reply = target
-            .grants
-            .revoke(&facts.identity.agent_project_id, &revoke);
+        let mut reply = if let Some(store) = planes.management.unified_agent_grants() {
+            agent_enforcement::revoke_access(
+                store,
+                crate::permission_scope::authorizing_holder(facts),
+                &revoke,
+            )
+        } else {
+            target
+                .grants
+                .revoke(&facts.identity.agent_project_id, &revoke)
+        };
         reply["browser"] = json!("user");
         return Ok(reply);
     }

@@ -242,7 +242,7 @@ async fn an_unbind_releases_a_parked_call_and_a_late_allow_grants_nothing() {
 
     let _ = planes.consent_test.as_ref().unwrap().answer_id(
         &ask_id,
-        cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"})),
+        cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})),
     );
     let caller = computer_grants::GrantCaller {
         holder: permission_scope::authorizing_holder(&facts),

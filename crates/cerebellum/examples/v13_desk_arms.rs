@@ -964,7 +964,7 @@ mod desk {
                 .call(
                     "computer.open_target",
                     json!({"bundle_identity":app}),
-                    "allow_conversation",
+                    "allow_30m",
                 )
                 .await?;
             if c.reply["outcome"] != "granted" {
@@ -976,7 +976,7 @@ mod desk {
             self.call(
                 "computer.read_state",
                 json!({"target":app,"include_image":image}),
-                "allow_conversation",
+                "allow_30m",
             )
             .await
         }
@@ -996,7 +996,7 @@ mod desk {
                     .call(
                         "computer.read_state",
                         json!({"target":app,"include_image":false,"text_filter":text}),
-                        "allow_conversation",
+                        "allow_30m",
                     )
                     .await?;
                 let unreadable = call.reply["unreadable_subtrees"].as_u64().unwrap_or(0);
@@ -1022,7 +1022,7 @@ mod desk {
                 .call(
                     "computer.takeover_move",
                     json!({"image_id":point["image_id"],"to":{"x":180,"y":150}}),
-                    "allow_conversation",
+                    "allow_30m",
                 )
                 .await?;
             if c.reply["outcome"] != "completed" {
@@ -1175,7 +1175,7 @@ mod desk {
             println!("COVERED HIT {}",json!({"textedit_pid":grant.pid,"finder_pid":finder_pid,"hit_pid":owner,"facts_pid":facts.pid,"shown_pid":shown_pid,"shown_element_id":shown_id,"same_retained_element":same_handle,"role":facts.role,"label":shown_label,"title":facts.title,"frame":bounds,"image_point":[x,y],"desktop_point":[desktop.0,desktop.1]}));
             check(owner == Some(grant.pid) && facts.pid == Some(grant.pid) && shown_pid == grant.pid && grant.pid != finder_pid,"hit belongs to another process")?;
             check(same_handle && facts.role.as_deref()==Some("AXButton") && facts.subrole.as_deref()==Some("AXCloseButton"),"hit is not the Close element shown in read_state")?;
-            let acted = p.call("computer.press_point",point,"allow_conversation").await?;
+            let acted = p.call("computer.press_point",point,"allow_30m").await?;
             let documents_after = script("tell application \"TextEdit\" to count documents")?;
             if documents_after=="0" { f.owned=false; }
             let finder_after = finder_state(f)?;
@@ -1215,7 +1215,7 @@ mod desk {
             let (x,y)=desktop_to_image(&image.mapping,desktop)?;
             check(x>=image.width_px as u64 || y>=image.height_px as u64,"negative point is unexpectedly inside the TextEdit image")?;
             let before=json!({"cursor":cursor_position()?,"finder":finder_state(f)?,"textedit":snapshot(TEXT)?});
-            let c=p.call("computer.press_point",json!({"image_id":initial.reply["image"]["image_id"],"x":x,"y":y}),"allow_conversation").await?;
+            let c=p.call("computer.press_point",json!({"image_id":initial.reply["image"]["image_id"],"x":x,"y":y}),"allow_30m").await?;
             let after=json!({"cursor":cursor_position()?,"finder":finder_state(f)?,"textedit":snapshot(TEXT)?});
             println!("NO TARGET POINT {}",json!({"desktop_point":[desktop.0,desktop.1],"image_point":[x,y],"target_hit":null,"finder_hit_pid":finder_hit.map(|(_,pid)|pid),"reply":c.reply}));
             refused(&c,"point_out_of_bounds",&before,&after)
@@ -1285,7 +1285,7 @@ mod desk {
             question.header.channel,
             question.header.epoch,
             question.header.corr,
-            serde_json::to_vec(&json!({"decision":"allow_conversation"})).unwrap(),
+            serde_json::to_vec(&json!({"decision":"allow_30m"})).unwrap(),
         )
         .map_err(|e| e.to_string())?;
         cerebellum::handle_frame_for_test(answer, &writer, &p.planes)
@@ -1301,7 +1301,7 @@ mod desk {
         let ring = p.ring().await;
         println!(
             "LATE ANSWER {}",
-            json!({"decision":"allow_conversation","waited_seconds":3,"original_reply":reply,"journal_rows":late_rows,"before":before,"after_late":after_late,"refusal_ring":ring,"ring_changed":ring!=ring_before})
+            json!({"decision":"allow_30m","waited_seconds":3,"original_reply":reply,"journal_rows":late_rows,"before":before,"after_late":after_late,"refusal_ring":ring,"ring_changed":ring!=ring_before})
         );
         check(
             zero_post_evidence(&late_rows, &before, &after_late),
@@ -1393,7 +1393,7 @@ mod desk {
                     .call(
                         "computer.press_element",
                         json!({"element_id":id}),
-                        "allow_conversation",
+                        "allow_30m",
                     )
                     .await?;
                 check(
@@ -1568,7 +1568,7 @@ mod desk {
                     .call(
                         "computer.keys",
                         json!({"target":TEXT,"keys":["command","a"]}),
-                        "allow_conversation",
+                        "allow_30m",
                     )
                     .await?;
                 let selection = selected_text()?;
@@ -1590,7 +1590,7 @@ mod desk {
                 let point = image_point(&read, 180, 150)?;
                 let selection = selected_text()?;
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let drag=p.call("computer.takeover_drag",json!({"image_id":point["image_id"],"from":{"x":40,"y":100},"to":{"x":180,"y":150}}),"allow_conversation").await?;
+                let drag=p.call("computer.takeover_drag",json!({"image_id":point["image_id"],"from":{"x":40,"y":100},"to":{"x":180,"y":150}}),"allow_30m").await?;
                 let selected = selected_text()?;
                 let scroll_before = scrollbar()?;
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1598,7 +1598,7 @@ mod desk {
                     .call(
                         "computer.takeover_scroll",
                         json!({"target":TEXT,"axis":"vertical","amount_lines":-30}),
-                        "allow_conversation",
+                        "allow_30m",
                     )
                     .await?;
                 let scroll_after = scrollbar()?;
@@ -1631,7 +1631,7 @@ mod desk {
                 p.call(
                     "computer.press_element",
                     json!({"element_id":id}),
-                    "allow_conversation",
+                    "allow_30m",
                 )
                 .await?;
                 check(
@@ -1648,7 +1648,7 @@ mod desk {
                     .call(
                         "computer.type",
                         json!({"target":DISCORD,"text":"ck-v13-unsent"}),
-                        "allow_conversation",
+                        "allow_30m",
                     )
                     .await;
                 // How long Discord takes to show the text, measured from the
@@ -1712,7 +1712,7 @@ mod desk {
             p.call(
                 "computer.press_element",
                 json!({"element_id":id}),
-                "allow_conversation",
+                "allow_30m",
             )
             .await?;
         }
@@ -1726,7 +1726,7 @@ mod desk {
                 .call(
                     "computer.keys",
                     json!({"target":DISCORD,"keys":keys}),
-                    "allow_conversation",
+                    "allow_30m",
                 )
                 .await?;
             check(
@@ -1872,7 +1872,7 @@ mod desk {
                 !c.questions.is_empty()
                     && c.questions.iter().all(|q| {
                         !contains_fact(&q["params"]["requestedSchema"], "allow_always")
-                            && contains_fact(&q["params"]["requestedSchema"], "allow_conversation")
+                            && contains_fact(&q["params"]["requestedSchema"], "allow_30m")
                     }),
                 "ad-hoc choices were wrong",
             )?;

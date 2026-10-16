@@ -12,6 +12,28 @@ impl Question {
     pub(crate) fn bind_holder(&mut self, holder: Option<GrantHolder>) {
         if let PreparedConsent::Browser(pending) = &mut self.prepared {
             pending.holder = holder;
+            pending.choices = crate::permission_cards::browser_choices(
+                &pending.authorized_origins,
+                &pending.disclosed_hazards,
+                pending.severity,
+                pending.holder.as_ref(),
+                pending.can_record,
+            );
+            self.body = super::browser_grant_question(
+                &pending.authorized_origins,
+                &pending
+                    .disclosed_hazards
+                    .iter()
+                    .map(|hazard| hazard.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                pending.severity,
+                if self.body["params"]["urgency"] == "normal" {
+                    crate::consent_card::Urgency::Normal
+                } else {
+                    crate::consent_card::Urgency::High
+                },
+                &pending.choices,
+            );
         }
     }
 }
@@ -36,7 +58,7 @@ impl ManagementPlane {
             return BrowserGrantSettlement::UnrecognizedAnswer;
         }
         let subjects = match choice {
-            BrowserGrantChoice::Conversation | BrowserGrantChoice::OriginAlways => pending
+            BrowserGrantChoice::SiteThirtyMinutes | BrowserGrantChoice::OriginAlways => pending
                 .authorized_origins
                 .iter()
                 .cloned()
@@ -54,7 +76,7 @@ impl ManagementPlane {
                     },
                 )
                 .collect(),
-            BrowserGrantChoice::AllSitesTenMinutes | BrowserGrantChoice::AllSitesAlways => {
+            BrowserGrantChoice::AllSitesThirtyMinutes | BrowserGrantChoice::AllSitesAlways => {
                 vec![GrantSubject::AllSites]
             }
         };

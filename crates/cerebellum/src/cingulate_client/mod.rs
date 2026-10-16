@@ -27,6 +27,7 @@
 
 pub mod card;
 pub mod desk;
+pub mod features;
 pub mod live_call;
 pub mod route;
 pub mod subject;

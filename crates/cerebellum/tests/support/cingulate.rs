@@ -307,6 +307,9 @@ fn fixture_record(id: &str, outcome: ScriptedAnswer) -> Value {
 }
 
 impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
+    fn features(&self) -> Option<cerebellum::cingulate_client::features::CingulateFeatures> {
+        Some(cerebellum::cingulate_client::features::CingulateFeatures { option_group: true })
+    }
     fn call<'a>(
         &'a mut self,
         method: &'a str,

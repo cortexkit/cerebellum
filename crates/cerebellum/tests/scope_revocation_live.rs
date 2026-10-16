@@ -491,14 +491,23 @@ async fn a_scope_end_closes_its_browser_and_questions_without_minting_unattested
             Vec::new(),
         )
         .await;
-    assert!(
-        !management
-            .settle_browser_grant(
+    assert_eq!(
+        management
+            .settle_browser_grant_outcome(
                 &granted.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
+                Some(&cerebellum::cingulate_client::desk::Ending::Granted {
+                    choice_id: "allow_30m".into()
+                })
             )
-            .await
+            .await,
+        cerebellum::management::BrowserGrantSettlement::UnrecognizedAnswer,
+        "an unattested scope was never offered the granting option"
     );
+    assert!(management
+        .agent_grants()
+        .live_rows(None, management.agent_grants().now_ms())
+        .unwrap()
+        .is_empty());
     let open = management
         .browser_grant_question_for_test(
             CONVERSATION,
@@ -565,10 +574,7 @@ async fn a_scope_end_closes_its_browser_and_questions_without_minting_unattested
     assert!(!management.browser_grant_question_open(&open.ask_id).await);
     assert!(
         !management
-            .settle_browser_grant(
-                &open.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&open.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await,
         "a late answer to the ended session's question was applied"
     );

@@ -31,8 +31,8 @@
     {
       "detail": "Up to making lasting changes.",
       "effect": "grant",
-      "id": "allow_conversation",
-      "label": "Allow for this conversation"
+      "id": "allow_30m",
+      "label": "Allow on login.example for 30 minutes"
     },
     {
       "detail": "Up to making lasting changes.",

@@ -508,7 +508,7 @@ async fn mint_browser_grant(planes: &Planes, origins: &[&str]) {
     let pending = cingulate_answer::answer_cards(
         planes,
         opening,
-        json!({"decision": "allow_conversation"}),
+        json!({"decision": "allow_30m"}),
         "browser.open_grant",
     )
     .await

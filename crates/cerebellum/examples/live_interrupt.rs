@@ -561,7 +561,7 @@ mod probe {
                 Arm::unmeasurable("3", "cancelled_wait_stops_early", reason),
             ]
         } else {
-            match wire.take_target(FINDER_BUNDLE, "allow_conversation").await {
+            match wire.take_target(FINDER_BUNDLE, "allow_30m").await {
                 Ok(()) => vec![
                     arm_one(&mut wire, &screen).await,
                     arm_two(&mut wire, &screen).await,
@@ -819,10 +819,7 @@ mod probe {
                 )
             }
         };
-        if let Err(reason) = wire
-            .take_target(&bundle_identity, "allow_conversation")
-            .await
-        {
+        if let Err(reason) = wire.take_target(&bundle_identity, "allow_30m").await {
             return Arm::unmeasurable(NUMBER, NAME, reason);
         }
         // The drag names its points in an image of the application's window,
@@ -853,7 +850,7 @@ mod probe {
         // drag is sent this probe blocks on the heartbeat and reads no frames,
         // so a question raised by the drag itself would never be answered. A
         // move to where the drag starts raises it and is answered here.
-        wire.elicitation_decision = "allow_conversation";
+        wire.elicitation_decision = "allow_30m";
         let settled = wire
             .call(
                 "computer.takeover_move",

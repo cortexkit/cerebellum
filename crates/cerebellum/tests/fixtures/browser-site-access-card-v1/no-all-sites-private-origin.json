@@ -23,8 +23,8 @@
     {
       "detail": "Up to clicking ordinary links and buttons.",
       "effect": "grant",
-      "id": "allow_conversation",
-      "label": "Allow for this conversation"
+      "id": "allow_30m",
+      "label": "Allow on 10.0.0.5 for 30 minutes"
     },
     {
       "detail": "Up to clicking ordinary links and buttons.",
@@ -44,7 +44,7 @@
     "properties": {
       "decision": {
         "enum": [
-          "allow_conversation",
+          "allow_30m",
           "allow_origin_always",
           "deny"
         ],

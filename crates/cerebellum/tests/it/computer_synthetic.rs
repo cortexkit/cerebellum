@@ -1357,7 +1357,7 @@ async fn background_modifier_chords_refuse_without_takeover_and_post_nothing() {
 }
 
 async fn grant_takeover(management: &Arc<ManagementPlane>) {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["computer_30m"]);
     management
         .computer_grants()
         .require(
@@ -1462,7 +1462,7 @@ async fn a_failed_restore_is_reported_naming_the_application_left_in_front() {
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     grant_takeover(&management).await;
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     let reply = serve_asking(
         &plane,
         "computer.keys",
@@ -1485,7 +1485,7 @@ async fn plain_background_text_never_enters_the_fronting_bracket() {
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     let reply = serve_asking(
         &plane,
         "computer.type",

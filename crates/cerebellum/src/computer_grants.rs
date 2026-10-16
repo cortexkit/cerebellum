@@ -92,8 +92,11 @@ pub const APP_QUESTION_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// screen it takes.
 pub const TAKEOVER_QUESTION_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
-const ALLOW_CONVERSATION: &str = "allow_conversation";
+const ALLOW_30M: &str = "allow_30m";
 const ALLOW_ALWAYS: &str = "allow_always";
+const COMPUTER_30M: &str = "computer_30m";
+const COMPUTER_ALWAYS: &str = "computer_always";
+const ALLOW_ONCE: &str = "allow_once";
 const DENY: &str = "deny";
 
 // ---------------------------------------------------------------------------
@@ -980,6 +983,7 @@ pub const LOGIN_CONSENT_PENDING_REMEDY: &str = "The person hasn't answered yet; 
 /// How a question ended, as its waiters see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Settlement {
+    Once,
     Allowed {
         persisted: Option<Result<(), String>>,
     },
@@ -1429,6 +1433,13 @@ impl ComputerGrants {
             result
         };
         match result {
+            Ending::Settled(Settlement::Once, executor) if executor == Some(waiter.id) => {
+                Ok(GrantAdmission {
+                    waited: true,
+                    ..GrantAdmission::default()
+                })
+            }
+            Ending::Settled(Settlement::Once, _) => Err(ConsentRefusal::GrantedNotExecuted),
             Ending::Settled(Settlement::Allowed { persisted }, executor) => {
                 if executor != Some(waiter.id) {
                     return Err(ConsentRefusal::GrantedNotExecuted);
@@ -1764,13 +1775,7 @@ impl ComputerGrants {
                 completion,
             ));
         }
-        let offers_always =
-            matches!(need, GrantNeed::App { .. }) && self.offers_always(caller, identity.as_ref());
-        let offered = if offers_always {
-            vec![ALLOW_CONVERSATION, ALLOW_ALWAYS, DENY]
-        } else {
-            vec![ALLOW_CONVERSATION, DENY]
-        };
+        let offered = self.offered_choices(caller, need, identity.as_ref());
         let kind = match need {
             GrantNeed::App { .. } => CardKind::AppControl,
             GrantNeed::Takeover => CardKind::Takeover,
@@ -1908,7 +1913,14 @@ impl ComputerGrants {
 
     fn apply_answer(&self, open: &AnsweredQuestion, outcome: &CardEnding) -> Settlement {
         let choice_id = match outcome {
-            CardEnding::Granted { choice_id } | CardEnding::Declined { choice_id } => choice_id,
+            CardEnding::Granted { choice_id } => choice_id,
+            CardEnding::Declined { choice_id } if choice_id == DENY => choice_id,
+            CardEnding::Declined { .. } => {
+                return Settlement::Ended {
+                    reason: "unrecognized_answer",
+                    remedy: "The answer did not name an offered granting option; retry this call.",
+                }
+            }
             CardEnding::NoAnswer => {
                 return Settlement::Ended {
                     reason: "no_answer",
@@ -1943,20 +1955,20 @@ impl ComputerGrants {
                 }
             }
         };
-        // A decision the question did not offer is not consent to anything:
-        // an "always" answer to a question that offered only this
-        // conversation, or a word this module does not know.
+        // A choice not offered on the consent card is not consent,
+        // including a forged permanent choice in a worker's answer.
         let decision = open
             .offered
             .iter()
             .copied()
             .find(|offered| *offered == choice_id);
         match decision {
-            Some(ALLOW_CONVERSATION) | Some(ALLOW_ALWAYS) => match self
-                .write_agent_answer(open, choice_id == ALLOW_ALWAYS)
+            Some(ALLOW_ONCE) => Settlement::Once,
+            Some(ALLOW_30M) | Some(ALLOW_ALWAYS) | Some(COMPUTER_30M) | Some(COMPUTER_ALWAYS) => match self
+                .write_card_answer(open, choice_id)
             {
                 Ok(()) => Settlement::Allowed {
-                    persisted: (choice_id == ALLOW_ALWAYS).then_some(Ok(())),
+                    persisted: matches!(choice_id.as_str(), ALLOW_ALWAYS | COMPUTER_ALWAYS).then_some(Ok(())),
                 },
                 Err(_) => Settlement::Ended {
                     reason: "grant_not_recorded",
@@ -2156,17 +2168,11 @@ pub(crate) fn question_body(
         ),
         GrantNeed::Takeover => (
             "Allow control of your mouse and keyboard?".to_string(),
-            "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It is machine-wide for this conversation and can reach every application on the screen.".to_string(),
+            "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It can reach every application on the screen. Touch your mouse or keyboard to stop it.".to_string(),
             Target { kind: TargetKind::Machine, label: "your mouse and keyboard".into() }, TAKEOVER_QUESTION_DEADLINE,
         ),
     };
-    let mut grants = vec![ConsentOption::grant(
-        ALLOW_CONVERSATION,
-        "Allow for this conversation",
-    )];
-    if offered.contains(&ALLOW_ALWAYS) {
-        grants.push(ConsentOption::grant(ALLOW_ALWAYS, "Always allow"));
-    }
+    let grants = cards::render_options(need, offered);
     let facts = if signature_changed {
         vec![Fact::new("Application changed", "This application's code signature has changed since it was approved, so it may not be the application you approved")]
     } else {
@@ -2185,11 +2191,7 @@ pub(crate) fn question_body(
         // decides (up to CONSENT_PARK_LIMIT), so the agent is blocked on it.
         urgency: Urgency::High,
         scope: grant_scope(need, identity),
-        duration: if offered.contains(&ALLOW_ALWAYS) {
-            None
-        } else {
-            Some(json!("conversation"))
-        },
+        duration: None,
     }
     .render()
 }
@@ -2260,15 +2262,19 @@ mod consent_card_tests {
     use super::*;
 
     #[test]
-    fn takeover_card_has_a_decline_and_conversation_duration() {
+    fn takeover_card_has_a_decline_and_no_conversation_duration() {
         let body = question_body(
             &GrantNeed::Takeover,
-            &[ALLOW_CONVERSATION, DENY],
+            &[ALLOW_ONCE, COMPUTER_30M, COMPUTER_ALWAYS, DENY],
             false,
             None,
         );
-        crate::consent_card::assert_contract(&body, &["allow_conversation", "deny"], "deny");
-        assert_eq!(body["params"]["duration"], "conversation");
+        crate::consent_card::assert_contract(
+            &body,
+            &["allow_once", "computer_30m", "computer_always", "deny"],
+            "deny",
+        );
+        assert!(body["params"].get("duration").is_none());
         assert_eq!(body["params"]["expires_in_ms"], 300_000);
         assert_eq!(body["params"]["urgency"], "high");
         assert_eq!(body["params"]["scope"], json!({"takeover": "machine"}));
@@ -2400,6 +2406,7 @@ pub(crate) async fn report_login_execution(
 pub(crate) mod tests;
 
 mod agent_enforcement;
+mod cards;
 
 /// While a newly raised card is being added to the in-memory pending map,
 /// a concurrent answer drain must not mistake it for a record lost on restart.

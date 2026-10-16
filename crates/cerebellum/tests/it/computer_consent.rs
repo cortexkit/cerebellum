@@ -10,9 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerebellum::agent_grants::{
-    AgentGrantStorage, AgentGrantStoreError, AgentGrantStoreState, AgentGrants,
-    FilesystemAgentGrantStorage, InMemoryAgentGrantStorage, LegacyGrantSource,
-    AGENT_GRANT_STORE_FORMAT,
+    AgentGrantStorage, AgentGrantStoreError, AgentGrantStoreState, FilesystemAgentGrantStorage,
+    InMemoryAgentGrantStorage, AGENT_GRANT_STORE_FORMAT,
 };
 use cerebellum::cingulate_client::ScriptedAnswer;
 use cerebellum::computer_capability::{servable, ComputerPlane, ServeContext};
@@ -195,19 +194,12 @@ fn in_memory_management() -> Arc<ManagementPlane> {
     management_over(ComputerGrants::in_memory())
 }
 
-struct EmptyLegacy;
-impl LegacyGrantSource for EmptyLegacy {
-    fn load(&self) -> Result<AgentGrantStoreState, AgentGrantStoreError> {
-        Ok(AgentGrantStoreState::default())
-    }
-}
-
 fn agent_grants_over(storage: Arc<dyn AgentGrantStorage>) -> ComputerGrants {
-    ComputerGrants::in_memory().with_agent_grants(Arc::new(AgentGrants::open(
+    ComputerGrants::in_memory().with_agent_grants(support::permissions::store(
         storage,
-        &EmptyLegacy,
-        Some(MACHINE.into()),
-    )))
+        MACHINE,
+        Arc::new(cerebellum::browser_standing_grants::SystemWallClock),
+    ))
 }
 
 async fn serve(
@@ -285,7 +277,7 @@ async fn one_question_per_app_per_holder_survives_conversation_changes() {
         let carrier = carrier.clone();
         async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            assert!(carrier.answer_next(answer("allow_conversation")));
+            assert!(carrier.answer_next(answer("allow_30m")));
         }
     };
     let (reply, ()) = tokio::join!(
@@ -311,7 +303,10 @@ async fn one_question_per_app_per_holder_survives_conversation_changes() {
     assert_eq!(params["target"]["kind"], "app");
     // No running name can be read in a test, so the bundle identity is shown.
     assert_eq!(params["target"]["label"], APP);
-    assert_eq!(decisions(&questions[0]), ["allow_conversation", "deny"]);
+    assert_eq!(
+        decisions(&questions[0]),
+        ["allow_30m", "computer_30m", "computer_always", "deny"]
+    );
 
     let keys = serve(
         &plane,
@@ -356,7 +351,7 @@ async fn one_question_per_app_per_holder_survives_conversation_changes() {
         "a second question was raised for an application already granted"
     );
 
-    carrier.queue(answer("allow_conversation"));
+    carrier.queue(answer("allow_30m"));
     let elsewhere = serve(
         &plane,
         "computer.type",
@@ -423,7 +418,7 @@ async fn an_unanswered_wait_is_consent_pending_and_a_later_answer_still_grants()
         "the question closed with the wait"
     );
 
-    assert!(carrier.answer_next(answer("allow_conversation")));
+    assert!(carrier.answer_next(answer("allow_30m")));
     let grants = Arc::clone(management.computer_grants());
     carrier.apply_late(management.computer_grants()).await;
     until(|| grants.holds(&caller("conversation-1", false), &app_need())).await;
@@ -516,11 +511,20 @@ async fn an_always_answer_survives_a_module_restart() {
     assert!(params.get("duration").is_none());
     assert_eq!(
         decisions(&questions[0]),
-        ["allow_conversation", "allow_always", "deny"]
+        [
+            "allow_30m",
+            "allow_always",
+            "computer_30m",
+            "computer_always",
+            "deny"
+        ]
     );
-    assert_eq!(params["options"][0]["label"], "Allow for this conversation");
-    assert_eq!(params["options"][1]["label"], "Always allow");
-    assert_eq!(params["options"][2]["effect"], "decline");
+    assert_eq!(
+        params["options"][0]["label"],
+        format!("Use {APP} for 30 minutes")
+    );
+    assert_eq!(params["options"][1]["label"], format!("Always allow {APP}"));
+    assert_eq!(params["options"][4]["effect"], "decline");
     assert_eq!(admission.persisted, Some(Ok(())));
     let mut reply = json!({"outcome":"completed"});
     admission.decorate(&mut reply);
@@ -596,7 +600,7 @@ async fn an_unattested_bind_is_not_offered_always() {
     let refused = admit(&management, &unattested, caller("conversation-1", false)).await;
     assert_eq!(
         decisions(&unattested.questions()[0]),
-        ["allow_conversation", "deny"],
+        ["allow_30m", "computer_30m", "computer_always", "deny"],
         "an unattested bind was offered always"
     );
     // An answer the question did not offer is consent to nothing.
@@ -607,7 +611,13 @@ async fn an_unattested_bind_is_not_offered_always() {
     let _ = admit(&management, &attested, caller("conversation-2", true)).await;
     assert_eq!(
         decisions(&attested.questions()[0]),
-        ["allow_conversation", "allow_always", "deny"]
+        [
+            "allow_30m",
+            "allow_always",
+            "computer_30m",
+            "computer_always",
+            "deny"
+        ]
     );
 }
 
@@ -643,14 +653,14 @@ async fn a_corrupt_store_fails_closed_and_is_disclosed() {
         "store_unavailable"
     );
     let management = management_over(grants);
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     let refused = admit(&management, &carrier, caller("conversation-1", true))
         .await
         .unwrap_err();
-    assert_eq!(refused["reason"], "grant_not_recorded");
+    assert_eq!(refused["reason"], "unrecognized_answer");
     assert_eq!(
         decisions(&carrier.questions()[0]),
-        ["allow_conversation", "deny"],
+        ["allow_once", "deny"],
         "always was offered over a store that could not be read"
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
@@ -754,8 +764,8 @@ async fn an_always_answer_is_stored_before_the_waiting_call_is_released() {
     );
 }
 
-/// The takeover grant is asked separately, never offers "always", and is not
-/// satisfied by any app grant.
+/// Takeover is asked separately with once and whole-computer choices; an app
+/// permission alone never authorizes pointer or keyboard takeover.
 #[tokio::test]
 async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
     let grants = Arc::new(ComputerGrants::open(
@@ -766,7 +776,7 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
         Arc::new(Fixed(TargetResolution::Resolved(grant()))),
         Arc::clone(&grants),
     ));
-    let carrier = ScriptedCarrier::answering(&["allow_conversation", "allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m", "computer_30m"]);
     let attested = caller("conversation-1", true);
     admit(&management, &carrier, attested.clone())
         .await
@@ -791,16 +801,17 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
     assert_eq!(takeover["params"]["target"]["kind"], "machine");
     assert_eq!(takeover["params"]["urgency"], "high");
     assert_eq!(takeover["params"]["scope"], json!({"takeover": "machine"}));
-    assert_eq!(decisions(takeover), ["allow_conversation", "deny"]);
+    assert_eq!(
+        decisions(takeover),
+        ["allow_once", "computer_30m", "computer_always", "deny"]
+    );
     assert!(takeover["params"].get("app").is_none());
     // Pinned byte for byte: the host shows this line unchanged, and it has to
     // cover both uses of the grant, fronting an application for keystrokes
     // and driving the real pointer.
     assert_eq!(
         takeover["params"]["prompt"],
-        "Takeover lets the agent bring apps to the front, type into them, and move your real \
-         mouse pointer. It is machine-wide for this conversation and can reach every \
-         application on the screen."
+        "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It can reach every application on the screen. Touch your mouse or keyboard to stop it."
     );
     assert!(grants.holds(&attested, &GrantNeed::Takeover));
     assert!(grants.holds(&caller("conversation-2", true), &GrantNeed::Takeover));
@@ -846,7 +857,7 @@ async fn two_concurrent_calls_raise_exactly_one_question() {
             until(|| carrier.questions().len() == 1).await;
             // Let the second call reach the app queue before answering.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(carrier.answer_next(answer("allow_conversation")));
+            assert!(carrier.answer_next(answer("allow_30m")));
         }
     };
     let (first, second, ()) = tokio::join!(
@@ -1004,7 +1015,7 @@ const SIGNATURE_CHANGED: &str = "code signature has changed since it was approve
 /// admit that app for the same agent in later conversations without asking again.
 #[tokio::test]
 async fn the_signature_a_grant_was_made_for_is_admitted_without_asking_again() {
-    for decision in ["allow_conversation", "allow_always"] {
+    for decision in ["allow_30m", "allow_always"] {
         let code = InjectedCode::default();
         let storage = InMemoryAgentGrantStorage::default();
         let management = signed_agent_management(&code, &storage);
@@ -1047,7 +1058,7 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
         let decision = if permanent {
             "allow_always"
         } else {
-            "allow_conversation"
+            "allow_30m"
         };
         let carrier = ScriptedCarrier::answering(&[decision, "deny"]);
         let owner = caller("conversation-1", permanent);
@@ -1088,9 +1099,15 @@ async fn a_different_signature_under_the_same_bundle_identity_is_asked_again() {
         assert_eq!(p["on_expiry"], "deny");
         assert_eq!(p["expires_in_ms"], 1_800_000);
         let expected = if permanent {
-            vec!["allow_conversation", "allow_always", "deny"]
+            vec![
+                "allow_30m",
+                "allow_always",
+                "computer_30m",
+                "computer_always",
+                "deny",
+            ]
         } else {
-            vec!["allow_conversation", "deny"]
+            vec!["allow_30m", "computer_30m", "computer_always", "deny"]
         };
         assert_eq!(decisions(&questions[1]), expected);
         assert!(p.get("requestedSchema").is_none());
@@ -1131,7 +1148,7 @@ async fn an_unreadable_signature_is_refused_and_nobody_is_asked() {
     let code = InjectedCode::new(unreadable());
     let storage = InMemoryGrantStorage::new();
     let management = signed_management(&code, &storage);
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
 
     let refused = admit(&management, &carrier, caller("conversation-1", true))
         .await
@@ -1178,14 +1195,14 @@ async fn an_ad_hoc_or_teamless_application_is_not_offered_always() {
         let code = InjectedCode::new(Ok(identity));
         let storage = InMemoryGrantStorage::new();
         let management = signed_management(&code, &storage);
-        let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+        let carrier = ScriptedCarrier::answering(&["allow_30m"]);
         let conversation = caller(&format!("conversation-{index}"), true);
         admit(&management, &carrier, conversation.clone())
             .await
             .expect("a conversation grant still works");
         assert_eq!(
             decisions(&carrier.questions()[0]),
-            ["allow_conversation", "deny"],
+            ["allow_30m", "computer_30m", "computer_always", "deny"],
             "always was offered to an application with no lasting signer"
         );
         assert!(management
@@ -1212,7 +1229,13 @@ async fn an_apple_anchored_application_is_offered_always() {
         .expect("the always answer admits");
     assert_eq!(
         decisions(&carrier.questions()[0]),
-        ["allow_conversation", "allow_always", "deny"]
+        [
+            "allow_30m",
+            "allow_always",
+            "computer_30m",
+            "computer_always",
+            "deny"
+        ]
     );
     let stored = storage.load().unwrap().unwrap();
     assert_eq!(stored.grants[0].team_id, None);
@@ -1421,7 +1444,7 @@ async fn a_differently_signed_process_swapped_in_during_the_wait_does_not_act() 
         async move {
             until(|| carrier.questions().len() == 1).await;
             resolver.swap_to(second.clone());
-            assert!(carrier.answer_next(answer("allow_conversation")));
+            assert!(carrier.answer_next(answer("allow_30m")));
         }
     };
     let (reply, ()) = tokio::join!(
@@ -1465,7 +1488,7 @@ async fn a_same_signed_process_swapped_in_during_the_wait_is_admitted() {
         async move {
             until(|| carrier.questions().len() == 1).await;
             resolver.swap_to(second);
-            assert!(carrier.answer_next(answer("allow_conversation")));
+            assert!(carrier.answer_next(answer("allow_30m")));
         }
     };
     let consent = asking(&carrier, caller("conversation-1", false));

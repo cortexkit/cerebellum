@@ -94,6 +94,7 @@ pub fn refusal(code: &str) -> CallError {
 
 #[derive(Default)]
 pub struct ScriptedCingulate {
+    features: Mutex<Option<super::features::CingulateFeatures>>,
     pub opens: AtomicUsize,
     pub calls: Mutex<Vec<(String, Value)>>,
     scopes: Mutex<Vec<subc_protocol::scope::ScopeSelector>>,
@@ -107,7 +108,15 @@ pub struct ScriptedCingulate {
 
 impl ScriptedCingulate {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let service = Arc::new(Self::default());
+        service.report_features(Some(super::features::CingulateFeatures {
+            option_group: true,
+        }));
+        service
+    }
+
+    pub fn report_features(&self, features: Option<super::features::CingulateFeatures>) {
+        *self.features.lock().unwrap() = features;
     }
 
     pub fn then(self: &Arc<Self>, method: &'static str, reply: Reply) -> &Arc<Self> {
@@ -153,6 +162,9 @@ impl CingulateOpener for Arc<ScriptedCingulate> {
 }
 
 impl CingulateRoute for ScriptedRoute {
+    fn features(&self) -> Option<super::features::CingulateFeatures> {
+        *self.0.features.lock().unwrap()
+    }
     fn call<'a>(
         &'a mut self,
         method: &'a str,

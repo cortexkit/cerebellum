@@ -1146,7 +1146,7 @@ mod tests {
             assert!(self.planes.consent_test.as_ref().unwrap().answer(
                 question.header.corr,
                 crate::cingulate_client::ScriptedAnswer::Answered(
-                    serde_json::json!({"decision":"allow_conversation"})
+                    serde_json::json!({"decision":"allow_30m"})
                 )
             ));
         }

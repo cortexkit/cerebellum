@@ -42,24 +42,43 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
     use crate::authorization::{HazardClass, Severity};
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
     use crate::consent_card::{Urgency, LOGIN_CARD_LIFETIME};
-    use crate::management::{browser_grant_question, BrowserGrantChoice, PHONE_CONSENT_DEADLINE};
+    use crate::management::{browser_grant_question, PHONE_CONSENT_DEADLINE};
 
     let origins = vec!["https://login.example".to_string()];
     let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
+    let holder = if standing {
+        crate::agent_grants::GrantHolder::Head {
+            agent_id: "agent-golden".into(),
+        }
+    } else {
+        crate::agent_grants::GrantHolder::Worker {
+            agent_id: "agent-golden".into(),
+            scope_ref: "worker-golden".into(),
+        }
+    };
+    let computer = crate::computer_grants::ComputerGrants::open(
+        Arc::new(crate::computer_grants::InMemoryGrantStorage::new()),
+        Some("machine-golden".into()),
+    );
+    let caller = crate::computer_grants::GrantCaller {
+        holder: Some(holder.clone()),
+        conversation_key: "conversation-golden".into(),
+        agent_project_id: "agent-golden".into(),
+        durable_identity_attested: standing,
+    };
     let site = |urgency| {
         browser_grant_question(
             &origins,
             &hazards,
             Severity::new(4, true, false),
             urgency,
-            &if standing {
-                vec![
-                    BrowserGrantChoice::Conversation,
-                    BrowserGrantChoice::OriginAlways,
-                ]
-            } else {
-                vec![BrowserGrantChoice::Conversation]
-            },
+            &crate::permission_cards::browser_choices(
+                &origins,
+                &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
+                Severity::new(4, true, false),
+                Some(&holder),
+                true,
+            ),
         )
     };
     let app = GrantNeed::App {
@@ -125,11 +144,17 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
         };
         crate::management::launch_recovery_clear_question(&preview)
     };
-    let user_browser_site = crate::user_browser::site_question(
+    let user_browser_site = crate::user_browser::site_question_with_choices(
         "https://bank.example",
         3,
         &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
-        standing,
+        &crate::permission_cards::browser_choices(
+            &["https://bank.example".into()],
+            &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
+            Severity::new(3, true, false),
+            Some(&holder),
+            true,
+        ),
     );
     vec![
         (
@@ -149,11 +174,7 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
             "app-control.json",
             crate::computer_grants::question_body(
                 &app,
-                if standing {
-                    &["allow_conversation", "allow_always", "deny"]
-                } else {
-                    &["allow_conversation", "deny"]
-                },
+                &computer.offered_choices(&caller, &app, Some(&team)),
                 false,
                 Some(&team),
             ),
@@ -164,7 +185,7 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
             "takeover.json",
             crate::computer_grants::question_body(
                 &GrantNeed::Takeover,
-                &["allow_conversation", "deny"],
+                &computer.offered_choices(&caller, &GrantNeed::Takeover, None),
                 false,
                 None,
             ),
@@ -1909,4 +1930,6 @@ fn every_kind_has_one_subject_and_kinds_never_collide() {
     assert_eq!(subject::login_parts(&by_kind[3].1), None);
 }
 
+mod agent_permission_cards;
+mod features;
 mod worker_options;

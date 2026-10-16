@@ -19,8 +19,15 @@
     {
       "detail": "Up to clicking ordinary links and buttons.",
       "effect": "grant",
-      "id": "allow_conversation",
-      "label": "Allow for this conversation"
+      "id": "allow_30m",
+      "label": "Allow on news.example for 30 minutes"
+    },
+    {
+      "detail": "Covers every public site. Sign-in and payment pages still ask.",
+      "effect": "grant",
+      "group": "danger",
+      "id": "allow_all_sites_30m",
+      "label": "Allow on all sites for 30 minutes"
     },
     {
       "effect": "decline",
@@ -34,7 +41,8 @@
     "properties": {
       "decision": {
         "enum": [
-          "allow_conversation",
+          "allow_30m",
+          "allow_all_sites_30m",
           "deny"
         ],
         "type": "string"

@@ -114,10 +114,7 @@ fn allowing(conversation_key: &str) -> ConsentContext {
     std::mem::forget(drain_sender);
     ConsentContext::new(
         GrantCaller::new(conversation_key.into(), GRANTEE.into(), false),
-        Some(
-            Arc::new(ScriptedCarrier::answering(&["allow_conversation"]))
-                as Arc<dyn QuestionCarrier>,
-        ),
+        Some(Arc::new(ScriptedCarrier::answering(&["allow_30m"])) as Arc<dyn QuestionCarrier>),
         Arc::new(cerebellum::computer_grants::AlwaysOpenRoute),
         drain,
         None,
@@ -1034,7 +1031,7 @@ async fn an_agent_run_reads_only_under_a_held_app_grant() {
 async fn codemode_computer_read_never_raises_a_desk_card() {
     let management = support::computer::management();
     let plane = plane(FixtureSource::new(vec![chat_window()]));
-    let carrier = support::computer::ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = support::computer::ScriptedCarrier::answering(&["allow_30m"]);
     let mut consent = support::computer::relayed(&carrier);
     consent.agent_run = true;
     let reply = serve(
@@ -1060,7 +1057,7 @@ async fn codemode_computer_read_never_raises_a_desk_card() {
 async fn classic_computer_read_keeps_the_desk_card_flow() {
     let management = support::computer::management();
     let plane = plane(FixtureSource::new(vec![chat_window()]));
-    let carrier = support::computer::ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = support::computer::ScriptedCarrier::answering(&["allow_30m"]);
     let reply = serve(
         &plane,
         &management,

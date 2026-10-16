@@ -145,7 +145,7 @@ pub(super) async fn withdraw_asked_call_and_apply_late_grant(planes: Planes) {
     assert_eq!(withdrawn["answer"], "withdrawn");
     assert!(planes.consent_test.as_ref().unwrap().answer(
         question.header.corr,
-        cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"})),
+        cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})),
     ));
     computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
     let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
