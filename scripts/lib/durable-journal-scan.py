@@ -245,8 +245,11 @@ class FileScan:
         self.tokens = tokens
         # Half-open token ranges that are test code.
         self.regions: List[Tuple[int, int]] = []
-        # Out-of-line modules: (name, #[path] value or None, declared in test code).
-        self.modules: List[Tuple[str, Optional[str], bool]] = []
+        # Out-of-line modules: (name, #[path] value or None, declared in test
+        # code, names of the inline `mod x { ... }` blocks enclosing the
+        # declaration). Rust resolves `mod y;` inside `mod x { }` to `x/y.rs`,
+        # so the enclosing names are part of where the file lives.
+        self.modules: List[Tuple[str, Optional[str], bool, Tuple[str, ...]]] = []
 
 
 def scan_structure(path: Path) -> FileScan:
@@ -255,8 +258,17 @@ def scan_structure(path: Path) -> FileScan:
     i = 0
     pending_test_start: Optional[int] = None
     pending_path: Optional[str] = None
+    # Inline modules currently open: (name, brace depth inside their body).
+    inline: List[Tuple[str, int]] = []
+    depth = 0
     while i < len(tokens):
         kind, text, _ = tokens[i]
+        if kind == "punct" and text == "{":
+            depth += 1
+        elif kind == "punct" and text == "}":
+            if inline and inline[-1][1] == depth:
+                inline.pop()
+            depth -= 1
         if kind == "punct" and text == "#":
             inner = i + 1 < len(tokens) and tokens[i + 1][1] == "!"
             bracket = i + 2 if inner else i + 1
@@ -291,7 +303,12 @@ def scan_structure(path: Path) -> FileScan:
             name, after = tokens[i + 1][1], tokens[i + 2][1]
             if after == ";":
                 in_test = pending_test_start is not None or scan_in_regions(scan, i)
-                scan.modules.append((name, pending_path, in_test))
+                enclosing = tuple(entry[0] for entry in inline)
+                scan.modules.append((name, pending_path, in_test, enclosing))
+            elif after == "{":
+                # The body's opening brace is the next token, so its depth
+                # will be one more than now.
+                inline.append((name, depth + 1))
         if pending_test_start is not None:
             end = _item_end(tokens, i)
             scan.regions.append((pending_test_start, end + 1))
@@ -329,14 +346,20 @@ def _item_end(tokens: List[Token], start: int) -> int:
     return len(tokens) - 1
 
 
-def module_file(parent: Path, name: str, explicit: Optional[str]) -> Optional[Path]:
-    if explicit is not None:
-        candidate = parent.parent / explicit
-        return candidate if candidate.is_file() else None
+def module_file(
+    parent: Path, name: str, explicit: Optional[str], enclosing: Tuple[str, ...] = ()
+) -> Optional[Path]:
     if parent.name in ("mod.rs", "lib.rs", "main.rs"):
         base = parent.parent
     else:
         base = parent.parent / parent.stem
+    if explicit is not None:
+        # A #[path] outside any inline module is relative to the file's own
+        # directory; inside one, to the directory the inline names describe.
+        directory = base.joinpath(*enclosing) if enclosing else parent.parent
+        candidate = directory / explicit
+        return candidate if candidate.is_file() else None
+    base = base.joinpath(*enclosing)
     for candidate in (base / f"{name}.rs", base / name / "mod.rs"):
         if candidate.is_file():
             return candidate
@@ -390,12 +413,12 @@ def main(argv: List[str]) -> int:
     whole_test_files: Set[Path] = set()
     pending = []
     for scan in scans.values():
-        for name, explicit, in_test in scan.modules:
+        for name, explicit, in_test, enclosing in scan.modules:
             if in_test:
-                pending.append((scan.path, name, explicit))
+                pending.append((scan.path, name, explicit, enclosing))
     while pending:
-        parent, name, explicit = pending.pop()
-        child = module_file(parent, name, explicit)
+        parent, name, explicit, enclosing = pending.pop()
+        child = module_file(parent, name, explicit, enclosing)
         if child is None:
             problems.append(
                 f"{parent.relative_to(root).as_posix()}: test module `{name}` has no file"
@@ -406,8 +429,8 @@ def main(argv: List[str]) -> int:
         if matched is None or matched in whole_test_files:
             continue
         whole_test_files.add(matched)
-        for grand_name, grand_explicit, _ in scans[matched].modules:
-            pending.append((matched, grand_name, grand_explicit))
+        for grand_name, grand_explicit, _, grand_enclosing in scans[matched].modules:
+            pending.append((matched, grand_name, grand_explicit, grand_enclosing))
 
     region_count = 0
     for path, scan in scans.items():

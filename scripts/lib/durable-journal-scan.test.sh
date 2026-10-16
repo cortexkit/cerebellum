@@ -173,6 +173,24 @@ mod nowhere;
 RUST
 expect "a test module with no file refuses rather than skipping it" 2 "test module \`nowhere\` has no file" "$tree"
 
+# `mod y;` inside an inline `mod x { }` lives at x/y.rs, and an offender there
+# must be found rather than reported as a missing file.
+tree="$(fresh_tree inline_nested)"
+cat >>"$tree/crates/demo/src/lib.rs" <<'RUST'
+
+#[cfg(test)]
+mod wire_tests {
+    mod inner;
+}
+RUST
+mkdir -p "$tree/crates/demo/src/wire_tests"
+cat >"$tree/crates/demo/src/wire_tests/inner.rs" <<'RUST'
+fn helper() {
+    let _ = computer_capability::production_audit();
+}
+RUST
+expect "an offender in a module declared inside an inline test module" 1 "crates/demo/src/wire_tests/inner.rs:2: production_audit(" "$tree"
+
 tree="$(fresh_tree format_floor)"
 cat >>"$tree/crates/demo/tests/wire.rs" <<'RUST'
 
