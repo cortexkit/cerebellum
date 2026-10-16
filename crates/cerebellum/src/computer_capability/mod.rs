@@ -51,6 +51,8 @@ use cerebellum_computer::platform::vocabulary::{
 use cerebellum_computer::platform::AccessibilityElementName;
 #[cfg(target_os = "macos")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::MacOs26PlatformDriver;
+#[cfg(all(target_os = "macos", test))]
+pub(crate) mod turn_stop_driver;
 #[cfg(target_os = "windows")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::WindowsPlatformDriver;
 #[cfg(target_os = "macos")]
@@ -2642,13 +2644,20 @@ fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> 
 /// poll: the same `cancelled` outcome a wait cancelled mid-poll returns, with
 /// no reads attempted.
 fn cancelled_before_polling_reply(predicate: PostCondition) -> Value {
-    let mut reply = wait_indeterminate_reply(
-        Some(predicate),
-        json!({"reason": "cancelled_while_awaiting_consent"}),
-    );
-    reply["outcome"] = json!("cancelled");
-    reply["attempts"] = json!(0);
-    reply
+    // No readback exists before polling. The evidence type already permits a
+    // plain reason string; serializing a diagnostic object here would encode
+    // JSON a second time inside that string.
+    let evidence = WaitEvidence::Indeterminate {
+        predicate,
+        readback: None,
+        reason: "cancelled_while_awaiting_consent".to_string(),
+    };
+    json!({
+        "outcome": "cancelled", "attempts": 0,
+        "evidence": serde_json::to_string(&evidence)
+            .expect("the closed wait evidence type serializes"),
+        "settle_path": "poll_with_deadline",
+    })
 }
 
 fn effect_status_name(status: EffectStatus) -> &'static str {
@@ -4080,6 +4089,17 @@ mod cancel_wire_tests {
     }
 
     #[test]
+    fn a_pre_poll_cancel_has_a_plain_reason_and_survives_withholding() {
+        let reply = cancelled_before_polling_reply(wait_predicate());
+        assert_eq!(reply["outcome"], "cancelled");
+        assert_eq!(reply["attempts"], 0);
+        let evidence: Value = serde_json::from_str(reply["evidence"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["reason"], "cancelled_while_awaiting_consent");
+        assert_eq!(evidence["readback"], Value::Null);
+        validate_capability_result("computer.wait", &reply).unwrap();
+    }
+
+    #[test]
     fn a_cancelled_wait_is_not_reported_as_indeterminate() {
         let reply = cancelled_wait_reply();
         assert_eq!(reply["outcome"], "cancelled");
@@ -4255,3 +4275,21 @@ mod outcome_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod future_size_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) type ScriptedComputerPlane = ComputerPlane<
+    NativeComputerCaptureBackend,
+    cerebellum_computer::audit::redaction::ExcludeApplicationText,
+    cerebellum_core::journal::ValidatedSeverityTaxonomy,
+    crate::PlaneJournalStorage,
+    turn_stop_driver::Driver,
+>;
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn unit_tests_keep_the_native_computer_driver_type() {
+    assert_eq!(
+        std::any::TypeId::of::<NativeComputerPlatformDriver>(),
+        std::any::TypeId::of::<cerebellum_computer::platform::MacOs26PlatformDriver>(),
+    );
+}

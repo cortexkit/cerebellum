@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 1,
+    "corr": 807,
+    "epoch": 1,
+    "type": "Cancel",
+    "wire_hex": "000000000206020100010000002703000000000000"
+  },
+  "case": "user-browser-site-card",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 65,
+    "body_utf8": "{\"browser\":\"user\",\"input_dispatched\":false,\"outcome\":\"cancelled\"}",
+    "channel": 1,
+    "corr": 807,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "4100000002010201000100000027030000000000007b2262726f77736572223a2275736572222c22696e7075745f64697370617463686564223a66616c73652c226f7574636f6d65223a2263616e63656c6c6564227d"
+  },
+  "request": {
+    "body_length": 88,
+    "body_utf8": "{\"arguments\":{\"action\":\"snapshot\",\"browser\":\"user\",\"tab\":\"handed\"},\"name\":\"browser_use\"}",
+    "channel": 1,
+    "corr": 807,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "5800000002000201000100000027030000000000007b22617267756d656e7473223a7b22616374696f6e223a22736e617073686f74222c2262726f77736572223a2275736572222c22746162223a2268616e646564227d2c226e616d65223a2262726f777365725f757365227d"
+  },
+  "state": "parked awaiting a user-browser site card; card is withdrawn on Cancel"
+}

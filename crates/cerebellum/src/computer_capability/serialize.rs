@@ -169,14 +169,17 @@ pub(crate) fn arrive(
         return None;
     }
     let plane = planes.computer.as_ref().ok()?;
-    if super::permissions::refusal(capability.capability(), &plane.permissions).is_some() {
+    let (permissions, serializer) = (&plane.permissions, &plane.serializer);
+    #[cfg(all(test, target_os = "macos"))]
+    let (permissions, serializer) = planes
+        .computer_for_test
+        .as_ref()
+        .map(|plane| (&plane.permissions, &plane.serializer))
+        .unwrap_or((permissions, serializer));
+    if super::permissions::refusal(capability.capability(), permissions).is_some() {
         return None;
     }
-    Some(
-        plane
-            .serializer
-            .arrive(facts.identity.conversation_key, position),
-    )
+    Some(serializer.arrive(facts.identity.conversation_key, position))
 }
 
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>

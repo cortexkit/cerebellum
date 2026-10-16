@@ -1170,7 +1170,11 @@ impl Context<'_> {
             InCall::Cancelled if *self.planes.drain_signal.borrow() => {
                 return Err(refusal("module_draining"))
             }
-            InCall::Cancelled => return Err(refusal("cancelled")),
+            InCall::Cancelled => {
+                return Err(json!({
+                    "browser":"user", "outcome":"cancelled", "input_dispatched":false,
+                }))
+            }
             InCall::RouteClosed => return Err(refusal("route_closed")),
             // `hold` never detaches the card (leaves it open for a later
             // answer), so it never reports one pending; read it as silence.

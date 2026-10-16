@@ -205,7 +205,7 @@ pub fn reply_schema(launch_refusal: Value) -> Value {
     json!({
         "type":"object",
         "properties":{
-            "outcome":{"type":"string","enum":["transferred","consent_pending","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","consent_unavailable","unrecognized_answer","question_withdrawn","launch_binary_unsupported","profile_busy","resource_busy","transfer_failed","invalid_origin","internal_failure"]},
+            "outcome":{"type":"string","enum":["transferred","consent_pending","cancelled","denied","hand_off","no_answer","not_put_to_anyone","undeliverable","profile_not_durable","session_open","consent_unavailable","unrecognized_answer","question_withdrawn","launch_binary_unsupported","profile_busy","resource_busy","transfer_failed","invalid_origin","internal_failure"]},
             "domains_matched":{"type":"array","items":{"type":"string"}},
             "browser":{"type":"string"},
             "rows":{"type":"integer"},
@@ -339,6 +339,11 @@ impl LoginImportPlan {
             }
         };
         self.result(word, None, 0, Some(unanswered_remedy(word)))
+    }
+
+    /// Cancellation is not a person's denial and must not suggest another ask.
+    pub fn cancelled(self) -> ImportResult {
+        self.result("cancelled", None, 0, None)
     }
 
     pub fn decide(self, decision: Option<&str>) -> ImportResult {
@@ -1567,10 +1572,15 @@ mod tests {
                     "hand_off"
                 } else if decision == "transfer:unknown" {
                     "unrecognized_answer"
+                } else if decision == "cancel" {
+                    "cancelled"
                 } else {
                     "denied"
                 }
             );
+            if decision == "cancel" {
+                assert!(reply.get("remedy").is_none());
+            }
             assert_eq!(status["outcome"], "ready");
             assert_eq!(status["browser_session_id"], old);
             assert!(events.is_empty());

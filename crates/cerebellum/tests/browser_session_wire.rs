@@ -50,6 +50,10 @@ mod stable_refs;
 mod browser_queue;
 #[path = "support/permissions.rs"]
 mod permission_support;
+#[path = "support/turn_stop_browser.rs"]
+mod turn_stop_browser;
+#[path = "support/turn_stop_vectors.rs"]
+mod turn_stop_vectors;
 
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -5315,7 +5319,9 @@ async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound(
         .await
         .unwrap();
     let reply = consent_frame(&mut rx).await;
-    assert_eq!(body(&reply)["detail"]["decision"], "cancelled");
+    assert_eq!(body(&reply)["outcome"], "cancelled");
+    assert!(body(&reply).get("remedy").is_none());
+    assert!(body(&reply).get("detail").is_none());
     assert!(rx.try_recv().is_err(), "no reverse cancellation frame");
     let service = ScriptedCarrier::for_planes(&planes);
     assert!(service
@@ -7857,12 +7863,9 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
         .await
         .unwrap();
     let reply = consent_frame(&mut rx).await;
-    assert_eq!(
-        body(&reply)["detail"]["decision"],
-        "cancelled",
-        "{}",
-        body(&reply)
-    );
+    assert_eq!(body(&reply)["outcome"], "cancelled", "{}", body(&reply));
+    assert!(body(&reply).get("remedy").is_none());
+    assert!(body(&reply).get("detail").is_none());
     assert!(rx.try_recv().is_err());
     assert!(ScriptedCarrier::for_planes(&planes)
         .calls()

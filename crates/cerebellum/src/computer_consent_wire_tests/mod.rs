@@ -284,6 +284,220 @@ async fn a_cancel_releases_a_parked_call_and_keeps_the_question_for_the_conversa
     );
 }
 
+#[tokio::test]
+async fn turn_stop_cancel_computer_app_card_accepts_empty_and_legacy_bodies() {
+    let mut replies = Vec::new();
+    for legacy_body in [false, true] {
+        let planes = planes();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = wait_request();
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["name"] = json!("computer_use");
+        body["arguments"]["action"] = json!("wait");
+        request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            CHANNEL,
+            EPOCH,
+            CORR,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        handle_frame_for_test(request.clone(), &tx, &planes)
+            .await
+            .unwrap();
+        let question = planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .card(CHANNEL, EPOCH)
+            .await;
+        let ask_id = serde_json::from_slice::<Value>(&question.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        settle_to(&planes, (0, 1)).await;
+        let mut stop = crate::turn_stop_vectors::cancel(&request);
+        if legacy_body {
+            stop = frame(FrameType::Cancel, CHANNEL, CORR, json!({}));
+        }
+        handle_frame_for_test(stop.clone(), &tx, &planes)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancelled app-card call must not hang")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["outcome"], "cancelled");
+        assert_eq!(body["attempts"], 0);
+        let evidence: Value = serde_json::from_str(body["evidence"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["reason"], "cancelled_while_awaiting_consent");
+        settle_to(&planes, (0, 0)).await;
+        assert!(planes.management.computer_grants().question_open(&ask_id));
+        assert!(planes
+            .consent_test
+            .as_ref()
+            .unwrap()
+            .calls()
+            .iter()
+            .any(|(method, _)| method == "consent.detach"));
+        assert!(rx.try_recv().is_err());
+        if !legacy_body {
+            crate::turn_stop_vectors::check(
+                "computer-app-card",
+                "parked awaiting an app card on a live route",
+                &request,
+                &stop,
+                Some(&reply),
+            );
+        }
+        replies.push(reply.body);
+    }
+    assert_eq!(
+        replies[0], replies[1],
+        "empty wire body and legacy JSON body behave identically"
+    );
+}
+
+#[tokio::test]
+async fn turn_stop_cancel_computer_queued_answers_before_the_head_card() {
+    let mut planes = planes();
+    Arc::make_mut(&mut planes.computer_admitted).insert("computer.read_state".into());
+    let (tx, mut rx) = mpsc::channel(8);
+    parked_call(&planes, &tx, &mut rx).await;
+    let request = frame(
+        FrameType::Request,
+        CHANNEL,
+        CORR + 1,
+        json!({"name":"computer_use", "arguments":{"action":"read_state", "target":APP}}),
+    );
+    handle_frame_for_test(request.clone(), &tx, &planes)
+        .await
+        .unwrap();
+    if let Ok(early) = tokio::time::timeout(Duration::from_millis(25), rx.recv()).await {
+        panic!("read_state must wait behind the head's app card: {early:?}");
+    }
+    let stop = crate::turn_stop_vectors::cancel(&request);
+    handle_frame_for_test(stop.clone(), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("queued cancellation must not wait on the head's card")
+        .unwrap();
+    assert_eq!(reply.header.corr, CORR + 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap(),
+        json!({
+            "outcome":"cancelled", "remedy":"the call was cancelled before it ran; nothing was done"
+        })
+    );
+    crate::turn_stop_vectors::check(
+        "computer-queued",
+        "read_state queued behind another call's app card",
+        &request,
+        &stop,
+        Some(&reply),
+    );
+    handle_frame_for_test(
+        crate::turn_stop_vectors::cancel(&wait_request()),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    self::reply(&mut rx).await;
+    settle_to(&planes, (0, 0)).await;
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn turn_stop_cancel_running_keys_releases_both_presses() {
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, AppStateSource, ElementActionError, ElementHandle, RawAppState,
+        ReadBounds,
+    };
+    struct NoFocusedField;
+    impl AppStateSource for NoFocusedField {
+        fn read_app_state(
+            &self,
+            _: &ProcessGrant,
+            _: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            Err(AppStateReadError::Unreadable)
+        }
+        fn focused_element(
+            &self,
+            _: &ProcessGrant,
+        ) -> Result<Option<ElementHandle>, ElementActionError> {
+            Ok(None)
+        }
+    }
+    let mut planes = planes();
+    Arc::make_mut(&mut planes.computer_admitted).insert("computer.keys".into());
+    let sequence = Arc::new(computer_capability::turn_stop_driver::Sequence::default());
+    let script = sequence.clone();
+    assert!(planes.computer_for_test.is_none());
+    planes.computer_for_test = Some(Arc::new(
+        computer_capability::ComputerPlane::with_synthetic_driver(
+            computer_capability::computer_audit(JournalPersistence::Isolated).unwrap(),
+            move || computer_capability::turn_stop_driver::Driver::scripted(script.clone()),
+        )
+        .with_permission_liveness(computer_capability::live_for_test())
+        .with_session_lock_for_test(Some(false))
+        .with_app_state_source(Arc::new(NoFocusedField)),
+    ));
+    let (tx, mut rx) = mpsc::channel(8);
+    let request = frame(
+        FrameType::Request,
+        CHANNEL,
+        806,
+        json!({"name":"computer_use", "arguments":{"action":"keys", "target":APP, "keys":["shift","a"]}}),
+    );
+    handle_frame_for_test(request.clone(), &tx, &planes)
+        .await
+        .unwrap();
+    let service = planes.consent_test.as_ref().unwrap();
+    let question = service.card(CHANNEL, EPOCH).await;
+    assert!(service.answer(
+        question.header.corr,
+        cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
+    ));
+    tokio::select! {
+        _ = sequence.posted.notified() => {},
+        early = rx.recv() => panic!("keys must reach the scripted platform: {}", String::from_utf8_lossy(&early.unwrap().body)),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("scripted sequence did not reach its second press"),
+    }
+    let stop = crate::turn_stop_vectors::cancel(&request);
+    handle_frame_for_test(stop.clone(), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("running sequence cancellation must answer")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["outcome"], "dispatch_outcome_unknown");
+    assert_eq!(body["detail"]["step"], "dispatch");
+    assert_eq!(body["detail"]["held_state"], "released");
+    // Observe paired recovery posts as well as the reply: a label alone could
+    // claim successful release while the actual keys remained down.
+    assert_eq!(
+        *sequence.events.lock().unwrap(),
+        [(0, false), (1, false), (3, true), (2, true)]
+    );
+    crate::turn_stop_vectors::check(
+        "computer-running-keys",
+        "scripted platform has posted two presses; paired releases remain",
+        &request,
+        &stop,
+        Some(&reply),
+    );
+    settle_to(&planes, (0, 0)).await;
+    assert!(rx.try_recv().is_err());
+}
+
 /// The grant operations answer on a management route.
 #[tokio::test]
 async fn the_grant_operations_answer_on_the_management_surface() {

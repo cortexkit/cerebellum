@@ -173,7 +173,8 @@ async fn browser_queue_cancelled_head_releases_successor() {
         results.iter().map(|f| f.header.corr).collect::<Vec<_>>(),
         [801, 802]
     );
-    assert_eq!(body(&results[0])["detail"]["decision"], "cancelled");
+    assert_eq!(body(&results[0])["outcome"], "cancelled");
+    assert!(body(&results[0]).get("remedy").is_none());
     assert_eq!(body(&results[1])["outcome"], "ok");
     assert_eq!(*launcher.effects.lock().unwrap(), ["snapshot"]);
     let calls = ScriptedCarrier::for_planes(&planes).calls();

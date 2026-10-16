@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 4,
+    "corr": 303,
+    "epoch": 1,
+    "type": "Cancel",
+    "wire_hex": "000000000206020400010000002f01000000000000"
+  },
+  "case": "capture-login-card",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 38,
+    "body_utf8": "{\"context\":null,\"outcome\":\"cancelled\"}",
+    "channel": 4,
+    "corr": 303,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "260000000201000400010000002f010000000000007b22636f6e74657874223a6e756c6c2c226f7574636f6d65223a2263616e63656c6c6564227d"
+  },
+  "request": {
+    "body_length": 221,
+    "body_utf8": "{\"arguments\":{\"account\":\"work\",\"action\":\"capture_login\",\"credential_domain\":\"ollama.com\",\"fetch_url\":\"https://ollama.com/settings\",\"login_url\":\"https://ollama.com/signin\"},\"call_key\":\"pf:capture-303\",\"name\":\"browser_use\"}",
+    "channel": 4,
+    "corr": 303,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "dd0000000200020400010000002f010000000000007b22617267756d656e7473223a7b226163636f756e74223a22776f726b222c22616374696f6e223a22636170747572655f6c6f67696e222c2263726564656e7469616c5f646f6d61696e223a226f6c6c616d612e636f6d222c2266657463685f75726c223a2268747470733a2f2f6f6c6c616d612e636f6d2f73657474696e6773222c226c6f67696e5f75726c223a2268747470733a2f2f6f6c6c616d612e636f6d2f7369676e696e227d2c2263616c6c5f6b6579223a2270663a636170747572652d333033222c226e616d65223a2262726f777365725f757365227d"
+  },
+  "state": "parked awaiting the 30-minute capture card before login handoff"
+}

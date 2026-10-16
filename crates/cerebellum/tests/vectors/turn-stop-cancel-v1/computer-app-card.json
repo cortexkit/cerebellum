@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 7,
+    "corr": 42,
+    "epoch": 1,
+    "type": "Cancel",
+    "wire_hex": "000000000206000700010000002a00000000000000"
+  },
+  "case": "computer-app-card",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 265,
+    "body_utf8": "{\"attempts\":0,\"evidence\":\"{\\\"status\\\":\\\"indeterminate\\\",\\\"predicate\\\":{\\\"kind\\\":\\\"element_present\\\",\\\"element\\\":{\\\"Identifier\\\":\\\"ready\\\"}},\\\"readback\\\":null,\\\"reason\\\":\\\"cancelled_while_awaiting_consent\\\"}\",\"outcome\":\"cancelled\",\"settle_path\":\"poll_with_deadline\"}",
+    "channel": 7,
+    "corr": 42,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "090100000201020700010000002a000000000000007b22617474656d707473223a302c2265766964656e6365223a227b5c227374617475735c223a5c22696e64657465726d696e6174655c222c5c227072656469636174655c223a7b5c226b696e645c223a5c22656c656d656e745f70726573656e745c222c5c22656c656d656e745c223a7b5c224964656e7469666965725c223a5c2272656164795c227d7d2c5c22726561646261636b5c223a6e756c6c2c5c22726561736f6e5c223a5c2263616e63656c6c65645f7768696c655f6177616974696e675f636f6e73656e745c227d222c226f7574636f6d65223a2263616e63656c6c6564222c22736574746c655f70617468223a22706f6c6c5f776974685f646561646c696e65227d"
+  },
+  "request": {
+    "body_length": 167,
+    "body_utf8": "{\"arguments\":{\"action\":\"wait\",\"app\":\"com.example.Editor\",\"predicate\":{\"element\":{\"Identifier\":\"ready\"},\"kind\":\"element_present\"},\"timeout_ms\":0},\"name\":\"computer_use\"}",
+    "channel": 7,
+    "corr": 42,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "a70000000200000700010000002a000000000000007b22617267756d656e7473223a7b22616374696f6e223a2277616974222c22617070223a22636f6d2e6578616d706c652e456469746f72222c22707265646963617465223a7b22656c656d656e74223a7b224964656e746966696572223a227265616479227d2c226b696e64223a22656c656d656e745f70726573656e74227d2c2274696d656f75745f6d73223a307d2c226e616d65223a22636f6d70757465725f757365227d"
+  },
+  "state": "parked awaiting an app card on a live route"
+}

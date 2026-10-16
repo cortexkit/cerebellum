@@ -1815,7 +1815,14 @@ async fn cancel_route_close_and_drain_withdraw_a_held_site_card() {
         match reason {
             Some(reason) => {
                 let reply = fixture.finish(started).await;
-                assert_eq!(reply["reason"], reason, "{event}: {reply}");
+                if event == "cancel" {
+                    assert_eq!(
+                        reply,
+                        json!({"browser":"user", "outcome":"cancelled", "input_dispatched":false})
+                    );
+                } else {
+                    assert_eq!(reply["reason"], reason, "{event}: {reply}");
+                }
             }
             None => {
                 let mut started = started;
@@ -1841,6 +1848,60 @@ async fn cancel_route_close_and_drain_withdraw_a_held_site_card() {
         assert!(fixture.planes.consent.raised("el_site_held").is_none());
         assert!(fixture.state.lock().unwrap().captures.is_empty());
     }
+}
+
+#[tokio::test]
+async fn turn_stop_cancel_user_browser_site_card_has_no_retry_advice() {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    let tab = fixture.claim(1).await;
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id":"el_site_stop"})),
+        )
+        .then(wire::CONSENT_AWAIT, Reply::Hang)
+        .then(
+            wire::CONSENT_WITHDRAW,
+            Reply::Result(json!({"elicitation_id":"el_site_stop","state":"withdrawn"})),
+        );
+    let request = tool_frame(1, 807, snapshot_args(&tab));
+    let (writer, mut replies) = mpsc::channel(8);
+    crate::handle_frame_for_test(request.clone(), &writer, &fixture.planes)
+        .await
+        .unwrap();
+    until(|| script.methods().len() == 2).await;
+    let cancel = crate::turn_stop_vectors::cancel(&request);
+    crate::handle_frame_for_test(cancel.clone(), &writer, &fixture.planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+        .await
+        .expect("cancelled user-browser card answers promptly")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap(),
+        json!({
+            "browser":"user", "outcome":"cancelled", "input_dispatched":false,
+        })
+    );
+    assert_eq!(
+        script.methods(),
+        [
+            wire::CONSENT_REQUEST,
+            wire::CONSENT_AWAIT,
+            wire::CONSENT_WITHDRAW
+        ]
+    );
+    assert!(fixture.planes.consent.raised("el_site_stop").is_none());
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
+    crate::turn_stop_vectors::check(
+        "user-browser-site-card",
+        "parked awaiting a user-browser site card; card is withdrawn on Cancel",
+        &request,
+        &cancel,
+        Some(&reply),
+    );
 }
 
 /// "Always on this site" stores a standing row whose consent reference is the

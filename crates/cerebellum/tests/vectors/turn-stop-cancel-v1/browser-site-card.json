@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 9,
+    "corr": 802,
+    "epoch": 3,
+    "type": "Cancel",
+    "wire_hex": "000000000206020900030000002203000000000000"
+  },
+  "case": "browser-site-card",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 38,
+    "body_utf8": "{\"context\":null,\"outcome\":\"cancelled\"}",
+    "channel": 9,
+    "corr": 802,
+    "epoch": 3,
+    "type": "Response",
+    "wire_hex": "2600000002010009000300000022030000000000007b22636f6e74657874223a6e756c6c2c226f7574636f6d65223a2263616e63656c6c6564227d"
+  },
+  "request": {
+    "body_length": 193,
+    "body_utf8": "{\"arguments\":{\"action\":\"navigate\",\"intent\":\"read the page\",\"severity\":{\"credential\":false,\"financial\":false,\"tier\":3},\"url\":\"https://requested.example/path\",\"wait\":\"none\"},\"name\":\"browser_use\"}",
+    "channel": 9,
+    "corr": 802,
+    "epoch": 3,
+    "type": "Request",
+    "wire_hex": "c100000002000209000300000022030000000000007b22617267756d656e7473223a7b22616374696f6e223a226e61766967617465222c22696e74656e74223a2272656164207468652070616765222c227365766572697479223a7b2263726564656e7469616c223a66616c73652c2266696e616e6369616c223a66616c73652c2274696572223a337d2c2275726c223a2268747470733a2f2f7265717565737465642e6578616d706c652f70617468222c2277616974223a226e6f6e65227d2c226e616d65223a2262726f777365725f757365227d"
+  },
+  "state": "parked awaiting a site card on a live route"
+}

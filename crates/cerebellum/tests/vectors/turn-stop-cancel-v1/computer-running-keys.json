@@ -1,0 +1,32 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 7,
+    "corr": 806,
+    "epoch": 1,
+    "type": "Cancel",
+    "wire_hex": "000000000206000700010000002603000000000000"
+  },
+  "case": "computer-running-keys",
+  "contract": "turn-stop-cancel-v1",
+  "reply": {
+    "body_length": 211,
+    "body_utf8": "{\"detail\":{\"dispatched\":true,\"held_state\":\"released\",\"reason\":\"cancelled\",\"step\":\"dispatch\"},\"effect_status\":\"effect_indeterminate\",\"outcome\":\"dispatch_outcome_unknown\",\"remedy\":\"read the state before retrying\"}",
+    "channel": 7,
+    "corr": 806,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "d300000002010007000100000026030000000000007b2264657461696c223a7b2264697370617463686564223a747275652c2268656c645f7374617465223a2272656c6561736564222c22726561736f6e223a2263616e63656c6c6564222c2273746570223a226469737061746368227d2c226566666563745f737461747573223a226566666563745f696e64657465726d696e617465222c226f7574636f6d65223a2264697370617463685f6f7574636f6d655f756e6b6e6f776e222c2272656d656479223a227265616420746865207374617465206265666f7265207265747279696e67227d"
+  },
+  "request": {
+    "body_length": 104,
+    "body_utf8": "{\"arguments\":{\"action\":\"keys\",\"keys\":[\"shift\",\"a\"],\"target\":\"com.example.Editor\"},\"name\":\"computer_use\"}",
+    "channel": 7,
+    "corr": 806,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "6800000002000007000100000026030000000000007b22617267756d656e7473223a7b22616374696f6e223a226b657973222c226b657973223a5b227368696674222c2261225d2c22746172676574223a22636f6d2e6578616d706c652e456469746f72227d2c226e616d65223a22636f6d70757465725f757365227d"
+  },
+  "state": "scripted platform has posted two presses; paired releases remain"
+}

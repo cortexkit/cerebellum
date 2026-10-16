@@ -1,0 +1,24 @@
+{
+  "cancel": {
+    "body_length": 0,
+    "body_utf8": "",
+    "channel": 9,
+    "corr": 805,
+    "epoch": 3,
+    "type": "Cancel",
+    "wire_hex": "000000000206020900030000002503000000000000"
+  },
+  "case": "unknown-corr",
+  "contract": "turn-stop-cancel-v1",
+  "reply": "no reply",
+  "request": {
+    "body_length": 40,
+    "body_utf8": "{\"arguments\":{},\"name\":\"browser.status\"}",
+    "channel": 9,
+    "corr": 805,
+    "epoch": 3,
+    "type": "Request",
+    "wire_hex": "2800000002000209000300000025030000000000007b22617267756d656e7473223a7b7d2c226e616d65223a2262726f777365722e737461747573227d"
+  },
+  "state": "request was never sent; correlation is unknown"
+}
