@@ -181,6 +181,17 @@ fn route_limits(frame: &Frame, planes: &Planes) -> (u64, u64) {
             return (limits.envelope_ms, limits.reply_max_ms);
         }
     }
+    if body["name"] == flat_tools::BROWSER_USE && body["arguments"]["browser"] == "user" {
+        if let Some(budget) =
+            budgets::user_browser(body["arguments"]["action"].as_str().unwrap_or_default())
+        {
+            let envelope = budgets::CALL_RECORD_BEGIN_MS
+                + budgets::BROWSER_QUEUE_WAIT_LIMIT_MS
+                + budgets::user_consent_count(budget.action) * budgets::USER_CONSENT_MS
+                + budget.work_ms;
+            return (envelope, envelope + budgets::TERMINAL_SUFFIX_MS);
+        }
+    }
     if body["name"] == flat_tools::COMPUTER_USE {
         (
             budgets::COMPUTER_ENVELOPE_MS,
@@ -7616,7 +7627,15 @@ async fn send_queue_refusal(
         frame.header.epoch,
         frame.header.corr,
     );
-    if let Some((capability, body)) = refusal.response_body() {
+    if let Some((capability, mut body)) = refusal.response_body() {
+        if capability == flat_tools::BROWSER_USE {
+            // User tabs are not owned browser sessions, so do not validate
+            // their queue refusal against a session action's result schema.
+            // response_body already supplies the fixed outcome/detail/remedy
+            // fields; add the user-target tag before sending it.
+            body["browser"] = json!("user");
+            return send_tool_response(writer, ver, channel, epoch, corr, body).await;
+        }
         if let Ok(body) = planes.browser.finish_reply(capability, body) {
             return send_tool_response(writer, ver, channel, epoch, corr, body).await;
         }

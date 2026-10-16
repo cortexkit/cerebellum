@@ -37,10 +37,164 @@ use crate::{AcceptedBindFacts, CancelHandle, Planes};
 /// at the same moment, so it is never left open after the call stops waiting.
 pub(crate) const CONSENT_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_SNAPSHOTS: usize = 64;
-const NAVIGATION_READ_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const NAVIGATION_READ_DEADLINE: Duration = Duration::from_secs(30);
+
+// A method the extension permits is not necessarily safe to call a read when
+// choosing a timeout reply. Use the separate fixed set so admitting a new
+// method cannot silently hide a possible mutation from the caller.
+static TERMINAL_READ_ONLY_METHODS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!(
+            "../../../extension/terminal-read-only-methods.json"
+        ))
+        .expect("checked-in read-only method set is valid JSON")
+    });
+
+pub(super) fn mutating_plan(command: &Value) -> bool {
+    match command["action"].as_str() {
+        Some("status") => false,
+        Some("cdp") => command["commands"].as_array().is_none_or(|commands| {
+            commands.iter().any(|command| {
+                let method = command["method"].as_str().unwrap_or_default();
+                !TERMINAL_READ_ONLY_METHODS.iter().any(|read| read == method)
+                    && !(method == "Runtime.callFunctionOn"
+                        && command["params"]["functionDeclaration"] == functions::HAS_FOCUS)
+            })
+        }),
+        _ => true,
+    }
+}
 
 tokio::task_local! {
     static POPUP_SEEN: Cell<bool>;
+    pub(super) static EXECUTION: Arc<UserExecution>;
+    pub(super) static EXECUTION_PERMITS: Arc<crate::blocking_permits::CallPermits>;
+}
+
+#[derive(Default)]
+struct ExecutionState {
+    stopped: bool,
+    in_flight: bool,
+    quarantined: bool,
+    held: bool,
+}
+
+// Permission waits pause work only for time actually spent waiting. An unused
+// permission allowance must not become extra time for slow extension plans.
+struct WorkClock {
+    work_end: tokio::time::Instant,
+    call_end: tokio::time::Instant,
+    parked: Duration,
+    park_left: Duration,
+    parking: Option<tokio::time::Instant>,
+}
+
+// A detached bridge task keeps both its quarantine cell and capacity alive.
+// The terminal hook only locks this small cell, never the target registry.
+pub(super) struct UserExecution {
+    route: Route,
+    tab: Option<String>,
+    action: String,
+    state: Mutex<ExecutionState>,
+    done: tokio::sync::Notify,
+    clock: Mutex<WorkClock>,
+    clock_changed: tokio::sync::Notify,
+}
+
+impl UserExecution {
+    pub(super) fn deadline(&self) -> tokio::time::Instant {
+        let clock = self.clock.lock().unwrap();
+        let pending = if clock.parking.is_some() {
+            CONSENT_DEADLINE.min(clock.park_left)
+        } else {
+            Duration::ZERO
+        };
+        (clock.work_end + clock.parked + pending).min(clock.call_end)
+    }
+
+    async fn expired(&self) {
+        loop {
+            let changed = self.clock_changed.notified();
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(self.deadline()) => {
+                    if tokio::time::Instant::now() >= self.deadline() { return; }
+                }
+            }
+        }
+    }
+
+    fn park(self: &Arc<Self>) -> ConsentPark {
+        self.clock.lock().unwrap().parking = Some(tokio::time::Instant::now());
+        self.clock_changed.notify_one();
+        ConsentPark(Arc::clone(self))
+    }
+
+    pub(super) fn begin(&self, held: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.in_flight = true;
+        state.held = held;
+    }
+
+    pub(super) fn finish(&self, safe: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.in_flight = false;
+        state.quarantined = !safe;
+        state.held &= !safe;
+        self.done.notify_waiters();
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stopped = true;
+        state.quarantined |= state.in_flight;
+    }
+
+    pub(super) fn stopped(&self) -> bool {
+        self.state.lock().unwrap().stopped
+    }
+
+    pub(super) fn release_receipt(
+        self: &Arc<Self>,
+        terminal: &crate::TerminalArbiter,
+        permits: &crate::blocking_permits::CallPermits,
+    ) {
+        let Some(permit) = permits.take_release() else {
+            return;
+        };
+        let watch = Arc::clone(self);
+        terminal.set_release(async move {
+            let _permit = permit;
+            loop {
+                let done = watch.done.notified();
+                {
+                    let state = watch.state.lock().unwrap();
+                    if !state.in_flight {
+                        return if state.held {
+                            crate::HeldState::Unknown
+                        } else {
+                            crate::HeldState::Released
+                        };
+                    }
+                }
+                done.await;
+            }
+        });
+    }
+}
+
+struct ConsentPark(Arc<UserExecution>);
+
+impl Drop for ConsentPark {
+    fn drop(&mut self) {
+        let mut clock = self.0.clock.lock().unwrap();
+        if let Some(start) = clock.parking.take() {
+            let spent = start.elapsed().min(CONSENT_DEADLINE).min(clock.park_left);
+            clock.parked += spent;
+            clock.park_left -= spent;
+        }
+        self.0.clock_changed.notify_one();
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -136,11 +290,13 @@ struct State {
     claims: BTreeMap<String, Route>,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: Vec<String>,
+    executions: BTreeMap<String, Arc<UserExecution>>,
 }
 
 pub(crate) struct UserBrowser {
     state: Mutex<State>,
     grants: Arc<StandingBrowserGrants>,
+    workers: crate::blocking_permits::PermitPool,
 }
 
 impl UserBrowser {
@@ -148,6 +304,9 @@ impl UserBrowser {
         Self {
             state: Mutex::new(State::default()),
             grants,
+            workers: crate::blocking_permits::PermitPool::new(
+                crate::budgets::MAX_BLOCKING_WORKERS_BROWSER,
+            ),
         }
     }
 
@@ -175,13 +334,88 @@ impl UserBrowser {
     pub(crate) fn disconnect(&self) {
         let mut state = self.state();
         let ended_routes = std::mem::take(&mut state.ended_routes);
+        let executions = std::mem::take(&mut state.executions);
         *state = State {
             ended_routes,
+            executions,
             ..State::default()
         };
     }
 
-    fn synchronize(&self, connection: u64) {
+    pub(crate) fn quarantine(
+        &self,
+        route: Route,
+        tab: Option<&str>,
+    ) -> Option<crate::browser_queue::QueueRefusal> {
+        let state = self.state();
+        state.executions.values().find_map(|execution| {
+            if execution.route != route
+                || tab.is_some_and(|tab| execution.tab.as_deref() != Some(tab))
+            {
+                return None;
+            }
+            let watch = execution.state.lock().unwrap();
+            watch
+                .quarantined
+                .then(|| crate::browser_queue::QueueRefusal::TargetBusy {
+                    capability: crate::flat_tools::BROWSER_USE,
+                    step: "queue",
+                    reason: watch
+                        .held
+                        .then_some(crate::browser_session::HELD_INPUT_UNCONFIRMED),
+                    call: execution.action.clone(),
+                })
+        })
+    }
+
+    fn execution(
+        &self,
+        route: Route,
+        action: &str,
+        args: &Value,
+        work_ms: u64,
+    ) -> Arc<UserExecution> {
+        let tab = args["tab"].as_str().map(str::to_owned);
+        let key = tab
+            .clone()
+            .unwrap_or_else(|| format!("route:{}:{}", route.channel, route.epoch));
+        let execution = Arc::new(UserExecution {
+            route,
+            tab,
+            action: action.into(),
+            state: Mutex::new(ExecutionState::default()),
+            done: tokio::sync::Notify::new(),
+            clock: Mutex::new(WorkClock {
+                work_end: tokio::time::Instant::now() + Duration::from_millis(work_ms),
+                call_end: crate::call_context::CALL_DEADLINE
+                    .try_with(|end| *end)
+                    .unwrap_or_else(|_| {
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(
+                                work_ms
+                                    + crate::budgets::user_consent_count(action)
+                                        * crate::budgets::USER_CONSENT_MS,
+                            )
+                    }),
+                parked: Duration::ZERO,
+                park_left: Duration::from_millis(
+                    crate::budgets::user_consent_count(action) * crate::budgets::USER_CONSENT_MS,
+                ),
+                parking: None,
+            }),
+            clock_changed: tokio::sync::Notify::new(),
+        });
+        self.state().executions.insert(key, Arc::clone(&execution));
+        if let Some(terminal) = crate::TerminalArbiter::current() {
+            let watch = Arc::clone(&execution);
+            if !terminal.publish_or_close(Box::new(move || watch.stop())) {
+                execution.stop();
+            }
+        }
+        execution
+    }
+
+    pub(crate) fn synchronize(&self, connection: u64) {
         let mut state = self.state();
         if state.connection != Some(connection) {
             let ended_routes = std::mem::take(&mut state.ended_routes);
@@ -773,12 +1007,40 @@ pub(crate) async fn serve(
     action: &str,
     args: &Value,
 ) -> Value {
-    POPUP_SEEN
-        .scope(
-            Cell::new(false),
-            serve_scoped(planes, facts, writer, request, action, args),
-        )
-        .await
+    let Some(budget) = crate::budgets::user_browser(action) else {
+        return invalid("action", "unsupported_value");
+    };
+    let Some(permits) = planes.user_browser.target().workers.try_call() else {
+        return json!({"browser":"user","outcome":"blocking_capacity_exhausted",
+            "detail":{"dispatched":false,"step":"queue"}});
+    };
+    if let Some(connection) = planes.user_browser.connected_epoch() {
+        planes.user_browser.target().synchronize(connection);
+    }
+    let execution = planes.user_browser.target().execution(
+        Route {
+            channel: request.0,
+            epoch: request.1,
+        },
+        action,
+        args,
+        budget.work_ms,
+    );
+    let result = EXECUTION_PERMITS.scope(Arc::new(permits),
+        EXECUTION.scope(Arc::clone(&execution), POPUP_SEEN.scope(Cell::new(false), async {
+            tokio::select! {
+                biased;
+                _ = execution.expired() => None,
+                reply = serve_scoped(planes, facts, writer, request, action, args) => Some(reply),
+            }
+        })),
+    ).await;
+    result.unwrap_or_else(|| {
+        if let Some(terminal) = crate::TerminalArbiter::current() {
+            terminal.stop(crate::TerminalCause::Deadline);
+        }
+        json!({"outcome":"action_deadline_exceeded","detail":{"dispatched":false,"step":"dispatch"}})
+    })
 }
 
 async fn serve_scoped(
@@ -1163,7 +1425,9 @@ impl Context<'_> {
         let parked = guard.as_ref().map(|guard| guard.park_on_consent());
         // Held, never detached: the answer is wanted only by this call, and
         // any ending other than an answer withdraws the card and forgets it.
+        let work_park = EXECUTION.try_with(|execution| execution.park()).ok();
         let ended = session.hold(&ask_id, CONSENT_DEADLINE, cancelled).await;
+        drop(work_park);
         drop(parked);
         let ending = match ended {
             InCall::Settled(ending) => ending,
