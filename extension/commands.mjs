@@ -7,7 +7,7 @@ import { RUNTIME_FUNCTION_SHA256 } from "./runtime-functions.mjs";
 const READ_METHODS = new Set([
   "Page.getNavigationHistory", "Page.getFrameTree", "Page.captureScreenshot", "Page.getLayoutMetrics",
   "Accessibility.enable", "Accessibility.getFullAXTree",
-  "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode",
+  "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode", "DOM.getFrameOwner",
   "Runtime.enable",
 ]);
 const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "DOM.focus"]);

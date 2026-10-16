@@ -102,6 +102,20 @@ struct PlanReply {
     connection_epoch: u64,
     #[serde(default)]
     popup_activated_briefly: bool,
+    #[serde(default)]
+    frame_mappings: Vec<FrameMapping>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrameMapping {
+    frame_id: String,
+    parent_id: Option<String>,
+    loader_id: String,
+    session_id: String,
+    url: String,
+    web_navigation_frame_id: u64,
+    document_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -510,7 +524,7 @@ async fn invoke(
     action: &str,
     mut command: Value,
 ) -> Result<Value, Value> {
-    command["version"] = json!(1);
+    command["version"] = json!(2);
     command["action"] = json!(action);
     let outcome = bridge.invoke(route, command, cancel.clone()).await;
     if outcome.terminal == Terminal::Completed {
@@ -554,6 +568,7 @@ struct Plan {
     results: Vec<Value>,
     interaction: u64,
     popup: bool,
+    frame_mappings: Vec<FrameMapping>,
 }
 
 async fn plan(
@@ -628,13 +643,12 @@ async fn plan(
         results,
         interaction: reply.interaction_epoch,
         popup: reply.popup_activated_briefly,
+        frame_mappings: reply.frame_mappings,
     })
 }
 
 fn command(method: &str, params: Value) -> Value {
-    // WebNavigation frame 0 is the only admitted input-sentinel scope. CDP
-    // frame ids belong in method parameters, never in sentinel routing.
-    json!({"method":method,"params":params,"frame_id":0})
+    json!({"method":method,"params":params})
 }
 
 /// Longest Chrome error message relayed in a `cdp_error` refusal.
@@ -678,7 +692,6 @@ struct Document {
     committed: CommittedDocument,
     frames: Vec<FrameDocument>,
     interaction: u64,
-    embedded_frames: usize,
 }
 
 async fn document(
@@ -713,7 +726,7 @@ async fn document(
     let mut frame_count = 0;
     collect_frames(
         &plan.results[1]["frameTree"],
-        tab,
+        &plan.frame_mappings,
         &mut frames,
         0,
         &mut frame_count,
@@ -722,13 +735,12 @@ async fn document(
         committed,
         frames,
         interaction: plan.interaction,
-        embedded_frames: frame_count.saturating_sub(1),
     })
 }
 
 fn collect_frames(
     tree: &Value,
-    tab: &str,
+    mappings: &[FrameMapping],
     frames: &mut Vec<FrameDocument>,
     depth: usize,
     count: &mut usize,
@@ -745,21 +757,51 @@ fn collect_frames(
             .ok_or_else(|| refusal("protocol_error"))
     };
     let url = text("url")?;
-    if let Ok(origin) = origin(&url) {
-        frames.push(FrameDocument {
-            navigation_revision: 0,
-            frame_id: text("id")?,
-            parent_id: (depth != 0)
-                .then(|| frame["parentId"].as_str().unwrap_or("embedded").to_owned()),
-            session_id: tab.into(),
-            loader_id: text("loaderId")?,
-            origin,
-            url,
-        });
+    let id = text("id")?;
+    let loader = text("loaderId")?;
+    let matching: Vec<_> = mappings
+        .iter()
+        .filter(|mapping| mapping.frame_id == id)
+        .collect();
+    let [mapping] = matching.as_slice() else {
+        return Err(refusal("frame_ambiguous"));
+    };
+    let parent_id =
+        (depth != 0).then(|| frame["parentId"].as_str().unwrap_or("embedded").to_owned());
+    if mapping.url != url
+        || mapping.loader_id != loader
+        || mapping.parent_id != parent_id
+        || mapping.session_id.is_empty()
+        || (depth == 0 && mapping.web_navigation_frame_id != 0)
+        || mapping.document_id.as_ref().is_some_and(String::is_empty)
+    {
+        return Err(refusal("frame_changed"));
     }
+    // Sandboxed documents can have an opaque origin even at an HTTPS URL.
+    // Reads belong to the top-page grant; input must use Chrome's actual origin.
+    let frame_origin = if let Some(security_origin) = frame["securityOrigin"].as_str() {
+        origin(security_origin).unwrap_or_else(|_| "null".into())
+    } else if matches!(url.as_str(), "about:blank" | "about:srcdoc") {
+        parent_id
+            .as_ref()
+            .and_then(|id| frames.iter().find(|frame| &frame.frame_id == id))
+            .map(|frame| frame.origin.clone())
+            .unwrap_or_else(|| "null".into())
+    } else {
+        origin(&url).unwrap_or_else(|_| "null".into())
+    };
+    frames.push(FrameDocument {
+        navigation_revision: 0,
+        frame_id: id,
+        parent_id,
+        session_id: mapping.session_id.clone(),
+        loader_id: loader,
+        origin: frame_origin,
+        url,
+    });
     if let Some(children) = tree["childFrames"].as_array() {
         for child in children {
-            collect_frames(child, tab, frames, depth + 1, count)?;
+            collect_frames(child, mappings, frames, depth + 1, count)?;
         }
     }
     Ok(())
@@ -1245,6 +1287,21 @@ impl Context<'_> {
         .await
     }
 
+    async fn cdp_frame(
+        &self,
+        tab: &str,
+        interaction: Option<u64>,
+        frame: &FrameDocument,
+        mut commands: Vec<Value>,
+    ) -> Result<Plan, Value> {
+        for command in &mut commands {
+            command["frame_id"] = json!(frame.frame_id);
+            command["loader_id"] = json!(frame.loader_id);
+            command["session_id"] = json!(frame.session_id);
+        }
+        self.cdp(tab, interaction, commands).await
+    }
+
     async fn document(&self, tab: &str) -> Result<Document, Value> {
         self.target().owned(self.route, tab, self.connection)?;
         document(
@@ -1548,7 +1605,15 @@ fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
 
 async fn confirm(context: &Context<'_>, tab: &str, expected: &Document) -> Result<(), Value> {
     let observed = context.document(tab).await?;
-    if observed.committed != expected.committed || observed.interaction != expected.interaction {
+    if observed.committed != expected.committed
+        || observed.interaction != expected.interaction
+        || observed.frames.len() != expected.frames.len()
+        || !observed
+            .frames
+            .iter()
+            .zip(&expected.frames)
+            .all(|(a, b)| a.same_document(b))
+    {
         return Err(read_again(false));
     }
     Ok(())
@@ -1571,6 +1636,7 @@ async fn capture(
     let mut ax_truncated = false;
     let mut refs_truncated = false;
     let mut zoom_target = None;
+    let mut omitted_frames = 0;
     let zoom_ref = args["zoom"].as_str();
     let expected_zoom =
         zoom.and_then(|snapshot| zoom_ref.and_then(|reference| snapshot.refs.get(reference)));
@@ -1579,25 +1645,78 @@ async fn capture(
     }) {
         return Err(read_again(false));
     }
+    if expected_zoom.is_some_and(|reference| {
+        !document
+            .frames
+            .iter()
+            .any(|frame| frame.same_document(&reference.frame))
+    }) {
+        return Err(refusal("frame_changed"));
+    }
     for frame in &document.frames {
-        if frame.parent_id.is_some() {
+        if records.len() >= crate::snapshot_store::MAX_REFS {
+            refs_truncated = true;
+            omitted_frames += 1;
             continue;
         }
         if !context.granted(
-            &frame.origin,
+            &origin(&document.committed.url)?,
             Severity::new(1, false, false),
             &BTreeSet::new(),
             Some(once),
         ) {
             continue;
         }
-        if expected_zoom.is_some_and(|reference| !reference.frame.same_document(frame)) {
-            continue;
-        }
+        let insertion = {
+            if let Some(parent_id) = &frame.parent_id {
+                let parent = document
+                    .frames
+                    .iter()
+                    .find(|parent| &parent.frame_id == parent_id)
+                    .ok_or_else(|| refusal("frame_changed"))?;
+                let owner = context
+                    .cdp_frame(
+                        tab,
+                        Some(document.interaction),
+                        parent,
+                        vec![command(
+                            "DOM.getFrameOwner",
+                            json!({"frameId":frame.frame_id}),
+                        )],
+                    )
+                    .await?;
+                let backend = owner.results[0]["backendNodeId"]
+                    .as_u64()
+                    .ok_or_else(|| refusal("protocol_error"))?;
+                let owner_ref = snapshot
+                    .refs
+                    .iter()
+                    .find(|(_, reference)| {
+                        reference.frame.same_document(parent)
+                            && reference.identity.backend_node_id == backend
+                    })
+                    .map(|(name, _)| name);
+                let index = owner_ref.and_then(|name| {
+                    records
+                        .iter()
+                        .position(|record: &crate::snapshot_store::AxRecord| {
+                            record.reference.as_ref() == Some(name)
+                        })
+                });
+                let Some(index) = index else {
+                    omitted_frames += 1;
+                    continue;
+                };
+                Some((index + 1, records[index].depth + 1))
+            } else {
+                None
+            }
+        };
         let plan = context
-            .cdp(
+            .cdp_frame(
                 tab,
                 Some(document.interaction),
+                frame,
                 vec![
                     command("Accessibility.enable", json!({})),
                     command(
@@ -1634,8 +1753,18 @@ async fn capture(
         })?;
         ax_truncated |= observation.ax_truncated;
         refs_truncated |= observation.refs_truncated;
+        let remaining = crate::snapshot_store::MAX_REFS.saturating_sub(records.len());
+        if observation.records.len() > remaining {
+            observation.records.truncate(remaining);
+            ax_truncated = true;
+            refs_truncated = true;
+        }
         let mut renamed = BTreeMap::new();
         for reference in observation.refs {
+            if snapshot.refs.len() >= crate::snapshot_store::MAX_REFS {
+                refs_truncated = true;
+                continue;
+            }
             let Some(mut identity) = reference.backend_identity else {
                 continue;
             };
@@ -1671,16 +1800,24 @@ async fn capture(
                 facts.insert(fresh.clone(), value);
             }
         }
-        records.extend(observation.records);
+        if let Some((index, depth)) = insertion {
+            for record in &mut observation.records {
+                record.depth += depth;
+            }
+            records.splice(index..index, observation.records);
+        } else {
+            records.extend(observation.records);
+        }
         if args["mode"] == "dom_full" {
             let root = nodes
                 .first()
                 .and_then(|node| node["backendDOMNodeId"].as_u64())
                 .ok_or_else(|| refusal("snapshot_not_ready"))?;
             let outer = context
-                .cdp(
+                .cdp_frame(
                     tab,
                     Some(document.interaction),
+                    frame,
                     vec![command("DOM.getOuterHTML", json!({"backendNodeId":root}))],
                 )
                 .await?;
@@ -1745,13 +1882,15 @@ async fn capture(
             rendered.cut_bytes > 0 || rendered.cut_lines > 0,
         )
     };
-    let truncated =
-        ax_truncated || refs_truncated || text_truncated || document.embedded_frames != 0;
+    let truncated = ax_truncated || refs_truncated || text_truncated || omitted_frames != 0;
     context.target().retain(id.clone(), snapshot);
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false,"truncated":truncated,"refs_truncated":refs_truncated});
     // A committed document and an unchanged interaction epoch do not establish
     // that Chrome has finished loading its page or accessibility tree.
     reply["settled"] = json!(false);
+    if omitted_frames != 0 {
+        reply["omitted_frames"] = json!(omitted_frames);
+    }
     reply["settlement_reason"] = json!("Page settlement is not observed on the person's browser.");
     if truncated {
         reply["remedy"] = json!(
@@ -1761,11 +1900,6 @@ async fn capture(
         && records.iter().all(|record| record.role == "RootWebArea")
     {
         reply["remedy"] = json!("Chrome exposed no page content beyond the document root. This may be an empty or still-loading page; read again before assuming controls are absent.");
-    }
-    if document.embedded_frames != 0 {
-        reply["omitted_frames"] = json!(document.embedded_frames);
-        reply["frame_note"] =
-            json!("Embedded frames are omitted; they cannot be used in the person's browser yet.");
     }
     if popup {
         reply["popup_activated_briefly"] = json!(true);
@@ -1889,11 +2023,24 @@ async fn input(
         let backend = hit.results[0]["backendNodeId"]
             .as_u64()
             .ok_or_else(|| refusal("classification_unavailable"))?;
+        let local = &hit.results[0]["frame_point"];
+        let position = if local.is_null() {
+            (x, y)
+        } else {
+            (
+                local["x"]
+                    .as_f64()
+                    .ok_or_else(|| refusal("protocol_error"))?,
+                local["y"]
+                    .as_f64()
+                    .ok_or_else(|| refusal("protocol_error"))?,
+            )
+        };
         (
             BackendNodeIdentity::new(tab, frame_id, backend)
                 .map_err(|_| refusal("classification_unavailable"))?,
             frame,
-            Some((x, y)),
+            Some(position),
         )
     } else {
         let reference = snapshot
@@ -1902,26 +2049,27 @@ async fn input(
             .ok_or_else(|| refusal("ref_scope_mismatch"))?;
         (reference.identity.clone(), reference.frame.clone(), None)
     };
-    if frame.parent_id.is_some() {
-        let mut reply = refusal("embedded_frame_unsupported");
-        reply["remedy"] = json!("The embedded frame cannot be used in the person's browser yet; use the top-level page instead.");
-        return Err(reply);
-    }
     if !current.frames.iter().any(|live| live.same_document(&frame)) {
         return Err(refusal("frame_changed"));
     }
     // An ungranted frame cannot even be classified for input. A top-level
     // screenshot grant does not authorize acting inside a cross-site frame.
+    let input_origin = origin(&frame.origin)?;
     let requested = if action == "type" {
         Severity::new(2, false, false)
     } else {
         declared_severity(args)?
     };
     let read_grant = context
-        .authorize(&frame.origin, requested, BTreeSet::new())
+        .authorize(&input_origin, requested, BTreeSet::new())
         .await?;
     let mut observed = context
-        .cdp(tab, Some(snapshot.interaction), flattened_document())
+        .cdp_frame(
+            tab,
+            Some(snapshot.interaction),
+            &frame,
+            flattened_document(),
+        )
         .await?;
     let dom = observed
         .results
@@ -1973,11 +2121,11 @@ async fn input(
         authorization::target_hazards(authorized_action, Some(&classification))
             .map_err(|_| refusal("classification_unavailable"))?
     };
-    let once = if read_grant.covers(&frame.origin, severity, &hazards) {
+    let once = if read_grant.covers(&input_origin, severity, &hazards) {
         read_grant
     } else {
         context
-            .authorize(&frame.origin, severity, hazards.clone())
+            .authorize(&input_origin, severity, hazards.clone())
             .await?
     };
     let destination_once = match &classification.activation_destination_origin {
@@ -2039,9 +2187,10 @@ async fn input(
         position
     } else {
         let quad = context
-            .cdp(
+            .cdp_frame(
                 tab,
                 Some(snapshot.interaction),
+                &frame,
                 vec![command(
                     "DOM.getContentQuads",
                     json!({"backendNodeId":identity.backend_node_id}),
@@ -2079,7 +2228,7 @@ async fn input(
     let mut popup = false;
     let mut steps = steps.into_iter();
     while let Some(step) = steps.next() {
-        if !context.granted(&frame.origin, severity, &hazards, Some(&once))
+        if !context.granted(&input_origin, severity, &hazards, Some(&once))
             || classification
                 .activation_destination_origin
                 .as_ref()
@@ -2131,9 +2280,10 @@ async fn input(
         } else {
             if action == "type" && step["method"] == "Input.insertText" {
                 let focused = context
-                    .cdp(
+                    .cdp_frame(
                         tab,
                         Some(snapshot.interaction),
+                        &frame,
                         runtime_plan(&identity, functions::HAS_FOCUS),
                     )
                     .await
@@ -2172,7 +2322,9 @@ async fn input(
             }
             commands
         };
-        let outcome = context.cdp(tab, Some(snapshot.interaction), commands).await;
+        let outcome = context
+            .cdp_frame(tab, Some(snapshot.interaction), &frame, commands)
+            .await;
         match outcome {
             Ok(result) => {
                 if result
@@ -2199,18 +2351,31 @@ async fn input(
         }
         reply
     })?;
-    let landing_origin = origin(&landed.committed.url)?;
-    if !context.granted(
-        &landing_origin,
-        Severity::new(1, false, false),
-        &BTreeSet::new(),
-        Some(&once),
-    ) && !context.granted(
-        &landing_origin,
-        Severity::new(1, false, false),
-        &BTreeSet::new(),
-        destination_once.as_ref(),
-    ) {
+    let landing_origin = landed
+        .frames
+        .iter()
+        .find(|live| live.frame_id == frame.frame_id)
+        .map(|live| live.origin.clone())
+        .unwrap_or_else(|| "null".into());
+    let landing_allowed = |origin: &str| {
+        context.granted(
+            origin,
+            Severity::new(1, false, false),
+            &BTreeSet::new(),
+            Some(&once),
+        ) || context.granted(
+            origin,
+            Severity::new(1, false, false),
+            &BTreeSet::new(),
+            destination_once.as_ref(),
+        )
+    };
+    // Acting inside a child does not revisit the unchanged top page. A real
+    // top-page navigation, or a child redirect, still needs its landing grant.
+    if !landing_allowed(&landing_origin)
+        || (landed.committed != current.committed
+            && !landing_allowed(&origin(&landed.committed.url)?))
+    {
         let mut reply = refusal("landing_site_not_authorized");
         reply["input_dispatched"] = json!(dispatched);
         return Err(reply);
@@ -2250,7 +2415,7 @@ async fn verify_input(
         return Err(reply);
     }
     let mut plan = context
-        .cdp(tab, Some(snapshot.interaction), flattened_document())
+        .cdp_frame(tab, Some(snapshot.interaction), frame, flattened_document())
         .await
         .map_err(|mut reply| {
             if dispatched {
@@ -2373,7 +2538,7 @@ async fn verify_click_position(
     dispatched: bool,
 ) -> Result<(), Value> {
     let (x, y) = position;
-    let result = context.cdp(tab, Some(snapshot.interaction), vec![command("Page.getLayoutMetrics", json!({})), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
+    let result = context.cdp_frame(tab, Some(snapshot.interaction), frame, vec![command("Page.getLayoutMetrics", json!({})), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
     let viewport = &result.results[0]["cssVisualViewport"];
     if snapshot
         .image
@@ -2403,7 +2568,7 @@ async fn verify_click_position(
     let identity = BackendNodeIdentity::new(tab, &frame.frame_id, backend)
         .map_err(|_| refusal("element_intercepted"))?;
     let mut dom = context
-        .cdp(tab, Some(snapshot.interaction), flattened_document())
+        .cdp_frame(tab, Some(snapshot.interaction), frame, flattened_document())
         .await?;
     let dom = dom
         .results

@@ -17,10 +17,11 @@ tabs or quit Chrome.
 The first visit to each site asks for permission to use **your own Chrome, signed
 in as you**. Choose allow once, always on this site, or decline. There is no
 all-sites grant. Grants for the agent's own browser do not authorize the user
-browser, and vice versa. Redirects and cross-origin frames require their own site
-permission. Embedded frames currently fail closed (`embedded_frame_unsupported`);
-the user-browser implementation currently drives top-level pages only. Credential and payment
-fields still refuse typing.
+browser, and vice versa. Redirects require the landing site's permission.
+Embedded-frame reads are covered by the top page's permission, including
+cross-origin frames. Clicking or typing in a frame needs that frame's own site
+permission. Ambiguous or stale frame mappings refuse rather than guessing which
+frame to use. Credential and payment fields still refuse typing in every frame.
 
 Chrome shows a debugging bar during an action. The debugger detaches between
 actions. If you interact with or activate a controlled tab, an old snapshot can
@@ -38,7 +39,8 @@ page, so it remains readable; its remedy explains that the page may instead stil
 be loading and that absent controls should not be assumed unavailable.
 
 Like own-browser snapshots, user snapshots report `truncated` and
-`refs_truncated`. Known AX/reference bounds, omitted embedded frames and output
+`refs_truncated`. Accessibility-tree and actionable-reference limits (4,096
+records and refs across all frames), hidden or replaced frame owners, and output
 byte cuts mark the snapshot partial, with a remedy to read again before relying
 on absent content. These flags describe the capture, not whether additional page
 content might load later. They do not change site consent or add automatic retries.

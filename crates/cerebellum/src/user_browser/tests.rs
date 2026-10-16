@@ -101,6 +101,8 @@ struct DoubleState {
     untyped_button: bool,
     ax_override: Option<Value>,
     top_level_only: bool,
+    same_origin_child: bool,
+    ambiguous_frames: bool,
 }
 
 /// Cingulate as the site-card tests need it: every card is answered at once
@@ -465,7 +467,7 @@ fn execute(
     epoch: u64,
     command: &Value,
 ) -> Result<(Value, bool), String> {
-    assert_eq!(command["version"], 1);
+    assert_eq!(command["version"], 2);
     state.commands.push(command.clone());
     let name = command["action"].as_str().unwrap();
     if name == "status" {
@@ -516,6 +518,14 @@ fn execute(
         return Err("tab_not_claimed_by_route".into());
     }
     assert_eq!(name, "cdp");
+    if state.ambiguous_frames {
+        return Err("frame_ambiguous".into());
+    }
+    let child_url = if state.same_origin_child {
+        tab.url.clone()
+    } else {
+        "https://ungranted.example/secret".into()
+    };
     let commands = command["commands"].as_array().unwrap();
     let input = commands.iter().any(|command| {
         command["method"].as_str().unwrap().starts_with("Input.")
@@ -566,7 +576,7 @@ fn execute(
                 json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
             }
             "Page.getFrameTree" => {
-                let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":"foreign-loader","url":"https://ungranted.example/secret"}}]}});
+                let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":"foreign-loader","url":child_url}}]}});
                 if state.top_level_only {
                     tree["frameTree"]
                         .as_object_mut()
@@ -587,7 +597,15 @@ fn execute(
                 state
                     .captures
                     .push(command["params"]["frameId"].as_str().unwrap().into());
-                state.ax_override.clone().unwrap_or_else(ax)
+                if command["frame_id"] == "foreign" {
+                    json!({"nodes":[
+                        {"nodeId":"child-root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Embedded page"},"backendDOMNodeId":1,"frameId":"foreign","childIds":["child-field","child-button"]},
+                        {"nodeId":"child-field","ignored":false,"role":{"value":"textbox"},"name":{"value":"Child message"},"value":{"value":"child field value"},"backendDOMNodeId":4},
+                        {"nodeId":"child-button","ignored":false,"role":{"value":"button"},"name":{"value":"Child go"},"backendDOMNodeId":3}
+                    ]})
+                } else {
+                    state.ax_override.clone().unwrap_or_else(ax)
+                }
             }
             "DOM.getFlattenedDocument" => dom(
                 state.new_tab_link,
@@ -596,8 +614,9 @@ fn execute(
                 state.untyped_button,
             ),
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
+            "DOM.getFrameOwner" => json!({"backendNodeId":6}),
             "DOM.getNodeForLocation" => {
-                json!({"backendNodeId":3,"frameId":if state.foreign_hit { "foreign" } else { "main" }})
+                json!({"backendNodeId":3,"frameId":if state.foreign_hit || command["frame_id"] == "foreign" { "foreign" } else { "main" }})
             }
             "Page.getLayoutMetrics" => {
                 json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
@@ -622,8 +641,14 @@ fn execute(
         };
         results.push(json!({"result":result}));
     }
+    let mut mappings = vec![
+        json!({"frame_id":"main","loader_id":format!("l{}",tab.loader),"session_id":"root","url":tab.url,"web_navigation_frame_id":0,"document_id":format!("main-{}",tab.loader)}),
+    ];
+    if !state.top_level_only {
+        mappings.push(json!({"frame_id":"foreign","parent_id":"main","loader_id":"foreign-loader","session_id":if state.same_origin_child {"root"} else {"child-target"},"url":child_url,"web_navigation_frame_id":7,"document_id":"child-doc"}));
+    }
     Ok((
-        json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup}),
+        json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
         input,
     ))
 }
@@ -634,8 +659,7 @@ fn ax() -> Value {
         {"nodeId":"button","ignored":false,"role":{"value":"button"},"name":{"value":"Go"},"backendDOMNodeId":3},
         {"nodeId":"text","ignored":false,"role":{"value":"textbox"},"name":{"value":"Message"},"backendDOMNodeId":4},
         {"nodeId":"secret","ignored":false,"role":{"value":"textbox"},"name":{"value":"Password"},"value":{"value":"secret-value"},"backendDOMNodeId":5},
-        {"nodeId":"foreign","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"FOREIGN_SECRET"},"frameId":"foreign","childIds":["foreign-child"]},
-        {"nodeId":"foreign-child","ignored":false,"role":{"value":"StaticText"},"name":{"value":"FOREIGN_CHILD_SECRET"}}
+        {"nodeId":"foreign","ignored":false,"role":{"value":"Iframe"},"name":{"value":"Embedded page"},"backendDOMNodeId":6}
     ]})
 }
 
@@ -652,7 +676,8 @@ fn dom(new_tab: bool, password: bool, payment: bool, untyped_button: bool) -> Va
         {"nodeId":2,"parentId":1,"backendNodeId":2,"nodeType":1,"nodeName":"DIV","localName":"div","attributes":[]},
         {"nodeId":3,"parentId":2,"backendNodeId":3,"nodeType":1,"nodeName":if new_tab {"A"} else {"BUTTON"},"localName":if new_tab {"a"} else {"button"},"attributes":button_attributes},
         {"nodeId":4,"parentId":2,"backendNodeId":4,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":if payment { json!(["type","text","autocomplete","cc-number"]) } else { json!(["type",if password {"password"} else {"text"}]) }},
-        {"nodeId":5,"parentId":2,"backendNodeId":5,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":["type","password"]}
+        {"nodeId":5,"parentId":2,"backendNodeId":5,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":["type","password"]},
+        {"nodeId":6,"parentId":2,"backendNodeId":6,"nodeType":1,"nodeName":"IFRAME","localName":"iframe","attributes":[]}
     ]})
 }
 
@@ -746,9 +771,9 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
             assert!(methods[..read].contains(&"DOM.enable"), "{methods:?}");
         }
     }
-    // Four flattened-DOM reads: snapshot capture, click classification, and
+    // Five flattened-DOM reads: both frame captures, click classification, and
     // target-state plus hit-test verification immediately before the mouse pair.
-    assert_eq!(reads, 4);
+    assert_eq!(reads, 5);
 }
 
 #[tokio::test]
@@ -799,9 +824,15 @@ async fn per_site_ask_is_required_and_thirty_minute_approval_is_reused() {
             .as_str()
             .unwrap()
             .contains("secret-value"));
-        assert!(!reply["state_text"].as_str().unwrap().contains("FOREIGN"));
+        assert!(reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Child message"));
     }
-    assert_eq!(fixture.state.lock().unwrap().captures, vec!["main", "main"]);
+    assert_eq!(
+        fixture.state.lock().unwrap().captures,
+        vec!["main", "foreign", "main", "foreign"]
+    );
 }
 
 #[tokio::test]
@@ -916,12 +947,12 @@ async fn bounded_ax_snapshots_preserve_projection_truncation_flags() {
 }
 
 #[tokio::test]
-async fn snapshot_byte_budget_and_omitted_frames_are_disclosed_as_partial() {
+async fn snapshot_byte_budget_is_disclosed_as_partial() {
     let mut root = ax()["nodes"][0].clone();
     root["childIds"] = json!([]);
     for (top_level_only, max_bytes, capture) in [
         (true, 64, None),
-        (false, 5000, None),
+        (false, 64, None),
         (true, 1, Some(json!({"nodes":[root]}))),
     ] {
         let fixture = Fixture::new();
@@ -1224,13 +1255,12 @@ async fn background_clicks_keep_focus_press_and_release_in_one_attachment() {
                 assert_eq!(index, 1, "mouse input lacks focus emulation: {plan}");
                 assert_eq!(commands.len(), 3, "{plan}");
                 assert_eq!(
-                    commands[index - 1],
-                    command(
-                        "Emulation.setFocusEmulationEnabled",
-                        json!({"enabled":true})
-                    ),
-                    "{plan}"
+                    commands[index - 1]["method"],
+                    "Emulation.setFocusEmulationEnabled"
                 );
+                assert_eq!(commands[index - 1]["params"], json!({"enabled":true}));
+                assert_eq!(commands[index - 1]["frame_id"], "main");
+                assert_eq!(commands[index - 1]["session_id"], "root");
                 assert_eq!(commands[index]["params"]["type"], "mousePressed");
                 let mut released = commands[index].clone();
                 released["params"]["type"] = json!("mouseReleased");
@@ -1386,21 +1416,11 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
     }
     fixture.state.lock().unwrap().inputs.clear();
     fixture.state.lock().unwrap().foreign_hit = true;
-    let before = fixture.state.lock().unwrap().commands.len();
     let (foreign, cards) = fixture.call(1, point.clone(), "allow_30m").await;
-    assert!(cards.is_empty());
-    assert!(!fixture.state.lock().unwrap().commands[before..]
-        .iter()
-        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
-        .any(|command| command["method"]
-            .as_str()
-            .is_some_and(|method| method.starts_with("Input."))));
-    assert_eq!(foreign["reason"], "embedded_frame_unsupported");
-    assert!(foreign["remedy"]
-        .as_str()
-        .unwrap()
-        .contains("cannot be used"));
-    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    assert_eq!(cards.len(), 1);
+    assert_eq!(foreign["outcome"], "ok", "{foreign}");
+    assert_eq!(foreign["input_dispatched"], true);
+    fixture.state.lock().unwrap().inputs.clear();
     fixture.state.lock().unwrap().viewport_changed = true;
     let (changed, _) = fixture.call(1, point, "allow_30m").await;
     assert_eq!(changed["reason"], "viewport_changed");
@@ -1638,10 +1658,14 @@ async fn typing_consumes_remote_objects_in_the_same_plan_that_resolves_them() {
             continue;
         };
         for (index, command) in commands.iter().enumerate() {
-            assert_eq!(
-                command["frame_id"], 0,
-                "CDP ids are not webNavigation sentinel ids"
-            );
+            if !command["frame_id"].is_null() {
+                assert!(
+                    command["frame_id"].is_string(),
+                    "routing uses verified CDP frame ids"
+                );
+                assert!(command["loader_id"].is_string());
+                assert!(command["session_id"].is_string());
+            }
             if command["method"] == "Runtime.callFunctionOn" {
                 functions += 1;
                 let object = &command["params"]["objectId"];
@@ -1663,16 +1687,47 @@ async fn typing_consumes_remote_objects_in_the_same_plan_that_resolves_them() {
 }
 
 #[tokio::test]
-async fn embedded_frames_are_explicitly_omitted_without_text_or_refs() {
+async fn embedded_frame_fields_are_read_under_the_top_page_grant_and_zoomable() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["omitted_frames"], 1);
-    assert!(snapshot["frame_note"]
+    assert!(snapshot["omitted_frames"].is_null());
+    assert!(snapshot["state_text"]
         .as_str()
         .unwrap()
-        .contains("cannot be used"));
+        .contains("Child message"));
+    assert!(snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("child field value"));
+    let child = reference(&snapshot, "Child message");
+    let (zoom, cards) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"zoom":child}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(zoom["outcome"], "ok", "{zoom}");
+    assert!(cards.is_empty());
+    assert!(zoom["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Child message"));
+    let owner = reference(&snapshot, "Embedded page");
+    let (owner_zoom, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"zoom":owner}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(owner_zoom["outcome"], "ok", "{owner_zoom}");
+    assert!(owner_zoom["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Child message"));
     assert!(!snapshot["state_text"].as_str().unwrap().contains("FOREIGN"));
     let state = fixture.planes.user_browser.target().state();
     let retained = state
@@ -1680,13 +1735,14 @@ async fn embedded_frames_are_explicitly_omitted_without_text_or_refs() {
         .get(snapshot["snapshot_id"].as_str().unwrap())
         .unwrap();
     assert!(!retained.refs.is_empty());
-    assert!(
-        retained
-            .refs
-            .values()
-            .all(|reference| reference.frame.parent_id.is_none()
-                && reference.frame.frame_id == "main")
-    );
+    assert!(retained
+        .refs
+        .values()
+        .any(
+            |reference| reference.frame.parent_id.as_deref() == Some("main")
+                && reference.frame.frame_id == "foreign"
+                && reference.frame.session_id == "child-target"
+        ));
 }
 
 #[tokio::test]
@@ -2058,3 +2114,109 @@ mod permission_cards;
 mod worker;
 
 mod agent_enforcement;
+
+#[tokio::test]
+async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().same_origin_child = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (top_clicked, top_cards) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(top_clicked["outcome"], "ok");
+    assert_eq!(top_cards.len(), 1);
+    let (reply, cards) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Child go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(cards.is_empty());
+    let state = fixture.state.lock().unwrap();
+    let sent: Vec<_> = state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .filter(|command| {
+            command["method"] == "Input.dispatchMouseEvent" && command["frame_id"] == "foreign"
+        })
+        .collect();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|command| command["frame_id"] == "foreign"
+        && command["session_id"] == "root"
+        && command["loader_id"] == "foreign-loader"));
+}
+
+#[tokio::test]
+async fn cross_origin_child_typing_requires_its_own_origin_card() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, cards) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"hello"}), "deny").await;
+    assert_eq!(
+        cards.len(),
+        1,
+        "child input must not reuse the top-page grant"
+    );
+    assert!(cards[0].to_string().contains("https://ungranted.example"));
+    assert_eq!(reply["reason"], "consent_declined", "{reply}");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    let (reply, cards) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"hello"}), "allow_30m").await;
+    assert_eq!(cards.len(), 1);
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    assert!(state
+        .inputs
+        .iter()
+        .any(|method| method == "Input.insertText"));
+    for command in state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .filter(|command| command["method"] == "Input.insertText")
+    {
+        assert_eq!(command["frame_id"], "foreign");
+        assert_eq!(command["session_id"], "child-target");
+    }
+}
+
+#[tokio::test]
+async fn credential_field_in_a_child_is_refused_even_with_its_origin_granted() {
+    for payment in [false, true] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        fixture.state.lock().unwrap().password = !payment;
+        fixture.state.lock().unwrap().payment = payment;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        assert!(!snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("child field value"));
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"secret"}), "allow_30m").await;
+        assert_eq!(
+            reply["reason"], "credential_payment_or_ineligible_field",
+            "{reply}"
+        );
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_extension_frame_mapping_refuses_before_content_or_input() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().ambiguous_frames = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["reason"], "frame_ambiguous", "{snapshot}");
+    assert!(snapshot["state_text"].is_null());
+    let state = fixture.state.lock().unwrap();
+    assert!(state.captures.is_empty());
+    assert!(state.inputs.is_empty());
+}

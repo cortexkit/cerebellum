@@ -3,7 +3,7 @@
   "epoch": 23,
   "host_to_extension": [
     { "type": "host_accepted", "protocol": 1, "epoch": 23 },
-    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "attach", "route": { "channel": 9, "epoch": 1 }, "command": { "version": 1, "action": "open_tab" } } } },
+    { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "attach", "route": { "channel": 9, "epoch": 1 }, "command": { "version": 2, "action": "open_tab" } } } },
     { "type": "relay", "message": { "id": 1, "epoch": 23, "body": { "type": "dispatch" } } }
   ],
   "extension_to_host": [

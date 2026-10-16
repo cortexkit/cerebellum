@@ -1,4 +1,4 @@
-# Extension bridge protocol v1
+# Extension bridge protocol v2
 
 This is the inner command contract consumed by the user-browser adapter. The
 extension does not render snapshots or decide site grants: cerebellum authorizes
@@ -58,7 +58,7 @@ second hidden queue.
 
 ## Closed plans
 
-All plans have `version:1`. Unknown plan/command fields refuse. Optional fields
+All plans have `version:2` (the native socket envelope remains protocol 1). Unknown plan/command fields refuse. Optional fields
 are omitted, not null.
 
 | action | fields besides version/action | result |
@@ -74,11 +74,45 @@ claims and unclaimed handed tabs, not another route's claims or unclaimed
 agent-opened tabs. Closing drops/rotates old handles. Agent-opened tabs remain in
 the group; handed tabs are ungrouped. No close path closes Chrome or a tab.
 
-Each command is `{method:<string>, params:<object>, frame_id?:<nonnegative Chrome
-webNavigation frame id>}`. `frame_id` selects only the input sentinel, **not** a CDP
-execution context or another target. Flat child sessions (`session_id`) are
-currently refused: the adapter must not assume OOPIF transport/authorization is
-implemented. Same-process CDP frame/context parameters retain their CDP meanings.
+Each command is `{method:<string>, params:<object>}` with an optional complete
+scope `{frame_id:<CDP string id>, loader_id:<CDP loader id>, session_id:<owner>}`.
+The owner is `root` (the claimed tab) or a stable child target id, **not** an ephemeral debugger
+session id. A scoped command is accepted only after the extension rediscovers the
+frame and verifies all three fields. `frame_stale` refuses missing or navigated
+frames; `frame_ambiguous` refuses more than one matching candidate.
+
+An unscoped `Page.getFrameTree` returns a composite tree including OOPIF trees.
+Its `cdp` reply also includes `frame_mappings:[{frame_id, parent_id?, loader_id,
+session_id, url, web_navigation_frame_id, document_id?}]`. The extension joins
+`webNavigation.getAllFrames` to CDP by the parent chain and exact URL, narrowing
+by `documentId` when exposed by both APIs. It verifies webNavigation document ids
+before and after discovery; URL duplicates without a document-id proof refuse,
+never select an arbitrary sibling. Each scoped command revalidates before and
+after dispatch. WebNavigation numeric ids never address CDP commands.
+
+After the bridge receives `dispatch` for a validated and attached CDP plan,
+the extension internally sends exactly
+`Target.setAutoAttach` with `{autoAttach:true,waitForDebuggerOnStart:false,
+flatten:true,filter:[{type:"iframe",exclude:false},{exclude:true}]}` to the claimed
+tab and recursively to its attached iframe sessions (Chrome 125+, below the
+manifest's minimum version). Child `Page.getFrameTree` roots establish which
+stable target owns each frame, without assuming target ids equal frame ids.
+Only descendants of this attachment are addressable; caller-supplied raw sessions
+or target attach commands are not admitted. Detaching the tab after every plan
+detaches its children too; nothing is retained across actions except ref identity.
+
+Frame-aware `DOM.getNodeForLocation` returns an additional `frame_point:{x,y}`
+in the resolved frame session's input coordinates. The extension verifies the
+point from the root renderer (so an overlay cannot be bypassed), follows iframe
+owners into child renderers, and maps affine frame coordinates just as the own
+browser does. Perspective or unavailable geometry refuses. The internal geometry
+vocabulary is pinned by name to `DOM.getFrameOwner`, `DOM.getBoxModel`,
+`Page.createIsolatedWorld`, `DOM.resolveNode`, `Runtime.callFunctionOn`,
+`Page.getLayoutMetrics`, and `DOM.getNodeForLocation`. The only internal Runtime
+declaration reads native computed content width/height in the isolated world
+`cortexkit-frame-geometry`; no caller text is evaluated. The additional geometry
+methods are not caller-allowlisted. Mouse dispatch still uses the resolved child
+session's local coordinates.
 
 Results are exactly `{result:<CDP result>}` or
 `{error:{code:<int>, message:<string>}}`, in command order. Stop the plan at the
@@ -101,7 +135,7 @@ It is substituted from that entry's `result` before dispatch. It cannot refer
 forward, traverse a prototype, or include other fields. For example:
 
 ```json
-{"version":1,"action":"cdp","tab":"opaque-handle","commands":[
+{"version":2,"action":"cdp","tab":"opaque-handle","commands":[
   {"method":"DOM.getFlattenedDocument","params":{"depth":1}},
   {"method":"DOM.resolveNode","params":{
     "backendNodeId":{"$result":0,"path":["nodes",0,"backendNodeId"]}}}
@@ -117,14 +151,15 @@ Result references do not authorize input or arbitrary JavaScript.
 - `Page.getNavigationHistory`, `Page.getFrameTree`, `Page.navigate`, `Page.captureScreenshot`, `Page.getLayoutMetrics`
 - `Accessibility.enable`, `Accessibility.getFullAXTree`
 - `DOM.enable`, `DOM.getFlattenedDocument`, `DOM.getOuterHTML`, `DOM.getContentQuads`,
-  `DOM.getNodeForLocation`, `DOM.focus`, `DOM.resolveNode`
+  `DOM.getNodeForLocation`, `DOM.focus`, `DOM.resolveNode`, `DOM.getFrameOwner`
 - `Runtime.enable`, `Runtime.callFunctionOn` (hash-pinned only, below)
 - `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText`
 - `Emulation.setFocusEmulationEnabled` (only `{enabled:true}`)
 
-Everything else refuses before attaching, including `Runtime.evaluate`, all
+Everything else in caller plans refuses before attaching, including `Runtime.evaluate`, all
 `Browser.*`/`Target.*`, `Page.bringToFront`, downloads, arbitrary JavaScript and
-commands reaching another tab. CDP node resolution is **DOM.resolveNode**, not
+commands reaching another tab. The internal `Target.setAutoAttach` pin above is
+not a caller command. CDP node resolution is **DOM.resolveNode**, not
 Runtime.resolveNode. The [CDP gap list](../docs/user-browser-gap-list.md) identifies the current driver's broader AX/DOM,
 geometry/navigation/screenshot/typing vocabulary; this adapter's admitted subset
 is deliberately narrower. The pipe driver's Target bootstrap and presentation

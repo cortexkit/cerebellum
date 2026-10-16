@@ -7211,7 +7211,7 @@ mod tests {
         // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "7aeb871c5106ffbca83afbc46c5ef24b73868aadeae0c722566f7c98310938d3"
+            "ad985c7d39e899cb76edf29d4879ae0b285ff8df11133b5f433f3a8b68e49e78"
         );
     }
 
