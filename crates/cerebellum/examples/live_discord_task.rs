@@ -1167,6 +1167,8 @@ mod macos_probe {
             .await
             .unwrap();
         assert!(grants.holds(&context.caller, &GrantNeed::Takeover));
+        // Grants belong to the agent, so another conversation of the same
+        // agent reuses the first approval and raises no second card.
         context.caller.conversation_key.push_str(":second");
         grants
             .require(&GrantNeed::Takeover, &context, &cancel)
@@ -1174,7 +1176,7 @@ mod macos_probe {
             .unwrap();
         assert!(grants.holds(&context.caller, &GrantNeed::Takeover));
         assert!(carrier.desk().raised("el_discord_probe_1").unwrap().applied);
-        assert!(carrier.desk().raised("el_discord_probe_2").unwrap().applied);
+        assert!(carrier.desk().raised("el_discord_probe_2").is_none());
     }
 
     /// The frontmost application, sampled every 100 ms until stopped.
