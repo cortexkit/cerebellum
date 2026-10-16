@@ -20,8 +20,11 @@ all-sites grant. Grants for the agent's own browser do not authorize the user
 browser, and vice versa. Redirects require the landing site's permission.
 Embedded-frame reads are covered by the top page's permission, including
 cross-origin frames. Clicking or typing in a frame needs that frame's own site
-permission. Ambiguous or stale frame mappings refuse rather than guessing which
-frame to use. Credential and payment fields still refuse typing in every frame.
+permission. Ambiguous or stale embedded frames are omitted from reads, with an
+`[embedded frame not readable: ambiguous|stale]` marker and a partial-snapshot
+flag; the top page and other readable frames remain available. Input into those
+frames still refuses rather than guessing which frame to use. Credential and
+payment fields still refuse typing in every frame.
 
 Chrome shows a debugging bar during an action. The debugger detaches between
 actions. If you interact with or activate a controlled tab, an old snapshot can

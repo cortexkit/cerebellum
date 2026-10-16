@@ -23,9 +23,13 @@ test("cross-origin mapping retains the verified child target owner", () => {
   assert.equal(mapFrames({ frame: root, childFrames: [{ frame: cross }] }, frames, new Map([[child.id, "target-not-frame-id"]]))[1].session_id, "target-not-frame-id");
 });
 
-test("duplicate sibling URL mapping refuses frame_ambiguous instead of picking a candidate", () => {
-  const frames = [...navigation(), { ...navigation()[1], frameId: 18, documentId: "duplicate-doc" }];
-  assert.throws(() => mapFrames({ frame: root, childFrames: [{ frame: child }, { frame: { ...child, id: "duplicate-child" } }] }, frames), { reason: "frame_ambiguous" });
+test("ambiguous siblings leave the top level and normal child readable", () => {
+  const frames = [...navigation(), { ...navigation()[1], frameId: 18, documentId: "duplicate-doc" }, { frameId: 19, parentFrameId: 0, documentId: "normal-doc", url: "https://page.example/normal" }];
+  const mappings = mapFrames({ frame: root, childFrames: [{ frame: child }, { frame: { ...child, id: "duplicate-child" } }, { frame: { ...child, id: "normal-child", url: frames[3].url } }] }, frames);
+  assert.deepEqual(mappings.map(frame => [frame.frame_id, frame.unreadable_reason ?? "readable"]), [[root.id, "readable"], [child.id, "ambiguous"], ["duplicate-child", "ambiguous"], ["normal-child", "readable"]]);
+  assert.equal(mappings[3].web_navigation_frame_id, 19);
+  assert.equal(mappings[1].web_navigation_frame_id, undefined);
+  assert.equal(mappings[2].web_navigation_frame_id, undefined);
 });
 
 test("documentId disambiguates only when Chrome exposes it on both sides", () => {
@@ -36,10 +40,12 @@ test("documentId disambiguates only when Chrome exposes it on both sides", () =>
   assert.equal(mappings[2].web_navigation_frame_id, 18);
 });
 
-test("a navigated-away child refuses frame_stale even at the same URL", () => {
+test("a navigated-away child is omitted as stale even at the same URL", () => {
   const frames = navigation();
   frames[1].documentId = "replacement-document";
-  assert.throws(() => mapFrames({ frame: root, childFrames: [{ frame: { ...child, documentId: "child-doc" } }] }, frames), { reason: "frame_stale" });
+  const mappings = mapFrames({ frame: root, childFrames: [{ frame: { ...child, documentId: "child-doc" } }] }, frames);
+  assert.equal(mappings[0].unreadable_reason, undefined);
+  assert.equal(mappings[1].unreadable_reason, "stale");
 });
 
 async function framed(cross = true) {
@@ -84,4 +90,102 @@ test("a stale loader cannot dispatch through a newly attached child session", as
   const { frame_id, session_id } = f.scope;
   await assert.rejects(f.run(f.cdp([{ method: "DOM.enable", params: {}, frame_id, loader_id: "old-loader", session_id }])), { reason: "frame_stale" });
   assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "DOM.enable").length, 0);
+});
+
+test("a stray navigation entry does not hide any tree document", async () => {
+  const f = await framed(false);
+  f.frames.push({ frameId: 99, parentFrameId: 0, documentId: "stray-doc", url: "about:blank" });
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.deepEqual(reply.frame_mappings.map(frame => [frame.frame_id, frame.unreadable_reason]), [[root.id, undefined], [child.id, undefined]]);
+});
+
+test("an unaccounted child session is ignored without hiding the tab", async () => {
+  const f = await framed();
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    if (method === "Target.setAutoAttach" && !target.sessionId) f.chrome.debugger.onEvent.emit(target, "Target.attachedToTarget", { sessionId: "stray-session", targetInfo: { type: "iframe", targetId: "stray-target" } });
+    if (method === "Page.getFrameTree" && target.sessionId === "stray-session") return { frameTree: { frame: { id: "stray-frame", loaderId: "stray-loader", url: "about:blank" } } };
+    return send(target, method, params);
+  };
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.deepEqual(reply.frame_mappings.map(frame => frame.frame_id), [root.id, child.id]);
+  assert(reply.frame_mappings.every(frame => !frame.unreadable_reason));
+});
+
+test("root reads survive an unverified navigation mapping", async () => {
+  const f = await framed(false);
+  f.frames[0].url = "https://page.example/navigating";
+  await f.run(f.cdp([{ method: "Accessibility.getFullAXTree", params: { frameId: root.id }, frame_id: root.id, loader_id: root.loaderId, session_id: "root" }]));
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Accessibility.getFullAXTree").length, 1);
+});
+
+test("clicking an omitted ambiguous child still refuses frame_ambiguous", async () => {
+  const f = await framed(false);
+  f.frames.push({ ...f.frames[1], frameId: 18, documentId: "duplicate" });
+  const epoch = f.epochs.record(2).epoch;
+  f.agent.baselines.set(2, { epoch, continuity: f.epochs.record(2).continuity });
+  const { frame_id, loader_id, session_id } = f.scope;
+  await assert.rejects(f.run({ ...f.cdp([{ method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 10, y: 10, button: "left" }, frame_id, loader_id, session_id }]), interaction_epoch: epoch }), { reason: "frame_ambiguous" });
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Input.dispatchMouseEvent").length, 0);
+});
+
+test("a changing navigation tree is retried once and a stable retry stays readable", async () => {
+  const f = await framed(false);
+  let calls = 0;
+  f.chrome.webNavigation.getAllFrames = async () => [{ ...f.frames[0] }, { ...f.frames[1], documentId: ++calls === 1 ? "before" : "after" }];
+  const before = f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Page.getFrameTree").length;
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Page.getFrameTree").length - before, 4);
+  assert.equal(reply.frame_mappings[1].document_id, "after");
+  assert.equal(reply.frame_mappings[1].unreadable_reason, undefined);
+});
+
+test("a child changing during both navigation reads is omitted after one retry", async () => {
+  const f = await framed(false);
+  let calls = 0;
+  f.chrome.webNavigation.getAllFrames = async () => [{ ...f.frames[0] }, { ...f.frames[1], documentId: `moving-${++calls}` }];
+  const before = f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Page.getFrameTree").length;
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Page.getFrameTree").length - before, 4);
+  assert.equal(reply.frame_mappings[0].unreadable_reason, undefined);
+  assert.equal(reply.frame_mappings[1].unreadable_reason, "stale");
+});
+
+test("a CDP tree changing twice degrades only its moving child", async () => {
+  const f = await framed(false);
+  const send = f.chrome.debugger.sendCommand;
+  let trees = 0;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    const reply = await send(target, method, params);
+    if (method === "Page.getFrameTree") reply.frameTree.childFrames[0].frame.loaderId = `moving-${++trees}`;
+    return reply;
+  };
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.equal(trees, 4);
+  assert.equal(reply.frame_mappings[0].unreadable_reason, undefined);
+  assert.equal(reply.frame_mappings[1].unreadable_reason, "stale");
+});
+
+test("missing webNavigation coverage never blocks a top-document read", async () => {
+  const f = await framed(false);
+  f.chrome.webNavigation.getAllFrames = async () => { throw new Error("navigation unavailable"); };
+  await f.run(f.cdp([{ method: "Accessibility.getFullAXTree", params: { frameId: root.id }, frame_id: root.id, loader_id: root.loaderId, session_id: "root" }]));
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Accessibility.getFullAXTree").length, 1);
+});
+
+test("an empty loader preserves top reads but never authorizes frame input", async () => {
+  const f = await framed(false);
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    const reply = await send(target, method, params);
+    if (method === "Page.getFrameTree") reply.frameTree.frame = { ...reply.frameTree.frame, loaderId: "" };
+    return reply;
+  };
+  const scope = { frame_id: root.id, loader_id: "", session_id: "root" };
+  await f.run(f.cdp([{ method: "Accessibility.getFullAXTree", params: { frameId: root.id }, ...scope }]));
+  const epoch = f.epochs.record(2).epoch;
+  f.agent.baselines.set(2, { epoch, continuity: f.epochs.record(2).continuity });
+  await assert.rejects(f.run({ ...f.cdp([{ method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 10, y: 10, button: "left" }, ...scope }]), interaction_epoch: epoch }), { reason: "frame_stale" });
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Accessibility.getFullAXTree").length, 1);
+  assert.equal(f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Input.dispatchMouseEvent").length, 0);
 });

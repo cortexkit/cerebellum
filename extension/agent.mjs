@@ -36,7 +36,9 @@ export function validatePlan(plan) {
   if (plan.action === "cdp") {
     if (!Array.isArray(plan.commands) || !plan.commands.length || plan.commands.length > 256) throw new Refusal("invalid_plan");
     for (const command of plan.commands) {
-      if (!closed(command, ["method", "params", "frame_id", "session_id", "loader_id"]) || ["frame_id", "session_id", "loader_id"].some(key => key in command && (typeof command[key] !== "string" || !command[key])) || ["frame_id", "session_id", "loader_id"].some(key => key in command) && !["frame_id", "session_id", "loader_id"].every(key => key in command)) throw new Refusal("invalid_plan", "provide the complete verified frame scope");
+      // Chrome can expose an empty loader before a document commits. Preserve
+      // top-level reads; frame resolution still rejects such a scope for input.
+      if (!closed(command, ["method", "params", "frame_id", "session_id", "loader_id"]) || ["frame_id", "session_id", "loader_id"].some(key => key in command && (typeof command[key] !== "string" || !command[key] && key !== "loader_id")) || ["frame_id", "session_id", "loader_id"].some(key => key in command) && !["frame_id", "session_id", "loader_id"].every(key => key in command)) throw new Refusal("invalid_plan", "provide the complete verified frame scope");
       classifyCommand(command);
     }
   }
@@ -277,7 +279,7 @@ export class Agent {
       const command = { ...planned, params: resolveParams(planned.params, results) };
       await this.guard(state);
       const kind = classifyCommand(command);
-      const scope = command.frame_id ? await state.frames.resolve(command) : null;
+      const scope = command.frame_id ? await state.frames.resolve(command, kind === "read" && !hasInput) : null;
       const target = scope?.target ?? { tabId: state.tabId };
       const frameId = scope?.frame.web_navigation_frame_id ?? 0;
       if (!hasInput && hasRead && kind === "read" && !readObservation) {
@@ -309,7 +311,7 @@ export class Agent {
           const { mappings } = await state.frames.read();
           result = await new FrameGeometry(state.frames, mappings).hit({ x: command.params.x, y: command.params.y }, scope?.frame, command.params);
         } else result = await bounded(this.chrome.debugger.sendCommand(target, command.method, command.params), "reply");
-        if (scope) await state.frames.resolve(command);
+        if (scope) await state.frames.resolve(command, kind === "read" && !hasInput);
         results.push({ result });
       } catch (error) {
         if (error instanceof Refusal) throw error;

@@ -77,18 +77,28 @@ the group; handed tabs are ungrouped. No close path closes Chrome or a tab.
 Each command is `{method:<string>, params:<object>}` with an optional complete
 scope `{frame_id:<CDP string id>, loader_id:<CDP loader id>, session_id:<owner>}`.
 The owner is `root` (the claimed tab) or a stable child target id, **not** an ephemeral debugger
-session id. A scoped command is accepted only after the extension rediscovers the
+session id. Scoped input is accepted only after the extension rediscovers the
 frame and verifies all three fields. `frame_stale` refuses missing or navigated
-frames; `frame_ambiguous` refuses more than one matching candidate.
+frames; `frame_ambiguous` refuses more than one matching candidate. Read-only
+commands for the top document do not require a webNavigation association.
 
 An unscoped `Page.getFrameTree` returns a composite tree including OOPIF trees.
 Its `cdp` reply also includes `frame_mappings:[{frame_id, parent_id?, loader_id,
-session_id, url, web_navigation_frame_id, document_id?}]`. The extension joins
+session_id, url, web_navigation_frame_id?, document_id?, unreadable_reason?}]`.
+`unreadable_reason` is `ambiguous` or `stale`; such an entry has no verified
+webNavigation identity and does not authorize input. The extension joins
 `webNavigation.getAllFrames` to CDP by the parent chain and exact URL, narrowing
 by `documentId` when exposed by both APIs. It verifies webNavigation document ids
-before and after discovery; URL duplicates without a document-id proof refuse,
-never select an arbitrary sibling. Each scoped command revalidates before and
-after dispatch. WebNavigation numeric ids never address CDP commands.
+before and after discovery and compares the CDP tree across the read. A changing
+tree is retried once; if it changes again, only affected child subtrees are
+omitted. URL duplicates without a document-id proof are marked ambiguous, never
+resolved to an arbitrary sibling. Stray navigation entries and sessions absent
+from the claimed tab's tree do not invalidate readable documents. Cerebellum
+renders `[embedded frame not readable: ambiguous|stale]` at the iframe owner,
+removes its refs, and reports `truncated:true`. The top document stays readable
+even if its webNavigation mapping is unavailable. Input and scoped child commands
+still refuse omissions exactly as above; each revalidates before and after
+dispatch. WebNavigation numeric ids never address CDP commands.
 
 After the bridge receives `dispatch` for a validated and attached CDP plan,
 the extension internally sends exactly

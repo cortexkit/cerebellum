@@ -73,7 +73,9 @@ and reject a one-byte change. It intentionally refuses browser-wide
 Target bootstrap/activation, downloads, Runtime.evaluate and arbitrary JavaScript.
 OOPIF child sessions are discovered only beneath the claimed tab's per-action
 attachment. Protocol v2 maps CDP frames to webNavigation by parent chain and URL,
-with document ids when exposed; ambiguous or stale associations refuse. Reads
+with document ids when exposed. Ambiguous or stale child reads are omitted with
+a marker and a partial-snapshot flag; the rest of the page remains readable.
+Input through an unverified frame still refuses. Reads
 include embedded frames under the top site's grant; child input needs that
 frame's origin grant. Missing sentinel/frame coverage also refuses input. These limits must remain visible to the
 adapter and real-Chrome acceptance probes; a test double does not establish actual

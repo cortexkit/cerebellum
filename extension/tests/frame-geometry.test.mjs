@@ -73,3 +73,12 @@ test("root and child hit tests use their own document scroll offsets", async () 
   const hits = f.calls.filter(call => call.method === "DOM.getNodeForLocation");
   assert.deepEqual(hits.map(call => [call.params.x, call.params.y]), [[140, 140], [20, 90]]);
 });
+
+test("point and ref hit tests preserve an omitted child's ambiguity refusal", async () => {
+  for (const scoped of [false, true]) {
+    const f = fixture();
+    f.child.unreadable_reason = "ambiguous";
+    await assert.rejects(f.helper.hit(scoped ? { x: 20, y: 30 } : { x: 140, y: 110 }, scoped ? f.child : null, {}), { reason: "frame_ambiguous" });
+    assert(!f.calls.some(call => call.target.sessionId));
+  }
+});

@@ -103,6 +103,12 @@ struct DoubleState {
     top_level_only: bool,
     same_origin_child: bool,
     ambiguous_frames: bool,
+    frame_pair: bool,
+    stray_navigation: bool,
+    stale_root_mapping: bool,
+    moving_child: bool,
+    child_loader: u64,
+    child_ax_unavailable: bool,
 }
 
 /// Cingulate as the site-card tests need it: every card is answered at once
@@ -518,15 +524,33 @@ fn execute(
         return Err("tab_not_claimed_by_route".into());
     }
     assert_eq!(name, "cdp");
-    if state.ambiguous_frames {
-        return Err("frame_ambiguous".into());
-    }
     let child_url = if state.same_origin_child {
         tab.url.clone()
     } else {
         "https://ungranted.example/secret".into()
     };
     let commands = command["commands"].as_array().unwrap();
+    if state.moving_child
+        && commands
+            .iter()
+            .any(|command| command["method"] == "Page.getFrameTree")
+    {
+        state.child_loader += 1;
+    }
+    let child_loader = if state.moving_child {
+        format!("foreign-loader-{}", state.child_loader)
+    } else {
+        "foreign-loader".into()
+    };
+    if state.ambiguous_frames
+        && commands.iter().any(|command| {
+            command["frame_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("pair-"))
+        })
+    {
+        return Err("frame_ambiguous".into());
+    }
     let input = commands.iter().any(|command| {
         command["method"].as_str().unwrap().starts_with("Input.")
             || command["method"] == "DOM.focus"
@@ -576,7 +600,12 @@ fn execute(
                 json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
             }
             "Page.getFrameTree" => {
-                let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":"foreign-loader","url":child_url}}]}});
+                let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":child_loader,"url":child_url}}]}});
+                if state.frame_pair {
+                    for id in ["pair-one", "pair-two"] {
+                        tree["frameTree"]["childFrames"].as_array_mut().unwrap().push(json!({"frame":{"id":id,"parentId":"main","loaderId":"pair-loader","url":"https://pair.example/embedded"}}));
+                    }
+                }
                 if state.top_level_only {
                     tree["frameTree"]
                         .as_object_mut()
@@ -597,24 +626,59 @@ fn execute(
                 state
                     .captures
                     .push(command["params"]["frameId"].as_str().unwrap().into());
-                if command["frame_id"] == "foreign" {
+                if command["frame_id"] == "foreign" && state.child_ax_unavailable {
+                    json!({"nodes":[]})
+                } else if command["frame_id"] == "foreign" {
                     json!({"nodes":[
                         {"nodeId":"child-root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Embedded page"},"backendDOMNodeId":1,"frameId":"foreign","childIds":["child-field","child-button"]},
                         {"nodeId":"child-field","ignored":false,"role":{"value":"textbox"},"name":{"value":"Child message"},"value":{"value":"child field value"},"backendDOMNodeId":4},
                         {"nodeId":"child-button","ignored":false,"role":{"value":"button"},"name":{"value":"Child go"},"backendDOMNodeId":3}
                     ]})
+                } else if command["frame_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("pair-"))
+                {
+                    json!({"nodes":[
+                        {"nodeId":"pair-root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Pair secret"},"backendDOMNodeId":1,"frameId":command["frame_id"],"childIds":["pair-button"]},
+                        {"nodeId":"pair-button","ignored":false,"role":{"value":"button"},"name":{"value":format!("{} button", command["frame_id"].as_str().unwrap())},"backendDOMNodeId":3}
+                    ]})
                 } else {
-                    state.ax_override.clone().unwrap_or_else(ax)
+                    let mut ax = state.ax_override.clone().unwrap_or_else(ax);
+                    if state.frame_pair {
+                        for (id, backend) in [("pair-one", 7), ("pair-two", 8)] {
+                            ax["nodes"][0]["childIds"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(json!(id));
+                            let inline = format!("{id}-inline");
+                            ax["nodes"].as_array_mut().unwrap().push(json!({"nodeId":id,"ignored":false,"role":{"value":"Iframe"},"name":{"value":format!("{id} owner")},"backendDOMNodeId":backend,"childIds":[inline]}));
+                            ax["nodes"].as_array_mut().unwrap().push(json!({"nodeId":inline,"ignored":false,"role":{"value":"StaticText"},"name":{"value":"UNMAPPABLE_INLINE_SECRET"}}));
+                        }
+                    }
+                    ax
                 }
             }
-            "DOM.getFlattenedDocument" => dom(
-                state.new_tab_link,
-                state.password,
-                state.payment,
-                state.untyped_button,
-            ),
+            "DOM.getFlattenedDocument" => {
+                let mut dom = dom(
+                    state.new_tab_link,
+                    state.password,
+                    state.payment,
+                    state.untyped_button,
+                );
+                if state.frame_pair {
+                    for id in [7, 8] {
+                        dom["nodes"].as_array_mut().unwrap().push(json!({"nodeId":id,"parentId":2,"backendNodeId":id,"nodeType":1,"nodeName":"IFRAME","localName":"iframe","attributes":[]}));
+                    }
+                }
+                dom
+            }
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
-            "DOM.getFrameOwner" => json!({"backendNodeId":6}),
+            "DOM.getOuterHTML" => {
+                json!({"outerHTML":format!("HTML-{}", command["frame_id"].as_str().unwrap())})
+            }
+            "DOM.getFrameOwner" => {
+                json!({"backendNodeId":match command["params"]["frameId"].as_str() { Some("pair-one") => 7, Some("pair-two") => 8, _ => 6 }})
+            }
             "DOM.getNodeForLocation" => {
                 json!({"backendNodeId":3,"frameId":if state.foreign_hit || command["frame_id"] == "foreign" { "foreign" } else { "main" }})
             }
@@ -645,7 +709,30 @@ fn execute(
         json!({"frame_id":"main","loader_id":format!("l{}",tab.loader),"session_id":"root","url":tab.url,"web_navigation_frame_id":0,"document_id":format!("main-{}",tab.loader)}),
     ];
     if !state.top_level_only {
-        mappings.push(json!({"frame_id":"foreign","parent_id":"main","loader_id":"foreign-loader","session_id":if state.same_origin_child {"root"} else {"child-target"},"url":child_url,"web_navigation_frame_id":7,"document_id":"child-doc"}));
+        mappings.push(json!({"frame_id":"foreign","parent_id":"main","loader_id":child_loader,"session_id":if state.same_origin_child {"root"} else {"child-target"},"url":child_url,"web_navigation_frame_id":7,"document_id":"child-doc"}));
+    }
+    if state.frame_pair {
+        for (id, web_id) in [("pair-one", 8), ("pair-two", 9)] {
+            let mut mapping = json!({"frame_id":id,"parent_id":"main","loader_id":"pair-loader","session_id":"root","url":"https://pair.example/embedded","web_navigation_frame_id":web_id});
+            if state.ambiguous_frames {
+                mapping["unreadable_reason"] = json!("ambiguous");
+                mapping
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("web_navigation_frame_id");
+            }
+            mappings.push(mapping);
+        }
+    }
+    if state.stray_navigation {
+        mappings.push(json!({"frame_id":"stray","parent_id":"main","loader_id":"stray-loader","session_id":"root","url":"about:blank","unreadable_reason":"stale"}));
+    }
+    if state.stale_root_mapping {
+        mappings[0]["unreadable_reason"] = json!("stale");
+        mappings[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("web_navigation_frame_id");
     }
     Ok((
         json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
@@ -2209,14 +2296,181 @@ async fn credential_field_in_a_child_is_refused_even_with_its_origin_granted() {
 }
 
 #[tokio::test]
-async fn ambiguous_extension_frame_mapping_refuses_before_content_or_input() {
+async fn ambiguous_child_pair_keeps_top_level_and_normal_child_readable() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    fixture.state.lock().unwrap().ambiguous_frames = true;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.frame_pair = true;
+        state.ambiguous_frames = true;
+        state.same_origin_child = true;
+    }
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
-    assert_eq!(snapshot["reason"], "frame_ambiguous", "{snapshot}");
-    assert!(snapshot["state_text"].is_null());
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["omitted_frames"], 2);
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert!(text.contains("Message"));
+    assert!(text.contains("Child message"));
+    assert_eq!(
+        text.matches("[embedded frame not readable: ambiguous]")
+            .count(),
+        2
+    );
+    assert!(!text.contains("Pair secret"));
+    assert!(!text.contains("UNMAPPABLE_INLINE_SECRET"));
+    assert!(
+        text.find("Child message").unwrap()
+            < text
+                .find("[embedded frame not readable: ambiguous]")
+                .unwrap()
+    );
+    assert!(!text.contains("pair-one owner"));
+    assert!(!text.contains("pair-two owner"));
+    for line in text
+        .lines()
+        .filter(|line| line.contains("[embedded frame not readable:"))
+    {
+        assert!(
+            !line.trim_start().starts_with("ur"),
+            "omitted owners must have no ref: {line}"
+        );
+    }
     let state = fixture.state.lock().unwrap();
-    assert!(state.captures.is_empty());
+    assert_eq!(state.captures, vec!["main", "foreign"]);
     assert!(state.inputs.is_empty());
+    let retained = fixture.planes.user_browser.target().state();
+    let refs = &retained
+        .snapshots
+        .get(snapshot["snapshot_id"].as_str().unwrap())
+        .unwrap()
+        .refs;
+    assert!(refs
+        .values()
+        .all(|reference| !reference.frame.frame_id.starts_with("pair-")
+            && ![7, 8].contains(&reference.identity.backend_node_id)));
+}
+
+#[tokio::test]
+async fn click_on_a_previously_read_element_in_an_omitted_pair_refuses_ambiguity() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().frame_pair = true;
+    let (before, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let args = click(&tab, &before, &reference(&before, "pair-one button"));
+    fixture.state.lock().unwrap().ambiguous_frames = true;
+    let (partial, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(partial["outcome"], "ok", "{partial}");
+    let (zoom, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"zoom":reference(&before,"pair-one button")}), "allow_30m").await;
+    assert_eq!(zoom["outcome"], "ok", "{zoom}");
+    assert_eq!(zoom["truncated"], true);
+    assert!(zoom["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("[embedded frame not readable: ambiguous]"));
+    let (clicked, cards) = fixture.call(1, args, "allow_30m").await;
+    assert_eq!(clicked["reason"], "frame_ambiguous", "{clicked}");
+    assert_eq!(clicked["input_dispatched"], false);
+    assert!(cards.is_empty());
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test]
+async fn stray_mapping_without_a_tree_node_does_not_hide_readable_documents() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().stray_navigation = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Child message"));
+    assert_eq!(snapshot["truncated"], false);
+}
+
+#[tokio::test]
+async fn an_unverified_root_navigation_mapping_never_hides_the_top_document() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().stale_root_mapping = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(snapshot["state_text"].as_str().unwrap().contains("Message"));
+}
+
+#[tokio::test]
+async fn a_child_changing_again_after_one_retry_is_omitted_from_the_read() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().moving_child = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    assert!(snapshot["state_text"].as_str().unwrap().contains("Message"));
+    assert!(snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("[embedded frame not readable: stale]"));
+    assert!(!snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Child message"));
+    assert_eq!(
+        fixture.state.lock().unwrap().captures,
+        vec!["main", "foreign", "main", "foreign"]
+    );
+}
+
+#[tokio::test]
+async fn dom_full_keeps_omission_markers_without_unreadable_child_documents() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.frame_pair = true;
+        state.ambiguous_frames = true;
+    }
+    let (snapshot, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"mode":"dom_full"}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert!(text.contains("HTML-main"));
+    assert!(text.contains("HTML-foreign"));
+    assert_eq!(
+        text.matches("[embedded frame not readable: ambiguous]")
+            .count(),
+        2
+    );
+    assert!(!text.contains("HTML-pair"));
+    assert!(fixture
+        .planes
+        .user_browser
+        .target()
+        .state()
+        .snapshots
+        .get(snapshot["snapshot_id"].as_str().unwrap())
+        .unwrap()
+        .refs
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_child_without_an_accessibility_tree_does_not_hide_the_top_page() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().child_ax_unavailable = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert!(text.contains("Message"));
+    assert!(text.contains("[embedded frame not readable: stale]"));
+    assert!(!text.contains("Child message"));
 }

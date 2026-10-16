@@ -53,6 +53,11 @@ export class FrameGeometry {
   async hit(point, scope, params) {
     const root = this.mappings.find(frame => !frame.parent_id);
     if (!root) throw new Refusal("frame_stale");
+    if (scope) {
+      const current = this.mappings.find(frame => frame.frame_id === scope.frame_id);
+      if (current?.unreadable_reason) throw new Refusal(`frame_${current.unreadable_reason}`, "read again");
+      if (!current || current.loader_id !== scope.loader_id || current.session_id !== scope.session_id) throw new Refusal("frame_stale", "read again");
+    }
     if (scope) point = await this.globalPoint(scope, point);
     const viewport = (await this.send(root, "Page.getLayoutMetrics", {})).cssVisualViewport;
     if (!viewport || ![viewport.offsetX, viewport.offsetY, viewport.clientWidth, viewport.clientHeight].every(Number.isFinite) || point.x < viewport.offsetX || point.y < viewport.offsetY || point.x >= viewport.offsetX + viewport.clientWidth || point.y >= viewport.offsetY + viewport.clientHeight) throw new Refusal("point_outside_viewport");
@@ -65,11 +70,13 @@ export class FrameGeometry {
       const hit = await this.send(session, "DOM.getNodeForLocation", { ...params, x: Math.round(point.x + visual.pageX - visual.offsetX), y: Math.round(point.y + visual.pageY - visual.offsetY) });
       const parent = this.mappings.find(frame => frame.frame_id === hit.frameId && frame.session_id === session.session_id);
       if (!parent) throw new Refusal("frame_stale");
+      if (parent.unreadable_reason) throw new Refusal(`frame_${parent.unreadable_reason}`, "read again");
       let next;
       for (const child of this.mappings.filter(frame => frame.parent_id === parent.frame_id && frame.session_id !== parent.session_id)) {
         if (await this.owner(parent, child) === hit.backendNodeId) { next = child; break; }
       }
       if (!next) return { ...hit, frame_point: point };
+      if (next.unreadable_reason) throw new Refusal(`frame_${next.unreadable_reason}`, "read again");
       point = transformPoint(point, await this.geometry(parent, hit.backendNodeId), true);
       session = next;
     }

@@ -114,8 +114,37 @@ struct FrameMapping {
     loader_id: String,
     session_id: String,
     url: String,
-    web_navigation_frame_id: u64,
+    web_navigation_frame_id: Option<u64>,
     document_id: Option<String>,
+    unreadable_reason: Option<FrameReadFailure>,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FrameReadFailure {
+    Ambiguous,
+    Stale,
+}
+
+impl FrameReadFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ambiguous => "ambiguous",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn refusal(self) -> Value {
+        refusal(&format!("frame_{}", self.label()))
+    }
+
+    fn from_reply(reply: &Value) -> Option<Self> {
+        match reply["reason"].as_str()? {
+            "frame_ambiguous" => Some(Self::Ambiguous),
+            "frame_stale" | "frame_changed" | "cdp_error" => Some(Self::Stale),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -692,6 +721,7 @@ struct Document {
     committed: CommittedDocument,
     frames: Vec<FrameDocument>,
     interaction: u64,
+    unreadable_frames: BTreeMap<String, FrameReadFailure>,
 }
 
 async fn document(
@@ -724,17 +754,20 @@ async fn document(
         .ok_or_else(|| refusal("document_not_ready"))?;
     let mut frames = Vec::new();
     let mut frame_count = 0;
+    let mut unreadable_frames = BTreeMap::new();
     collect_frames(
         &plan.results[1]["frameTree"],
         &plan.frame_mappings,
         &mut frames,
         0,
         &mut frame_count,
+        &mut unreadable_frames,
     )?;
     Ok(Document {
         committed,
         frames,
         interaction: plan.interaction,
+        unreadable_frames,
     })
 }
 
@@ -744,6 +777,7 @@ fn collect_frames(
     frames: &mut Vec<FrameDocument>,
     depth: usize,
     count: &mut usize,
+    unreadable: &mut BTreeMap<String, FrameReadFailure>,
 ) -> Result<(), Value> {
     if depth > 64 || *count >= 256 {
         return Err(refusal("frame_limit"));
@@ -763,19 +797,29 @@ fn collect_frames(
         .iter()
         .filter(|mapping| mapping.frame_id == id)
         .collect();
-    let [mapping] = matching.as_slice() else {
-        return Err(refusal("frame_ambiguous"));
-    };
+    let mapping = (matching.len() == 1).then(|| matching[0]);
     let parent_id =
         (depth != 0).then(|| frame["parentId"].as_str().unwrap_or("embedded").to_owned());
-    if mapping.url != url
-        || mapping.loader_id != loader
-        || mapping.parent_id != parent_id
-        || mapping.session_id.is_empty()
-        || (depth == 0 && mapping.web_navigation_frame_id != 0)
-        || mapping.document_id.as_ref().is_some_and(String::is_empty)
-    {
-        return Err(refusal("frame_changed"));
+    let reason = mapping
+        .and_then(|mapping| mapping.unreadable_reason)
+        .or_else(|| {
+            if matching.len() > 1 {
+                Some(FrameReadFailure::Ambiguous)
+            } else if mapping.is_none_or(|mapping| {
+                mapping.url != url
+                    || mapping.loader_id != loader
+                    || mapping.parent_id != parent_id
+                    || mapping.session_id.is_empty()
+                    || (depth == 0 && mapping.web_navigation_frame_id != Some(0))
+                    || mapping.document_id.as_ref().is_some_and(String::is_empty)
+            }) {
+                Some(FrameReadFailure::Stale)
+            } else {
+                None
+            }
+        });
+    if let Some(reason) = reason {
+        unreadable.insert(id.clone(), reason);
     }
     // Sandboxed documents can have an opaque origin even at an HTTPS URL.
     // Reads belong to the top-page grant; input must use Chrome's actual origin.
@@ -794,14 +838,14 @@ fn collect_frames(
         navigation_revision: 0,
         frame_id: id,
         parent_id,
-        session_id: mapping.session_id.clone(),
+        session_id: mapping.map_or_else(|| "root".into(), |mapping| mapping.session_id.clone()),
         loader_id: loader,
         origin: frame_origin,
         url,
     });
     if let Some(children) = tree["childFrames"].as_array() {
         for child in children {
-            collect_frames(child, mappings, frames, depth + 1, count)?;
+            collect_frames(child, mappings, frames, depth + 1, count, unreadable)?;
         }
     }
     Ok(())
@@ -1627,9 +1671,83 @@ async fn capture(
     once: &InvocationGrant,
     zoom: Option<&Snapshot>,
 ) -> Result<Value, Value> {
+    let mut retry_document = None;
+    for attempt in 0..2 {
+        let current = retry_document.as_ref().unwrap_or(document);
+        let result = capture_attempt(context, tab, args, current, once, zoom, attempt != 0).await;
+        if attempt == 0
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|reply| reply["reason"] == "frame_tree_changed")
+        {
+            let current = context.document(tab).await?;
+            if current.committed != document.committed
+                || current.interaction != document.interaction
+            {
+                return Err(read_again(false));
+            }
+            retry_document = Some(current);
+        } else {
+            return result;
+        }
+    }
+    unreachable!("the second capture returns its partial result")
+}
+
+fn mark_unreadable_frame(
+    records: &mut Vec<crate::snapshot_store::AxRecord>,
+    record_frames: &mut Vec<String>,
+    snapshot: &mut Snapshot,
+    facts: &mut HashMap<String, state_text::NodeFacts>,
+    frame: &FrameDocument,
+    owner_index: Option<usize>,
+    reason: FrameReadFailure,
+) {
+    let marker = crate::snapshot_store::AxRecord {
+        depth: owner_index.map_or(1, |index| records[index].depth),
+        role: "StaticText".into(),
+        name: format!("[embedded frame not readable: {}]", reason.label()),
+        value: None,
+        reference: None,
+    };
+    if let Some(index) = owner_index {
+        // Chrome can include child text without a frame tag in the parent's
+        // accessibility capture. Replacing only the owner would leave that
+        // unreadable document's text or refs beneath its omission marker.
+        let end = records[index + 1..]
+            .iter()
+            .position(|record| record.depth <= records[index].depth)
+            .map_or(records.len(), |offset| index + 1 + offset);
+        for record in &records[index..end] {
+            if let Some(reference) = &record.reference {
+                snapshot.refs.remove(reference);
+                facts.remove(reference);
+            }
+        }
+        records.splice(index..end, [marker]);
+        record_frames.splice(index..end, [frame.frame_id.clone()]);
+    } else {
+        records.push(marker);
+        record_frames.push(frame.frame_id.clone());
+    }
+}
+
+async fn capture_attempt(
+    context: &Context<'_>,
+    tab: &str,
+    args: &Value,
+    document: &Document,
+    once: &InvocationGrant,
+    zoom: Option<&Snapshot>,
+    allow_partial_change: bool,
+) -> Result<Value, Value> {
     let id = opaque("us");
     let mut snapshot = baseline(context, tab, document);
     let mut records = Vec::new();
+    let mut record_frames = Vec::new();
+    let mut frame_owners = BTreeMap::new();
+    let mut failed_frames = BTreeSet::new();
     let mut facts = HashMap::new();
     let mut html = Vec::new();
     let mut popup = false;
@@ -1647,13 +1765,25 @@ async fn capture(
     }
     if expected_zoom.is_some_and(|reference| {
         !document
-            .frames
-            .iter()
-            .any(|frame| frame.same_document(&reference.frame))
+            .unreadable_frames
+            .contains_key(&reference.frame.frame_id)
+            && !document
+                .frames
+                .iter()
+                .any(|frame| frame.same_document(&reference.frame))
     }) {
         return Err(refusal("frame_changed"));
     }
     for frame in &document.frames {
+        if frame.parent_id.as_ref().is_some_and(|id| {
+            document.unreadable_frames.contains_key(id)
+                && document
+                    .frames
+                    .iter()
+                    .any(|parent| &parent.frame_id == id && parent.parent_id.is_some())
+        }) {
+            continue;
+        }
         if records.len() >= crate::snapshot_store::MAX_REFS {
             refs_truncated = true;
             omitted_frames += 1;
@@ -1667,7 +1797,7 @@ async fn capture(
         ) {
             continue;
         }
-        let insertion = {
+        let owner_index = {
             if let Some(parent_id) = &frame.parent_id {
                 let parent = document
                     .frames
@@ -1684,7 +1814,24 @@ async fn capture(
                             json!({"frameId":frame.frame_id}),
                         )],
                     )
-                    .await?;
+                    .await;
+                let owner = match owner {
+                    Ok(owner) => owner,
+                    Err(reply) if FrameReadFailure::from_reply(&reply).is_some() => {
+                        mark_unreadable_frame(
+                            &mut records,
+                            &mut record_frames,
+                            &mut snapshot,
+                            &mut facts,
+                            frame,
+                            None,
+                            FrameReadFailure::from_reply(&reply).unwrap(),
+                        );
+                        omitted_frames += 1;
+                        continue;
+                    }
+                    Err(reply) => return Err(reply),
+                };
                 let backend = owner.results[0]["backendNodeId"]
                     .as_u64()
                     .ok_or_else(|| refusal("protocol_error"))?;
@@ -1703,15 +1850,36 @@ async fn capture(
                             record.reference.as_ref() == Some(name)
                         })
                 });
-                let Some(index) = index else {
-                    omitted_frames += 1;
-                    continue;
-                };
-                Some((index + 1, records[index].depth + 1))
+                index
             } else {
                 None
             }
         };
+        if let Some(index) = owner_index {
+            if let Some(reference) = &records[index].reference {
+                frame_owners.insert(frame.frame_id.clone(), reference.clone());
+            }
+        }
+        if frame.parent_id.is_some() {
+            if let Some(reason) = document
+                .unreadable_frames
+                .get(&frame.frame_id)
+                .copied()
+                .or_else(|| owner_index.is_none().then_some(FrameReadFailure::Stale))
+            {
+                mark_unreadable_frame(
+                    &mut records,
+                    &mut record_frames,
+                    &mut snapshot,
+                    &mut facts,
+                    frame,
+                    owner_index,
+                    reason,
+                );
+                omitted_frames += 1;
+                continue;
+            }
+        }
         let plan = context
             .cdp_frame(
                 tab,
@@ -1730,7 +1898,26 @@ async fn capture(
                     ),
                 ],
             )
-            .await?;
+            .await;
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(reply)
+                if frame.parent_id.is_some() && FrameReadFailure::from_reply(&reply).is_some() =>
+            {
+                mark_unreadable_frame(
+                    &mut records,
+                    &mut record_frames,
+                    &mut snapshot,
+                    &mut facts,
+                    frame,
+                    owner_index,
+                    FrameReadFailure::from_reply(&reply).unwrap(),
+                );
+                omitted_frames += 1;
+                continue;
+            }
+            Err(reply) => return Err(reply),
+        };
         popup |= plan.popup;
         let nodes = plan.results[1]["nodes"]
             .as_array()
@@ -1738,7 +1925,7 @@ async fn capture(
         let dom = plan.results[3]
             .as_object()
             .ok_or_else(|| refusal("protocol_error"))?;
-        let mut observation = snapshot_from_capture(
+        let observation = snapshot_from_capture(
             nodes,
             dom,
             tab,
@@ -1750,7 +1937,24 @@ async fn capture(
             let mut reply = refusal("snapshot_not_ready");
             reply["remedy"] = json!("read again");
             reply
-        })?;
+        });
+        let mut observation = match observation {
+            Ok(observation) => observation,
+            Err(_) if frame.parent_id.is_some() => {
+                mark_unreadable_frame(
+                    &mut records,
+                    &mut record_frames,
+                    &mut snapshot,
+                    &mut facts,
+                    frame,
+                    owner_index,
+                    FrameReadFailure::Stale,
+                );
+                omitted_frames += 1;
+                continue;
+            }
+            Err(reply) => return Err(reply),
+        };
         ax_truncated |= observation.ax_truncated;
         refs_truncated |= observation.refs_truncated;
         let remaining = crate::snapshot_store::MAX_REFS.saturating_sub(records.len());
@@ -1800,19 +2004,30 @@ async fn capture(
                 facts.insert(fresh.clone(), value);
             }
         }
-        if let Some((index, depth)) = insertion {
+        let owners = vec![frame.frame_id.clone(); observation.records.len()];
+        if let Some(owner_index) = owner_index {
+            let index = owner_index + 1;
+            let depth = records[owner_index].depth + 1;
             for record in &mut observation.records {
                 record.depth += depth;
             }
             records.splice(index..index, observation.records);
+            record_frames.splice(index..index, owners);
         } else {
             records.extend(observation.records);
+            record_frames.extend(owners);
         }
         if args["mode"] == "dom_full" {
             let root = nodes
                 .first()
-                .and_then(|node| node["backendDOMNodeId"].as_u64())
-                .ok_or_else(|| refusal("snapshot_not_ready"))?;
+                .and_then(|node| node["backendDOMNodeId"].as_u64());
+            let Some(root) = root else {
+                if frame.parent_id.is_some() {
+                    failed_frames.insert(frame.frame_id.clone());
+                    continue;
+                }
+                return Err(refusal("snapshot_not_ready"));
+            };
             let outer = context
                 .cdp_frame(
                     tab,
@@ -1820,19 +2035,150 @@ async fn capture(
                     frame,
                     vec![command("DOM.getOuterHTML", json!({"backendNodeId":root}))],
                 )
-                .await?;
-            html.push(
+                .await;
+            let outer = match outer {
+                Ok(outer) => outer,
+                Err(reply)
+                    if frame.parent_id.is_some()
+                        && FrameReadFailure::from_reply(&reply).is_some() =>
+                {
+                    failed_frames.insert(frame.frame_id.clone());
+                    continue;
+                }
+                Err(reply) => return Err(reply),
+            };
+            html.push((
+                frame.frame_id.clone(),
                 outer.results[0]["outerHTML"]
                     .as_str()
                     .ok_or_else(|| refusal("protocol_error"))?
                     .to_owned(),
-            );
+            ));
         }
     }
-    if expected_zoom.is_some() && zoom_target.is_none() {
+    let omitted_zoom = expected_zoom.is_some_and(|reference| {
+        document
+            .unreadable_frames
+            .contains_key(&reference.frame.frame_id)
+            || records.iter().zip(&record_frames).any(|(record, frame)| {
+                frame == &reference.frame.frame_id
+                    && record.name.starts_with("[embedded frame not readable:")
+            })
+    });
+    if expected_zoom.is_some() && zoom_target.is_none() && !omitted_zoom {
         return Err(refusal("ref_scope_mismatch"));
     }
-    confirm(context, tab, document).await?;
+    let observed = context.document(tab).await?;
+    if observed.committed != document.committed || observed.interaction != document.interaction {
+        return Err(read_again(false));
+    }
+    let mut changed = failed_frames;
+    for frame in document
+        .frames
+        .iter()
+        .chain(&observed.frames)
+        .filter(|frame| frame.parent_id.is_some())
+    {
+        let before = document
+            .frames
+            .iter()
+            .find(|candidate| candidate.frame_id == frame.frame_id);
+        let after = observed
+            .frames
+            .iter()
+            .find(|candidate| candidate.frame_id == frame.frame_id);
+        if before
+            .zip(after)
+            .is_none_or(|(before, after)| !before.same_document(after))
+            || document.unreadable_frames.get(&frame.frame_id)
+                != observed.unreadable_frames.get(&frame.frame_id)
+        {
+            changed.insert(frame.frame_id.clone());
+        }
+    }
+    if !changed.is_empty() && !allow_partial_change {
+        return Err(refusal("frame_tree_changed"));
+    }
+    if !changed.is_empty() {
+        // A child whose document or verified mapping changes during both read
+        // attempts cannot supply current text or refs. Omit its subtree while
+        // preserving the unchanged top document and sibling captures.
+        for _ in 0..64 {
+            let mut added = false;
+            for frame in document.frames.iter().chain(&observed.frames) {
+                if frame
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|id| changed.contains(id))
+                {
+                    added |= changed.insert(frame.frame_id.clone());
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let affected: Vec<_> = document
+            .frames
+            .iter()
+            .chain(&observed.frames)
+            .filter(|frame| {
+                changed.contains(&frame.frame_id)
+                    && !frame
+                        .parent_id
+                        .as_ref()
+                        .is_some_and(|id| changed.contains(id))
+            })
+            .cloned()
+            .collect();
+        let mut marked = BTreeSet::new();
+        for frame in affected {
+            if !marked.insert(frame.frame_id.clone()) {
+                continue;
+            }
+            let reason = observed
+                .unreadable_frames
+                .get(&frame.frame_id)
+                .copied()
+                .unwrap_or(FrameReadFailure::Stale);
+            let owner_index = frame_owners
+                .get(&frame.frame_id)
+                .and_then(|owner| {
+                    records
+                        .iter()
+                        .position(|record| record.reference.as_ref() == Some(owner))
+                })
+                .or_else(|| record_frames.iter().position(|id| id == &frame.frame_id));
+            mark_unreadable_frame(
+                &mut records,
+                &mut record_frames,
+                &mut snapshot,
+                &mut facts,
+                &frame,
+                owner_index,
+                reason,
+            );
+        }
+        let mut markers = BTreeSet::new();
+        let pairs = std::mem::take(&mut records)
+            .into_iter()
+            .zip(std::mem::take(&mut record_frames));
+        for (record, owner) in pairs {
+            if !changed.contains(&owner)
+                || (record.name.starts_with("[embedded frame not readable:")
+                    && markers.insert(owner.clone()))
+            {
+                records.push(record);
+                record_frames.push(owner);
+            }
+        }
+        snapshot
+            .refs
+            .retain(|_, reference| !changed.contains(&reference.frame.frame_id));
+        facts.retain(|reference, _| snapshot.refs.contains_key(reference));
+        html.retain(|(frame, _)| !changed.contains(frame));
+        omitted_frames = omitted_frames.max(markers.len());
+    }
     let max_bytes = args["max_bytes"].as_u64().unwrap_or(5000).min(262144) as usize;
     let mut filters = Filters {
         text: args["text_filter"].as_str().map(str::to_owned),
@@ -1873,7 +2219,23 @@ async fn capture(
         .retain(|reference, _| rendered.printed_refs.contains(reference));
     let (text, text_truncated) = if args["mode"] == "dom_full" {
         snapshot.refs.clear();
-        crate::snapshot_store::encode_dom_text(&html.join("\n"), max_bytes)
+        let mut seen = BTreeSet::new();
+        let mut documents = Vec::new();
+        for frame in document.frames.iter().chain(&observed.frames) {
+            if !seen.insert(&frame.frame_id) {
+                continue;
+            }
+            if let Some((marker, _)) = records.iter().zip(&record_frames).find(|(record, owner)| {
+                *owner == &frame.frame_id
+                    && record.name.starts_with("[embedded frame not readable:")
+            }) {
+                documents.push(marker.name.as_str());
+            } else if let Some((_, html)) = html.iter().find(|(owner, _)| owner == &frame.frame_id)
+            {
+                documents.push(html.as_str());
+            }
+        }
+        crate::snapshot_store::encode_dom_text(&documents.join("\n"), max_bytes)
     } else {
         // AX and actionable reads share the renderer that withholds protected
         // field values. Its output budget can cut an otherwise complete tree.
@@ -2049,6 +2411,9 @@ async fn input(
             .ok_or_else(|| refusal("ref_scope_mismatch"))?;
         (reference.identity.clone(), reference.frame.clone(), None)
     };
+    if let Some(reason) = current.unreadable_frames.get(&frame.frame_id) {
+        return Err(reason.refusal());
+    }
     if !current.frames.iter().any(|live| live.same_document(&frame)) {
         return Err(refusal("frame_changed"));
     }
@@ -2404,6 +2769,9 @@ async fn verify_input(
     })?;
     if observed.interaction != snapshot.interaction || observed.committed != snapshot.document {
         return Err(read_again(dispatched));
+    }
+    if let Some(reason) = observed.unreadable_frames.get(&frame.frame_id) {
+        return Err(prior_input(reason.refusal(), dispatched));
     }
     if !observed
         .frames
