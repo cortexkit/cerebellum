@@ -1034,6 +1034,34 @@ impl ManagementPlane {
         can_raise_card: bool,
         standing_agent: Option<&str>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
+        let holder = standing_agent.map(|agent| crate::agent_grants::GrantHolder::Head {
+            agent_id: agent.into(),
+        });
+        self.open_browser_grant_for_holder(
+            conversation_key,
+            origins,
+            hazards,
+            severity_tier,
+            can_raise_card,
+            standing_agent,
+            holder.as_ref(),
+        )
+        .await
+    }
+
+    /// Check the call's resolved holder, which can be a scoped worker, rather
+    /// than the agent eligible for permanent choices on a new consent card.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_browser_grant_for_holder(
+        &self,
+        conversation_key: &str,
+        origins: Vec<String>,
+        hazards: Vec<HazardClass>,
+        severity_tier: Option<u8>,
+        can_raise_card: bool,
+        standing_agent: Option<&str>,
+        holder: Option<&crate::agent_grants::GrantHolder>,
+    ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         let key = browser_grant_key(conversation_key, &origins);
         let (mut reply, question) = self
             .open_browser_grant_with_urgency(
@@ -1044,6 +1072,7 @@ impl ManagementPlane {
                 can_raise_card,
                 crate::consent_card::Urgency::Normal,
                 standing_agent,
+                holder,
             )
             .await?;
         // Only this reply carries the previous question's fate. A browser
@@ -1077,6 +1106,7 @@ impl ManagementPlane {
             true,
             crate::consent_card::Urgency::High,
             standing_agent,
+            None,
         )
         .await
     }
@@ -1091,6 +1121,7 @@ impl ManagementPlane {
         can_raise_card: bool,
         urgency: crate::consent_card::Urgency,
         standing_agent: Option<&str>,
+        holder: Option<&crate::agent_grants::GrantHolder>,
     ) -> Result<(Value, Option<Question>), BrowserGrantRequestError> {
         if severity_tier.is_some_and(|tier| {
             !(crate::authorization::OBSERVE..=crate::authorization::MAX_GRANTABLE_TIER)
@@ -1128,6 +1159,38 @@ impl ManagementPlane {
         }
         let severity = browser_grant_minted_severity(&disclosed_hazards, severity_tier);
         let severity_value = browser_grant_severity_value(severity);
+
+        // A retry must read the authority dispatch would use, including grants
+        // recorded by a late answer. Reusing the dispatch check keeps domain,
+        // public-site, hazard and expiry rules identical without renewing rows.
+        let mut already_covered_origins = Vec::new();
+        if let (Some(store), Some(holder)) = (&self.unified_grants, holder) {
+            authorized_origins.retain(|origin| {
+                let demand = crate::agent_grants::GrantDemand::Browser {
+                    target: crate::agent_grants::BrowserTarget::AgentProfile,
+                    origin: origin.clone(),
+                    severity,
+                    hazards: disclosed_hazards.clone(),
+                };
+                if store.authorize(holder, demand).is_some() {
+                    already_covered_origins.push(origin.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if authorized_origins.is_empty() {
+            return Ok((
+                json!({
+                    "outcome": "granted",
+                    "origins": already_covered_origins,
+                    "hazards": disclosed_hazards_wire,
+                    "severity_ceiling": severity_value,
+                }),
+                None,
+            ));
+        }
 
         if !can_raise_card {
             return Ok((
@@ -1184,17 +1247,18 @@ impl ManagementPlane {
             ),
             deadline: PHONE_CONSENT_DEADLINE,
         };
-        Ok((
-            json!({
-                "outcome": "consent_pending",
-                "ask_id": ask_id,
-                "origins": authorized_origins,
-                "hazards": disclosed_hazards_wire,
-                "severity_ceiling": severity_value,
-                "remedy": "retry the browser action after the request has been answered",
-            }),
-            Some(question),
-        ))
+        let mut reply = json!({
+            "outcome": "consent_pending",
+            "ask_id": ask_id,
+            "origins": authorized_origins,
+            "hazards": disclosed_hazards_wire,
+            "severity_ceiling": severity_value,
+            "remedy": "retry the browser action after the request has been answered",
+        });
+        if !already_covered_origins.is_empty() {
+            reply["already_covered_origins"] = json!(already_covered_origins);
+        }
+        Ok((reply, Some(question)))
     }
 
     /// Apply exactly one human answer to the browser scope recorded at ask time.

@@ -4418,13 +4418,14 @@ async fn handle_management_request_observed(
         };
         let opened = planes
             .management
-            .open_browser_grant_at_tier(
+            .open_browser_grant_for_holder(
                 &facts.identity.conversation_key,
                 origins,
                 hazards,
                 severity_tier,
                 true,
                 standing_offer_agent(facts),
+                permission_scope::authorizing_holder(facts).as_ref(),
             )
             .await;
         let (reply, question) = match opened {
