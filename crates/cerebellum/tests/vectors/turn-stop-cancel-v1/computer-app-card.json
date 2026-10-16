@@ -11,13 +11,13 @@
   "case": "computer-app-card",
   "contract": "turn-stop-cancel-v1",
   "reply": {
-    "body_length": 290,
-    "body_utf8": "{\"attempts\":0,\"evidence\":\"{\\\"status\\\":\\\"indeterminate\\\",\\\"predicate\\\":{\\\"kind\\\":\\\"element_present\\\",\\\"element\\\":{\\\"Identifier\\\":\\\"ready\\\"}},\\\"readback\\\":null,\\\"reason\\\":\\\"{\\\\\\\"reason\\\\\\\":\\\\\\\"cancelled_while_awaiting_consent\\\\\\\"}\\\"}\",\"outcome\":\"cancelled\",\"settle_path\":\"poll_with_deadline\"}",
+    "body_length": 265,
+    "body_utf8": "{\"attempts\":0,\"evidence\":\"{\\\"status\\\":\\\"indeterminate\\\",\\\"predicate\\\":{\\\"kind\\\":\\\"element_present\\\",\\\"element\\\":{\\\"Identifier\\\":\\\"ready\\\"}},\\\"readback\\\":null,\\\"reason\\\":\\\"cancelled_while_awaiting_consent\\\"}\",\"outcome\":\"cancelled\",\"settle_path\":\"poll_with_deadline\"}",
     "channel": 7,
     "corr": 42,
     "epoch": 1,
     "type": "Response",
-    "wire_hex": "220100000201020700010000002a000000000000007b22617474656d707473223a302c2265766964656e6365223a227b5c227374617475735c223a5c22696e64657465726d696e6174655c222c5c227072656469636174655c223a7b5c226b696e645c223a5c22656c656d656e745f70726573656e745c222c5c22656c656d656e745c223a7b5c224964656e7469666965725c223a5c2272656164795c227d7d2c5c22726561646261636b5c223a6e756c6c2c5c22726561736f6e5c223a5c227b5c5c5c22726561736f6e5c5c5c223a5c5c5c2263616e63656c6c65645f7768696c655f6177616974696e675f636f6e73656e745c5c5c227d5c227d222c226f7574636f6d65223a2263616e63656c6c6564222c22736574746c655f70617468223a22706f6c6c5f776974685f646561646c696e65227d"
+    "wire_hex": "090100000201020700010000002a000000000000007b22617474656d707473223a302c2265766964656e6365223a227b5c227374617475735c223a5c22696e64657465726d696e6174655c222c5c227072656469636174655c223a7b5c226b696e645c223a5c22656c656d656e745f70726573656e745c222c5c22656c656d656e745c223a7b5c224964656e7469666965725c223a5c2272656164795c227d7d2c5c22726561646261636b5c223a6e756c6c2c5c22726561736f6e5c223a5c2263616e63656c6c65645f7768696c655f6177616974696e675f636f6e73656e745c227d222c226f7574636f6d65223a2263616e63656c6c6564222c22736574746c655f70617468223a22706f6c6c5f776974685f646561646c696e65227d"
   },
   "request": {
     "body_length": 167,

@@ -157,5 +157,5 @@ fn turn_stop_vectors_contain_no_screen_or_page_text() {
             count += 1;
         }
     }
-    assert!(count >= 9, "the complete turn-stop corpus is scanned");
+    assert!(count >= 10, "the complete turn-stop corpus is scanned");
 }

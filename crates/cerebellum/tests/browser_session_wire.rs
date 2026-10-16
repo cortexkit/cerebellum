@@ -5319,7 +5319,9 @@ async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound(
         .await
         .unwrap();
     let reply = consent_frame(&mut rx).await;
-    assert_eq!(body(&reply)["detail"]["decision"], "cancelled");
+    assert_eq!(body(&reply)["outcome"], "cancelled");
+    assert!(body(&reply).get("remedy").is_none());
+    assert!(body(&reply).get("detail").is_none());
     assert!(rx.try_recv().is_err(), "no reverse cancellation frame");
     let service = ScriptedCarrier::for_planes(&planes);
     assert!(service
@@ -7861,12 +7863,9 @@ async fn a_relayed_call_is_cancelled_like_any_other() {
         .await
         .unwrap();
     let reply = consent_frame(&mut rx).await;
-    assert_eq!(
-        body(&reply)["detail"]["decision"],
-        "cancelled",
-        "{}",
-        body(&reply)
-    );
+    assert_eq!(body(&reply)["outcome"], "cancelled", "{}", body(&reply));
+    assert!(body(&reply).get("remedy").is_none());
+    assert!(body(&reply).get("detail").is_none());
     assert!(rx.try_recv().is_err());
     assert!(ScriptedCarrier::for_planes(&planes)
         .calls()

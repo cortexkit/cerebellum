@@ -62,7 +62,14 @@ async fn turn_stop_cancel_browser_site_card_answers_and_detaches() {
     let stop = cancel(&request);
     send(&planes, &tx, stop.clone()).await;
     let reply = frame_for(&mut rx, 802).await;
-    assert_eq!(body(&reply)["detail"]["decision"], "cancelled");
+    let cancelled = body(&reply);
+    assert_eq!(cancelled["outcome"], "cancelled");
+    assert!(cancelled.get("remedy").is_none());
+    assert!(
+        cancelled.get("detail").is_none(),
+        "a stop is not a grant refusal"
+    );
+    assert!(cancelled.get("grant_request").is_none());
     assert!(service
         .calls()
         .iter()

@@ -1,7 +1,7 @@
 # Turn-stop cancellation, v1
 
-This is the cerebellum receive-side contract for a head's relayed
-`browser_use` and `computer_use` calls. It uses subc wire v2
+This is the cerebellum receive-side contract for Prefrontal core (ALF), which
+relays a head's `browser_use` and `computer_use` calls. It uses subc wire v2
 (`subc-protocol` 0.31.0). The executable examples are in
 [`crates/cerebellum/tests/vectors/turn-stop-cancel-v1`](../../crates/cerebellum/tests/vectors/turn-stop-cancel-v1/).
 They contain exact frames, not reconstructed tool-result examples.
@@ -60,7 +60,9 @@ Queues include the computer per-application/per-conversation lanes and the
 browser per-conversation lane. Waiting behind another call's consent card is
 still queued work, not permission to run when that other card is answered.
 Cancelling the queued call removes its ability to dispatch. It does **not**
-withdraw or detach the predecessor's card.
+withdraw or detach the predecessor's card. **The frame types differ:** queued
+browser cancellation is an `Error` with `code:"cancelled"`; queued computer
+cancellation is a `Response` with `outcome:"cancelled"`. Core must handle both.
 
 * **Computer `read_state`** in the queue returns a `Response`, exactly:
   `{"outcome":"cancelled","remedy":"the call was cancelled before it ran; nothing was done"}`.
@@ -68,7 +70,10 @@ withdraw or detach the predecessor's card.
 * **Computer `wait`** uses its wait-result vocabulary: `outcome:"cancelled"`,
   `attempts:0`, `settle_path:"poll_with_deadline"`, and an `evidence` JSON string
   with `status:"indeterminate"`, the requested predicate, `readback:null`, and
-  `reason:"{\"reason\":\"cancelled_while_awaiting_consent\"}"`.
+  `reason:"cancelled_while_awaiting_consent"`. The evidence remains a JSON
+  string, but its `reason` is an ordinary word, not a second JSON object
+  serialized into a string. This uses the existing wait-evidence schema and
+  requires no vocabulary revision.
 * **Computer `keys`/`type` and takeover input** use the synthetic cancellation
   result: `outcome:"cancelled"`, `posts_returned:0`,
   `reason:"caller_interrupted_none_held"`, and
@@ -155,15 +160,17 @@ outlive the call, but cannot authorize that call to restart.
 
 ### Owned-browser site card
 
-The browser keeps the original authorization refusal and adds
-`detail.decision:"cancelled"`. The exact example is:
+Cerebellum returns `outcome:"cancelled"` with the call's existing browser
+context. It discards the authorization refusal: no `reason:"no_grant"`,
+`detail.grant_request`, or open-grant/retry remedy survives. Stopping a turn
+is not the person denying permission. The exact example is:
 
 ```json
-{"context":{"profile_disposition":"durable","profile_name":"default","profile_uuid":null,"session_kind_effective":"primary"},"detail":{"attempted_origin":"https://requested.example","decision":"cancelled","grant_request":{"hazards":[],"origins":["https://requested.example"],"severity_tier":3},"reason":"no_grant","required":{"credential":false,"financial":false,"tier":3}},"outcome":"authorization_denied","remedy":"call browser.open_grant with the arguments in detail.grant_request, then retry"}
+{"context":{"profile_disposition":"durable","profile_name":"default","profile_uuid":null,"session_kind_effective":"primary"},"outcome":"cancelled"}
 ```
 
-The origin, required severity, grant request, context, and original refusal
-reason/remedy are request-dependent. This is a `Response`, not the queued
+The response's `context` retains the original call's profile identity and
+effective session kind. This is a `Response`, not the queued
 browser `Error`. The detached site card is still answerable; its late answer
 can mint the corresponding grant when the session drains its answer feed.
 It cannot navigate, click, or otherwise resume the cancelled action. An
@@ -175,9 +182,10 @@ the request that raised it has ended.
 `browser:"user"` site cards are different: their answer belongs only to the
 current call. Cancellation **withdraws and forgets** that card, never detaches
 it for another call to use. A late answer cannot mint permission from that
-forgotten card. Before a user-browser mutation, the frame handler's outer
-response is `{"context":null,"outcome":"cancelled"}`; once a mutation may
-have started, the uncertainty family above applies. The user-browser bridge
+forgotten card. A call cancelled while parked on this card responds exactly
+`{"browser":"user","input_dispatched":false,"outcome":"cancelled"}`, with no
+grant request or retry remedy. Once a mutation may have started, the uncertainty
+family above applies. The user-browser bridge
 also observes the request's Cancel while queued or awaiting a browser RPC;
 an already-sent RPC cannot be recalled. This does not close any of the
 person's tabs or revoke unrelated site grants.
@@ -189,9 +197,13 @@ through the same request address. Its frame-handler response is exactly
 `{"context":null,"outcome":"cancelled"}`. The card is detached, not withdrawn
 on an ordinary turn-stop. No browser is launched by a late approval alone.
 
-`import_login` also detaches its login card on turn-stop. Its outer cancellation
-response before dispatch is `{"context":null,"outcome":"cancelled"}`; the
-inner import records a not-transferred result, not a transfer authorization.
+`import_login` also detaches its login card on turn-stop. Its cooperative
+response has exactly `outcome:"cancelled"` and the request's `domains_matched`
+array, with no denial, grant request, or retry remedy. The import result schema
+explicitly permits this cancellation outcome, and the audit also records
+cancellation rather than a person's denial. If cleanup cannot return that
+result within its allowance, the frame handler's before-dispatch fallback is
+`{"context":null,"outcome":"cancelled"}`. Neither result authorizes a transfer.
 This is distinct from the call's bounded wait for an unanswered card ending
 normally, which replies
 `consent_pending` with `ask_id` and the import/capture-specific pending fields.
@@ -226,9 +238,10 @@ already-started transfer.
 
 1. Send one empty-body Cancel for each still-outstanding relayed call on stop.
 2. Never wait for a separate Cancel reply, including when a reply won the race.
-3. Accept `Error(cancelled)`, before-dispatch `cancelled`, site-card
-   `authorization_denied` with `detail.decision:"cancelled"`, and the
-   after-dispatch uncertainty family. Do not reduce these to a success flag.
+3. Accept `Error(cancelled)`, before-dispatch `Response` results with
+   `outcome:"cancelled"`, and the after-dispatch uncertainty family. A stopped
+   card wait is not `authorization_denied` and carries no ask-again advice.
+   Do not reduce these results to a success flag.
 4. Preserve uncertainty and held-input status. Read state before considering a
    retry; turn-stop itself implies no retry.
 5. Do not dismiss a still-answerable card or active login handoff on the

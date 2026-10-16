@@ -1,10 +1,12 @@
 # Turn-stop Cancel v1 vectors
 
-These nine JSON files record frames observed at cerebellum's production
+These ten JSON files record frames observed at cerebellum's production
 `handle_frame_for_test` entry point (which delegates to `handle_frame`). They
 are not replies assembled by a test from an expected JSON object. The computer
 cases use a scripted platform sequence or an in-process consent service; the
-browser cases use a scripted browser and consent service. No installed app,
+browser cases use a scripted browser and consent service. The user-browser
+site-card case uses a scripted extension bridge and pins withdrawal as well as
+its cancellation reply. No installed app,
 real input post, screen text, page text, or login secret is required.
 
 Each file contains:

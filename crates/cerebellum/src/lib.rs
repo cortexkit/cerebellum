@@ -4949,9 +4949,8 @@ async fn complete_login_import(
     }
     let result = match &answer {
         Some(answer) => plan.conclude(answer),
-        // A cancelled request is still recorded as not transferred, as it
-        // always has been; its caller has stopped waiting for the reply.
-        None => plan.decide(None),
+        // A caller stop authorizes no transfer and is not a person's denial.
+        None => plan.cancelled(),
     };
     execution_result = result.to_value();
     let mut reply = journal_login_import_result(planes, &facts.identity, result).await;
@@ -7233,6 +7232,17 @@ async fn serve_browser_with_consent(
             pending["context"] = reply["context"].clone();
             planes.browser.finish_reply(capability.name(), pending)
         }
+        InCall::Cancelled if !draining => {
+            // Stopping the call did not deny permission. Discard the original
+            // grant refusal and its ask-again advice so a stopped turn cannot
+            // start another consent loop.
+            planes.browser.finish_reply(
+                capability.name(),
+                json!({
+                    "outcome": "cancelled", "context": reply["context"],
+                }),
+            )
+        }
         ending => {
             let decision = match &ending {
                 InCall::Settled(ending) => {
@@ -7291,9 +7301,8 @@ fn in_call_grant_decision(ending: &cingulate_client::desk::Ending) -> &'static s
 /// What the caller should do after each [`in_call_grant_decision`]. It replaces
 /// the remedy the `authorization_denied` refusal already carries (open the
 /// grant and retry), which is right only for a question a person might still
-/// answer. `None` keeps that remedy: the question was cancelled, its route
-/// closed, or the module began draining before the question ended, so nothing
-/// was decided.
+/// answer. Caller cancellation returns a separate `cancelled` result with no
+/// grant remedy. `None` keeps the original remedy for other stop conditions.
 fn in_call_grant_remedy(decision: &str) -> Option<&'static str> {
     match decision {
         "declined" => Some("the person declined this grant; ask again only if they change their mind"),
@@ -10779,7 +10788,7 @@ mod tests {
             .unwrap();
         let reply = next_frame(&mut writer_rx).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(body["outcome"], "cancelled", "{body}");
+        assert_eq!(body, json!({"context":null,"outcome":"cancelled"}));
         crate::turn_stop_vectors::check(
             "capture-login-card",
             "parked awaiting the 30-minute capture card before login handoff",
@@ -12889,6 +12898,67 @@ mod login_import_consent_tests {
             planes.consent.has_single_use_approvals()
                 || planes.management.computer_grants().remembers_login_answer()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_import_card_has_no_refusal_or_retry_advice() {
+        let consent = ScriptedConsent::new();
+        consent.raises("el_imp_stop");
+        consent
+            .script
+            .then(CONSENT_AWAIT, cingulate_client::Reply::Hang)
+            .then(
+                CONSENT_DETACH,
+                cingulate_client::Reply::Result(json!({
+                    "elicitation_id":"el_imp_stop", "state":"pending", "detached":true,
+                })),
+            );
+        let planes = planes(&consent);
+        let root = root();
+        let (tx, _rx) = mpsc::channel(8);
+        let facts = planes.routes.get(1, 1).unwrap();
+        let cancel = CancelHandle::pending();
+        let waiting = computer_grants::tests::with_live(complete_login_import(
+            &planes,
+            &facts,
+            &tx,
+            1,
+            1,
+            plan(&root),
+            Some(cancel.clone()),
+        ));
+        let stop = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while consent.methods().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("import is waiting on its card");
+            cancel.cancel();
+        };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(waiting, stop)
+        })
+        .await
+        .expect("cancelled import answers promptly");
+        assert_eq!(reply["outcome"], "cancelled");
+        assert!(reply.get("remedy").is_none());
+        assert!(reply.get("grant_request").is_none());
+        browser::validate_browser_result(management::IMPORT_LOGIN, &reply).unwrap();
+        assert_eq!(
+            consent.methods(),
+            [CONSENT_REQUEST, CONSENT_AWAIT, CONSENT_DETACH]
+        );
+        assert_eq!(
+            planes
+                .consent
+                .unapplied(&computer_grants::tests::session_key("test-project"))
+                .len(),
+            1,
+            "the cancelled call leaves its card answerable but cannot transfer a login"
+        );
+        assert!(!root.join("profile").exists());
     }
 
     #[tokio::test]

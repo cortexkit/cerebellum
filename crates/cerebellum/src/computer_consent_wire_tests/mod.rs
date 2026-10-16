@@ -331,6 +331,8 @@ async fn turn_stop_cancel_computer_app_card_accepts_empty_and_legacy_bodies() {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["outcome"], "cancelled");
         assert_eq!(body["attempts"], 0);
+        let evidence: Value = serde_json::from_str(body["evidence"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["reason"], "cancelled_while_awaiting_consent");
         settle_to(&planes, (0, 0)).await;
         assert!(planes.management.computer_grants().question_open(&ask_id));
         assert!(planes
