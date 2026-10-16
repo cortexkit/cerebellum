@@ -31,15 +31,8 @@ pub const AGENT_GRANT_STORE_FORMAT: DurableFormat = DurableFormat::new("agent-gr
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GrantHolder {
-    Head {
-        agent_id: String,
-    },
-    Worker {
-        agent_id: String,
-        owner: String,
-        scope_ref: String,
-        scope_epoch: u64,
-    },
+    Head { agent_id: String },
+    Worker { agent_id: String, scope_ref: String },
 }
 
 impl GrantHolder {
@@ -124,12 +117,8 @@ impl AgentGrant {
         if self.id.is_empty() || self.holder.agent_id().is_empty() || self.machine_uuid.is_empty() {
             return Err(corrupt("a row needs an id, holder and machine identity"));
         }
-        if let GrantHolder::Worker {
-            owner, scope_ref, ..
-        } = &self.holder
-        {
-            if owner.is_empty()
-                || scope_ref.is_empty()
+        if let GrantHolder::Worker { scope_ref, .. } = &self.holder {
+            if scope_ref.is_empty()
                 || self.expires_at_ms.is_none_or(|expires| {
                     expires <= self.granted_at_ms || expires - self.granted_at_ms > 30 * 60 * 1000
                 })

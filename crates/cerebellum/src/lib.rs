@@ -2398,6 +2398,8 @@ where
     send_hello(&writer, config).await?;
     expect_hello_ack(read_half).await?;
 
+    planes.scopes.control.connect(&writer);
+
     let mut idle_wake = PeriodicIdleWake {
         period: idle_wake_period(config.health.heartbeat_threshold()),
     };
@@ -3535,13 +3537,57 @@ async fn handle_route_request(
             }
         }
     }
-    if let Ok(live) = consent_drain::live_call(&frame, &facts, planes) {
+    let worker = if facts.admits_session_calls() {
+        match permission_scope::resolve_worker(&facts, &planes.scopes).await {
+            Ok(worker) => worker,
+            Err(refusal) => {
+                let (reason, remedy) = match refusal {
+                    permission_scope::HeadRefusal::NoHolder => (
+                        "no_agent_session",
+                        "open a worker route under a live head session",
+                    ),
+                    permission_scope::HeadRefusal::Unavailable => (
+                        "worker_head_unavailable",
+                        "retry when the daemon and scope owner are available",
+                    ),
+                };
+                return send_tool_response(writer, ver, channel, epoch, corr, json!({
+                    "outcome":"consent_unavailable", "reason":reason,
+                    "detail":{"reason":reason, "retryable":refusal == permission_scope::HeadRefusal::Unavailable},
+                    "remedy":remedy,
+                })).await;
+            }
+        }
+    } else {
+        None
+    };
+    permission_scope::WORKER_HOLDER
+        .scope(
+            worker,
+            dispatch_resolved_route(frame, writer, planes, &facts),
+        )
+        .await
+}
+
+async fn dispatch_resolved_route(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
         // A failed drain is retried on a later call; it must not replace this
         // call's ordinary reply with a consent refusal.
         let _ = planes.consent_drain.run(&planes.consent, &live).await;
     }
 
-    let dispatch = dispatch_bound_route(frame, writer, planes, &facts);
+    let dispatch = dispatch_bound_route(frame, writer, planes, facts);
     if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode {
         let cancel = planes.cancellations.get((channel, epoch, corr));
         tokio::select! {
