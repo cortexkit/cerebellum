@@ -27,8 +27,18 @@ go quickly; the gate exists for the cases where the shape is the question.
   stay thin FFI seams with no decisions in them.
 - Nothing in `tests/` that needs an installed application; live probes
   against a real browser or desktop live in `examples/`.
-- `scripts/rust-test-gate.sh` green, with its final `GATE PASSED` line in
-  the pull request description.
+- `scripts/fast-gate.sh` green against `origin/main` (or the intended base).
+  The full `scripts/rust-test-gate.sh` remains required after deployment; it is
+  not a pre-push gate.
+
+## Landing flow
+
+Run `scripts/fast-gate.sh` against the landing base, then push the change. Stage
+and deploy it with the normal release flow, and run `scripts/rust-test-gate.sh`
+after deployment. The full gate still runs post-deploy so the running module is
+checked without holding up the common landing path. If that full gate finds a
+failure, fix it forward with a new change; do not roll back the deployed change
+just to make the gate green.
 
 ## Dependencies
 
