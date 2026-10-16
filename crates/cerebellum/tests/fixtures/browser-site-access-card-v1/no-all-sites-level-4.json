@@ -4,7 +4,7 @@
   "facts": [
     {
       "label": "Standing access",
-      "value": "news.example and its subdomains"
+      "value": "example.com and its subdomains"
     },
     {
       "label": "Can",
@@ -28,13 +28,13 @@
       "detail": "Up to making lasting changes.",
       "effect": "grant",
       "id": "allow_30m",
-      "label": "Allow on news.example for 30 minutes"
+      "label": "Allow on example.com for 30 minutes"
     },
     {
       "detail": "Up to making lasting changes.",
       "effect": "grant",
       "id": "allow_origin_always",
-      "label": "Always allow on news.example and its subdomains"
+      "label": "Always allow on example.com and its subdomains"
     },
     {
       "effect": "decline",
@@ -42,7 +42,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Let the agent use its own browser on news.example to read pages and click, including actions that make lasting changes.",
+  "prompt": "Let the agent use its own browser on example.com to read pages and click, including actions that make lasting changes.",
   "requestedSchema": {
     "additionalProperties": false,
     "properties": {
@@ -62,14 +62,14 @@
   },
   "scope": {
     "origins": [
-      "https://news.example"
+      "https://example.com"
     ],
     "tier": 4
   },
   "target": {
     "kind": "site",
-    "label": "news.example"
+    "label": "example.com"
   },
-  "title": "Allow access to news.example?",
+  "title": "Allow access to example.com?",
   "urgency": "high"
 }

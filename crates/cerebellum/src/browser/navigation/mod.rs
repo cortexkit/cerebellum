@@ -5964,7 +5964,7 @@ mod tests {
         assert!(hazards(&cross).is_empty(), "{cross:?}");
         assert_eq!(
             cross.activation_destination_origin.as_deref(),
-            Some("https://cross-origin.invalid")
+            Some("https://external.example.com")
         );
         assert_eq!(required(&cross), Severity::new(1, false, false));
 

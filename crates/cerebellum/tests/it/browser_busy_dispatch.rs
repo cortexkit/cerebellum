@@ -90,7 +90,7 @@ impl CdpPipeIo for FixturePipe {
                     std::fs::write(attachment.downloads.join("report.txt"), "fixture payload")
                         .unwrap();
                 }
-                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"navigation-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"navigation-download","url":"https://requested.example.com/attachment","suggestedFilename":"report.txt"}}));
                 json!({"frameId":"target-own","isDownload":true,"errorText":"net::ERR_ABORTED"})
             }
             "Accessibility.getRootAXNode" => {
@@ -128,7 +128,7 @@ impl CdpPipeIo for FixturePipe {
                     document["nodes"][1]["localName"] = json!("a");
                     document["nodes"][1]["nodeName"] = json!("A");
                     document["nodes"][1]["attributes"] =
-                        json!(["href", "https://requested.example/attachment"]);
+                        json!(["href", "https://requested.example.com/attachment"]);
                 }
                 document
             }
@@ -138,9 +138,9 @@ impl CdpPipeIo for FixturePipe {
             "DOM.querySelector" => json!({"nodeId":2}),
             "DOM.getOuterHTML" => json!({"outerHTML":"<div>Event row</div>"}),
             "Page.getFrameTree" => {
-                let mut tree = json!({"frameTree":{"frame":{"id":"frame-main","loaderId":if self.main_loader_changed { "loader-new" } else { "loader-page" },"url":"https://requested.example/page","securityOrigin":"https://requested.example"}}});
+                let mut tree = json!({"frameTree":{"frame":{"id":"frame-main","loaderId":if self.main_loader_changed { "loader-new" } else { "loader-page" },"url":"https://requested.example.com/page","securityOrigin":"https://requested.example.com"}}});
                 if self.hidden_owner {
-                    tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"frame-child","loaderId":"child-loader","url":"https://embedded.example/frame","securityOrigin":"https://embedded.example"},"childFrames":[{"frame":{"id":"frame-grandchild","loaderId":"grandchild-loader","url":"https://nested.example/frame","securityOrigin":"https://nested.example"}}]}]);
+                    tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"frame-child","loaderId":"child-loader","url":"https://embedded.example.net/frame","securityOrigin":"https://embedded.example.net"},"childFrames":[{"frame":{"id":"frame-grandchild","loaderId":"grandchild-loader","url":"https://nested.example.org/frame","securityOrigin":"https://nested.example.org"}}]}]);
                     if self.private_frames {
                         tree["frameTree"]["childFrames"][0]["frame"]["url"] =
                             json!("http://127.0.0.1/admin");
@@ -164,7 +164,7 @@ impl CdpPipeIo for FixturePipe {
                 json!({})
             }
             "Page.getNavigationHistory" => {
-                json!({"currentIndex":0,"entries":[{"id":1,"url":"https://requested.example/page"}]})
+                json!({"currentIndex":0,"entries":[{"id":1,"url":"https://requested.example.com/page"}]})
             }
             "DOM.getContentQuads" => json!({"quads":[[0,0,100,0,100,40,0,40]]}),
             "Page.getLayoutMetrics" => {
@@ -246,7 +246,7 @@ impl CdpPipeIo for FixturePipe {
                         .unwrap();
                 }
                 self.queue(json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"requestId":"attachment","frameId":"target-own","type":"Document","response":{"status":200,"statusText":"OK","headers":{"Content-Disposition":"attachment; filename=report.txt"}}}}));
-                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"fixture-download","url":"https://requested.example/attachment","suggestedFilename":"report.txt"}}));
+                self.queue(json!({"method":"Browser.downloadWillBegin","params":{"frameId":"target-own","guid":"fixture-download","url":"https://requested.example.com/attachment","suggestedFilename":"report.txt"}}));
             }
         }
         if self.block_once == Some(method) {
@@ -690,7 +690,7 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
             .unwrap()
             .contains(&json!("download_blocked")));
         cerebellum::browser::validate_browser_result("browser.click", &reply).unwrap();
-        let navigated = plane.serve(&route, BrowserCapability::Navigate, &json!({"url":"https://requested.example/attachment","intent":"read an attachment URL","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}})).await.unwrap();
+        let navigated = plane.serve(&route, BrowserCapability::Navigate, &json!({"url":"https://requested.example.com/attachment","intent":"read an attachment URL","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}})).await.unwrap();
         assert_eq!(navigated["outcome"], "unsupported_download", "{navigated}");
         assert!(navigated["remedy"]
             .as_str()

@@ -99,7 +99,7 @@
           "id",
           "cross",
           "href",
-          "https://cross-origin.invalid/landing"
+          "https://external.example.com/landing"
         ],
         "backendNodeId": 17,
         "childNodeCount": 1,

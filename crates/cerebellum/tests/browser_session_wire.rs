@@ -3310,19 +3310,19 @@ async fn a_browser_relaunched_after_close_serves_snapshots() {
 async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
-    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    grant_browser(&planes, "https://example.com", Vec::new()).await;
     grant_browser(&planes, "https://landed.example:8443", Vec::new()).await;
 
-    let first = launch_session_at(&planes, &launcher.page, 1, "https://requested.example").await;
+    let first = launch_session_at(&planes, &launcher.page, 1, "https://example.com").await;
     close_session(&planes, 2, &first).await;
-    launch_session_at(&planes, &launcher.page, 3, "https://requested.example").await;
+    launch_session_at(&planes, &launcher.page, 3, "https://example.com").await;
 
     let navigated = response_body(
         &planes,
         4,
         "browser.navigate",
         json!({
-            "url": "https://requested.example/",
+            "url": "https://example.com/",
             "intent": "read the page after a relaunch",
             "wait": "settle",
             "severity": {"tier": 1, "credential": false, "financial": false},
@@ -4600,7 +4600,7 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
         9,
         "browser.navigate",
         json!({
-            "url": "https://requested.example/",
+            "url": "https://example.com/",
             "intent": "read the page as it lands",
             "wait": "settle",
             "severity": {"tier": 1, "credential": false, "financial": false},
@@ -4976,7 +4976,7 @@ fn blocking_navigation(tier: u8) -> Frame {
     request(
         801,
         "browser.navigate",
-        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":tier,"credential":false,"financial":false}}),
+        json!({"url":"https://example.com/path", "intent":"read the page", "wait":"none", "severity":{"tier":tier,"credential":false,"financial":false}}),
     )
 }
 
@@ -5069,7 +5069,7 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     let body: Value = serde_json::from_slice(&question.body).unwrap();
     assert_eq!(
         body["params"]["scope"]["origins"],
-        json!(["https://requested.example"])
+        json!(["https://example.com"])
     );
     let p = &body["params"];
     assert_eq!(p["kind"], "consent");
@@ -5079,12 +5079,9 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
     // the public-browsing baseline, without inventing a form hazard.
     assert_eq!(
         p["scope"],
-        json!({"origins": ["https://requested.example"], "tier": 3})
+        json!({"origins": ["https://example.com"], "tier": 3})
     );
-    assert_eq!(
-        p["target"],
-        json!({"kind": "site", "label": "requested.example"})
-    );
+    assert_eq!(p["target"], json!({"kind": "site", "label": "example.com"}));
     assert_eq!(p["default"], "deny");
     assert_eq!(p["on_expiry"], "deny");
     assert_eq!(p["expires_in_ms"], 1_800_000);
@@ -5242,7 +5239,7 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
         // on the default port.
         assert_eq!(
             rows[0].subject,
-            cerebellum::agent_grants::GrantSubject::Domain("requested.example".into())
+            cerebellum::agent_grants::GrantSubject::Domain("example.com".into())
         );
     } else {
         assert!(rows.is_empty());
@@ -5510,7 +5507,7 @@ fn keyed_navigation(channel: u16, corr: u64, call_key: &str) -> Frame {
         channel,
         corr,
         "browser.navigate",
-        json!({"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
+        json!({"url":"https://example.com/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
         call_key,
     )
 }
@@ -6020,7 +6017,7 @@ async fn typed_text_never_reaches_the_call_records() {
             9,
             801,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
+            json!({"url":"https://example.com/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
             "pf:secret-1",
         ),
     )
@@ -6574,7 +6571,7 @@ async fn named_preset_refusal_records_refused_before_dispatch() {
 async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
-    grant_browser(&planes, "https://requested.example", Vec::new()).await;
+    grant_browser(&planes, "https://example.com", Vec::new()).await;
     bind_route(&planes, 9, reserved("prefrontal-core"), None).await;
     let (tx, mut rx) = mpsc::channel(8);
     let refused = exchange(
@@ -6585,7 +6582,7 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
             9,
             801,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            json!({"url":"https://example.com/path", "intent":"read", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
             "pf:unscoped",
         ),
     )
@@ -6634,7 +6631,7 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
             12,
             801,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
+            json!({"url":"https://example.com/path", "intent": SECRET, "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
             "pf:scoped-1",
         ),
     )
@@ -6887,7 +6884,7 @@ async fn scoped_browser(planes: &Planes) -> String {
         Some(scope_stamp(4, true)),
     )
     .await;
-    grant_browser(planes, "https://requested.example", Vec::new()).await;
+    grant_browser(planes, "https://example.com", Vec::new()).await;
     let question = planes
         .management
         .browser_grant_question_for_test(
@@ -7134,7 +7131,7 @@ async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() 
     permission_support::seed(
         planes.management.agent_grants(),
         "test-project",
-        cerebellum::agent_grants::GrantSubject::Origin("https://requested.example".into()),
+        cerebellum::agent_grants::GrantSubject::Origin("https://example.com".into()),
         3,
         vec![],
         Some(1_800_000),
@@ -7174,7 +7171,7 @@ async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() 
             15,
             840,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
+            json!({"url":"https://example.com/path", "intent":"read", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
         ),
     )
     .await;
@@ -7478,7 +7475,7 @@ fn relayed_navigation(
 ) -> Frame {
     let mut request = json!({
         "name": "browser.navigate",
-        "arguments": {"url":"https://requested.example/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}},
+        "arguments": {"url":"https://example.com/path", "intent":"read the page", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}},
     });
     if let Some(call_key) = call_key {
         request["call_key"] = call_key.into();
@@ -9764,17 +9761,17 @@ async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Val
 async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     let (planes, launcher) = flow_planes();
     bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
-    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://page.example/page","intent":"read the page","severity":{"tier":3,"credential":false,"financial":false}})).await;
+    let reply = flow_wire_call(&planes, 2, json!({"action":"navigate","url":"https://example.org/page","intent":"read the page","severity":{"tier":3,"credential":false,"financial":false}})).await;
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     let token = reply["detail"]["grant"].as_str().unwrap();
     let label = reply["detail"]["grant_label"].as_str().unwrap();
     assert_eq!(
         decode_missing_grant(token),
-        json!({"tool":"browser_use","subject":{"domain":"page.example"},"level":3})
+        json!({"tool":"browser_use","subject":{"domain":"example.org"},"level":3})
     );
     assert_eq!(
         label,
-        "browser access to page.example up to filling in forms and other changes that can be undone"
+        "browser access to example.org up to filling in forms and other changes that can be undone"
     );
     bind_flow_wire_target(
         &planes,
@@ -9794,7 +9791,7 @@ async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     permission_support::seed(
         planes.management.agent_grants(),
         "pj-scope-agent",
-        cerebellum::agent_grants::GrantSubject::Domain("page.example".into()),
+        cerebellum::agent_grants::GrantSubject::Domain("example.org".into()),
         1,
         vec![],
         None,
@@ -9806,7 +9803,7 @@ async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     permission_support::seed(
         planes.management.agent_grants(),
         "pj-scope-agent",
-        cerebellum::agent_grants::GrantSubject::Domain("page.example".into()),
+        cerebellum::agent_grants::GrantSubject::Domain("example.org".into()),
         3,
         vec![],
         None,
@@ -10002,7 +9999,7 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
     bind_management_route(&planes).await;
     let service = ScriptedCarrier::for_planes(&planes);
     let (tx, mut rx) = mpsc::channel(8);
-    let opening = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), MANAGEMENT_CHANNEL, MANAGEMENT_EPOCH, 9800, serde_json::to_vec(&json!({"method":"browser.open_grant","params":{"origins":["https://requested.example"],"hazards":[],"severity_tier":3}})).unwrap()).unwrap();
+    let opening = Frame::build_with_version(PROTOCOL_VERSION, FrameType::Request, Flags::new(false, Priority::Interactive, false), MANAGEMENT_CHANNEL, MANAGEMENT_EPOCH, 9800, serde_json::to_vec(&json!({"method":"browser.open_grant","params":{"origins":["https://example.com"],"hazards":[],"severity_tier":3}})).unwrap()).unwrap();
     cerebellum::handle_frame_for_test(opening, &tx, &planes)
         .await
         .unwrap();

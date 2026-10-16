@@ -969,10 +969,27 @@ pub(crate) fn domain_covers(domain: &str, origin: &str) -> bool {
                 .is_some_and(|prefix| prefix.ends_with('.')))
 }
 
-/// Public-web access excludes raw addresses and service ports because those
-/// often name local or development services rather than public websites. An
-/// exact per-site grant can still cover them. DNS resolution remains subject
-/// to the connector's restricted-address policy.
+/// Special-use and commonly deployed private DNS suffixes, including names
+/// described by RFC 6761, RFC 8375, and RFC 6762 Appendix G. These names and their
+/// subdomains are not public websites, even when an enclosing PSL rule exists.
+const NON_PUBLIC_DNS_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "internal",
+    "home.arpa",
+    "localdomain",
+    "lan",
+    "home",
+    "corp",
+    "intranet",
+    "private",
+];
+
+/// Public-web access requires a registrable DNS name under an explicit PSL
+/// rule: single-label names and unlisted suffixes can resolve on local networks,
+/// and public suffixes alone do not identify a site. Raw addresses and service
+/// ports are excluded too. An exact per-site grant can still cover them. DNS
+/// resolution remains subject to the connector's restricted-address policy.
 pub fn origin_is_public(origin: &str) -> bool {
     let Some(canonical) = canonical_grant_origin(origin) else {
         return false;
@@ -987,12 +1004,12 @@ pub fn origin_is_public(origin: &str) -> bool {
     }
     let host = authority.trim_end_matches('.');
     if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host == "local"
-        || host.ends_with(".local")
-        || host == "internal"
-        || host.ends_with(".internal")
+        || NON_PUBLIC_DNS_SUFFIXES.iter().any(|suffix| {
+            host == *suffix
+                || host
+                    .strip_suffix(*suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     {
         return false;
     }
@@ -1000,7 +1017,7 @@ pub fn origin_is_public(origin: &str) -> bool {
         label.bytes().all(|byte| byte.is_ascii_digit())
             || label.starts_with("0x")
             || label.starts_with("0X")
-    })
+    }) && crate::public_suffix::registrable_domain_listed(host).is_some()
 }
 
 #[cfg(test)]
@@ -1085,6 +1102,57 @@ mod tests {
             "http://0x7f.1",
         ] {
             assert!(!origin_is_public(local), "{local} should not be public");
+        }
+    }
+
+    #[test]
+    fn public_dns_names_require_a_label_beyond_the_public_suffix() {
+        for (origin, public) in [
+            ("https://intranet", false),
+            ("https://printer", false),
+            ("https://router", false),
+            ("https://intranet.", false),
+            ("https://com", false),
+            ("https://co.uk", false),
+            ("https://github.io", false),
+            ("https://nas.lan", false),
+            ("https://router.home", false),
+            ("https://printer.corp", false),
+            ("https://server.localdomain", false),
+            ("https://x.home.arpa", false),
+            ("https://site.unlisted-public-suffix-test", false),
+            ("https://example.123", false),
+            ("https://example.123.", false),
+            ("https://example.com", true),
+            ("http://example.com", true),
+            ("https://example.com.", true),
+            ("https://foo.github.io", true),
+            ("https://bbc.co.uk", true),
+            ("https://example.dev", true),
+            ("https://foo.app", true),
+            ("https://nothome.arpa", true),
+        ] {
+            assert_eq!(origin_is_public(origin), public, "{origin}");
+        }
+    }
+
+    #[test]
+    fn special_use_dns_names_and_their_subdomains_are_not_public() {
+        for host in [
+            "localhost",
+            "local",
+            "internal",
+            "home.arpa",
+            "localdomain",
+            "lan",
+            "home",
+            "corp",
+            "intranet",
+            "private",
+        ] {
+            for origin in [format!("https://{host}"), format!("https://x.{host}.")] {
+                assert!(!origin_is_public(&origin), "{origin}");
+            }
         }
     }
 

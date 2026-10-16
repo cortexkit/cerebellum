@@ -2960,8 +2960,8 @@ mod tests {
             .open_browser_grant_at_tier(
                 "conversation",
                 vec![
-                    "https://login.example".to_string(),
-                    "https://pay.example".to_string(),
+                    "https://example.com".to_string(),
+                    "https://example.net".to_string(),
                 ],
                 vec![
                     HazardClass::CredentialFormSubmit,
@@ -2982,10 +2982,10 @@ mod tests {
         );
         assert_eq!(
             question.body["params"]["target"]["label"],
-            "login.example, pay.example"
+            "example.com, example.net"
         );
         let prompt = question.body["params"]["prompt"].as_str().unwrap();
-        assert!(prompt.contains("login.example") && prompt.contains("pay.example"));
+        assert!(prompt.contains("example.com") && prompt.contains("example.net"));
         assert_eq!(reply["outcome"], "consent_pending");
         assert_eq!(
             question.body["params"]["scope"]["origins"],
@@ -3031,8 +3031,8 @@ mod tests {
                 .map(|row| row.subject.clone())
                 .collect::<Vec<_>>(),
             vec![
-                crate::agent_grants::GrantSubject::Domain("login.example".into()),
-                crate::agent_grants::GrantSubject::Domain("pay.example".into())
+                crate::agent_grants::GrantSubject::Domain("example.com".into()),
+                crate::agent_grants::GrantSubject::Domain("example.net".into())
             ]
         );
         for row in rows {

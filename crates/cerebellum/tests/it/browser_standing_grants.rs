@@ -55,7 +55,7 @@ mod cingulate_answer;
 const MACHINE: &str = "machine-under-test";
 const AGENT: &str = "pj-standing-agent";
 const OTHER_AGENT: &str = "pj-another-agent";
-const PUBLIC: &str = "https://news.example";
+const PUBLIC: &str = "https://example.com";
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -170,7 +170,7 @@ impl OwnedBrowserProcess for Process {
                     NodeIdentityInput::new("target", "frame-main", 43),
                     TargetKind::Anchor,
                 )
-                .destination("https://other.example/page"),
+                .destination("https://example.org/page"),
             ),
             (
                 "Text",
@@ -948,7 +948,7 @@ async fn each_answered_option_mints_exactly_its_row() {
         assert_eq!(row.card_ref.as_deref(), Some(raised_id.as_str()));
         assert_eq!(row.granted_at_ms, fixture.clock_now());
         let subject = if matches!(id, "allow_30m" | "allow_origin_always") {
-            GrantSubject::Domain("news.example".into())
+            GrantSubject::Domain("example.com".into())
         } else {
             GrantSubject::AllSites
         };
@@ -978,14 +978,14 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
         (
             "primary, public, ordinary",
             Session::primary("c-full", AGENT).asking(),
-            "https://news.example/",
+            "https://example.com/",
             3,
             ALL_OPTIONS.to_vec(),
         ),
         (
             "lasting changes",
             Session::primary("c-level4", AGENT).asking(),
-            "https://news.example/",
+            "https://example.com/",
             4,
             no_all_sites.clone(),
         ),
@@ -1009,7 +1009,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
                 kind: "subagent",
                 ..Session::primary("c-worker", AGENT).asking()
             },
-            "https://news.example/",
+            "https://example.com/",
             3,
             worker_options,
         ),
@@ -1110,7 +1110,9 @@ async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other()
         "the same agent in a new conversation",
     );
     assert_refused(
-        &fixture.navigate(&later, "https://elsewhere.example/").await,
+        &fixture
+            .navigate(&later, "https://elsewhere.example.net/")
+            .await,
         "another origin",
     );
 
@@ -1130,18 +1132,24 @@ async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     let route = fixture.route(Session::primary("c-all", AGENT)).await;
-    for public in ["https://news.example/", "https://shop.example/item"] {
+    for public in ["https://example.com/", "https://example.net/item"] {
         assert_authorized(&fixture.navigate(&route, public).await, public);
     }
     // A read commits its decision, which re-checks the standing row.
     let captured = fixture.call(&route, "browser.screenshot", json!({})).await;
     assert_eq!(captured["outcome"], "ok", "{captured}");
     for local in [
-        "https://shop.example:8443/item",
+        "https://example.net:8443/item",
         "https://1.1.1.1/",
         "http://1.1.1.1/",
         "https://office.local/",
         "https://office.internal/",
+        "https://nas.lan/",
+        "https://router.home/",
+        "https://printer.corp/",
+        "https://server.localdomain/",
+        "https://x.home.arpa/",
+        "https://site.unlisted-public-suffix-test/",
         "http://127.0.0.1:8080/",
         "http://10.0.0.5/",
         "http://192.168.1.1/",
@@ -1151,13 +1159,13 @@ async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     }
     fixture.seed(
         AGENT,
-        GrantSubject::Origin("https://shop.example:8443".into()),
+        GrantSubject::Origin("https://example.net:8443".into()),
         3,
         &[],
     );
     assert_authorized(
         &fixture
-            .navigate(&route, "https://shop.example:8443/item")
+            .navigate(&route, "https://example.net:8443/item")
             .await,
         "an exact service-port grant",
     );
@@ -1296,12 +1304,12 @@ async fn the_thirty_minute_all_sites_row_expires() {
         .await;
     fixture.clock.advance_ms(ALL_SITES_SHORT_GRANT_MS - 1);
     assert_authorized(
-        &fixture.navigate(&route, "https://other.example/").await,
+        &fixture.navigate(&route, "https://example.org/").await,
         "one millisecond before expiry",
     );
     fixture.clock.advance_ms(1);
     assert_refused(
-        &fixture.navigate(&route, "https://other.example/").await,
+        &fixture.navigate(&route, "https://example.org/").await,
         "at expiry",
     );
     assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
@@ -1315,11 +1323,11 @@ async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
     fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
     fixture
         .browser
-        .redirect("https://news.example/go", "http://10.0.0.5/admin");
+        .redirect("https://example.com/go", "http://10.0.0.5/admin");
     let route = fixture.route(Session::primary("c-redirect", AGENT)).await;
     // The request names a public origin, so the navigation itself is covered.
     assert_authorized(
-        &fixture.navigate(&route, "https://news.example/go").await,
+        &fixture.navigate(&route, "https://example.com/go").await,
         "the navigation",
     );
     // Reading where it landed is not.
@@ -1429,7 +1437,7 @@ async fn revoke_access_removes_the_calling_agents_rows_only() {
         .call(
             &route,
             "browser_use",
-            json!({"action": "revoke_access", "origin": "https://news.example/path"}),
+            json!({"action": "revoke_access", "origin": "https://example.com/path"}),
         )
         .await;
     assert_eq!(invalid["outcome"], "invalid_request", "{invalid}");
@@ -1976,7 +1984,7 @@ async fn baseline_signed_in_typing_still_asks() {
         "never-signed-in typing",
     );
     observed_fixture_login(&fixture, &route, "c-baseline-type", PUBLIC).await;
-    let sibling = public_snapshot(&fixture, &route, "https://account.news.example").await;
+    let sibling = public_snapshot(&fixture, &route, "https://account.example.com").await;
     let mut cards = Vec::new();
     let typed = fixture.call_answering(&route, "browser.type", json!({"ref":named_ref(&sibling,"Text"),"snapshot_id":sibling["snapshot_id"],"text":"hello again"}), json!({"decision":"deny"}), |question| cards.push(question.clone())).await;
     assert_refused(&typed, "signed-in typing on a sibling");
@@ -2012,6 +2020,47 @@ async fn baseline_signed_in_typing_still_asks() {
 }
 
 #[tokio::test]
+async fn single_label_navigation_requires_a_site_card_even_with_an_all_sites_grant() {
+    for all_sites in [false, true] {
+        let mut fixture = Fixture::new();
+        if all_sites {
+            fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
+        }
+        let route = fixture
+            .route(Session::primary("c-single-label", AGENT).asking())
+            .await;
+        let mut offered = Vec::new();
+        let reply = fixture
+            .call_answering(
+                &route,
+                "browser.navigate",
+                navigation("https://intranet/", 1),
+                json!({"decision":"deny"}),
+                |question| offered.push(option_ids(question)),
+            )
+            .await;
+        assert_refused(&reply, "single-label navigation");
+        assert_eq!(
+            offered,
+            vec![vec!["allow_30m", "allow_origin_always", "deny"]],
+            "all-sites grant present: {all_sites}"
+        );
+        assert!(fixture.browser.effects().is_empty());
+
+        fixture.seed(
+            AGENT,
+            GrantSubject::Origin("https://intranet".into()),
+            3,
+            &[],
+        );
+        assert_authorized(
+            &fixture.navigate(&route, "https://intranet/").await,
+            "an exact single-label site grant",
+        );
+    }
+}
+
+#[tokio::test]
 async fn baseline_local_services_still_ask() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2021,11 +2070,17 @@ async fn baseline_local_services_still_ask() {
         "http://localhost/",
         "http://10.0.0.5/",
         "http://192.168.1.1/",
-        "https://news.example:8443/",
+        "https://example.com:8443/",
         "http://1.1.1.1/",
         "https://1.1.1.1/",
         "http://printer.local/",
         "https://service.internal/",
+        "https://nas.lan/",
+        "https://router.home/",
+        "https://printer.corp/",
+        "https://server.localdomain/",
+        "https://x.home.arpa/",
+        "https://site.unlisted-public-suffix-test/",
     ] {
         let mut cards = Vec::new();
         let reply = fixture
@@ -2098,7 +2153,7 @@ async fn baseline_login_record_survives_plane_restart() {
     let state: Value = serde_json::from_str(&bytes).unwrap();
     assert_eq!(
         state,
-        json!({"version":1,"profiles":{AGENT:{"default":{"domains":["news.example"],"signed_in_coverage":"complete","profile_uuid":"fixture-pj-standing-agent-default"}}}})
+        json!({"version":1,"profiles":{AGENT:{"default":{"domains":["example.com"],"signed_in_coverage":"complete","profile_uuid":"fixture-pj-standing-agent-default"}}}})
     );
     assert!(!bytes.contains("https://"));
     assert!(!bytes.contains("session"));
@@ -2205,9 +2260,13 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
         frame(
             "frame-nested",
             Some("frame-private"),
-            "https://nested.example",
+            "https://nested.example.net",
         ),
-        frame("frame-public", Some("frame-main"), "https://widget.example"),
+        frame(
+            "frame-public",
+            Some("frame-main"),
+            "https://widget.example.org",
+        ),
     ];
     assert_authorized(
         &fixture
@@ -2291,14 +2350,20 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
     let route = fixture
         .route(Session::primary("c-legacy-history", AGENT).asking())
         .await;
-    public_snapshot(&fixture, &route, "https://seen.example").await;
-    observed_fixture_login(&fixture, &route, "c-legacy-history", "https://seen.example").await;
+    public_snapshot(&fixture, &route, "https://seen.example.com").await;
+    observed_fixture_login(
+        &fixture,
+        &route,
+        "c-legacy-history",
+        "https://seen.example.com",
+    )
+    .await;
     fixture
         .planes
         .browser
         .journal_login_import(
             &route.identity,
-            "https://imported.example",
+            "https://imported.example.net",
             "transferred",
             Some("chrome"),
             1,
@@ -2314,7 +2379,7 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
     );
     assert_eq!(
         evidence.domains,
-        ["seen.example".to_string(), "imported.example".to_string()].into()
+        ["example.com".to_string(), "example.net".to_string()].into()
     );
     // A first registry lookup after an upgrade identifies an existing profile,
     // but the untimed journal cannot prove that all of its sign-ins are retained.
@@ -2322,7 +2387,10 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
         .signed_in
         .initialize_profile(AGENT, "default", "legacy-profile", false)
         .unwrap();
-    for origin in ["https://seen.example", "https://never-signed.example"] {
+    for origin in [
+        "https://seen.example.com",
+        "https://never-signed.example.org",
+    ] {
         let snapshot = public_snapshot(&fixture, &route, origin).await;
         let mut cards = Vec::new();
         let reply = fixture.call_answering(&route,"browser.type",json!({"ref":named_ref(&snapshot,"Text"),"snapshot_id":snapshot["snapshot_id"],"text":"legacy profile"}),json!({"decision":"deny"}),|question|cards.push(question.clone())).await;
@@ -2332,7 +2400,7 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
     }
     assert!(fixture
         .signed_in
-        .is_signed_in(AGENT, "default", "https://any-other.example"));
+        .is_signed_in(AGENT, "default", "https://unrecorded.example.dev"));
 }
 
 #[tokio::test]
