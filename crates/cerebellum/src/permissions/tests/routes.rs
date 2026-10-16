@@ -154,6 +154,55 @@ async fn cingulate_management_route_refuses_grants_list_and_every_other_method_b
 }
 
 #[tokio::test]
+async fn cingulate_management_route_refuses_requests_it_cannot_read_as_a_permissions_call() {
+    // A body that doesn't parse, or names no method at all, must be refused
+    // like any other non-permissions call rather than handed to the general
+    // dispatcher, whose grant processing runs before it would refuse.
+    let (planes, _, _, backend) = fixture(corpus_rows());
+    let ack = bind(&planes, cingulate(), management_target()).await;
+    assert_eq!(ack.header.ty, FrameType::Response);
+    let before = backend.load().unwrap();
+    for (corr, raw) in [
+        (200u64, b"not json".to_vec()),
+        (
+            201,
+            serde_json::to_vec(&json!({"tool":"computer_use"})).unwrap(),
+        ),
+        (202, serde_json::to_vec(&json!({"method":7})).unwrap()),
+    ] {
+        let frame = Frame::build(
+            FrameType::Request,
+            crate::control_flags(),
+            CHANNEL,
+            1,
+            corr,
+            raw,
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        crate::handle_frame_for_test(frame, &tx, &planes)
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refused.header.ty,
+            FrameType::Error,
+            "corr {corr}: {}",
+            body(&refused)
+        );
+        assert_eq!(body(&refused)["code"], "principal_denied", "corr {corr}");
+        assert_eq!(
+            backend.load().unwrap(),
+            before,
+            "corr {corr} changed grants"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cingulate_session_and_other_targets_stay_principal_denied() {
     let (planes, _, _, _) = fixture(corpus_rows());
     for target in [

@@ -33,17 +33,29 @@ pub(crate) fn refused_method(frame: &Frame, facts: &AcceptedBindFacts) -> Option
     if !is_aggregator(&facts.principal) {
         return None;
     }
-    let request: Value = serde_json::from_slice(&frame.body).ok()?;
     // Processing pending consent answers can mint grants before an operation's
     // handler runs. Reject unrelated names before that processing or any other
     // handler's grant lookup, even if the handler would eventually refuse.
-    if let Some(method) = request.get("method").and_then(Value::as_str) {
-        return (!is_operation(method)).then(|| method.to_string());
+    // Anything that isn't plainly one of the two operations is refused,
+    // including a body that doesn't parse or names no method, so a request
+    // shape this check doesn't recognise can't slip past it.
+    let request: Option<Value> = serde_json::from_slice(&frame.body).ok();
+    let method = request
+        .as_ref()
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str);
+    match method {
+        Some(method) if is_operation(method) => None,
+        Some(method) => Some(method.to_string()),
+        None => Some(
+            request
+                .as_ref()
+                .and_then(|request| request.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("<request without a method>")
+                .to_string(),
+        ),
     }
-    request
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 pub(crate) async fn handle(
