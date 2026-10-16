@@ -399,16 +399,44 @@ pub(crate) fn register(planes: &Planes) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_grants::{
+        AgentGrant, AgentGrantStorage, AgentGrantStoreError, AgentGrantStoreState, AgentGrants,
+        BrowserTarget, GrantHolder, GrantSubject, InMemoryAgentGrantStorage, LegacyGrantSource,
+    };
+    use crate::browser_standing_grants::ManualWallClock;
     use crate::cingulate_client::desk::FileRegistryStore;
     use crate::cingulate_client::double::{Reply, ScriptedCingulate};
     use crate::{Frame, FrameType, JournalPersistence};
     use cerebellum_core::health::HealthState;
     use subc_protocol::{BindIdentity, Flags, Priority, RouteTarget, PROTOCOL_VERSION};
 
+    #[derive(Default)]
+    struct GrantStorage {
+        inner: InMemoryAgentGrantStorage,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+    impl AgentGrantStorage for GrantStorage {
+        fn load(&self) -> Result<Option<AgentGrantStoreState>, AgentGrantStoreError> {
+            self.inner.load()
+        }
+        fn save(&self, state: &AgentGrantStoreState) -> Result<(), AgentGrantStoreError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.save(state)
+        }
+    }
+    impl LegacyGrantSource for GrantStorage {
+        fn load(&self) -> Result<AgentGrantStoreState, AgentGrantStoreError> {
+            Ok(AgentGrantStoreState::default())
+        }
+    }
+
     struct Fixture {
         planes: Planes,
         service: Arc<ScriptedCingulate>,
         root: std::path::PathBuf,
+        grant_storage: Arc<GrantStorage>,
+        clock: Arc<ManualWallClock>,
     }
     impl Fixture {
         fn new(unreadable: bool) -> Self {
@@ -424,6 +452,8 @@ mod tests {
                     .unwrap();
             }
             let service = ScriptedCingulate::new();
+            let grant_storage = Arc::new(GrantStorage::default());
+            let clock = Arc::new(ManualWallClock::at(100));
             let mut planes = Planes::with_browser_config_journaling(
                 Arc::new(HealthState::default()),
                 None,
@@ -434,7 +464,12 @@ mod tests {
                     crate::management::PlatformResolver::new(),
                 ))
                 .with_agent_grants(Arc::new(
-                    crate::agent_grants::AgentGrants::in_memory(Some("machine-test".into())),
+                    AgentGrants::open(
+                        grant_storage.clone(),
+                        grant_storage.as_ref(),
+                        Some("machine-test".into()),
+                    )
+                    .with_clock(clock.clone()),
                 )),
             );
             planes.browser = Arc::new(
@@ -467,6 +502,8 @@ mod tests {
                 planes,
                 service,
                 root,
+                grant_storage,
+                clock,
             }
         }
         async fn call(&self, method: &str, params: Value) -> Value {
@@ -499,6 +536,32 @@ mod tests {
                 json!({"origins":["https://requested.example"],"hazards":[]}),
             )
             .await
+        }
+        fn grant(&self, subject: GrantSubject, expires_at_ms: Option<u64>) -> AgentGrant {
+            let store = self.planes.management.agent_grants();
+            let mut row = AgentGrant {
+                id: String::new(),
+                holder: GrantHolder::Head {
+                    agent_id: "browser-tests".into(),
+                },
+                subject,
+                browser_target: Some(BrowserTarget::AgentProfile),
+                machine_uuid: "machine-test".into(),
+                granted_at_ms: store.now_ms(),
+                expires_at_ms,
+                card_ref: Some("el_existing".into()),
+                max_level: 2,
+                hazards: Vec::new(),
+                team_id: None,
+                designated_requirement: None,
+            };
+            row.id = store.upsert(row.clone(), store.now_ms()).unwrap();
+            row
+        }
+        fn writes(&self) -> usize {
+            self.grant_storage
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
         fn raised(&self, id: &str) {
             self.service.then(
@@ -671,6 +734,198 @@ mod tests {
         crate::handle_frame_for_test(cancel, &tx, &fixture.planes)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_grant_live_domain_covers_subdomains_without_cingulate_or_writes() {
+        for expiry in [None, Some(1_800_100)] {
+            let fixture = Fixture::new(false);
+            let row = fixture.grant(GrantSubject::Domain("example.com".into()), expiry);
+            let writes = fixture.writes();
+            fixture.raised("el_unexpected");
+            let reply = fixture
+                .call(
+                    crate::management::OPEN_GRANT,
+                    json!({"origins":["https://child.example.com"],"severity_tier":2,"hazards":[]}),
+                )
+                .await;
+            assert_eq!(reply["outcome"], "granted", "{reply}");
+            assert_eq!(reply["origins"], json!(["https://child.example.com"]));
+            assert!(reply.get("ask_id").is_none());
+            assert!(fixture.service.methods().is_empty());
+            assert_eq!(fixture.writes(), writes);
+            let store = fixture.planes.management.agent_grants();
+            assert_eq!(store.live_rows(None, store.now_ms()).unwrap(), vec![row]);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_grant_all_sites_excludes_non_public_origins_and_hazards() {
+        for (origin, hazards, expected) in [
+            ("https://example.com", json!([]), "granted"),
+            ("http://localhost", json!([]), "consent_pending"),
+            ("http://192.168.1.10", json!([]), "consent_pending"),
+            ("https://intranet.local", json!([]), "consent_pending"),
+            ("https://service.internal", json!([]), "consent_pending"),
+            ("https://example.com:8443", json!([]), "consent_pending"),
+            (
+                "https://example.com",
+                json!(["credential_form_submit"]),
+                "consent_pending",
+            ),
+            (
+                "https://example.com",
+                json!(["financial_form_submit"]),
+                "consent_pending",
+            ),
+            (
+                "https://example.com",
+                json!(["unverified_form_contents"]),
+                "consent_pending",
+            ),
+        ] {
+            let fixture = Fixture::new(false);
+            fixture.grant(GrantSubject::AllSites, None);
+            let writes = fixture.writes();
+            fixture.raised("el_missing");
+            let reply = fixture
+                .call(
+                    crate::management::OPEN_GRANT,
+                    json!({"origins":[origin],"severity_tier":2,"hazards":hazards}),
+                )
+                .await;
+            assert_eq!(reply["outcome"], expected, "{origin}: {reply}");
+            assert_eq!(fixture.writes(), writes);
+            if expected == "granted" {
+                assert!(fixture.service.methods().is_empty());
+            } else {
+                assert_eq!(reply["origins"], json!([origin]));
+                assert_eq!(
+                    fixture.service.methods(),
+                    ["consent.request", "consent.detach"]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn open_grant_expired_thirty_minute_grant_asks_again() {
+        let fixture = Fixture::new(false);
+        fixture.grant(
+            GrantSubject::Domain("requested.example".into()),
+            Some(1_800_100),
+        );
+        fixture.clock.advance_ms(1_800_001);
+        fixture.raised("el_expired_retry");
+        let reply = fixture.open().await;
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        assert_eq!(reply["ask_id"], "el_expired_retry");
+        assert_eq!(
+            fixture.service.methods(),
+            ["consent.request", "consent.detach"]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_grant_partial_coverage_asks_only_for_missing_origins() {
+        let fixture = Fixture::new(false);
+        fixture.grant(GrantSubject::Domain("example.com".into()), None);
+        fixture.raised("el_partial");
+        let reply = fixture
+            .call(
+                crate::management::OPEN_GRANT,
+                json!({
+                    "origins":["https://child.example.com","https://missing.example.org"],
+                    "severity_tier":2,
+                    "hazards":[],
+                }),
+            )
+            .await;
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        assert_eq!(reply["origins"], json!(["https://missing.example.org"]));
+        assert_eq!(
+            reply["already_covered_origins"],
+            json!(["https://child.example.com"])
+        );
+        assert_eq!(
+            fixture.service.methods(),
+            ["consent.request", "consent.detach"]
+        );
+        let request = fixture.service.calls()[0].1.to_string();
+        assert!(request.contains("missing.example.org"), "{request}");
+        assert!(!request.contains("example.com"), "{request}");
+        assert_eq!(
+            fixture
+                .planes
+                .management
+                .consent_subject(CardKind::WebsiteAccessInAdvance, "el_partial")
+                .unwrap(),
+            crate::cingulate_client::subject::website_access_in_call(
+                &fixture
+                    .planes
+                    .routes
+                    .get(4, 1)
+                    .unwrap()
+                    .identity
+                    .conversation_key,
+                &["https://missing.example.org".into()],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn open_grant_late_always_answer_never_raises_a_second_card() {
+        for acknowledged in [true, false] {
+            let fixture = Fixture::new(false);
+            fixture.raised("el_late_always");
+            assert_eq!(fixture.open().await["outcome"], "consent_pending");
+            fixture.service.then(
+                "consent.answers",
+                Reply::Result(json!({"records":[{
+                    "elicitation_id":"el_late_always",
+                    "state":"answered",
+                    "answered_choice_id":crate::management::BrowserGrantChoice::OriginAlways.option_id(),
+                }],"cursor":1})),
+            );
+            fixture.service.then(
+                "consent.ack",
+                if acknowledged {
+                    Reply::Result(json!({"cursor":1}))
+                } else {
+                    Reply::Refused("elicitation_store_error")
+                },
+            );
+            assert_eq!(fixture.open().await["outcome"], "granted");
+            let methods = fixture.service.methods();
+            assert_eq!(
+                methods,
+                [
+                    "consent.request",
+                    "consent.detach",
+                    "consent.answers",
+                    "consent.ack"
+                ]
+            );
+            let card = fixture.planes.consent.raised("el_late_always");
+            if acknowledged {
+                assert!(card.is_none());
+            } else {
+                assert!(card.unwrap().applied);
+            }
+            let writes = fixture.writes();
+            assert_eq!(fixture.open().await["outcome"], "granted");
+            assert_eq!(fixture.service.methods(), methods);
+            assert_eq!(fixture.writes(), writes);
+            let store = fixture.planes.management.agent_grants();
+            let rows = store.live_rows(None, store.now_ms()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].subject,
+                GrantSubject::Domain("requested.example".into())
+            );
+            assert_eq!(rows[0].expires_at_ms, None);
+            assert_eq!(rows[0].card_ref.as_deref(), Some("el_late_always"));
+        }
     }
 
     #[tokio::test]
