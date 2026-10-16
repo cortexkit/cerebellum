@@ -45,3 +45,11 @@ Without that variable, the test checks the committed bytes, checksum list,
 decline default, expiry denial and danger groups. Cingulate's production
 validator checks these exports separately; the local tests also check the
 stripped requests sent to older Cingulate versions.
+
+All 24 exported `consent.request` parameter files, including head and worker
+cards with danger options, were accepted by Cingulate 0.6.0's production
+`ConsentRequest::decode` validator, and every SHA256SUMS entry was verified.
+This records receiver acceptance for the phone release; the local shape checks
+alone cannot establish it. Validation used Cingulate commit `9986456` and
+Cerebellum export `05142d0b1d2ee1593dd114c170734f0c0ac14d7a`. Subsequent fixture
+and retained-operation routing changes preserve those JSON bytes.
