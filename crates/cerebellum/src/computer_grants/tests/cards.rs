@@ -115,9 +115,7 @@ fn app_and_takeover_card_answers_replace_in_place_and_worker_always_is_refused()
     }
     open.holder = Some(GrantHolder::Worker {
         agent_id: "head".into(),
-        owner: "reserved:prefrontal-core".into(),
         scope_ref: "worker".into(),
-        scope_epoch: 1,
     });
     assert!(matches!(
         grants.apply_answer(
@@ -151,11 +149,18 @@ fn computer_offers_follow_holder_storage_and_signer_without_making_danger_the_on
         grants.offered_choices(&caller, &GrantNeed::Takeover, None),
         [ALLOW_ONCE, COMPUTER_30M, COMPUTER_ALWAYS, DENY]
     );
+    let unreadable = ComputerGrants::in_memory().with_agent_grants(Arc::new(
+        crate::agent_grants::AgentGrants::unavailable(
+            crate::agent_grants::AgentGrantStoreError::NoMachineIdentity,
+        ),
+    ));
+    assert_eq!(
+        unreadable.offered_choices(&caller, &need, Some(&identity)),
+        [ALLOW_ONCE, DENY]
+    );
     caller.holder = Some(GrantHolder::Worker {
         agent_id: "head".into(),
-        owner: "reserved:prefrontal-core".into(),
         scope_ref: "worker".into(),
-        scope_epoch: 1,
     });
     assert_eq!(
         grants.offered_choices(&caller, &need, Some(&identity)),

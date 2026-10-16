@@ -222,11 +222,9 @@ async fn bind(
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status"]}),
         ),
-        scope: Some(cingulate_answer::cingulate::stamp(
-            "pj-browser-session-wire",
-        )),
+        scope: Some(cingulate_answer::cingulate::stamp("test-project")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,

@@ -3179,3 +3179,6 @@ mod tests {
 }
 
 mod agent_enforcement;
+pub(crate) mod retained_browser_ops;
+#[cfg(test)]
+mod retained_browser_ops_tests;

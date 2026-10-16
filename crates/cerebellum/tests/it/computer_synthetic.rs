@@ -1357,7 +1357,7 @@ async fn background_modifier_chords_refuse_without_takeover_and_post_nothing() {
 }
 
 async fn grant_takeover(management: &Arc<ManagementPlane>) {
-    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
+    let carrier = ScriptedCarrier::answering(&["computer_30m"]);
     management
         .computer_grants()
         .require(

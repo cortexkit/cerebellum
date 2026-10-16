@@ -104,7 +104,7 @@ fn parent_only_facts(planes: &Planes) -> crate::AcceptedBindFacts {
 async fn parent_only_worker_mints_and_lists_under_the_described_heads_agent_id() {
     let planes = app_planes();
     let facts = parent_only_facts(&planes);
-    let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+    let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
     assert_eq!(reply["outcome"], "granted", "{reply}");
     let store = planes.management.agent_grants();
     let rows = store
@@ -131,7 +131,7 @@ async fn revived_worker_reuses_its_grant_but_a_fresh_scope_ref_asks_again() {
         &planes,
         crate::permission_scope::test_support::live_head(),
     );
-    let (reply, planes) = dispatch(planes, facts.clone(), "allow_conversation").await;
+    let (reply, planes) = dispatch(planes, facts.clone(), "allow_30m").await;
     assert_eq!(reply["outcome"], "granted", "{reply}");
     let mut revived = facts.clone();
     revived.scope.as_mut().unwrap().scope_epoch += 1;
@@ -171,12 +171,12 @@ async fn a_head_ending_between_calls_refuses_even_an_existing_worker_grant() {
         &planes,
         crate::permission_scope::test_support::live_head(),
     );
-    let (reply, planes) = dispatch(planes, facts.clone(), "allow_conversation").await;
+    let (reply, planes) = dispatch(planes, facts.clone(), "allow_30m").await;
     assert_eq!(reply["outcome"], "granted", "{reply}");
     for status in ["ended", "not_live"] {
         answer.lock().unwrap()["status"] = json!(status);
         answer.lock().unwrap()["scope"] = Value::Null;
-        let (reply, _) = dispatch(planes.clone(), facts.clone(), "allow_conversation").await;
+        let (reply, _) = dispatch(planes.clone(), facts.clone(), "allow_30m").await;
         assert_eq!(reply["reason"], "no_agent_session", "{reply}");
         assert_eq!(reply["detail"]["retryable"], false);
     }
@@ -192,7 +192,7 @@ async fn an_unsynced_head_owner_is_unavailable_never_gone() {
         answer["owner_synced"] = json!(false);
         answer["status"] = json!(status);
         crate::permission_scope::test_support::describe(&planes, answer);
-        let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+        let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
         assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
         assert_eq!(reply["detail"]["retryable"], true);
         let store = planes.management.agent_grants();
@@ -208,7 +208,7 @@ async fn a_describe_failure_never_defaults_to_a_worker_holder() {
     // A control error or malformed response cannot establish an identity.
     answer["op"] = json!("not-scope-describe");
     let (_, requests) = crate::permission_scope::test_support::describe(&planes, answer);
-    let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+    let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
     assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
     assert_eq!(requests.lock().unwrap().len(), 1);
     let store = planes.management.agent_grants();
@@ -245,7 +245,7 @@ async fn parent_owner_epoch_kind_and_carrier_must_match_the_admitted_worker() {
             _ => unreachable!(),
         }
         crate::permission_scope::test_support::describe(&planes, answer);
-        let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+        let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
         if alteration == "carrier" {
             assert_eq!(reply["code"], "session_caller_not_admitted", "{reply}");
         } else {
@@ -263,7 +263,7 @@ async fn a_parent_epoch_mismatch_refuses_a_live_head() {
     let mut answer = crate::permission_scope::test_support::live_head();
     answer["scope_epoch"] = json!(8);
     crate::permission_scope::test_support::describe(&planes, answer);
-    let (reply, _) = dispatch(planes, facts, "allow_conversation").await;
+    let (reply, _) = dispatch(planes, facts, "allow_30m").await;
     assert_eq!(reply["reason"], "no_agent_session", "{reply}");
 }
 
@@ -271,7 +271,7 @@ async fn a_parent_epoch_mismatch_refuses_a_live_head() {
 async fn no_daemon_connection_refuses_instead_of_defaulting_to_a_holder() {
     let planes = app_planes();
     planes.routes.insert(1, 1, parent_only_facts(&planes));
-    let (planes, script) = super::worker::scripted_consent(planes, "allow_conversation");
+    let (planes, script) = super::worker::scripted_consent(planes, "allow_30m");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(app_request(1), &tx, &planes)
         .await

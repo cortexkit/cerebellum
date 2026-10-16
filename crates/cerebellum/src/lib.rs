@@ -4628,7 +4628,11 @@ fn standing_grant_operation(
             standing_grant_params::only(params, &["origin", "domain"])
                 .map_err(StandingGrantOperationRefusal::UnknownField)?;
             let origin = standing_grant_params::origin(params)?;
-            if !facts.agent_project_id_attested || !facts.acts_as_agent {
+            let holder = permission_scope::authorizing_holder(facts);
+            if (planes.management.unified_agent_grants().is_some() && holder.is_none())
+                || (planes.management.unified_agent_grants().is_none()
+                    && (!facts.agent_project_id_attested || !facts.acts_as_agent))
+            {
                 return Ok(json!({
                     "outcome": "agent_not_attested",
                     "revoked": 0,
@@ -4642,6 +4646,14 @@ fn standing_grant_operation(
                 (None, Some(domain)) => RevokeTarget::Domain(domain),
                 (None, None) => RevokeTarget::Everything,
             };
+            if let Some(store) = planes.management.unified_agent_grants() {
+                return Ok(management::retained_browser_ops::revoke_rows(
+                    store,
+                    agent_grants::BrowserTarget::AgentProfile,
+                    &target,
+                    |row_holder| Some(row_holder) == holder.as_ref(),
+                ));
+            }
             Ok(standing.revoke(&facts.identity.agent_project_id, &target))
         }
         management::REVOKE_GRANT => {
@@ -4667,6 +4679,14 @@ fn standing_grant_operation(
                 (None, true) => RevokeTarget::AllSites,
                 (None, false) => domain.map_or(RevokeTarget::Everything, RevokeTarget::Domain),
             };
+            if let Some(store) = planes.management.unified_agent_grants() {
+                return Ok(management::retained_browser_ops::revoke_rows(
+                    store,
+                    agent_grants::BrowserTarget::AgentProfile,
+                    &target,
+                    |holder| holder.agent_id() == agent_id,
+                ));
+            }
             Ok(standing.revoke(&agent_id, &target))
         }
         _ => {
@@ -4686,14 +4706,14 @@ fn standing_grant_operation(
                 .unwrap_or_default();
             Ok(json!({
                 "agent_id": agent_id,
-                "browser": {
+                "browser": planes.management.unified_agent_grants().map_or_else(|| json!({
                     "grants": standing
                         .live_rows(&agent_id)
                         .iter()
                         .map(browser_standing_grants::StandingBrowserGrant::describe)
                         .collect::<Vec<_>>(),
                     "store": standing.store_state(),
-                },
+                }), |store| management::retained_browser_ops::listing(store, &agent_id)),
                 "apps": {
                     "grants": app_grants,
                     "store": apps["store"].clone(),

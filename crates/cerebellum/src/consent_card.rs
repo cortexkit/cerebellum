@@ -988,9 +988,7 @@ mod every_card_kind {
                     severity,
                     Some(&crate::agent_grants::GrantHolder::Worker {
                         agent_id: "head".into(),
-                        owner: "reserved:prefrontal-core".into(),
                         scope_ref: "worker".into(),
-                        scope_epoch: 1,
                     }),
                     true,
                 )

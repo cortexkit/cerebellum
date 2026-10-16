@@ -4,6 +4,10 @@ use super::*;
 
 fn worker_fixture() -> Fixture {
     let fixture = Fixture::new();
+    crate::permission_scope::test_support::describe(
+        &fixture.planes,
+        crate::permission_scope::test_support::live_head(),
+    );
     let mut facts = fixture.planes.routes.get(1, 1).unwrap();
     let mut stamp = crate::cingulate_client::worker_vectors::worker_stamp();
     stamp.attributes.agent_id = Some("test-project".into());

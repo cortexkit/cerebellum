@@ -124,7 +124,7 @@ async fn fixture() -> (Planes, Arc<RecordingLauncher>, Arc<Mutex<Dropdowns>>) {
         dropdowns: Some(dropdowns.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -345,7 +345,7 @@ async fn stable_refs_wire_frame_same_document_url_keeps_old_click() {
         frame_fixture: Some(fixture.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,

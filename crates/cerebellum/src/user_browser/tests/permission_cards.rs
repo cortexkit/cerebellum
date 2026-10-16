@@ -93,9 +93,7 @@ fn user_revoke_matches_only_the_callers_holder_target_and_subject() {
     let store = AgentGrants::in_memory(Some("test-machine".into()));
     let worker = |scope: &str| GrantHolder::Worker {
         agent_id: "head".into(),
-        owner: "reserved:prefrontal-core".into(),
         scope_ref: scope.into(),
-        scope_epoch: 1,
     };
     let caller = worker("one");
     for (holder, target, domain) in [
@@ -148,6 +146,10 @@ fn user_revoke_matches_only_the_callers_holder_target_and_subject() {
 async fn user_browser_writer_rejects_broad_or_worker_permanent_answers() {
     use crate::management::BrowserGrantChoice;
     let fixture = Fixture::new();
+    crate::permission_scope::test_support::describe(
+        &fixture.planes,
+        crate::permission_scope::test_support::live_head(),
+    );
     for worker in [false, true] {
         let mut facts = fixture.planes.routes.get(1, 1).unwrap();
         if worker {
@@ -155,40 +157,47 @@ async fn user_browser_writer_rejects_broad_or_worker_permanent_answers() {
             stamp.attributes.agent_id = Some("test-project".into());
             facts = facts.with_scope(Some(stamp));
         }
-        let context = Context {
-            planes: &fixture.planes,
-            facts: &facts,
-            route: Route {
-                channel: 1,
-                epoch: 1,
-            },
-            cancel: CancelHandle::pending(),
-            connection: fixture.epoch,
-            action: "open_grant",
-        };
-        for choice in [
-            BrowserGrantChoice::AllSitesThirtyMinutes,
-            BrowserGrantChoice::AllSitesAlways,
-            BrowserGrantChoice::OriginAlways,
-        ] {
-            if !worker && choice == BrowserGrantChoice::OriginAlways {
-                continue;
-            }
-            let grant = InvocationGrant {
-                authorizing_row: None,
-                origin: "https://example.com".into(),
-                severity: Severity::new(3, false, false),
-                hazards: Default::default(),
-                once: false,
-            };
-            assert_eq!(
-                context
-                    .record_agent_answer(grant, "card", choice)
-                    .err()
-                    .unwrap()["reason"],
-                "unrecognized_answer"
-            );
-        }
+        let resolved = crate::permission_scope::resolve_worker(&facts, &fixture.planes.scopes)
+            .await
+            .unwrap();
+        crate::permission_scope::WORKER_HOLDER
+            .scope(resolved, async {
+                let context = Context {
+                    planes: &fixture.planes,
+                    facts: &facts,
+                    route: Route {
+                        channel: 1,
+                        epoch: 1,
+                    },
+                    cancel: CancelHandle::pending(),
+                    connection: fixture.epoch,
+                    action: "open_grant",
+                };
+                for choice in [
+                    BrowserGrantChoice::AllSitesThirtyMinutes,
+                    BrowserGrantChoice::AllSitesAlways,
+                    BrowserGrantChoice::OriginAlways,
+                ] {
+                    if !worker && choice == BrowserGrantChoice::OriginAlways {
+                        continue;
+                    }
+                    let grant = InvocationGrant {
+                        authorizing_row: None,
+                        origin: "https://example.com".into(),
+                        severity: Severity::new(3, false, false),
+                        hazards: Default::default(),
+                        once: false,
+                    };
+                    assert_eq!(
+                        context
+                            .record_agent_answer(grant, "card", choice)
+                            .err()
+                            .unwrap()["reason"],
+                        "unrecognized_answer"
+                    );
+                }
+            })
+            .await;
     }
     assert!(rows(&fixture).is_empty());
 }

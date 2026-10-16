@@ -1,17 +1,9 @@
-//! Only Prefrontal's core module may call cerebellum in a conversation's name.
+//! Only `reserved:prefrontal-core` may dispatch browser calls for an admitted agent.
+//! Naming an agent or conversation in route metadata is not enough authority.
 //!
-//! Cerebellum's standing permissions (site grants, app grants, the takeover
-//! grant) are keyed on the conversation a person gave them in, and a route
-//! names its conversation when it binds. Any first-party module can bind a
-//! route under any conversation, so without this rule AFT, Broca, the routing
-//! module or a `direct` host plugin could act on a permission the person gave
-//! a different caller, without anyone being asked.
-//!
-//! Every test here drives the frame entry point the module loop uses
-//! (`handle_frame_for_test`): a real `route.bind` control frame, then a real
-//! request on the bound route. The grant a refused caller must not reach is
-//! planted for the very conversation its route names, so a refusal that came
-//! after the grant was read would show up as that grant being used.
+//! These tests seed a site permission for one agent, bind a route from each
+//! caller, and send real frames through `handle_frame_for_test`. An unauthorized
+//! caller must be refused before it can use that agent's permission.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +18,7 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
-/// The conversation every route in these tests names, and the one the planted
-/// grant belongs to.
+/// Shared conversation identifier on the test routes; it does not own the grant.
 const CONVERSATION: &str = "conversation-with-a-grant";
 const GRANTED_ORIGIN: &str = "https://granted.example";
 const UNGRANTED_ORIGIN: &str = "http://localhost:8080";
@@ -46,24 +37,22 @@ fn config() -> BrowserConfig {
     }
 }
 
-/// Planes serving the browser, with a site grant for [`GRANTED_ORIGIN`] held
-/// by [`CONVERSATION`].
+/// Browser and permission services with a seeded grant for `GRANTED_ORIGIN`
+/// belonging to the agent `pj-session-admission`.
 async fn planes_with_a_grant() -> Planes {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = super::support::permissions::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         JournalPersistence::Isolated,
     );
-    let question = planes
-        .management
-        .browser_grant_question_for_test(CONVERSATION, vec![GRANTED_ORIGIN.to_string()], Vec::new())
-        .await;
-    assert!(
-        planes
-            .management
-            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
-            .await,
-        "the planted grant settles"
+    super::support::permissions::seed(
+        planes.management.agent_grants(),
+        "pj-session-admission",
+        cerebellum::agent_grants::GrantSubject::Origin(GRANTED_ORIGIN.into()),
+        3,
+        vec![],
+        Some(1_800_000),
+        "session-admission-card",
     );
     planes
 }
@@ -168,7 +157,7 @@ fn navigate(corr: u64, origin: &str) -> Frame {
                 "url": format!("{origin}/"),
                 "intent": "read the page",
                 "wait": "none",
-                "severity": {"tier": 1, "credential": false, "financial": false},
+                "severity": {"tier": 3, "credential": false, "financial": false},
             },
         }),
     )
@@ -239,11 +228,11 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
     ]
 }
 
-/// The admitted caller reaches its conversation's grant: navigating to the
+/// The admitted caller reaches its agent's grant: navigating to the
 /// granted site passes authorization and stops only because no browser is
 /// running, while the ungranted site is put to the person instead.
 #[tokio::test]
-async fn the_session_caller_acts_on_its_conversations_grant() {
+async fn the_session_caller_acts_on_its_agents_grant() {
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
     let planes = service.install(planes_with_a_grant().await);
     let bound = bind_with_scope(
@@ -263,8 +252,9 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
     let body: Value = serde_json::from_slice(&granted[0].body).unwrap();
     assert_eq!(body["outcome"], "no_session", "{body}");
 
-    // The local-service contrast proves the grant gate ran: public sites can
-    // pass on the baseline, but an ungranted local service must ask.
+    // Reversible-change severity (tier three) exceeds free public reading and
+    // ordinary clicks. Only the seeded row can admit the first request; the
+    // ungranted local service must ask.
     assert!(service.questions().is_empty());
     service.queue(cerebellum::cingulate_client::ScriptedAnswer::Answered(
         json!({"decision":"deny"}),
@@ -288,7 +278,7 @@ async fn the_session_caller_acts_on_its_conversations_grant() {
         json!([UNGRANTED_ORIGIN])
     );
     assert_eq!(
-        planes.management.browser_grant_count().await,
+        super::support::permissions::count(&planes),
         1,
         "declining grants nothing more"
     );

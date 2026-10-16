@@ -14,9 +14,7 @@ fn holder(head: bool) -> GrantHolder {
     } else {
         GrantHolder::Worker {
             agent_id: "agent-golden".into(),
-            owner: "reserved:prefrontal-core".into(),
             scope_ref: "worker-golden".into(),
-            scope_epoch: 1,
         }
     }
 }

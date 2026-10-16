@@ -48,6 +48,8 @@ mod stable_refs;
 
 #[path = "support/browser_queue.rs"]
 mod browser_queue;
+#[path = "support/permissions.rs"]
+mod permission_support;
 
 /// A valid one-pixel PNG, the smallest image a screenshot reply admits.
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -109,15 +111,15 @@ fn route_identity() -> RouteIdentity {
 }
 
 async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>) {
-    let question = planes
-        .management
-        .browser_grant_question_for_test("test-session", vec![origin.to_string()], hazards)
-        .await;
-    assert!(
-        planes
-            .management
-            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
-            .await
+    let level = if hazards.is_empty() { 2 } else { 4 };
+    permission_support::seed(
+        planes.management.agent_grants(),
+        "test-project",
+        cerebellum::agent_grants::GrantSubject::Origin(origin.into()),
+        level,
+        hazards,
+        Some(1_800_000),
+        "fixture-browser-card",
     );
 }
 
@@ -141,14 +143,12 @@ async fn bind_management_route(planes: &Planes) {
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
-            "agentProjectId": "pj-browser-session-wire",
+            "agentProjectId": "test-project",
             "sessionKind": "primary",
             "effectiveCapabilityScope": ["*"],
             "browserControlOperations": ["browser.open_grant"]
         })),
-        scope: Some(cingulate_answer::cingulate::stamp(
-            "pj-browser-session-wire",
-        )),
+        scope: Some(cingulate_answer::cingulate::stamp("test-project")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -177,7 +177,6 @@ async fn bind_management_route(planes: &Planes) {
 /// wait until the grant is minted. Returns the `open_grant` reply, whose
 /// `severity_ceiling` is the ceiling the minted grant carries.
 async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Value {
-    let before = planes.management.browser_grant_count().await;
     let opening = Frame::build_with_version(
         PROTOCOL_VERSION,
         FrameType::Request,
@@ -202,7 +201,14 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
     .expect("the grant request and its question complete");
     assert_eq!(reply["outcome"], "consent_pending", "{reply}");
     tokio::time::timeout(Duration::from_secs(2), async {
-        while planes.management.browser_grant_count().await <= before {
+        while !planes
+            .management
+            .agent_grants()
+            .live_rows(None, planes.management.agent_grants().now_ms())
+            .unwrap()
+            .iter()
+            .any(|row| row.card_ref.as_deref() == reply["ask_id"].as_str())
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -1087,7 +1093,7 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
 #[tokio::test]
 async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1245,7 +1251,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
 #[tokio::test]
 async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1274,16 +1280,22 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
         wrong_origin["detail"]["reason"], "no_agent_session",
         "{wrong_origin}"
     );
-    // Compared as a set: the list follows grant-id order, and minted grant ids
-    // come from a process-wide counter shared with every other test in this
-    // binary, so `...-9` and `...-10` can sort either way round.
     let mut granted_origins: Vec<String> =
-        serde_json::from_value(wrong_origin["detail"]["granted_origins"].clone()).unwrap();
+        permission_support::rows(planes.management.agent_grants(), "test-project")
+            .iter()
+            .filter_map(|row| match &row.subject {
+                cerebellum::agent_grants::GrantSubject::Domain(domain) => {
+                    Some(format!("https://{domain}"))
+                }
+                cerebellum::agent_grants::GrantSubject::Origin(origin) => Some(origin.clone()),
+                _ => None,
+            })
+            .collect();
     granted_origins.sort();
     assert_eq!(
         granted_origins,
         ["https://other.example", "https://second-other.example"],
-        "the origin-scope refusal must name every severity-covering grant: {wrong_origin}"
+        "the existing rows must not cover the refused origin: {wrong_origin}"
     );
     assert!(
         launcher.effects.lock().unwrap().is_empty(),
@@ -1295,7 +1307,7 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
 #[tokio::test]
 async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1356,7 +1368,7 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
 #[tokio::test]
 async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1407,7 +1419,7 @@ async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
 #[tokio::test]
 async fn wire_click_without_a_covering_grant_dispatches_no_input() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1468,7 +1480,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
         cross_site_link_target: true,
         ..RecordingLauncher::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1506,9 +1518,11 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
         "{refused}"
     );
     assert_eq!(
-        refused["detail"]["granted_ceilings"],
-        json!([{"tier": 2, "credential": false, "financial": false}]),
-        "{refused}"
+        permission_support::rows(planes.management.agent_grants(), "test-project")
+            .iter()
+            .map(|row| row.max_level)
+            .collect::<Vec<_>>(),
+        [2]
     );
     assert_eq!(
         refused["detail"]["attempted_origin"], "https://page.example:8443",
@@ -1556,7 +1570,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
 #[tokio::test]
 async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_it() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1602,7 +1616,7 @@ async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_
 /// about:blank, data: and sandboxed page at once.
 #[tokio::test]
 async fn wire_open_grant_refuses_the_opaque_null_origin_without_asking_a_person() {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1648,7 +1662,7 @@ async fn wire_open_grant_refuses_the_opaque_null_origin_without_asking_a_person(
         json!({"field": "origins", "reason_code": "unsupported_value", "value": "null"}),
         "{reply}"
     );
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert_eq!(permission_support::count(&planes), 0);
 }
 
 /// A page with an opaque origin (the fresh about:blank a launch starts on)
@@ -1658,7 +1672,7 @@ async fn wire_open_grant_refuses_the_opaque_null_origin_without_asking_a_person(
 #[tokio::test]
 async fn wire_snapshot_on_an_opaque_origin_page_says_to_navigate_and_offers_no_grant() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1689,7 +1703,7 @@ fn planes_with_installed_grants(
     launcher: &Arc<RecordingLauncher>,
     grants: Vec<ActionGrant>,
 ) -> Planes {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1866,7 +1880,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
         hazardous_target: true,
         ..RecordingLauncher::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1931,7 +1945,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
 
 #[tokio::test]
 async fn wire_launch_withholds_undeclared_launcher_reply_at_the_dispatch_site() {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1967,7 +1981,7 @@ fn browser_control_outcome_vocabularies_reject_undeclared_words() {
 
 #[tokio::test]
 async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -1993,7 +2007,7 @@ async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() 
 #[tokio::test]
 async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2027,7 +2041,7 @@ async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
 
 #[tokio::test]
 async fn all_browser_controls_share_the_existing_invalid_request_shape() {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2065,7 +2079,7 @@ async fn all_browser_controls_share_the_existing_invalid_request_shape() {
 #[tokio::test]
 async fn operation_authority_refusal_precedes_parameter_validation_and_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2098,7 +2112,7 @@ async fn operation_authority_refusal_precedes_parameter_validation_and_effects()
 #[tokio::test]
 async fn missing_operation_authority_has_no_launch_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2117,7 +2131,7 @@ async fn missing_operation_authority_has_no_launch_effects() {
 #[tokio::test]
 async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2188,7 +2202,7 @@ async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame 
 /// returning the reply body and how many browsers were launched.
 async fn launch_on_route_with_facts(admission_facts: Value) -> (Value, usize) {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2342,7 +2356,7 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
 
     for (key, facts) in cases {
         let launcher = Arc::new(RecordingLauncher::default());
-        let mut planes = Planes::with_browser_config_journaling(
+        let mut planes = permission_support::planes(
             Arc::new(HealthState::new()),
             Some(config()),
             cerebellum::JournalPersistence::Isolated,
@@ -2390,7 +2404,7 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
 /// enforcement would have answered `computer_result_schema_violation` instead.
 #[tokio::test]
 async fn a_route_opened_without_the_carrier_is_refused_with_a_reason_through_the_contract() {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2423,7 +2437,7 @@ async fn a_route_opened_without_the_carrier_is_refused_with_a_reason_through_the
 
 #[tokio::test]
 async fn absent_browser_config_uses_the_route_level_unknown_method_envelope() {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         Arc::new(HealthState::new()),
         None,
         cerebellum::JournalPersistence::Isolated,
@@ -2545,7 +2559,7 @@ fn the_browser_surface_reporter_agrees_with_dispatch() {
 async fn the_production_constructor_wires_a_launcher_on_every_platform_that_has_one() {
     // A path that is a file, since the wiring filters on exactly that.
     let executable = std::env::current_exe().expect("the test binary is a file");
-    let planes = cerebellum::Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         std::sync::Arc::new(cerebellum_core::health::HealthState::new()),
         Some(cerebellum::browser_config::BrowserConfig {
             executable_path: Some(executable),
@@ -2680,7 +2694,7 @@ fn build_an_isolated_plane_with_a_launcher() {
         .build()
         .expect("build a runtime");
     runtime.block_on(async {
-        let planes = cerebellum::Planes::with_browser_config_journaling(
+        let planes = permission_support::planes(
             std::sync::Arc::new(cerebellum_core::health::HealthState::new()),
             Some(cerebellum::browser_config::BrowserConfig {
                 // A path that is a file, since the launcher wiring filters on
@@ -2810,7 +2824,7 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[tokio::test]
 async fn present_with_opaque_origin_does_not_front_browser() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2845,7 +2859,7 @@ async fn present_with_opaque_origin_does_not_front_browser() {
 #[tokio::test]
 async fn present_fronts_then_marks_human_in_control() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2892,7 +2906,7 @@ async fn present_that_cannot_front_is_refused_not_presented() {
         present_error: Some("fronting was refused by Chrome"),
         ..RecordingLauncher::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2927,7 +2941,7 @@ async fn present_that_cannot_front_is_refused_not_presented() {
 #[tokio::test]
 async fn resume_closes_by_caller_and_reports_it() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -2965,7 +2979,7 @@ async fn cookie_values_never_leave_the_driver() {
         credential_field_then_clears: true,
         ..RecordingLauncher::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -3055,7 +3069,7 @@ async fn response_body(planes: &Planes, corr: u64, name: &str, arguments: Value)
 #[tokio::test]
 async fn poisoned_session_lock_refuses_status_close_and_launch_through_the_wire() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -3094,7 +3108,7 @@ async fn poisoned_session_lock_refuses_status_close_and_launch_through_the_wire(
 #[tokio::test]
 async fn poisoned_session_lock_refuses_a_browser_action_through_the_wire() {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -3141,7 +3155,7 @@ impl BrowserSessionLauncher for PoisonedRegistryLauncher {
 
 #[tokio::test]
 async fn poisoned_profile_registry_lock_launch_refusal_reaches_the_caller_not_a_schema_violation() {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -3182,7 +3196,7 @@ impl BrowserSessionLauncher for UntrustedRootLauncher {
 /// lost the remedy that would have told it to rebind the profile root.
 #[tokio::test]
 async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_violation() {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -3247,7 +3261,7 @@ async fn close_session(planes: &Planes, corr: u64, browser_session_id: &str) {
 }
 
 fn recording_planes(launcher: &Arc<RecordingLauncher>) -> Planes {
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -4079,7 +4093,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
         navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
         ..config()
     };
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config.clone()),
         cerebellum::JournalPersistence::Isolated,
@@ -4179,7 +4193,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
         ..config()
     };
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config),
         cerebellum::JournalPersistence::Isolated,
@@ -4237,9 +4251,9 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
         "{refused}"
     );
     assert_eq!(
-        refused["detail"]["granted_origins"],
-        json!(["https://example.com", "https://iana.org"]),
-        "{refused}"
+        refused["detail"]["grant_request"]["origins"],
+        json!(["https://www.iana.org:8443"]),
+        "the refusal must request the uncovered landing origin: {refused}"
     );
     assert_eq!(
         refused["detail"]["required"],
@@ -4473,7 +4487,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
     );
     let moved = (
         "https://attacker.example:8443/moved".to_string(),
-        "origin_scope".to_string(),
+        "no_grant".to_string(),
     );
     assert_eq!(refusal_records(&planes).await, [moved.clone(), moved]);
 }
@@ -4722,7 +4736,7 @@ async fn actuation_planes() -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>) 
         navigation_settle_deadline_ms: CLICK_SETTLE_DEADLINE_MS,
         ..config()
     };
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config.clone()),
         cerebellum::JournalPersistence::Isolated,
@@ -4899,31 +4913,21 @@ async fn an_action_after_a_same_document_fragment_change_still_dispatches() {
 }
 
 async fn blocking_grant_fixture() -> (Planes, Arc<RecordingLauncher>) {
-    blocking_grant_fixture_with_standing(false).await
-}
-
-async fn blocking_grant_fixture_with_standing(standing: bool) -> (Planes, Arc<RecordingLauncher>) {
-    let store = standing.then(|| {
-        Arc::new(
-            cerebellum::browser_standing_grants::StandingBrowserGrants::open(
-                Arc::new(cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new()),
-                Some("test-machine".into()),
-            ),
-        )
-    });
-    blocking_grant_fixture_with_store(store).await
+    blocking_grant_fixture_with_store(None).await
 }
 
 async fn blocking_grant_fixture_with_store(
-    store: Option<Arc<cerebellum::browser_standing_grants::StandingBrowserGrants>>,
+    store: Option<Arc<cerebellum::agent_grants::AgentGrants>>,
 ) -> (Planes, Arc<RecordingLauncher>) {
     let launcher = Arc::new(RecordingLauncher::default());
-    let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
-        store,
     );
+    if let Some(store) = store {
+        planes = permission_support::attach(planes, store, None);
+    }
     planes.launch_service = Some(launcher.clone());
     launch_at(&planes, &launcher.page, "https://page.example:8443").await;
     let bind = ModuleControlRequest::RouteBind {
@@ -4938,11 +4942,9 @@ async fn blocking_grant_fixture_with_store(
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
-        scope: Some(cingulate_answer::cingulate::stamp(
-            "pj-browser-session-wire",
-        )),
+        scope: Some(cingulate_answer::cingulate::stamp("test-project")),
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -5024,7 +5026,9 @@ async fn drain_browser(planes: &Planes) {
 }
 
 async fn consent_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
-    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    // Production deadlines are asserted separately; this receive bound also
+    // allows for a loaded test runner scheduling the reply producer.
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("prompt reply")
         .unwrap()
@@ -5087,11 +5091,17 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
             .iter()
             .map(|o| o["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["allow_30m", "deny"]
+        [
+            "allow_30m",
+            "allow_origin_always",
+            "allow_all_sites_30m",
+            "allow_all_sites_always",
+            "deny"
+        ]
     );
     assert_eq!(p.get("requestedSchema"), None);
     assert_eq!(p["options"][0]["effect"], "grant");
-    assert_eq!(p["options"][1]["effect"], "decline");
+    assert_eq!(p["options"][4]["effect"], "decline");
     assert!(launcher.effects.lock().unwrap().is_empty());
     answer_browser(&planes, &tx, &question, "allow_30m").await;
     let reply = consent_frame(&mut rx).await;
@@ -5180,7 +5190,7 @@ async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
             "{ending} navigated"
         );
         assert_eq!(
-            planes.management.browser_grant_count().await,
+            permission_support::count(&planes),
             0,
             "{ending} granted something"
         );
@@ -5190,7 +5200,7 @@ async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
 }
 
 async fn late_in_call_answer(decision: &str, _linkable: bool) {
-    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
+    let (planes, launcher) = blocking_grant_fixture().await;
     let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
     assert!(facts.agent_project_id_attested && facts.acts_as_agent && facts.session_kind_attested);
     assert_eq!(
@@ -5211,29 +5221,28 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
     let pending = consent_frame(&mut rx).await;
     assert_eq!(body(&pending)["outcome"], "consent_pending");
     answer_browser(&planes, &tx, &question, decision).await;
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert_eq!(permission_support::count(&planes), 0);
     drain_browser(&planes).await;
-    let rows = planes
-        .management
-        .standing_browser_grants()
-        .live_rows(&facts.identity.agent_project_id);
-    if decision == "allow_origin_always" {
+    let rows = permission_support::rows(
+        planes.management.agent_grants(),
+        &facts.identity.agent_project_id,
+    );
+    if matches!(decision, "allow_origin_always" | "allow_30m") {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].consent_ref, body(&question)["id"].as_str().unwrap());
+        assert_eq!(
+            rows[0].card_ref.as_deref().unwrap(),
+            body(&question)["id"].as_str().unwrap()
+        );
+        assert_eq!(rows[0].expires_at_ms.is_some(), decision == "allow_30m");
         // An "always" answer covers the registrable domain of an https origin
         // on the default port.
         assert_eq!(
             rows[0].subject,
-            cerebellum::browser_standing_grants::StandingSubject::Domain(
-                "requested.example".into()
-            )
+            cerebellum::agent_grants::GrantSubject::Domain("requested.example".into())
         );
     } else {
         assert!(rows.is_empty());
-        assert_eq!(
-            planes.management.browser_grant_count().await,
-            usize::from(decision == "allow_30m")
-        );
+        assert_eq!(permission_support::count(&planes), 0);
     }
     assert!(
         launcher.effects.lock().unwrap().is_empty(),
@@ -5247,7 +5256,7 @@ async fn late_in_call_always_answer_records_standing_origin() {
 }
 
 #[tokio::test]
-async fn late_in_call_conversation_answer_records_conversation_grant() {
+async fn late_in_call_temporary_answer_records_agent_grant() {
     late_in_call_answer("allow_30m", true).await;
 }
 
@@ -5276,7 +5285,7 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
     assert!(body["ask_id"].as_str().is_some());
     assert!(launcher.effects.lock().unwrap().is_empty());
     answer_browser(&planes, &tx, &question, "allow_30m").await;
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert_eq!(permission_support::count(&planes), 0);
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
         .unwrap();
@@ -5318,9 +5327,9 @@ async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound(
         .iter()
         .any(|(method, _)| method == "consent.withdraw"));
     answer_browser(&planes, &tx, &question, "allow_30m").await;
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert_eq!(permission_support::count(&planes), 0);
     drain_browser(&planes).await;
-    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert_eq!(permission_support::count(&planes), 1);
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
@@ -5465,7 +5474,7 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_only_held_cards() {
                 );
             }
             answer_browser(&planes, &tx, &question, "allow_30m").await;
-            assert_eq!(planes.management.browser_grant_count().await, 0);
+            assert_eq!(permission_support::count(&planes), 0);
         }
     }
 }
@@ -5582,7 +5591,7 @@ async fn bind_second_principal(planes: &Planes) {
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status"]}),
         ),
         scope: None,
     };
@@ -5845,7 +5854,7 @@ async fn withdrawing_a_denied_call_is_refused_denied() {
 
 #[tokio::test]
 async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_navigation() {
-    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
+    let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
     cerebellum::handle_browser_consent_deadline_for_test(
         keyed_navigation(9, 801, "pf:pending"),
@@ -5873,18 +5882,14 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
     // Withdrawing the navigation leaves its site-access question open, so the
     // later permission response can still record a grant without navigating.
     answer_browser(&planes, &tx, &question, "allow_origin_always").await;
-    assert!(planes
-        .management
-        .standing_browser_grants()
-        .live_rows("pj-browser-session-wire")
-        .is_empty());
+    assert!(permission_support::rows(planes.management.agent_grants(), "test-project").is_empty());
     drain_browser(&planes).await;
-    let rows = planes
-        .management
-        .standing_browser_grants()
-        .live_rows("pj-browser-session-wire");
+    let rows = permission_support::rows(planes.management.agent_grants(), "test-project");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].consent_ref, body(&question)["id"].as_str().unwrap());
+    assert_eq!(
+        rows[0].card_ref.as_deref().unwrap(),
+        body(&question)["id"].as_str().unwrap()
+    );
     assert!(
         rx.try_recv().is_err(),
         "withdraw must not end the card or resume the call"
@@ -6087,7 +6092,7 @@ async fn bind_route(
         principal: Some(principal),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status", "browser.close"]}),
         ),
         scope,
     };
@@ -6141,7 +6146,7 @@ fn with_readable_call_records(
 
 #[tokio::test]
 async fn flow_id_scope_stamp_binds_but_session_calls_are_refused() {
-    let planes = Planes::with_browser_config_journaling(
+    let planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -6397,7 +6402,7 @@ async fn bind_other_conversation(planes: &Planes, channel: u16) {
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status", "browser.close"]}),
         ),
         scope: None,
     };
@@ -6597,7 +6602,7 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     );
     assert_eq!(planes.scopes.control.outstanding(), 0);
     // Browser grants were never ended by a route close, and still are not.
-    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert_eq!(permission_support::count(&planes), 1);
 }
 
 /// A keyed call on a scoped route records the stamp's owner, ref and epoch,
@@ -6886,7 +6891,7 @@ async fn scoped_browser(planes: &Planes) -> String {
         )
         .await;
     assert!(planes.sessions.has_open_session("test-session"));
-    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert_eq!(permission_support::count(planes), 1);
     assert!(
         planes
             .management
@@ -6983,7 +6988,7 @@ async fn wait_until_closed(planes: &Planes) {
 /// the production reply boundary, which withholds a reply its result schema
 /// does not declare.
 #[tokio::test]
-async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_question() {
+async fn a_definitive_scope_end_closes_the_browser_and_question_but_keeps_agent_grants() {
     for answer in [
         describe_answer("ended", Some(4), true, true),
         describe_answer("live", Some(5), true, true),
@@ -6996,7 +7001,11 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
         answer_describe(&planes, &tx, &question, FrameType::Response, answer.clone()).await;
         wait_until_closed(&planes).await;
-        assert_eq!(planes.management.browser_grant_count().await, 0, "{answer}");
+        assert_eq!(
+            permission_support::count(&planes),
+            1,
+            "scope end must not revoke the agent's row: {answer}"
+        );
         assert!(
             !planes.management.browser_grant_question_open(&ask_id).await,
             "the scope's open question survived its end: {answer}"
@@ -7007,7 +7016,7 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
                 .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow_30m"})))
                 .await
         );
-        assert_eq!(planes.management.browser_grant_count().await, 0);
+        assert_eq!(permission_support::count(&planes), 1);
 
         let status = exchange(
             &planes,
@@ -7084,7 +7093,7 @@ async fn bind_reply(
         principal: Some(reserved("prefrontal-core")),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
-            json!({"agentProjectId":"pj-browser-session-wire", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.status", "browser.close"]}),
+            json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status", "browser.close"]}),
         ),
         scope: Some(stamp),
     };
@@ -7105,11 +7114,9 @@ async fn bind_reply(
     rx.recv().await.unwrap()
 }
 
-/// A grant a person gave the epoch-1 session is gone the moment an epoch-2
-/// route of the same scope binds, with no watcher running (route 12 never
-/// closed), so nothing on the new route is served under it.
+/// Replacing a head scope ends its pending work, not the agent's reusable rows.
 #[tokio::test]
-async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
+async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() {
     let (planes, launcher) = blocking_grant_fixture().await;
     bind_route(
         &planes,
@@ -7118,13 +7125,21 @@ async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
         Some(scope_stamp(1, true)),
     )
     .await;
-    grant_browser(&planes, "https://requested.example", Vec::new()).await;
-    assert_eq!(planes.management.browser_grant_count().await, 1);
+    permission_support::seed(
+        planes.management.agent_grants(),
+        "test-project",
+        cerebellum::agent_grants::GrantSubject::Origin("https://requested.example".into()),
+        3,
+        vec![],
+        Some(1_800_000),
+        "epoch-one-card",
+    );
+    assert_eq!(permission_support::count(&planes), 1);
 
     let bound = bind_reply(&planes, 15, scope_stamp(2, true)).await;
     assert_eq!(bound.header.ty, FrameType::Response, "{}", body(&bound));
-    // Gone before the bind was answered, so before any call on route 15.
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    // The row belongs to the agent, not the replaced head-scope epoch.
+    assert_eq!(permission_support::count(&planes), 1);
     assert!(!planes
         .scopes
         .is_watching(&cerebellum::scope_watch::ScopeKey::from_stamp(
@@ -7132,6 +7147,19 @@ async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
         )));
 
     let (tx, mut rx) = mpsc::channel(8);
+    let relaunched = exchange(
+        &planes,
+        &tx,
+        &mut rx,
+        request_on(15, 839, "browser.launch", json!({})),
+    )
+    .await;
+    assert_eq!(
+        body(&relaunched)["outcome"],
+        "launched",
+        "{}",
+        body(&relaunched)
+    );
     let navigated = exchange(
         &planes,
         &tx,
@@ -7140,24 +7168,22 @@ async fn a_grant_made_under_epoch_1_is_not_usable_from_an_epoch_2_route() {
             15,
             840,
             "browser.navigate",
-            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":1,"credential":false,"financial":false}}),
+            json!({"url":"https://requested.example/path", "intent":"read", "wait":"none", "severity":{"tier":3,"credential":false,"financial":false}}),
         ),
     )
     .await;
-    assert!(
-        navigated.header.ty == FrameType::Request || body(&navigated)["outcome"] != "ok",
-        "the epoch-2 route navigated under the epoch-1 grant: {}",
+    assert_eq!(
+        body(&navigated)["outcome"],
+        "ok",
+        "the same agent must reuse its row after a head-scope replacement: {}",
         body(&navigated)
     );
-    assert!(
-        !launcher.effects.lock().unwrap().contains(&"navigate"),
-        "navigated under the old session's grant"
-    );
+    assert!(launcher.effects.lock().unwrap().contains(&"navigate"));
 }
 
 #[tokio::test]
 async fn scope_epoch_replacement_cancels_late_in_call_card() {
-    let (planes, launcher) = blocking_grant_fixture_with_standing(true).await;
+    let (planes, launcher) = blocking_grant_fixture().await;
     bind_route(
         &planes,
         12,
@@ -7192,11 +7218,7 @@ async fn scope_epoch_replacement_cancels_late_in_call_card() {
         "scope replacement has no reverse frame"
     );
     answer_browser(&planes, &tx, &question, "allow_origin_always").await;
-    assert!(planes
-        .management
-        .standing_browser_grants()
-        .live_rows("pj-browser-session-wire")
-        .is_empty());
+    assert!(permission_support::rows(planes.management.agent_grants(), "test-project").is_empty());
     assert!(!launcher.effects.lock().unwrap().contains(&"navigate"));
 }
 
@@ -7234,7 +7256,7 @@ async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing
             .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await
     );
-    assert_eq!(planes.management.browser_grant_count().await, 0);
+    assert_eq!(permission_support::count(&planes), 0);
 }
 
 /// An epoch-2 bind while the epoch-1 session's browser is open closes it as
@@ -7352,7 +7374,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         // open and no route under the scope is bound.
         let again = next_describe(&mut rx).await;
         assert!(planes.sessions.has_open_session("test-session"), "{answer}");
-        assert_eq!(planes.management.browser_grant_count().await, 1, "{answer}");
+        assert_eq!(permission_support::count(&planes), 1, "{answer}");
         assert!(
             planes.management.browser_grant_question_open(&ask_id).await,
             "{answer}"
@@ -7367,7 +7389,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         )
         .await;
         wait_until_closed(&planes).await;
-        assert_eq!(planes.management.browser_grant_count().await, 0);
+        assert_eq!(permission_support::count(&planes), 1);
     }
 }
 
@@ -7394,7 +7416,7 @@ async fn an_unanswered_describe_leaves_everything_in_place() {
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(planes.sessions.has_open_session("test-session"));
-    assert_eq!(planes.management.browser_grant_count().await, 1);
+    assert_eq!(permission_support::count(&planes), 1);
     assert!(planes.management.browser_grant_question_open(&ask_id).await);
     assert_eq!(planes.scopes.control.outstanding(), 0);
 }
@@ -8034,7 +8056,7 @@ mod resource_busy_wire {
             )),
             process: RecordingLauncher::default(),
         });
-        let mut planes = Planes::with_browser_config_journaling(
+        let mut planes = permission_support::planes(
             Arc::new(HealthState::new()),
             Some(config()),
             cerebellum::JournalPersistence::Isolated,
@@ -8161,17 +8183,10 @@ fn admission_stamp() -> subc_protocol::scope::ScopeStamp {
 
 fn scope_admission_planes() -> (Planes, Arc<RecordingLauncher>) {
     let launcher = Arc::new(RecordingLauncher::default());
-    let standing = Arc::new(
-        cerebellum::browser_standing_grants::StandingBrowserGrants::open(
-            Arc::new(cerebellum::browser_standing_grants::InMemoryStandingGrantStorage::new()),
-            Some("test-machine".into()),
-        ),
-    );
-    let mut planes = Planes::with_browser_config_journaling_and_standing_grants(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
-        Some(standing),
     );
     planes.launch_service = Some(launcher.clone());
     (planes, launcher)
@@ -8341,20 +8356,15 @@ async fn scope_admission_ephemeral_gets_no_controls() {
 }
 
 async fn seed_scope_standing_grant(planes: &Planes) {
-    planes
-        .management
-        .standing_browser_grants()
-        .record(
-            "pj-scope-agent",
-            cerebellum::browser_standing_grants::StandingSubject::Origin(
-                "https://page.example:8443".into(),
-            ),
-            cerebellum::authorization::COMPOSE,
-            vec![],
-            None,
-            "scope-consent",
-        )
-        .unwrap();
+    permission_support::seed(
+        planes.management.agent_grants(),
+        "pj-scope-agent",
+        cerebellum::agent_grants::GrantSubject::Origin("https://page.example:8443".into()),
+        cerebellum::authorization::COMPOSE,
+        vec![],
+        None,
+        "scope-consent",
+    );
 }
 
 #[tokio::test]
@@ -9019,7 +9029,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
         frame_fixture: Some(fixture.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -9092,7 +9102,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
         frame_fixture: Some(fixture.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -9133,7 +9143,7 @@ async fn navigated_frame_ref_is_stale_before_mouse_input() {
         frame_fixture: Some(fixture.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -9200,7 +9210,7 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
             hazardous_target: !financial,
             ..Default::default()
         });
-        let mut planes = Planes::with_browser_config_journaling(
+        let mut planes = permission_support::planes(
             Arc::new(HealthState::new()),
             Some(config()),
             cerebellum::JournalPersistence::Isolated,
@@ -9220,7 +9230,10 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
         for reply in [ref_reply, point_reply] {
             let reply: Value = serde_json::from_slice(&reply.body).unwrap();
             assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
-            assert_eq!(reply["detail"]["missing_hazard"], missing_hazard);
+            assert_eq!(
+                reply["detail"]["grant_request"]["hazards"],
+                json!([missing_hazard])
+            );
             assert_eq!(
                 reply["detail"]["attempted_origin"],
                 "https://payment.example:8443"
@@ -9246,7 +9259,7 @@ async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
         frame_fixture: Some(fixture.clone()),
         ..Default::default()
     });
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -9288,7 +9301,7 @@ impl TypePage {
 async fn type_fixture(page: TypePage) -> (Planes, CommittedPage, Arc<Mutex<Vec<String>>>, String) {
     let committed = CommittedPage::default();
     let commands = Arc::new(Mutex::new(Vec::new()));
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(config()),
         cerebellum::JournalPersistence::Isolated,
@@ -9624,7 +9637,7 @@ async fn navigate_unanswered(method: &'static str, code: &str, sent: bool) {
         },
         ..config()
     };
-    let mut planes = Planes::with_browser_config_journaling(
+    let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
         Some(cfg.clone()),
         cerebellum::JournalPersistence::Isolated,
@@ -9775,33 +9788,27 @@ async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     seed_scope_standing_grant(&planes).await;
     let apex_only = flow_permission_query(&planes, 30, params.clone()).await;
     assert_eq!(apex_only["items"][0]["verdict"], "would_ask", "{apex_only}");
-    planes
-        .management
-        .standing_browser_grants()
-        .record(
-            "pj-scope-agent",
-            cerebellum::browser_standing_grants::StandingSubject::Domain("page.example".into()),
-            1,
-            vec![],
-            None,
-            "lower-permission",
-        )
-        .unwrap();
+    permission_support::seed(
+        planes.management.agent_grants(),
+        "pj-scope-agent",
+        cerebellum::agent_grants::GrantSubject::Domain("page.example".into()),
+        1,
+        vec![],
+        None,
+        "lower-permission",
+    );
     let lower = flow_permission_query(&planes, 31, params.clone()).await;
     assert_eq!(lower["items"][0]["verdict"], "would_ask", "{lower}");
     assert_eq!(lower["items"][0]["reason"], "level_above_grant", "{lower}");
-    planes
-        .management
-        .standing_browser_grants()
-        .record(
-            "pj-scope-agent",
-            cerebellum::browser_standing_grants::StandingSubject::Domain("page.example".into()),
-            3,
-            vec![],
-            None,
-            "permission-restored",
-        )
-        .unwrap();
+    permission_support::seed(
+        planes.management.agent_grants(),
+        "pj-scope-agent",
+        cerebellum::agent_grants::GrantSubject::Domain("page.example".into()),
+        3,
+        vec![],
+        None,
+        "permission-restored",
+    );
     let after = flow_permission_query(&planes, 4, params.clone()).await;
     assert_eq!(after["items"][0]["verdict"], "yes", "{after}");
     let mut other = params.clone();
@@ -9931,13 +9938,13 @@ fn only_profile_creation_marks_signed_in_coverage_complete() {
     assert!(!persisted.is_signed_in("fresh-agent", "default", "https://never-signed.example"));
 }
 
-struct HeldStandingSave {
-    inner: cerebellum::browser_standing_grants::InMemoryStandingGrantStorage,
+struct HeldAgentGrantSave {
+    inner: cerebellum::agent_grants::InMemoryAgentGrantStorage,
     started: tokio::sync::Notify,
     release: (Mutex<bool>, std::sync::Condvar),
     saves: std::sync::atomic::AtomicUsize,
 }
-impl HeldStandingSave {
+impl HeldAgentGrantSave {
     fn new() -> Self {
         Self {
             inner: Default::default(),
@@ -9951,19 +9958,19 @@ impl HeldStandingSave {
         self.release.1.notify_all();
     }
 }
-impl cerebellum::browser_standing_grants::StandingGrantStorage for HeldStandingSave {
+impl cerebellum::agent_grants::AgentGrantStorage for HeldAgentGrantSave {
     fn load(
         &self,
     ) -> Result<
-        cerebellum::browser_standing_grants::StandingGrantStoreState,
-        cerebellum::browser_standing_grants::StandingGrantStoreError,
+        Option<cerebellum::agent_grants::AgentGrantStoreState>,
+        cerebellum::agent_grants::AgentGrantStoreError,
     > {
         self.inner.load()
     }
     fn save(
         &self,
-        state: &cerebellum::browser_standing_grants::StandingGrantStoreState,
-    ) -> Result<(), cerebellum::browser_standing_grants::StandingGrantStoreError> {
+        state: &cerebellum::agent_grants::AgentGrantStoreState,
+    ) -> Result<(), cerebellum::agent_grants::AgentGrantStoreError> {
         self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.started.notify_one();
         let released = self.release.0.lock().unwrap();
@@ -9982,12 +9989,11 @@ impl cerebellum::browser_standing_grants::StandingGrantStorage for HeldStandingS
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect() {
-    let storage = Arc::new(HeldStandingSave::new());
-    let standing = Arc::new(
-        cerebellum::browser_standing_grants::StandingBrowserGrants::open(
-            storage.clone(),
-            Some("test-machine".into()),
-        ),
+    let storage = Arc::new(HeldAgentGrantSave::new());
+    let standing = permission_support::store(
+        storage.clone(),
+        "test-machine",
+        Arc::new(cerebellum::browser_standing_grants::SystemWallClock),
     );
     let (planes, launcher) = blocking_grant_fixture_with_store(Some(standing.clone())).await;
     bind_management_route(&planes).await;
@@ -10062,7 +10068,7 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
         1,
         "only the election winner stores the answer"
     );
-    assert_eq!(standing.live_rows("pj-browser-session-wire").len(), 1);
+    assert_eq!(permission_support::rows(&standing, "test-project").len(), 1);
     assert_eq!(launcher.effects.lock().unwrap().as_slice(), ["navigate"]);
     assert!(
         rx.try_recv().is_err(),

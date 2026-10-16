@@ -357,7 +357,7 @@ impl Fixture {
             let _registration = registration;
             crate::browser_queue::scope(
                 arrival,
-                crate::handle_tool_request(frame, &writer, &planes, &crate::CallObservation::new()),
+                crate::handle_route_request(frame, &writer, &planes),
             )
             .await
             .unwrap();

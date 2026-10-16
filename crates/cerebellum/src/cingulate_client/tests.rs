@@ -53,9 +53,7 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
     } else {
         crate::agent_grants::GrantHolder::Worker {
             agent_id: "agent-golden".into(),
-            owner: "reserved:prefrontal-core".into(),
             scope_ref: "worker-golden".into(),
-            scope_epoch: 1,
         }
     };
     let computer = crate::computer_grants::ComputerGrants::open(

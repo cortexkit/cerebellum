@@ -430,7 +430,7 @@ fn rig() -> Rig {
 }
 
 async fn hold_takeover(management: &ManagementPlane) {
-    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
+    let carrier = ScriptedCarrier::answering(&["computer_30m"]);
     management
         .computer_grants()
         .require(
@@ -439,7 +439,7 @@ async fn hold_takeover(management: &ManagementPlane) {
             &cerebellum::CancelHandle::pending(),
         )
         .await
-        .expect("the takeover question is answered allow_conversation");
+        .expect("the whole-computer permission is granted for thirty minutes");
 }
 
 async fn hold_other_app(management: &ManagementPlane) {
@@ -451,7 +451,7 @@ async fn hold_other_app(management: &ManagementPlane) {
             &cerebellum::CancelHandle::pending(),
         )
         .await
-        .expect("the other application's question is answered allow_conversation");
+        .expect("the application's permission is granted for thirty minutes");
 }
 
 /// Both grants a move or drag in the fixture application needs.

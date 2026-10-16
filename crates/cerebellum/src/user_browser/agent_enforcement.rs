@@ -11,25 +11,15 @@ pub(super) fn revoke_access(
     holder: Option<GrantHolder>,
     target: &crate::browser_standing_grants::RevokeTarget,
 ) -> Value {
-    use crate::browser_standing_grants::RevokeTarget;
-    let result = store.revoke_matching(store.now_ms(), |row| {
-        holder.as_ref() == Some(&row.holder)
-            && row.browser_target == Some(BrowserTarget::UserBrowser)
-            && match target {
-                RevokeTarget::Everything => true,
-                RevokeTarget::Origin(origin) => row.subject == GrantSubject::Origin(origin.clone()),
-                RevokeTarget::Domain(domain) => row.subject == GrantSubject::Domain(domain.clone()),
-                RevokeTarget::AllSites => row.subject == GrantSubject::AllSites,
-            }
-    });
-    match result {
-        Ok(ids) => {
-            serde_json::json!({"outcome":if ids.is_empty() { "nothing_to_revoke" } else { "revoked" },"revoked":ids.len()})
-        }
-        Err(_) => {
-            serde_json::json!({"outcome":"revoke_failed","revoked":0,"reason":"grant_store_write_failed","remedy":"the access is still in force; check the data directory is writable and retry"})
-        }
-    }
+    let Some(holder) = holder else {
+        return serde_json::json!({"outcome":"nothing_to_revoke","revoked":0});
+    };
+    crate::management::retained_browser_ops::revoke_rows(
+        store,
+        BrowserTarget::UserBrowser,
+        target,
+        |row_holder| row_holder == &holder,
+    )
 }
 
 impl Context<'_> {
