@@ -56,12 +56,12 @@ def scan(root: Path):
     whole_test_files: Set[Path] = set()
     pending = []
     for result in scans.values():
-        for name, explicit, in_test in result.modules:
+        for name, explicit, in_test, enclosing in result.modules:
             if in_test:
-                pending.append((result.path, name, explicit))
+                pending.append((result.path, name, explicit, enclosing))
     while pending:
-        parent, name, explicit = pending.pop()
-        child = SHARED.module_file(parent, name, explicit)
+        parent, name, explicit, enclosing = pending.pop()
+        child = SHARED.module_file(parent, name, explicit, enclosing)
         if child is None:
             continue
         child = child.resolve()
@@ -70,8 +70,8 @@ def scan(root: Path):
             continue
         whole_test_files.add(matched)
         pending.extend(
-            (matched, child_name, child_path)
-            for child_name, child_path, _ in scans[matched].modules
+            (matched, child_name, child_path, child_enclosing)
+            for child_name, child_path, _, child_enclosing in scans[matched].modules
         )
 
     found = []

@@ -304,13 +304,13 @@ def _test_file_set(root: Path):
     pending = []
     for result in scans.values():
         pending.extend(
-            (result.path, name, explicit)
-            for name, explicit, in_test in result.modules
+            (result.path, name, explicit, enclosing)
+            for name, explicit, in_test, enclosing in result.modules
             if in_test
         )
     while pending:
-        parent, name, explicit = pending.pop()
-        child = SHARED.module_file(parent, name, explicit)
+        parent, name, explicit, enclosing = pending.pop()
+        child = SHARED.module_file(parent, name, explicit, enclosing)
         if child is None:
             continue
         child = child.resolve()
@@ -318,7 +318,10 @@ def _test_file_set(root: Path):
         if matched is None or matched in whole_test_files:
             continue
         whole_test_files.add(matched)
-        pending.extend((matched, child_name, child_path) for child_name, child_path, _ in scans[matched].modules)
+        pending.extend(
+            (matched, child_name, child_path, child_enclosing)
+            for child_name, child_path, _, child_enclosing in scans[matched].modules
+        )
 
     files = []
     for path in test_files:
