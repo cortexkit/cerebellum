@@ -29,8 +29,12 @@ pub(crate) struct CardService {
 
 impl CardService {
     pub(crate) fn new() -> Arc<Self> {
+        Self::new_in(std::env::temp_dir())
+    }
+
+    fn new_in(parent: PathBuf) -> Arc<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let root = std::env::temp_dir().join(format!(
+        let root = parent.join(format!(
             "computer-cards-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -44,7 +48,11 @@ impl CardService {
     }
 
     pub(crate) fn install(planes: Planes, channel: u16, epoch: u32) -> Planes {
-        let service = Self::new();
+        Self::install_in(planes, channel, epoch, std::env::temp_dir())
+    }
+
+    pub(crate) fn install_in(planes: Planes, channel: u16, epoch: u32, parent: PathBuf) -> Planes {
+        let service = Self::new_in(parent);
         let mut planes = planes.with_cingulate(
             Arc::new(service.clone()),
             Arc::new(crate::cingulate_client::desk::FileRegistryStore::new(

@@ -851,9 +851,12 @@ where
             return self.finish_reply(capability.capability(), reply);
         }
         let grant_cancel = context.cancel.clone();
+        // Capability work holds the app-consent wait and eventual platform
+        // call. Keep that future on the heap before the grant watcher adds
+        // polling and cancellation-cleanup frames around it.
         let mut reply = crate::grant_enforcement::scope(
             grant_cancel,
-            work.scope(async {
+            Box::pin(work.scope(async {
                 match capability.0 {
                     Served::ReadState => {
                         self.serve_read_state(arguments, context, make_backend)
@@ -886,7 +889,7 @@ where
                             .await
                     }
                 }
-            }),
+            })),
         )
         .await;
         // The call went ahead without knowing whether the screen was locked.
@@ -4249,3 +4252,6 @@ mod cancel_wire_tests {
 
 #[cfg(test)]
 mod outcome_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod future_size_tests;

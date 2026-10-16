@@ -6322,7 +6322,10 @@ async fn handle_tool_request_enforced(
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
     let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
-    let future = handle_tool_request_inner(frame, writer, planes, call);
+    // Passing a large handler by value through the grant watcher multiplies
+    // debug poll-frame stack slots. Pin it once so normal completion and
+    // cancellation cleanup carry only the pointer.
+    let future = Box::pin(handle_tool_request_inner(frame, writer, planes, call));
     match planes.cancellations.get(key) {
         Some(cancel) => grant_enforcement::scope(cancel, future).await,
         None => future.await,
@@ -13143,6 +13146,7 @@ mod sigterm_listener_tests {
 /// the request is counted exactly once as in flight or as awaiting consent.
 #[cfg(all(test, target_os = "macos"))]
 mod computer_consent_wire_tests {
+    pub(crate) mod stack_tests;
     use super::*;
     use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 
@@ -13170,6 +13174,10 @@ mod computer_consent_wire_tests {
     /// Planes with one tool route that declares it can relay a question, and
     /// with `computer.wait` admitted.
     fn planes() -> Planes {
+        computer_grants::tests::CardService::install(planes_without_cards(), CHANNEL, EPOCH)
+    }
+
+    fn planes_without_cards() -> Planes {
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
@@ -13212,7 +13220,7 @@ mod computer_consent_wire_tests {
                 },
             ),
         );
-        computer_grants::tests::CardService::install(planes, CHANNEL, EPOCH)
+        planes
     }
 
     fn frame(ty: FrameType, channel: u16, corr: u64, body: Value) -> Frame {
@@ -13305,72 +13313,7 @@ mod computer_consent_wire_tests {
 
     #[tokio::test]
     async fn withdrawing_an_asked_computer_call_keeps_its_late_app_grant() {
-        let planes = planes();
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut request = wait_request();
-        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
-        body["call_key"] = json!("pf:computer-pending");
-        request.body = serde_json::to_vec(&body).unwrap();
-        COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST
-            .scope(
-                Duration::from_millis(20),
-                computer_grants::tests::with_live(
-                    handle_tool_request_for_test_with_existing_planes(request, &tx, &planes),
-                ),
-            )
-            .await
-            .unwrap();
-        let question = planes
-            .consent_test
-            .as_ref()
-            .unwrap()
-            .card(CHANNEL, EPOCH)
-            .await;
-        assert_eq!(question.header.ty, FrameType::Request);
-        assert_eq!(reply(&mut rx).await["outcome"], "consent_pending");
-        handle_frame(
-            frame(
-                FrameType::Request,
-                CHANNEL,
-                CORR + 1,
-                json!({"name":"tool.withdraw", "arguments":{"call_key":"pf:computer-pending"}}),
-            ),
-            &tx,
-            &planes,
-        )
-        .await
-        .unwrap();
-        let withdrawn: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
-        assert_eq!(withdrawn["answer"], "withdrawn");
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
-        ));
-        computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
-        let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
-        let caller = computer_grants::GrantCaller {
-            holder: permission_scope::authorizing_holder(&facts),
-            conversation_key: facts.identity.conversation_key,
-            agent_project_id: facts.identity.agent_project_id,
-            durable_identity_attested: true,
-        };
-        let need = computer_grants::GrantNeed::App {
-            bundle_identity: APP.into(),
-            display_name: APP.into(),
-            code: Arc::new(computer_grants::SignedByFixtureTeam),
-        };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !planes.management.computer_grants().holds(&caller, &need) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the late answer records the app grant");
-        assert!(
-            rx.try_recv().is_err(),
-            "no cancelled card or resumed action"
-        );
-        settle_to(&planes, (0, 0)).await;
+        stack_tests::withdraw_asked_call_and_apply_late_grant(planes()).await;
     }
 
     #[tokio::test]
