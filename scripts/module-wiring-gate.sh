@@ -42,7 +42,12 @@ for crate_dir in crates/*/; do
   crate="$(basename "$crate_dir")"
   src="${crate_dir}src"
   [ -d "$src" ] || continue
-
+  # Every module file the source tree declares, including `mod y;` inside an
+  # inline `mod x { }` (which lives at x/y.rs with no file parent).
+  declared="$(python3 "$(dirname "$0")/lib/declared-modules.py" "$src")" || {
+    echo "declared-modules.py failed for $src" >&2
+    exit 1
+  }
   while IFS= read -r file; do
     # Counted here rather than at the loop's end: the body continues early for
     # most files, so a tail increment counts almost nothing and reads as a
@@ -72,6 +77,12 @@ for crate_dir in crates/*/; do
       if [ ! -f "$parent" ] && [ -f "$src/$parent_dir.rs" ]; then
         parent="$src/$parent_dir.rs"
       fi
+    fi
+
+    # Declared from inside an inline module of another file: Rust resolves
+    # it, and the scanner has already confirmed the declaration.
+    if grep -qxF "$(cd "$(dirname "$file")" && pwd -P)/$(basename "$file")" <<<"$declared"; then
+      continue
     fi
 
     # A parent that does not exist is its own defect: the directory holds
