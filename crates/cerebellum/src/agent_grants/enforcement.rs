@@ -284,6 +284,24 @@ impl AgentGrants {
             .any(|call| call.uses_row(id))
     }
 
+    pub(crate) fn revoke_with_stopping(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<(bool, bool), AgentGrantStoreError> {
+        // Serialize use registration with durable revocation. Work that has
+        // finished while the write was pending is not reported as stopping;
+        // a later registration cannot start effects under the removed row.
+        let active = lock(&self.active);
+        let revoked = self.revoke(id, now_ms)?;
+        let stopping = revoked
+            && active
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|call| call.uses_row(id));
+        Ok((revoked, stopping))
+    }
+
     pub fn authorize(
         self: &Arc<Self>,
         holder: &GrantHolder,

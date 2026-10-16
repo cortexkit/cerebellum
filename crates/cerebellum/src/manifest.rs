@@ -197,6 +197,8 @@ fn management_surface() -> ProviderRole {
                 "List a named agent's live standing browser grants and always-allow app \
                  grants. Operator-only.",
             ),
+            (crate::permissions::LIST, "List live agent and worker permissions. Cingulate aggregator only."),
+            (crate::permissions::REVOKE, "Revoke a permission by id and stop work using it. Cingulate aggregator only."),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
@@ -213,6 +215,7 @@ fn management_surface() -> ProviderRole {
                 crate::management::REVOKE_APP_GRANT
                     | crate::management::REVOKE_ACCESS
                     | crate::management::REVOKE_GRANT
+                    | crate::permissions::REVOKE
             ) {
                 // A revoke rewrites a durable grant store.
                 ManagementOperationKind::Mutate
@@ -433,6 +436,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         // admission support independently of the tool and management roles.
         .capabilities(Some(CapabilityDeclarations {
             provides: vec![
+                crate::permissions::CAPABILITY.to_string(),
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::call_mode::CALL_MODES_CAPABILITY.to_string(),
@@ -970,6 +974,8 @@ mod tests {
                 crate::management::REVOKE_ACCESS,
                 crate::management::REVOKE_GRANT,
                 crate::management::LIST_GRANTS,
+                crate::permissions::LIST,
+                crate::permissions::REVOKE,
             ]
         );
         let dispatchable = crate::management::OPERATIONS

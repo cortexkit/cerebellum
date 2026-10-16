@@ -61,6 +61,7 @@ pub mod network;
 mod open_app_history;
 mod permission_cards;
 mod permission_scope;
+mod permissions;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
@@ -859,22 +860,24 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 
 /// Whether the management dispatcher has an explicit arm for this operation.
 pub fn dispatchable_management_operation(name: &str) -> bool {
-    matches!(
-        name,
-        management::OPEN_TARGET
-            | management::WOULD_ASK
-            | management::LIST_APP_GRANTS
-            | management::REVOKE_APP_GRANT
-            | management::OPEN_GRANT
-            | management::IMPORT_LOGIN
-            | management::REBIND_PROFILE_ROOT
-            | management::CAPTURE_LOGIN
-            | management::CLEAR_LAUNCH_RECOVERY
-            | management::REVOKE_ACCESS
-            | management::REVOKE_GRANT
-            | management::LIST_GRANTS
-    ) || (matches!(name, management::PRESENT | management::RESUME)
-        && browser::has_wire_dispatch_route(name))
+    permissions::is_operation(name)
+        || matches!(
+            name,
+            management::OPEN_TARGET
+                | management::WOULD_ASK
+                | management::LIST_APP_GRANTS
+                | management::REVOKE_APP_GRANT
+                | management::OPEN_GRANT
+                | management::IMPORT_LOGIN
+                | management::REBIND_PROFILE_ROOT
+                | management::CAPTURE_LOGIN
+                | management::CLEAR_LAUNCH_RECOVERY
+                | management::REVOKE_ACCESS
+                | management::REVOKE_GRANT
+                | management::LIST_GRANTS
+        )
+        || (matches!(name, management::PRESENT | management::RESUME)
+            && browser::has_wire_dispatch_route(name))
 }
 
 /// The operator's own management operations: the ones served to a caller that
@@ -3730,6 +3733,9 @@ async fn handle_management_request_observed(
             &format!("unknown method '{method}'"),
         )
         .await;
+    }
+    if permissions::is_operation(method) {
+        return permissions::handle(&frame, writer, facts, planes, method, object).await;
     }
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.

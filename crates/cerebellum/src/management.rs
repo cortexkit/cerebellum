@@ -73,7 +73,7 @@ pub const REVOKE_GRANT: &str = "browser.revoke_grant";
 /// List a named agent's standing browser access and always-allow app grants.
 /// Operator-only.
 pub const LIST_GRANTS: &str = "grants.list";
-pub const OPERATIONS: [&str; 14] = [
+pub const OPERATIONS: [&str; 16] = [
     WOULD_ASK,
     OPEN_TARGET,
     LIST_APP_GRANTS,
@@ -88,6 +88,8 @@ pub const OPERATIONS: [&str; 14] = [
     REVOKE_ACCESS,
     REVOKE_GRANT,
     LIST_GRANTS,
+    crate::permissions::LIST,
+    crate::permissions::REVOKE,
 ];
 
 /// Receive-to-terminal bounds for a Management-surface method. Flat browser

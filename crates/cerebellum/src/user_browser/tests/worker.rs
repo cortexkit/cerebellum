@@ -97,3 +97,106 @@ async fn worker_user_site_never_borrows_the_heads_standing_grant() {
     assert_eq!(cards.len(), 1, "the worker must ask despite the head's row");
     assert_eq!(reply["reason"], "consent_declined", "{reply}");
 }
+
+#[tokio::test]
+async fn worker_user_revoke_preserves_head_sibling_and_agent_profile_rows() {
+    use crate::agent_grants::{AgentGrant, BrowserTarget, GrantHolder, GrantSubject};
+    let fixture = worker_fixture();
+    let store = fixture.planes.management.agent_grants();
+    let scope = fixture
+        .planes
+        .routes
+        .get(1, 1)
+        .unwrap()
+        .scope
+        .unwrap()
+        .scope_ref;
+    let now = store.now_ms();
+    for (name, holder) in [
+        (
+            "head",
+            GrantHolder::Head {
+                agent_id: "test-project".into(),
+            },
+        ),
+        (
+            "caller",
+            GrantHolder::Worker {
+                agent_id: "test-project".into(),
+                scope_ref: scope,
+            },
+        ),
+        (
+            "sibling",
+            GrantHolder::Worker {
+                agent_id: "test-project".into(),
+                scope_ref: "another-worker".into(),
+            },
+        ),
+    ] {
+        for (prefix, target) in [
+            ("agent", BrowserTarget::AgentProfile),
+            ("user", BrowserTarget::UserBrowser),
+        ] {
+            store
+                .upsert(
+                    AgentGrant {
+                        id: String::new(),
+                        holder: holder.clone(),
+                        subject: GrantSubject::Domain("example.com".into()),
+                        browser_target: Some(target),
+                        machine_uuid: store.machine_uuid().unwrap().into(),
+                        granted_at_ms: now,
+                        expires_at_ms: Some(now + 1_800_000),
+                        card_ref: Some(format!("{prefix}-{name}")),
+                        max_level: 3,
+                        hazards: vec![],
+                        team_id: None,
+                        designated_requirement: None,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+    }
+    let (reply, cards) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"revoke_access"}),
+            "deny",
+        )
+        .await;
+    assert!(cards.is_empty());
+    assert_eq!(
+        reply,
+        json!({"browser":"user","outcome":"revoked","revoked":1})
+    );
+    let mut remaining: Vec<_> = store
+        .live_rows(None, now)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.card_ref.unwrap())
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        [
+            "agent-caller",
+            "agent-head",
+            "agent-sibling",
+            "user-head",
+            "user-sibling"
+        ]
+    );
+    let (reply, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"revoke_access"}),
+            "deny",
+        )
+        .await;
+    assert_eq!(
+        reply,
+        json!({"browser":"user","outcome":"nothing_to_revoke","revoked":0})
+    );
+}
