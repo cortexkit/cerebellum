@@ -6,7 +6,15 @@ use subc_protocol::manifest::CapabilityDeclarations;
 async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_present_peers() {
     use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
     use subc_transport::{read_frame, write_frame};
-    for mode in ["absent", "error", "present", "other-module", "malformed"] {
+    for mode in [
+        "absent",
+        "error",
+        "present",
+        "single-use-only",
+        "other-module",
+        "unknown",
+        "malformed",
+    ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -32,10 +40,18 @@ async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_
                 vec![],
             )
             .with_capabilities(Some(CapabilityDeclarations {
-                provides: if mode == "absent" {
-                    vec![]
-                } else {
-                    vec!["consent-option-group/v1".into()]
+                provides: match mode {
+                    "present" => vec![
+                        "consent-option-group/v1".into(),
+                        "consent-single-use/v1".into(),
+                    ],
+                    "single-use-only" => vec!["consent-single-use/v1".into()],
+                    "unknown" => vec!["consent-single-use/v10".into()],
+                    "other-module" => vec![
+                        "consent-option-group/v1".into(),
+                        "consent-single-use/v1".into(),
+                    ],
+                    _ => vec![],
                 },
                 requires: vec![],
                 must_never_reach: vec![],
@@ -69,9 +85,17 @@ async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_
         assert_eq!(
             features,
             match mode {
-                "present" => Some(CingulateFeatures { option_group: true }),
-                "absent" | "other-module" => Some(CingulateFeatures {
-                    option_group: false
+                "present" => Some(CingulateFeatures {
+                    option_group: true,
+                    single_use: true,
+                }),
+                "single-use-only" => Some(CingulateFeatures {
+                    option_group: false,
+                    single_use: true,
+                }),
+                "absent" | "other-module" | "unknown" => Some(CingulateFeatures {
+                    option_group: false,
+                    single_use: false,
                 }),
                 _ => None,
             },
@@ -96,6 +120,10 @@ async fn check_filed_cards(reported: Option<CingulateFeatures>, full: bool) {
                 .as_array_mut()
                 .unwrap()
                 .retain(|option| option["group"] != "danger");
+        }
+        let supports_single_use = reported.is_some_and(|features| features.single_use);
+        if supports_single_use && matches!(kind, CardKind::LoginCapture | CardKind::LoginImport) {
+            expected["single_use"] = serde_json::Value::Bool(true);
         }
         let id = session.raise(card.clone(), name).await.unwrap();
         let sent = &service.calls()[0].1;
@@ -148,6 +176,7 @@ async fn old_or_unknown_cingulate_receives_only_safe_options_and_records_only_sa
     check_filed_cards(
         Some(CingulateFeatures {
             option_group: false,
+            single_use: false,
         }),
         false,
     )
@@ -156,5 +185,12 @@ async fn old_or_unknown_cingulate_receives_only_safe_options_and_records_only_sa
 
 #[tokio::test]
 async fn supporting_cingulate_receives_the_full_card_and_records_danger_answers() {
-    check_filed_cards(Some(CingulateFeatures { option_group: true }), true).await;
+    check_filed_cards(
+        Some(CingulateFeatures {
+            option_group: true,
+            single_use: true,
+        }),
+        true,
+    )
+    .await;
 }

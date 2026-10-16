@@ -78,6 +78,26 @@ fn exported() -> Vec<(String, CardRequest)> {
             request_for(CardKind::UserBrowserSite, &body, USER_BROWSER_SITE_DEADLINE),
         ));
     }
+    for head in [true, false] {
+        let prefix = if head { "head" } else { "worker" };
+        for (kind, name, body, deadline) in cards_with_standing(head) {
+            if matches!(kind, CardKind::LoginCapture | CardKind::LoginImport) {
+                let card = request_for(kind, &body, deadline).for_features(
+                    crate::cingulate_client::features::CingulateFeatures {
+                        option_group: true,
+                        single_use: true,
+                    },
+                );
+                result.push((
+                    format!(
+                        "{prefix}-{}-single-use.json",
+                        name.trim_end_matches(".json")
+                    ),
+                    card,
+                ));
+            }
+        }
+    }
     result
 }
 
@@ -89,8 +109,13 @@ fn exported_permission_cards_match_goldens_and_fail_closed() {
     let write = std::env::var_os("CEREBELLUM_WRITE_AGENT_PERMISSION_CARDS").is_some();
     let mut sums = String::new();
     let cards = exported();
-    assert_eq!(cards.len(), 24);
+    assert_eq!(cards.len(), 28);
     for (name, card) in cards {
+        assert_eq!(
+            card.params.get("single_use") == Some(&serde_json::Value::Bool(true)),
+            name.ends_with("-single-use.json"),
+            "{name}"
+        );
         assert_eq!(card.params["default"], card.decline_id, "{name}");
         assert_eq!(card.params["on_expiry"], "deny", "{name}");
         crate::consent_card::core_verdict(&card.params)
@@ -144,6 +169,127 @@ fn exported_permission_cards_match_goldens_and_fail_closed() {
         std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap(),
         sums
     );
+}
+
+#[test]
+fn cingulate_single_use_vectors_pin_the_login_export_shape() {
+    use sha2::{Digest, Sha256};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors/consent-outcomes-refs-v1");
+    let expected_pins = [
+        (
+            "single-use-non-boolean-refusal.json",
+            "dbe1bb1c9f68e29419981ebcdeb75fe2f2cb3d3f4837c3cf9fb42afa9700a00f",
+        ),
+        (
+            "single-use-non-consent-refusal.json",
+            "dabe84da799654860a7bbdf11767f636fe1b51a870bb9ccfdc1e630bc5cc5ba0",
+        ),
+        (
+            "single-use-outcomes-reply.json",
+            "ddae72b743dd126ea4c795929185a5109d9313c91082ca1c3c1476035996945b",
+        ),
+        (
+            "single-use-reply.json",
+            "94c32b237b1a464812b81872e515537703e4140418158866cec6db06a78a0c74",
+        ),
+        (
+            "single-use-request.json",
+            "c439d04e5b2cbf1bd103b6b386c0d8a4040d3c76a742ad34a3fd4dbdbaba4c6c",
+        ),
+    ];
+    let mut sums = String::new();
+    for (name, expected) in expected_pins {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(actual, expected, "{name}");
+        sums.push_str(&format!("{actual}  {name}\n"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap(),
+        sums
+    );
+
+    let request: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("single-use-request.json")).unwrap())
+            .unwrap();
+    let params = &request["params"];
+    assert_eq!(params["kind"], "consent");
+    assert_eq!(params["single_use"], true);
+    assert_eq!(params["requester_ref"], "call-single-use");
+    assert_single_use_position(params, "Cingulate request vector");
+
+    let reply: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("single-use-reply.json")).unwrap()).unwrap();
+    assert_eq!(reply["result"]["elicitation_id"], "el_1");
+    let outcomes: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("single-use-outcomes-reply.json")).unwrap())
+            .unwrap();
+    let outcome = &outcomes["result"]["records"][0];
+    assert_eq!(outcome["kind"], "consent");
+    assert_eq!(outcome["single_use"], true);
+    assert_eq!(outcome["requester_ref"], params["requester_ref"]);
+    assert!(outcome.get("late").is_none());
+
+    let login_exports: Vec<_> = exported()
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("-single-use.json"))
+        .collect();
+    assert_eq!(login_exports.len(), 4);
+    for (name, card) in login_exports {
+        assert_eq!(card.params["kind"], params["kind"], "{name}");
+        assert!(card.params["requester_ref"].is_string(), "{name}");
+        assert_eq!(card.params["single_use"], params["single_use"], "{name}");
+        assert_single_use_position(&card.params, &name);
+    }
+}
+
+fn assert_single_use_position(params: &Value, context: &str) {
+    let keys: Vec<_> = params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let position = keys
+        .iter()
+        .position(|key| *key == "single_use")
+        .unwrap_or_else(|| panic!("{context}: single_use is not a top-level request field"));
+    assert_eq!(
+        keys.get(position.wrapping_sub(1)),
+        Some(&"scope"),
+        "{context}"
+    );
+    assert_eq!(keys.get(position + 1), Some(&"target"), "{context}");
+}
+
+#[test]
+fn cingulate_single_use_refusal_vectors_match_the_closed_request_checker() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors/consent-outcomes-refs-v1");
+    let request: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("single-use-request.json")).unwrap())
+            .unwrap();
+    let non_consent: Value = serde_json::from_slice(
+        &std::fs::read(dir.join("single-use-non-consent-refusal.json")).unwrap(),
+    )
+    .unwrap();
+    let mut params = request["params"].clone();
+    params["kind"] = json!("package");
+    let refusal = crate::consent_card::core_verdict(&params).unwrap_err();
+    assert_eq!(refusal.code, non_consent["code"]);
+    assert_eq!(refusal.message, non_consent["message"]);
+
+    let non_boolean: Value = serde_json::from_slice(
+        &std::fs::read(dir.join("single-use-non-boolean-refusal.json")).unwrap(),
+    )
+    .unwrap();
+    params = request["params"].clone();
+    params["single_use"] = json!("yes");
+    let refusal = crate::consent_card::core_verdict(&params).unwrap_err();
+    assert_eq!(refusal.code, non_boolean["code"]);
+    assert_eq!(refusal.message, non_boolean["message"]);
 }
 
 #[test]

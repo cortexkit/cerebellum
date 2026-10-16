@@ -1,7 +1,9 @@
 # Agent permission request goldens
 
 These files are exact `consent.request` params from Cerebellum's production
-builders and mapper for a Cingulate advertising `consent-option-group/v1`.
+builders and mapper. The original files model a Cingulate advertising
+`consent-option-group/v1` without the single-use feature; the suffixed login
+exports model a Cingulate that also advertises `consent-single-use/v1`.
 `head-` identifies the main agent; `worker-` identifies a task worker whose
 permissions are separate from its main agent. Both identities are verified by
 the daemon before a granting choice can be offered.
@@ -16,8 +18,10 @@ the daemon before a granting choice can be offered.
 | `head-website-public-in-advance.json` | `worker-website-public-in-advance.json` | Public site and all-sites choices, asked ahead |
 | `head-user-browser-site.json` | `worker-user-browser-site.json` | Person's Chrome, sign-in site only |
 | `head-user-browser-public.json` | `worker-user-browser-public.json` | Person's Chrome, public site only |
-| `head-login-import.json` | `worker-login-import.json` | Unchanged single-use control |
-| `head-login-capture.json` | `worker-login-capture.json` | Unchanged single-use control |
+| `head-login-import.json` | `worker-login-import.json` | Login import, no capability marker |
+| `head-login-capture.json` | `worker-login-capture.json` | Login capture, no capability marker |
+| `head-login-import-single-use.json` | `worker-login-import-single-use.json` | Login import, single-use feature |
+| `head-login-capture-single-use.json` | `worker-login-capture-single-use.json` | Login capture, single-use feature |
 | `head-profile-reidentification.json` | `worker-profile-reidentification.json` | Unchanged single-use control |
 | `head-stuck-profile-clearance.json` | `worker-stuck-profile-clearance.json` | Unchanged single-use control |
 
@@ -26,7 +30,8 @@ options are removed, along with their remembered granting answer ids, when
 Cingulate's catalog declaration is missing or cannot be read. Takeover's
 non-danger once option writes no reusable permission row.
 
-`SHA256SUMS` lists the checksums of all 24 files for CKIOS. Existing changed
+The `SHA256SUMS` file in this directory pins all 28 exported head and worker
+card JSON files; it excludes itself and this README. Existing changed
 card goldens are `app-control.json`, `takeover.json`,
 `website-access-in-call.json`, `website-access-in-advance.json` and
 `user-browser-site.json` under `../cingulate-consent-cards-v1/`; its other four
