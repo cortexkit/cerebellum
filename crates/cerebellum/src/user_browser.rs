@@ -525,6 +525,9 @@ async fn plan(
     cancel: &CancelHandle,
     commands: Vec<Value>,
 ) -> Result<Plan, Value> {
+    if !crate::grant_enforcement::commit_current() {
+        return Err(refusal("grant_revoked"));
+    }
     let count = commands.len();
     let methods: Vec<String> = commands
         .iter()
@@ -939,6 +942,7 @@ fn matches_schema(value: &Value, schema: &Value) -> bool {
 }
 
 struct InvocationGrant {
+    authorizing_row: Option<crate::agent_grants::GrantUse>,
     origin: String,
     severity: Severity,
     hazards: BTreeSet<HazardClass>,
@@ -947,7 +951,14 @@ struct InvocationGrant {
 
 impl InvocationGrant {
     fn covers(&self, origin: &str, severity: Severity, hazards: &BTreeSet<HazardClass>) -> bool {
-        self.once
+        if self
+            .authorizing_row
+            .as_ref()
+            .is_some_and(|row| !row.is_live())
+        {
+            return false;
+        }
+        (self.once || self.authorizing_row.is_some())
             && self.origin == origin
             && self.severity.covers(severity)
             && hazards.is_subset(&self.hazards)
@@ -980,6 +991,29 @@ impl Context<'_> {
         hazards: &BTreeSet<HazardClass>,
         once: Option<&InvocationGrant>,
     ) -> bool {
+        if let Some(grant) = once {
+            if grant.authorizing_row.is_some() {
+                return grant.covers(origin, severity, hazards);
+            }
+        }
+        if let Some(store) = self.planes.management.unified_agent_grants() {
+            return crate::permission_scope::authorizing_holder(self.facts)
+                .and_then(|holder| {
+                    store.authorize(
+                        &holder,
+                        crate::agent_grants::GrantDemand::Browser {
+                            target: crate::agent_grants::BrowserTarget::UserBrowser,
+                            origin: origin.into(),
+                            severity,
+                            hazards: hazards.clone(),
+                        },
+                    )
+                })
+                .is_some_and(|used| {
+                    crate::grant_enforcement::track(&used);
+                    true
+                });
+        }
         once.is_some_and(|grant| grant.covers(origin, severity, hazards))
             || (!crate::permission_scope::is_worker(self.facts)
                 && self
@@ -994,6 +1028,7 @@ impl Context<'_> {
         hazards: BTreeSet<HazardClass>,
     ) -> Result<InvocationGrant, Value> {
         let mut grant = InvocationGrant {
+            authorizing_row: None,
             origin: origin.into(),
             severity,
             hazards,
@@ -1002,7 +1037,26 @@ impl Context<'_> {
         if severity.tier > 4 {
             return Err(refusal("severity_ungrantable"));
         }
-        if !crate::permission_scope::is_worker(self.facts)
+        if let Some(store) = self.planes.management.unified_agent_grants() {
+            let holder = crate::permission_scope::authorizing_holder(self.facts);
+            if let Some(used) = holder.as_ref().and_then(|holder| {
+                store.authorize(
+                    holder,
+                    crate::agent_grants::GrantDemand::Browser {
+                        target: crate::agent_grants::BrowserTarget::UserBrowser,
+                        origin: origin.into(),
+                        severity,
+                        hazards: grant.hazards.clone(),
+                    },
+                )
+            }) {
+                crate::grant_enforcement::track(&used);
+                grant.authorizing_row = Some(used);
+                return Ok(grant);
+            }
+        }
+        if self.planes.management.unified_agent_grants().is_none()
+            && !crate::permission_scope::is_worker(self.facts)
             && self
                 .target()
                 .covers(self.agent(), origin, severity, &grant.hazards)
@@ -1012,8 +1066,10 @@ impl Context<'_> {
         if self.facts.flow_id.is_some() {
             return Err(refusal("consent_unavailable"));
         }
-        let standing =
-            self.target().grants.can_record() && crate::standing_offer_agent(self.facts).is_some();
+        let standing = self.planes.management.unified_agent_grants().map_or_else(
+            || self.target().grants.can_record(),
+            |store| store.can_record(),
+        ) && crate::standing_offer_agent(self.facts).is_some();
         let body = site_question(origin, severity.tier, &grant.hazards, standing);
         let card = consent_request(
             CardKind::UserBrowserSite,
@@ -1074,8 +1130,18 @@ impl Context<'_> {
         };
         let decided = match &ending {
             Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ONCE => {
+                if self.planes.management.unified_agent_grants().is_some() {
+                    return self.record_agent_answer(grant, &ask_id, false);
+                }
                 grant.once = true;
                 Ok(grant)
+            }
+            Ending::Granted { choice_id }
+                if choice_id == SITE_ALLOW_ALWAYS
+                    && standing
+                    && self.planes.management.unified_agent_grants().is_some() =>
+            {
+                return self.record_agent_answer(grant, &ask_id, true);
             }
             Ending::Granted { choice_id } if choice_id == SITE_ALLOW_ALWAYS && standing => self
                 .target()
@@ -2229,6 +2295,7 @@ fn declared_severity(args: &Value) -> Result<Severity, Value> {
     Ok(severity)
 }
 
+mod agent_enforcement;
 mod functions;
 
 #[cfg(test)]

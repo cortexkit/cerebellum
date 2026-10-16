@@ -17,10 +17,27 @@ use crate::{
 /// Tracks whether ordinary external mutations may start. Once a terminal
 /// decision stops dispatch, only held-input release may proceed.
 #[derive(Default)]
-pub struct DispatchGate(std::sync::atomic::AtomicU8);
+pub struct DispatchGate(
+    std::sync::atomic::AtomicU8,
+    std::sync::Mutex<Option<Arc<crate::grant_enforcement::CallGrants>>>,
+);
 
 impl DispatchGate {
+    pub(crate) fn bind_grants(&self, grants: Arc<crate::grant_enforcement::CallGrants>) {
+        *self.1.lock().unwrap() = Some(grants);
+    }
+
     pub fn begin_mutation(&self) -> bool {
+        if self
+            .1
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|grants| !grants.is_live())
+        {
+            self.stop();
+            return false;
+        }
         use std::sync::atomic::Ordering::SeqCst;
         let mut bits = self.0.load(SeqCst);
         loop {

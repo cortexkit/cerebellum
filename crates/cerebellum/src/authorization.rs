@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::agent_grants::{AgentGrants, BrowserTarget, GrantDemand, GrantHolder, GrantUse};
 use crate::browser_standing_grants::StandingBrowserGrants;
 use crate::classification::{
     canonical_grant_origin, canonical_origin, NonTypeClassificationFingerprint,
@@ -30,7 +31,7 @@ pub const STANDING_GRANT_ID_PREFIX: &str = "standing:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandingCaller {
     /// The attested `agentProjectId`.
-    pub agent_id: String,
+    pub holder: GrantHolder,
 }
 
 tokio::task_local! {
@@ -235,6 +236,7 @@ impl Action {
 /// the person who issued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionGrant {
+    agent_grant: Option<GrantUse>,
     pub id: String,
     pub revision: u64,
     pub conversation_key: String,
@@ -252,6 +254,7 @@ impl ActionGrant {
         authorized_origins: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         Self {
+            agent_grant: None,
             id: id.into(),
             revision,
             conversation_key: conversation_key.into(),
@@ -450,6 +453,7 @@ impl<'a> AuthorizationRequest<'a> {
 /// values and there is deliberately no reauthorization method on this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationDecision {
+    agent_grant: Option<GrantUse>,
     decision_id: String,
     grant_id: String,
     grant_revision: u64,
@@ -576,6 +580,7 @@ impl AuthorizationCommitment {
 /// decision inside that commitment.
 #[derive(Debug, Clone, Default)]
 pub struct GrantStore {
+    agent_grants: Option<Arc<AgentGrants>>,
     current: BTreeMap<String, ActionGrant>,
     invalid: bool,
     /// Standing per-agent browser rows, consulted when no conversation grant
@@ -588,6 +593,10 @@ pub struct GrantStore {
 pub type AuthorizationStore = GrantStore;
 
 impl GrantStore {
+    pub fn with_agent_grants(mut self, grants: Arc<AgentGrants>) -> Self {
+        self.agent_grants = Some(grants);
+        self
+    }
     pub fn with_public_web_baseline(
         mut self,
         signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
@@ -643,16 +652,43 @@ impl GrantStore {
         attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
     ) -> Option<ActionGrant> {
-        let standing = self.standing.as_ref()?;
         let caller = current_standing_caller()?;
         // The request names the agent it acts for; a scope set for another
         // agent must never lend that agent's rows to this request.
-        if caller.agent_id.is_empty() || caller.agent_id != request.bind_identity {
+        if caller.holder.agent_id().is_empty() || caller.holder.agent_id() != request.bind_identity
+        {
             return None;
         }
         let origin = canonical_grant_origin(attempted_origin)?;
+        if let Some(grants) = &self.agent_grants {
+            let used = grants.authorize(
+                &caller.holder,
+                GrantDemand::Browser {
+                    target: BrowserTarget::AgentProfile,
+                    origin: origin.clone(),
+                    severity: required,
+                    hazards: required_hazards.clone(),
+                },
+            )?;
+            let row = used.row();
+            let mut grant = ActionGrant::new(
+                format!("{STANDING_GRANT_ID_PREFIX}{}", row.id),
+                row.granted_at_ms.max(1),
+                request.conversation_key,
+                required,
+                [origin],
+            )
+            .with_disclosed_hazards(required_hazards.iter().copied());
+            crate::grant_enforcement::track(&used);
+            grant.agent_grant = Some(used);
+            return Some(grant);
+        }
+        let standing = self.standing.as_ref()?;
+        let GrantHolder::Head { agent_id } = &caller.holder else {
+            return None;
+        };
         let row = standing.covering_row(
-            &caller.agent_id,
+            agent_id,
             &origin,
             required,
             required_hazards,
@@ -708,6 +744,17 @@ impl GrantStore {
         attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
     ) -> Result<ActionGrant, AuthorizationError> {
+        if self.agent_grants.is_some() {
+            return self
+                .standing_grant(request, required, attempted_origin, required_hazards)
+                .or_else(|| {
+                    self.baseline_grant(request, required, attempted_origin, required_hazards)
+                })
+                .ok_or_else(|| AuthorizationError::NoGrantForAction {
+                    attempted_origin: attempted_origin.into(),
+                    required,
+                });
+        }
         match self.select_covering_grant_for_hazards(
             request.conversation_key,
             required,
@@ -967,6 +1014,15 @@ impl GrantStore {
             });
         }
         if let Some(key) = decision.grant_id.strip_prefix(STANDING_GRANT_ID_PREFIX) {
+            if self.agent_grants.is_some() {
+                if !decision.agent_grant.as_ref().is_some_and(GrantUse::is_live) {
+                    return Err(AuthorizationCommitError::GrantRevoked);
+                }
+                return Ok(AuthorizationCommitment {
+                    token: format!("commit-{}", decision.decision_id),
+                    decision: decision.clone(),
+                });
+            }
             // A standing decision commits only while its row is still in
             // force: revoked or expired since authorization admits nothing.
             let live = self.standing.as_ref().is_some_and(|standing| {
@@ -1151,6 +1207,7 @@ fn make_decision(
     let decision_number = NEXT_DECISION_ID.fetch_add(1, AtomicOrdering::Relaxed);
     let decision_id = format!("ad-{decision_number:016x}");
     Ok(AuthorizationDecision {
+        agent_grant: grant.agent_grant.clone(),
         decision_id,
         grant_id: grant.id.clone(),
         grant_revision: grant.revision,

@@ -113,11 +113,7 @@ fn allowing(conversation_key: &str) -> ConsentContext {
     let (drain_sender, drain) = tokio::sync::watch::channel(false);
     std::mem::forget(drain_sender);
     ConsentContext::new(
-        GrantCaller {
-            conversation_key: conversation_key.into(),
-            agent_project_id: GRANTEE.into(),
-            durable_identity_attested: false,
-        },
+        GrantCaller::new(conversation_key.into(), GRANTEE.into(), false),
         Some(
             Arc::new(ScriptedCarrier::answering(&["allow_conversation"]))
                 as Arc<dyn QuestionCarrier>,
@@ -307,11 +303,11 @@ async fn two_conversations_hold_disjoint_ids_that_end_with_them() {
 }
 
 fn no_relay_for(conversation_key: &str) -> ConsentContext {
-    ConsentContext::without_carrier(GrantCaller {
-        conversation_key: conversation_key.into(),
-        agent_project_id: GRANTEE.into(),
-        durable_identity_attested: false,
-    })
+    ConsentContext::without_carrier(GrantCaller::new(
+        conversation_key.into(),
+        GRANTEE.into(),
+        false,
+    ))
 }
 
 /// A minimal JPEG: start of image, one frame header, padding, end of image.

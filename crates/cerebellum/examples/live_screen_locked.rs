@@ -99,11 +99,7 @@ mod macos_probe {
             let clock = SystemClock::new();
             // Nobody to ask: without the lock refusal this read would stop at
             // consent_unavailable, which is itself a different answer.
-            let consent = ConsentContext::without_carrier(GrantCaller {
-                conversation_key: "live-probe".to_string(),
-                agent_project_id: grantee.to_string(),
-                durable_identity_attested: false,
-            });
+            let consent = ConsentContext::without_carrier(GrantCaller::new("live-probe".to_string(), grantee.to_string(), false));
             plane
                 .serve(
                     servable("computer.read_state").expect("read_state is served"),

@@ -513,6 +513,9 @@ impl StandingGrantStorage for FilesystemStandingGrantStorage {
 /// expiry stamped by one run would mean nothing to the next.
 pub trait WallClock: Send + Sync {
     fn now_ms(&self) -> u64;
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// The system's wall clock.
@@ -529,20 +532,33 @@ impl WallClock for SystemWallClock {
 }
 
 /// A wall clock that moves only when told to, for tests of expiry.
-#[derive(Debug, Clone, Default)]
-pub struct ManualWallClock(Arc<AtomicU64>);
+#[derive(Debug, Clone)]
+pub struct ManualWallClock(Arc<AtomicU64>, tokio::sync::watch::Sender<u64>);
+
+impl Default for ManualWallClock {
+    fn default() -> Self {
+        Self::at(0)
+    }
+}
 
 impl ManualWallClock {
     pub fn at(now_ms: u64) -> Self {
-        Self(Arc::new(AtomicU64::new(now_ms)))
+        Self(
+            Arc::new(AtomicU64::new(now_ms)),
+            tokio::sync::watch::channel(now_ms).0,
+        )
     }
 
     pub fn advance_ms(&self, by: u64) {
         self.0.fetch_add(by, Ordering::SeqCst);
+        self.1.send_replace(self.0.load(Ordering::SeqCst));
     }
 }
 
 impl WallClock for ManualWallClock {
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.1.subscribe())
+    }
     fn now_ms(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
@@ -621,25 +637,6 @@ impl StandingBrowserGrants {
                 let grants =
                     Self::open(Arc::new(InMemoryStandingGrantStorage::new()), machine_uuid);
                 *lock(&grants.rows) = Err(error);
-                grants
-            }
-        }
-    }
-
-    /// A distinct store prevents grants for the agent's profile from authorizing
-    /// the person's signed-in Chrome (and vice versa).
-    pub(crate) fn open_user_durable(machine_uuid: Option<String>) -> Self {
-        match cerebellum_core::journal::journal_data_path("user-browser-standing-grants.json") {
-            Ok(path) => Self::open(
-                Arc::new(FilesystemStandingGrantStorage::new(path)),
-                machine_uuid,
-            ),
-            Err(error) => {
-                let grants =
-                    Self::open(Arc::new(InMemoryStandingGrantStorage::new()), machine_uuid);
-                *lock(&grants.rows) = Err(StandingGrantStoreError::Unreadable {
-                    detail: format!("{error:?}"),
-                });
                 grants
             }
         }
@@ -961,7 +958,7 @@ pub fn always_subject(origin: String) -> StandingSubject {
     domain_scope(&origin).map_or(StandingSubject::Origin(origin), StandingSubject::Domain)
 }
 
-fn domain_covers(domain: &str, origin: &str) -> bool {
+pub(crate) fn domain_covers(domain: &str, origin: &str) -> bool {
     let Some(host) = origin.strip_prefix("https://") else {
         return false;
     };

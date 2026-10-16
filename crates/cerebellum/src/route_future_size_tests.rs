@@ -6,8 +6,9 @@
 //! thread stack. The handlers are boxed at their call boundaries, which keeps
 //! each future small. These tests build each future on the route path without
 //! polling it and check its size, so a handler that stops being boxed fails
-//! here. The stack itself is checked by a browser call run on a reduced
-//! stack in the `browser_session_wire` tests.
+//! here. Actual calls also run on 1 MiB stacks: browser navigation in
+//! `browser_session_wire` and computer consent in
+//! `computer_consent_wire_tests::stack_tests`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,18 +23,17 @@ use crate::{
     CallObservation, HealthState, JournalPersistence, Planes, TerminalArbiter,
 };
 
-/// The most any future on the route path may take in an unoptimized build.
-/// Measured on macOS debug once the route handlers were boxed at their call
-/// boundaries: the largest is `handle_tool_request_inner` at 11,920 bytes.
-/// Before boxing, `handle_route_request` was 32,864 bytes and the spawned
-/// route task 35,600. 16 KiB leaves about a third for growth while catching a
-/// handler that stops being boxed.
+/// Bound for each route or computer-consent future in an unoptimized build.
+/// With boxed enforcement inputs, the largest native debug future measured
+/// 9,008 bytes. Without those boxes the enforcement wrapper was 135,296 bytes
+/// and computer dispatch was 43,904. The 16 KiB bound catches an oversized
+/// future before nested poll frames can exhaust a normal thread stack.
 pub(crate) const MAX_ROUTE_FUTURE_BYTES: usize = 16 * 1024;
 
-/// The most the spawned route task may take: the future built on the frame
-/// reader's stack and moved by value into `tokio::spawn`. Measured at 2,248
-/// bytes with its worker boxed; 8 KiB catches an unboxed worker, which made it
-/// 35,600.
+/// Bound the spawned route future that the frame reader constructs on its
+/// stack before moving it into `tokio::spawn`. Boxing its route-request
+/// handler keeps it at 2,296 bytes; the 8 KiB limit catches unboxing that
+/// previously made it 35,600 bytes.
 pub(crate) const MAX_SPAWNED_ROUTE_BYTES: usize = 8 * 1024;
 
 fn planes() -> Planes {
@@ -144,6 +144,8 @@ fn route_future_sizes() -> Vec<(&'static str, usize)> {
     );
     sizes.push(("run_arbitrated_route", std::mem::size_of_val(&route)));
     drop(route);
+    #[cfg(target_os = "macos")]
+    sizes.extend(crate::computer_consent_wire_tests::stack_tests::future_sizes());
     sizes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
     sizes
 }

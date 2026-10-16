@@ -4,8 +4,12 @@
 //! projection and its change atomically; the presence of that file is the migration
 //! marker, even when it contains no rows. Legacy files are then ignored.
 
+mod enforcement;
 mod legacy;
 mod storage;
+pub use enforcement::{GrantDemand, GrantUse};
+#[cfg(test)]
+mod enforcement_tests;
 #[cfg(test)]
 mod tests;
 
@@ -226,6 +230,9 @@ pub struct AgentGrants {
     storage: Arc<dyn AgentGrantStorage>,
     machine_uuid: Option<String>,
     state: Mutex<Result<AgentGrantStoreState, AgentGrantStoreError>>,
+    clock: Arc<dyn crate::browser_standing_grants::WallClock>,
+    changed: tokio::sync::watch::Sender<u64>,
+    active: Mutex<Vec<std::sync::Weak<crate::grant_enforcement::CallGrants>>>,
 }
 
 impl AgentGrants {
@@ -248,6 +255,9 @@ impl AgentGrants {
             storage,
             machine_uuid,
             state: Mutex::new(state),
+            clock: Arc::new(crate::browser_standing_grants::SystemWallClock),
+            changed: tokio::sync::watch::channel(0).0,
+            active: Mutex::new(Vec::new()),
         }
     }
 
@@ -347,6 +357,8 @@ impl AgentGrants {
         // neither changes enforcement nor marks a legacy projection migrated.
         self.storage.save(&next)?;
         *state = Ok(next);
+        self.changed
+            .send_modify(|version| *version = version.wrapping_add(1));
         Ok(result)
     }
 }

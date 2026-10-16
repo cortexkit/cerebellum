@@ -585,11 +585,7 @@ pub fn request() -> Value {
 /// [`identity`], with an identity the daemon did not attest.
 #[allow(dead_code)]
 pub fn caller() -> GrantCaller {
-    GrantCaller {
-        conversation_key: identity().conversation_key,
-        agent_project_id: GRANTEE.to_string(),
-        durable_identity_attested: false,
-    }
+    GrantCaller::new(identity().conversation_key, GRANTEE.to_string(), false)
 }
 
 /// A consent context that can ask nobody. Enough for a caller that already

@@ -850,8 +850,13 @@ where
             };
             return self.finish_reply(capability.capability(), reply);
         }
-        let mut reply = work
-            .scope(async {
+        let grant_cancel = context.cancel.clone();
+        // Capability work holds the app-consent wait and eventual platform
+        // call. Keep that future on the heap before the grant watcher adds
+        // polling and cancellation-cleanup frames around it.
+        let mut reply = crate::grant_enforcement::scope(
+            grant_cancel,
+            Box::pin(work.scope(async {
                 match capability.0 {
                     Served::ReadState => {
                         self.serve_read_state(arguments, context, make_backend)
@@ -884,8 +889,9 @@ where
                             .await
                     }
                 }
-            })
-            .await;
+            })),
+        )
+        .await;
         // The call went ahead without knowing whether the screen was locked.
         // Said on the reply so an empty tree or a missing element is not
         // taken for an application that has nothing there.
@@ -976,7 +982,9 @@ where
             return busy;
         }
         let takeover = !consent.unattended
-            && management.computer_grants().holds(
+            && parsed.include_image
+            && parsed.bring_to_front
+            && management.computer_grants().retain_held(
                 &consent.caller,
                 &crate::computer_grants::GrantNeed::Takeover,
             );
@@ -4244,3 +4252,6 @@ mod cancel_wire_tests {
 
 #[cfg(test)]
 mod outcome_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod future_size_tests;

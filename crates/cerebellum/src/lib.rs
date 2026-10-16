@@ -46,6 +46,7 @@ pub mod custody;
 pub mod durable_formats;
 mod egress;
 pub mod flat_tools;
+mod grant_enforcement;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
@@ -1675,6 +1676,7 @@ fn consent_context(
     }));
     let mut context = computer_grants::ConsentContext::new(
         computer_grants::GrantCaller {
+            holder: permission_scope::authorizing_holder(facts),
             conversation_key: facts.identity.conversation_key.clone(),
             agent_project_id: facts.identity.agent_project_id.clone(),
             durable_identity_attested: facts.agent_project_id_attested
@@ -2937,35 +2939,29 @@ impl Planes {
         // machine identity, never offers "always".
         // Standing browser grants follow the same rule, and are bound to the
         // same machine identity.
-        let (computer_grants, durable_standing) = match journal {
+        let (computer_grants, agent_grants) = match journal {
             JournalPersistence::Durable => {
                 let machine_uuid = computer_grants::this_machine_uuid();
+                let grants = Arc::new(
+                    agent_grants::AgentGrants::open_durable(machine_uuid.clone())
+                        .unwrap_or_else(agent_grants::AgentGrants::unavailable),
+                );
+                computer_grants::ComputerGrants::note_durable_store_health(&grants);
                 (
-                    Arc::new(computer_grants::ComputerGrants::open_durable(
-                        machine_uuid.clone(),
-                    )),
-                    Some(machine_uuid),
+                    Arc::new(
+                        computer_grants::ComputerGrants::in_memory()
+                            .with_agent_grants(Arc::clone(&grants)),
+                    ),
+                    Some(grants),
                 )
             }
             JournalPersistence::Isolated => {
                 (Arc::new(computer_grants::ComputerGrants::in_memory()), None)
             }
         };
-        let user_grants = Arc::new(match &durable_standing {
-            Some(machine_uuid) => {
-                browser_standing_grants::StandingBrowserGrants::open_user_durable(
-                    machine_uuid.clone(),
-                )
-            }
-            None => browser_standing_grants::StandingBrowserGrants::in_memory(),
-        });
+        let user_grants = Arc::new(browser_standing_grants::StandingBrowserGrants::in_memory());
         let standing = standing.unwrap_or_else(|| {
-            Arc::new(match durable_standing {
-                Some(machine_uuid) => {
-                    browser_standing_grants::StandingBrowserGrants::open_durable(machine_uuid)
-                }
-                None => browser_standing_grants::StandingBrowserGrants::in_memory(),
-            })
+            Arc::new(browser_standing_grants::StandingBrowserGrants::in_memory())
         });
         let signed_in = signed_in.unwrap_or_else(|| {
             Arc::new(match journal {
@@ -2973,15 +2969,17 @@ impl Planes {
                 JournalPersistence::Isolated => browser_signed_in::SignedInDomains::default(),
             })
         });
-        let management = Arc::new(
-            ManagementPlane::with_computer_grants(
-                Arc::new(management::PlatformResolver::new()),
-                computer_grants,
-            )
-            .with_isolated_storage(journal == JournalPersistence::Isolated)
-            .with_standing_browser_grants(standing)
-            .with_signed_in_domains(Arc::clone(&signed_in)),
-        );
+        let management = ManagementPlane::with_computer_grants(
+            Arc::new(management::PlatformResolver::new()),
+            computer_grants,
+        )
+        .with_isolated_storage(journal == JournalPersistence::Isolated)
+        .with_standing_browser_grants(standing)
+        .with_signed_in_domains(Arc::clone(&signed_in));
+        let management = Arc::new(match agent_grants {
+            Some(grants) => management.with_agent_grants(grants),
+            None => management,
+        });
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let launch_service: Option<Arc<dyn browser_session::BrowserSessionLauncher>> =
             browser_config
@@ -4511,7 +4509,8 @@ async fn handle_management_request_observed(
         (reply, question, CardKind::ProfileReidentification)
     };
 
-    if let Some(question) = question {
+    if let Some(mut question) = question {
+        question.bind_holder(permission_scope::minting_holder(facts));
         let raised = async {
             let live = browser_consent::live(facts, planes, channel, epoch)?;
             let mut session = planes
@@ -6279,7 +6278,7 @@ async fn handle_tool_request(
             body["name"] == flat_tools::BROWSER_USE && body["arguments"]["browser"] == "user"
         });
     if !user {
-        return Box::pin(handle_tool_request_inner(frame, writer, planes, call)).await;
+        return Box::pin(handle_tool_request_enforced(frame, writer, planes, call)).await;
     }
     // Tag even admission/schema refusals, which never reach the user adapter.
     // Own calls bypass this forwarding path and keep their original bytes.
@@ -6308,12 +6307,29 @@ async fn handle_tool_request(
         }
         Ok::<(), ModuleError>(())
     });
-    let result = Box::pin(handle_tool_request_inner(frame, &tagged, planes, call)).await;
+    let result = Box::pin(handle_tool_request_enforced(frame, &tagged, planes, call)).await;
     drop(tagged);
     forwarding
         .await
         .map_err(|error| ModuleError::Message(error.to_string()))??;
     result
+}
+
+async fn handle_tool_request_enforced(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    call: &CallObservation,
+) -> Result<(), ModuleError> {
+    let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
+    // Passing a large handler by value through the grant watcher multiplies
+    // debug poll-frame stack slots. Pin it once so normal completion and
+    // cancellation cleanup carry only the pointer.
+    let future = Box::pin(handle_tool_request_inner(frame, writer, planes, call));
+    match planes.cancellations.get(key) {
+        Some(cancel) => grant_enforcement::scope(cancel, future).await,
+        None => future.await,
+    }
 }
 
 async fn handle_tool_request_inner(
@@ -7044,7 +7060,7 @@ async fn serve_browser_with_consent(
     let (Some(origins), Some(hazards), Some(tier)) = (origins, hazards, tier) else {
         return Ok(reply);
     };
-    let Ok((mut pending, Some(question))) = planes
+    let Ok((mut pending, Some(mut question))) = planes
         .management
         .open_in_call_browser_grant(
             &facts.identity.conversation_key,
@@ -7057,6 +7073,7 @@ async fn serve_browser_with_consent(
     else {
         return Ok(reply);
     };
+    question.bind_holder(permission_scope::minting_holder(facts));
     use cingulate_client::desk::{Ending, InCall, LetGo};
     let live = match browser_consent::live(facts, planes, request.0, request.1) {
         Ok(live) => live,
@@ -7162,27 +7179,22 @@ async fn serve_browser_with_consent(
     }
 }
 
-/// Standing browser rows may authorize this route only when its agent is
-/// daemon-attested and the route may act for that agent outside a worker session,
-/// never for an identity taken from the caller-controlled project-root fallback.
+/// Use the caller's accepted agent and session scope to resolve its holder.
+/// For a flow, only an admitted stamp with `delegates` true identifies the
+/// owner's head-agent row; a raw `agent_id` attribute is not authority.
 fn standing_caller(facts: &AcceptedBindFacts) -> Option<authorization::StandingCaller> {
-    (facts.agent_project_id_attested && facts.acts_as_agent && !permission_scope::is_worker(facts))
-        .then(|| authorization::StandingCaller {
-            agent_id: facts.identity.agent_project_id.clone(),
-        })
+    permission_scope::authorizing_holder(facts)
+        .map(|holder| authorization::StandingCaller { holder })
 }
 
-/// The agent a site-access card on this route may offer standing answers for:
-/// a primary session acting for its daemon-attested agent and session kind.
-/// Worker and ephemeral sessions are offered this conversation only.
+/// Only an admitted primary head may be offered a permanent site grant.
+/// Workers and flows must never borrow a head's minting authority.
 fn standing_offer_agent(facts: &AcceptedBindFacts) -> Option<&str> {
-    (facts.flow_id.is_none()
-        && !permission_scope::is_worker(facts)
-        && facts.agent_project_id_attested
-        && facts.acts_as_agent
-        && facts.session_kind_attested
-        && facts.identity.session_kind == cerebellum_core::identity::SessionKind::Primary)
-        .then_some(facts.identity.agent_project_id.as_str())
+    matches!(
+        permission_scope::minting_holder(facts),
+        Some(agent_grants::GrantHolder::Head { .. })
+    )
+    .then_some(facts.identity.agent_project_id.as_str())
 }
 
 /// The `detail.decision` a browser action held open on a grant question
@@ -13134,6 +13146,7 @@ mod sigterm_listener_tests {
 /// the request is counted exactly once as in flight or as awaiting consent.
 #[cfg(all(test, target_os = "macos"))]
 mod computer_consent_wire_tests {
+    pub(crate) mod stack_tests;
     use super::*;
     use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 
@@ -13161,6 +13174,10 @@ mod computer_consent_wire_tests {
     /// Planes with one tool route that declares it can relay a question, and
     /// with `computer.wait` admitted.
     fn planes() -> Planes {
+        computer_grants::tests::CardService::install(planes_without_cards(), CHANNEL, EPOCH)
+    }
+
+    fn planes_without_cards() -> Planes {
         let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
@@ -13203,7 +13220,7 @@ mod computer_consent_wire_tests {
                 },
             ),
         );
-        computer_grants::tests::CardService::install(planes, CHANNEL, EPOCH)
+        planes
     }
 
     fn frame(ty: FrameType, channel: u16, corr: u64, body: Value) -> Frame {
@@ -13296,71 +13313,7 @@ mod computer_consent_wire_tests {
 
     #[tokio::test]
     async fn withdrawing_an_asked_computer_call_keeps_its_late_app_grant() {
-        let planes = planes();
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut request = wait_request();
-        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
-        body["call_key"] = json!("pf:computer-pending");
-        request.body = serde_json::to_vec(&body).unwrap();
-        COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST
-            .scope(
-                Duration::from_millis(20),
-                computer_grants::tests::with_live(
-                    handle_tool_request_for_test_with_existing_planes(request, &tx, &planes),
-                ),
-            )
-            .await
-            .unwrap();
-        let question = planes
-            .consent_test
-            .as_ref()
-            .unwrap()
-            .card(CHANNEL, EPOCH)
-            .await;
-        assert_eq!(question.header.ty, FrameType::Request);
-        assert_eq!(reply(&mut rx).await["outcome"], "consent_pending");
-        handle_frame(
-            frame(
-                FrameType::Request,
-                CHANNEL,
-                CORR + 1,
-                json!({"name":"tool.withdraw", "arguments":{"call_key":"pf:computer-pending"}}),
-            ),
-            &tx,
-            &planes,
-        )
-        .await
-        .unwrap();
-        let withdrawn: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
-        assert_eq!(withdrawn["answer"], "withdrawn");
-        assert!(planes.consent_test.as_ref().unwrap().answer(
-            question.header.corr,
-            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
-        ));
-        computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
-        let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
-        let caller = computer_grants::GrantCaller {
-            conversation_key: facts.identity.conversation_key,
-            agent_project_id: facts.identity.agent_project_id,
-            durable_identity_attested: true,
-        };
-        let need = computer_grants::GrantNeed::App {
-            bundle_identity: APP.into(),
-            display_name: APP.into(),
-            code: Arc::new(computer_grants::SignedByFixtureTeam),
-        };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !planes.management.computer_grants().holds(&caller, &need) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the late answer records the app grant");
-        assert!(
-            rx.try_recv().is_err(),
-            "no cancelled card or resumed action"
-        );
-        settle_to(&planes, (0, 0)).await;
+        stack_tests::withdraw_asked_call_and_apply_late_grant(planes()).await;
     }
 
     #[tokio::test]
@@ -13440,6 +13393,7 @@ mod computer_consent_wire_tests {
             cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"})),
         );
         let caller = computer_grants::GrantCaller {
+            holder: permission_scope::authorizing_holder(&facts),
             conversation_key: facts.identity.conversation_key.clone(),
             agent_project_id: facts.identity.agent_project_id.clone(),
             durable_identity_attested: false,
@@ -13982,7 +13936,7 @@ mod relayed_computer_call_tests {
                 planes
                     .management
                     .computer_grants()
-                    .seed_takeover_for_test("test-session");
+                    .seed_takeover_for_test("test-project");
                 let keys = json!({"name":"computer_use","arguments":{"action":"keys","target":APP,"keys":["command","s"]}});
                 handle_frame(
                     Frame::build(
@@ -14034,7 +13988,7 @@ mod relayed_computer_call_tests {
         planes
             .management
             .computer_grants()
-            .seed_takeover_for_test("test-session");
+            .seed_takeover_for_test("test-project");
         let image_id = planes.management.app_state_sessions().register_image(
             "test-session",
             cerebellum_computer::app_state::session::RegisteredImage {
