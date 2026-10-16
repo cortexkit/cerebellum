@@ -79,6 +79,14 @@ fn main() {
     std::process::exit(macos_probe::run());
 }
 
+// The probe's Cingulate, which answers each card with the narrowest grant it
+// offers. Declared at the file's top level: a `#[path]` on a mod nested in an
+// inline module resolves against `examples/<inline-mod-name>/`, which does not
+// exist.
+#[cfg(target_os = "macos")]
+#[path = "support/allowing_cingulate.rs"]
+mod allowing_cingulate;
+
 /// The parts of the probe that decide what to act on and whether an action
 /// is allowed. They take text and numbers rather than a live application, so
 /// they are unit-tested on every platform; the probe itself only runs on a
@@ -981,16 +989,12 @@ mod task {
 
 #[cfg(target_os = "macos")]
 mod macos_probe {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use cerebellum::cingulate_client::desk::ConsentDesk;
     use cerebellum::cingulate_client::live_call::{LiveCall, NotLive};
-    use cerebellum::cingulate_client::route::{
-        BoxFuture, CallError, CingulateOpener, CingulateRoute,
-    };
-    use cerebellum::cingulate_client::{Reply, ScriptedCingulate};
     use cerebellum::computer_capability::{
         computer_audit, servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
     };
@@ -1060,9 +1064,9 @@ mod macos_probe {
             let clock = SystemClock::new();
             let timing = Arc::new(DispatchTimingState::new(&clock));
             Self {
-                desk: Arc::new(ConsentDesk::new(Arc::new(AnsweringOpener(AtomicU64::new(
-                    1,
-                ))))),
+                desk: Arc::new(ConsentDesk::new(Arc::new(
+                    crate::allowing_cingulate::AllowingCingulate::new("el_discord_probe_"),
+                ))),
                 guard: Arc::new(timing.enter(&clock)),
                 stamp: ScopeStamp::new(
                     Principal::Reserved {
@@ -1086,43 +1090,6 @@ mod macos_probe {
         }
         fn live(&self) -> Result<LiveCall, NotLive> {
             LiveCall::from_inbound(Some(&self.stamp), &self.guard, Arc::new(AlwaysOpenRoute))
-        }
-    }
-
-    struct AnsweringOpener(AtomicU64);
-    impl CingulateOpener for AnsweringOpener {
-        fn open<'a>(
-            &'a self,
-            live: &'a LiveCall,
-        ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
-            Box::pin(async move {
-                let id = format!(
-                    "el_discord_probe_{}",
-                    self.0.fetch_add(1, Ordering::Relaxed)
-                );
-                let script = ScriptedCingulate::new();
-                script.then("consent.request", Reply::Result(json!({"elicitation_id":id})))
-                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_30m"})));
-                Ok(Box::new(AnsweringRoute(script.open(live).await?)) as Box<dyn CingulateRoute>)
-            })
-        }
-    }
-
-    struct AnsweringRoute(Box<dyn CingulateRoute>);
-    impl CingulateRoute for AnsweringRoute {
-        fn call<'a>(
-            &'a mut self,
-            method: &'a str,
-            params: Value,
-        ) -> BoxFuture<'a, Result<Value, CallError>> {
-            if method == "consent.request" {
-                println!(
-                    "  QUESTION grant_kind={} app={} message={}",
-                    params["grant_kind"], params["app"], params["message"]
-                );
-                println!("  ANSWER allow_conversation");
-            }
-            self.0.call(method, params)
         }
     }
 

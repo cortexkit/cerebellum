@@ -50,18 +50,22 @@ fn main() {
     std::process::exit(macos_probe::run());
 }
 
+// The probe's Cingulate, which answers each card with the narrowest grant it
+// offers. Declared at the file's top level: a `#[path]` on a mod nested in an
+// inline module resolves against `examples/<inline-mod-name>/`, which does not
+// exist.
+#[cfg(target_os = "macos")]
+#[path = "support/allowing_cingulate.rs"]
+mod allowing_cingulate;
+
 #[cfg(target_os = "macos")]
 mod macos_probe {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use cerebellum::cingulate_client::desk::ConsentDesk;
     use cerebellum::cingulate_client::live_call::{LiveCall, NotLive};
-    use cerebellum::cingulate_client::route::{
-        BoxFuture, CallError, CingulateOpener, CingulateRoute,
-    };
-    use cerebellum::cingulate_client::{Reply, ScriptedCingulate};
     use cerebellum::computer_capability::{
         computer_audit, servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
     };
@@ -85,9 +89,9 @@ mod macos_probe {
 
     const CANDIDATES: [&str; 2] = ["com.apple.TextEdit", "com.hnc.Discord"];
 
-    /// Answers every question "allow for this conversation": running this
-    /// probe is the person's consent to what it does, and each arm that goes
-    /// beyond a write is named on the command line.
+    /// Answers every question with the narrowest grant the card offers:
+    /// running this probe is the person's consent to what it does, and each arm
+    /// that goes beyond a write is named on the command line.
     struct Allowing {
         desk: Arc<ConsentDesk>,
         guard: Arc<InFlightGuard>,
@@ -99,9 +103,9 @@ mod macos_probe {
             let clock = SystemClock::new();
             let timing = Arc::new(DispatchTimingState::new(&clock));
             Self {
-                desk: Arc::new(ConsentDesk::new(Arc::new(AllowingOpener(AtomicU64::new(
-                    1,
-                ))))),
+                desk: Arc::new(ConsentDesk::new(Arc::new(
+                    crate::allowing_cingulate::AllowingCingulate::new("el_ax_probe_"),
+                ))),
                 guard: Arc::new(timing.enter(&clock)),
                 stamp: ScopeStamp::new(
                     Principal::Reserved {
@@ -125,22 +129,6 @@ mod macos_probe {
         }
         fn live(&self) -> Result<LiveCall, NotLive> {
             LiveCall::from_inbound(Some(&self.stamp), &self.guard, Arc::new(AlwaysOpenRoute))
-        }
-    }
-
-    struct AllowingOpener(AtomicU64);
-    impl CingulateOpener for AllowingOpener {
-        fn open<'a>(
-            &'a self,
-            live: &'a LiveCall,
-        ) -> BoxFuture<'a, Result<Box<dyn CingulateRoute>, CallError>> {
-            Box::pin(async move {
-                let id = format!("el_ax_probe_{}", self.0.fetch_add(1, Ordering::Relaxed));
-                let script = ScriptedCingulate::new();
-                script.then("consent.request", Reply::Result(json!({"elicitation_id":id})))
-                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_30m"})));
-                script.open(live).await
-            })
         }
     }
 
@@ -221,6 +209,8 @@ mod macos_probe {
             .require(&GrantNeed::Takeover, &context, &cancel)
             .await
             .unwrap();
+        // The takeover card's narrowest reusable grant is 30 minutes of the
+        // whole computer, which the probe's Cingulate picks.
         assert!(grants.holds(&context.caller, &GrantNeed::Takeover));
         // Grants belong to the agent, so another conversation of the same
         // agent reuses the first approval and raises no second card.
