@@ -2012,6 +2012,47 @@ async fn baseline_signed_in_typing_still_asks() {
 }
 
 #[tokio::test]
+async fn single_label_navigation_requires_a_site_card_even_with_an_all_sites_grant() {
+    for all_sites in [false, true] {
+        let mut fixture = Fixture::new();
+        if all_sites {
+            fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
+        }
+        let route = fixture
+            .route(Session::primary("c-single-label", AGENT).asking())
+            .await;
+        let mut offered = Vec::new();
+        let reply = fixture
+            .call_answering(
+                &route,
+                "browser.navigate",
+                navigation("https://intranet/", 1),
+                json!({"decision":"deny"}),
+                |question| offered.push(option_ids(question)),
+            )
+            .await;
+        assert_refused(&reply, "single-label navigation");
+        assert_eq!(
+            offered,
+            vec![vec!["allow_30m", "allow_origin_always", "deny"]],
+            "all-sites grant present: {all_sites}"
+        );
+        assert!(fixture.browser.effects().is_empty());
+
+        fixture.seed(
+            AGENT,
+            GrantSubject::Origin("https://intranet".into()),
+            3,
+            &[],
+        );
+        assert_authorized(
+            &fixture.navigate(&route, "https://intranet/").await,
+            "an exact single-label site grant",
+        );
+    }
+}
+
+#[tokio::test]
 async fn baseline_local_services_still_ask() {
     let mut fixture = Fixture::new();
     let route = fixture
