@@ -1219,6 +1219,39 @@ mod tests {
             );
             self.idle().await;
         }
+        async fn reuse_grant(&mut self, channel: u16, app: &str) {
+            let consent = self.planes.consent_test.as_ref().unwrap().clone();
+            let requests = || {
+                consent
+                    .calls()
+                    .into_iter()
+                    .filter(|(method, _)| method == crate::cingulate_client::wire::CONSENT_REQUEST)
+                    .count()
+            };
+            let before = requests();
+            // Reuse the agent's app permission across conversations without
+            // another card. Invalid zoom still exercises app admission but
+            // stops before a desk read adds events to the concurrency check.
+            let prime = request(channel, 100 + u64::from(channel), app);
+            let mut body: Value = serde_json::from_slice(&prime.body).unwrap();
+            body["arguments"]["zoom"] = serde_json::json!("zz999999");
+            self.send(frame(
+                FrameType::Request,
+                channel,
+                100 + u64::from(channel),
+                body,
+            ))
+            .await;
+            let response = self.reply().await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            assert_eq!(outcome(&response)["outcome"], "stale_element");
+            self.idle().await;
+            assert_eq!(
+                requests(),
+                before,
+                "reusing an agent grant raised a second card"
+            );
+        }
         async fn idle(&self) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -1705,7 +1738,11 @@ mod tests {
         let mut rig = rig(second_conversation, None);
         let app = if second_conversation { APP } else { OTHER };
         rig.grant(7, APP).await;
-        rig.grant(8, app).await;
+        if second_conversation {
+            rig.reuse_grant(8, app).await;
+        } else {
+            rig.grant(8, app).await;
+        }
         rig.send(request(7, 1, APP)).await;
         assert_eq!(rig.event().await, Event::Start(1));
         rig.send(request(8, 2, app)).await;
@@ -2047,7 +2084,7 @@ mod tests {
     async fn a_stuck_press_quarantines_its_app_for_every_conversation_until_it_ends() {
         let mut rig = rig(true, None);
         rig.grant(7, APP).await;
-        rig.grant(8, APP).await;
+        rig.reuse_grant(8, APP).await;
         rig.grant(8, OTHER).await;
         rig.desk.release();
         let ids = rig.register_buttons(7);
