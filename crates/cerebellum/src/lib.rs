@@ -10212,8 +10212,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capture_returns_pending_without_waiting_for_sign_in() {
+        // The handoff lasts a minute while the call is allowed ten seconds: a
+        // call that waited for the sign-in would overrun by far more than any
+        // scheduling delay under a loaded full-suite run, so the bound measures
+        // the behaviour rather than the machine.
         let fixture = login_capture::test_support::fixture_with(|env| {
-            env.handoff_duration = Duration::from_secs(5);
+            env.handoff_duration = Duration::from_secs(60);
             env.poll_interval = Duration::from_millis(20);
         });
         fixture.launcher.script.lock().unwrap().logs_in = false;
@@ -10224,14 +10228,14 @@ mod tests {
         let planes = cingulate.planes(&fixture);
         let (tx, mut rx) = mpsc::channel(8);
         let reply = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(10),
             capture_initial_reply(&planes, &tx, &mut rx, 340, ollama_capture_params()),
         )
         .await
         .expect("consent was answered; sign-in must not hold the call");
         assert_eq!(reply["outcome"], "capture_pending", "{reply}");
         assert_eq!(reply["origin"], "https://ollama.com");
-        assert_eq!(reply["expires_in_ms"], 5_000);
+        assert_eq!(reply["expires_in_ms"], 60_000);
         assert!(reply["message"]
             .as_str()
             .unwrap()
