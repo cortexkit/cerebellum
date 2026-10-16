@@ -438,10 +438,11 @@ async fn turn_stop_cancel_running_keys_releases_both_presses() {
     Arc::make_mut(&mut planes.computer_admitted).insert("computer.keys".into());
     let sequence = Arc::new(computer_capability::turn_stop_driver::Sequence::default());
     let script = sequence.clone();
-    planes.computer = Ok(Arc::new(
+    assert!(planes.computer_for_test.is_none());
+    planes.computer_for_test = Some(Arc::new(
         computer_capability::ComputerPlane::with_synthetic_driver(
             computer_capability::computer_audit(JournalPersistence::Isolated).unwrap(),
-            move || computer_capability::NativeComputerPlatformDriver::scripted(script.clone()),
+            move || computer_capability::turn_stop_driver::Driver::scripted(script.clone()),
         )
         .with_permission_liveness(computer_capability::live_for_test())
         .with_session_lock_for_test(Some(false))

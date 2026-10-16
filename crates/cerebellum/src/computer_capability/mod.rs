@@ -49,12 +49,10 @@ use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
 };
 use cerebellum_computer::platform::AccessibilityElementName;
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::MacOs26PlatformDriver;
 #[cfg(all(target_os = "macos", test))]
 pub(crate) mod turn_stop_driver;
-#[cfg(all(target_os = "macos", test))]
-pub(crate) use turn_stop_driver::Driver as NativeComputerPlatformDriver;
 #[cfg(target_os = "windows")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::WindowsPlatformDriver;
 #[cfg(target_os = "macos")]
@@ -4277,3 +4275,21 @@ mod outcome_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod future_size_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) type ScriptedComputerPlane = ComputerPlane<
+    NativeComputerCaptureBackend,
+    cerebellum_computer::audit::redaction::ExcludeApplicationText,
+    cerebellum_core::journal::ValidatedSeverityTaxonomy,
+    crate::PlaneJournalStorage,
+    turn_stop_driver::Driver,
+>;
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn unit_tests_keep_the_native_computer_driver_type() {
+    assert_eq!(
+        std::any::TypeId::of::<NativeComputerPlatformDriver>(),
+        std::any::TypeId::of::<cerebellum_computer::platform::MacOs26PlatformDriver>(),
+    );
+}

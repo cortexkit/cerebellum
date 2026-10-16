@@ -2165,6 +2165,10 @@ where
 }
 
 fn planes_cursor(planes: &Planes) -> Option<computer_capability::cursor::Coordinator> {
+    #[cfg(all(test, target_os = "macos"))]
+    if let Some(plane) = &planes.computer_for_test {
+        return Some(plane.cursor());
+    }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         planes.computer.as_ref().ok().map(|plane| plane.cursor())
@@ -2679,6 +2683,10 @@ impl Drop for RequestCancellationGuard {
 pub struct Planes {
     #[cfg(test)]
     route_test_handler: Option<RouteTestHandler>,
+    /// Explicit frame-loop fixture injection. Ordinary tests retain the native
+    /// plane and driver, rather than changing the platform for the whole suite.
+    #[cfg(all(test, target_os = "macos"))]
+    computer_for_test: Option<Arc<computer_capability::ScriptedComputerPlane>>,
     pub health: Arc<HealthState>,
     cancellations: RequestCancellations,
     browser_queue: Arc<call_queue::ConversationQueue>,
@@ -3144,6 +3152,8 @@ impl Planes {
             ),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(all(test, target_os = "macos"))]
+            computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
@@ -3179,6 +3189,8 @@ impl Clone for Planes {
         Self {
             #[cfg(test)]
             route_test_handler: self.route_test_handler.clone(),
+            #[cfg(all(test, target_os = "macos"))]
+            computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
             cancellations: self.cancellations.clone(),
             browser_queue: self.browser_queue.clone(),
@@ -6922,43 +6934,56 @@ async fn handle_tool_request_inner(
         // commitment before its first input, so an unmarked witness after this
         // point means nothing was dispatched.
         call.commit_point_follows();
+        let context = computer_capability::ServeContext {
+            cancel,
+            // The durable agent identity, taken from the accepted bind
+            // rather than from the request: an identity a caller could
+            // choose is a lease granted to whoever asks for it.
+            grantee: &accepted_facts.identity.agent_project_id,
+            identity: cerebellum_core::journal::JournalIdentity {
+                witness: call.dispatch.clone(),
+                principal: accepted_facts
+                    .principal
+                    .as_ref()
+                    .map(|principal| format!("{principal:?}"))
+                    .unwrap_or_default(),
+                conversation_key: accepted_facts.identity.conversation_key.clone(),
+                agent_project_id: accepted_facts.identity.agent_project_id.clone(),
+                session_kind: accepted_facts.identity.session_kind,
+                origin: accepted_facts.identity.origin.clone(),
+                computer_order: None,
+            },
+            management: &planes.management,
+            consent: consent_context(planes, &accepted_facts, writer, channel, epoch),
+            clock,
+            // Wall-clock rather than the lease clock: this stamps a
+            // journal entry a person may later read against other
+            // records, where the lease clock only answers whether one
+            // moment came after another inside this process.
+            now_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis() as u64)
+                .unwrap_or_default(),
+        };
+        #[cfg(all(test, target_os = "macos"))]
+        let result = if let Some(scripted) = &planes.computer_for_test {
+            scripted
+                .serve(servable, arguments, context, |_grant| {
+                    computer_capability::native_capture_backend()
+                })
+                .await
+        } else {
+            plane
+                .serve(servable, arguments, context, |_grant| {
+                    computer_capability::native_capture_backend()
+                })
+                .await
+        };
+        #[cfg(not(all(test, target_os = "macos")))]
         let result = plane
-            .serve(
-                servable,
-                arguments,
-                computer_capability::ServeContext {
-                    cancel,
-                    // The durable agent identity, taken from the accepted bind
-                    // rather than from the request: an identity a caller could
-                    // choose is a lease granted to whoever asks for it.
-                    grantee: &accepted_facts.identity.agent_project_id,
-                    identity: cerebellum_core::journal::JournalIdentity {
-                        witness: call.dispatch.clone(),
-                        principal: accepted_facts
-                            .principal
-                            .as_ref()
-                            .map(|principal| format!("{principal:?}"))
-                            .unwrap_or_default(),
-                        conversation_key: accepted_facts.identity.conversation_key.clone(),
-                        agent_project_id: accepted_facts.identity.agent_project_id.clone(),
-                        session_kind: accepted_facts.identity.session_kind,
-                        origin: accepted_facts.identity.origin.clone(),
-                        computer_order: None,
-                    },
-                    management: &planes.management,
-                    consent: consent_context(planes, &accepted_facts, writer, channel, epoch),
-                    clock,
-                    // Wall-clock rather than the lease clock: this stamps a
-                    // journal entry a person may later read against other
-                    // records, where the lease clock only answers whether one
-                    // moment came after another inside this process.
-                    now_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_millis() as u64)
-                        .unwrap_or_default(),
-                },
-                |_grant| computer_capability::native_capture_backend(),
-            )
+            .serve(servable, arguments, context, |_grant| {
+                computer_capability::native_capture_backend()
+            })
             .await;
         // A call whose route unbound while it waited on a person has nobody
         // to answer; its reply is dropped rather than sent to a closed route.
@@ -9635,6 +9660,8 @@ mod tests {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
+            #[cfg(all(test, target_os = "macos"))]
+            computer_for_test: None,
             capture: login_capture::test_support::fixture().module,
             calls: Arc::new(journal::call_records::CallRecords::in_memory()),
             call_record_workers: Arc::new(CallRecordWorkers::default()),
@@ -11397,6 +11424,8 @@ mod tests {
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(all(test, target_os = "macos"))]
+            computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
@@ -11476,6 +11505,8 @@ mod tests {
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(all(test, target_os = "macos"))]
+            computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
