@@ -81,7 +81,7 @@ async fn forged_project_root_and_unattested_heads_neither_match_nor_mint() {
             "missing {missing}"
         );
         assert!(crate::permission_scope::minting_holder(&facts).is_none());
-        let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+        let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
         assert_ne!(reply["outcome"], "granted", "missing {missing}: {reply}");
         let store = planes.management.agent_grants();
         assert_eq!(store.live_rows(None, store.now_ms()).unwrap(), before);
@@ -344,7 +344,7 @@ async fn only_an_admitted_delegated_flow_uses_its_owner_row_without_cards() {
             assert_eq!(advisory["items"][0]["verdict"], "yes");
             let store = planes.management.agent_grants();
             store.revoke(&id, store.now_ms()).unwrap();
-            let (reply, _) = dispatch(planes, facts, "allow_conversation").await;
+            let (reply, _) = dispatch(planes, facts, "allow_30m").await;
             assert_ne!(reply["outcome"], "granted", "revoked owner grant: {reply}");
         }
     }

@@ -59,6 +59,7 @@ mod management_bounds;
 pub mod manifest;
 pub mod network;
 mod open_app_history;
+mod permission_cards;
 mod permission_scope;
 pub mod profile;
 pub mod profile_custody;
@@ -8559,7 +8560,7 @@ mod tests {
     /// the navigation may use is the answer delivered to the elicitation request.
     #[tokio::test]
     async fn an_elicited_browser_grant_admits_wire_navigation() {
-        let planes = Planes::with_browser_config_journaling(
+        let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             Some(BrowserConfig {
                 executable_path: None,
@@ -8571,6 +8572,19 @@ mod tests {
                 navigation_settle_deadline_ms: 100,
             }),
             JournalPersistence::Isolated,
+        );
+        planes.management = Arc::new(
+            ManagementPlane::new(Arc::new(management::PlatformResolver::new())).with_agent_grants(
+                Arc::new(agent_grants::AgentGrants::in_memory(Some(
+                    "machine-test".into(),
+                ))),
+            ),
+        );
+        planes.browser = Arc::new(
+            Arc::try_unwrap(planes.browser)
+                .ok()
+                .unwrap()
+                .with_shared_grants(planes.management.browser_grants()),
         );
         let identity = bind_identity_for_test();
         let admission = json!({
@@ -8679,11 +8693,19 @@ mod tests {
 
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question_frame.header.corr,
-            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
         ));
         assert_eq!(planes.browser.grant_count_for_test().await, 0);
         computer_grants::tests::drain_call(&planes, 4, 1).await;
-        assert_eq!(planes.browser.grant_count_for_test().await, 1);
+        assert_eq!(
+            planes
+                .management
+                .agent_grants()
+                .live_rows(None, planes.management.agent_grants().now_ms())
+                .unwrap()
+                .len(),
+            1
+        );
 
         let navigation = Frame::build_with_version(
             subc_protocol::PROTOCOL_VERSION,
@@ -9130,7 +9152,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
         ));
         assert_eq!(planes.management.browser_grant_count().await, 0);
         assert!(planes
@@ -9385,10 +9407,7 @@ mod tests {
             )
             .await;
         management
-            .settle_browser_grant(
-                &question.ask_id,
-                Some(&json!({"decision": "allow_conversation"})),
-            )
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await;
         let browser = browser_plane_with_shared_grants_for_test(management.browser_grants());
         let route = RouteIdentity {
@@ -13370,7 +13389,7 @@ mod relayed_computer_call_tests {
             .await;
         assert!(planes.consent_test.as_ref().unwrap().answer(
             question.header.corr,
-            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+            cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
         ));
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -13893,9 +13912,7 @@ mod relayed_computer_call_tests {
                 );
                 assert!(planes.consent_test.as_ref().unwrap().answer(
                     reply.header.corr,
-                    cingulate_client::ScriptedAnswer::Answered(
-                        json!({"decision":"allow_conversation"})
-                    ),
+                    cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})),
                 ));
                 reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                     .await

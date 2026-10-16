@@ -183,7 +183,12 @@ impl Fixture {
     }
 
     fn with_cingulate(opener: Option<Arc<dyn CingulateOpener>>) -> Self {
-        Self::with_agent_grants(opener, None)
+        Self::with_agent_grants(
+            opener,
+            Some(Arc::new(crate::agent_grants::AgentGrants::in_memory(Some(
+                "test-machine".into(),
+            )))),
+        )
     }
 
     fn with_agent_grants(
@@ -403,7 +408,7 @@ impl Fixture {
             .call(
                 channel,
                 json!({"browser":"user","action":"claim_tab","tab":"handed"}),
-                "allow_once",
+                "allow_30m",
             )
             .await;
         assert_eq!(reply["outcome"], "ok", "{reply}");
@@ -680,7 +685,7 @@ async fn cdp_errors_name_the_failing_method_with_chromes_code_and_message() {
         "Could not compute content quads.".into(),
     ));
     let (reply, _) = fixture
-        .call(1, click(&tab, &snapshot, &reference), "allow_once")
+        .call(1, click(&tab, &snapshot, &reference), "allow_30m")
         .await;
     assert_eq!(reply["reason"], "cdp_error", "{reply}");
     assert_eq!(
@@ -694,7 +699,7 @@ async fn cdp_errors_name_the_failing_method_with_chromes_code_and_message() {
     for message in ["line one\nline two".to_owned(), "x".repeat(201)] {
         fixture.state.lock().unwrap().fail_method = Some(("DOM.getContentQuads", -32000, message));
         let (reply, _) = fixture
-            .call(1, click(&tab, &snapshot, &reference), "allow_once")
+            .call(1, click(&tab, &snapshot, &reference), "allow_30m")
             .await;
         assert_eq!(
             reply["detail"],
@@ -716,7 +721,7 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
         .call(
             1,
             click(&tab, &snapshot, &reference(&snapshot, "Go")),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
@@ -750,16 +755,16 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
 async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
     // A <button> defaults to type submit, but with no form owner it submits
     // nothing. It must classify at the declared level, so the read card is the
-    // only card: one invocation, one allow_once ask.
+    // only card: one invocation, one allow_30m ask.
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().untyped_button = true;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let (clicked, cards) = fixture
         .call(
             1,
             click(&tab, &snapshot, &reference(&snapshot, "Go")),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
@@ -768,19 +773,28 @@ async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
 }
 
 #[tokio::test]
-async fn per_site_ask_is_required_and_allow_once_is_one_invocation() {
+async fn per_site_ask_is_required_and_thirty_minute_approval_is_reused() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    for _ in 0..2 {
-        let (reply, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    for number in 0..2 {
+        let (reply, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
         assert_eq!(reply["outcome"], "ok", "{reply}");
-        assert_eq!(cards.len(), 1, "a skipped per-site ask exposed content");
-        let card = &cards[0];
-        assert!(card["prompt"]
-            .as_str()
-            .unwrap()
-            .contains("your own Chrome, signed in as you"));
-        assert!(!card.to_string().contains("all_sites"));
+        assert_eq!(
+            cards.len(),
+            usize::from(number == 0),
+            "the site row should authorize the second read"
+        );
+        if let Some(card) = cards.first() {
+            assert!(card["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("your own Chrome, signed in as you"));
+            assert!(card["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["id"] == "allow_30m"));
+        }
         assert!(!reply["state_text"]
             .as_str()
             .unwrap()
@@ -797,12 +811,12 @@ async fn open_navigate_snapshot_never_launches_an_owned_browser() {
         .call(
             1,
             json!({"browser":"user","action":"open_tab"}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(opened["outcome"], "ok", "{opened}");
     let tab = opened["tab"].as_str().unwrap();
-    let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"read","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}}), "allow_once").await;
+    let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"read","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}}), "allow_30m").await;
     assert_eq!(navigated["outcome"], "ok", "{navigated}");
     assert_eq!(navigated["settled"], false);
     assert!(navigated["remedy"]
@@ -810,9 +824,9 @@ async fn open_navigate_snapshot_never_launches_an_owned_browser() {
         .unwrap()
         .contains("Read the page before acting"));
     assert_eq!(cards.len(), 1);
-    let (snapshot, cards) = fixture.snapshot(1, tab, "allow_once").await;
+    let (snapshot, cards) = fixture.snapshot(1, tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(cards.len(), 1);
+    assert!(cards.is_empty());
     assert!(!fixture
         .state
         .lock()
@@ -830,13 +844,13 @@ async fn cold_snapshots_after_unsettled_navigation_refuse_empty_or_missing_ax_ch
         let fixture = Fixture::new();
         let tab = fixture.claim(1).await;
         fixture.state.lock().unwrap().top_level_only = true;
-        let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/cold","wait":"settle","intent":"load page","severity":{"tier":1,"credential":false,"financial":false}}), "allow_once").await;
+        let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/cold","wait":"settle","intent":"load page","severity":{"tier":1,"credential":false,"financial":false}}), "allow_30m").await;
         assert_eq!(navigated["outcome"], "ok", "{navigated}");
         assert_eq!(navigated["settled"], false);
         assert_eq!(cards.len(), 1);
         fixture.state.lock().unwrap().ax_override = Some(capture);
-        let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
-        assert_eq!(cards.len(), 1);
+        let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+        assert!(cards.is_empty());
         assert_eq!(snapshot["reason"], "snapshot_not_ready", "{snapshot}");
         assert_eq!(snapshot["remedy"], "read again");
         assert!(snapshot.get("state_text").is_none());
@@ -856,7 +870,7 @@ async fn root_only_snapshots_disclose_unknown_readiness_without_rejecting_empty_
         state.top_level_only = true;
         state.ax_override = Some(json!({"nodes":[root]}));
     }
-    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     assert_eq!(cards.len(), 1);
     assert_eq!(snapshot["settled"], false);
@@ -872,9 +886,9 @@ async fn root_only_snapshots_disclose_unknown_readiness_without_rejecting_empty_
         .contains("empty or still-loading"));
     assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
     fixture.state.lock().unwrap().ax_override = None;
-    let (complete, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (complete, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(complete["outcome"], "ok", "{complete}");
-    assert_eq!(cards.len(), 1);
+    assert!(cards.is_empty());
     assert_eq!(complete["truncated"], false);
     assert_eq!(complete["refs_truncated"], false);
     assert!(complete["state_text"].as_str().unwrap().contains("Go"));
@@ -892,7 +906,7 @@ async fn bounded_ax_snapshots_preserve_projection_truncation_flags() {
         state.top_level_only = true;
         state.ax_override = Some(capture);
     }
-    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     assert_eq!(cards.len(), 1);
     assert_eq!(snapshot["truncated"], true);
@@ -921,7 +935,7 @@ async fn snapshot_byte_budget_and_omitted_frames_are_disclosed_as_partial() {
             .call(
                 1,
                 json!({"browser":"user","action":"snapshot","tab":tab,"max_bytes":max_bytes}),
-                "allow_once",
+                "allow_30m",
             )
             .await;
         assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
@@ -938,12 +952,12 @@ async fn snapshot_byte_budget_and_omitted_frames_are_disclosed_as_partial() {
 async fn outside_group_tab_is_refused_before_any_cdp_command() {
     let fixture = Fixture::new();
     let (status, _) = fixture
-        .call(1, json!({"browser":"user","action":"status"}), "allow_once")
+        .call(1, json!({"browser":"user","action":"status"}), "allow_30m")
         .await;
     assert_eq!(status["tabs"].as_array().unwrap().len(), 1);
     assert_eq!(status["tabs"][0]["tab"], "handed");
     let before = fixture.state.lock().unwrap().commands.len();
-    let (reply, cards) = fixture.snapshot(1, "outside", "allow_once").await;
+    let (reply, cards) = fixture.snapshot(1, "outside", "allow_30m").await;
     assert_eq!(reply["reason"], "tab_not_claimed_by_route");
     assert!(cards.is_empty());
     assert_eq!(
@@ -956,34 +970,34 @@ async fn outside_group_tab_is_refused_before_any_cdp_command() {
 #[tokio::test]
 async fn handed_tab_claims_refs_and_snapshots_are_route_tab_and_epoch_scoped() {
     let fixture = Fixture::new();
-    let (unclaimed, _) = fixture.snapshot(1, "handed", "allow_once").await;
+    let (unclaimed, _) = fixture.snapshot(1, "handed", "allow_30m").await;
     assert_eq!(unclaimed["reason"], "tab_not_claimed_by_route");
     let tab = fixture.claim(1).await;
     let (held, _) = fixture
         .call(
             2,
             json!({"browser":"user","action":"claim_tab","tab":tab}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(held["reason"], "tab_already_claimed");
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let reference = reference(&snapshot, "Go");
     let (other, _) = fixture
         .call(
             2,
             json!({"browser":"user","action":"open_tab"}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     let other_tab = other["tab"].as_str().unwrap();
     let (reused, _) = fixture
-        .call(2, click(other_tab, &snapshot, &reference), "allow_once")
+        .call(2, click(other_tab, &snapshot, &reference), "allow_30m")
         .await;
     assert_eq!(reused["reason"], "snapshot_scope_mismatch");
     let mut own_ref = click(&tab, &snapshot, "own-ref");
     own_ref["snapshot_id"] = json!("own-snapshot");
-    let (refused, _) = fixture.call(1, own_ref, "allow_once").await;
+    let (refused, _) = fixture.call(1, own_ref, "allow_30m").await;
     assert_eq!(refused["reason"], "snapshot_scope_mismatch");
     fixture
         .planes
@@ -1055,7 +1069,7 @@ async fn redirect_to_ungranted_landing_site_exposes_no_content() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().redirect = Some("https://ungranted.example/private".into());
-    let (reply, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/go","intent":"read","severity":{"tier":1,"credential":false,"financial":false},"read_page":true}), "allow_once").await;
+    let (reply, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/go","intent":"read","severity":{"tier":1,"credential":false,"financial":false},"read_page":true}), "allow_30m").await;
     assert_eq!(reply["reason"], "landing_site_not_authorized");
     assert_eq!(cards.len(), 1);
     assert!(reply.get("read_page").is_none());
@@ -1079,7 +1093,7 @@ async fn human_input_before_click_and_between_typing_steps_stops_all_further_inp
             state.human_before_input = before;
             state.human_after_input = !before;
         }
-        let (reply, _) = fixture.call(1, args, "allow_once").await;
+        let (reply, _) = fixture.call(1, args, "allow_30m").await;
         assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
         assert_eq!(reply["remedy"], "read again");
         assert_eq!(reply["input_dispatched"], !before);
@@ -1098,7 +1112,7 @@ async fn human_input_before_click_and_between_typing_steps_stops_all_further_inp
             .next()
             .unwrap();
         let (success, _) = fixture
-            .call(1, click(&tab, &fresh, fresh_reference), "allow_once")
+            .call(1, click(&tab, &fresh, fresh_reference), "allow_30m")
             .await;
         assert_eq!(success["outcome"], "ok", "{success}");
     }
@@ -1108,7 +1122,7 @@ async fn human_input_before_click_and_between_typing_steps_stops_all_further_inp
 async fn detached_human_input_and_reconnect_never_refresh_a_refused_baseline() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let reference = reference(&snapshot, "Go");
     fixture
         .state
@@ -1120,7 +1134,7 @@ async fn detached_human_input_and_reconnect_never_refresh_a_refused_baseline() {
         .interaction += 1;
     for _ in 0..2 {
         let (reply, _) = fixture
-            .call(1, click(&tab, &snapshot, &reference), "allow_once")
+            .call(1, click(&tab, &snapshot, &reference), "allow_30m")
             .await;
         assert_eq!(reply["reason"], "state_changed_by_person");
     }
@@ -1130,7 +1144,7 @@ async fn detached_human_input_and_reconnect_never_refresh_a_refused_baseline() {
         .user_browser
         .disconnect_for_policy_test(fixture.epoch);
     let (reply, _) = fixture
-        .call(1, click(&tab, &snapshot, &reference), "allow_once")
+        .call(1, click(&tab, &snapshot, &reference), "allow_30m")
         .await;
     assert_eq!(reply["reason"], "not_connected");
     assert_eq!(reply["browser"], "user");
@@ -1141,7 +1155,7 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     let (reply, _) = fixture
-        .call(1, json!({"browser":"user","action":"close"}), "allow_once")
+        .call(1, json!({"browser":"user","action":"close"}), "allow_30m")
         .await;
     assert_eq!(reply["outcome"], "closed");
     assert!(fixture
@@ -1158,7 +1172,7 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
         .call(
             1,
             json!({"browser":"user","action":"open_tab"}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     fixture.planes.user_browser.goodbye(Route {
@@ -1184,18 +1198,18 @@ async fn close_and_goodbye_release_without_closing_any_person_tab() {
 async fn background_clicks_keep_focus_press_and_release_in_one_attachment() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let (image, _) = fixture
         .call(
             1,
             json!({"browser":"user","action":"screenshot","tab":tab}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     let point = json!({"browser":"user","action":"click_point","tab":tab,"snapshot_id":image["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"intent":"click","severity":{"tier":2,"credential":false,"financial":false}});
     for args in [click(&tab, &snapshot, &reference(&snapshot, "Go")), point] {
         let before = fixture.state.lock().unwrap().commands.len();
-        let (clicked, _) = fixture.call(1, args, "allow_once").await;
+        let (clicked, _) = fixture.call(1, args, "allow_30m").await;
         assert_eq!(clicked["outcome"], "ok", "{clicked}");
         let state = fixture.state.lock().unwrap();
         let mut pairs = 0;
@@ -1232,16 +1246,16 @@ async fn background_clicks_keep_focus_press_and_release_in_one_attachment() {
 async fn credential_payment_typing_refuses_and_normal_typing_uses_background_focus() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let password = reference(&snapshot, "Password");
-    let (refused, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":password,"text":"do not persist this"}), "allow_once").await;
+    let (refused, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":password,"text":"do not persist this"}), "allow_30m").await;
     assert_eq!(
         refused["reason"], "credential_payment_or_ineligible_field",
         "{refused}"
     );
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
     let text = reference(&snapshot, "Message");
-    let (typed, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":text,"text":"do not persist this","clear_first":true}), "allow_once").await;
+    let (typed, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":text,"text":"do not persist this","clear_first":true}), "allow_30m").await;
     assert_eq!(typed["outcome"], "ok", "{typed}");
     let journal = fixture.planes.browser.journal_export_for_test().await;
     assert!(journal.contains("\"browser\":\"user\""));
@@ -1268,7 +1282,7 @@ async fn explicit_new_tab_links_are_background_opens_and_script_popup_flags_surf
         .call(
             1,
             click(&tab, &snapshot, &reference(&snapshot, "Go")),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
@@ -1290,7 +1304,7 @@ async fn explicit_new_tab_links_are_background_opens_and_script_popup_flags_surf
         .call(
             1,
             click(&tab, &snapshot, &reference(&snapshot, "Go")),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(reply["popup_activated_briefly"], true, "{reply}");
@@ -1336,7 +1350,7 @@ async fn group_removal_while_consent_is_pending_returns_no_content_or_input() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().remove_group_on_card = true;
-    let (reply, cards) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (reply, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(cards.len(), 1);
     assert_eq!(reply["reason"], "outside_agent_group");
     assert!(fixture.state.lock().unwrap().captures.is_empty());
@@ -1352,13 +1366,13 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
         .call(
             1,
             json!({"browser":"user","action":"screenshot","tab":tab}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(image["outcome"], "ok", "{image}");
     assert_eq!(image["image_width_px"], 1);
     let point = json!({"browser":"user","action":"click_point","tab":tab,"snapshot_id":image["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"intent":"click","severity":{"tier":2,"credential":false,"financial":false}});
-    let (clicked, _) = fixture.call(1, point.clone(), "allow_once").await;
+    let (clicked, _) = fixture.call(1, point.clone(), "allow_30m").await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     {
         let state = fixture.state.lock().unwrap();
@@ -1373,7 +1387,7 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
     fixture.state.lock().unwrap().inputs.clear();
     fixture.state.lock().unwrap().foreign_hit = true;
     let before = fixture.state.lock().unwrap().commands.len();
-    let (foreign, cards) = fixture.call(1, point.clone(), "allow_once").await;
+    let (foreign, cards) = fixture.call(1, point.clone(), "allow_30m").await;
     assert!(cards.is_empty());
     assert!(!fixture.state.lock().unwrap().commands[before..]
         .iter()
@@ -1388,7 +1402,7 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
         .contains("cannot be used"));
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
     fixture.state.lock().unwrap().viewport_changed = true;
-    let (changed, _) = fixture.call(1, point, "allow_once").await;
+    let (changed, _) = fixture.call(1, point, "allow_30m").await;
     assert_eq!(changed["reason"], "viewport_changed");
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
 }
@@ -1401,7 +1415,7 @@ async fn screenshot_returns_a_liftable_image_object_without_flat_base64() {
         .call(
             1,
             json!({"browser":"user","action":"screenshot","tab":tab}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
@@ -1483,7 +1497,7 @@ async fn payment_field_typing_is_hard_refused_even_with_site_consent() {
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().payment = true;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
-    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"4111"}), "allow_once").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"4111"}), "allow_30m").await;
     assert_eq!(
         reply["reason"], "credential_payment_or_ineligible_field",
         "{reply}"
@@ -1544,8 +1558,8 @@ fn user_result_envelopes_are_closed_and_target_tagged() {
 async fn user_browser_typing_never_sends_text_key_events() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
-    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"hello","clear_first":true}), "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"hello","clear_first":true}), "allow_30m").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     let state = fixture.state.lock().unwrap();
     let commands: Vec<_> = state
@@ -1584,7 +1598,7 @@ async fn user_target_preserves_unattended_flow_admission() {
         .call(
             1,
             json!({"browser":"user","action":"open_tab"}),
-            "allow_once",
+            "allow_30m",
         )
         .await;
     assert_eq!(reply["browser"], "user");
@@ -1614,8 +1628,8 @@ async fn popup_reports_from_metadata_plans_survive_terminal_refusals() {
 async fn typing_consumes_remote_objects_in_the_same_plan_that_resolves_them() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
-    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"hello","clear_first":true}), "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"hello","clear_first":true}), "allow_30m").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     let state = fixture.state.lock().unwrap();
     let mut functions = 0;
@@ -1652,7 +1666,7 @@ async fn typing_consumes_remote_objects_in_the_same_plan_that_resolves_them() {
 async fn embedded_frames_are_explicitly_omitted_without_text_or_refs() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     assert_eq!(snapshot["omitted_frames"], 1);
     assert!(snapshot["frame_note"]
@@ -1679,10 +1693,10 @@ async fn embedded_frames_are_explicitly_omitted_without_text_or_refs() {
 async fn authority_changing_severity_is_never_grantable_in_the_user_browser() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_once").await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let mut request = click(&tab, &snapshot, &reference(&snapshot, "Go"));
     request["severity"]["tier"] = json!(5);
-    let (reply, cards) = fixture.call(1, request, "allow_once").await;
+    let (reply, cards) = fixture.call(1, request, "allow_30m").await;
     assert_eq!(reply["reason"], "severity_ungrantable");
     assert!(cards.is_empty());
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
@@ -1841,12 +1855,16 @@ async fn an_always_answer_records_the_cingulate_card_id_and_is_applied() {
     assert_eq!(cards.len(), 1);
     let rows = fixture
         .planes
-        .user_browser
-        .target()
-        .grants
-        .live_rows("test-project");
+        .management
+        .agent_grants()
+        .live_rows(
+            Some("test-project"),
+            fixture.planes.management.agent_grants().now_ms(),
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].consent_ref, "el_site_1");
+    assert_eq!(rows[0].card_ref.as_deref(), Some("el_site_1"));
+    assert_eq!(rows[0].expires_at_ms, None);
     assert!(fixture.planes.consent.raised("el_site_1").unwrap().applied);
     assert!(fixture.planes.consent.unapplied(&this_session()).is_empty());
 }
@@ -1908,7 +1926,7 @@ async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
         session: this_session(),
         kind: CardKind::UserBrowserSite,
         subject: subject::user_browser_site("https://example.com"),
-        grant_ids: vec![SITE_ALLOW_ONCE.into()],
+        grant_ids: vec!["allow_30m".into()],
         decline_id: SITE_DENY.into(),
         next_steps: Default::default(),
         applied: false,
@@ -1975,6 +1993,7 @@ async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+mod permission_cards;
 mod worker;
 
 mod agent_enforcement;

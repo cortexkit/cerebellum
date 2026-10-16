@@ -23,7 +23,7 @@
       "label": "Allow on news.example for 30 minutes"
     },
     {
-      "detail": "Up to clicking ordinary links and buttons. Covers public websites only. Sign-in and payment pages still ask per site. Password and card fields stay blocked. To withdraw it, ask the agent to remove its browser access.",
+      "detail": "Covers every public site. Sign-in and payment pages still ask.",
       "effect": "grant",
       "group": "danger",
       "id": "allow_all_sites_30m",

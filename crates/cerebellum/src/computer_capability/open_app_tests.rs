@@ -97,7 +97,7 @@ fn rig_with_history(
 }
 
 async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> (Value, usize) {
-    wire_with_decision(planes, action, arguments, "allow_conversation").await
+    wire_with_decision(planes, action, arguments, "allow_30m").await
 }
 
 async fn wire_with_decision(

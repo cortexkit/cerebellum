@@ -620,7 +620,7 @@ pub use cingulate::ScriptedCarrier;
 /// Hold the fixture application's app grant for the fixture conversation, by
 /// answering its question "allow for this conversation".
 pub async fn grant_app(management: &ManagementPlane) {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     management
         .admit_app(
             TARGET_BUNDLE_ID,

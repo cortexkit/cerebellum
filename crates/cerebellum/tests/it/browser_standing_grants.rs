@@ -869,9 +869,9 @@ fn option_ids(question: &Value) -> Vec<String> {
 }
 
 const ALL_OPTIONS: [&str; 5] = [
-    "allow_conversation",
+    "allow_30m",
     "allow_origin_always",
-    "allow_all_sites_10m",
+    "allow_all_sites_30m",
     "allow_all_sites_always",
     "deny",
 ];
@@ -919,7 +919,7 @@ async fn each_answered_option_mints_exactly_its_row() {
         let rows = fixture.store.live_rows(AGENT);
         let now = fixture.clock_now();
         match id {
-            "allow_conversation" => {
+            "allow_30m" => {
                 assert_authorized(&reply, id);
                 assert_eq!(conversation_grants, 1, "{id}");
                 assert!(rows.is_empty(), "{id}: {rows:?}");
@@ -949,7 +949,7 @@ async fn each_answered_option_mints_exactly_its_row() {
                 assert_eq!(row.revoked_at_ms, None);
                 let (subject, expires) = match id {
                     "allow_origin_always" => (StandingSubject::Domain("news.example".into()), None),
-                    "allow_all_sites_10m" => (
+                    "allow_all_sites_30m" => (
                         StandingSubject::AllSites,
                         Some(now + ALL_SITES_SHORT_GRANT_MS),
                     ),
@@ -975,8 +975,8 @@ impl Fixture {
 /// disclosing a hazard, and a site that is not public.
 #[tokio::test]
 async fn the_card_offers_only_what_the_session_and_request_allow() {
-    let conversation_only = vec!["allow_conversation", "deny"];
-    let no_all_sites = vec!["allow_conversation", "allow_origin_always", "deny"];
+    let conversation_only = vec!["allow_30m", "deny"];
+    let no_all_sites = vec!["allow_30m", "allow_origin_always", "deny"];
     let cases: [(&str, Session<'_>, &str, u8, Vec<&str>); 5] = [
         (
             "primary, public, ordinary",
@@ -1042,7 +1042,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
             "hazard asked ahead",
             Session::primary("c-hazard", AGENT).asking(),
             json!(["credential_form_submit"]),
-            vec!["allow_conversation", "allow_origin_always", "deny"],
+            vec!["allow_30m", "allow_origin_always", "deny"],
         ),
         (
             "ordinary request asked ahead",
@@ -1057,7 +1057,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
                 ..Session::primary("c-unattested", AGENT).asking()
             },
             json!([]),
-            vec!["allow_conversation", "deny"],
+            vec!["allow_30m", "deny"],
         ),
     ] {
         let mut fixture = Fixture::new();
@@ -1271,10 +1271,10 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
         .contains(&"click_point".to_string()));
 }
 
-/// The ten-minute answer covers for ten minutes of the store's clock and
+/// The thirty-minute answer covers for thirty minutes of the store's clock and
 /// nothing after.
 #[tokio::test]
-async fn the_ten_minute_all_sites_row_expires() {
+async fn the_thirty_minute_all_sites_row_expires() {
     let mut fixture = Fixture::new();
     let asking = fixture
         .route(Session::primary("c-short", AGENT).asking())
@@ -1284,7 +1284,7 @@ async fn the_ten_minute_all_sites_row_expires() {
             &asking,
             "browser.navigate",
             navigation(&format!("{PUBLIC}/"), 3),
-            json!({"decision": "allow_all_sites_10m", "elicitation_id": "el_short"}),
+            json!({"decision": "allow_all_sites_30m", "elicitation_id": "el_short"}),
             |_| {},
         )
         .await;
@@ -1674,7 +1674,7 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
             |question| offered.push(option_ids(question)),
         )
         .await;
-    assert_eq!(offered, vec![vec!["allow_conversation", "deny"]]);
+    assert_eq!(offered, vec![vec!["allow_30m", "deny"]]);
     let revoke = fixture
         .call(&route, "browser_use", json!({"action": "revoke_access"}))
         .await;
@@ -2252,7 +2252,7 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
             &route,
             "browser_use",
             json!({"action":"open_grant","origins":[PUBLIC],"hazards":[]}),
-            json!({"decision":"allow_conversation"}),
+            json!({"decision":"allow_30m"}),
             |question| cards.push(question.clone()),
         )
         .await;

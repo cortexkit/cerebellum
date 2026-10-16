@@ -116,10 +116,7 @@ async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>)
     assert!(
         planes
             .management
-            .settle_browser_grant(
-                &question.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await
     );
 }
@@ -198,7 +195,7 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
     let reply = cingulate_answer::answer_cards(
         planes,
         opening,
-        json!({"decision": "allow_conversation"}),
+        json!({"decision": "allow_30m"}),
         "browser.open_grant",
     )
     .await
@@ -5090,13 +5087,13 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
             .iter()
             .map(|o| o["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["allow_conversation", "deny"]
+        ["allow_30m", "deny"]
     );
     assert_eq!(p.get("requestedSchema"), None);
     assert_eq!(p["options"][0]["effect"], "grant");
     assert_eq!(p["options"][1]["effect"], "decline");
     assert!(launcher.effects.lock().unwrap().is_empty());
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let reply = consent_frame(&mut rx).await;
     assert_eq!(reply.header.corr, 801);
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -5235,7 +5232,7 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
         assert!(rows.is_empty());
         assert_eq!(
             planes.management.browser_grant_count().await,
-            usize::from(decision == "allow_conversation")
+            usize::from(decision == "allow_30m")
         );
     }
     assert!(
@@ -5251,7 +5248,7 @@ async fn late_in_call_always_answer_records_standing_origin() {
 
 #[tokio::test]
 async fn late_in_call_conversation_answer_records_conversation_grant() {
-    late_in_call_answer("allow_conversation", true).await;
+    late_in_call_answer("allow_30m", true).await;
 }
 
 #[tokio::test]
@@ -5278,7 +5275,7 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
     assert_eq!(body["outcome"], "consent_pending", "{body}");
     assert!(body["ask_id"].as_str().is_some());
     assert!(launcher.effects.lock().unwrap().is_empty());
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     assert_eq!(planes.management.browser_grant_count().await, 0);
     cerebellum::handle_frame_for_test(blocking_navigation(1), &tx, &planes)
         .await
@@ -5320,7 +5317,7 @@ async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound(
         .calls()
         .iter()
         .any(|(method, _)| method == "consent.withdraw"));
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     assert_eq!(planes.management.browser_grant_count().await, 0);
     drain_browser(&planes).await;
     assert_eq!(planes.management.browser_grant_count().await, 1);
@@ -5467,7 +5464,7 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_only_held_cards() {
                     "a detached card stays answerable"
                 );
             }
-            answer_browser(&planes, &tx, &question, "allow_conversation").await;
+            answer_browser(&planes, &tx, &question, "allow_30m").await;
             assert_eq!(planes.management.browser_grant_count().await, 0);
         }
     }
@@ -5616,7 +5613,7 @@ async fn allowed_keyed_navigation(
 ) -> Frame {
     let question = exchange(planes, tx, rx, keyed_navigation(9, 801, call_key)).await;
     assert_eq!(question.header.ty, FrameType::Request, "a consent question");
-    answer_browser(planes, tx, &question, "allow_conversation").await;
+    answer_browser(planes, tx, &question, "allow_30m").await;
     let reply = consent_frame(rx).await;
     assert_eq!(body(&reply)["outcome"], "ok", "{}", body(&reply));
     reply
@@ -5728,7 +5725,7 @@ async fn a_resend_while_the_first_is_running_does_not_run_twice() {
     assert_eq!(error_code(&resent), "call_in_flight");
     assert_eq!(resent.header.corr, 802);
 
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     let reply = consent_frame(&mut rx).await;
     assert_eq!(reply.header.corr, 801);
     assert_eq!(body(&reply)["outcome"], "ok");
@@ -5779,7 +5776,7 @@ async fn a_call_without_a_call_key_runs_as_before_and_leaves_no_record() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
     let question = exchange(&planes, &tx, &mut rx, blocking_navigation(1)).await;
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     assert_eq!(body(&consent_frame(&mut rx).await)["outcome"], "ok");
     let again = exchange(&planes, &tx, &mut rx, blocking_navigation(1)).await;
     assert_eq!(body(&again)["outcome"], "ok");
@@ -6017,7 +6014,7 @@ async fn typed_text_never_reaches_the_call_records() {
         ),
     )
     .await;
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     assert_eq!(body(&consent_frame(&mut rx).await)["outcome"], "ok");
     // A computer typing call whose text is the planted string. Whether this
     // host serves or refuses it, its record must not hold the text.
@@ -6248,7 +6245,7 @@ async fn quarantined_session() -> (
     let stuck = keyed_navigation(9, 801, "pf:stuck");
     let question = exchange(&planes, &tx, &mut rx, stuck.clone()).await;
     assert_eq!(question.header.ty, FrameType::Request, "a consent question");
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     effect_seen(&launcher, "navigate").await;
     cerebellum::handle_frame_for_test(cancel_of(&stuck), &tx, &planes)
         .await
@@ -6432,7 +6429,7 @@ async fn a_stuck_worker_keeps_its_permits_until_it_ends() {
     let stuck = keyed_navigation(9, 801, "pf:stuck");
     let question = exchange(&planes, &tx, &mut rx, stuck.clone()).await;
     assert_eq!(question.header.ty, FrameType::Request, "a consent question");
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     effect_seen(&launcher, "navigate").await;
     cerebellum::handle_frame_for_test(cancel_of(&stuck), &tx, &planes)
         .await
@@ -6492,7 +6489,7 @@ async fn a_close_behind_a_running_navigation_waits_for_it_and_closes_gracefully(
     )
     .await;
     assert_eq!(question.header.ty, FrameType::Request, "a consent question");
-    answer_browser(&planes, &tx, &question, "allow_conversation").await;
+    answer_browser(&planes, &tx, &question, "allow_30m").await;
     effect_seen(&launcher, "navigate").await;
     cerebellum::handle_frame_for_test(close_request(802, &session), &tx, &planes)
         .await
@@ -7007,7 +7004,7 @@ async fn a_definitive_scope_end_closes_the_browser_drops_grants_and_closes_the_q
         assert!(
             !planes
                 .management
-                .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow_conversation"})))
+                .settle_browser_grant(&ask_id, Some(&json!({"decision": "allow_30m"})))
                 .await
         );
         assert_eq!(planes.management.browser_grant_count().await, 0);
@@ -7234,10 +7231,7 @@ async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing
     assert!(
         !planes
             .management
-            .settle_browser_grant(
-                &question.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await
     );
     assert_eq!(planes.management.browser_grant_count().await, 0);
@@ -7498,7 +7492,7 @@ async fn served(planes: &Planes, frame: Frame) -> Frame {
     if first.header.ty != FrameType::Request {
         return first;
     }
-    answer_browser(planes, &tx, &first, "allow_conversation").await;
+    answer_browser(planes, &tx, &first, "allow_30m").await;
     consent_frame(&mut rx).await
 }
 

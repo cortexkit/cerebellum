@@ -75,7 +75,7 @@ fn need() -> GrantNeed {
 #[tokio::test]
 async fn worker_app_card_grants_only_the_calling_holder_across_conversations() {
     let (planes, _) = worker_planes(true);
-    let (planes, script) = scripted(planes, "allow_conversation");
+    let (planes, script) = scripted(planes, "allow_30m");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(app_request(1), &tx, &planes)
         .await
@@ -88,7 +88,7 @@ async fn worker_app_card_grants_only_the_calling_holder_across_conversations() {
             .iter()
             .map(|option| option["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["allow_conversation", "deny"]
+        ["allow_30m", "computer_30m", "deny"]
     );
     let worker = caller(&planes);
     let head = GrantCaller {
@@ -138,7 +138,7 @@ async fn worker_app_card_never_offers_or_applies_always() {
             .iter()
             .map(|option| option["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["allow_conversation", "deny"]
+        ["allow_30m", "computer_30m", "deny"]
     );
     assert!(storage.load().unwrap().records.is_empty());
     assert!(!planes
@@ -150,7 +150,7 @@ async fn worker_app_card_never_offers_or_applies_always() {
 #[tokio::test]
 async fn worker_without_parent_is_refused_before_any_route_opens() {
     let (planes, _) = worker_planes(false);
-    let (planes, script) = scripted(planes, "allow_conversation");
+    let (planes, script) = scripted(planes, "allow_30m");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(app_request(1), &tx, &planes)
         .await

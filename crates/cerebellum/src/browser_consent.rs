@@ -424,12 +424,26 @@ mod tests {
                     .unwrap();
             }
             let service = ScriptedCingulate::new();
-            let planes = Planes::with_browser_config_journaling(
+            let mut planes = Planes::with_browser_config_journaling(
                 Arc::new(HealthState::default()),
                 None,
                 JournalPersistence::Isolated,
-            )
-            .with_cingulate(
+            );
+            planes.management = Arc::new(
+                crate::management::ManagementPlane::new(Arc::new(
+                    crate::management::PlatformResolver::new(),
+                ))
+                .with_agent_grants(Arc::new(
+                    crate::agent_grants::AgentGrants::in_memory(Some("machine-test".into())),
+                )),
+            );
+            planes.browser = Arc::new(
+                Arc::try_unwrap(planes.browser)
+                    .ok()
+                    .unwrap()
+                    .with_shared_grants(planes.management.browser_grants()),
+            );
+            let planes = planes.with_cingulate(
                 Arc::new(service.clone()),
                 Arc::new(FileRegistryStore::new(root.join("registry.json"))),
             );
@@ -684,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn late_browser_endings_are_applied_only_by_the_next_call_drain() {
         for (state, choice, granted) in [
-            ("answered", "allow_conversation", true),
+            ("answered", "allow_30m", true),
             ("answered", "deny", false),
             ("expired", "", false),
         ] {
@@ -718,7 +732,13 @@ mod tests {
                 0
             );
             assert_eq!(
-                fixture.planes.management.browser_grant_count().await,
+                fixture
+                    .planes
+                    .management
+                    .agent_grants()
+                    .live_rows(None, fixture.planes.management.agent_grants().now_ms())
+                    .unwrap()
+                    .len(),
                 usize::from(granted)
             );
             assert_eq!(

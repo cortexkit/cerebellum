@@ -1411,7 +1411,7 @@ mod probe {
                 question.header.channel,
                 question.header.epoch,
                 question.header.corr,
-                serde_json::to_vec(&json!({"decision": "allow_conversation"}))
+                serde_json::to_vec(&json!({"decision": "allow_30m"}))
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| format!("build consent answer frame: {error}"))?;

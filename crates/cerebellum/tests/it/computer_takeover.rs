@@ -430,7 +430,7 @@ fn rig() -> Rig {
 }
 
 async fn hold_takeover(management: &ManagementPlane) {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     management
         .computer_grants()
         .require(
@@ -443,7 +443,7 @@ async fn hold_takeover(management: &ManagementPlane) {
 }
 
 async fn hold_other_app(management: &ManagementPlane) {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"]);
     management
         .admit_app(
             OTHER_BUNDLE_ID,

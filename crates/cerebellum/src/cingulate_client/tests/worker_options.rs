@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn every_worker_card_kind_has_only_conversation_or_single_use_options() {
+fn every_worker_card_kind_has_only_thirty_minute_or_single_use_options() {
     let facts = crate::tests::management_bound_planes(1, 1)
         .routes
         .get(1, 1)
@@ -12,16 +12,16 @@ fn every_worker_card_kind_has_only_conversation_or_single_use_options() {
     assert!(crate::standing_offer_agent(&facts).is_none());
     let cards = cards_with_standing(crate::standing_offer_agent(&facts).is_some());
     let expected = [
+        (CardKind::WebsiteAccessInCall, vec!["allow_30m", "deny"]),
+        (CardKind::WebsiteAccessInAdvance, vec!["allow_30m", "deny"]),
         (
-            CardKind::WebsiteAccessInCall,
-            vec!["allow_conversation", "deny"],
+            CardKind::AppControl,
+            vec!["allow_30m", "computer_30m", "deny"],
         ),
         (
-            CardKind::WebsiteAccessInAdvance,
-            vec!["allow_conversation", "deny"],
+            CardKind::Takeover,
+            vec!["allow_once", "computer_30m", "deny"],
         ),
-        (CardKind::AppControl, vec!["allow_conversation", "deny"]),
-        (CardKind::Takeover, vec!["allow_conversation", "deny"]),
         (
             CardKind::LoginImport,
             vec!["transfer:chrome", "hand_off", "deny"],
@@ -29,7 +29,7 @@ fn every_worker_card_kind_has_only_conversation_or_single_use_options() {
         (CardKind::LoginCapture, vec!["allow", "deny"]),
         (CardKind::ProfileReidentification, vec!["allow", "deny"]),
         (CardKind::StuckProfileClearance, vec!["clear", "keep"]),
-        (CardKind::UserBrowserSite, vec!["allow_once", "deny"]),
+        (CardKind::UserBrowserSite, vec!["allow_30m", "deny"]),
     ];
     assert_eq!(cards.len(), CardKind::ALL.len());
     assert_eq!(expected.len(), CardKind::ALL.len());
@@ -65,7 +65,7 @@ fn every_worker_card_kind_has_only_conversation_or_single_use_options() {
         for forbidden in [
             "allow_always",
             "allow_origin_always",
-            "allow_all_sites_10m",
+            "computer_always",
             "allow_all_sites_always",
         ] {
             let record = Record::parse(json!({"elicitation_id":"el_worker","state":"answered","answered_choice_id":forbidden})).unwrap();

@@ -50,12 +50,12 @@ async fn worker_website_card_grants_only_the_worker_conversation() {
             &route,
             "browser.navigate",
             navigation(&format!("{PUBLIC}/"), 3),
-            json!({"decision":"allow_conversation"}),
+            json!({"decision":"allow_30m"}),
             |card| offered.push(option_ids(card)),
         )
         .await;
     assert_authorized(&reply, "worker conversation answer");
-    assert_eq!(offered, [vec!["allow_conversation", "deny"]]);
+    assert_eq!(offered, [vec!["allow_30m", "deny"]]);
     assert_eq!(fixture.planes.management.browser_grant_count().await, 1);
     assert!(fixture.store.live_rows(AGENT).is_empty());
 
@@ -112,7 +112,7 @@ async fn worker_website_cards_never_offer_or_apply_standing_or_all_sites() {
     for in_advance in [false, true] {
         for id in [
             "allow_origin_always",
-            "allow_all_sites_10m",
+            "allow_all_sites_30m",
             "allow_all_sites_always",
         ] {
             let mut fixture = Fixture::new();
@@ -133,7 +133,7 @@ async fn worker_website_cards_never_offer_or_apply_standing_or_all_sites() {
                 .await;
             assert_eq!(
                 offered,
-                [vec!["allow_conversation", "deny"]],
+                [vec!["allow_30m", "deny"]],
                 "{id}, advance={in_advance}"
             );
             if !in_advance {

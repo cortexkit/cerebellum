@@ -10,14 +10,15 @@ field the phone shows; its exact bytes are pinned per card kind in
 
 | File | Options offered | Case |
 |---|---|---|
-| `all-options.json` | `allow_conversation`, `allow_origin_always`, `allow_all_sites_10m`, `allow_all_sites_always`, `deny` | primary session with an attested agent, public origin, ordinary browsing |
-| `no-all-sites-level-4.json` | `allow_conversation`, `allow_origin_always`, `deny` | the request needs lasting changes (tier 4) |
-| `no-all-sites-hazard.json` | `allow_conversation`, `allow_origin_always`, `deny` | the request discloses a hazard (here `credential_form_submit`) |
-| `no-all-sites-private-origin.json` | `allow_conversation`, `allow_origin_always`, `deny` | the origin is not a public website (here `http://10.0.0.5`) |
-| `conversation-only-worker.json` | `allow_conversation`, `deny` | a worker, ephemeral or unattested session |
+| `all-options.json` | `allow_30m`, `allow_origin_always`, `allow_all_sites_30m`, `allow_all_sites_always`, `deny` | primary session with an attested agent, public origin, ordinary browsing |
+| `no-all-sites-level-4.json` | `allow_30m`, `allow_origin_always`, `deny` | the request needs lasting changes (tier 4) |
+| `no-all-sites-hazard.json` | `allow_30m`, `allow_origin_always`, `deny` | the request discloses a hazard (here `credential_form_submit`) |
+| `no-all-sites-private-origin.json` | `allow_30m`, `allow_origin_always`, `deny` | the origin is not a public website (here `http://10.0.0.5`) |
+| `worker-options.json` | `allow_30m`, `allow_all_sites_30m`, `deny` | admitted worker, public origin, ordinary browsing |
 
-Each option is `{id, label, effect, detail?}`; no option carries a level or a
-duration. The card-wide `duration` is left unset. What each granting option
+Each option is `{id, label, effect, detail?, group?}`. All-sites choices carry
+`group:"danger"`; these files show the full request for a Cingulate advertising
+`consent-option-group/v1`. No option carries a level or a duration. The card-wide `duration` is left unset. What each granting option
 grants is recorded by cerebellum against its id when the card is sent, and an
 answer is mapped back through that record, never through the id's spelling.
 

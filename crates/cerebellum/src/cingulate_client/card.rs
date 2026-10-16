@@ -135,6 +135,9 @@ pub fn consent_request(
     let mut next_steps = BTreeMap::new();
     let mut grant_ids = Vec::new();
     let mut decline_id = None;
+    let mut safe_grant = false;
+    let default_id = params.get("default").cloned().unwrap_or(Value::Null);
+    let denies_on_expiry = params.get("on_expiry").is_some_and(|value| value == "deny");
     let options = params
         .get_mut("options")
         .and_then(Value::as_array_mut)
@@ -148,16 +151,38 @@ pub fn consent_request(
             .and_then(Value::as_str)
             .ok_or(NotACard("an option has no id"))?
             .to_string();
+        let danger = match option.get("group") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(group)) if group == "danger" => true,
+            _ => return Err(NotACard("unknown option group")),
+        };
         if let Some(Value::String(step)) = option.remove("next_step") {
             next_steps.insert(id.clone(), step);
         }
         match option.get("effect").and_then(Value::as_str) {
-            Some("grant") => grant_ids.push(id),
+            Some("grant") => {
+                safe_grant |= !danger;
+                grant_ids.push(id);
+            }
             Some("decline") => decline_id = Some(id),
             _ => return Err(NotACard("an option is neither a grant nor the decline")),
         }
     }
     let decline_id = decline_id.ok_or(NotACard("the card has no decline option"))?;
+    let default = options
+        .iter()
+        .find(|option| option["id"] == default_id)
+        .ok_or(NotACard("the default must name an option"))?;
+    if default["effect"] != "decline" || default["group"] == "danger" || !denies_on_expiry {
+        return Err(NotACard(
+            "consent requires a non-danger decline default and on_expiry deny",
+        ));
+    }
+    if !grant_ids.is_empty() && !safe_grant {
+        return Err(NotACard(
+            "at least one grant must be outside the danger group",
+        ));
+    }
     if let Some(reference) = requester_ref.filter(|reference| wire::is_requester_ref(reference)) {
         params.insert("requester_ref".into(), Value::from(reference));
     }

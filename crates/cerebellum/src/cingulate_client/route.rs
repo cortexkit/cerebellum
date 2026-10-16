@@ -51,6 +51,9 @@ pub enum CallError {
 
 /// One open route to Cingulate. Dropping it closes the route.
 pub trait CingulateRoute: Send {
+    fn features(&self) -> Option<super::features::CingulateFeatures> {
+        None
+    }
     /// Send one request and return its `result` member.
     fn call<'a>(
         &'a mut self,
@@ -214,7 +217,9 @@ impl DaemonCingulate {
                 }
                 let opened: Opened =
                     serde_json::from_slice(&reply.body).map_err(|_| unreachable())?;
+                let features = super::features::discover(&mut stream).await;
                 Ok(DaemonRoute {
+                    features,
                     stream,
                     channel: opened.route_channel,
                     epoch: opened.route_epoch,
@@ -247,6 +252,7 @@ impl CingulateOpener for DaemonCingulate {
 
 /// One open route to Cingulate on its own connection.
 struct DaemonRoute {
+    features: Option<super::features::CingulateFeatures>,
     stream: TcpStream,
     channel: u16,
     epoch: u32,
@@ -254,6 +260,9 @@ struct DaemonRoute {
 }
 
 impl CingulateRoute for DaemonRoute {
+    fn features(&self) -> Option<super::features::CingulateFeatures> {
+        self.features
+    }
     fn call<'a>(
         &'a mut self,
         method: &'a str,

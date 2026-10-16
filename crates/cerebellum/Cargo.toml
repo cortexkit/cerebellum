@@ -47,6 +47,7 @@ cortexkit-paths = "=0.1.2"
 cerebellum-core = { path = "../cerebellum-core" }
 cerebellum-computer = { path = "../cerebellum-computer" }
 subc-protocol = { workspace = true }
+subc-control = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
 subc-os = { workspace = true }
@@ -79,7 +80,6 @@ cerebellum-linux = { path = "../cerebellum-linux" }
 async-trait = "0.1"
 cortexkit-role-tool-provider-conformance = "=0.7.2"
 tokio = { workspace = true, features = ["test-util"] }
-subc-control = { workspace = true }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.
 subc-daemon = { workspace = true }

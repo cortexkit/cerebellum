@@ -138,7 +138,7 @@ mod macos_probe {
                 let id = format!("el_ax_probe_{}", self.0.fetch_add(1, Ordering::Relaxed));
                 let script = ScriptedCingulate::new();
                 script.then("consent.request", Reply::Result(json!({"elicitation_id":id})))
-                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_conversation"})));
+                    .then("consent.await", Reply::Result(json!({"elicitation_id":id,"state":"answered","answered_choice_id":"allow_30m"})));
                 script.open(live).await
             })
         }

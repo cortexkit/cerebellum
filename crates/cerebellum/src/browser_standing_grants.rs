@@ -52,7 +52,7 @@ pub const STANDING_GRANT_STORE_FORMAT: cerebellum_core::format_floor::DurableFor
     );
 
 /// How long the "all sites for 10 minutes" answer lasts.
-pub const ALL_SITES_SHORT_GRANT_MS: u64 = 10 * 60 * 1000;
+pub const ALL_SITES_SHORT_GRANT_MS: u64 = 30 * 60 * 1000;
 
 /// The highest ceiling an all-sites row may carry: changes that can be undone.
 /// Lasting changes are only ever granted for a named origin.
@@ -573,7 +573,7 @@ pub enum RevokeTarget {
     Origin(String),
     /// The agent's row for one registrable domain.
     Domain(String),
-    /// The agent's all-sites rows: both the ten-minute row and the one that
+    /// The agent's all-sites rows: both the thirty-minute row and the one that
     /// lasts until revoked.
     AllSites,
 }

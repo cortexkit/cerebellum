@@ -493,10 +493,7 @@ async fn a_scope_end_closes_its_browser_and_questions_without_minting_unattested
         .await;
     assert!(
         !management
-            .settle_browser_grant(
-                &granted.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&granted.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await
     );
     let open = management
@@ -565,10 +562,7 @@ async fn a_scope_end_closes_its_browser_and_questions_without_minting_unattested
     assert!(!management.browser_grant_question_open(&open.ask_id).await);
     assert!(
         !management
-            .settle_browser_grant(
-                &open.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&open.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await,
         "a late answer to the ended session's question was applied"
     );

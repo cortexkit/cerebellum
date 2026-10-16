@@ -61,10 +61,7 @@ async fn planes_with_a_grant() -> Planes {
     assert!(
         planes
             .management
-            .settle_browser_grant(
-                &question.ask_id,
-                Some(&json!({"decision": "allow_conversation"}))
-            )
+            .settle_browser_grant(&question.ask_id, Some(&json!({"decision": "allow_30m"})))
             .await,
         "the planted grant settles"
     );

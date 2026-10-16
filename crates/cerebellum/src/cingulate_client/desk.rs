@@ -708,6 +708,7 @@ impl DeskSession<'_> {
         if !self.live.is_held() {
             return Err(Ending::NoCard(NoCard::CallEnded));
         }
+        let card = card.for_features(super::features::negotiated(self.route.features()));
         let result = self
             .route
             .call(wire::CONSENT_REQUEST, card.params.clone())

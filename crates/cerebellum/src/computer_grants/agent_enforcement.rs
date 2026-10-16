@@ -1,6 +1,6 @@
 //! Card effects publish to the same machine-bound store used by dispatch.
 
-use super::{AnsweredQuestion, ComputerGrants, Subject};
+use super::{AnsweredQuestion, ComputerGrants};
 use crate::agent_grants::{AgentGrant, AgentGrantStoreError, GrantHolder, GrantSubject};
 
 impl ComputerGrants {
@@ -19,6 +19,15 @@ impl ComputerGrants {
         open: &AnsweredQuestion,
         always: bool,
     ) -> Result<(), AgentGrantStoreError> {
+        self.write_agent_answer_for(open, always, false)
+    }
+
+    pub(super) fn write_agent_answer_for(
+        &self,
+        open: &AnsweredQuestion,
+        always: bool,
+        whole: bool,
+    ) -> Result<(), AgentGrantStoreError> {
         let holder = open
             .holder
             .clone()
@@ -26,13 +35,7 @@ impl ComputerGrants {
         if always && !matches!(holder, GrantHolder::Head { .. }) {
             return Err(AgentGrantStoreError::NoMachineIdentity);
         }
-        let subject = match &open.subject {
-            Subject::App {
-                bundle_identity, ..
-            } => GrantSubject::App(bundle_identity.clone()),
-            Subject::Takeover { .. } => GrantSubject::WholeComputer,
-            Subject::Login { .. } => return Err(AgentGrantStoreError::NoMachineIdentity),
-        };
+        let subject = super::cards::subject(open, whole)?;
         let now = self.agent_grants.now_ms();
         self.agent_grants.upsert(
             AgentGrant {

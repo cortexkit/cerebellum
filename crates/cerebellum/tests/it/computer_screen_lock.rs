@@ -341,7 +341,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
 #[tokio::test]
 async fn a_locked_screen_refuses_every_row_before_resolving_asking_or_posting() {
     let rig = rig(Some(true));
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"; 20]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"; 20]);
     let journal_before = rig.plane.journal_entry_count().await;
 
     for (name, arguments) in every_row() {
@@ -397,9 +397,9 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
             async move {
                 until(|| carrier.questions().len() == 1).await;
                 lock.set(Some(true));
-                assert!(carrier.answer_next(ScriptedAnswer::Answered(
-                    json!({"decision": "allow_conversation"})
-                )));
+                assert!(
+                    carrier.answer_next(ScriptedAnswer::Answered(json!({"decision": "allow_30m"})))
+                );
             }
         };
         let (reply, ()) = tokio::join!(serve(&rig, name, &arguments, relayed(&carrier)), answering);
@@ -431,9 +431,7 @@ async fn a_lock_during_the_consent_wait_refuses_after_the_answer_and_the_grant_s
 async fn lock_then_allow(carrier: &ScriptedCarrier, lock: &LockState, question: usize) {
     until(|| carrier.questions().len() == question).await;
     lock.set(Some(true));
-    assert!(carrier.answer_next(ScriptedAnswer::Answered(
-        json!({"decision": "allow_conversation"})
-    )));
+    assert!(carrier.answer_next(ScriptedAnswer::Answered(json!({"decision": "allow_30m"}))));
 }
 
 /// The element- and point-addressed rows ask for their application's grant
@@ -543,9 +541,7 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
         async move {
             until(|| carrier.questions().len() == 1).await;
             lock.set(Some(true));
-            assert!(carrier.answer_next(ScriptedAnswer::Answered(
-                json!({"decision": "allow_conversation"})
-            )));
+            assert!(carrier.answer_next(ScriptedAnswer::Answered(json!({"decision": "allow_30m"}))));
         }
     };
     let (reply, ()) = tokio::join!(
@@ -571,7 +567,7 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
 /// A state read as unlocked carries no such disclosure.
 #[tokio::test]
 async fn an_unreadable_lock_state_proceeds_and_is_disclosed() {
-    let carrier = ScriptedCarrier::answering(&["allow_conversation"; 4]);
+    let carrier = ScriptedCarrier::answering(&["allow_30m"; 4]);
     for (state, disclosed) in [(None, true), (Some(false), false)] {
         let rig = rig(state);
         let read = serve(

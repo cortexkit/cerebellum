@@ -1,0 +1,45 @@
+//! A worker may receive temporary rows, but a permanent choice is never offered.
+
+use crate::agent_grants::GrantHolder;
+use crate::authorization::{HazardClass, Severity};
+use crate::management::{offered_browser_grant_choices, BrowserGrantChoice};
+use std::collections::BTreeSet;
+
+pub(crate) fn browser_choices(
+    origins: &[String],
+    hazards: &BTreeSet<HazardClass>,
+    severity: Severity,
+    holder: Option<&GrantHolder>,
+    can_record: bool,
+) -> Vec<BrowserGrantChoice> {
+    let mut choices =
+        offered_browser_grant_choices(origins, hazards, severity, holder.is_some() && can_record);
+    if !matches!(holder, Some(GrantHolder::Head { .. })) {
+        choices.retain(|choice| {
+            !matches!(
+                choice,
+                BrowserGrantChoice::OriginAlways | BrowserGrantChoice::AllSitesAlways
+            )
+        });
+    }
+    choices
+}
+
+/// The person's Chrome contains real logins; it is never offered an all-sites grant.
+pub(crate) fn user_browser_choices(
+    origins: &[String],
+    hazards: &BTreeSet<HazardClass>,
+    severity: Severity,
+    holder: Option<&GrantHolder>,
+    can_record: bool,
+) -> Vec<BrowserGrantChoice> {
+    browser_choices(origins, hazards, severity, holder, can_record)
+        .into_iter()
+        .filter(|choice| {
+            matches!(
+                choice,
+                BrowserGrantChoice::SiteThirtyMinutes | BrowserGrantChoice::OriginAlways
+            )
+        })
+        .collect()
+}

@@ -182,6 +182,9 @@ impl CingulateOpener for Arc<CardService> {
 
 struct ServiceRoute(Arc<CardService>);
 impl CingulateRoute for ServiceRoute {
+    fn features(&self) -> Option<crate::cingulate_client::features::CingulateFeatures> {
+        Some(crate::cingulate_client::features::CingulateFeatures { option_group: true })
+    }
     fn call<'a>(
         &'a mut self,
         method: &'a str,
@@ -358,7 +361,7 @@ async fn app_cards_use_cingulate_ids_and_never_the_route_writer() {
     let planes = app_planes();
     let script = crate::cingulate_client::ScriptedCingulate::new();
     script.then(wire::CONSENT_REQUEST, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_remote"})))
-        .then(wire::CONSENT_AWAIT, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_remote","state":"answered","answered_choice_id":"allow_conversation"})));
+        .then(wire::CONSENT_AWAIT, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_remote","state":"answered","answered_choice_id":"allow_30m"})));
     let store = Arc::new(crate::cingulate_client::desk::FileRegistryStore::new(
         planes
             .consent_test
@@ -404,7 +407,7 @@ async fn computer_cards_require_an_attested_agent_session_not_elicitation() {
         planes.routes.insert(1, 1, facts);
         let script = crate::cingulate_client::ScriptedCingulate::new();
         script.then(wire::CONSENT_REQUEST, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_admission"})))
-            .then(wire::CONSENT_AWAIT, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_admission","state":"answered","answered_choice_id":"allow_conversation"})));
+            .then(wire::CONSENT_AWAIT, crate::cingulate_client::Reply::Result(json!({"elicitation_id":"el_admission","state":"answered","answered_choice_id":"allow_30m"})));
         let store = Arc::new(crate::cingulate_client::desk::FileRegistryStore::new(
             planes
                 .consent_test
@@ -499,7 +502,7 @@ async fn app_holder_loses_to_the_session_drain_only_after_the_grant_exists() {
     .await;
     assert!(service.answer(
         question.header.corr,
-        ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
     ));
     drain_call(&planes, 1, 1).await;
     assert_eq!(
@@ -552,7 +555,7 @@ async fn two_app_holders_elect_exactly_one_execution() {
     .await;
     assert!(service.answer(
         question.header.corr,
-        ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+        ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
     ));
     let mut outcomes = vec![
         wire_reply(&mut rx).await["outcome"]
@@ -860,7 +863,7 @@ async fn takeover_holders_elect_one_and_the_drain_winner_makes_holds_true() {
         .await;
         assert!(service.answer(
             card.header.corr,
-            ScriptedAnswer::Answered(json!({"decision":"allow_conversation"}))
+            ScriptedAnswer::Answered(json!({"decision":"computer_30m"}))
         ));
         if drain_wins {
             let drain = crate::consent_drain::ConsentDrain::default();
@@ -1341,7 +1344,7 @@ async fn a_raising_card_is_not_swept_before_its_memory_record_is_registered() {
     let mut session = carrier.desk.session(&live).await.unwrap();
     let card = consent_request(
         CardKind::Takeover,
-        &question_body(&need, &[ALLOW_CONVERSATION, DENY], false, None),
+        &question_body(&need, &[ALLOW_30M, DENY], false, None),
         TAKEOVER_QUESTION_DEADLINE,
         None,
         None,
@@ -1395,12 +1398,7 @@ async fn retained_accounting_guard_cannot_authorize_a_card_after_terminal_finali
             assert!(matches!(desk.session(&live).await, Err(CallError::NotLive)));
             let card = consent_request(
                 CardKind::Takeover,
-                &question_body(
-                    &GrantNeed::Takeover,
-                    &[ALLOW_CONVERSATION, DENY],
-                    false,
-                    None,
-                ),
+                &question_body(&GrantNeed::Takeover, &[ALLOW_30M, DENY], false, None),
                 TAKEOVER_QUESTION_DEADLINE,
                 None,
                 None,
@@ -1481,3 +1479,4 @@ mod worker;
 mod holders;
 
 mod agent_app_ops;
+mod cards;
