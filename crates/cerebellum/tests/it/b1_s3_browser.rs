@@ -28,7 +28,7 @@ fn plain_click_classification(
             TargetKind::Button,
         )
         .input_type("button"),
-        "https://requested.example",
+        "https://requested.example.com",
     ))
     .unwrap()
 }
@@ -283,7 +283,7 @@ fn navigation_grants() -> GrantStore {
             credential: true,
             financial: true,
         },
-        ["https://requested.example"],
+        ["https://requested.example.com"],
     )
     .with_disclosed_hazards([HazardClass::UnverifiedFormContents])])
 }
@@ -317,7 +317,7 @@ impl OwnedBrowserProcess for SnapshotProcess {
         tracker: &mut Tracker,
     ) -> Result<(), NavigationDriveError> {
         let now = Instant::now();
-        tracker.url_final = Some("https://requested.example/landed".into());
+        tracker.url_final = Some("https://requested.example.com/landed".into());
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
         Ok(())
@@ -968,7 +968,7 @@ impl CdpPipeIo for DialogClickPointPipe {
                     "params":{
                         "type":"confirm",
                         "message":"continue?",
-                        "url":"https://requested.example/page",
+                        "url":"https://requested.example.com/page",
                         "hasBrowserHandler":false
                     }
                 }));
@@ -1249,7 +1249,7 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         )
         .with_incremental_ax_snapshots(),
         captures,
-        page_url: "https://requested.example/page",
+        page_url: "https://requested.example.com/page",
     }
 }
 
@@ -1337,7 +1337,7 @@ fn screenshot_process_with_capture(
         )
         .with_incremental_ax_snapshots(),
         captures,
-        page_url: "https://requested.example/page",
+        page_url: "https://requested.example.com/page",
     }
 }
 
@@ -1380,14 +1380,14 @@ fn snapshot_observation(records: Vec<AxRecord>) -> BrowserSnapshotObservation {
 /// an action on them passes the check that the page still shows the document
 /// they were taken from.
 fn page_document() -> CommittedDocument {
-    CommittedDocument::new("https://requested.example/page", 1, "loader-page")
+    CommittedDocument::new("https://requested.example.com/page", 1, "loader-page")
 }
 
 async fn position_on_authorized_page(plane: &BrowserPlane, route: &RouteIdentity) {
     plane
         .same_document_url(
             route,
-            "https://requested.example/page",
+            "https://requested.example.com/page",
             SameDocumentChange::ReplaceState,
         )
         .await
@@ -1521,7 +1521,7 @@ async fn a_confirming_click_is_dismissed_reported_journaled_and_leaves_the_sessi
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/after-dialog",
+                "url": "https://requested.example.com/after-dialog",
                 "intent": "prove the same browser session remains usable",
                 "wait": "none",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -1691,7 +1691,7 @@ async fn screenshot_with_covering_observe_grant_captures() {
         Box::new(screenshot_process(Arc::clone(&captures))),
         100,
     )
-    .with_grants_installed(screenshot_grants(&["https://requested.example"]));
+    .with_grants_installed(screenshot_grants(&["https://requested.example.com"]));
     plane.open_context(route.clone()).await.unwrap();
     position_on_authorized_page(&plane, &route).await;
 
@@ -2348,7 +2348,7 @@ async fn read_page_false_preserves_the_navigation_reply() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "navigate without reading",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2364,7 +2364,7 @@ async fn read_page_false_preserves_the_navigation_reply() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "navigate without reading",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -2404,7 +2404,7 @@ async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply(
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open and read the page",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -2427,7 +2427,7 @@ async fn read_page_returns_a_bounded_clickable_snapshot_in_the_navigation_reply(
     assert_eq!(
         text,
         format!(
-            "Structured fixture · requested.example/page · snapshot {}\n{reference} button Save profile\n",
+            "Structured fixture · requested.example.com/page · snapshot {}\n{reference} button Save profile\n",
             page["snapshot_id"].as_str().unwrap()
         ),
         "{result}"
@@ -2496,7 +2496,7 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open and read a bounded page",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -2606,7 +2606,7 @@ async fn navigation_without_a_ready_session_refuses_before_commit_or_transport()
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open a page",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2640,7 +2640,7 @@ async fn navigation_while_launch_is_pending_still_names_no_open_session() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open a page",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2664,7 +2664,7 @@ async fn navigation_reports_the_browser_landing_url_instead_of_the_request() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "follow the redirect",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2701,7 +2701,7 @@ async fn unsettled_navigation_returns_the_observed_tokens() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open a page that stays busy",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2740,7 +2740,7 @@ async fn page_navigate_error_text_is_a_named_refusal_not_an_ok_reply() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open a resolvable host",
                 "wait": "none",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2773,7 +2773,7 @@ async fn main_frame_cloudflare_challenge_header_is_reported_as_evidence() {
         Box::new(CdpNavigationProcess::with_frames(page_navigate_frames(
             [
                 json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"type":"Document","frameId":"main","response":{"status":403,"statusText":"Forbidden","headers":{"cf-mitigated":"challenge"}}}}),
-                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example/"}}}),
+                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example.com/"}}}),
             ],
             json!({"frameId":"main"}),
         ))),
@@ -2786,7 +2786,7 @@ async fn main_frame_cloudflare_challenge_header_is_reported_as_evidence() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "observe a documented challenge response",
                 "wait": "none",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2798,7 +2798,7 @@ async fn main_frame_cloudflare_challenge_header_is_reported_as_evidence() {
         result,
         json!({
             "outcome": "ok",
-            "url_final": "https://requested.example/",
+            "url_final": "https://requested.example.com/",
             "lifecycle": {"events": ["navigation_started"], "loaded": false, "settled": false},
             "http_status": 403,
             "challenge": {"vendor": "cloudflare", "evidence": "cf-mitigated: challenge"},
@@ -2819,7 +2819,7 @@ async fn subframe_document_response_cannot_replace_main_frame_status_or_claim_a_
         &route,
         Box::new(CdpNavigationProcess::with_frames(page_navigate_frames(
             [
-                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example/"}}}),
+                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example.com/"}}}),
                 json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"type":"Document","frameId":"main","response":{"status":403,"statusText":"Forbidden","headers":{"server":"cloudflare"}}}}),
                 json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"subframe","parentId":"main","url":"https://embed.example/"}}}),
                 json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"type":"Document","frameId":"subframe","response":{"status":200,"statusText":"OK","headers":{"cf-mitigated":"challenge"}}}}),
@@ -2835,7 +2835,7 @@ async fn subframe_document_response_cannot_replace_main_frame_status_or_claim_a_
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "observe the main document response only",
                 "wait": "none",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2847,7 +2847,7 @@ async fn subframe_document_response_cannot_replace_main_frame_status_or_claim_a_
         result,
         json!({
             "outcome": "ok",
-            "url_final": "https://requested.example/",
+            "url_final": "https://requested.example.com/",
             "lifecycle": {"events": ["navigation_started"], "loaded": false, "settled": false},
             "http_status": 403,
             "context": {
@@ -2868,7 +2868,7 @@ async fn unsettled_navigation_keeps_its_observed_main_frame_status() {
         &route,
         Box::new(CdpNavigationProcess::with_frames(page_navigate_frames(
             [
-                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example/"}}}),
+                json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example.com/"}}}),
                 json!({"method":"Network.responseReceived","sessionId":"session-own","params":{"type":"Document","frameId":"main","response":{"status":503,"statusText":"Service Unavailable","headers":{}}}}),
             ],
             json!({"frameId":"main"}),
@@ -2888,7 +2888,7 @@ async fn unsettled_navigation_keeps_its_observed_main_frame_status() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "observe an unsettled service response",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -2990,7 +2990,7 @@ async fn retain_click_snapshot(plane: &BrowserPlane, route: &RouteIdentity) -> S
     plane
         .same_document_url(
             route,
-            "https://requested.example/page",
+            "https://requested.example.com/page",
             cerebellum::snapshot_store::SameDocumentChange::ReplaceState,
         )
         .await
@@ -3378,7 +3378,7 @@ async fn a_redirect_off_the_authorized_origin_refuses_the_next_snapshot() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open the authorized origin",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -3429,7 +3429,7 @@ async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "open the authorized origin and read it",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -3488,7 +3488,7 @@ async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "drive the journal lifecycle",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -3566,7 +3566,7 @@ async fn a_refusal_records_only_claimed_addressing_and_typed_reason() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "drive a refused read into its separate audit ring",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -3685,7 +3685,7 @@ async fn a_refused_read_never_reaches_the_journal() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "drive a refused read through the journal",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
@@ -3754,7 +3754,7 @@ async fn journal_dispatches_share_one_store() {
                 &route,
                 BrowserCapability::Navigate,
                 &json!({
-                    "url": "https://requested.example/",
+                    "url": "https://requested.example.com/",
                     "intent": "measure journal retention",
                     "wait": "settle",
                     "severity": {"tier": 2, "credential": false, "financial": false}
@@ -3909,7 +3909,7 @@ async fn served_browser_reply_divergence_inventory_is_empty() {
             &route,
             BrowserCapability::Navigate,
             &json!({
-                "url": "https://requested.example/",
+                "url": "https://requested.example.com/",
                 "intent": "inventory navigation",
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false}
@@ -3975,7 +3975,7 @@ async fn served_browser_reply_divergence_inventory_is_empty() {
         Box::new(screenshot_process(Arc::new(AtomicUsize::new(0)))),
         1_000,
     )
-    .with_grants_installed(screenshot_grants(&["https://requested.example"]));
+    .with_grants_installed(screenshot_grants(&["https://requested.example.com"]));
     plane.open_context(route.clone()).await.unwrap();
     position_on_authorized_page(&plane, &route).await;
     let reply = plane

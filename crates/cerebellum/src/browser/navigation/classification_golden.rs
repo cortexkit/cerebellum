@@ -42,7 +42,7 @@ fn settings_classification_matches_preindexed_fixture_bytes() {
     assert_eq!(bytes.len(), 765897);
     assert_eq!(
         digest,
-        "32c59bb56922bf0023570ab9803d6597fb6792e618e4ee70609a4c86f248ce99"
+        "52389d886866b0deaf76af9c49350786e024cafea0c5713fee4dae36ff945849"
     );
     println!(
         "{} classification results, {} bytes, sha256={digest}",

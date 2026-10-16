@@ -823,7 +823,7 @@ mod every_card_kind {
     #[tokio::test]
     async fn browser_site_access_cards_decode_in_core() {
         use crate::management::BrowserGrantChoice;
-        let origins = vec!["https://login.example".to_string()];
+        let origins = vec!["https://example.com".to_string()];
         let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
         for (path, kind, urgency, wire, golden) in [
             (
@@ -906,7 +906,7 @@ mod every_card_kind {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/browser-site-access-card-v1"
         );
-        let public = vec!["https://news.example".to_string()];
+        let public = vec!["https://example.com".to_string()];
         let private = vec!["http://10.0.0.5".to_string()];
         let credential = BTreeSet::from([HazardClass::CredentialFormSubmit]);
         let none = BTreeSet::new();
@@ -1343,7 +1343,7 @@ mod every_card_kind {
     #[tokio::test]
     async fn user_browser_site_card_decodes_in_core() {
         let body = crate::user_browser::site_question(
-            "https://bank.example",
+            "https://example.net",
             3,
             &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
             true,

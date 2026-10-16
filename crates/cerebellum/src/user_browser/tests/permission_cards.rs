@@ -99,7 +99,7 @@ fn user_revoke_matches_only_the_callers_holder_target_and_subject() {
     for (holder, target, domain) in [
         (caller.clone(), BrowserTarget::UserBrowser, "example.com"),
         (caller.clone(), BrowserTarget::AgentProfile, "example.com"),
-        (caller.clone(), BrowserTarget::UserBrowser, "other.example"),
+        (caller.clone(), BrowserTarget::UserBrowser, "example.net"),
         (worker("two"), BrowserTarget::UserBrowser, "example.com"),
         (
             GrantHolder::Head {

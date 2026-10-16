@@ -44,7 +44,7 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
     use crate::consent_card::{Urgency, LOGIN_CARD_LIFETIME};
     use crate::management::{browser_grant_question, PHONE_CONSENT_DEADLINE};
 
-    let origins = vec!["https://login.example".to_string()];
+    let origins = vec!["https://example.com".to_string()];
     let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
     let holder = if standing {
         crate::agent_grants::GrantHolder::Head {
@@ -145,11 +145,11 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
         crate::management::launch_recovery_clear_question(&preview)
     };
     let user_browser_site = crate::user_browser::site_question_with_choices(
-        "https://bank.example",
+        "https://example.net",
         3,
         &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
         &crate::permission_cards::browser_choices(
-            &["https://bank.example".into()],
+            &["https://example.net".into()],
             &std::collections::BTreeSet::from([HazardClass::CredentialFormSubmit]),
             Severity::new(3, true, false),
             Some(&holder),
