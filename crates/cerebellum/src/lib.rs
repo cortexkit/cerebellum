@@ -61,6 +61,7 @@ pub mod network;
 mod open_app_history;
 mod permission_cards;
 mod permission_scope;
+mod permissions;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
@@ -859,22 +860,24 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 
 /// Whether the management dispatcher has an explicit arm for this operation.
 pub fn dispatchable_management_operation(name: &str) -> bool {
-    matches!(
-        name,
-        management::OPEN_TARGET
-            | management::WOULD_ASK
-            | management::LIST_APP_GRANTS
-            | management::REVOKE_APP_GRANT
-            | management::OPEN_GRANT
-            | management::IMPORT_LOGIN
-            | management::REBIND_PROFILE_ROOT
-            | management::CAPTURE_LOGIN
-            | management::CLEAR_LAUNCH_RECOVERY
-            | management::REVOKE_ACCESS
-            | management::REVOKE_GRANT
-            | management::LIST_GRANTS
-    ) || (matches!(name, management::PRESENT | management::RESUME)
-        && browser::has_wire_dispatch_route(name))
+    permissions::is_operation(name)
+        || matches!(
+            name,
+            management::OPEN_TARGET
+                | management::WOULD_ASK
+                | management::LIST_APP_GRANTS
+                | management::REVOKE_APP_GRANT
+                | management::OPEN_GRANT
+                | management::IMPORT_LOGIN
+                | management::REBIND_PROFILE_ROOT
+                | management::CAPTURE_LOGIN
+                | management::CLEAR_LAUNCH_RECOVERY
+                | management::REVOKE_ACCESS
+                | management::REVOKE_GRANT
+                | management::LIST_GRANTS
+        )
+        || (matches!(name, management::PRESENT | management::RESUME)
+            && browser::has_wire_dispatch_route(name))
 }
 
 /// The operator's own management operations: the ones served to a caller that
@@ -3505,6 +3508,11 @@ async fn handle_route_request(
         )
         .await;
     };
+    if let Some(method) = permissions::refused_method(&frame, &facts) {
+        return send_route_error(writer, ver, channel, epoch, corr, "principal_denied",
+            &format!("reserved:cingulate may call only permissions.list or permissions.revoke, not '{method}'"))
+            .await;
+    }
     // A route of a session that a newer epoch has replaced, whose close has
     // not reached this module yet. Serving it could mint a grant under the
     // conversation the new session now holds.
@@ -3730,6 +3738,9 @@ async fn handle_management_request_observed(
             &format!("unknown method '{method}'"),
         )
         .await;
+    }
+    if permissions::is_operation(method) {
+        return permissions::handle(&frame, writer, facts, planes, method, object).await;
     }
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.
@@ -5399,16 +5410,16 @@ async fn handle_control_request(
             role_versions: _,
             call_mode,
         } => {
-            // Refuse non-first-party principals at bind; the only exception is a
-            // Basal route that passes `flow_carrier_admitted`. The subc-mcp gateway
-            // also keeps these tools off MCP surfaces. Whether a first-party caller
-            // may act in a conversation is checked per call in
-            // `send_session_caller_not_admitted`.
+            // Basal needs verified flow delegation. Cingulate may bind only to
+            // this module's management surface, where its calls are limited to
+            // permissions.list/revoke before any grant lookup. Neither needs
+            // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
             if !trust.is_first_party()
                 && !scope.as_ref().is_some_and(|stamp| {
                     cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
                 })
+                && !permissions::bind_admitted(&principal, &target)
             {
                 return send_principal_denied(
                     writer,

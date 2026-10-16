@@ -630,7 +630,17 @@ budget!(
     management::LIST_GRANTS,
     [("store", STORE_MS, 2)]
 );
-pub const MANAGEMENT_ACTIONS: [ActionBudget; 14] = [
+budget!(
+    MANAGEMENT_PERMISSIONS_LIST,
+    crate::permissions::LIST,
+    [("store", STORE_MS, 1), ("labels", RESOLUTION_LIMIT_MS, 1)]
+);
+budget!(
+    MANAGEMENT_PERMISSIONS_REVOKE,
+    crate::permissions::REVOKE,
+    [("store", STORE_MS, 1)]
+);
+pub const MANAGEMENT_ACTIONS: [ActionBudget; 16] = [
     MANAGEMENT_WOULD_ASK,
     MANAGEMENT_OPEN_TARGET,
     MANAGEMENT_LIST_APP_GRANTS,
@@ -645,6 +655,8 @@ pub const MANAGEMENT_ACTIONS: [ActionBudget; 14] = [
     MANAGEMENT_REVOKE_ACCESS,
     MANAGEMENT_REVOKE_GRANT,
     MANAGEMENT_LIST_GRANTS,
+    MANAGEMENT_PERMISSIONS_LIST,
+    MANAGEMENT_PERMISSIONS_REVOKE,
 ];
 const FLAT_MANAGEMENT_ACTIONS: [ActionBudget; 6] = [
     MANAGEMENT_OPEN_GRANT,
@@ -771,7 +783,7 @@ const fn management_limits(
 // answer consent or complete sign-in. OPEN_GRANT, REBIND_PROFILE_ROOT and
 // CLEAR_LAUNCH_RECOVERY ask on spawned tasks after the Management reply,
 // so those replies need no park allowance.
-pub const MANAGEMENT_LIMITS: [ManagementLimits; 14] = [
+pub const MANAGEMENT_LIMITS: [ManagementLimits; 16] = [
     management_limits(MANAGEMENT_WOULD_ASK, 0, 0),
     management_limits(MANAGEMENT_OPEN_TARGET, 0, CONSENT_PARK_LIMIT_MS),
     management_limits(MANAGEMENT_LIST_APP_GRANTS, 0, 0),
@@ -802,6 +814,8 @@ pub const MANAGEMENT_LIMITS: [ManagementLimits; 14] = [
     management_limits(MANAGEMENT_REVOKE_ACCESS, BROWSER_QUEUE_WAIT_LIMIT_MS, 0),
     management_limits(MANAGEMENT_REVOKE_GRANT, BROWSER_QUEUE_WAIT_LIMIT_MS, 0),
     management_limits(MANAGEMENT_LIST_GRANTS, 0, 0),
+    management_limits(MANAGEMENT_PERMISSIONS_LIST, 0, 0),
+    management_limits(MANAGEMENT_PERMISSIONS_REVOKE, 0, 0),
 ];
 
 #[cfg(test)]
@@ -1054,6 +1068,8 @@ mod tests {
             (MANAGEMENT_REVOKE_ACCESS, 2 * STORE_MS),
             (MANAGEMENT_REVOKE_GRANT, 2 * STORE_MS),
             (MANAGEMENT_LIST_GRANTS, 2 * STORE_MS),
+            (MANAGEMENT_PERMISSIONS_LIST, STORE_MS + RESOLUTION_LIMIT_MS),
+            (MANAGEMENT_PERMISSIONS_REVOKE, STORE_MS),
         ];
         assert_eq!(expected.len(), MANAGEMENT_ACTIONS.len());
         for (budget, total) in expected {
@@ -1216,6 +1232,8 @@ mod tests {
             (management::REVOKE_ACCESS, BROWSER_QUEUE_WAIT_LIMIT_MS, 0),
             (management::REVOKE_GRANT, BROWSER_QUEUE_WAIT_LIMIT_MS, 0),
             (management::LIST_GRANTS, 0, 0),
+            (crate::permissions::LIST, 0, 0),
+            (crate::permissions::REVOKE, 0, 0),
         ];
         assert_eq!(expected.len(), management::OPERATIONS.len());
         assert_eq!(expected.len(), MANAGEMENT_LIMITS.len());
