@@ -485,19 +485,16 @@ fn invalid_durable_rows_block_every_write() {
     let mut candidate = row();
     candidate.subject = GrantSubject::AllSites;
     invalid.push(candidate);
-    for (owner, scope_ref, expires) in [
-        ("", "scope", Some(NOW + 1)),
-        ("owner", "", Some(NOW + 1)),
-        ("owner", "scope", None),
-        ("owner", "scope", Some(NOW)),
-        ("owner", "scope", Some(NOW + 30 * 60 * 1000 + 1)),
+    for (scope_ref, expires) in [
+        ("", Some(NOW + 1)),
+        ("scope", None),
+        ("scope", Some(NOW)),
+        ("scope", Some(NOW + 30 * 60 * 1000 + 1)),
     ] {
         let mut candidate = row();
         candidate.holder = GrantHolder::Worker {
             agent_id: "head".into(),
-            owner: owner.into(),
             scope_ref: scope_ref.into(),
-            scope_epoch: 1,
         };
         candidate.expires_at_ms = expires;
         invalid.push(candidate);
@@ -640,19 +637,17 @@ fn every_holder_subject_target_and_machine_has_its_own_identity() {
     worker.id = "worker".into();
     worker.holder = GrantHolder::Worker {
         agent_id: "head".into(),
-        owner: "owner".into(),
         scope_ref: "scope".into(),
-        scope_epoch: 1,
     };
-    let mut epoch = worker.clone();
-    epoch.id = "epoch".into();
-    if let GrantHolder::Worker { scope_epoch, .. } = &mut epoch.holder {
-        *scope_epoch = 2;
+    let mut other_ref = worker.clone();
+    other_ref.id = "other-ref".into();
+    if let GrantHolder::Worker { scope_ref, .. } = &mut other_ref.holder {
+        *scope_ref = "another-ref".into();
     }
-    let mut owner = worker.clone();
-    owner.id = "owner".into();
-    if let GrantHolder::Worker { owner, .. } = &mut owner.holder {
-        *owner = "other-owner".into();
+    let mut agent = worker.clone();
+    agent.id = "agent".into();
+    if let GrantHolder::Worker { agent_id, .. } = &mut agent.holder {
+        *agent_id = "other-agent".into();
     }
     let state = AgentGrantStoreState {
         grants: vec![
@@ -663,8 +658,8 @@ fn every_holder_subject_target_and_machine_has_its_own_identity() {
             site,
             user,
             worker,
-            epoch,
-            owner,
+            other_ref,
+            agent,
         ],
         ..Default::default()
     };

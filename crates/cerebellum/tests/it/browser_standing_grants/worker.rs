@@ -2,6 +2,37 @@
 
 use super::*;
 
+pub(super) fn describe_head(planes: &Planes, agent: &str) {
+    let (tx, mut rx) = mpsc::channel::<Frame>(8);
+    if !planes.scopes.control.connect(&tx) {
+        return;
+    }
+    let planes = planes.clone();
+    let agent = agent.to_owned();
+    tokio::spawn(async move {
+        let _connection = tx;
+        while let Some(frame) = rx.recv().await {
+            assert_eq!(frame.header.channel, 0);
+            let request: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(
+                request,
+                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+            );
+            let reply = Frame::build(FrameType::Response, Flags::new(false, Priority::Passive, false), 0, 0, frame.header.corr,
+                serde_json::to_vec(&json!({
+                    "op":"scope.describe", "status":"live", "scope_epoch":7,
+                    "daemon_incarnation":"daemon-test", "owner_synced":true, "owner_configured":true,
+                    "scope":{"owner":request["owner"], "owner_authorized":true,
+                        "ref":"sc_head_alf", "scope_epoch":7, "kind":"head", "attributes":{"agent_id":agent}}
+                })).unwrap()).unwrap();
+            let (writer, _replies) = mpsc::channel(8);
+            cerebellum::handle_frame_for_test(reply, &writer, &planes)
+                .await
+                .unwrap();
+        }
+    });
+}
+
 fn worker(conversation: &str) -> Session<'_> {
     Session {
         kind: "subagent",

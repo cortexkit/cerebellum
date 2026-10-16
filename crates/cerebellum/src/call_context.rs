@@ -18,6 +18,9 @@ tokio::task_local! {
     pub(crate) static ROUTE_GUARD: Arc<cerebellum_core::dispatch::InFlightGuard>;
     /// The validated key identifying the tool call that initiated this request.
     pub(crate) static CALL_KEY: String;
+    /// Admission lookups spend the same action budget as dispatch, rather than
+    /// acquiring a fresh timeout near the end of a call.
+    pub(crate) static CALL_DEADLINE: tokio::time::Instant;
 }
 
 /// The key of the tool call this task serves, when it serves one.

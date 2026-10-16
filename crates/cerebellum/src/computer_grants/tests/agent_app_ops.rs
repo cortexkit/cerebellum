@@ -47,9 +47,7 @@ fn retained_app_operations_use_only_local_permanent_head_app_rows() {
                     "worker",
                     GrantHolder::Worker {
                         agent_id: "head-a".into(),
-                        owner: "owner".into(),
                         scope_ref: "ref".into(),
-                        scope_epoch: 1,
                     },
                     GrantSubject::App("editor".into()),
                     Some(now + 1_800_000),

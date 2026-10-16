@@ -83,6 +83,7 @@ pub enum ControlAnswer {
 pub struct ControlRequests {
     next_corr: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<ControlAnswer>>>,
+    connection: std::sync::OnceLock<mpsc::WeakSender<Frame>>,
 }
 
 impl Default for ControlRequests {
@@ -90,11 +91,29 @@ impl Default for ControlRequests {
         Self {
             next_corr: AtomicU64::new(FIRST_CONTROL_CORR),
             pending: Mutex::new(HashMap::new()),
+            connection: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl ControlRequests {
+    /// Attach the module connection only after its daemon handshake succeeds.
+    /// Isolated planes have no connection and cannot invent scope authority.
+    pub fn connect(&self, writer: &mpsc::Sender<Frame>) -> bool {
+        // Plane clones may outlive the connection. Retaining its writer here
+        // would prevent the egress channel from ever closing during shutdown.
+        self.connection.set(writer.downgrade()).is_ok()
+    }
+
+    pub(crate) async fn request_connected(
+        &self,
+        request: &ModuleControlRequestFromModule,
+        deadline: Duration,
+    ) -> Option<ControlAnswer> {
+        let writer = self.connection.get()?.upgrade()?;
+        self.request(&writer, request, deadline).await
+    }
+
     /// Send `request` on channel 0 and wait up to `deadline` for its answer.
     /// `None` when it could not be sent, too many are outstanding, or no answer
     /// came in time.

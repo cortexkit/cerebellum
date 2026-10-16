@@ -594,6 +594,9 @@ impl Fixture {
     ) -> Route {
         let channel = self.next_channel;
         self.next_channel += 1;
+        if session.kind == "subagent" {
+            worker::describe_head(&self.planes, session.agent.unwrap());
+        }
         let mut facts = json!({
             "sessionKind": session.kind,
             "effectiveCapabilityScope": ["*"],

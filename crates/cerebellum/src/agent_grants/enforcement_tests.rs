@@ -11,12 +11,10 @@ fn head() -> GrantHolder {
         agent_id: "head".into(),
     }
 }
-fn worker(owner: &str, epoch: u64) -> GrantHolder {
+fn worker(scope_ref: &str) -> GrantHolder {
     GrantHolder::Worker {
         agent_id: "head".into(),
-        owner: owner.into(),
-        scope_ref: "same-ref".into(),
-        scope_epoch: epoch,
+        scope_ref: scope_ref.into(),
     }
 }
 fn store() -> (Arc<AgentGrants>, Arc<ManualWallClock>) {
@@ -58,7 +56,7 @@ fn app() -> GrantDemand {
 }
 
 #[test]
-fn worker_owner_and_epoch_never_lend_authority_to_another_holder_even_after_restart() {
+fn worker_scope_ref_never_lends_authority_to_another_holder_even_after_restart() {
     let backing = Arc::new(InMemoryAgentGrantStorage::default());
     struct Empty;
     impl LegacyGrantSource for Empty {
@@ -73,22 +71,13 @@ fn worker_owner_and_epoch_never_lend_authority_to_another_holder_even_after_rest
     );
     store
         .upsert(
-            row(worker("owner-a", 1), GrantSubject::WholeComputer, None),
+            row(worker("same-ref"), GrantSubject::WholeComputer, None),
             100,
         )
         .unwrap();
     let check = |store: &Arc<AgentGrants>| {
-        assert!(store.authorize(&worker("owner-a", 1), app()).is_some());
-        let mut other_ref = worker("owner-a", 1);
-        if let GrantHolder::Worker { scope_ref, .. } = &mut other_ref {
-            *scope_ref = "another-ref".into();
-        }
-        for other in [
-            head(),
-            worker("owner-b", 1),
-            worker("owner-a", 2),
-            other_ref,
-        ] {
+        assert!(store.authorize(&worker("same-ref"), app()).is_some());
+        for other in [head(), worker("another-ref")] {
             assert!(
                 store.authorize(&other, app()).is_none(),
                 "holder {other:?} borrowed a worker's row"

@@ -88,91 +88,225 @@ async fn forged_project_root_and_unattested_heads_neither_match_nor_mint() {
     }
 }
 
-#[tokio::test]
-async fn parent_only_worker_neither_matches_head_nor_mints_a_row() {
-    let planes = app_planes();
-    let facts = planes.routes.get(1, 1).unwrap();
-    seed(
-        &planes,
-        GrantHolder::Head {
-            agent_id: facts.identity.agent_project_id.clone(),
-        },
-    );
-    let before = planes
-        .management
-        .agent_grants()
-        .live_rows(None, planes.management.agent_grants().now_ms())
-        .unwrap();
-    let facts = facts.with_scope(Some(crate::cingulate_client::worker_vectors::worker_stamp()));
-    assert!(crate::permission_scope::authorizing_holder(&facts).is_none());
-    assert!(crate::permission_scope::minting_holder(&facts).is_none());
-    let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
-    assert_ne!(reply["outcome"], "granted", "{reply}");
-    let store = planes.management.agent_grants();
-    assert_eq!(store.live_rows(None, store.now_ms()).unwrap(), before);
+fn parent_only_facts(planes: &Planes) -> crate::AcceptedBindFacts {
+    let mut facts = planes
+        .routes
+        .get(1, 1)
+        .unwrap()
+        .with_scope(Some(crate::cingulate_client::worker_vectors::worker_stamp()));
+    // Production workers inherit identity from their parent, not bind attributes.
+    facts.agent_project_id_attested = false;
+    facts.identity.agent_project_id = "untrusted-bind-project".into();
+    facts
 }
 
 #[tokio::test]
-async fn stamped_worker_dispatch_uses_its_owner_ref_and_epoch_not_the_head() {
+async fn parent_only_worker_mints_and_lists_under_the_described_heads_agent_id() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+    assert_eq!(reply["outcome"], "granted", "{reply}");
+    let store = planes.management.agent_grants();
+    let rows = store
+        .live_rows(Some("test-project"), store.now_ms())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&rows[0].holder).unwrap(),
+        json!({
+            "kind":"worker", "agent_id":"test-project", "scope_ref":"sc_worker"
+        })
+    );
+    assert!(store
+        .live_rows(Some("untrusted-bind-project"), store.now_ms())
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn revived_worker_reuses_its_grant_but_a_fresh_scope_ref_asks_again() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let (_, requests) = crate::permission_scope::test_support::describe(
+        &planes,
+        crate::permission_scope::test_support::live_head(),
+    );
+    let (reply, planes) = dispatch(planes, facts.clone(), "allow_conversation").await;
+    assert_eq!(reply["outcome"], "granted", "{reply}");
+    let mut revived = facts.clone();
+    revived.scope.as_mut().unwrap().scope_epoch += 1;
+    let (reply, planes) = dispatch(planes, revived.clone(), "deny").await;
+    assert_eq!(
+        reply["outcome"], "granted",
+        "a revival keeps its grant: {reply}"
+    );
+    revived.scope.as_mut().unwrap().scope_ref = "fresh-task".into();
+    let (reply, planes) = dispatch(planes, revived, "deny").await;
+    assert_ne!(
+        reply["outcome"], "granted",
+        "a fresh task must ask: {reply}"
+    );
+    assert_eq!(reply["outcome"], "consent_denied", "{reply}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "one describe per call, not per grant lookup"
+    );
+    for request in requests.iter() {
+        assert_eq!(
+            request,
+            &json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+        );
+    }
+    let store = planes.management.agent_grants();
+    assert_eq!(store.live_rows(None, store.now_ms()).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_head_ending_between_calls_refuses_even_an_existing_worker_grant() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let (answer, requests) = crate::permission_scope::test_support::describe(
+        &planes,
+        crate::permission_scope::test_support::live_head(),
+    );
+    let (reply, planes) = dispatch(planes, facts.clone(), "allow_conversation").await;
+    assert_eq!(reply["outcome"], "granted", "{reply}");
+    for status in ["ended", "not_live"] {
+        answer.lock().unwrap()["status"] = json!(status);
+        answer.lock().unwrap()["scope"] = Value::Null;
+        let (reply, _) = dispatch(planes.clone(), facts.clone(), "allow_conversation").await;
+        assert_eq!(reply["reason"], "no_agent_session", "{reply}");
+        assert_eq!(reply["detail"]["retryable"], false);
+    }
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn an_unsynced_head_owner_is_unavailable_never_gone() {
+    for status in ["live", "not_live", "ended"] {
+        let planes = app_planes();
+        let facts = parent_only_facts(&planes);
+        let mut answer = crate::permission_scope::test_support::live_head();
+        answer["owner_synced"] = json!(false);
+        answer["status"] = json!(status);
+        crate::permission_scope::test_support::describe(&planes, answer);
+        let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+        assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
+        assert_eq!(reply["detail"]["retryable"], true);
+        let store = planes.management.agent_grants();
+        assert!(store.live_rows(None, store.now_ms()).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_describe_failure_never_defaults_to_a_worker_holder() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let mut answer = crate::permission_scope::test_support::live_head();
+    // A control error or malformed response cannot establish an identity.
+    answer["op"] = json!("not-scope-describe");
+    let (_, requests) = crate::permission_scope::test_support::describe(&planes, answer);
+    let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+    assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let store = planes.management.agent_grants();
+    assert!(store.live_rows(None, store.now_ms()).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn parent_owner_epoch_kind_and_carrier_must_match_the_admitted_worker() {
     for alteration in [
-        "none",
-        "head",
-        "ref",
-        "epoch",
-        "owner",
+        "parent-owner",
+        "worker-owner",
+        "parent-epoch",
+        "head-kind",
+        "head-ref",
+        "head-record-epoch",
+        "head-agent",
         "unauthorized",
         "carrier",
     ] {
         let planes = app_planes();
-        let facts = planes.routes.get(1, 1).unwrap();
-        let mut stamp = crate::cingulate_client::worker_vectors::worker_stamp();
-        stamp.attributes.agent_id = Some(facts.identity.agent_project_id.clone());
-        let mut facts = facts.with_scope(Some(stamp.clone()));
-        let holder = crate::permission_scope::authorizing_holder(&facts).unwrap();
-        seed(&planes, holder.clone());
+        let mut facts = parent_only_facts(&planes);
+        let mut answer = crate::permission_scope::test_support::live_head();
+        let stamp = facts.scope.as_mut().unwrap();
         match alteration {
-            "none" => {}
-            "head" => {
-                let agent = facts.identity.agent_project_id.clone();
-                facts = facts.with_scope(Some(super::stamp(&agent)));
-            }
-            "ref" => {
-                stamp.scope_ref = "another-ref".into();
-                facts = facts.with_scope(Some(stamp));
-            }
-            "owner" => {
-                facts.scope.as_mut().unwrap().owner = Principal::Reserved {
-                    module_id: "other".into(),
-                };
-            }
-            "epoch" => {
-                stamp.scope_epoch += 1;
-                facts = facts.with_scope(Some(stamp));
-            }
-            "unauthorized" => {
-                facts.scope.as_mut().unwrap().owner_authorized = false;
-            }
-            "carrier" => {
-                facts.principal = Some(Principal::Direct);
-            }
+            "parent-owner" => stamp.parent.as_mut().unwrap().owner = Principal::Direct,
+            "worker-owner" => stamp.owner = Principal::Direct,
+            "parent-epoch" => stamp.parent.as_mut().unwrap().scope_epoch += 1,
+            "head-kind" => answer["scope"]["kind"] = json!("worker"),
+            "head-ref" => answer["scope"]["ref"] = json!("another-head"),
+            "head-record-epoch" => answer["scope"]["scope_epoch"] = json!(8),
+            "head-agent" => answer["scope"]["attributes"] = json!({}),
+            "unauthorized" => stamp.owner_authorized = false,
+            "carrier" => facts.principal = Some(Principal::Direct),
             _ => unreachable!(),
         }
-        if alteration == "head" || alteration == "epoch" {
-            assert_ne!(
-                crate::permission_scope::authorizing_holder(&facts),
-                Some(holder)
-            );
+        crate::permission_scope::test_support::describe(&planes, answer);
+        let (reply, planes) = dispatch(planes, facts, "allow_conversation").await;
+        if alteration == "carrier" {
+            assert_eq!(reply["code"], "session_caller_not_admitted", "{reply}");
+        } else {
+            assert_eq!(reply["reason"], "no_agent_session", "{alteration}: {reply}");
         }
-        if matches!(alteration, "owner" | "unauthorized" | "carrier") {
-            assert!(crate::permission_scope::authorizing_holder(&facts).is_none());
-        }
-        let (reply, _) = dispatch(planes, facts, "deny").await;
-        assert_eq!(
-            reply["outcome"] == "granted",
-            alteration == "none",
-            "alteration {alteration}: {reply}"
-        );
+        let store = planes.management.agent_grants();
+        assert!(store.live_rows(None, store.now_ms()).unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn a_parent_epoch_mismatch_refuses_a_live_head() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let mut answer = crate::permission_scope::test_support::live_head();
+    answer["scope_epoch"] = json!(8);
+    crate::permission_scope::test_support::describe(&planes, answer);
+    let (reply, _) = dispatch(planes, facts, "allow_conversation").await;
+    assert_eq!(reply["reason"], "no_agent_session", "{reply}");
+}
+
+#[tokio::test]
+async fn no_daemon_connection_refuses_instead_of_defaulting_to_a_holder() {
+    let planes = app_planes();
+    planes.routes.insert(1, 1, parent_only_facts(&planes));
+    let (planes, script) = super::worker::scripted_consent(planes, "allow_conversation");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    crate::handle_frame(app_request(1), &tx, &planes)
+        .await
+        .unwrap();
+    let reply = wire_reply(&mut rx).await;
+    assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
+    assert_eq!(reply["detail"]["retryable"], true);
+    assert!(script.calls().is_empty());
+    let store = planes.management.agent_grants();
+    assert!(store.live_rows(None, store.now_ms()).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_describe_spends_only_the_calls_remaining_deadline() {
+    let planes = app_planes();
+    let facts = parent_only_facts(&planes);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    planes.scopes.control.connect(&tx);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        crate::call_context::CALL_DEADLINE.scope(
+            deadline,
+            crate::permission_scope::resolve_worker(&facts, &planes.scopes),
+        ),
+    )
+    .await
+    .expect("the call deadline must bound an unanswered describe");
+    assert!(matches!(
+        result,
+        Err(crate::permission_scope::HeadRefusal::Unavailable)
+    ));
+    let request = rx.try_recv().unwrap();
+    assert_eq!(request.header.channel, 0);
+    assert_eq!(planes.scopes.control.outstanding(), 0);
 }
 
 #[tokio::test]

@@ -354,7 +354,10 @@ pub(crate) async fn run_arbitrated_route(
             None => worker.as_mut().poll(cx),
         }
     });
-    let mut job = Box::pin(CALL_TERMINAL.scope(Arc::clone(&terminal), guarded));
+    let mut job = Box::pin(call_context::CALL_DEADLINE.scope(
+        envelope_end,
+        CALL_TERMINAL.scope(Arc::clone(&terminal), guarded),
+    ));
     let request = request_id(&terminal.request);
     let mut drain = planes.drain_signal.subscribe();
     let mut finished = false;
