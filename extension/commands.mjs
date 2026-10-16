@@ -10,6 +10,10 @@ const READ_METHODS = new Set([
   "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode",
   "Runtime.enable",
 ]);
+// Terminal accounting uses the narrower fixed set in
+// terminal-read-only-methods.json, embedded by the Rust bridge. Methods absent
+// from that set count as mutations, even if admitted above without input guards.
+// Runtime.callFunctionOn is read-only only for the pinned HAS_FOCUS declaration.
 const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "DOM.focus"]);
 
 export function classifyCommand(command) {

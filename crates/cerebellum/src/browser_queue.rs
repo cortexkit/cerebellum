@@ -229,6 +229,28 @@ enum Quarantined {
     Refuse(QueueRefusal),
 }
 
+fn user_quarantine(frame: &Frame, planes: &Planes) -> Option<Quarantined> {
+    let body: Value = serde_json::from_slice(&frame.body).ok()?;
+    let args = &body["arguments"];
+    if body["name"] != crate::flat_tools::BROWSER_USE || args["browser"] != "user" {
+        return None;
+    }
+    if let Some(connection) = planes.user_browser.connected_epoch() {
+        planes.user_browser.target().synchronize(connection);
+    }
+    planes
+        .user_browser
+        .target()
+        .quarantine(
+            crate::user_browser_bridge::Route {
+                channel: frame.header.channel,
+                epoch: frame.header.epoch,
+            },
+            args["tab"].as_str(),
+        )
+        .map(Quarantined::Refuse)
+}
+
 fn execution_quarantine(call: &SessionCall, planes: &Planes) -> Option<Quarantined> {
     if !call.drives_session {
         return None;
@@ -319,10 +341,10 @@ pub(crate) async fn enter(
         return Ok(None);
     };
     let call = session_call(frame, planes);
-    match call
-        .as_ref()
-        .and_then(|call| execution_quarantine(call, planes))
-    {
+    match user_quarantine(frame, planes).or_else(|| {
+        call.as_ref()
+            .and_then(|call| execution_quarantine(call, planes))
+    }) {
         Some(Quarantined::Refuse(refusal)) => return Err(refusal),
         Some(Quarantined::Bypass) => return Ok(None),
         None => {}
@@ -331,9 +353,16 @@ pub(crate) async fn enter(
         .cancellations
         .get((frame.header.channel, frame.header.epoch, frame.header.corr))
         .expect("frame reader registered cancellation");
-    let quarantine: Option<QuarantineCheck> = call.clone().map(|call| {
+    let quarantine: Option<QuarantineCheck> = Some({
+        let call = call.clone();
+        let frame = frame.clone();
         let planes = planes.clone();
-        Box::new(move || execution_quarantine(&call, &planes)) as QuarantineCheck
+        Box::new(move || {
+            user_quarantine(&frame, &planes).or_else(|| {
+                call.as_ref()
+                    .and_then(|call| execution_quarantine(call, &planes))
+            })
+        }) as QuarantineCheck
     });
     let Some(guard) = acquire(ticket, cancel, planes.drain_signal.subscribe(), quarantine).await?
     else {

@@ -8,7 +8,7 @@ use crate::management;
 pub const CONSENT_PARK_LIMIT_MS: u64 = 120_000;
 pub const HANDOFF_DURATION_MS: u64 = 600_000;
 pub const COMPUTER_MAX_PARK_MS: u64 = CONSENT_PARK_LIMIT_MS;
-pub const BROWSER_MAX_PARK_MS: u64 = CONSENT_PARK_LIMIT_MS;
+pub const BROWSER_MAX_PARK_MS: u64 = 3 * USER_CONSENT_MS;
 
 pub const TARGET_CHECK_MS: u64 = 2_000;
 pub const CODE_IDENTITY_MS: u64 = 2_000;
@@ -307,10 +307,9 @@ budget!(
     ]
 );
 budget!(BROWSER_STATUS, "status", [("metadata", GRANT_LOOKUP_MS, 1)]);
-// open_tab and claim_tab ask the person's Chrome through the extension
-// bridge: one bridge turn (queue wait then reply) for the tab request. The
-// other user-target actions are served from the own-browser budgets above
-// until the user target adopts the call envelope as its own follow-up.
+// Tab requests use one bridge turn. The user's multi-plan actions below have
+// shared phase allowances instead: a slow plan spends the time left in the
+// action, rather than renewing every transport timeout for every plan.
 pub const BRIDGE_TURN_MS: u64 = crate::user_browser_bridge::QUEUE_DEADLINE.as_millis() as u64
     + crate::user_browser_bridge::REPLY_DEADLINE.as_millis() as u64;
 budget!(
@@ -506,6 +505,111 @@ pub const BROWSER_ACTIONS: [ActionBudget; 12] = [
     BROWSER_TYPE,
     BROWSER_CLICK_POINT,
 ];
+
+// These count debugger attachments, not CDP commands. Only the top-level frame
+// is captured; embedded frames are omitted. Snapshot has no readiness retry:
+// initial document + post-consent document + AX/DOM + optional HTML + confirm = 5.
+pub const USER_SNAPSHOT_PLANS: u64 = 2 + 2 + 1;
+// Screenshot: two document reads + one image plan + confirmation.
+pub const USER_SCREENSHOT_PLANS: u64 = 2 + 1 + 1;
+// Click: document + classify + quad + verify(document, DOM) + position(hit,
+// DOM) + input + landed document = 9. Press and release share one attachment.
+pub const USER_CLICK_PLANS: u64 = 1 + 1 + 1 + 2 + 2 + 1 + 1;
+// Point input replaces the quad with separate viewport and hit-test plans.
+pub const USER_CLICK_POINT_PLANS: u64 = USER_CLICK_PLANS - 1 + 2;
+// Type: document + classify + three steps each with verify(document, DOM) and
+// dispatch + focus check + another verify before insert + landed document = 15.
+pub const USER_TYPE_PLANS: u64 = 1 + 1 + 3 * (2 + 1) + 1 + 2 + 1;
+// Navigation: initial/rechecked document + navigate + optional page read
+// (AX/DOM, confirm). Navigation cannot request dom_full. Commit polling is
+// variable-length and shares one phase cap.
+pub const USER_NAVIGATE_PLANS: u64 = 2 + 1 + 2;
+pub const USER_NAVIGATION_READ_MS: u64 =
+    crate::user_browser::NAVIGATION_READ_DEADLINE.as_millis() as u64;
+// Reserve one queue wait, two acknowledgement caps per planned attachment,
+// and one shared reply-transfer allowance. Socket writes and all reply waits
+// spend this same action allowance; these are not promises that every stage
+// of every plan can simultaneously use its independent transport maximum.
+pub const USER_PLAN_ALLOWANCE_MS: u64 = crate::user_browser_bridge::ATTACH_DEADLINE.as_millis()
+    as u64
+    + crate::user_browser_bridge::DISPATCH_DEADLINE.as_millis() as u64;
+pub const USER_QUEUE_MS: u64 = crate::user_browser_bridge::QUEUE_DEADLINE.as_millis() as u64;
+pub const USER_REPLY_MS: u64 = crate::user_browser_bridge::REPLY_DEADLINE.as_millis() as u64;
+pub const USER_CONSENT_MS: u64 = crate::user_browser::CONSENT_DEADLINE.as_millis() as u64;
+
+macro_rules! user_budget {
+    ($id:ident, $action:literal, $plans:expr, $journals:expr, $poll:expr) => {
+        budget!(
+            $id,
+            $action,
+            [
+                ("bridge_queue", USER_QUEUE_MS, 1),
+                ("plan_acknowledgements", USER_PLAN_ALLOWANCE_MS, $plans),
+                ("reply_transfer", USER_REPLY_MS, 1),
+                ("commit_poll", USER_NAVIGATION_READ_MS, $poll),
+                ("journal", STORE_MS, $journals),
+            ]
+        );
+    };
+}
+user_budget!(USER_OPEN_TAB, "open_tab", 1, 2, 0);
+user_budget!(USER_CLAIM_TAB, "claim_tab", 1, 2, 0);
+user_budget!(USER_STATUS, "status", 1, 1, 0);
+user_budget!(USER_CLOSE, "close", 1, 1, 0);
+user_budget!(USER_SNAPSHOT, "snapshot", USER_SNAPSHOT_PLANS, 3, 0);
+user_budget!(USER_SCREENSHOT, "screenshot", USER_SCREENSHOT_PLANS, 2, 0);
+user_budget!(USER_NAVIGATE, "navigate", USER_NAVIGATE_PLANS, 3, 1);
+user_budget!(USER_CLICK, "click", USER_CLICK_PLANS, 7, 0);
+user_budget!(
+    USER_CLICK_POINT,
+    "click_point",
+    USER_CLICK_POINT_PLANS,
+    8,
+    0
+);
+user_budget!(USER_TYPE, "type", USER_TYPE_PLANS, 10, 0);
+budget!(USER_OPEN_GRANT, "open_grant", [("store", STORE_MS, 2)]);
+budget!(
+    USER_REVOKE_ACCESS,
+    "revoke_access",
+    [("store", STORE_MS, 2)]
+);
+budget!(USER_UNSUPPORTED, "unsupported", [("journal", STORE_MS, 1)]);
+pub const USER_BROWSER_ACTIONS: [ActionBudget; 12] = [
+    USER_OPEN_TAB,
+    USER_CLAIM_TAB,
+    USER_STATUS,
+    USER_CLOSE,
+    USER_SNAPSHOT,
+    USER_SCREENSHOT,
+    USER_NAVIGATE,
+    USER_CLICK,
+    USER_CLICK_POINT,
+    USER_TYPE,
+    USER_OPEN_GRANT,
+    USER_REVOKE_ACCESS,
+];
+
+pub fn user_browser(action: &str) -> Option<&'static ActionBudget> {
+    lookup(&USER_BROWSER_ACTIONS, action).or_else(|| {
+        matches!(
+            action,
+            "launch" | "present" | "resume" | "import_login" | "capture_login" | "scroll"
+        )
+        .then_some(&USER_UNSUPPORTED)
+    })
+}
+
+pub const fn user_consent_count(action: &str) -> u64 {
+    // A click can ask once to inspect its page, again for a sensitive control
+    // (for example a submit button), and once for a link to a different site.
+    // Typing only edits a field, so it needs no link-destination approval.
+    match action.as_bytes() {
+        b"click" | b"click_point" => 3,
+        b"snapshot" | b"screenshot" | b"navigate" | b"type" | b"open_grant" => 1,
+        _ => 0,
+    }
+}
 
 budget!(
     MANAGEMENT_WOULD_ASK,
@@ -703,16 +807,47 @@ pub fn management(method: &str) -> Option<&'static ActionBudget> {
 
 pub const COMPUTER_MAX_WORK_MS: u64 = max_work(&COMPUTER_ACTIONS);
 pub const BROWSER_MAX_WORK_MS: u64 = max(
-    max_work(&BROWSER_ACTIONS),
+    max(max_work(&BROWSER_ACTIONS), max_work(&USER_BROWSER_ACTIONS)),
     max_work(&FLAT_MANAGEMENT_ACTIONS),
+);
+const fn max_user_action_ms() -> u64 {
+    let mut result = 0;
+    let mut i = 0;
+    while i < USER_BROWSER_ACTIONS.len() {
+        let action = USER_BROWSER_ACTIONS[i];
+        result = max(
+            result,
+            action.work_ms + user_consent_count(action.action) * USER_CONSENT_MS,
+        );
+        i += 1;
+    }
+    result
+}
+// Keep work and consent from the same action together when finding the reply
+// maximum. The action with the longest work need not ask the most questions.
+pub const BROWSER_MAX_ACTION_MS: u64 = max(
+    max(
+        max_work(&BROWSER_ACTIONS),
+        max_work(&FLAT_MANAGEMENT_ACTIONS),
+    ) + CONSENT_PARK_LIMIT_MS,
+    max_user_action_ms(),
 );
 pub const COMPUTER_QUEUE_WAIT_LIMIT_MS: u64 = CONSENT_PARK_LIMIT_MS
     + COMPUTER_MAX_WORK_MS
     + RELEASE_BUDGET_MS
     + BOUNDARY_SLACK_MS
     + RESOLUTION_LIMIT_MS;
-pub const BROWSER_QUEUE_WAIT_LIMIT_MS: u64 =
-    CONSENT_PARK_LIMIT_MS + BROWSER_MAX_WORK_MS + RELEASE_BUDGET_MS + BOUNDARY_SLACK_MS;
+// Keep the conversation queue's existing own-browser wait ceiling independent
+// of extension transport allowances. A queued call can safely refuse before
+// dispatch even when a preceding extension call is still running; increasing
+// this wait with every action allowance would only delay that safe refusal.
+pub const BROWSER_QUEUE_WAIT_LIMIT_MS: u64 = CONSENT_PARK_LIMIT_MS
+    + max(
+        max_work(&BROWSER_ACTIONS),
+        max_work(&FLAT_MANAGEMENT_ACTIONS),
+    )
+    + RELEASE_BUDGET_MS
+    + BOUNDARY_SLACK_MS;
 pub const TERMINAL_SUFFIX_MS: u64 = RELEASE_BUDGET_MS + CALL_RECORD_SETTLE_MS + EGRESS_SEND_MS;
 
 const fn reply_max_ms(queue_ms: u64, park_ms: u64, work_ms: u64) -> u64 {
@@ -729,17 +864,15 @@ pub const COMPUTER_REPLY_MAX_MS: u64 = reply_max_ms(
     COMPUTER_MAX_PARK_MS,
     COMPUTER_MAX_WORK_MS,
 );
-// browser_use: 6,000 + 423,000 + 120,000 + 292,000 + 6,000 + 6,000
-// + 130,001 = 983,001 ms. Only waiting for the person's consent-card answer
-// parks the call. The sign-in window returns a pending reply; a later result
-// reports how sign-in ended. EGRESS_SEND_MS reserves 130,001 ms to send the
-// active reply batch and queued channel buffer at EGRESS_MIN_BYTES_PER_S,
-// including two flushes.
-pub const BROWSER_REPLY_MAX_MS: u64 = reply_max_ms(
-    BROWSER_QUEUE_WAIT_LIMIT_MS,
-    BROWSER_MAX_PARK_MS,
-    BROWSER_MAX_WORK_MS,
-);
+// browser_use: 6,000 + 423,000 + 360,000 + 208,000 + 6,000 + 6,000
+// + 130,001 = 1,139,001 ms. User click_point dominates: its 360,000-ms park
+// covers three permission questions. Sign-in does not hold a call open:
+// its initial reply does not wait for the person to finish logging in; that
+// eventual sign-in result is delivered after the original call has returned.
+// EGRESS_SEND_MS reserves time to write both the current reply batch and the
+// channel's queued replies at EGRESS_MIN_BYTES_PER_S, including two flushes.
+pub const BROWSER_REPLY_MAX_MS: u64 =
+    reply_max_ms(BROWSER_QUEUE_WAIT_LIMIT_MS, 0, BROWSER_MAX_ACTION_MS);
 pub const COMPUTER_ENVELOPE_MS: u64 = COMPUTER_REPLY_MAX_MS - TERMINAL_SUFFIX_MS;
 pub const BROWSER_ENVELOPE_MS: u64 = BROWSER_REPLY_MAX_MS - TERMINAL_SUFFIX_MS;
 pub const MAX_ACTION_WORK_MS: u64 = max(
@@ -1091,6 +1224,7 @@ mod tests {
             BROWSER_MAX_WORK_MS,
             BROWSER_ACTIONS
                 .iter()
+                .chain(&USER_BROWSER_ACTIONS)
                 .chain(&FLAT_MANAGEMENT_ACTIONS)
                 .map(|entry| entry.work_ms)
                 .max()
@@ -1106,10 +1240,16 @@ mod tests {
         );
         assert_eq!(
             BROWSER_QUEUE_WAIT_LIMIT_MS,
-            CONSENT_PARK_LIMIT_MS + BROWSER_MAX_WORK_MS + RELEASE_BUDGET_MS + BOUNDARY_SLACK_MS
+            CONSENT_PARK_LIMIT_MS
+                + max(
+                    max_work(&BROWSER_ACTIONS),
+                    max_work(&FLAT_MANAGEMENT_ACTIONS)
+                )
+                + RELEASE_BUDGET_MS
+                + BOUNDARY_SLACK_MS
         );
         assert_eq!(COMPUTER_MAX_PARK_MS, CONSENT_PARK_LIMIT_MS);
-        assert_eq!(BROWSER_MAX_PARK_MS, CONSENT_PARK_LIMIT_MS);
+        assert_eq!(BROWSER_MAX_PARK_MS, 3 * USER_CONSENT_MS);
         for (reply, queue, park, work, envelope) in [
             (
                 COMPUTER_REPLY_MAX_MS,
@@ -1121,8 +1261,8 @@ mod tests {
             (
                 BROWSER_REPLY_MAX_MS,
                 BROWSER_QUEUE_WAIT_LIMIT_MS,
-                BROWSER_MAX_PARK_MS,
-                BROWSER_MAX_WORK_MS,
+                0,
+                BROWSER_MAX_ACTION_MS,
                 BROWSER_ENVELOPE_MS,
             ),
         ] {
@@ -1139,7 +1279,7 @@ mod tests {
             assert_eq!(envelope, CALL_RECORD_BEGIN_MS + queue + park + work);
         }
         assert_eq!(COMPUTER_REPLY_MAX_MS, 685_001);
-        assert_eq!(BROWSER_REPLY_MAX_MS, 983_001);
+        assert_eq!(BROWSER_REPLY_MAX_MS, 1_139_001);
     }
 
     #[test]
