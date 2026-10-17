@@ -137,7 +137,16 @@ pub(crate) fn parse(params: &Map<String, Value>) -> Result<TurnEnded, ParamsErro
         return Err(error("scope.owner", "invalid_value"));
     }
     string(params, "harness", "harness")?;
-    string(params, "turn_id", "turn_id")?;
+    // An opaque token from whoever reports the turn (core's stopgap sends its
+    // own, the harness event 32 hex digits). Only its bounds are checked; it
+    // is never parsed, stored or matched on.
+    let turn_id = string(params, "turn_id", "turn_id")?;
+    if turn_id.is_empty()
+        || turn_id.len() > 128
+        || !turn_id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return Err(error("turn_id", "invalid_value"));
+    }
     let outcome = match string(params, "outcome", "outcome")? {
         "completed" => TurnOutcome::Completed,
         "stopped" => TurnOutcome::Stopped,
@@ -224,6 +233,20 @@ mod tests {
     }
 
     #[test]
+    fn turn_id_is_an_opaque_bounded_printable_token() {
+        for token in [
+            "t".to_string(),
+            "x".repeat(128),
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "core stopgap/42:~".to_string(),
+        ] {
+            let mut params = full();
+            params["turn_id"] = json!(token);
+            assert!(parse(params.as_object().unwrap()).is_ok(), "{token}");
+        }
+    }
+
+    #[test]
     fn error_class_is_refused_unless_the_turn_failed() {
         for outcome in ["completed", "stopped"] {
             let mut params = full();
@@ -283,6 +306,10 @@ mod tests {
             ("seq", json!("7"), "wrong_type"),
             ("harness", json!(7), "wrong_type"),
             ("turn_id", json!(null), "wrong_type"),
+            ("turn_id", json!(""), "invalid_value"),
+            ("turn_id", json!("t".repeat(129)), "invalid_value"),
+            ("turn_id", json!("turn\n1"), "invalid_value"),
+            ("turn_id", json!("tür-1"), "invalid_value"),
             ("source", json!(["x"]), "wrong_type"),
             ("scope", json!("s-1"), "wrong_type"),
         ] {

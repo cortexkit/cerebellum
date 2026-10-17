@@ -30,6 +30,8 @@ required, and unknown fields are refused):
 ```
 
 `session_ref` is the harness runner's ref, exactly 32 lowercase hex digits.
+`turn_id` is an opaque token: any non-empty string of at most 128 printable
+ASCII characters (space through `~`). It is never parsed, stored or matched.
 `scope` is the daemon-stamped head scope that relayed calls already carry.
 Badges are matched on `scope.ref` only; `epoch` is required but not compared,
 because a revived session keeps its ref. `owner` is checked against the
