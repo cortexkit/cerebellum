@@ -26,7 +26,7 @@ async function native(t) {
   bridge.connect();
   const port = f.chrome.ports.at(-1);
   port.onMessage.emit({ type: "host_accepted", protocol: 1, epoch: 50 });
-  await f.run({ version: 1, action: "claim_tab", tab: f.record.handle });
+  await f.run({ version: 2, action: "claim_tab", tab: f.record.handle });
   t.after(async () => { bridge.drop(); await bridge.disconnecting; });
   const send = (id, body, epoch = 50, to = port) => to.onMessage.emit({ type: "relay", message: { id, epoch, body } });
   const attach = (id, command) => send(id, { type: "attach", route, command });

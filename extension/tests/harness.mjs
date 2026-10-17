@@ -17,14 +17,14 @@ export async function setup() {
   agent.connect(50);
   const record = await tabs.join(2, "handed");
   await epochs.install(2);
-  const claim = await agent.prepare(route, { version: 1, action: "claim_tab", tab: record.handle }, 50);
+  const claim = await agent.prepare(route, { version: 2, action: "claim_tab", tab: record.handle }, 50);
   await agent.execute(claim);
   await agent.finish(claim);
   const run = async (plan, owner = route) => {
     const state = await agent.prepare(owner, plan, agent.connectionEpoch);
     try { return await agent.execute(state); } finally { await agent.finish(state); }
   };
-  const cdp = commands => ({ version: 1, action: "cdp", tab: record.handle, commands });
+  const cdp = commands => ({ version: 2, action: "cdp", tab: record.handle, commands });
   const fresh = () => run(cdp([read]));
   const input = epoch => ({ ...cdp([press, release]), interaction_epoch: epoch });
   return { chrome, tabs, epochs, agent, record, run, cdp, fresh, input };

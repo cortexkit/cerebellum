@@ -22,7 +22,7 @@ test("explicit popup open creates a background grouped tab without changing focu
     f.chrome.tabs.onCreated.emit(tab);
     return tab;
   };
-  const reply = await f.run({ version: 1, action: "open_tab", url: "http://localhost/popup", opener_tab: f.record.handle });
+  const reply = await f.run({ version: 2, action: "open_tab", url: "http://localhost/popup", opener_tab: f.record.handle });
   const tab = await f.tabs.resolve(reply.tab);
   await turn();
   const createCall = f.chrome.calls.find(call => call[0] === "create");

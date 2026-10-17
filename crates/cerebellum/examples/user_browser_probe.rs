@@ -9,7 +9,7 @@
 //! generated state is under /tmp. The in-process scratch cerebellum uses an
 //! isolated journal and a scripted Cingulate (the consent module) in place of
 //! the real one: only a card for its loopback origin is answered, with
-//! allow_once, and no phone or standing grants are involved.
+//! allow_30m into the scratch-only grant store; no phone or personal grants are involved.
 //! See docs/user-browser.md for the pinned CfT version, probe feature and signing.
 //!
 //! This launches a headed browser with --no-startup-window, never activates it
@@ -206,17 +206,19 @@ impl Drop for Scratch {
 
 /// Whether `card`, a `consent.request` the scripted Cingulate received (as
 /// `{"id", "params"}`), is the per-site card for the probe's own fixture
-/// origin, so the probe may answer it allow_once.
+/// origin or its explicit localhost iframe origin, so it may answer allow_30m.
 fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
     let p = &card["params"];
+    let child_origin = origin.replace("127.0.0.1", "localhost");
+    let site = p["target"]["label"].as_str().unwrap_or("");
     if p["kind"] != "consent"
         || p["scope"]["browser"] != "user"
-        || p["scope"]["origins"] != json!([origin])
-        || p["target"]["label"] != origin
+        || ![origin, child_origin.as_str()].contains(&site)
+        || p["scope"]["origins"] != json!([site])
         || p["prompt"] != "Let the agent use your own Chrome, signed in as you, on this site?"
         || !p["options"]
             .as_array()
-            .is_some_and(|options| options.iter().any(|o| o["id"] == "allow_once"))
+            .is_some_and(|options| options.iter().any(|o| o["id"] == "allow_30m"))
     {
         return Err("scripted Cingulate refused a non-fixture or malformed site card".into());
     }
@@ -446,9 +448,9 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
         .await?;
     check(
-        "snapshot reads fixture and asks again after allow_once",
+        "snapshot reuses the fixture site's read grant",
         ok(&snapshot)
-            && asks == 1
+            && asks == 0
             && snapshot["state_text"].as_str().is_some_and(|s| {
                 s.contains("Probe button")
                     && s.contains("Probe input")
@@ -483,6 +485,13 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
     check(
         "type delivered to local fixture",
         ok(&typed) && driver.observe()?["typed"] == "scratch-only",
+    )?;
+    detached_and_unfocused(driver)?;
+    let child_input = reference(&fresh, "Iframe input")?;
+    let (child_typed, _) = driver.call(json!({"action":"type","tab":tab,"ref":child_input,"text":"iframe-only","clear_first":true})).await?;
+    check(
+        "type delivered inside iframe fixture",
+        ok(&child_typed) && driver.observe()?["child_typed"] == "iframe-only",
     )?;
     detached_and_unfocused(driver)?;
     let old_epoch = opened["connection_epoch"].clone();
@@ -848,7 +857,7 @@ mod live {
     // delivery. The browser sends click/input beacons to the loopback server.
     struct Page {
         origin: String,
-        reports: Arc<Mutex<(usize, String)>>,
+        reports: Arc<Mutex<(usize, String, String)>>,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -860,7 +869,8 @@ mod live {
                 "http://{}",
                 listener.local_addr().map_err(|e| e.to_string())?
             );
-            let reports = Arc::new(Mutex::new((0, String::new())));
+            let reports = Arc::new(Mutex::new((0, String::new(), String::new())));
+            let child_origin = origin.replace("127.0.0.1", "localhost");
             let state = reports.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
@@ -886,14 +896,20 @@ mod live {
                     if let Some(text) = path.strip_prefix("/type?") {
                         report.1 = text.to_owned();
                     }
+                    if let Some(text) = path.strip_prefix("/child-type?") {
+                        report.2 = text.to_owned();
+                    }
                     drop(report);
                     let body = if path == "/outside-secret" {
                         "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
                     } else if path == "/" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))">"#
+                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
+                    } else if path == "/iframe" {
+                        r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
                     } else {
                         "ok"
                     };
+                    let body = body.replace("IFRAME_ORIGIN", &child_origin);
                     let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 }
             });
@@ -1432,14 +1448,14 @@ mod live {
                     consent_for_fixture(&card, &self.origin)?;
                     asks += 1;
                     println!(
-                        "PASS per-site card: your own Chrome, signed in as you; {} -> allow_once",
+                        "PASS per-site card: your own Chrome, signed in as you; {} -> allow_30m",
                         self.origin
                     );
                     let id = card["id"].as_str().ok_or("the card has no id")?;
                     if !self.consent.answer_id(
                         id,
                         cerebellum::cingulate_client::ScriptedAnswer::Answered(
-                            json!({"decision":"allow_once"}),
+                            json!({"decision":"allow_30m"}),
                         ),
                     ) {
                         return Err(format!("the scripted Cingulate does not hold card {id}"));
@@ -1489,6 +1505,7 @@ mod live {
             let reports = self.page.reports.lock().unwrap();
             observation["clicks"] = json!(reports.0);
             observation["typed"] = json!(reports.1);
+            observation["child_typed"] = json!(reports.2);
             if self.focus.changed.load(Ordering::SeqCst) {
                 observation["focus_events"] = json!(1);
             }
@@ -1632,6 +1649,7 @@ struct Double {
     epoch: u64,
     clicked: usize,
     typed: String,
+    child_typed: String,
     click_observations: usize,
     last_reply: LastReply,
     failure: Option<Value>,
@@ -1643,6 +1661,7 @@ impl Double {
             epoch: 1,
             clicked: 0,
             typed: String::new(),
+            child_typed: String::new(),
             click_observations: 0,
             last_reply: LastReply::default(),
             failure: None,
@@ -1671,10 +1690,10 @@ impl Driver for Double {
                 reply["outcome"] = json!("refused");
             }
             "snapshot" => {
-                asks = 1;
+                asks = 0;
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
-                    json!("button-ref button Probe button\ninput-ref textbox Probe input");
+                    json!("button-ref button Probe button\ninput-ref textbox Probe input\nchild-ref textbox Iframe input");
                 if self.fault == "snapshot_text" {
                     reply["state_text"] = json!("fixture-only".repeat(50));
                 }
@@ -1688,7 +1707,13 @@ impl Driver for Double {
                 }
             }
             "type" => {
-                self.typed = args["text"].as_str().unwrap().to_owned();
+                if args["ref"] == "child-ref" {
+                    if self.fault != "iframe" {
+                        self.child_typed = args["text"].as_str().unwrap().to_owned();
+                    }
+                } else {
+                    self.typed = args["text"].as_str().unwrap().to_owned();
+                }
             }
             "close" => {
                 reply["outcome"] = json!("closed");
@@ -1705,7 +1730,7 @@ impl Driver for Double {
         Ok(
             json!({"agent_attached":self.fault == "detach", "focus_events":if self.fault == "focus" {1} else {0},
             "outside_group":if self.fault == "group" {1} else {-1}, "agent_tabs":1,
-            "clicks":self.clicked,"typed":self.typed}),
+            "clicks":self.clicked,"typed":self.typed,"child_typed":self.child_typed}),
         )
     }
     async fn click_observation(&mut self) -> Result<Value, String> {
@@ -1809,7 +1834,7 @@ fn symlink_control() -> Result<(), String> {
 fn cingulate_answer_control() -> Result<(), String> {
     let origin = "http://127.0.0.1:12345";
     let card = json!({"id":"el_1","params":{"kind":"consent","scope":{"browser":"user","origins":[origin]},
-        "target":{"label":origin},"prompt":"Let the agent use your own Chrome, signed in as you, on this site?","options":[{"id":"allow_once"},{"id":"deny"}]}});
+        "target":{"label":origin},"prompt":"Let the agent use your own Chrome, signed in as you, on this site?","options":[{"id":"allow_30m"},{"id":"deny"}]}});
     consent_for_fixture(&card, origin)?;
     for mutation in ["origin", "target", "option"] {
         let mut other = card.clone();
@@ -1983,11 +2008,11 @@ async fn self_test() -> Result<(), String> {
         if result
             .as_ref()
             .err()
-            .is_some_and(|error| error == "snapshot reads fixture and asks again after allow_once")
+            .is_some_and(|error| error == "snapshot reuses the fixture site's read grant")
             && driver.failure.as_ref().is_some_and(|diagnostics| {
                 diagnostics["outcome"] == "ok"
                     && diagnostics["reason"].is_null()
-                    && diagnostics["ask_count"] == 1
+                    && diagnostics["ask_count"] == 0
                     && diagnostics["state_text_prefix"]
                         .as_str()
                         .is_some_and(|text| text.len() == 400)
@@ -2056,6 +2081,11 @@ async fn self_test() -> Result<(), String> {
         ));
     }
     for (fault, name, expected) in [
+        (
+            "iframe",
+            "acceptance_rejects_undelivered_iframe_input",
+            "type delivered inside iframe fixture",
+        ),
         (
             "group",
             "acceptance_rejects_outside_group_visibility",

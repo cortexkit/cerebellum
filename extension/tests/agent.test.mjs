@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { deferred } from "./fake-chrome.mjs";
 
 const route = { channel: 2, epoch: 1 };
-const read = { method: "Page.getFrameTree", params: {} };
+const read = { method: "Page.getLayoutMetrics", params: {} };
 const press = { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 10, y: 20, button: "left" } };
 const release = { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 10, y: 20, button: "left" } };
 import { setup } from "./harness.mjs";
@@ -98,7 +98,7 @@ test("group membership is rechecked before attachment", async () => {
 
 test("outside tabs are invisible and raw tab ids cannot be driven", async () => {
   const f = await setup();
-  const status = await f.run({ version: 1, action: "status" });
+  const status = await f.run({ version: 2, action: "status" });
   assert.deepEqual(status, { tabs: [{ tab: f.record.handle, claimed: true, handed: true, interaction_epoch: 0 }], connection_epoch: 50 });
   await assert.rejects(f.run({ ...f.cdp([read]), tab: "1" }), { reason: "unknown_tab" });
   assert.equal(f.chrome.calls.some(call => call[0] === "get" && call[1] === 1), false);
@@ -107,8 +107,8 @@ test("outside tabs are invisible and raw tab ids cannot be driven", async () => 
 test("claims and status remain route bound", async () => {
   const f = await setup();
   const other = { channel: 9, epoch: 4 };
-  assert.deepEqual((await f.run({ version: 1, action: "status" }, other)).tabs, []);
-  await assert.rejects(f.run({ version: 1, action: "claim_tab", tab: f.record.handle }, other), { reason: "tab_claimed_by_other_route" });
+  assert.deepEqual((await f.run({ version: 2, action: "status" }, other)).tabs, []);
+  await assert.rejects(f.run({ version: 2, action: "claim_tab", tab: f.record.handle }, other), { reason: "tab_claimed_by_other_route" });
   await assert.rejects(f.run(f.cdp([read]), other), { reason: "tab_not_claimed" });
 });
 
@@ -186,7 +186,7 @@ test("restart clears baselines even when interaction epoch happens to match", as
   await f.agent.disconnect();
   f.agent.connect(51);
   const tab = await f.tabs.join(2, "handed");
-  await f.run({ version: 1, action: "claim_tab", tab: tab.handle });
+  await f.run({ version: 2, action: "claim_tab", tab: tab.handle });
   await assert.rejects(f.run({ ...f.input(epoch), tab: tab.handle }), { reason: "fresh_read_required" });
   assert.equal(inputs(f.chrome).length, 0);
 });
@@ -266,8 +266,8 @@ test("a cancelled in-flight press has only a matching cleanup release", async ()
 
 test("close leaves every tab alive and returns handed tabs", async () => {
   const f = await setup();
-  const opened = await f.run({ version: 1, action: "open_tab" });
-  await f.run({ version: 1, action: "close" });
+  const opened = await f.run({ version: 2, action: "open_tab" });
+  await f.run({ version: 2, action: "close" });
   assert.equal(f.chrome.tabData.has(1), true);
   assert.equal(f.chrome.tabData.has(2), true);
   assert.equal(f.chrome.tabData.get(2).groupId, -1);
@@ -306,7 +306,7 @@ test("cancelled background creation never leaks a new route claim", async () => 
   const pause = deferred();
   const create = f.chrome.tabs.create;
   f.chrome.tabs.create = async options => { await pause.promise; return create(options); };
-  const state = await f.agent.prepare(route, { version: 1, action: "open_tab" }, 50);
+  const state = await f.agent.prepare(route, { version: 2, action: "open_tab" }, 50);
   const running = f.agent.execute(state);
   await new Promise(resolve => setImmediate(resolve));
   await f.agent.cancel(state);

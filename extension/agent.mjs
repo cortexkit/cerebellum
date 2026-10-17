@@ -1,5 +1,7 @@
 import { bounded, Refusal } from "./errors.mjs";
 import { classifyCommand, resolveParams, verifyRuntime } from "./commands.mjs";
+import { Frames } from "./frames.mjs";
+import { FrameGeometry } from "./frame-geometry.mjs";
 
 const routeKey = route => `${route.channel}:${route.epoch}`;
 const closed = (value, fields) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
@@ -22,7 +24,7 @@ export function debuggerError(error) {
 }
 
 export function validatePlan(plan) {
-  if (!closed(plan, ["version", "action", "tab", "url", "opener_tab", "interaction_epoch", "commands"]) || plan.version !== 1) throw new Refusal("invalid_plan", "update cerebellum and the extension together");
+  if (!closed(plan, ["version", "action", "tab", "url", "opener_tab", "interaction_epoch", "commands"]) || plan.version !== 2) throw new Refusal("invalid_plan", "update cerebellum and the extension together");
   const fields = {
     status: ["version", "action"], close: ["version", "action"],
     open_tab: ["version", "action", "url", "opener_tab"], claim_tab: ["version", "action", "tab"],
@@ -34,7 +36,9 @@ export function validatePlan(plan) {
   if (plan.action === "cdp") {
     if (!Array.isArray(plan.commands) || !plan.commands.length || plan.commands.length > 256) throw new Refusal("invalid_plan");
     for (const command of plan.commands) {
-      if (!closed(command, ["method", "params", "frame_id", "session_id"]) || "frame_id" in command && (!Number.isSafeInteger(command.frame_id) || command.frame_id < 0) || "session_id" in command) throw new Refusal("invalid_plan", "child target sessions are not yet supported");
+      // Chrome can expose an empty loader before a document commits. Preserve
+      // top-level reads; frame resolution still rejects such a scope for input.
+      if (!closed(command, ["method", "params", "frame_id", "session_id", "loader_id"]) || ["frame_id", "session_id", "loader_id"].some(key => key in command && (typeof command[key] !== "string" || !command[key] && key !== "loader_id")) || ["frame_id", "session_id", "loader_id"].some(key => key in command) && !["frame_id", "session_id", "loader_id"].every(key => key in command)) throw new Refusal("invalid_plan", "provide the complete verified frame scope");
       classifyCommand(command);
     }
   }
@@ -170,6 +174,7 @@ export class Agent {
         // caller's deadline expires before the detach promise settles.
         const pending = this.chrome.debugger.detach({ tabId: state.tabId }).then(() => {
           state.attached = false;
+          state.frames?.close();
           this.epochs.endAction(state.actionWindow);
         });
         await bounded(pending, "cancel");
@@ -181,12 +186,12 @@ export class Agent {
   async releaseMouse(state) {
     if (state.releasing) return state.releasing;
     if (!state.heldMouse || !state.attached) return;
-    const params = state.heldMouse;
+    const { target, params } = state.heldMouse;
     state.heldMouse = null;
     // This is release-only cleanup for a press we dispatched on this attachment.
     // A refusal may revoke membership or freshness, but must not leave that
     // button held. Never resume the plan or dispatch another press during cleanup.
-    state.releasing = bounded(this.chrome.debugger.sendCommand({ tabId: state.tabId }, "Input.dispatchMouseEvent", params), "reply")
+    state.releasing = bounded(this.chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", params), "reply")
       .catch(() => { throw new Refusal("input_release_unconfirmed", "read again", { input_dispatched: true }); });
     return state.releasing;
   }
@@ -260,6 +265,11 @@ export class Agent {
 
   async runCommands(state) {
     const results = [];
+    let frameMappings;
+    if (state.plan.commands.some(command => command.frame_id || ["Page.getFrameTree", "DOM.getNodeForLocation"].includes(command.method))) {
+      state.frames = new Frames(this.chrome, state, () => this.guard(state));
+      await state.frames.start();
+    }
     let readObservation = null;
     const hasInput = state.plan.commands.some(command => classifyCommand(command) === "input");
     const hasRead = state.plan.commands.some(command => ["Accessibility.getFullAXTree", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "Page.captureScreenshot"].includes(command.method));
@@ -269,7 +279,9 @@ export class Agent {
       const command = { ...planned, params: resolveParams(planned.params, results) };
       await this.guard(state);
       const kind = classifyCommand(command);
-      const frameId = command.frame_id ?? 0;
+      const scope = command.frame_id ? await state.frames.resolve(command, kind === "read" && !hasInput) : null;
+      const target = scope?.target ?? { tabId: state.tabId };
+      const frameId = scope?.frame.web_navigation_frame_id ?? 0;
       if (!hasInput && hasRead && kind === "read" && !readObservation) {
         try {
           const epoch = await this.epochs.sample(state.tabId);
@@ -287,10 +299,19 @@ export class Agent {
         if (kind === "navigate") this.navigation.set(state.tabId, { state, frameId, started: false, url: command.params.url, deadline: Date.now() + 30000 });
         if (kind === "input") state.input = true;
         if (command.method === "Input.dispatchMouseEvent") {
-          if (command.params.type === "mousePressed") state.heldMouse = { ...command.params, type: "mouseReleased" };
+          if (command.params.type === "mousePressed") state.heldMouse = { target, params: { ...command.params, type: "mouseReleased" } };
           if (command.params.type === "mouseReleased") state.heldMouse = null;
         }
-        const result = await bounded(this.chrome.debugger.sendCommand({ tabId: state.tabId }, command.method, command.params), "reply");
+        let result;
+        if (command.method === "Page.getFrameTree" && !scope) {
+          const observed = await state.frames.read();
+          result = { frameTree: observed.tree };
+          frameMappings = observed.mappings;
+        } else if (command.method === "DOM.getNodeForLocation") {
+          const { mappings } = await state.frames.read();
+          result = await new FrameGeometry(state.frames, mappings).hit({ x: command.params.x, y: command.params.y }, scope?.frame, command.params);
+        } else result = await bounded(this.chrome.debugger.sendCommand(target, command.method, command.params), "reply");
+        if (scope) await state.frames.resolve(command, kind === "read" && !hasInput);
         results.push({ result });
       } catch (error) {
         if (error instanceof Refusal) throw error;
@@ -321,6 +342,7 @@ export class Agent {
     if (hasInput && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
     await this.guard(state);
     const result = { tab: state.plan.tab, results, interaction_epoch: epoch, connection_epoch: state.epoch };
+    if (frameMappings) result.frame_mappings = frameMappings;
     if (this.popupFlags.delete(state.tabId)) result.popup_activated_briefly = true;
     return result;
   }

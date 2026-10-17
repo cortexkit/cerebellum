@@ -7,13 +7,15 @@ import { RUNTIME_FUNCTION_SHA256 } from "./runtime-functions.mjs";
 const READ_METHODS = new Set([
   "Page.getNavigationHistory", "Page.getFrameTree", "Page.captureScreenshot", "Page.getLayoutMetrics",
   "Accessibility.enable", "Accessibility.getFullAXTree",
-  "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode",
+  "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode", "DOM.getFrameOwner",
   "Runtime.enable",
 ]);
-// Terminal accounting uses the narrower fixed set in
-// terminal-read-only-methods.json, embedded by the Rust bridge. Methods absent
-// from that set count as mutations, even if admitted above without input guards.
-// Runtime.callFunctionOn is read-only only for the pinned HAS_FOCUS declaration.
+// Rust uses terminal-read-only-methods.json to decide whether a request may
+// have changed the page, including when it times out or loses its reply.
+// Debugger enables configure only this action's debugger; frame-owner, HTML,
+// quad and hit-test queries only observe the page, so they are listed there.
+// Unlisted methods count as mutations. Runtime.callFunctionOn is exempt only
+// for the exact native focus-check function documented as HAS_FOCUS in PROTOCOL.md.
 const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "DOM.focus"]);
 
 export function classifyCommand(command) {

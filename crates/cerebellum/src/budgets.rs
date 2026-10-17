@@ -506,8 +506,9 @@ pub const BROWSER_ACTIONS: [ActionBudget; 12] = [
     BROWSER_CLICK_POINT,
 ];
 
-// These count debugger attachments, not CDP commands. Only the top-level frame
-// is captured; embedded frames are omitted. Snapshot has no readiness retry:
+// These count baseline top-level debugger attachments, not CDP commands.
+// Child captures and retries spend this same fixed action allowance; attaching
+// another session never supplies a fresh allowance. A top-level snapshot uses:
 // initial document + post-consent document + AX/DOM + optional HTML + confirm = 5.
 pub const USER_SNAPSHOT_PLANS: u64 = 2 + 2 + 1;
 // Screenshot: two document reads + one image plan + confirmation.
