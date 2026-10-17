@@ -377,7 +377,27 @@ mod computer {
                     .with_app_state_source(Arc::new(Desk)),
                 )
             });
-        planes.computer_admitted = test_admitted_computer_capabilities();
+        // A test build binds no release attestations, so its default admitted
+        // set (`test_admitted_computer_capabilities`) is only computer.wait,
+        // and an unadmitted capability is refused before dispatch. Name every
+        // action the walk sends, as `relayed_computer_call_tests` names
+        // read_state.
+        planes.computer_admitted = Arc::new(
+            [
+                "computer.read_state",
+                "computer.list_apps",
+                "computer.press_element",
+                "computer.press_point",
+                "computer.write_text",
+                "computer.type",
+                "computer.keys",
+                "computer.takeover_move",
+                "computer.wait",
+                "computer.open_app",
+            ]
+            .map(String::from)
+            .into(),
+        );
         bind_content_reader(&planes);
         computer_grants::tests::CardService::install(planes, CHANNEL, EPOCH)
     }
