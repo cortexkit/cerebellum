@@ -60,7 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent: "Focus probe".into(),
             initial: 'F',
             to: point,
-            width: 24.0,
+            target: None,
+            resting: false,
             label: Some("Focus probe".into()),
             kind: CursorKind::Press,
         };

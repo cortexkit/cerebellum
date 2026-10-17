@@ -65,6 +65,11 @@ pub use responsibility::{require_responsibility_disclaim, ResponsibilityDisclaim
 #[cfg(all(target_os = "macos", test))]
 #[path = "../../cerebellum/src/content_named_fixture.rs"]
 mod content_named_fixture;
+// Pure geometry, so its tests run on every host. Off macOS only the tests use
+// it, and the drawing constants they do not touch would read as dead code.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod cursor_geometry;
 #[cfg(target_os = "macos")]
 mod cursor_overlay;
 #[cfg(any(target_os = "macos", test))]
@@ -72,7 +77,10 @@ mod cursor_schedule;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use cursor_overlay::{run_agent_cursor, OverlayEvent};
+pub use cursor_overlay::{
+    render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot, OverlayEvent,
+    OverlayGesture,
+};
 #[cfg(target_os = "macos")]
 mod peer_attestation;
 #[cfg(target_os = "macos")]

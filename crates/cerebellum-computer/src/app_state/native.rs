@@ -144,11 +144,12 @@ impl AppStateSource for MacAppStateSource {
         &self,
         target: &ProcessGrant,
         point: Option<[f64; 2]>,
+        frame: Option<[f64; 4]>,
     ) -> Option<[f64; 2]> {
         if verify_grant(target.pid, target) != GrantVerification::Current {
             return None;
         }
-        cerebellum_macos::visible_cursor_point(target.pid, point)
+        cerebellum_macos::visible_cursor_point(target.pid, point, frame)
     }
     /// Read the granted process, and only while it is still the granted
     /// process: a pid reused by another program after the grant was made is

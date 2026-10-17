@@ -270,11 +270,13 @@ pub trait AppStateSource: Send + Sync {
     }
 
     /// A point in a target window not hidden by another app's normal window.
-    /// With no element point, choose the target window's top-left badge inset.
+    /// An exact point wins; otherwise the centre of the element frame's
+    /// visible part; with neither, the middle of the window's content.
     fn visible_cursor_point(
         &self,
         _target: &ProcessGrant,
         _point: Option<[f64; 2]>,
+        _frame: Option<[f64; 4]>,
     ) -> Option<[f64; 2]> {
         None
     }
