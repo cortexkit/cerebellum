@@ -1748,6 +1748,7 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     launch_nonce::read_before_any_spawn();
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
+    record_engram_catalog_write();
     conclude(run(config, |_| {}, true).await)
 }
 
@@ -7966,6 +7967,28 @@ fn record_private_state_tightening() {
     }
 }
 
+/// Number of startup attempts to write the backup catalog that failed.
+static ENGRAM_CATALOG_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Write `engram-catalog.json` into the module's data directory, so the
+/// fleet's backup module knows what that directory holds on every machine,
+/// including a new one where nobody placed the file by hand.
+///
+/// Called only from the production entry point: tests write catalogs into
+/// scratch directories through [`cerebellum_core::engram_catalog::write_catalog`]
+/// and never into the operator's data home. A failure is counted for health
+/// and never stops startup, since the module works without its catalog; only
+/// backup coverage is missing.
+fn record_engram_catalog_write() {
+    if let Some(home) = cerebellum_core::platform_dirs::data_home() {
+        let root = cerebellum_core::format_floor::module_directory(&home);
+        if cerebellum_core::engram_catalog::write_catalog(&root).is_err() {
+            ENGRAM_CATALOG_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Add the process-wide gauges to a health reply:
 ///
 /// - `crashReportLeftovers: {removed, failed}`, counts of crash-report
@@ -7973,6 +7996,8 @@ fn record_private_state_tightening() {
 ///   them. These directories can contain page memory from signed-in sessions;
 /// - `privateStateTightenFailures`, the number of state directories or files
 ///   whose owner-only mode could not be enforced at startup;
+/// - `engramCatalogWriteFailures`, the number of startup attempts to write the
+///   backup catalog (`engram-catalog.json`) that failed;
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
@@ -8007,6 +8032,12 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
             "privateStateTightenFailures".to_string(),
             serde_json::Value::from(
                 PRIVATE_STATE_TIGHTEN_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
+        metrics.insert(
+            "engramCatalogWriteFailures".to_string(),
+            serde_json::Value::from(
+                ENGRAM_CATALOG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
             ),
         );
         metrics.insert(
@@ -13664,6 +13695,14 @@ mod sigterm_listener_tests {
         let listener = listen_for_sigterm_with(|| Err(std::io::Error::other("fixture")));
         assert!(listener.is_none());
         assert_eq!(health_metrics().await["sigtermListener"], "not_installed");
+    }
+
+    /// A failed backup-catalog write is printed nowhere, so the health reply is
+    /// where it shows. No test runs the production entry point, so the count
+    /// here is the untouched zero.
+    #[tokio::test]
+    async fn the_backup_catalog_write_failure_count_is_on_the_health_reply() {
+        assert_eq!(health_metrics().await["engramCatalogWriteFailures"], 0);
     }
 }
 

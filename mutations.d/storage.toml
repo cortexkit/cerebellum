@@ -139,3 +139,23 @@ build_timeout_s = 1800
 
 [control.scope]
 after = "fn shared(path: PathBuf) -> Self {"
+
+[[control]]
+id = "engram-catalog-bytes-are-fixed"
+guards = "the backup catalog is written with the same bytes on every start, so an unchanged file is left alone"
+file = "crates/cerebellum-core/src/engram_catalog.rs"
+old = "    CATALOG.as_bytes().to_vec()"
+new = "    CATALOG.replacen('{', &format!(\"{{\\n  \\\"generated_at_ns\\\": {},\", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()), 1).into_bytes() // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-core/src/engram_catalog.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "engram_catalog::tests::two_writes_produce_identical_bytes",
+    "engram_catalog::tests::an_unchanged_catalog_is_not_rewritten",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

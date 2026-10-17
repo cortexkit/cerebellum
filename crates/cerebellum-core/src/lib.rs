@@ -31,6 +31,7 @@ pub mod config;
 pub mod consent;
 pub mod dispatch;
 pub mod dispatch_witness;
+pub mod engram_catalog;
 pub mod format_floor;
 pub mod health;
 pub mod identity;
