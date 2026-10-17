@@ -931,7 +931,10 @@ fn a_long_table_keeps_its_summary_and_the_outline_cap() {
     let tokens = Tokens::new();
     let read = observe(vec![window_with(memories_table(&tokens, 40), &tokens)]);
     let outline = outline_of("Dashboard", &read);
-    assert!(outline.contains(" table Memories  [40 rows"), "{outline}");
+    assert!(
+        outline.contains(" table Memories\n    40 rows (zoom: "),
+        "{outline}"
+    );
     assert!(!outline.contains("Memory 39"), "{outline}");
     // Zooming into one row prints its cells with their text.
     let row = &find(&read.roots, "Dashboard").children[0].children[0].children[5];
