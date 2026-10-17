@@ -11,6 +11,7 @@ async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_
         "error",
         "present",
         "single-use-only",
+        "no-expiry-only",
         "other-module",
         "unknown",
         "malformed",
@@ -44,12 +45,18 @@ async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_
                     "present" => vec![
                         "consent-option-group/v1".into(),
                         "consent-single-use/v1".into(),
+                        "consent-no-expiry/v1".into(),
                     ],
                     "single-use-only" => vec!["consent-single-use/v1".into()],
-                    "unknown" => vec!["consent-single-use/v10".into()],
+                    "no-expiry-only" => vec!["consent-no-expiry/v1".into()],
+                    "unknown" => vec![
+                        "consent-single-use/v10".into(),
+                        "consent-no-expiry/v10".into(),
+                    ],
                     "other-module" => vec![
                         "consent-option-group/v1".into(),
                         "consent-single-use/v1".into(),
+                        "consent-no-expiry/v1".into(),
                     ],
                     _ => vec![],
                 },
@@ -88,14 +95,21 @@ async fn catalog_discovery_decodes_protocol_types_and_rechecks_absent_error_and_
                 "present" => Some(CingulateFeatures {
                     option_group: true,
                     single_use: true,
+                    no_expiry: true,
                 }),
                 "single-use-only" => Some(CingulateFeatures {
                     option_group: false,
                     single_use: true,
+                    no_expiry: false,
+                }),
+                "no-expiry-only" => Some(CingulateFeatures {
+                    no_expiry: true,
+                    ..Default::default()
                 }),
                 "absent" | "other-module" | "unknown" => Some(CingulateFeatures {
                     option_group: false,
                     single_use: false,
+                    no_expiry: false,
                 }),
                 _ => None,
             },
@@ -177,6 +191,7 @@ async fn old_or_unknown_cingulate_receives_only_safe_options_and_records_only_sa
         Some(CingulateFeatures {
             option_group: false,
             single_use: false,
+            no_expiry: false,
         }),
         false,
     )
@@ -189,6 +204,7 @@ async fn supporting_cingulate_receives_the_full_card_and_records_danger_answers(
         Some(CingulateFeatures {
             option_group: true,
             single_use: true,
+            no_expiry: false,
         }),
         true,
     )

@@ -151,4 +151,17 @@ impl LiveCall {
     pub fn session(&self) -> &SessionKey {
         &self.session
     }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    /// Worker stamps name a parent rather than an agent. Inbound callers may
+    /// supply the head identity only after daemon-backed worker resolution.
+    pub(crate) fn with_authorizing_agent(mut self, agent: Option<String>) -> Self {
+        if self.agent_id.is_none() {
+            self.agent_id = agent;
+        }
+        self
+    }
 }

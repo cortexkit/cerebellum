@@ -333,6 +333,7 @@ fn single_use_is_negotiated_only_for_login_cards_across_all_kinds() {
                 super::features::CingulateFeatures {
                     option_group: true,
                     single_use: true,
+                    no_expiry: false,
                 },
             ] {
                 let card = request_for(kind, &body, deadline).for_features(features);
@@ -680,6 +681,7 @@ async fn single_use_login_answers_stay_attached_and_timeouts_detach_before_pendi
     let features = Some(super::features::CingulateFeatures {
         option_group: true,
         single_use: true,
+        no_expiry: false,
     });
 
     let cingulate = ScriptedCingulate::new();
@@ -1032,11 +1034,7 @@ async fn a_detached_card_settled_later_is_picked_up_on_the_next_call() {
     );
     assert_eq!(report.acked, Some(1));
     assert_eq!(cingulate.calls().last().unwrap().1, json!({"cursor": 1}));
-    assert_eq!(
-        desk.raised("el_1"),
-        None,
-        "an acknowledged card is forgotten"
-    );
+    assert!(desk.raised("el_1").unwrap().lifecycle.acked);
 }
 
 /// An answer in the feed to a card this desk did not raise on this session
@@ -1095,7 +1093,7 @@ async fn a_late_login_approval_is_used_once_and_reported() {
     let mut executed = answered();
     executed["execution"] = json!("executed");
     cingulate.then(wire::CONSENT_REPORT_EXECUTION, Reply::Result(executed));
-    let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
+    let desk = ConsentDesk::new(Arc::new(cingulate.clone())).with_clock(Arc::new(|| 11001));
     let (first, _) = live_call("sc_head_alf");
     {
         let mut session = desk.session(&first).await.unwrap();
@@ -1223,8 +1221,12 @@ async fn a_crash_between_apply_and_ack_reapplies_once_without_duplicating() {
         "an answer marked applied was applied again"
     );
     assert!(
-        store.load().unwrap().is_empty(),
-        "the acknowledged card is still stored"
+        store
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked),
+        "the acknowledgment must retain the execution receipt"
     );
 }
 
@@ -1420,6 +1422,7 @@ fn settled_records_map_to_endings_against_their_card() {
         decline_id: "deny".into(),
         next_steps: Default::default(),
         applied: false,
+        lifecycle: Default::default(),
     };
     let with = |state: &str, choice: Option<&str>| {
         let mut record = answered();
@@ -1579,16 +1582,14 @@ async fn a_held_card_answered_in_the_wait_is_the_answer() {
     assert!(desk.raised("el_1").is_some_and(|card| !card.applied));
 }
 
-/// A held card that expires with its wait is withdrawn and forgotten even
-/// though the withdrawal reads back `expired` rather than `withdrawn`, and it
-/// is never detached. A stray record of it in the answers feed is ignored.
+/// A legacy card that expired needs no withdrawal or detach. It can no longer
+/// be answered, so a stray feed record must not mint a grant.
 #[tokio::test]
 async fn a_held_card_that_expires_is_forgotten_and_never_detached() {
     let cingulate = ScriptedCingulate::new();
     cingulate
         .then(wire::CONSENT_REQUEST, created())
-        .then(wire::CONSENT_AWAIT, Reply::Result(expired()))
-        .then(wire::CONSENT_WITHDRAW, Reply::Result(expired()));
+        .then(wire::CONSENT_AWAIT, Reply::Result(expired()));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, _) = live_call("sc_head_alf");
     {
@@ -1604,11 +1605,7 @@ async fn a_held_card_that_expires_is_forgotten_and_never_detached() {
     }
     assert_eq!(
         cingulate.methods(),
-        vec![
-            wire::CONSENT_REQUEST,
-            wire::CONSENT_AWAIT,
-            wire::CONSENT_WITHDRAW
-        ],
+        vec![wire::CONSENT_REQUEST, wire::CONSENT_AWAIT,],
         "a held card was detached"
     );
     assert_eq!(desk.raised("el_1"), None, "the expired card is remembered");
@@ -1626,17 +1623,16 @@ async fn a_held_card_that_expires_is_forgotten_and_never_detached() {
     assert!(applied.seen().is_empty());
 }
 
-/// A held card still pending when the wait ends, or whose holding call is
-/// cancelled, is withdrawn and forgotten, even when the withdrawal itself
-/// fails.
+/// A bounded unanswered wait detaches. Cancellation withdraws the unwanted
+/// card; a failed withdrawal remains recorded for a later call to reconcile.
 #[tokio::test]
-async fn a_held_card_let_go_unanswered_is_withdrawn_and_forgotten() {
+async fn a_held_card_detaches_on_timeout_and_withdraws_on_cancellation() {
     // Still pending as the wait ends.
     let cingulate = ScriptedCingulate::new();
     cingulate
         .then(wire::CONSENT_REQUEST, created())
         .then(wire::CONSENT_AWAIT, Reply::Result(pending()))
-        .then(wire::CONSENT_WITHDRAW, Reply::Result(withdrawn()));
+        .then(wire::CONSENT_DETACH, Reply::Result(detached()));
     let desk = ConsentDesk::new(Arc::new(cingulate.clone()));
     let (live, _) = live_call("sc_head_alf");
     let mut session = desk.session(&live).await.unwrap();
@@ -1647,8 +1643,8 @@ async fn a_held_card_let_go_unanswered_is_withdrawn_and_forgotten() {
     let ending = session
         .hold(&id, USER_BROWSER_SITE_DEADLINE, std::future::pending())
         .await;
-    assert_eq!(ending, InCall::Settled(Ending::NoAnswer));
-    assert_eq!(desk.raised("el_1"), None);
+    assert_eq!(ending, InCall::Pending { ask_id: id });
+    assert!(desk.raised("el_1").is_some());
 
     // Cancelled, and the withdrawal fails in transit.
     let cingulate = ScriptedCingulate::new();
@@ -1673,7 +1669,7 @@ async fn a_held_card_let_go_unanswered_is_withdrawn_and_forgotten() {
     assert!(!cingulate
         .methods()
         .contains(&wire::CONSENT_DETACH.to_string()));
-    assert_eq!(desk.raised("el_1"), None);
+    assert!(desk.raised("el_1").is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -1813,7 +1809,7 @@ async fn a_settlement_with_no_record_is_acked_without_effect() {
     assert_eq!(report.without_effect, vec!["el_1".to_string()]);
     assert!(report.applied.is_empty());
     assert_eq!(report.acked, Some(1));
-    assert_eq!(desk.raised("el_1"), None);
+    assert!(desk.raised("el_1").unwrap().lifecycle.acked);
     assert_eq!(
         desk.take_single_use_approval(live.session(), "login"),
         None,
@@ -1886,7 +1882,7 @@ async fn the_registry_file_is_versioned_and_survives_a_restart() {
     let file: Value =
         serde_json::from_slice(&std::fs::read(scratch.0.join("cingulate_raised.json")).unwrap())
             .unwrap();
-    assert_eq!(file["version"], 1);
+    assert_eq!(file["version"], 2);
     let desk = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
     let card = desk.raised("el_1").expect("the card did not survive");
     assert_eq!(card.kind, CardKind::LoginCapture);
@@ -1900,7 +1896,7 @@ async fn the_registry_file_is_versioned_and_survives_a_restart() {
 #[tokio::test]
 async fn an_unreadable_registry_is_refused_and_never_overwritten() {
     for (name, bytes) in [
-        ("newer", br#"{"version":2,"cards":[]}"#.to_vec()),
+        ("newer", br#"{"version":3,"cards":[]}"#.to_vec()),
         ("damaged", b"{not json".to_vec()),
         ("unversioned", b"[]".to_vec()),
     ] {
@@ -2048,4 +2044,5 @@ fn every_kind_has_one_subject_and_kinds_never_collide() {
 
 mod agent_permission_cards;
 mod features;
+mod no_expiry;
 mod worker_options;

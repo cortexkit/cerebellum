@@ -60,6 +60,12 @@ impl CallGrants {
 }
 
 pub(crate) fn track(row: &GrantUse) {
+    if let (Some(terminal), Some(id)) = (
+        crate::TerminalArbiter::current(),
+        row.row().card_ref.as_deref(),
+    ) {
+        terminal.track_grant_consent(id);
+    }
     let _ = CALL_GRANTS.try_with(|grants| {
         grants.rows.lock().unwrap().push(row.clone());
         row.register(grants);

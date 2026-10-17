@@ -173,6 +173,9 @@ impl CingulateRoute for SiteCingulateRoute {
                     Ok(json!({"elicitation_id":id,"state":"answered","answered_choice_id":choice}))
                 }
                 wire::CONSENT_WITHDRAW => Ok(json!({"elicitation_id":id,"state":"withdrawn"})),
+                wire::CONSENT_REPORT_EXECUTION => Ok(
+                    json!({"elicitation_id":id,"state":"answered","execution":params["execution"]}),
+                ),
                 _ => panic!("a site card made an unexpected Cingulate call: {method}"),
             }
         })
@@ -1998,12 +2001,10 @@ fn this_session() -> crate::cingulate_client::live_call::SessionKey {
     crate::computer_grants::tests::session_key("test-project")
 }
 
-/// Silence: the card's wait ends with it still pending. The call replies
-/// `consent_unavailable` as it always has; the card is withdrawn, never
-/// detached (nobody will want its answer later), and forgotten, so the
-/// session's next call has nothing to read from Cingulate and opens no route.
+/// The bounded wait is not the card deadline. Detach the pending card so a
+/// late answer wakes the agent, without reading or dispatching in the meantime.
 #[tokio::test]
-async fn an_unanswered_site_card_is_withdrawn_never_detached_and_leaves_no_registry_entry() {
+async fn an_unanswered_site_card_detaches_and_replies_pending_without_content() {
     let script = ScriptedCingulate::new();
     let fixture = Fixture::scripted(&script);
     let tab = fixture.claim(1).await;
@@ -2017,34 +2018,29 @@ async fn an_unanswered_site_card_is_withdrawn_never_detached_and_leaves_no_regis
             Reply::Result(json!({"elicitation_id":"el_site_silent","state":"pending"})),
         )
         .then(
-            wire::CONSENT_WITHDRAW,
-            Reply::Result(json!({"elicitation_id":"el_site_silent","state":"expired"})),
+            wire::CONSENT_DETACH,
+            Reply::Result(
+                json!({"elicitation_id":"el_site_silent","state":"pending","detached":true}),
+            ),
         );
     let reply = fixture
         .finish(fixture.start(1, snapshot_args(&tab), ""))
         .await;
-    assert_eq!(reply["outcome"], "refused", "{reply}");
-    assert_eq!(reply["reason"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    assert_eq!(reply["ask_id"], "el_site_silent", "{reply}");
     assert!(reply.get("state_text").is_none());
     assert_eq!(
         script.methods(),
         [
             wire::CONSENT_REQUEST,
             wire::CONSENT_AWAIT,
-            wire::CONSENT_WITHDRAW
+            wire::CONSENT_DETACH
         ]
     );
     assert_eq!(script.calls()[1].1["timeout_ms"], 120_000);
-    assert!(fixture.planes.consent.raised("el_site_silent").is_none());
-    assert!(fixture.planes.consent.unapplied(&this_session()).is_empty());
+    assert!(fixture.planes.consent.raised("el_site_silent").is_some());
+    assert_eq!(fixture.planes.consent.unapplied(&this_session()).len(), 1);
     assert!(fixture.state.lock().unwrap().captures.is_empty());
-    let opens = script.opens();
-    crate::computer_grants::tests::drain_call(&fixture.planes, 1, 1).await;
-    assert_eq!(
-        script.opens(),
-        opens,
-        "the next call opened a consent route"
-    );
 }
 
 /// A cancel, the call's route closing, and the module draining each end the
@@ -2266,6 +2262,7 @@ async fn the_drain_leaves_a_held_site_card_and_withdraws_an_abandoned_one() {
         decline_id: SITE_DENY.into(),
         next_steps: Default::default(),
         applied: false,
+        lifecycle: Default::default(),
     };
     store.save(std::slice::from_ref(&card)).unwrap();
     let script = ScriptedCingulate::new();

@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use super::card::{CardKind, CardRequest};
 use super::live_call::{LiveCall, NotLive, SessionKey};
 use super::route::{CallError, CingulateOpener, CingulateRoute};
-use super::wire::{self, CardState, Execution, Record, RefusalCode};
+use super::wire::{self, CardState, Execution, ExecutionReason, Record, RefusalCode};
 
 /// How a card ended, from the point of view of the code that raised it.
 ///
@@ -287,6 +287,84 @@ pub struct RaisedCard {
     pub next_steps: BTreeMap<String, String>,
     /// The settlement has been applied; only its acknowledgment is left.
     pub applied: bool,
+    #[serde(default, skip_serializing_if = "CardLifecycle::is_empty")]
+    pub lifecycle: CardLifecycle,
+}
+
+/// Acknowledging the answer feed only tells Cingulate that the answer was saved.
+/// Its later consumption and execution report must survive independently.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardLifecycle {
+    pub agent_id: Option<String>,
+    pub answered: bool,
+    pub answer_choice: Option<String>,
+    pub approval: Option<String>,
+    pub approval_taken: bool,
+    pub dispatch_started: bool,
+    pub final_report: Option<ExecutionReport>,
+    pub reported: bool,
+    pub report_attempted: bool,
+    pub sent_report: Option<ExecutionReport>,
+    pub report_undeliverable: bool,
+    pub settled_at_ms: Option<u64>,
+    pub answer_lost: bool,
+    pub ended: bool,
+    pub acked: bool,
+    pub deferred_use: bool,
+}
+
+impl CardLifecycle {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionReport {
+    pub execution: Execution,
+    pub reason: Option<ExecutionReason>,
+}
+
+/// Cingulate owns cards by cerebellum's principal and fixed "consent" session,
+/// not by the agent scope that authorized opening the route. Any live agent
+/// call can deliver an old scope's report; only the raising agent can use its answer.
+pub fn may_report_from(_card: &RaisedCard, live: &LiveCall) -> bool {
+    live.is_held()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportDelivery {
+    Delivered,
+    Undeliverable,
+    Retry,
+}
+
+/// Older Cingulate releases hide acknowledged answers from reporting; all
+/// releases prune their payload after 24 hours. Neither case can recover by
+/// retrying. A pruned card is deliberately indistinguishable from another owner.
+fn classify_report_delivery(reply: &Result<Record, CallError>, acked: bool) -> ReportDelivery {
+    match reply {
+        Ok(_) => ReportDelivery::Delivered,
+        Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::NotFound => {
+            ReportDelivery::Undeliverable
+        }
+        Err(CallError::Refused(refusal)) if acked && refusal.code == RefusalCode::NotOwner => {
+            ReportDelivery::Undeliverable
+        }
+        Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::InvalidExecution => {
+            ReportDelivery::Delivered
+        }
+        _ => ReportDelivery::Retry,
+    }
+}
+
+fn may_apply_from(card: &RaisedCard, live: &LiveCall) -> bool {
+    card.session == *live.session()
+        && card
+            .lifecycle
+            .agent_id
+            .as_deref()
+            .is_none_or(|agent| Some(agent) == live.agent_id())
 }
 
 /// Where the registry of raised cards is kept across restarts.
@@ -306,7 +384,7 @@ pub const CINGULATE_RAISED_FILE: &str = "cingulate_raised.json";
 
 /// The highest registry file version this build reads, and the one it
 /// writes.
-pub const CINGULATE_RAISED_VERSION: u64 = 1;
+pub const CINGULATE_RAISED_VERSION: u64 = 2;
 
 /// The registry file's durable format (name and version). Every format this
 /// module writes is recorded in the operator's format-floor file before its
@@ -390,11 +468,19 @@ impl RegistryStore for FileRegistryStore {
         // rolling back to a build without it stays a plain binary swap. Once
         // the file is written, the floor must record its format, or the
         // install-time check could accept a build that cannot read it.
+        let version = if cards.iter().any(|card| !card.lifecycle.is_empty()) {
+            2
+        } else {
+            1
+        };
         self.floor
-            .raise(CINGULATE_RAISED_FORMAT)
+            .raise(cerebellum_core::format_floor::DurableFormat::new(
+                "cingulate-raised",
+                version,
+            ))
             .map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(&RegistryFile {
-            version: CINGULATE_RAISED_VERSION,
+            version,
             cards: cards.to_vec(),
         })
         .map_err(|error| error.to_string())?;
@@ -487,6 +573,9 @@ pub struct ConsentDesk {
     readable: bool,
     registry: Mutex<HashMap<String, RaisedCard>>,
     single_use: Mutex<SingleUse>,
+    reporting: tokio::sync::Mutex<()>,
+    saving: Mutex<()>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -504,6 +593,9 @@ impl ConsentDesk {
             readable: true,
             registry: Mutex::new(HashMap::new()),
             single_use: Mutex::new(SingleUse::default()),
+            reporting: tokio::sync::Mutex::new(()),
+            saving: Mutex::new(()),
+            clock: Arc::new(crate::wall_clock_ms),
         }
     }
 
@@ -521,13 +613,37 @@ impl ConsentDesk {
             ),
             Err(_) => (false, HashMap::new()),
         };
-        Self {
+        let desk = Self {
             opener,
             store: Some(store),
             readable,
             registry: Mutex::new(cards),
             single_use: Mutex::new(SingleUse::default()),
+            reporting: tokio::sync::Mutex::new(()),
+            saving: Mutex::new(()),
+            clock: Arc::new(crate::wall_clock_ms),
+        };
+        // Never reuse a claimed approval after a restart. A dispatch with no
+        // final outcome may have run; a claim not yet dispatched did not run.
+        for card in lock(&desk.registry).values_mut() {
+            if (card.lifecycle.dispatch_started || card.lifecycle.approval_taken)
+                && card.lifecycle.final_report.is_none()
+            {
+                card.lifecycle.final_report = Some(ExecutionReport {
+                    execution: if card.lifecycle.dispatch_started {
+                        Execution::OutcomeUnknown
+                    } else {
+                        Execution::ApprovedNotExecuted
+                    },
+                    reason: if card.lifecycle.dispatch_started {
+                        None
+                    } else {
+                        Some(ExecutionReason::RefusedAtDispatch)
+                    },
+                });
+            }
         }
+        desk
     }
 
     /// Open a route to Cingulate for `live`'s call.
@@ -552,11 +668,13 @@ impl ConsentDesk {
         if !live.is_held() {
             return Err(CallError::NotLive);
         }
-        Ok(DeskSession {
+        let mut session = DeskSession {
             desk: self,
             live,
             route,
-        })
+        };
+        session.retry_reports().await;
+        Ok(session)
     }
 
     /// The card cerebellum raised under `elicitation_id`, if it still holds it.
@@ -584,6 +702,20 @@ impl ConsentDesk {
             .collect()
     }
 
+    pub fn unapplied_for(&self, live: &LiveCall) -> Vec<RaisedCard> {
+        lock(&self.registry)
+            .values()
+            .filter(|card| !card.applied && may_apply_from(card, live))
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Take once the late approval recorded from the session's answer feed
     /// for `subject`. Returns its card id and granting choice, so the retry
     /// performs the selected action and reports what actually happened.
@@ -592,12 +724,42 @@ impl ConsentDesk {
         session: &SessionKey,
         subject: &str,
     ) -> Option<(String, String)> {
-        lock(&self.single_use)
-            .approvals
-            .remove(&(session.clone(), subject.to_string()))
+        let approval = lock(&self.registry).values_mut().find_map(|card| {
+            if card.session != *session
+                || card.subject != subject
+                || card.lifecycle.ended
+                || card.lifecycle.dispatch_started
+                || card.lifecycle.approval_taken
+                || card.lifecycle.final_report.is_some()
+            {
+                return None;
+            }
+            let choice = card.lifecycle.approval.take()?;
+            card.lifecycle.approval_taken = true;
+            Some((card.elicitation_id.clone(), choice))
+        });
+        if approval.is_some() {
+            if self.save().is_err() {
+                if let Some((id, choice)) = &approval {
+                    if let Some(card) = lock(&self.registry).get_mut(id) {
+                        card.lifecycle.approval = Some(choice.clone());
+                        card.lifecycle.approval_taken = false;
+                    }
+                }
+                return None;
+            }
+            lock(&self.single_use)
+                .approvals
+                .remove(&(session.clone(), subject.to_string()));
+            return approval;
+        }
+        None
     }
 
     fn record_single_use_approval(&self, card: &RaisedCard, choice_id: &str) {
+        if let Some(raised) = lock(&self.registry).get_mut(&card.elicitation_id) {
+            raised.lifecycle.approval = Some(choice_id.to_string());
+        }
         lock(&self.single_use).approvals.insert(
             (card.session.clone(), card.subject.clone()),
             (card.elicitation_id.clone(), choice_id.to_string()),
@@ -605,6 +767,7 @@ impl ConsentDesk {
     }
 
     fn save(&self) -> Result<(), String> {
+        let _saving = lock(&self.saving);
         if !self.readable {
             // Never save over a registry this build could not read.
             return Err("the stored registry could not be read; it is not overwritten".into());
@@ -627,18 +790,104 @@ impl ConsentDesk {
         let flipped = match lock(&self.registry).get_mut(elicitation_id) {
             Some(card) if !card.applied => {
                 card.applied = true;
+                if card.lifecycle.answered
+                    && card
+                        .lifecycle
+                        .answer_choice
+                        .as_ref()
+                        .is_some_and(|choice| !card.grant_ids.contains(choice))
+                    && card.lifecycle.final_report.is_none()
+                {
+                    card.lifecycle.final_report = Some(ExecutionReport {
+                        execution: Execution::ApprovedNotExecuted,
+                        reason: Some(ExecutionReason::RefusedAtDispatch),
+                    });
+                }
                 true
             }
             _ => false,
         };
-        self.save().map(|()| flipped)
+        if let Err(error) = self.save() {
+            if flipped {
+                if let Some(card) = lock(&self.registry).get_mut(elicitation_id) {
+                    card.applied = false;
+                }
+            }
+            return Err(error);
+        }
+        Ok(flipped)
+    }
+
+    /// Save a final outcome before any network report. Waiting for an action is
+    /// deliberately not final and must not call this method.
+    pub fn finish_execution(
+        &self,
+        id: &str,
+        execution: Execution,
+        reason: Option<ExecutionReason>,
+    ) -> Result<(), String> {
+        if let Some(card) = lock(&self.registry).get_mut(id) {
+            if card.lifecycle.final_report.is_none() {
+                card.lifecycle.final_report = Some(ExecutionReport {
+                    execution,
+                    reason: (execution == Execution::ApprovedNotExecuted)
+                        .then_some(reason)
+                        .flatten(),
+                });
+                card.lifecycle.approval = None;
+            }
+        }
+        self.save()
+    }
+
+    pub fn begin_execution(&self, id: &str) -> Result<(), String> {
+        if let Some(card) = lock(&self.registry).get_mut(id) {
+            card.lifecycle.dispatch_started = true;
+            card.lifecycle.approval = None;
+        }
+        self.save()
+    }
+
+    pub fn claim_execution(&self, id: &str) -> Result<(), String> {
+        if let Some(card) = lock(&self.registry).get_mut(id) {
+            card.lifecycle.approval_taken = true;
+            card.lifecycle.approval = None;
+        }
+        self.save()
+    }
+
+    pub fn has_pending_reports(&self) -> bool {
+        lock(&self.registry).values().any(|card| {
+            card.lifecycle.final_report.is_some()
+                && !card.lifecycle.reported
+                && !card.lifecycle.report_undeliverable
+        })
+    }
+
+    pub fn take_lost_answer(&self, session: &SessionKey, subject: &str) -> bool {
+        let found = lock(&self.registry)
+            .values_mut()
+            .find_map(|card| {
+                if card.session == *session && card.subject == subject && card.lifecycle.answer_lost
+                {
+                    card.lifecycle.answer_lost = false;
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+        if found {
+            let _ = self.save();
+        }
+        found
     }
 
     /// Remove an ended session's cards and unused approvals from storage.
     /// No route to the consent service is opened: the session has ended, so
     /// it can no longer authorize such a route.
     pub fn forget_session(&self, session: &SessionKey) -> Result<(), String> {
-        lock(&self.registry).retain(|_, card| card.session != *session);
+        self.end_sessions(|owner| owner == session);
         lock(&self.single_use)
             .approvals
             .retain(|(owner, _), _| owner != session);
@@ -659,7 +908,7 @@ impl ConsentDesk {
         let ended = |session: &SessionKey| {
             session.owner == owner && session.scope_ref == scope_ref && session.scope_epoch < epoch
         };
-        lock(&self.registry).retain(|_, card| !ended(&card.session));
+        self.end_sessions(ended);
         lock(&self.single_use)
             .approvals
             .retain(|(session, _), _| !ended(session));
@@ -669,6 +918,31 @@ impl ConsentDesk {
     #[cfg(test)]
     pub(crate) fn has_single_use_approvals(&self) -> bool {
         !lock(&self.single_use).approvals.is_empty()
+    }
+
+    fn end_sessions(&self, ended: impl Fn(&SessionKey) -> bool) {
+        lock(&self.registry).retain(|_, card| {
+            if !ended(&card.session) {
+                return true;
+            }
+            card.lifecycle.ended = true;
+            card.lifecycle.approval = None;
+            if card.lifecycle.answered && card.lifecycle.final_report.is_none() {
+                card.lifecycle.final_report = Some(ExecutionReport {
+                    execution: if card.lifecycle.dispatch_started {
+                        Execution::OutcomeUnknown
+                    } else {
+                        Execution::ApprovedNotExecuted
+                    },
+                    reason: if card.lifecycle.dispatch_started {
+                        None
+                    } else {
+                        Some(ExecutionReason::SessionEnded)
+                    },
+                });
+            }
+            card.lifecycle.answered && !card.lifecycle.reported
+        });
     }
 
     fn forget(&self, ids: &[String]) {
@@ -692,6 +966,7 @@ pub struct DeskSession<'a> {
 /// What ended a held call's wait on its card.
 enum Woke<C> {
     Read(Result<Record, CallError>),
+    GiveUp,
     Cancelled(C),
     RouteClosed,
 }
@@ -699,7 +974,17 @@ enum Woke<C> {
 impl DeskSession<'_> {
     async fn record(&mut self, method: &str, params: Value) -> Result<Record, CallError> {
         let result = self.route.call(method, params).await?;
-        Record::parse(result).ok_or(CallError::Transport { code: None })
+        let record = Record::parse(result).ok_or(CallError::Transport { code: None })?;
+        if let Some(card) = lock(&self.desk.registry).get_mut(&record.elicitation_id) {
+            if record.state == CardState::Answered {
+                card.lifecycle.answered = true;
+                card.lifecycle.answer_choice = record.answered_choice_id.clone();
+                if let Some(settled) = record.raw.get("answered_at_ms").and_then(Value::as_u64) {
+                    card.lifecycle.settled_at_ms = Some(settled);
+                }
+            }
+        }
+        Ok(record)
     }
 
     /// Raise `card` about `subject` and remember it. Returns the card's
@@ -730,6 +1015,11 @@ impl DeskSession<'_> {
                 decline_id: card.decline_id,
                 next_steps: card.next_steps,
                 applied: false,
+                lifecycle: CardLifecycle {
+                    agent_id: self.live.agent_id().map(str::to_string),
+                    deferred_use: card.kind.single_use() || card.kind == CardKind::UserBrowserSite,
+                    ..Default::default()
+                },
             },
         );
         // The save result is deliberately ignored: if it fails, the card is
@@ -784,7 +1074,7 @@ impl DeskSession<'_> {
             wire::await_params(elicitation_id, timeout_ms),
         );
         tokio::select! {
-            read = waiting => Woke::Read(read),
+            read = tokio::time::timeout(wait.min(Duration::from_millis(wire::AWAIT_CAP_MS)), waiting) => match read { Ok(read) => Woke::Read(read), Err(_) => Woke::GiveUp },
             cancel = cancelled => Woke::Cancelled(cancel),
             () = route_closed => Woke::RouteClosed,
         }
@@ -816,6 +1106,18 @@ impl DeskSession<'_> {
         }
         let read = match self.wait_on(elicitation_id, park, cancelled).await {
             Woke::Read(read) => read,
+            Woke::GiveUp => {
+                return match self.detach_or_withdraw(elicitation_id).await {
+                    Ok(Detach::Detached(_)) => InCall::Pending {
+                        ask_id: elicitation_id.to_string(),
+                    },
+                    Ok(Detach::AlreadySettled(record)) => InCall::Settled(
+                        Ending::of_record(&record, &card).unwrap_or(Ending::NoAnswer),
+                    ),
+                    Ok(Detach::NotDetached) => InCall::Settled(Ending::DeliveryFailed),
+                    Err(ending) => InCall::Settled(ending),
+                }
+            }
             Woke::Cancelled(LetGo::Detach) => {
                 let _ = self.detach_or_withdraw(elicitation_id).await;
                 return InCall::Cancelled;
@@ -848,46 +1150,27 @@ impl DeskSession<'_> {
         }
     }
 
-    /// Hold the call on the card for at most `wait` and never detach it: for
-    /// a card whose answer is wanted only by this call (the user-browser site
-    /// card, which expires as the wait ends).
-    ///
-    /// An answer is returned as [`InCall::Settled`] and left for the caller
-    /// to mark applied, as with [`DeskSession::park`]. Anything else (the
-    /// card still pending or expired when the wait ends, a failed await, the
-    /// caller's cancellation, the route unbinding) withdraws the card and
-    /// then forgets it whatever the withdrawal said, an `expired` readback
-    /// included: no later call will ever act on it, so a stray record of it
-    /// in the answers feed is ignored.
+    /// User-browser calls use the same bounded wait and detach handoff as all
+    /// other cards. The wait deadline is not the card's lifetime.
     pub async fn hold(
         &mut self,
         elicitation_id: &str,
         wait: Duration,
         cancelled: impl Future<Output = ()>,
     ) -> InCall {
-        let Some(card) = self.desk.raised(elicitation_id) else {
-            return InCall::Settled(Ending::DeliveryFailed);
-        };
-        if let Some(terminal) = crate::terminal_arbiter::TerminalArbiter::current() {
-            terminal.set_step(crate::terminal_arbiter::CallStep::Consent);
+        let result = self
+            .park(elicitation_id, wait, async {
+                cancelled.await;
+                LetGo::Withdraw
+            })
+            .await;
+        if matches!(
+            result,
+            InCall::Settled(Ending::NoAnswer | Ending::Withdrawn)
+        ) {
+            self.desk.forget(&[elicitation_id.to_string()]);
         }
-        let unanswered = match self.wait_on(elicitation_id, wait, cancelled).await {
-            Woke::Read(Ok(record)) => match Ending::of_record(&record, &card) {
-                Some(ending @ (Ending::Granted { .. } | Ending::Declined { .. })) => {
-                    return InCall::Settled(ending)
-                }
-                Some(ending) => InCall::Settled(ending),
-                // Still pending when the wait ended: the card is about to
-                // expire, and nobody will wait on it again.
-                None => InCall::Settled(Ending::NoAnswer),
-            },
-            Woke::Read(Err(error)) => InCall::Settled(Ending::of_refusal(&error)),
-            Woke::Cancelled(()) => InCall::Cancelled,
-            Woke::RouteClosed => InCall::RouteClosed,
-        };
-        let _ = self.withdraw(elicitation_id).await;
-        self.desk.forget(&[elicitation_id.to_string()]);
-        unanswered
+        result
     }
 
     /// Mark the moment cerebellum stops holding the call on `elicitation_id`.
@@ -956,12 +1239,151 @@ impl DeskSession<'_> {
         &mut self,
         elicitation_id: &str,
         execution: Execution,
-    ) -> Result<Record, CallError> {
-        self.record(
-            wire::CONSENT_REPORT_EXECUTION,
-            wire::report_execution_params(elicitation_id, execution),
-        )
-        .await
+    ) -> Result<(), CallError> {
+        self.report_execution_reason(elicitation_id, execution, None)
+            .await
+    }
+
+    pub async fn report_execution_reason(
+        &mut self,
+        id: &str,
+        execution: Execution,
+        reason: Option<ExecutionReason>,
+    ) -> Result<(), CallError> {
+        self.desk
+            .finish_execution(id, execution, reason)
+            .map_err(|_| CallError::RegistryUnreadable)?;
+        self.retry_reports().await;
+        Ok(())
+    }
+
+    /// The outbox is driven by live route opens, not by a background timer.
+    /// Read back an uncertain send before retrying: a lost response may have
+    /// committed, and a completed execution report must never be overwritten.
+    async fn retry_reports(&mut self) {
+        let _reporting = self.desk.reporting.lock().await;
+        let cards: Vec<_> = lock(&self.desk.registry)
+            .values()
+            .filter(|card| {
+                may_report_from(card, self.live)
+                    && card.lifecycle.final_report.is_some()
+                    && !card.lifecycle.reported
+                    && !card.lifecycle.report_undeliverable
+            })
+            .cloned()
+            .collect();
+        for card in cards {
+            if self.desk.save().is_err() {
+                return;
+            }
+            if card.lifecycle.settled_at_ms.is_some_and(|settled| {
+                (self.desk.clock)().saturating_sub(settled) >= 24 * 60 * 60 * 1000
+            }) {
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.report_undeliverable = true;
+                }
+                let _ = self.desk.save();
+                continue;
+            }
+            let mut done = false;
+            if card.lifecycle.report_attempted {
+                match self
+                    .record(wire::CONSENT_GET, wire::id_params(&card.elicitation_id))
+                    .await
+                {
+                    Ok(record) if record.state == CardState::Answered => {
+                        let sent = card
+                            .lifecycle
+                            .sent_report
+                            .or(card.lifecycle.final_report)
+                            .expect("pending report");
+                        // A scope-end backstop is not necessarily our execution.
+                        // Only our own payload confirms that a lost send committed.
+                        done = record.raw.get("execution").and_then(Value::as_str)
+                            == Some(sent.execution.as_str())
+                            && record.raw.get("execution_reason").and_then(Value::as_str)
+                                == sent.reason.map(ExecutionReason::as_str);
+                    }
+                    Ok(record) if record.state == CardState::Pending => continue,
+                    Ok(_) => {
+                        if let Some(current) =
+                            lock(&self.desk.registry).get_mut(&card.elicitation_id)
+                        {
+                            current.lifecycle.report_undeliverable = true;
+                        }
+                        let _ = self.desk.save();
+                        continue;
+                    }
+                    Err(CallError::Refused(refusal)) if refusal.code == RefusalCode::NotFound => {
+                        if let Some(current) =
+                            lock(&self.desk.registry).get_mut(&card.elicitation_id)
+                        {
+                            current.lifecycle.report_undeliverable = true;
+                        }
+                        let _ = self.desk.save();
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            if !done {
+                if !card.lifecycle.answered {
+                    continue;
+                }
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.report_attempted = true;
+                }
+                if self.desk.save().is_err() {
+                    continue;
+                }
+                let report = card.lifecycle.final_report.expect("selected final report");
+                let reason = super::features::negotiated(self.route.features())
+                    .no_expiry
+                    .then_some(report.reason)
+                    .flatten();
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.sent_report = Some(ExecutionReport {
+                        execution: report.execution,
+                        reason,
+                    });
+                }
+                if self.desk.save().is_err() {
+                    continue;
+                }
+                let reply = self
+                    .record(
+                        wire::CONSENT_REPORT_EXECUTION,
+                        wire::report_execution_with_reason(
+                            &card.elicitation_id,
+                            report.execution,
+                            reason,
+                        ),
+                    )
+                    .await;
+                match classify_report_delivery(&reply, card.lifecycle.acked) {
+                    ReportDelivery::Delivered => done = true,
+                    ReportDelivery::Undeliverable => {
+                        if let Some(current) =
+                            lock(&self.desk.registry).get_mut(&card.elicitation_id)
+                        {
+                            current.lifecycle.report_undeliverable = true;
+                        }
+                        let _ = self.desk.save();
+                    }
+                    ReportDelivery::Retry => {}
+                }
+            }
+            if done {
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.reported = true;
+                }
+                if self.desk.save().is_err() {
+                    if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                        current.lifecycle.reported = false;
+                    }
+                }
+            }
+        }
     }
 
     /// Apply every settlement in the answers feed that answers a card this
@@ -983,6 +1405,7 @@ impl DeskSession<'_> {
         let mut report = DrainReport::default();
         let mut seen = Vec::new();
         let mut since = 0;
+        let mut can_ack = true;
         let cursor = loop {
             let page = self
                 .route
@@ -994,12 +1417,34 @@ impl DeskSession<'_> {
                 let card = self
                     .desk
                     .raised(&record.elicitation_id)
-                    .filter(|card| card.session == *self.live.session());
+                    .filter(|card| may_apply_from(card, self.live));
                 let Some(card) = card else {
+                    if let Some(other) = self.desk.raised(&record.elicitation_id) {
+                        if !other.lifecycle.ended {
+                            can_ack = false;
+                        }
+                    }
                     report.ignored.push(record.elicitation_id.clone());
                     continue;
                 };
                 seen.push(card.elicitation_id.clone());
+                if record.state == CardState::Expired
+                    && record.raw.get("settled_at").is_some()
+                    && record.raw.get("options").is_none()
+                {
+                    if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                        current.lifecycle.answer_lost = true;
+                        current.lifecycle.approval = None;
+                    }
+                }
+                if record.state == CardState::Answered {
+                    if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                        current.lifecycle.answered = true;
+                        current.lifecycle.answer_choice = record.answered_choice_id.clone();
+                        current.lifecycle.settled_at_ms =
+                            record.raw.get("answered_at_ms").and_then(Value::as_u64);
+                    }
+                }
                 if card.applied {
                     continue;
                 }
@@ -1011,13 +1456,49 @@ impl DeskSession<'_> {
                     // Not acknowledged: the next call reads it again.
                     Err(ApplyFailed(_)) => return Ok(report),
                 };
-                if applied == Apply::Applied && card.kind.single_use() {
+                if applied == Apply::Applied
+                    && (card.kind.single_use() || card.lifecycle.deferred_use)
+                {
                     if let Ending::Granted { choice_id } = &ending {
                         self.desk.record_single_use_approval(&card, choice_id);
                     }
                 }
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {
                     return Ok(report);
+                }
+                if record.state == CardState::Answered && matches!(ending, Ending::Declined { .. })
+                {
+                    let _ = self.desk.finish_execution(
+                        &card.elicitation_id,
+                        Execution::ApprovedNotExecuted,
+                        Some(ExecutionReason::RefusedAtDispatch),
+                    );
+                } else if record.state == CardState::Answered && applied == Apply::NoRecord {
+                    let _ = self.desk.finish_execution(
+                        &card.elicitation_id,
+                        Execution::ApprovedNotExecuted,
+                        Some(ExecutionReason::TargetGone),
+                    );
+                } else if matches!(card.kind, CardKind::AppControl | CardKind::Takeover)
+                    && matches!(&ending, Ending::Granted { choice_id } if choice_id == "allow_once")
+                {
+                    // The drain is not an action holder. A one-call permission
+                    // cannot dispatch there or be lent to another waiting call.
+                    let _ = self.desk.finish_execution(
+                        &card.elicitation_id,
+                        Execution::ApprovedNotExecuted,
+                        Some(ExecutionReason::RefusedAtDispatch),
+                    );
+                } else if record.state == CardState::Answered
+                    && matches!(
+                        card.kind,
+                        CardKind::ProfileReidentification | CardKind::StuckProfileClearance
+                    )
+                    && matches!(ending, Ending::Granted { .. })
+                {
+                    let _ =
+                        self.desk
+                            .finish_execution(&card.elicitation_id, Execution::Executed, None);
                 }
                 match applied {
                     Apply::Applied => report.applied.push(card.elicitation_id.clone()),
@@ -1029,14 +1510,20 @@ impl DeskSession<'_> {
                 None => break page.cursor,
             }
         };
-        if self
-            .route
-            .call(wire::CONSENT_ACK, wire::ack_params(cursor))
-            .await
-            .is_ok()
+        if can_ack
+            && self
+                .route
+                .call(wire::CONSENT_ACK, wire::ack_params(cursor))
+                .await
+                .is_ok()
         {
             report.acked = Some(cursor);
-            self.desk.forget(&seen);
+            for id in seen {
+                if let Some(card) = lock(&self.desk.registry).get_mut(&id) {
+                    card.lifecycle.acked = true;
+                }
+            }
+            let _ = self.desk.save();
         }
         Ok(report)
     }

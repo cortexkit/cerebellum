@@ -73,6 +73,12 @@ pub(crate) fn live(
             conversation_key: facts.identity.conversation_key.clone(),
         }),
     )
+    .map(|live| {
+        live.with_authorizing_agent(
+            crate::permission_scope::authorizing_holder(facts)
+                .map(|holder| holder.agent_id().to_string()),
+        )
+    })
     .map_err(|error| Ending::NoCard(NoCard::of_not_live(error)))
 }
 
@@ -288,16 +294,26 @@ pub(crate) async fn park(
             ) {
                 Ok(true) => {
                     let _ = planes.consent.mark_applied(id);
+                    if matches!(
+                        completion.result.lock().unwrap().as_ref(),
+                        Some((
+                            Ending::Granted { .. },
+                            BrowserGrantSettlement::NotRecorded { .. }
+                        ))
+                    ) {
+                        let _ = planes.consent.finish_execution(id, crate::cingulate_client::wire::Execution::ApprovedNotExecuted, Some(crate::cingulate_client::wire::ExecutionReason::GrantStoreUnavailable));
+                    }
                     completion.done.send_replace(true);
                     break;
                 }
                 Ok(false) => break,
                 Err(_) if tokio::time::Instant::now() < end => tokio::task::yield_now().await,
                 Err(_) => {
+                    let _ = session.detach(id).await;
                     return (
                         InCall::Pending { ask_id: id.into() },
                         BrowserGrantSettlement::NotGranted,
-                    )
+                    );
                 }
             }
         },
@@ -317,6 +333,7 @@ pub(crate) async fn park(
             .await
             .is_err()
     {
+        let _ = session.detach(id).await;
         return (
             InCall::Pending { ask_id: id.into() },
             BrowserGrantSettlement::NotGranted,
@@ -451,7 +468,7 @@ mod tests {
                 std::fs::write(root.join("registry.json"), br#"{"version":99,"cards":[]}"#)
                     .unwrap();
             }
-            let service = ScriptedCingulate::new();
+            let service = ScriptedCingulate::new().accept_execution_reports();
             let grant_storage = Arc::new(GrantStorage::default());
             let clock = Arc::new(ManualWallClock::at(100));
             let mut planes = Planes::with_browser_config_journaling(
@@ -905,7 +922,7 @@ mod tests {
             );
             let card = fixture.planes.consent.raised("el_late_always");
             if acknowledged {
-                assert!(card.is_none());
+                assert!(card.unwrap().lifecycle.acked);
             } else {
                 assert!(card.unwrap().applied);
             }
@@ -999,7 +1016,15 @@ mod tests {
                     "consent.ack"
                 ]
             );
-            assert!(fixture.planes.consent.raised("el_browser_late").is_none());
+            assert!(
+                fixture
+                    .planes
+                    .consent
+                    .raised("el_browser_late")
+                    .unwrap()
+                    .lifecycle
+                    .acked
+            );
         }
     }
 

@@ -86,6 +86,7 @@ fn exported() -> Vec<(String, CardRequest)> {
                     crate::cingulate_client::features::CingulateFeatures {
                         option_group: true,
                         single_use: true,
+                        no_expiry: false,
                     },
                 );
                 result.push((

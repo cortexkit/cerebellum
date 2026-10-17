@@ -186,6 +186,7 @@ impl CingulateRoute for ServiceRoute {
         Some(crate::cingulate_client::features::CingulateFeatures {
             option_group: true,
             single_use: false,
+            no_expiry: false,
         })
     }
     fn call<'a>(
@@ -1023,7 +1024,7 @@ async fn a_login_call_that_loses_its_approval_parks_no_longer_than_one_allowance
         consent,
         LoginConsent::Ended(LoginAnswer {
             ending: CardEnding::Granted { .. },
-            taken_approval: false,
+            taken_approval: true,
             ..
         })
     )));
@@ -1061,8 +1062,10 @@ async fn execution_reports_cover_definite_nonexecution_and_indeterminate_results
         ),
         (json!({"outcome":"captured"}), "executed"),
     ] {
-        report_login_execution(&carrier, &answer, &reply, "captured").await;
-        assert_eq!(service.calls().last().unwrap().1["execution"], expected);
+        assert_eq!(
+            login_execution_outcome(&reply, "captured").0.as_str(),
+            expected
+        );
     }
     let before = service.calls().len();
     let not_taken = LoginAnswer {

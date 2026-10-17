@@ -5600,7 +5600,8 @@ pub(crate) fn validate_user_browser_result(
         closed_object(
             json!({
                 "browser":enum_schema(&["user"]),
-                "outcome":enum_schema(&["ok","refused","closed","invalid_request","cancelled","outcome_unknown","authorization_denied"]),
+                "outcome":enum_schema(&["ok","refused","closed","invalid_request","cancelled","outcome_unknown","authorization_denied","consent_pending"]),
+                "ask_id":string_schema(),
             "reason":string_schema(), "remedy":string_schema(),
             "settled":boolean_schema(), "settlement_reason":string_schema(),
                 "input_dispatched":{"anyOf":[boolean_schema(),{"type":"null"}]},

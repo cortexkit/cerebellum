@@ -20,6 +20,7 @@ use crate::{
 pub struct DispatchGate(
     std::sync::atomic::AtomicU8,
     std::sync::Mutex<Option<Arc<crate::grant_enforcement::CallGrants>>>,
+    std::sync::Mutex<Vec<(Arc<crate::cingulate_client::desk::ConsentDesk>, String)>>,
 );
 
 impl DispatchGate {
@@ -39,6 +40,16 @@ impl DispatchGate {
             return false;
         }
         use std::sync::atomic::Ordering::SeqCst;
+        if self
+            .2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(desk, id)| desk.begin_execution(id).is_err())
+        {
+            self.stop();
+            return false;
+        }
         let mut bits = self.0.load(SeqCst);
         loop {
             if bits & 2 != 0 {
@@ -149,6 +160,7 @@ pub struct TerminalArbiter {
     pub(crate) state: std::sync::Mutex<TerminalState>,
     request: Frame,
     changed: tokio::sync::Notify,
+    consent_desk: std::sync::Mutex<Option<Arc<crate::cingulate_client::desk::ConsentDesk>>>,
 }
 
 tokio::task_local! {
@@ -174,11 +186,82 @@ impl TerminalArbiter {
             }),
             request,
             changed: tokio::sync::Notify::new(),
+            consent_desk: std::sync::Mutex::new(None),
         }
     }
 
     pub fn current() -> Option<Arc<Self>> {
         CALL_TERMINAL.try_with(Arc::clone).ok()
+    }
+
+    /// Grant application is not execution. Retain the answered card until the
+    /// action's single terminal decision establishes what actually happened.
+    pub(crate) fn track_consent(
+        &self,
+        desk: Arc<crate::cingulate_client::desk::ConsentDesk>,
+        id: &str,
+    ) {
+        if !desk
+            .raised(id)
+            .is_some_and(|card| card.lifecycle.answered && card.lifecycle.final_report.is_none())
+        {
+            return;
+        }
+        let mut cards = self.gate.2.lock().unwrap();
+        if !cards.iter().any(|(_, existing)| existing == id) {
+            cards.push((desk, id.to_string()));
+        }
+    }
+
+    pub(crate) fn track_grant_consent(&self, id: &str) {
+        if let Some(desk) = self.consent_desk.lock().unwrap().clone() {
+            self.track_consent(desk, id);
+        }
+    }
+
+    fn finish_consent(&self, reply: &Frame) {
+        use crate::cingulate_client::wire::{Execution, ExecutionReason};
+        let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+        let dispatched = self.state.lock().unwrap().possibly_dispatched
+            || self.gate.0.load(std::sync::atomic::Ordering::SeqCst) & 1 != 0;
+        let outcome = body["outcome"].as_str().unwrap_or_default();
+        let refused_before_dispatch =
+            body["input_dispatched"] == false || body["detail"]["dispatched"] == false;
+        let success = reply.header.ty == FrameType::Response
+            && matches!(
+                outcome,
+                "ok" | "completed"
+                    | "launched"
+                    | "launched_no_window"
+                    | "already_running"
+                    | "navigated"
+                    | "opened"
+                    | "clicked"
+                    | "typed"
+                    | "snapshot"
+                    | "screenshot"
+                    | "read"
+            );
+        let execution = if matches!(outcome, "dispatch_outcome_unknown" | "outcome_unknown") {
+            Execution::OutcomeUnknown
+        } else if body["effect_status"] == "not_dispatched" {
+            Execution::ApprovedNotExecuted
+        } else if success {
+            Execution::Executed
+        } else if refused_before_dispatch {
+            Execution::ApprovedNotExecuted
+        } else if dispatched {
+            Execution::Executed
+        } else {
+            Execution::ApprovedNotExecuted
+        };
+        let reason = (execution == Execution::ApprovedNotExecuted).then(|| {
+            crate::computer_grants::execution_refusal_reason(&body)
+                .unwrap_or(ExecutionReason::RefusedAtDispatch)
+        });
+        for (desk, id) in self.gate.2.lock().unwrap().iter() {
+            let _ = desk.finish_execution(id, execution, reason);
+        }
     }
 
     /// Accounting guards can outlive a reply during worker cleanup, but may
@@ -352,6 +435,7 @@ pub(crate) async fn run_arbitrated_route(
     envelope_end: tokio::time::Instant,
     connection_end: tokio::time::Instant,
 ) {
+    *terminal.consent_desk.lock().unwrap() = Some(Arc::clone(&planes.consent));
     let execution = Arc::new(std::sync::Mutex::new(Some(Arc::clone(&guard))));
     let worker_execution = Arc::clone(&execution);
     // Supply in-flight accounting only while polling active route work. After
@@ -489,6 +573,7 @@ pub(crate) async fn run_arbitrated_route(
                 .expect("terminal frame fits");
             }
         }
+        terminal.finish_consent(&chosen);
         if serde_json::from_slice::<Value>(&chosen.body)
             .ok()
             .is_some_and(|body| body["outcome"] == "route_closed")
@@ -546,6 +631,155 @@ pub(crate) async fn run_arbitrated_route(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod consent_execution_tests {
+    use super::*;
+    use crate::cingulate_client::card::CardKind;
+    use crate::cingulate_client::desk::{CardLifecycle, ConsentDesk, RaisedCard, RegistryStore};
+    use crate::cingulate_client::double::ScriptedCingulate;
+    use crate::cingulate_client::live_call::SessionKey;
+    use crate::cingulate_client::wire::{Execution, ExecutionReason};
+
+    struct Saved(std::sync::Mutex<Vec<RaisedCard>>);
+    impl RegistryStore for Saved {
+        fn load(&self) -> Result<Vec<RaisedCard>, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save(&self, cards: &[RaisedCard]) -> Result<(), String> {
+            *self.0.lock().unwrap() = cards.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn final_action_reports_distinguish_dispatch_refusal_and_postdispatch_deadline() {
+        for kind in [
+            CardKind::AppControl,
+            CardKind::Takeover,
+            CardKind::WebsiteAccessInCall,
+            CardKind::UserBrowserSite,
+        ] {
+            for (dispatch, body, execution, reason) in [
+                (true, json!({"outcome":"ok"}), Execution::Executed, None),
+                (
+                    false,
+                    json!({"outcome":"ok","input_dispatched":false}),
+                    Execution::Executed,
+                    None,
+                ),
+                (
+                    true,
+                    json!({"outcome":"dispatch_outcome_unknown"}),
+                    Execution::OutcomeUnknown,
+                    None,
+                ),
+                (
+                    true,
+                    json!({"outcome":"refused","effect_status":"not_dispatched","reason":"target_gone"}),
+                    Execution::ApprovedNotExecuted,
+                    Some(ExecutionReason::TargetGone),
+                ),
+                (
+                    false,
+                    json!({"outcome":"refused","reason":"screen_locked"}),
+                    Execution::ApprovedNotExecuted,
+                    Some(ExecutionReason::RefusedAtDispatch),
+                ),
+                (
+                    false,
+                    json!({"outcome":"refused","reason":"target_gone"}),
+                    Execution::ApprovedNotExecuted,
+                    Some(ExecutionReason::TargetGone),
+                ),
+                (
+                    false,
+                    json!({"outcome":"refused","reason":"grant_store_write_failed"}),
+                    Execution::ApprovedNotExecuted,
+                    Some(ExecutionReason::GrantStoreUnavailable),
+                ),
+                (
+                    false,
+                    json!({"outcome":"route_closed"}),
+                    Execution::ApprovedNotExecuted,
+                    Some(ExecutionReason::SessionEnded),
+                ),
+            ] {
+                let store = Arc::new(Saved(std::sync::Mutex::new(vec![RaisedCard {
+                    elicitation_id: "el_final".into(),
+                    session: SessionKey {
+                        owner: "owner".into(),
+                        scope_ref: "scope".into(),
+                        scope_epoch: 1,
+                    },
+                    kind,
+                    subject: "target".into(),
+                    grant_ids: vec!["allow".into()],
+                    decline_id: "deny".into(),
+                    next_steps: Default::default(),
+                    applied: true,
+                    lifecycle: CardLifecycle {
+                        answered: true,
+                        ..Default::default()
+                    },
+                }])));
+                let peer = ScriptedCingulate::new();
+                let desk = Arc::new(ConsentDesk::with_store(
+                    Arc::new(peer.clone()),
+                    store.clone(),
+                ));
+                let request =
+                    Frame::build(FrameType::Request, control_flags(), 1, 1, 1, vec![]).unwrap();
+                let terminal = TerminalArbiter::new(request);
+                terminal.track_consent(Arc::clone(&desk), "el_final");
+                assert!(
+                    desk.raised("el_final")
+                        .unwrap()
+                        .lifecycle
+                        .final_report
+                        .is_none(),
+                    "waiting to run is not an execution"
+                );
+                if dispatch {
+                    assert!(terminal.gate.begin_mutation());
+                }
+                let reply = Frame::build(
+                    FrameType::Response,
+                    control_flags(),
+                    1,
+                    1,
+                    1,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+                terminal.finish_consent(&reply);
+                let report = store.load().unwrap()[0].lifecycle.final_report.unwrap();
+                assert_eq!(
+                    (report.execution, report.reason),
+                    (execution, reason),
+                    "{kind:?}: {body}"
+                );
+                terminal.finish_consent(
+                    &Frame::build(
+                        FrameType::Response,
+                        control_flags(),
+                        1,
+                        1,
+                        1,
+                        serde_json::to_vec(&json!({"outcome":"ok"})).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(
+                    store.load().unwrap()[0].lifecycle.final_report,
+                    Some(report),
+                    "a late worker result replaced the terminal outcome"
+                );
+                assert_eq!(peer.opens(), 0, "finalization opened a background route");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

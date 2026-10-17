@@ -52,11 +52,33 @@ pub fn ack_params(cursor: i64) -> Value {
 }
 
 /// What the requester did with an answered card, reported once it is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Execution {
     Executed,
     ApprovedNotExecuted,
     OutcomeUnknown,
+}
+
+/// These predefined execution reasons avoid sending arbitrary diagnostics to the phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionReason {
+    SessionEnded,
+    TargetGone,
+    GrantStoreUnavailable,
+    RefusedAtDispatch,
+}
+
+impl ExecutionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionEnded => "session_ended",
+            Self::TargetGone => "target_gone",
+            Self::GrantStoreUnavailable => "grant_store_unavailable",
+            Self::RefusedAtDispatch => "refused_at_dispatch",
+        }
+    }
 }
 
 impl Execution {
@@ -71,6 +93,20 @@ impl Execution {
 
 pub fn report_execution_params(elicitation_id: &str, execution: Execution) -> Value {
     json!({"elicitation_id": elicitation_id, "execution": execution.as_str()})
+}
+
+pub fn report_execution_with_reason(
+    elicitation_id: &str,
+    execution: Execution,
+    reason: Option<ExecutionReason>,
+) -> Value {
+    let mut params = report_execution_params(elicitation_id, execution);
+    if execution == Execution::ApprovedNotExecuted {
+        if let Some(reason) = reason {
+            params["reason"] = Value::from(reason.as_str());
+        }
+    }
+    params
 }
 
 /// Whether `value` may be sent as `requester_ref`: 1 to 128 printable ASCII
@@ -214,9 +250,9 @@ impl Record {
 /// One page of `consent.answers`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnswersPage {
-    /// Full records. Retention tombstones (an id, `state: "expired"` and
-    /// `settled_at`, and nothing else) are dropped: a tombstone's state is a
-    /// retention marker, not evidence of what the person chose.
+    /// After 24 hours Cingulate replaces an unacknowledged answer with only its
+    /// id, expired state and settlement time. This tombstone clears the local
+    /// pending card as an answer lost; it contains no evidence of a choice.
     pub records: Vec<Record>,
     pub cursor: i64,
     /// Present on a partial page: pass it as the next `since`.
@@ -229,7 +265,6 @@ impl AnswersPage {
             .get("records")?
             .as_array()?
             .iter()
-            .filter(|row| row.get("settled_at").is_none() || row.get("options").is_some())
             .filter_map(|row| Record::parse(row.clone()))
             .collect();
         Some(Self {

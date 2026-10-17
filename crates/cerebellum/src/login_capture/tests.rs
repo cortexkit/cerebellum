@@ -68,7 +68,7 @@ impl Answer {
     /// and no card is raised; otherwise the card is raised and the capture
     /// call's wait on it (`consent.await`) returns its ending at once.
     fn script(self) -> Arc<ScriptedCingulate> {
-        let script = ScriptedCingulate::new();
+        let script = ScriptedCingulate::new().accept_execution_reports();
         let (id, mut record) = match self {
             Answer::Refused(code) => {
                 script.then(wire::CONSENT_REQUEST, Reply::Refused(code));
@@ -1797,7 +1797,7 @@ async fn a_cancel_during_the_handoff_writes_nothing_and_deletes_the_profile() {
 #[tokio::test]
 async fn a_cancel_while_the_question_is_open_ends_the_capture() {
     let fixture = fixture();
-    let script = ScriptedCingulate::new();
+    let script = ScriptedCingulate::new().accept_execution_reports();
     script
         .then(
             wire::CONSENT_REQUEST,
@@ -1841,7 +1841,7 @@ async fn a_cancel_while_the_question_is_open_ends_the_capture() {
 async fn a_cancel_keeps_a_slow_detach_alive_past_the_polling_timer() {
     let fixture = fixture();
     let request = ollama();
-    let script = ScriptedCingulate::new();
+    let script = ScriptedCingulate::new().accept_execution_reports();
     let (detach_called, mut detach_started) = tokio::sync::oneshot::channel();
     let (detach_reply, detach_response) = tokio::sync::oneshot::channel();
     script

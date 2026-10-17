@@ -5,6 +5,9 @@ pub struct CingulateFeatures {
     pub option_group: bool,
     /// Cingulate 0.7.1 understands this marker; older versions reject it.
     pub single_use: bool,
+    /// Older servers require a deadline and reject execution reason codes.
+    /// Only an advertised capability permits either new wire shape.
+    pub no_expiry: bool,
 }
 
 pub(crate) fn negotiated(reported: Option<CingulateFeatures>) -> CingulateFeatures {
@@ -34,6 +37,15 @@ pub(crate) fn from_catalog(body: &[u8]) -> Option<CingulateFeatures> {
                         .provides
                         .iter()
                         .any(|capability| capability == "consent-single-use/v1")
+                })
+        }),
+        no_expiry: modules.iter().any(|module| {
+            module.module_id == "cingulate"
+                && module.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|capability| capability == "consent-no-expiry/v1")
                 })
         }),
     })
@@ -80,6 +92,9 @@ impl super::card::CardRequest {
                 super::card::CardKind::LoginCapture | super::card::CardKind::LoginImport
             );
         let params = self.params.as_object_mut().expect("mapped card params");
+        if features.no_expiry {
+            params.remove("expires_in_ms");
+        }
         if single_use {
             params.insert("single_use".into(), serde_json::Value::Bool(true));
         } else {

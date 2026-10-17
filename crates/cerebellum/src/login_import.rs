@@ -491,7 +491,7 @@ impl LoginImportPlan {
 /// shown will reach nobody however many times it is put.
 fn unanswered_remedy(ending: &str) -> &'static str {
     match ending {
-        "no_answer" => "nothing was copied; the person was asked but did not answer in time. Ask again when they are available.",
+        "no_answer" => "nothing was copied; the answer is unavailable or was lost. Ask again when they are available.",
         "not_put_to_anyone" => "nothing was copied; the question was shown to no one, and putting it again reaches no one either until the caller's consent route can put it to a person.",
         "unrecognized_answer" => "nothing was copied; the answer was not one the card offered. Retry this call to ask again.",
         "question_withdrawn" => "nothing was copied; the card was withdrawn before it was answered. Retry this call to ask again.",
