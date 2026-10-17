@@ -640,7 +640,11 @@ mod tests {
         };
         schedule();
         cursor.end("agent-a");
-        assert_eq!(hidden(receiver.recv().await.unwrap()), "agent-a");
+        let hide = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("end sends a hide at once")
+            .unwrap();
+        assert_eq!(hidden(hide), "agent-a");
         assert!(
             tokio::time::timeout(Duration::from_millis(150), receiver.recv())
                 .await
