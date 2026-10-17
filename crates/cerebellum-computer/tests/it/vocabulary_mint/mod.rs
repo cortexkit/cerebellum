@@ -2074,3 +2074,45 @@ pub fn v24_from_v23(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Rows whose `target` may be an application's display name, resolved
+/// against the running applications before anything else happens.
+pub const NAME_RESOLVED_ROW_IDS: [&str; 4] = [
+    "computer.read_state",
+    "computer.type",
+    "computer.keys",
+    "computer.takeover_scroll",
+];
+
+/// A target name now also matches a running application in part (a prefix
+/// or whole words of its name) when no application has exactly that name, so
+/// "Magic Context" reaches "Magic Context Dashboard". The reply then says
+/// which application it picked, in `matched_app`, on every row that resolves
+/// a name; a caller that meant another application learns so from the reply
+/// it already reads.
+///
+/// `list_apps` takes an optional `text_filter`, because the full installed
+/// list is several hundred entries and a caller looking for one application
+/// should not have to read them all. Its schema is the plain string the
+/// state-reading rows declare, so the flat `computer_use` tool, which gives
+/// every `text_filter` one shared description, advertises the same bytes.
+pub fn v25_from_v24(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if NAME_RESOLVED_ROW_IDS.contains(&capability.as_str()) {
+            row["result_schema"]["properties"]["matched_app"] = json!({
+                "type":"string",
+                "description":"The full name of the running application the target named only in part (a prefix or whole words of its name); present only then.",
+            });
+        }
+        if capability == "computer.list_apps" {
+            row["request_schema"]["properties"]["text_filter"] = json!({
+                "type":"string",
+                "description":"Keep only applications whose name or bundle identity contains this text, ignoring case.",
+            });
+        }
+    }
+    next
+}

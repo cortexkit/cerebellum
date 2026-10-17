@@ -503,7 +503,7 @@ pub(super) fn queued_refusal(
 fn valid_request(capability: Servable, arguments: &Value) -> Result<(), Value> {
     match capability.0 {
         Served::ReadState => super::parse_read_state_request(arguments).map(|_| ()),
-        Served::ListApps => super::parse_list_apps_request(arguments),
+        Served::ListApps => super::parse_list_apps_request(arguments).map(|_| ()),
         Served::Wait => super::parse_wait_request(arguments).map(|_| ()),
         Served::PressElement => super::element_actions::parse_press_element(arguments).map(|_| ()),
         Served::PressPoint => super::element_actions::parse_press_point(arguments).map(|_| ()),
