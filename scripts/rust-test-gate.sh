@@ -68,12 +68,20 @@ acquire_gate_lock() {
   echo $$ > "$GATE_LOCK/holder"
 }
 
+parallel_phase_dir=
+parallel_phase_labels=()
+parallel_phase_pids=()
+parallel_phase_logs=()
+
 release_gate_lock() {
+  [ -n "${parallel_phase_dir:-}" ] && rm -rf "$parallel_phase_dir"
   [ -n "${GATE_LOCK:-}" ] && rm -rf "$GATE_LOCK"
 }
 
 acquire_gate_lock
 trap release_gate_lock EXIT INT TERM HUP QUIT
+parallel_phase_dir="$gate_target_dir/rust-test-gate-phases.$$"
+mkdir "$parallel_phase_dir"
 
 # An upper bound on a single phase, so a test that waits on something which
 # never arrives fails loudly instead of holding the machine until someone
@@ -121,6 +129,70 @@ run_phase() {
   echo "    ok ($((SECONDS - started))s)"
 }
 
+# These source-only and script checks use separate scratch paths and do not
+# invoke Cargo, so they can overlap without competing for the shared build tree.
+start_parallel_phase() {
+  local label="$1"
+  shift
+  local index="${#parallel_phase_pids[@]}"
+  local log="$parallel_phase_dir/$index.log"
+  parallel_phase_logs+=("$log")
+  parallel_phase_labels+=("$label")
+  echo "==> starting independent phase: $label"
+  (
+    set +m
+    phase_started=$SECONDS
+    echo "==> $label"
+    if "$@"; then
+      echo "    ok ($((SECONDS - phase_started))s)"
+    else
+      status=$?
+      echo "GATE FAILED: $label" >&2
+      exit "$status"
+    fi
+  ) >"$log" 2>&1 &
+  parallel_phase_pids+=("$!")
+}
+
+wait_parallel_phases() {
+  local failed=0 index waited timed_out
+  for index in "${!parallel_phase_pids[@]}"; do
+    waited=0
+    timed_out=0
+    while kill -0 "${parallel_phase_pids[$index]}" 2>/dev/null; do
+      if [ "$waited" -ge "$GATE_PHASE_TIMEOUT_S" ]; then
+        timed_out=1
+        kill -TERM "-${parallel_phase_pids[$index]}" 2>/dev/null || \
+          kill -TERM "${parallel_phase_pids[$index]}" 2>/dev/null || true
+        sleep 5
+        kill -KILL "-${parallel_phase_pids[$index]}" 2>/dev/null || \
+          kill -KILL "${parallel_phase_pids[$index]}" 2>/dev/null || true
+        break
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if [ "$timed_out" -eq 1 ]; then
+      wait "${parallel_phase_pids[$index]}" 2>/dev/null || true
+      echo "PHASE EXCEEDED ITS BOUND: ${parallel_phase_labels[$index]}" >>"${parallel_phase_logs[$index]}"
+      echo "GATE FAILED: ${parallel_phase_labels[$index]} did not finish within ${GATE_PHASE_TIMEOUT_S}s" >>"${parallel_phase_logs[$index]}"
+      failed=1
+    elif wait "${parallel_phase_pids[$index]}"; then
+      :
+    else
+      failed=1
+    fi
+    cat "${parallel_phase_logs[$index]}"
+  done
+  parallel_phase_pids=()
+  parallel_phase_logs=()
+  parallel_phase_labels=()
+  if [ "$failed" -ne 0 ]; then
+    echo "GATE FAILED: one or more independent source/script phases" >&2
+    exit 1
+  fi
+}
+
 # Phase 0: refuse to certify a tree in which a guard may still be deliberately
 # broken. `scripts/mutate.sh` weakens a mechanism on purpose to see whether any
 # test notices, and restores it afterwards -- but a hard kill runs no restore and
@@ -140,16 +212,9 @@ check_no_mutation_in_progress() {
 run_phase "no mutation left in the working tree" \
   check_no_mutation_in_progress
 
-run_phase "extension tests (nonzero test count required)" \
-  node extension/test-gate.mjs
-
-# Registry checksums and git revisions in Cargo.lock replace sibling source pins.
-# Check every manifest, including target-specific and test dependencies, before
-# Cargo runs so an external checkout can never become an implicit build input.
-run_phase "path dependency guard planted-violation self-tests" \
-  scripts/check-repo-path-deps.sh --self-test
-run_phase "repository-contained path dependencies" \
-  scripts/check-repo-path-deps.sh
+check_path_dependencies() {
+  scripts/check-repo-path-deps.sh --self-test && scripts/check-repo-path-deps.sh
+}
 
 # Phase 0c: no test may build a plane that journals to the operator's disk.
 #
@@ -200,9 +265,6 @@ check_tests_do_not_journal_durably() {
   return "$status"
 }
 
-run_phase "no test journals to the operator's disk" \
-  check_tests_do_not_journal_durably
-
 # A preflight is a reading, not a request. A test that calls one of the
 # requesting APIs can put a system dialog on the desk running the gate, so the
 # source guard uses the same Rust-aware test-code regions as the journal scan
@@ -215,9 +277,6 @@ check_tests_do_not_request_macOS_permissions() {
   }
   python3 scripts/lib/mac-permission-request-scan.py .
 }
-
-run_phase "no test requests macOS permissions" \
-  check_tests_do_not_request_macOS_permissions
 
 # A real daemon execs a test module through the privacy trampoline, so both the
 # smoke launch and the configured module path must be ckdev links. Check each
@@ -232,8 +291,19 @@ check_test_binaries_use_ckdev_names() {
   python3 scripts/lib/ckdev-naming-scan.py .
 }
 
-run_phase "test and script ck-* executions use ckdev names" \
-  check_test_binaries_use_ckdev_names
+# These preflight checks use independent inputs and scratch paths. The path
+# dependency proof invokes Cargo only in those scratch repositories; no workspace
+# targets are built here. Keep workspace format, lint, and test builds serialized.
+not_verified=
+start_parallel_phase "extension tests (nonzero test count required)" node extension/test-gate.mjs
+start_parallel_phase "repository-contained path dependencies" check_path_dependencies
+start_parallel_phase "no test journals to the operator's disk" check_tests_do_not_journal_durably
+start_parallel_phase "no test requests macOS permissions" check_tests_do_not_request_macOS_permissions
+start_parallel_phase "test and script ck-* executions use ckdev names" check_test_binaries_use_ckdev_names
+start_parallel_phase "scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
+start_parallel_phase "scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
+start_parallel_phase "scripts/watch-ci.test.sh" scripts/watch-ci.test.sh
+wait_parallel_phases
 
 # Phase 1: format workspace members. Keep the scope explicit so only this
 # repository's source is checked, and refuse an empty member list.
@@ -250,13 +320,6 @@ check_members_formatted() {
 }
 run_phase "workspace members are formatted" \
   check_members_formatted
-
-# Phase 2: structural wiring. A module that exists on disk but is not declared
-# in its crate root compiles only where a test includes it explicitly, so dead
-# code inside it is never reported and nothing outside a test can call it. That
-# state is indistinguishable from a module nobody remembered to wire up.
-run_phase "scripts/module-wiring-gate.sh" \
-  ./scripts/module-wiring-gate.sh
 
 # Phase 3: clippy with warnings as errors, across all targets.
 run_phase "cargo clippy --locked --workspace --all-targets --quiet -- -D warnings" \
@@ -288,12 +351,10 @@ run_phase "cargo clippy --locked --workspace --all-targets --quiet -- -D warning
 # Every phase this host could not run, collected for the verdict line. A skip
 # printed only mid-log is invisible to anyone who reads the last line, which is
 # the line this script tells them to read.
-not_verified=
 
-# Ubuntu CI runs this gate natively, where the host clippy phase checks Linux.
-# On macOS the same CI run supplies that signal; on Linux the host phase already
-# supplies it locally. Keep the cross lane available for operators who explicitly
-# request it, but do not spend a second build on a signal CI already provides.
+# On macOS, CI's native Linux job supplies the Linux lint result. On Linux, the
+# host clippy phase above already checks Linux, so a second cross-build is
+# unnecessary unless an operator explicitly requests it.
 host_os="$(uname -s)"
 if [ "${CEREBELLUM_GATE_LINUX_LINT:-}" != 1 ] && [ "$host_os" = Linux ]; then
   # The host clippy phase above already linted Linux natively; nothing is
@@ -379,28 +440,12 @@ run_phase "cargo test --locked --workspace --quiet" \
 run_phase "cargo test --locked -p cerebellum --features test-observer --test conformance -- --exact feature_gated_identity_observer_records_resolved_facts" \
   scripts/lib/observer-conformance-gate.sh feature_gated_identity_observer_records_resolved_facts
 
-# Phase 5b: staging refuses a build below the format floor. The gate lives in a
-# script rather than a test, so a test run never exercises it; its proofs point
-# it at scratch floor files, one version above what this tree reads, equal to
-# it, and missing, and never at the operator's data home.
-run_phase "scripts/lib/format-floor-gate.test.sh" \
-  scripts/lib/format-floor-gate.test.sh
-
-# Phase 5b2: the CI watcher that decides whether a train lands must never read
-# a failed GitHub call as a green run. Driven against a fake gh, no network.
-run_phase "scripts/watch-ci.test.sh" \
-  scripts/watch-ci.test.sh
-# Phase 5b3: the train lock's stale-owner recovery never takes a lock another
-# train acquired meanwhile. Drives the real script in a scratch repository.
+# The format-floor tests verify that staging rejects newer journal/browser data;
+# the CI-watcher tests verify that failed GitHub reads and failed runs never look
+# green. The train-lock and signed-binary checks remain after Cargo so an
+# environment failure in those tools cannot prevent the workspace suite running.
 run_phase "scripts/train-push-lock.test.sh" \
   scripts/train-push-lock.test.sh
-
-# Phase 5c: staging and placement refuse a binary without hardened runtime or
-# with get-task-allow, since either lets a same-user debugger read the module.
-# Like the floor gate, the check is a script a test run never reaches, so its
-# proofs run here against ad hoc signed scratch binaries under /tmp. codesign
-# and lipo exist only on macOS, so elsewhere the phase is named as not run
-# rather than passed.
 if [ "$(uname -s)" = Darwin ]; then
   run_phase "scripts/check-placed-hardening.test.sh" \
     scripts/check-placed-hardening.test.sh
@@ -408,6 +453,7 @@ else
   printf '==> SKIPPED: the hardening check needs macOS codesign, so it did not run\n'
   not_verified="$not_verified; hardening check (macOS only)"
 fi
+
 
 # Phase 6: a generated file must be committed in the form its generator emits.
 # An entry that is semantically right but textually different -- a hand-written

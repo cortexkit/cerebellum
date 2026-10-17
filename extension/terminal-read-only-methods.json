@@ -1,0 +1,19 @@
+[
+  "Page.getFrameTree",
+  "Page.getNavigationHistory",
+  "Page.getLayoutMetrics",
+  "Page.captureScreenshot",
+  "Accessibility.enable",
+  "Accessibility.getFullAXTree",
+  "DOM.enable",
+  "DOM.getDocument",
+  "DOM.getFlattenedDocument",
+  "DOM.describeNode",
+  "DOM.resolveNode",
+  "DOM.getBoxModel",
+  "DOM.getOuterHTML",
+  "DOM.getContentQuads",
+  "DOM.getNodeForLocation",
+  "DOM.getFrameOwner",
+  "Runtime.enable"
+]

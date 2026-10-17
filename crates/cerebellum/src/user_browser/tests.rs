@@ -109,6 +109,17 @@ struct DoubleState {
     moving_child: bool,
     child_loader: u64,
     child_ax_unavailable: bool,
+    plan_delay: Duration,
+    consent_delay: Duration,
+    plan_count: usize,
+    attaches: usize,
+    hang_plan: Option<usize>,
+    hang_action: Option<&'static str>,
+    hang_attach: bool,
+    ignore_cancel: bool,
+    stop_after_plan: Option<usize>,
+    cancel_on_stop: bool,
+    terminal: Option<Arc<crate::TerminalArbiter>>,
 }
 
 /// Cingulate as the site-card tests need it: every card is answered at once
@@ -152,6 +163,10 @@ impl CingulateRoute for SiteCingulateRoute {
                     Ok(json!({"elicitation_id": format!("el_site_{}", cards.len())}))
                 }
                 wire::CONSENT_AWAIT => {
+                    let delay = self.0.state.lock().unwrap().consent_delay;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let choice = self.0.decision.lock().unwrap().clone();
                     Ok(json!({"elicitation_id":id,"state":"answered","answered_choice_id":choice}))
                 }
@@ -272,9 +287,16 @@ impl Fixture {
         let worker = tokio::spawn(async move {
             let mut pending = BTreeMap::new();
             while let Some(message) = commands.recv().await {
+                if !bridge.should_send(&message) {
+                    continue;
+                }
                 match message.body {
                     MessageBody::Attach { route, command } => {
+                        worker_state.lock().unwrap().attaches += 1;
                         pending.insert(message.id, (route, command));
+                        if worker_state.lock().unwrap().hang_attach {
+                            continue;
+                        }
                         bridge.receive_for_policy_test(Message {
                             id: message.id,
                             epoch,
@@ -284,6 +306,12 @@ impl Fixture {
                     MessageBody::Dispatch => {
                         let (route, command) = pending.remove(&message.id).unwrap();
                         let mut state = worker_state.lock().unwrap();
+                        let cdp = command["action"] == "cdp";
+                        if cdp {
+                            state.plan_count += 1;
+                        }
+                        let hanging = (cdp && state.hang_plan == Some(state.plan_count))
+                            || state.hang_action == command["action"].as_str();
                         let result = execute(&mut state, route, epoch, &command);
                         let input = result.as_ref().is_ok_and(|(_, input)| *input);
                         bridge.receive_for_policy_test(Message {
@@ -305,11 +333,38 @@ impl Fixture {
                                 detached: true,
                             },
                         };
-                        bridge.receive_for_policy_test(Message {
-                            id: message.id,
-                            epoch,
-                            body,
-                        });
+                        if cdp && state.stop_after_plan == Some(state.plan_count) {
+                            state
+                                .terminal
+                                .as_ref()
+                                .unwrap()
+                                .stop(if state.cancel_on_stop {
+                                    crate::TerminalCause::Cancelled
+                                } else {
+                                    crate::TerminalCause::Deadline
+                                });
+                        }
+                        if !hanging {
+                            let bridge = bridge.clone();
+                            let delay = if cdp {
+                                state.plan_delay
+                            } else {
+                                Duration::ZERO
+                            };
+                            let reply = Message {
+                                id: message.id,
+                                epoch,
+                                body,
+                            };
+                            if delay.is_zero() {
+                                bridge.receive_for_policy_test(reply);
+                            } else {
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    bridge.receive_for_policy_test(reply);
+                                });
+                            }
+                        }
                         if input && state.human_after_input {
                             state.human_after_input = false;
                             state
@@ -323,6 +378,9 @@ impl Fixture {
                         release_double(&mut worker_state.lock().unwrap(), route)
                     }
                     MessageBody::Cancel => {
+                        if worker_state.lock().unwrap().ignore_cancel {
+                            continue;
+                        }
                         pending.remove(&message.id);
                         bridge.receive_for_policy_test(Message {
                             id: message.id,
@@ -370,6 +428,54 @@ impl Fixture {
             .await
             .unwrap();
         }));
+        Started {
+            corr,
+            replies,
+            task,
+        }
+    }
+
+    // Run the production handler under the frame loop's terminal arbiter. Keep
+    // its handle so the scripted extension can stop dispatch between plans.
+    fn start_arbitrated(&self, args: Value) -> Started {
+        self.start_arbitrated_with_limit(
+            args,
+            Duration::from_millis(crate::budgets::BROWSER_ENVELOPE_MS),
+        )
+    }
+
+    fn start_arbitrated_with_limit(&self, args: Value, limit: Duration) -> Started {
+        *self.site.decision.lock().unwrap() = "allow_30m".into();
+        let corr = self.corr.fetch_add(1, Ordering::Relaxed);
+        let frame = tool_frame(1, corr, args);
+        let terminal = Arc::new(crate::TerminalArbiter::new(frame.clone()));
+        self.state.lock().unwrap().terminal = Some(Arc::clone(&terminal));
+        let registration = self.planes.cancellations.register((1, 1, corr));
+        *registration.handle.0.terminal.lock().unwrap() = Some(Arc::downgrade(&terminal));
+        let (writer, replies) = mpsc::channel(16);
+        let (proxy, outgoing) = mpsc::channel(16);
+        let planes = self.planes.clone();
+        let worker_planes = Arc::clone(&planes);
+        let arrival = crate::browser_queue::arrive(&frame, &planes);
+        let guard = Arc::new(planes.health.enter_request());
+        let now = tokio::time::Instant::now();
+        let task = tokio::spawn(crate::terminal_arbiter::run_arbitrated_route(
+            Box::pin(async move {
+                crate::browser_queue::scope(
+                    arrival,
+                    crate::handle_route_request(frame, &proxy, &worker_planes),
+                )
+                .await
+            }),
+            outgoing,
+            writer,
+            (*planes).clone(),
+            registration,
+            guard,
+            terminal,
+            now + limit,
+            now + Duration::from_millis(crate::budgets::BROWSER_REPLY_MAX_MS),
+        ));
         Started {
             corr,
             replies,
@@ -2295,6 +2401,79 @@ async fn credential_field_in_a_child_is_refused_even_with_its_origin_granted() {
     }
 }
 
+// Keep the driver runnable between clock steps so filesystem workers finish
+// without Tokio jumping straight to a far-away action deadline.
+async fn clocked_reply(mut call: Started, max_seconds: u64) -> Value {
+    for _ in 0..=max_seconds * 10 {
+        for _ in 0..64 {
+            if let Ok(frame) = call.replies.try_recv() {
+                call.task.await.unwrap();
+                assert!(call.replies.try_recv().is_err());
+                return serde_json::from_slice(&frame.body).unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+    }
+    panic!("no terminal reply inside the declared allowance");
+}
+
+#[tokio::test]
+async fn user_snapshot_maximum_plans_complete_inside_its_budget() {
+    let f = Fixture::new();
+    f.state.lock().unwrap().top_level_only = true;
+    let tab = f.claim(1).await;
+    f.snapshot(1, &tab, "allow_30m").await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.plan_count = 0;
+        state.plan_delay = Duration::from_secs(23);
+    }
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let reply = clocked_reply(
+        f.start_arbitrated(json!({
+            "browser":"user","action":"snapshot","tab":tab,"mode":"dom_full"
+        })),
+        130,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(f.state.lock().unwrap().plan_count, 5);
+    assert!(start.elapsed() <= Duration::from_millis(crate::budgets::USER_SNAPSHOT.work_ms));
+}
+
+#[tokio::test]
+async fn user_slow_type_and_hanging_last_plan_end_at_the_shared_action_deadline() {
+    for hanging in [false, true] {
+        let f = Fixture::new();
+        let tab = f.claim(1).await;
+        let (snapshot, _) = f.snapshot(1, &tab, "allow_30m").await;
+        let args = json!({"browser":"user","action":"type","tab":tab,
+            "ref":reference(&snapshot,"textbox"),"text":"hello"});
+        {
+            let mut state = f.state.lock().unwrap();
+            state.plan_count = 0;
+            state.plan_delay = Duration::from_secs(27);
+            state.hang_plan = hanging.then_some(10);
+        }
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let allowance = crate::budgets::USER_TYPE.work_ms;
+        let reply = clocked_reply(f.start_arbitrated(args), allowance / 1000 + 6).await;
+        assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+        assert_eq!(
+            reply["detail"]["reason"], "action_deadline_exceeded",
+            "{reply}"
+        );
+        assert_eq!(reply["detail"]["dispatched"], true);
+        assert_eq!(f.state.lock().unwrap().plan_count, 10);
+        assert!(start.elapsed() >= Duration::from_millis(allowance));
+        assert!(start.elapsed() <= Duration::from_millis(allowance + 100));
+        tokio::time::resume();
+    }
+}
+
 #[tokio::test]
 async fn ambiguous_child_pair_keeps_top_level_and_normal_child_readable() {
     let fixture = Fixture::new();
@@ -2473,4 +2652,460 @@ async fn a_child_without_an_accessibility_tree_does_not_hide_the_top_page() {
     assert!(text.contains("Message"));
     assert!(text.contains("[embedded frame not readable: stale]"));
     assert!(!text.contains("Child message"));
+}
+
+#[tokio::test]
+async fn user_consent_wait_pauses_work_without_lending_unused_park_time() {
+    let f = Fixture::new();
+    f.state.lock().unwrap().top_level_only = true;
+    let tab = f.claim(1).await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.plan_count = 0;
+        state.plan_delay = Duration::from_secs(23);
+        state.consent_delay = Duration::from_secs(60);
+    }
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let reply = clocked_reply(
+        f.start_arbitrated(json!({
+            "browser":"user","action":"snapshot","tab":tab,"mode":"dom_full"
+        })),
+        190,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(f.state.lock().unwrap().plan_count, 5);
+    assert!(start.elapsed() > Duration::from_millis(crate::budgets::USER_SNAPSHOT.work_ms));
+    assert!(
+        start.elapsed() <= Duration::from_millis(crate::budgets::USER_SNAPSHOT.work_ms + 60_000)
+    );
+}
+
+#[tokio::test]
+async fn user_deadline_before_dispatch_reports_no_effect_and_no_late_dispatch() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.hang_attach = true;
+        state.plan_count = 0;
+    }
+    tokio::time::pause();
+    let reply = clocked_reply(
+        f.start_arbitrated_with_limit(snapshot_args(&tab), Duration::from_secs(1)),
+        8,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "action_deadline_exceeded", "{reply}");
+    assert_eq!(reply["detail"]["dispatched"], false);
+    assert_eq!(f.state.lock().unwrap().plan_count, 0);
+}
+
+#[tokio::test]
+async fn user_gate_closure_prevents_the_next_plan() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    f.snapshot(1, &tab, "allow_30m").await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.plan_count = 0;
+        state.attaches = 0;
+        state.stop_after_plan = Some(1);
+    }
+    tokio::time::pause();
+    let reply = clocked_reply(f.start_arbitrated(snapshot_args(&tab)), 8).await;
+    assert_eq!(reply["outcome"], "action_deadline_exceeded", "{reply}");
+    assert_eq!(
+        f.state.lock().unwrap().attaches,
+        1,
+        "no attachment may begin after terminal ownership closes dispatch"
+    );
+    assert_eq!(f.state.lock().unwrap().plan_count, 1);
+}
+
+#[tokio::test]
+async fn user_cancel_after_a_mutating_plan_reports_outcome_unknown() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    let (snapshot, _) = f.snapshot(1, &tab, "allow_30m").await;
+    let args = click(&tab, &snapshot, &reference(&snapshot, "Go"));
+    {
+        let mut state = f.state.lock().unwrap();
+        state.plan_count = 0;
+        // Debugger-agent setup is read-only. Stop after the mouse gesture so
+        // the unknown outcome still proves that actual mutation was admitted.
+        state.stop_after_plan = Some(8);
+        state.cancel_on_stop = true;
+    }
+    tokio::time::pause();
+    let reply = clocked_reply(f.start_arbitrated(args), 8).await;
+    assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "cancelled", "{reply}");
+    assert_eq!(reply["detail"]["dispatched"], true);
+}
+
+#[test]
+fn user_plan_mutation_classification_pins_every_admitted_method() {
+    let methods = [
+        ("Page.getNavigationHistory", false),
+        ("Page.getFrameTree", false),
+        ("Page.captureScreenshot", false),
+        ("Page.getLayoutMetrics", false),
+        ("Accessibility.enable", false),
+        ("Accessibility.getFullAXTree", false),
+        ("DOM.enable", false),
+        ("DOM.getFlattenedDocument", false),
+        ("DOM.getOuterHTML", false),
+        ("DOM.getContentQuads", false),
+        ("DOM.getNodeForLocation", false),
+        ("DOM.getFrameOwner", false),
+        ("DOM.resolveNode", false),
+        ("Runtime.enable", false),
+        ("Input.dispatchMouseEvent", true),
+        ("Input.dispatchKeyEvent", true),
+        ("Input.insertText", true),
+        ("DOM.focus", true),
+        ("Emulation.setFocusEmulationEnabled", true),
+        ("Page.navigate", true),
+    ];
+    for (method, expected) in methods {
+        for child in [false, true] {
+            let mut command = command(method, json!({}));
+            if child {
+                command["frame_id"] = json!("foreign");
+                command["loader_id"] = json!("foreign-loader");
+                command["session_id"] = json!("child-target");
+            }
+            assert_eq!(
+                mutating_plan(&json!({"action":"cdp", "commands":[command]})),
+                expected,
+                "{method}, child={child}"
+            );
+        }
+    }
+    for declaration in [
+        functions::SELECT,
+        functions::APPEND_CARET,
+        functions::HAS_FOCUS,
+        "function() { return true; }",
+    ] {
+        assert_eq!(
+            mutating_plan(
+                &json!({"action":"cdp", "commands":[command("Runtime.callFunctionOn", json!({"functionDeclaration":declaration}))]})
+            ),
+            declaration != functions::HAS_FOCUS,
+            "{declaration}"
+        );
+    }
+    assert!(mutating_plan(
+        &json!({"action":"cdp","commands":[command("Runtime.callFunctionOn", json!({"functionDeclaration":format!("{} ", functions::HAS_FOCUS)}))]})
+    ));
+    for method in ["DOM.getDocument", "DOM.describeNode", "DOM.getBoxModel"] {
+        assert!(!mutating_plan(
+            &json!({"action":"cdp", "commands":[command(method, json!({}))]})
+        ));
+    }
+    assert!(!mutating_plan(&json!({"action":"status"})));
+    for action in ["open_tab", "claim_tab", "close", "unknown"] {
+        assert!(mutating_plan(&json!({"action":action})), "{action}");
+    }
+    for method in [
+        "DOM.newReadMethod",
+        "Runtime.evaluate",
+        "Target.setAutoAttach",
+        "Page.createIsolatedWorld",
+        "",
+    ] {
+        for child in [false, true] {
+            let mut command = command(method, json!({}));
+            if child {
+                command["frame_id"] = json!("foreign");
+                command["loader_id"] = json!("foreign-loader");
+                command["session_id"] = json!("child-target");
+            }
+            assert!(
+                mutating_plan(&json!({"action":"cdp", "commands":[command]})),
+                "{method}, child={child}"
+            );
+        }
+    }
+    assert!(mutating_plan(
+        &json!({"action":"cdp","commands":[command("Page.getFrameTree", json!({})), command("Input.insertText", json!({}))]})
+    ));
+}
+
+#[tokio::test]
+async fn user_stuck_mouse_plan_quarantines_the_tab_before_the_next_call() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    let (snapshot, _) = f.snapshot(1, &tab, "allow_30m").await;
+    let args = click(&tab, &snapshot, &reference(&snapshot, "Go"));
+    {
+        let mut state = f.state.lock().unwrap();
+        state.plan_count = 0;
+        state.hang_plan = Some(8);
+        state.ignore_cancel = true;
+    }
+    tokio::time::pause();
+    let reply = clocked_reply(
+        f.start_arbitrated_with_limit(args, Duration::from_secs(1)),
+        8,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+    assert_eq!(reply["detail"]["held_state"], "unknown", "{reply}");
+    let before = f.state.lock().unwrap().attaches;
+    let next = clocked_reply(f.start_arbitrated(snapshot_args(&tab)), 8).await;
+    assert_eq!(next["outcome"], "target_busy", "{next}");
+    assert_eq!(next["detail"]["reason"], "held_input_unconfirmed", "{next}");
+    assert_eq!(next["detail"]["dispatched"], false);
+    assert_eq!(f.state.lock().unwrap().attaches, before);
+}
+
+#[tokio::test]
+async fn user_first_claim_keeps_quarantine_until_a_new_connection() {
+    let f = Fixture::new();
+    {
+        let mut state = f.state.lock().unwrap();
+        state.hang_action = Some("claim_tab");
+        state.ignore_cancel = true;
+    }
+    tokio::time::pause();
+    let reply = clocked_reply(
+        f.start_arbitrated_with_limit(
+            json!({
+                "browser":"user","action":"claim_tab","tab":"handed"
+            }),
+            Duration::from_secs(1),
+        ),
+        8,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+    assert_eq!(reply["detail"]["held_state"], "none_held");
+    let next = clocked_reply(f.start_arbitrated(snapshot_args("handed")), 8).await;
+    assert_eq!(next["outcome"], "target_busy", "{next}");
+    assert!(next["detail"].get("reason").is_none(), "{next}");
+    tokio::time::advance(Duration::from_secs(3)).await;
+    until(|| f.planes.user_browser.connected_epoch().is_none()).await;
+    let (epoch, _commands) = f.planes.user_browser.connect_for_policy_test();
+    // A new extension connection has detached all work from the old one and
+    // rotates tab handles; old quarantine must not mask normal ownership checks.
+    let frame = tool_frame(1, 999, snapshot_args("handed"));
+    let arrival = crate::browser_queue::arrive(&frame, &f.planes);
+    let registration = f.planes.cancellations.register((1, 1, 999));
+    let lane =
+        crate::browser_queue::scope(arrival, crate::browser_queue::enter(&frame, &f.planes)).await;
+    assert!(lane.is_ok());
+    let unclaimed = f
+        .planes
+        .user_browser
+        .target()
+        .owned(
+            Route {
+                channel: 1,
+                epoch: 1,
+            },
+            "handed",
+            epoch,
+        )
+        .unwrap_err();
+    assert_eq!(unclaimed["reason"], "tab_not_claimed_by_route");
+    drop(lane);
+    drop(registration);
+}
+
+#[tokio::test]
+async fn child_frame_reads_never_mark_the_call_dispatched() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let f = Fixture::new();
+        let tab = f.claim(1).await;
+        f.state.lock().unwrap().commands.clear();
+        let reply = f
+            .finish(f.start_arbitrated(
+                json!({"browser":"user","action":"snapshot","tab":tab,"mode":mode}),
+            ))
+            .await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        let state = f.state.lock().unwrap();
+        assert!(state
+            .commands
+            .iter()
+            .any(
+                |plan| plan["commands"].as_array().is_some_and(|commands| commands
+                    .iter()
+                    .any(|command| command["frame_id"] == "foreign"
+                        && command["session_id"] == "child-target"))
+            ));
+        assert!(state.commands.iter().all(|plan| !mutating_plan(plan)));
+        let terminal = state.terminal.as_ref().unwrap();
+        assert!(
+            !terminal.gate_dispatched.load(Ordering::SeqCst),
+            "{mode} read entered the mutation gate"
+        );
+        assert!(
+            !terminal.witness.committed(),
+            "{mode} read committed the dispatch witness"
+        );
+        assert!(
+            !state
+                .terminal
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .possibly_dispatched,
+            "{mode} read marked terminal dispatch"
+        );
+        assert!(state.inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_click_and_type_pass_through_the_mutating_dispatch_gate() {
+    for action in ["click", "type"] {
+        let f = Fixture::new();
+        let tab = f.claim(1).await;
+        let (snapshot, _) = f.snapshot(1, &tab, "allow_30m").await;
+        let args = if action == "click" {
+            click(&tab, &snapshot, &reference(&snapshot, "Child go"))
+        } else {
+            json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"hello"})
+        };
+        f.state.lock().unwrap().commands.clear();
+        let reply = f.finish(f.start_arbitrated(args)).await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        let state = f.state.lock().unwrap();
+        assert!(
+            state
+                .terminal
+                .as_ref()
+                .unwrap()
+                .gate_dispatched
+                .load(Ordering::SeqCst),
+            "{action} bypassed the mutating dispatch gate"
+        );
+        assert!(
+            state
+                .terminal
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .possibly_dispatched,
+            "{action} bypassed the terminal dispatch gate"
+        );
+        let mutations: Vec<_> = state
+            .commands
+            .iter()
+            .filter(|plan| mutating_plan(plan))
+            .collect();
+        assert!(!mutations.is_empty());
+        assert!(mutations.iter().all(|plan| plan["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| command["frame_id"] == "foreign"
+                && command["session_id"] == "child-target")));
+        let expected = if action == "click" {
+            "Input.dispatchMouseEvent"
+        } else {
+            "Input.insertText"
+        };
+        assert!(state.inputs.iter().any(|method| method == expected));
+    }
+}
+
+#[tokio::test]
+async fn child_read_plans_spend_the_parent_actions_remaining_allowance() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    f.snapshot(1, &tab, "allow_30m").await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.commands.clear();
+        state.plan_count = 0;
+        state.plan_delay = Duration::from_secs(23);
+    }
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let allowance = crate::budgets::USER_SNAPSHOT.work_ms;
+    let reply = clocked_reply(
+        f.start_arbitrated(
+            json!({"browser":"user","action":"snapshot","tab":tab,"mode":"dom_full"}),
+        ),
+        allowance / 1000 + 6,
+    )
+    .await;
+    assert_eq!(reply["outcome"], "action_deadline_exceeded", "{reply}");
+    assert_eq!(reply["detail"]["dispatched"], false);
+    assert!(start.elapsed() >= Duration::from_millis(allowance));
+    assert!(start.elapsed() <= Duration::from_millis(allowance + 1_000));
+    let completed = {
+        let state = f.state.lock().unwrap();
+        assert!(state
+            .commands
+            .iter()
+            .any(
+                |plan| plan["commands"].as_array().is_some_and(|commands| commands
+                    .iter()
+                    .any(|command| command["frame_id"] == "foreign"
+                        && command["session_id"] == "child-target"))
+            ));
+        assert!(
+            state.plan_count < 8,
+            "the child must not receive time for a fresh eight-plan snapshot"
+        );
+        state.plan_count
+    };
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        f.state.lock().unwrap().plan_count,
+        completed,
+        "late child replies must not resume work"
+    );
+}
+
+#[tokio::test]
+async fn child_type_keeps_the_same_deadline_after_switching_sessions() {
+    let f = Fixture::new();
+    let tab = f.claim(1).await;
+    let (snapshot, _) = f.snapshot(1, &tab, "allow_30m").await;
+    let args = json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"hello"});
+    let (warmup, _) = f.call(1, args.clone(), "allow_30m").await;
+    assert_eq!(warmup["outcome"], "ok", "{warmup}");
+    {
+        let mut state = f.state.lock().unwrap();
+        state.commands.clear();
+        state.plan_count = 0;
+        state.plan_delay = Duration::from_secs(27);
+        state.hang_plan = Some(10);
+    }
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let allowance = crate::budgets::USER_TYPE.work_ms;
+    let reply = clocked_reply(f.start_arbitrated(args), allowance / 1000 + 6).await;
+    assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "action_deadline_exceeded");
+    assert_eq!(reply["detail"]["dispatched"], true);
+    assert!(start.elapsed() >= Duration::from_millis(allowance));
+    assert!(start.elapsed() <= Duration::from_millis(allowance + 1_000));
+    let state = f.state.lock().unwrap();
+    assert_eq!(state.plan_count, 10);
+    assert!(state
+        .commands
+        .iter()
+        .filter(|plan| mutating_plan(plan))
+        .all(|plan| plan["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| command["frame_id"] == "foreign"
+                && command["session_id"] == "child-target")));
 }

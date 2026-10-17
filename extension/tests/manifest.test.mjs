@@ -86,3 +86,14 @@ test("browser-adapter declarations match all three pins and a one-byte change re
     await assert.rejects(verifyRuntime({ ...command, params: { ...command.params, functionDeclaration: declaration + " " } }), { reason: "unsupported_cdp_method" });
   }
 });
+
+test("terminal read accounting covers frame queries without admitting target mutations", async () => {
+  const readOnly = JSON.parse(await readFile(new URL("../terminal-read-only-methods.json", import.meta.url), "utf8"));
+  for (const method of ["Accessibility.enable", "DOM.enable", "Runtime.enable", "DOM.getFrameOwner", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation"]) {
+    assert.ok(readOnly.includes(method), `${method} must not mark a child read dispatched`);
+    assert.equal(classifyCommand({ method, params: {} }), "read");
+  }
+  for (const method of ["Input.dispatchMouseEvent", "Input.insertText", "DOM.focus", "Runtime.callFunctionOn", "Target.setAutoAttach", "Page.createIsolatedWorld", "DOM.newReadMethod"]) {
+    assert.ok(!readOnly.includes(method), `${method} must not become unconditionally read-only`);
+  }
+});

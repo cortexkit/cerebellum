@@ -209,6 +209,75 @@ async fn catalog_carries_exact_browser_capability_tags() {
     }
 }
 
+#[test]
+fn user_browser_budgets_are_target_specific_and_exhaustive() {
+    use cerebellum::budgets;
+    let expected = [
+        ("open_tab", 82_000, 1, 0),
+        ("claim_tab", 82_000, 1, 0),
+        ("status", 76_000, 1, 0),
+        ("close", 76_000, 1, 0),
+        ("snapshot", 128_000, 5, 1),
+        ("screenshot", 112_000, 4, 1),
+        ("navigate", 158_000, 5, 1),
+        ("click", 192_000, 9, 3),
+        ("click_point", 208_000, 10, 3),
+        ("type", 270_000, 15, 1),
+        ("open_grant", 12_000, 0, 1),
+        ("revoke_access", 12_000, 0, 0),
+    ];
+    assert_eq!(expected.len(), budgets::USER_BROWSER_ACTIONS.len());
+    for (action, work_ms, plans, consent_cards) in expected {
+        let budget = budgets::user_browser(action).unwrap();
+        assert_eq!(budget.action, action);
+        assert_eq!(budget.work_ms, work_ms, "{action}");
+        assert_eq!(
+            budget
+                .phases
+                .iter()
+                .find(|phase| phase.name == "plan_acknowledgements")
+                .map_or(0, |phase| phase.count),
+            plans,
+            "{action}"
+        );
+        assert_eq!(
+            budgets::user_consent_count(action),
+            consent_cards,
+            "{action}"
+        );
+    }
+    for action in [
+        "launch",
+        "scroll",
+        "present",
+        "resume",
+        "import_login",
+        "capture_login",
+    ] {
+        assert_eq!(
+            budgets::user_browser(action),
+            Some(&budgets::USER_UNSUPPORTED)
+        );
+    }
+    assert!(budgets::user_browser("not_an_action").is_none());
+    let own = budgets::BROWSER_ACTIONS
+        .iter()
+        .map(|action| action.work_ms + budgets::CONSENT_PARK_LIMIT_MS);
+    let user = budgets::USER_BROWSER_ACTIONS.iter().map(|action| {
+        action.work_ms + budgets::user_consent_count(action.action) * budgets::USER_CONSENT_MS
+    });
+    let max_action = own.chain(user).max().unwrap();
+    assert_eq!(
+        budgets::BROWSER_REPLY_MAX_MS,
+        budgets::CALL_RECORD_BEGIN_MS
+            + budgets::BROWSER_QUEUE_WAIT_LIMIT_MS
+            + max_action
+            + budgets::TERMINAL_SUFFIX_MS
+    );
+    assert_eq!(budgets::BROWSER_REPLY_MAX_MS, 1_139_001);
+    const { assert!(budgets::BROWSER_REPLY_MAX_MS < 31 * 60 * 1000) };
+}
+
 #[tokio::test]
 async fn catalog_refuses_unknown_inputs_and_omits_disabled_browser() {
     let configured = planes(true);

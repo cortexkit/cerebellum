@@ -156,6 +156,19 @@ Result references do not authorize input or arbitrary JavaScript.
 
 ### Vetted CDP methods
 
+Terminal dispatch accounting uses `terminal-read-only-methods.json`, shared with
+the Rust bridge. A method absent from that array is mutating by default.
+`Accessibility.enable`, `DOM.enable`, and `Runtime.enable` configure only the
+per-action debugger; frame-owner, outer-HTML, quad and hit-test queries observe
+the page without changing it. They are explicitly read-only so a child capture
+does not mark the call dispatched. Input, focus emulation and selection/caret
+changes remain mutating; only the exact pinned focus-check function is exempt.
+
+Choosing a child session does not create a new action or work allowance. Its
+plans use the same Rust dispatch gate and remaining action deadline as the root
+session. Internal child attachment and geometry steps stay within their admitted
+plan; they are not new caller commands and do not extend that deadline.
+
 `commands.mjs` allows **exactly**:
 
 - `Page.getNavigationHistory`, `Page.getFrameTree`, `Page.navigate`, `Page.captureScreenshot`, `Page.getLayoutMetrics`

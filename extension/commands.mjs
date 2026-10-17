@@ -10,6 +10,12 @@ const READ_METHODS = new Set([
   "DOM.enable", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "DOM.getContentQuads", "DOM.getNodeForLocation", "DOM.resolveNode", "DOM.getFrameOwner",
   "Runtime.enable",
 ]);
+// Rust uses terminal-read-only-methods.json to decide whether a request may
+// have changed the page, including when it times out or loses its reply.
+// Debugger enables configure only this action's debugger; frame-owner, HTML,
+// quad and hit-test queries only observe the page, so they are listed there.
+// Unlisted methods count as mutations. Runtime.callFunctionOn is exempt only
+// for the exact native focus-check function documented as HAS_FOCUS in PROTOCOL.md.
 const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "DOM.focus"]);
 
 export function classifyCommand(command) {

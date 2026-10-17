@@ -182,6 +182,7 @@ struct State {
     connection: Option<Connection>,
     replies: BTreeMap<u64, mpsc::Sender<MessageBody>>,
     calls: BTreeMap<u64, (Route, CancelHandle)>,
+    controls: BTreeMap<u64, CallControl>,
 }
 
 struct Inner {
@@ -192,6 +193,50 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct UserBrowserBridge(Arc<Inner>);
+
+#[derive(Clone)]
+struct CallControl {
+    terminal: Option<Arc<crate::TerminalArbiter>>,
+    deadline: Option<tokio::time::Instant>,
+    execution: Option<Arc<crate::user_browser::UserExecution>>,
+    _permits: Option<Arc<crate::blocking_permits::CallPermits>>,
+}
+
+impl CallControl {
+    fn current() -> Self {
+        Self {
+            terminal: crate::TerminalArbiter::current(),
+            deadline: crate::user_browser::EXECUTION
+                .try_with(|execution| execution.deadline())
+                .ok()
+                .or_else(|| crate::call_context::CALL_DEADLINE.try_with(|end| *end).ok()),
+            execution: crate::user_browser::EXECUTION.try_with(Arc::clone).ok(),
+            _permits: crate::user_browser::EXECUTION_PERMITS
+                .try_with(Arc::clone)
+                .ok(),
+        }
+    }
+
+    fn live(&self) -> bool {
+        if self
+            .deadline
+            .is_some_and(|end| tokio::time::Instant::now() >= end)
+        {
+            if let Some(terminal) = &self.terminal {
+                terminal.stop(crate::TerminalCause::Deadline);
+            }
+            return false;
+        }
+        !self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.gate.stopped())
+            && !self
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.stopped())
+    }
+}
 
 impl Default for UserBrowserBridge {
     fn default() -> Self {
@@ -225,6 +270,7 @@ impl UserBrowserBridge {
                 connection: None,
                 replies: BTreeMap::new(),
                 calls: BTreeMap::new(),
+                controls: BTreeMap::new(),
             }),
             lane: tokio::sync::Mutex::new(()),
             target: crate::user_browser::UserBrowser::new(grants),
@@ -276,10 +322,39 @@ impl UserBrowserBridge {
         cancel: CancelHandle,
     ) -> ActionOutcome {
         let bridge = self.clone();
-        // Dropping a caller's future must not strand the debugger attachment.
-        tokio::spawn(async move { bridge.invoke_inner(route, command, cancel).await })
-            .await
-            .expect("bridge action task panicked")
+        let control = CallControl::current();
+        // Dropping the caller must still let the extension detach from Chrome.
+        // Carry its dispatch gate and deadline into cleanup so it cannot start
+        // fresh work after the reply, and retain its permits until cleanup ends.
+        // Tokio does not inherit these task-local values across spawn.
+        tokio::spawn(async move {
+            let action = bridge.invoke_inner(route, command, cancel.clone(), &control);
+            tokio::pin!(action);
+            let outcome = if let Some(end) = control.deadline {
+                tokio::select! {
+                    biased;
+                    outcome = &mut action => outcome,
+                    _ = tokio::time::sleep_until(end) => {
+                        if let Some(terminal) = &control.terminal {
+                            terminal.stop(crate::TerminalCause::Deadline);
+                        }
+                        cancel.cancel();
+                        action.await
+                    }
+                }
+            } else {
+                action.await
+            };
+            if let Some(execution) = &control.execution {
+                execution.finish(!matches!(
+                    outcome.reason,
+                    Some(Reason::CancelDeadline | Reason::ConnectionLost)
+                ));
+            }
+            outcome
+        })
+        .await
+        .expect("bridge action task panicked")
     }
 
     pub fn goodbye(&self, route: Route) {
@@ -363,16 +438,22 @@ impl UserBrowserBridge {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    fn should_send(&self, message: &Message) -> bool {
+    pub(super) fn should_send(&self, message: &Message) -> bool {
         let state = self.state();
         if state.stopped || state.connection.as_ref().map(|c| c.epoch) != Some(message.epoch) {
             return false;
         }
         match message.body {
-            MessageBody::Attach { .. } | MessageBody::Dispatch => state
-                .calls
-                .get(&message.id)
-                .is_some_and(|(_, cancel)| !cancel.is_cancelled()),
+            MessageBody::Attach { .. } | MessageBody::Dispatch => {
+                state
+                    .calls
+                    .get(&message.id)
+                    .is_some_and(|(_, cancel)| !cancel.is_cancelled())
+                    && state
+                        .controls
+                        .get(&message.id)
+                        .is_none_or(CallControl::live)
+            }
             _ => true,
         }
     }
@@ -382,6 +463,7 @@ impl UserBrowserBridge {
         route: Route,
         command: Value,
         cancel: CancelHandle,
+        control: &CallControl,
     ) -> ActionOutcome {
         let (id, epoch, outgoing, mut closed) = {
             let mut state = self.state();
@@ -414,6 +496,7 @@ impl UserBrowserBridge {
         };
         let closed = closed.as_mut().expect("connected action has close signal");
         self.state().calls.insert(id, (route, cancel.clone()));
+        self.state().controls.insert(id, control.clone());
         let _registration = Registration {
             bridge: self.clone(),
             id,
@@ -431,6 +514,22 @@ impl UserBrowserBridge {
             outcome.finish(Terminal::Refused, Some(Reason::ConnectionLost));
             return outcome;
         }
+        if !control.live() {
+            outcome.finish(Terminal::Cancelled, Some(Reason::CancelRequested));
+            return outcome;
+        }
+        if let Some(execution) = &control.execution {
+            execution.begin(false);
+        }
+        let held = command["commands"].as_array().is_some_and(|commands| {
+            commands.iter().any(|command| {
+                matches!(
+                    command["params"]["type"].as_str(),
+                    Some("mousePressed" | "keyDown" | "rawKeyDown")
+                )
+            })
+        });
+        let mutating = crate::user_browser::mutating_plan(&command);
         let attach = Message {
             id,
             epoch,
@@ -476,7 +575,30 @@ impl UserBrowserBridge {
                 epoch,
                 body: MessageBody::Dispatch,
             };
-            match send_message(&outgoing, dispatch, &cancel, closed).await {
+            let allowed = control.live()
+                && (!mutating
+                    || control.terminal.as_ref().is_none_or(|terminal| {
+                        terminal.set_step(crate::CallStep::Dispatch);
+                        terminal.gate.begin_mutation()
+                    }));
+            if allowed {
+                if let Some(execution) = &control.execution {
+                    execution.begin(held);
+                    if held {
+                        if let (Some(terminal), Some(permits)) =
+                            (&control.terminal, &control._permits)
+                        {
+                            execution.release_receipt(terminal, permits);
+                        }
+                    }
+                }
+            }
+            let sent = if allowed {
+                send_message(&outgoing, dispatch, &cancel, closed).await
+            } else {
+                Err(Reason::CancelRequested)
+            };
+            match sent {
                 Ok(()) => {
                     outcome.phases.push(ActionPhase::Dispatched);
                     outcome.input_dispatched = None;
@@ -684,6 +806,7 @@ impl Drop for Registration {
     fn drop(&mut self) {
         let mut state = self.bridge.state();
         state.calls.remove(&self.id);
+        state.controls.remove(&self.id);
         state.replies.remove(&self.id);
     }
 }
