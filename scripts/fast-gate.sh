@@ -7,10 +7,11 @@ cd "$repo_root"
 
 base="${FAST_GATE_BASE:-origin/main}"
 self_test=0
+mutations=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
-      [ "$#" -ge 2 ] || { echo "usage: $0 [--base REF] [--self-test]" >&2; exit 2; }
+      [ "$#" -ge 2 ] || { echo "usage: $0 [--base REF] [--self-test] [--mutations]" >&2; exit 2; }
       base="$2"
       shift 2
       ;;
@@ -18,13 +19,17 @@ while [ "$#" -gt 0 ]; do
       self_test=1
       shift
       ;;
+    --mutations)
+      mutations=1
+      shift
+      ;;
     -h|--help)
-      echo "usage: $0 [--base REF] [--self-test]"
+      echo "usage: $0 [--base REF] [--self-test] [--mutations]"
       exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
-      echo "usage: $0 [--base REF] [--self-test]" >&2
+      echo "usage: $0 [--base REF] [--self-test] [--mutations]" >&2
       exit 2
       ;;
   esac
@@ -220,16 +225,6 @@ wait_static_phases() {
   fi
 }
 
-check_no_mutation_marker() {
-  local marker
-  marker="$(git rev-parse --git-dir)/mutation-in-progress"
-  if [ -e "$marker" ]; then
-    echo "mutation-in-progress marker exists: $marker" >&2
-    return 1
-  fi
-}
-
-run_phase "no mutation-in-progress marker" check_no_mutation_marker
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
 start_static_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 wait_static_phases
@@ -336,6 +331,10 @@ if [ "${#all_suites[@]}" -gt 0 ]; then
   if [ "${#skipped_suites[@]}" -gt 0 ]; then
     echo "==> SKIP: integration suites without changed source/module paths: ${skipped_suites[*]}"
   fi
+fi
+
+if [ "$mutations" -eq 1 ]; then
+  run_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
 fi
 
 echo "FAST GATE PASSED: all selected phases are green"

@@ -1,0 +1,139 @@
+
+[[control]]
+id = "browser-credential-classification"
+guards = "credential fields remain ineligible for browser typing"
+file = "crates/cerebellum/src/browser_type.rs"
+old = "credential,"
+new = "credential: false,"
+edits = []
+test_file = "crates/cerebellum/src/browser_type.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser_type::tests::credential_and_financial_targets_are_refused_before_authorization"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn classification(&self) -> ClassificationRecord {"
+before = """
+
+    }
+}"""
+
+
+[[control]]
+id = "public-web-baseline-tier-floor"
+guards = "ordinary public reads through compose tier use the public-web baseline"
+file = "crates/cerebellum/src/authorization.rs"
+old = "required.tier <= COMPOSE"
+new = "false"
+edits = []
+test_file = "crates/cerebellum/tests/it/browser_standing_grants.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["browser_standing_grants::baseline_public_reads_and_ordinary_clicks_need_no_card"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn public_web_baseline_covers("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "user-browser-input-uses-child-frame-origin"
+guards = "input authorization is scoped to the selected child frame origin"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "let input_origin = origin(&frame.origin)?;"
+new = "let input_origin = origin(&current.committed.url)?;"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::cross_origin_child_typing_requires_its_own_origin_card"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "// An ungranted frame cannot even be classified for input."
+before = 'let requested = if action == "type" {'
+
+
+[[control]]
+id = "browser-downloads-stay-denied"
+guards = "owned Chrome sessions deny downloads before browser activity"
+file = "crates/cerebellum/src/browser/navigation/mod.rs"
+old = '{"behavior":"deny","eventsEnabled":true}'
+new = '{"behavior":"allow","eventsEnabled":true}'
+edits = []
+test_file = "crates/cerebellum/tests/it/browser_busy_dispatch.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["b1_s3_browser::busy_dispatch::an_attachment_click_is_blocked_without_writing_downloads_even_after_relaunch"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn ensure_downloads_denied<"
+before = "fn command<"
+
+
+[[control]]
+id = "user-browser-read-only-plan-classification"
+guards = "read-only user-browser actions are classified as non-mutating plans"
+file = "crates/cerebellum/src/user_browser.rs"
+old = 'Some("status") => false,'
+new = 'Some("status") => true,'
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::user_plan_mutation_classification_pins_every_admitted_method"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(super) fn mutating_plan("
+before = "fn mutating_commands("
+
+[[control]]
+id = "public-web-predicate-requires-listed-domain"
+guards = "the public-web baseline applies only to listed registrable domains"
+file = "crates/cerebellum/src/browser_standing_grants.rs"
+old = "crate::public_suffix::registrable_domain_listed(host).is_some()"
+new = "false"
+edits = []
+test_file = "crates/cerebellum/tests/it/browser_standing_grants.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["browser_standing_grants::baseline_public_reads_and_ordinary_clicks_need_no_card"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn origin_is_public("
+before = """
+
+}
+"""

@@ -1,0 +1,111 @@
+
+[[control]]
+id = "person-focus-change-refuses-input"
+guards = "input is refused after the person's focused element changes"
+file = "crates/cerebellum-computer/src/app_state/person.rs"
+old = "if !same {"
+new = "if false && !same {"
+edits = []
+test_file = "crates/cerebellum/tests/it/computer_person_changes.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["computer_person_changes::after_the_refusal_a_read_lets_the_press_through"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn person_change("
+before = "if let (Reading::Read(before), Reading::Read(after)) = (&seen.window, &now.window) {"
+
+
+[[control]]
+id = "session-ending-chords-remain-blocked"
+guards = "the exact platform session-ending chords are refused"
+file = "crates/cerebellum-computer/src/platform/blocked_chord.rs"
+old = "blocked.platform == platform && blocked.modifiers == modifiers && blocked.key == key"
+new = "false"
+edits = []
+test_file = "crates/cerebellum/tests/it/computer_synthetic.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["computer_synthetic::the_session_floor_holds_every_chord_this_test_names"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn blocked_chord("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "process-generation-must-match-at-dispatch"
+guards = "per-process input refuses a pid whose generation differs from its grant"
+file = "crates/cerebellum-computer/src/platform/process_event.rs"
+old = "observed == target.start_time_micros"
+new = "true"
+edits = []
+test_file = "crates/cerebellum-computer/src/platform/process_event.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = ["platform::process_event::tests::a_recycled_pid_is_refused_by_the_final_generation_read"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn require_exact_generation("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "failed-input-release-remains-unknown"
+guards = "a failed release never claims held input was released"
+file = "crates/cerebellum-computer/src/platform/process_event.rs"
+old = "if unrecoverable {"
+new = "if false {"
+edits = []
+test_file = "crates/cerebellum-computer/src/platform/process_event.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = ["platform::process_event::tests::a_failed_release_reports_the_held_state_as_unknown"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn recover_held_state<"
+before = "/// Proof that one post-time identity check happened."
+
+
+[[control]]
+id = "dispatch-gate-stops-after-terminal"
+guards = "ordinary mutations cannot start after a terminal decision seals dispatch"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "if bits & 2 != 0 {"
+new = "if false {"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["terminal_arbiter::arbiter_egress_tests::second_terminal_cannot_replace_success_or_unknown_and_seals_dispatch"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

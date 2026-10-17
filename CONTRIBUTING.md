@@ -21,7 +21,8 @@ go quickly; the gate exists for the cases where the shape is the question.
 
 - Tests that would fail if the mechanism were wrong: assert the exact value
   an invariant governs, not an inequality that a zero also satisfies, and for
-  a guard, show which named test goes red when the guard is removed.
+  a guard, record which named test goes red when the guard is removed in
+  `mutations.d/`.
 - Business logic in the platform-neutral crates, so Linux CI covers it;
   `crates/cerebellum-macos`, `cerebellum-linux`, and `cerebellum-windows`
   stay thin FFI seams with no decisions in them.
@@ -39,6 +40,22 @@ after deployment. The full gate still runs post-deploy so the running module is
 checked without holding up the common landing path. If that full gate finds a
 failure, fix it forward with a new change; do not roll back the deployed change
 just to make the gate green.
+
+## Mutation proofs
+
+`mutations.d/` replaces the old one-off `scripts/mutate.sh` flow with a replayable
+catalogue: every guard edit is paired with the exact test that must fail. Run
+`scripts/mutations.sh --diff origin/main` before landing to
+replay changed rows narrowly and then replay every catalogue row. The narrow
+selection is not a substitute for the full run; it limits each row to its named
+expected tests and does not audit sibling tests for collateral failures.
+When the selected base predates the catalogue, the wrapper runs every row
+instead of claiming an empty narrow replay.
+
+The regular fast gate stays quick and leaves mutation replay opt-in. To include
+the narrow replay for the fast gate's selected base, run
+`scripts/fast-gate.sh --mutations` (or pass the base explicitly with
+`scripts/fast-gate.sh --base REF --mutations`).
 
 ## Dependencies
 
