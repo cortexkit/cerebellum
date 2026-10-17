@@ -1474,6 +1474,8 @@ impl Context<'_> {
             can_record,
         );
         let body = site_question_with_choices(origin, severity.tier, &grant.hazards, &choices);
+        crate::permission_cards::require_grant_choice(&body, holder.as_ref())
+            .map_err(|error| refusal(error.reason()))?;
         let card = consent_request(
             CardKind::UserBrowserSite,
             &body,

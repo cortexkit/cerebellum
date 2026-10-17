@@ -11,6 +11,174 @@ fn ask(tier: u8, hazards: Value, origin: &str) -> Value {
     json!({"browser":"user","action":"open_grant","origins":[origin],"hazards":hazards,"severity_tier":tier})
 }
 
+const PROBE_CHANNEL: u16 = 9;
+const PROBE_AGENT: &str = "pj-user-browser-probe";
+
+// Use channel-zero admission with the probe's primary head facts and authorized
+// Prefrontal stamp, rather than installing already-accepted facts in the route.
+async fn bind_probe_head(fixture: &Fixture) {
+    use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+    use subc_protocol::session::ModuleControlRequest;
+    use subc_protocol::{BindIdentity, RouteTarget};
+
+    let stamp = ScopeStamp::new(
+        crate::session_caller_principal_for_test().unwrap(),
+        "browser-tests",
+        1,
+        ScopeKind::Head,
+    )
+    .with_attributes(
+        ScopeAttributes::new()
+            .with_agent_id(Some(PROBE_AGENT.into()))
+            .with_delegates(true),
+    )
+    .with_owner_authorized(true);
+    let request = ModuleControlRequest::RouteBind {
+        role_versions: None,
+        call_mode: None,
+        route_channel: PROBE_CHANNEL,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        identity: BindIdentity::new(fixture.registry.clone(), "probe", "user-browser-probe"),
+        principal: crate::session_caller_principal_for_test(),
+        consumer_capabilities: None,
+        admission_facts: Some(json!({"agentProjectId":PROBE_AGENT,"sessionKind":"primary",
+            "effectiveCapabilityScope":["*"],"browserControlOperations":["browser.launch","browser.status","browser.close"]})),
+        scope: Some(stamp),
+    };
+    let frame = Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(2);
+    crate::handle_control_request_for_test_with_bindings(
+        frame,
+        &writer,
+        &fixture.planes.health,
+        &fixture.planes.routes,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replies.recv().await.unwrap().header.ty,
+        subc_protocol::FrameType::Response
+    );
+    let facts = fixture.planes.routes.get(PROBE_CHANNEL, 1).unwrap();
+    assert_eq!(
+        crate::permission_scope::minting_holder(&facts),
+        Some(crate::agent_grants::GrantHolder::Head {
+            agent_id: PROBE_AGENT.into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn prefrontal_head_offers_thirty_minutes_on_loopback_and_public_origins() {
+    use crate::agent_grants::{FilesystemAgentGrantStorage, LegacyGrantStores};
+    let mut fixture = Fixture::new();
+    // Keep the installation's filesystem-backed unified grant path, but place
+    // every file under the fixture instead of the operator's data home.
+    let path = fixture.registry.join("agent-grants.json");
+    let open = || {
+        AgentGrants::open(
+            Arc::new(FilesystemAgentGrantStorage::new(&path)),
+            &LegacyGrantStores::beside(&path),
+            Some("test-machine".into()),
+        )
+    };
+    let store = Arc::new(open());
+    assert!(store.can_record());
+    Arc::get_mut(&mut fixture.planes).unwrap().management = Arc::new(
+        crate::management::ManagementPlane::new(Arc::new(
+            crate::management::PlatformResolver::new(),
+        ))
+        .with_agent_grants(store),
+    );
+    bind_probe_head(&fixture).await;
+    for origin in ["http://127.0.0.1:53967", "https://example.com"] {
+        let (reply, cards) = fixture
+            .call(PROBE_CHANNEL, ask(1, json!([]), origin), "allow_30m")
+            .await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert_eq!(cards.len(), 1);
+        let ids: Vec<_> = cards[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["allow_30m", "allow_origin_always", "deny"],
+            "{origin}"
+        );
+    }
+    assert_eq!(rows(&fixture).len(), 2);
+    assert_eq!(open().live_rows(None, 0).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn probe_isolated_store_refuses_before_raising_a_deny_only_card() {
+    let fixture = Fixture::with_stores(None, None, false);
+    bind_probe_head(&fixture).await;
+    assert!(fixture.planes.management.unified_agent_grants().is_none());
+    assert!(!fixture.planes.user_browser.target().grants.can_record());
+    let (reply, cards) = fixture
+        .call(
+            PROBE_CHANNEL,
+            ask(1, json!([]), "http://127.0.0.1:53967"),
+            "deny",
+        )
+        .await;
+    assert_eq!(reply["reason"], "grant_store_unavailable", "{reply}");
+    assert!(cards.is_empty());
+}
+
+#[tokio::test]
+async fn user_site_card_requires_a_holder_and_a_recordable_unified_store() {
+    for no_holder in [true, false] {
+        let fixture = Fixture::with_agent_grants(
+            None,
+            Some(Arc::new(AgentGrants::in_memory(if no_holder {
+                Some("test-machine".into())
+            } else {
+                None
+            }))),
+        );
+        bind_probe_head(&fixture).await;
+        if no_holder {
+            let mut facts = fixture.planes.routes.get(PROBE_CHANNEL, 1).unwrap();
+            facts.session_kind_attested = false;
+            fixture.planes.routes.insert(PROBE_CHANNEL, 1, facts);
+        }
+        let (reply, cards) = fixture
+            .call(
+                PROBE_CHANNEL,
+                ask(1, json!([]), "https://example.com"),
+                "deny",
+            )
+            .await;
+        assert_eq!(
+            reply["reason"],
+            if no_holder {
+                "no_grant_holder"
+            } else {
+                "grant_store_unavailable"
+            },
+            "{reply}"
+        );
+        assert!(cards.is_empty());
+        assert!(rows(&fixture).is_empty());
+    }
+}
+
 #[tokio::test]
 async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clock() {
     let clock = Arc::new(ManualWallClock::at(1000));

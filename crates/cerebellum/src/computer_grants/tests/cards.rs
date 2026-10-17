@@ -48,6 +48,80 @@ async fn takeover_once_never_writes_a_row_and_the_next_call_asks_again() {
     }
 }
 
+#[tokio::test]
+async fn computer_once_remains_usable_without_a_holder_or_recording_store() {
+    for no_holder in [true, false] {
+        for need in [
+            GrantNeed::Takeover,
+            GrantNeed::App {
+                bundle_identity: "com.example.Editor".into(),
+                display_name: "Editor".into(),
+                code: Arc::new(SignedByFixtureTeam),
+            },
+        ] {
+            let service = CardService::new();
+            let carrier = TestCarrier::new(&service);
+            let grants =
+                if no_holder {
+                    grants()
+                } else {
+                    Arc::new(ComputerGrants::in_memory().with_agent_grants(Arc::new(
+                        crate::agent_grants::AgentGrants::in_memory(None),
+                    )))
+                };
+            let task = {
+                let grants = grants.clone();
+                let mut context = context(carrier);
+                if no_holder {
+                    context.caller.holder = None;
+                }
+                tokio::spawn(async move {
+                    grants
+                        .require(&need, &context, &CancelHandle::pending())
+                        .await
+                })
+            };
+            let card = service.card(1, 1).await;
+            assert!(service.answer(
+                card.header.corr,
+                ScriptedAnswer::Answered(json!({"decision":"allow_once"}))
+            ));
+            let admission = task.await.unwrap().unwrap();
+            assert!(admission.commit());
+            assert!(admission.row.is_none());
+            assert!(grants.agent_grants().live_rows(None, 0).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn filtered_computer_card_without_a_grant_choice_has_a_typed_refusal() {
+    use crate::permission_cards::{require_grant_choice, GrantCardRefusal};
+    for need in [
+        GrantNeed::Takeover,
+        GrantNeed::App {
+            bundle_identity: "com.example.Editor".into(),
+            display_name: "Editor".into(),
+            code: Arc::new(SignedByFixtureTeam),
+        },
+    ] {
+        let body = question_body(&need, &[DENY], false, None);
+        assert_eq!(
+            require_grant_choice(&body, None),
+            Err(GrantCardRefusal::NoGrantHolder)
+        );
+        assert_eq!(
+            require_grant_choice(
+                &body,
+                Some(&GrantHolder::Head {
+                    agent_id: "head".into()
+                })
+            ),
+            Err(GrantCardRefusal::GrantStoreUnavailable)
+        );
+    }
+}
+
 #[test]
 fn app_and_takeover_card_answers_replace_in_place_and_worker_always_is_refused() {
     let grants = grants();

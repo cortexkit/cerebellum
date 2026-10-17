@@ -9,7 +9,10 @@ use super::{
 use crate::agent_grants::{AgentGrant, BrowserTarget, GrantHolder, GrantSubject};
 
 impl Question {
-    pub(crate) fn bind_holder(&mut self, holder: Option<GrantHolder>) {
+    pub(crate) fn bind_holder(
+        &mut self,
+        holder: Option<GrantHolder>,
+    ) -> Result<(), crate::permission_cards::GrantCardRefusal> {
         if let PreparedConsent::Browser(pending) = &mut self.prepared {
             pending.holder = holder;
             pending.choices = crate::permission_cards::browser_choices(
@@ -34,7 +37,9 @@ impl Question {
                 },
                 &pending.choices,
             );
+            crate::permission_cards::require_grant_choice(&self.body, pending.holder.as_ref())?;
         }
+        Ok(())
     }
 }
 

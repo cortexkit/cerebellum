@@ -1070,11 +1070,59 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
             .await;
         if session.agent.is_none() {
             assert_eq!(reply["outcome"], "consent_unavailable");
-            assert_eq!(reply["detail"]["reason"], "no_agent_session");
+            assert_eq!(reply["detail"]["reason"], "no_grant_holder");
             assert!(offered.is_empty());
         } else {
             assert_eq!(reply["outcome"], "consent_pending", "{case}: {reply}");
             assert_eq!(offered, vec![expected], "{case}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn own_browser_decline_only_cards_refuse_before_explicit_or_in_call_consent() {
+    for no_holder in [true, false] {
+        let clock = ManualWallClock::at(1_700_000_000_000);
+        let store = Arc::new(
+            AgentGrants::in_memory(if no_holder {
+                Some(MACHINE.into())
+            } else {
+                None
+            })
+            .with_clock(Arc::new(clock.clone())),
+        );
+        let mut fixture = Fixture::with_store(store, clock);
+        let route = fixture
+            .route(Session {
+                agent: (!no_holder).then_some(AGENT),
+                ..Session::primary("no-grant", AGENT).asking()
+            })
+            .await;
+        let before = fixture.browser.effects();
+        let mut calls = vec![(
+            "browser_use",
+            json!({"action":"open_grant","origins":[PUBLIC],"hazards":[]}),
+        )];
+        if !no_holder {
+            calls.push((
+                "browser.navigate",
+                navigation(&format!("{PUBLIC}/private"), 3),
+            ));
+        }
+        for (name, args) in calls {
+            let reply = fixture.call(&route, name, args).await;
+            assert_eq!(reply["outcome"], "consent_unavailable", "{name}: {reply}");
+            assert_eq!(
+                reply["detail"]["reason"],
+                if no_holder {
+                    "no_grant_holder"
+                } else {
+                    "grant_store_unavailable"
+                },
+                "{name}: {reply}"
+            );
+            assert!(reply.get("ask_id").is_none(), "{reply}");
+            assert_eq!(fixture.browser.effects(), before);
         }
     }
 }
@@ -1676,8 +1724,8 @@ async fn a_row_bound_to_another_machine_grants_nothing() {
     assert!(permission_support::rows(&fixture.store, AGENT).is_empty());
 }
 
-/// A file this build cannot read withholds every standing grant, offers no
-/// standing answer, and is left exactly as it was.
+/// A file this build cannot read withholds every standing grant, raises no
+/// unusable consent card, and is left exactly as it was.
 #[tokio::test]
 async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() {
     let scratch = Scratch::new("unreadable");
@@ -1689,17 +1737,18 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
     let route = fixture
         .route(Session::primary("c-unreadable", AGENT).asking())
         .await;
-    let mut offered = Vec::new();
-    fixture
-        .call_answering(
+    let reply = fixture
+        .call(
             &route,
             "browser.navigate",
             navigation(&format!("{PUBLIC}/"), 3),
-            json!({"decision": "deny"}),
-            |question| offered.push(option_ids(question)),
         )
         .await;
-    assert_eq!(offered, vec![vec!["deny"]]);
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(
+        reply["detail"]["reason"], "grant_store_unavailable",
+        "{reply}"
+    );
     let revoke = fixture
         .call(&route, "browser_use", json!({"action": "revoke_access"}))
         .await;

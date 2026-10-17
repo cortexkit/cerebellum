@@ -1776,6 +1776,13 @@ impl ComputerGrants {
             ));
         }
         let offered = self.offered_choices(caller, need, identity.as_ref());
+        let body = question_body(need, &offered, signature_changed, identity.as_ref());
+        crate::permission_cards::require_grant_choice(&body, caller.holder.as_ref()).map_err(
+            |error| ConsentRefusal::Unavailable {
+                reason: error.reason(),
+                remedy: error.remedy(),
+            },
+        )?;
         let kind = match need {
             GrantNeed::App { .. } => CardKind::AppControl,
             GrantNeed::Takeover => CardKind::Takeover,
@@ -1794,7 +1801,6 @@ impl ComputerGrants {
         let ask_id = if let Some(card) = desk.open_card_for(live.session(), &key) {
             card.elicitation_id
         } else {
-            let body = question_body(need, &offered, signature_changed, identity.as_ref());
             let card = consent_request(
                 kind,
                 &body,

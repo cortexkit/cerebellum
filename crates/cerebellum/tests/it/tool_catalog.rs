@@ -638,7 +638,15 @@ async fn flow_still_refuses_consent_on_the_production_handler() {
 #[tokio::test]
 async fn classic_still_elicits_a_consent_card() {
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
-    let planes = service.install(planes(true));
+    let mut planes = service.install(planes(true));
+    planes.management = std::sync::Arc::new(
+        cerebellum::management::ManagementPlane::new(std::sync::Arc::new(
+            cerebellum::management::PlatformResolver::new(),
+        ))
+        .with_agent_grants(std::sync::Arc::new(
+            cerebellum::agent_grants::AgentGrants::in_memory(Some("catalog-test-machine".into())),
+        )),
+    );
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode: Some(subc_protocol::call_mode::CallMode::Classic),

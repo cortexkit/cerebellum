@@ -509,7 +509,7 @@ async fn profile_site_answers_keep_the_row_id_and_bind_worker_choices_before_fil
                 .await
                 .unwrap();
             let question = question.as_mut().unwrap();
-            question.bind_holder(Some(identity.clone()));
+            question.bind_holder(Some(identity.clone())).unwrap();
             let offered = question.body["params"]["options"].as_array().unwrap();
             assert!(offered.iter().any(|option| option["id"] == *choice));
             if !head {
@@ -577,7 +577,7 @@ async fn stripped_profile_danger_answers_never_mint_a_row() {
         .await
         .unwrap();
     let question = question.as_mut().unwrap();
-    question.bind_holder(Some(holder(true)));
+    question.bind_holder(Some(holder(true))).unwrap();
     plane.record_prepared_consent(question, &question.ask_id);
     assert_eq!(
         plane
