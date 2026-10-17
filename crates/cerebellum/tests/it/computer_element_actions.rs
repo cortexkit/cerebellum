@@ -1570,7 +1570,9 @@ async fn cursor_planted_label_reaches_pipe_but_not_journal_or_call_records() {
     let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .picture()
+        .expect("a picture line, not a hide");
     assert!(
         event.label.unwrap().contains("CURSOR_PRIVATE"),
         "the planted label must reach the actual pipe double"

@@ -1,0 +1,24 @@
+{
+  "case": "acknowledged",
+  "contract": "session-turn-ended-v1",
+  "principal": "reserved:prefrontal-core",
+  "reply": {
+    "body_length": 21,
+    "body_utf8": "{\"acknowledged\":true}",
+    "channel": 4,
+    "corr": 500,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "15000000020102040001000000f4010000000000007b2261636b6e6f776c6564676564223a747275657d"
+  },
+  "request": {
+    "body_length": 319,
+    "body_utf8": "{\"method\":\"session.turn_ended\",\"params\":{\"at_ms\":1700000000000,\"harness\":\"claude-code\",\"outcome\":\"completed\",\"quality\":\"strong\",\"scope\":{\"epoch\":3,\"owner\":{\"kind\":\"reserved\",\"module_id\":\"prefrontal-core\"},\"ref\":\"head-a\"},\"seq\":7,\"session_ref\":\"0123456789abcdef0123456789abcdef\",\"source\":\"stop-hook\",\"turn_id\":\"turn-1\"}}",
+    "channel": 4,
+    "corr": 500,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "3f010000020002040001000000f4010000000000007b226d6574686f64223a2273657373696f6e2e7475726e5f656e646564222c22706172616d73223a7b2261745f6d73223a313730303030303030303030302c226861726e657373223a22636c617564652d636f6465222c226f7574636f6d65223a22636f6d706c65746564222c227175616c697479223a227374726f6e67222c2273636f7065223a7b2265706f6368223a332c226f776e6572223a7b226b696e64223a227265736572766564222c226d6f64756c655f6964223a2270726566726f6e74616c2d636f7265227d2c22726566223a22686561642d61227d2c22736571223a372c2273657373696f6e5f726566223a223031323334353637383961626364656630313233343536373839616263646566222c22736f75726365223a2273746f702d686f6f6b222c227475726e5f6964223a227475726e2d31227d7d"
+  },
+  "state": "head-a drew agent-a's badge"
+}

@@ -42,6 +42,8 @@ pub mod consent_drain;
 #[cfg(test)]
 mod content_named_fixture;
 pub mod coordinate;
+#[cfg(test)]
+mod cursor_end_tests;
 pub mod custody;
 pub mod durable_formats;
 mod egress;
@@ -74,6 +76,7 @@ pub mod snapshot_store;
 mod terminal_arbiter;
 mod tool_provider;
 mod tool_result;
+mod turn_ended;
 #[cfg(test)]
 #[path = "../tests/support/turn_stop_vectors.rs"]
 mod turn_stop_vectors;
@@ -889,6 +892,7 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
                 | management::REVOKE_ACCESS
                 | management::REVOKE_GRANT
                 | management::LIST_GRANTS
+                | management::SESSION_TURN_ENDED
         )
         || (matches!(name, management::PRESENT | management::RESUME)
             && browser::has_wire_dispatch_route(name))
@@ -2188,6 +2192,10 @@ where
 }
 
 fn planes_cursor(planes: &Planes) -> Option<computer_capability::cursor::Coordinator> {
+    #[cfg(test)]
+    if let Some(cursor) = &planes.cursor_for_test {
+        return Some(cursor.clone());
+    }
     #[cfg(all(test, target_os = "macos"))]
     if let Some(plane) = &planes.computer_for_test {
         return Some(plane.cursor());
@@ -2627,6 +2635,17 @@ impl CancelHandle {
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
+    /// The agent whose cursor badge this request drew, if it was a computer
+    /// call that drew one.
+    fn cursor_agent(&self) -> Option<String> {
+        self.0
+            .terminal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|terminal| terminal.cursor_agent())
+    }
     /// Resolve once the handle is cancelled, immediately if it already is.
     pub async fn cancelled(&self) {
         loop {
@@ -2706,6 +2725,10 @@ impl Drop for RequestCancellationGuard {
 pub struct Planes {
     #[cfg(test)]
     route_test_handler: Option<RouteTestHandler>,
+    /// A cursor coordinator for the frame loop's end signals, on every
+    /// platform, without building a computer plane.
+    #[cfg(test)]
+    cursor_for_test: Option<computer_capability::cursor::Coordinator>,
     /// Explicit frame-loop fixture injection. Ordinary tests retain the native
     /// plane and driver, rather than changing the platform for the whole suite.
     #[cfg(all(test, target_os = "macos"))]
@@ -3175,6 +3198,8 @@ impl Planes {
             ),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(test)]
+            cursor_for_test: None,
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3212,6 +3237,8 @@ impl Clone for Planes {
         Self {
             #[cfg(test)]
             route_test_handler: self.route_test_handler.clone(),
+            #[cfg(test)]
+            cursor_for_test: self.cursor_for_test.clone(),
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
@@ -3314,6 +3341,11 @@ async fn handle_frame(
                 channel: frame.header.channel,
                 epoch: frame.header.epoch,
             });
+            // The route's agent is done with the computer: its badge goes now
+            // rather than resting on screen until it idles out.
+            if let Some(cursor) = planes_cursor(planes) {
+                cursor.end_route(frame.header.channel, frame.header.epoch);
+            }
             // Unbound before its requests are cancelled, so a call waiting on a
             // person sees the route gone when it wakes and answers
             // `route_closed` rather than a caller-requested cancel.
@@ -3377,7 +3409,17 @@ async fn handle_frame(
                 )),
             ) {
                 (0, _) => {}
-                (_, Some(handle)) => handle.cancel(),
+                (_, Some(handle)) => {
+                    handle.cancel();
+                    // A stopped turn cancels its computer call; that call's
+                    // badge must not linger as if the agent were still working.
+                    // Calls that drew no badge leave every badge alone.
+                    if let (Some(agent), Some(cursor)) =
+                        (handle.cursor_agent(), planes_cursor(planes))
+                    {
+                        cursor.end(&agent);
+                    }
+                }
                 // Replies commonly win the race. Unknown or late correlations
                 // are explicitly ignored without a reply, error, or log.
                 (_, None) => {}
@@ -3609,12 +3651,16 @@ async fn handle_route_request(
         None
     };
     let cursor_agent = permission_scope::cursor_agent(&facts, worker.as_ref());
+    let cursor_session = permission_scope::cursor_session(&facts);
     permission_scope::WORKER_HOLDER
         .scope(
             worker,
             computer_capability::cursor::ACTING_AGENT.scope(
                 cursor_agent,
-                dispatch_resolved_route(frame, writer, planes, &facts),
+                computer_capability::cursor::ACTING_SESSION.scope(
+                    cursor_session,
+                    dispatch_resolved_route(frame, writer, planes, &facts),
+                ),
             ),
         )
         .await
@@ -3783,6 +3829,16 @@ async fn handle_management_request_observed(
     }
     if permissions::is_operation(method) {
         return permissions::handle(&frame, writer, facts, planes, method, object).await;
+    }
+    if method == management::SESSION_TURN_ENDED {
+        return handle_session_turn_ended(
+            writer,
+            facts,
+            planes,
+            object,
+            (ver, channel, epoch, corr),
+        )
+        .await;
     }
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.
@@ -7580,6 +7636,84 @@ fn session_flow_refusal(facts: &AcceptedBindFacts) -> Option<Value> {
         })
 }
 
+/// Adapter for `session.turn_ended`: admit, parse, hand off, acknowledge.
+///
+/// Interim: Prefrontal core calls this directly until the harness publishes a
+/// turn-ended event this module subscribes to; then this adapter goes, and the
+/// subscription calls [`computer_capability::cursor::Coordinator::turn_ended`]
+/// the same way.
+///
+/// Only `reserved:prefrontal-core` may call it, by exact principal. A flow
+/// carrier or another first-party module is refused like any other caller of
+/// a Prefrontal-only operation. Once admitted and well formed, the reply is
+/// always an acknowledgement, even for a session that drew no badge: the
+/// caller learns nothing about which sessions used the computer. It writes no
+/// journal, cancels nothing, and touches nothing but the cursor badge.
+async fn handle_session_turn_ended(
+    writer: &mpsc::Sender<Frame>,
+    facts: &AcceptedBindFacts,
+    planes: &Planes,
+    object: &serde_json::Map<String, Value>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+) -> Result<(), ModuleError> {
+    if !cerebellum_core::principal::admits_session_calls(&facts.principal) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "principal_denied",
+            "session.turn_ended requires reserved:prefrontal-core",
+        )
+        .await;
+    }
+    let params = object.get("params").cloned().unwrap_or(json!({}));
+    let Some(params) = params.as_object() else {
+        return send_invalid_request_response(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "params",
+            "wrong_type",
+        )
+        .await;
+    };
+    let request = match turn_ended::parse(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return send_invalid_request_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &error.field,
+                error.reason,
+            )
+            .await
+        }
+    };
+    if let Some(cursor) = planes_cursor(planes) {
+        cursor.turn_ended(
+            &request.session_ref,
+            Some(&request.scope_ref),
+            request.outcome,
+        );
+    }
+    send_tool_response(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        json!({"acknowledged": true}),
+    )
+    .await
+}
+
 async fn send_invalid_request_response(
     writer: &mpsc::Sender<Frame>,
     ver: u8,
@@ -9733,6 +9867,7 @@ mod tests {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             route_test_handler: None,
+            cursor_for_test: None,
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: None,
             capture: login_capture::test_support::fixture().module,
@@ -11576,6 +11711,8 @@ mod tests {
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(test)]
+            cursor_for_test: None,
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11657,6 +11794,8 @@ mod tests {
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
+            #[cfg(test)]
+            cursor_for_test: None,
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

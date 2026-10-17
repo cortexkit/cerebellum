@@ -95,6 +95,68 @@ impl CursorEvent {
     }
 }
 
+/// Take one agent's picture off the screen now, rather than waiting for it to
+/// fade after the agent stops acting. It names only the agent; there is nothing
+/// else in it that could leak. `hide` is always true on the wire so the line is
+/// self-describing, and the helper refuses a line with `hide: false`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CursorHide {
+    pub hide: bool,
+    pub agent: String,
+}
+
+impl CursorHide {
+    pub fn new(agent: impl Into<String>) -> Self {
+        Self {
+            hide: true,
+            agent: agent.into(),
+        }
+    }
+}
+
+/// One line of the helper's stdin pipe: a picture to show or move, or one
+/// agent's picture to hide. Untagged, so a picture line keeps exactly the shape
+/// it had before hiding existed. Both shapes refuse unknown fields, and they
+/// share no required field set, so a line decodes as at most one of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CursorLine {
+    Picture(CursorEvent),
+    Hide(CursorHide),
+}
+
+impl CursorLine {
+    pub fn encode_line(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Picture(event) => event.encode_line(),
+            Self::Hide(hide) => {
+                if !self.valid() {
+                    return None;
+                }
+                let mut line = serde_json::to_vec(hide).ok()?;
+                line.push(b'\n');
+                (line.len() <= MAX_CURSOR_LINE).then_some(line)
+            }
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Picture(event) => event.valid(),
+            Self::Hide(hide) => hide.hide,
+        }
+    }
+
+    /// The picture this line carries, if it is not a hide.
+    pub fn picture(self) -> Option<CursorEvent> {
+        match self {
+            Self::Picture(event) => Some(event),
+            Self::Hide(_) => None,
+        }
+    }
+}
+
 /// Glide time grows with distance, from a quick 180 ms hop to a 450 ms
 /// cross-screen move, so short moves feel snappy and long ones stay legible.
 /// With Reduce Motion the picture does a short fade-move instead of gliding.
@@ -306,6 +368,37 @@ mod tests {
             serde_json::from_slice::<CursorEvent>(&encoded).unwrap(),
             event
         );
+        // The helper decodes the wider line type; planted fields must not
+        // slip through as a hide either.
+        for field in ["text", "value", "keys", "request"] {
+            value[field] = serde_json::json!("planted typed secret");
+            assert!(serde_json::from_value::<CursorLine>(value.clone()).is_err());
+            value.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(
+            serde_json::from_slice::<CursorLine>(&encoded).unwrap(),
+            CursorLine::Picture(event)
+        );
+    }
+
+    #[test]
+    fn hide_line_names_only_the_agent_and_refuses_extras() {
+        let line = CursorLine::Hide(CursorHide::new("agent-a"));
+        let encoded = line.encode_line().unwrap();
+        assert_eq!(encoded, b"{\"hide\":true,\"agent\":\"agent-a\"}\n");
+        assert_eq!(
+            serde_json::from_slice::<CursorLine>(&encoded).unwrap(),
+            line
+        );
+        for planted in [
+            r#"{"hide":true,"agent":"a","text":"planted typed secret"}"#,
+            r#"{"hide":true}"#,
+        ] {
+            assert!(serde_json::from_str::<CursorLine>(planted).is_err());
+        }
+        let refused: CursorLine = serde_json::from_str(r#"{"hide":false,"agent":"a"}"#).unwrap();
+        assert!(!refused.valid());
+        assert!(refused.encode_line().is_none());
     }
 
     #[test]

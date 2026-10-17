@@ -73,7 +73,12 @@ pub const REVOKE_GRANT: &str = "browser.revoke_grant";
 /// List a named agent's standing browser access and always-allow app grants.
 /// Operator-only.
 pub const LIST_GRANTS: &str = "grants.list";
-pub const OPERATIONS: [&str; 16] = [
+/// Prefrontal core reports that a head session's turn ended, so that
+/// session's agent cursor badge comes off the screen now. Prefrontal core
+/// only. Interim: to be replaced by a subscription to the harness module's
+/// turn-ended event, after which core's direct call goes away.
+pub const SESSION_TURN_ENDED: &str = "session.turn_ended";
+pub const OPERATIONS: [&str; 17] = [
     WOULD_ASK,
     OPEN_TARGET,
     LIST_APP_GRANTS,
@@ -90,6 +95,7 @@ pub const OPERATIONS: [&str; 16] = [
     LIST_GRANTS,
     crate::permissions::LIST,
     crate::permissions::REVOKE,
+    SESSION_TURN_ENDED,
 ];
 
 /// Receive-to-terminal bounds for a Management-surface method. Flat browser

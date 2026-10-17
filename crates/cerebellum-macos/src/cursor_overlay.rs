@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Instant;
 
 use crate::cursor_geometry::{
@@ -30,6 +30,10 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRect, NSSize, NSString,
 };
+
+/// One 60 Hz frame, in ms: how far ahead a picture looks to decide whether its
+/// landing motion still needs another frame.
+const ONE_FRAME_MS: f64 = 1000.0 / 60.0;
 
 /// What the agent is doing, which decides the label and the landing motion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +57,13 @@ pub struct OverlayEvent {
     pub serial: u64,
     pub avatar_rgba: Option<Vec<u8>>,
     pub avatar_update: bool,
+}
+
+/// One message from the module: a picture to show or move, or one agent's
+/// picture to take off the screen now because that agent is done.
+pub enum OverlayMessage {
+    Show(OverlayEvent),
+    Hide { agent: String },
 }
 
 /// Motion curves, supplied by the platform-neutral crate where they are
@@ -531,7 +542,9 @@ impl Picture {
         }
     }
 
-    fn tick(&mut self, elapsed: f64, alpha: f64, motion: CursorMotion) {
+    /// Draw one frame and answer whether the picture is still gliding or
+    /// settling. A picture at rest needs no further frames until it fades.
+    fn tick(&mut self, elapsed: f64, alpha: f64, motion: CursorMotion) -> bool {
         let fraction = if self.duration_ms <= 0.0 {
             1.0
         } else {
@@ -550,12 +563,19 @@ impl Picture {
             self.panel.setAlphaValue(alpha);
             self.last_alpha = alpha;
         }
+        // Still moving while the glide runs, while the landing scale is off
+        // 1, or while it will be off 1 one frame from now: the settle starts
+        // at exactly 1, so the arrival frame alone cannot tell.
+        let since_arrival = elapsed - self.duration_ms;
+        fraction < 1.0
+            || scale != 1.0
+            || (motion.settle_scale)(since_arrival + ONE_FRAME_MS, self.press, self.reduce) != 1.0
     }
 }
 
 /// Run only in the hidden helper mode, before any asynchronous runtime exists.
 /// EOF closes the channel and ends the main-thread run loop without saving state.
-pub fn run_agent_cursor(events: Receiver<OverlayEvent>, motion: CursorMotion) {
+pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -571,7 +591,10 @@ pub fn run_agent_cursor(events: Receiver<OverlayEvent>, motion: CursorMotion) {
             // a noisy agent is continuously sending events.
             for _ in 0..32 {
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
-                    Ok(event) => {
+                    Ok(OverlayMessage::Hide { agent }) => {
+                        pictures.end(&agent, |picture, _| picture.panel.orderOut(None));
+                    }
+                    Ok(OverlayMessage::Show(event)) => {
                         if !event.to.iter().all(|v| v.is_finite()) {
                             continue;
                         }
@@ -596,10 +619,11 @@ pub fn run_agent_cursor(events: Receiver<OverlayEvent>, motion: CursorMotion) {
                 }
             }
             let wait = pictures.advance(Instant::now(), |picture, step| match step {
-                PictureStep::Draw { elapsed_ms, alpha } => {
-                    picture.tick(elapsed_ms, alpha, motion);
+                PictureStep::Draw { elapsed_ms, alpha } => picture.tick(elapsed_ms, alpha, motion),
+                PictureStep::Hide => {
+                    picture.panel.orderOut(None);
+                    false
                 }
-                PictureStep::Hide => picture.panel.orderOut(None),
             });
             if let Wait::Frame(interval) = wait {
                 let date = NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64());
@@ -613,7 +637,23 @@ pub fn run_agent_cursor(events: Receiver<OverlayEvent>, motion: CursorMotion) {
                     app.sendEvent(&event);
                 }
             }
-            // Flush the final orderOut before sleeping without any live panels.
+            if let Wait::Timed(_) = wait {
+                // About to sleep for up to the idle fade time with panels on
+                // screen. Handle whatever AppKit already queued so it is not
+                // left waiting that long; never blocks.
+                for _ in 0..16 {
+                    let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                        NSEventMask::Any,
+                        Some(&NSDate::distantPast()),
+                        unsafe { NSDefaultRunLoopMode },
+                        true,
+                    ) else {
+                        break;
+                    };
+                    app.sendEvent(&event);
+                }
+            }
+            // Flush the final draw or orderOut before sleeping.
             app.updateWindows();
             Some(wait)
         });
@@ -626,6 +666,16 @@ pub fn run_agent_cursor(events: Receiver<OverlayEvent>, motion: CursorMotion) {
                 match events.recv() {
                     Ok(event) => pending = Some(event),
                     Err(_) => break,
+                }
+            }
+            Some(Wait::Timed(until_fade)) => {
+                // Every picture is resting. Sleep until the next event or until
+                // the oldest one is due to fade, with no frames in between, so
+                // a badge left on screen costs no CPU while its agent thinks.
+                match events.recv_timeout(until_fade) {
+                    Ok(event) => pending = Some(event),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             Some(Wait::Frame(_)) => {}

@@ -161,6 +161,10 @@ pub struct TerminalArbiter {
     request: Frame,
     changed: tokio::sync::Notify,
     consent_desk: std::sync::Mutex<Option<Arc<crate::cingulate_client::desk::ConsentDesk>>>,
+    /// The agent whose cursor badge this call drew, if it drew one. Only
+    /// computer calls draw badges, so a cancel that finds one here cancelled a
+    /// computer call and can hide that agent's badge.
+    cursor_agent: std::sync::Mutex<Option<String>>,
 }
 
 tokio::task_local! {
@@ -187,11 +191,31 @@ impl TerminalArbiter {
             request,
             changed: tokio::sync::Notify::new(),
             consent_desk: std::sync::Mutex::new(None),
+            cursor_agent: std::sync::Mutex::new(None),
         }
     }
 
     pub fn current() -> Option<Arc<Self>> {
         CALL_TERMINAL.try_with(Arc::clone).ok()
+    }
+
+    /// The route this call arrived on, as `(channel, epoch)`.
+    pub(crate) fn route(&self) -> (u16, u32) {
+        (self.request.header.channel, self.request.header.epoch)
+    }
+
+    pub(crate) fn note_cursor_agent(&self, agent: &str) {
+        *self
+            .cursor_agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agent.to_owned());
+    }
+
+    pub(crate) fn cursor_agent(&self) -> Option<String> {
+        self.cursor_agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Grant application is not execution. Retain the answered card until the

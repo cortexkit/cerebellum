@@ -860,6 +860,14 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
         .provides
         .iter()
         .any(|name| name == "permissions/v1"));
+    // Prefrontal core checks for this before it reports turn endings.
+    assert!(entry
+        .capabilities
+        .as_ref()
+        .unwrap()
+        .provides
+        .iter()
+        .any(|name| name == manifest::SESSION_TURN_ENDED_CAPABILITY));
     // Both roles survive registration with a real daemon and come back in its
     // catalogue. Asserted against the DAEMON's view rather than the manifest
     // builder's, which is the difference between advertising a surface and the
@@ -894,6 +902,7 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
             "grants.list",
             "permissions.list",
             "permissions.revoke",
+            "session.turn_ended",
         ]
     );
 

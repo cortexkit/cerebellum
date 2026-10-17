@@ -79,7 +79,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
     render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot, OverlayEvent,
-    OverlayGesture,
+    OverlayGesture, OverlayMessage,
 };
 #[cfg(target_os = "macos")]
 mod peer_attestation;
