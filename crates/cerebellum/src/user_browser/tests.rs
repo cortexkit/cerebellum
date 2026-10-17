@@ -218,6 +218,14 @@ impl Fixture {
         opener: Option<Arc<dyn CingulateOpener>>,
         agent_grants: Option<Arc<crate::agent_grants::AgentGrants>>,
     ) -> Self {
+        Self::with_stores(opener, agent_grants, true)
+    }
+
+    fn with_stores(
+        opener: Option<Arc<dyn CingulateOpener>>,
+        agent_grants: Option<Arc<crate::agent_grants::AgentGrants>>,
+        recordable_user_store: bool,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let registry = std::env::temp_dir().join(format!(
             "user-browser-cards-{}-{}",
@@ -238,11 +246,13 @@ impl Fixture {
                     opener,
                     Arc::new(FileRegistryStore::new(registry.join("registry.json"))),
                 );
-        let grants = Arc::new(StandingBrowserGrants::open(
-            Arc::new(crate::browser_standing_grants::InMemoryStandingGrantStorage::new()),
-            Some("test-machine".into()),
-        ));
-        planes.user_browser = UserBrowserBridge::with_user_grants(grants);
+        if recordable_user_store {
+            let grants = Arc::new(StandingBrowserGrants::open(
+                Arc::new(crate::browser_standing_grants::InMemoryStandingGrantStorage::new()),
+                Some("test-machine".into()),
+            ));
+            planes.user_browser = UserBrowserBridge::with_user_grants(grants);
+        }
         if let Some(grants) = agent_grants {
             planes.management = Arc::new(
                 crate::management::ManagementPlane::new(Arc::new(

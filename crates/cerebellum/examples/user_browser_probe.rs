@@ -220,7 +220,19 @@ fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
             .as_array()
             .is_some_and(|options| options.iter().any(|o| o["id"] == "allow_30m"))
     {
-        return Err("scripted Cingulate refused a non-fixture or malformed site card".into());
+        return Err(format!(
+            "scripted Cingulate refused a non-fixture or malformed site card: label {site:?}, expected origins {:?}, scope origins {}, option ids {}",
+            [origin, child_origin.as_str()],
+            p["scope"]["origins"],
+            Value::Array(
+                p["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|option| option["id"].clone())
+                    .collect()
+            )
+        ));
     }
     Ok(())
 }
@@ -1260,11 +1272,22 @@ mod live {
             navigation_settle_deadline_ms: 10_000,
         };
         let consent = cingulate::ScriptedCarrier::default();
-        let planes = consent.install(Planes::with_browser_config_journaling(
+        let mut planes = consent.install(Planes::with_browser_config_journaling(
             Arc::new(HealthState::new()),
             Some(config),
             JournalPersistence::Isolated,
         ));
+        // An isolated plane has no machine identity and cannot record site
+        // consent. Supply a scratch-only store so the probe can exercise the
+        // same temporary-grant path as a durable installation.
+        planes.management = Arc::new(
+            cerebellum::management::ManagementPlane::new(Arc::new(
+                cerebellum::management::PlatformResolver::new(),
+            ))
+            .with_agent_grants(Arc::new(
+                cerebellum::agent_grants::AgentGrants::in_memory(Some("user-browser-probe".into())),
+            )),
+        );
         bind(&planes, root).await?;
         let listener =
             BridgeListener::bind(planes.user_browser.clone()).map_err(|e| e.to_string())?;
@@ -1845,6 +1868,21 @@ fn cingulate_answer_control() -> Result<(), String> {
         }
         if consent_for_fixture(&other, origin).is_ok() {
             return Err(format!("scripted Cingulate accepted bad {mutation}"));
+        }
+    }
+    let mut deny_only = card.clone();
+    deny_only["params"]["options"] = json!([{"id":"deny"}]);
+    let error = consent_for_fixture(&deny_only, origin).unwrap_err();
+    for detail in [
+        origin,
+        "http://localhost:12345",
+        "label",
+        "expected origins",
+        "scope origins",
+        "option ids [\"deny\"]",
+    ] {
+        if !error.contains(detail) {
+            return Err(format!("site card diagnostic omitted {detail:?}: {error}"));
         }
     }
     Ok(())

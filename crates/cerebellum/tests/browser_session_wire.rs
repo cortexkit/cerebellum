@@ -8474,9 +8474,10 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
     .await;
     let body: Value = serde_json::from_slice(&navigated.body).unwrap();
     assert_eq!(
-        body["outcome"], "authorization_denied",
+        body["outcome"], "consent_unavailable",
         "standing rows must not authorize: {body}"
     );
+    assert_eq!(body["detail"]["reason"], "no_grant_holder", "{body}");
     assert_eq!(body["context"]["profile_disposition"], "none", "{body}");
     assert!(body["context"]["profile_name"].is_null(), "{body}");
 }

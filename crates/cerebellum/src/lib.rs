@@ -4595,7 +4595,10 @@ async fn handle_management_request_observed(
     };
 
     if let Some(mut question) = question {
-        question.bind_holder(permission_scope::minting_holder(facts));
+        if let Err(error) = question.bind_holder(permission_scope::minting_holder(facts)) {
+            error.apply_to_reply(&mut reply);
+            return send_tool_response(writer, ver, channel, epoch, corr, reply).await;
+        }
         let raised = async {
             let live = browser_consent::live(facts, planes, channel, epoch)?;
             let mut session = planes
@@ -7190,7 +7193,10 @@ async fn serve_browser_with_consent(
     else {
         return Ok(reply);
     };
-    question.bind_holder(permission_scope::minting_holder(facts));
+    if let Err(error) = question.bind_holder(permission_scope::minting_holder(facts)) {
+        error.apply_to_reply(&mut reply);
+        return planes.browser.finish_reply(capability.name(), reply);
+    }
     use cingulate_client::desk::{Ending, InCall, LetGo};
     let live = match browser_consent::live(facts, planes, request.0, request.1) {
         Ok(live) => live,
@@ -9111,10 +9117,19 @@ mod tests {
     /// Planes with an admitted agent-session management route and an answerable
     /// consent-service fixture (channel 4, epoch 1).
     fn open_grant_planes() -> Planes {
-        let planes = Planes::with_browser_config_journaling(
+        let mut planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
             JournalPersistence::Isolated,
+        );
+        // Card-lifetime tests need an answer that can be recorded; isolated
+        // browser defaults have no machine identity and offer no site grants.
+        planes.management = Arc::new(
+            ManagementPlane::new(Arc::new(management::PlatformResolver::new())).with_agent_grants(
+                Arc::new(agent_grants::AgentGrants::in_memory(Some(
+                    "test-machine".into(),
+                ))),
+            ),
         );
         planes.routes.insert(
             4,
