@@ -52,6 +52,23 @@ expected tests and does not audit sibling tests for collateral failures.
 When the selected base predates the catalogue, the wrapper runs every row
 instead of claiming an empty narrow replay.
 
+The wrapper runs only the `ckdev-mutate` installed in this checkout's own
+`target/tools` root, pinned to version 0.12.3 from commons revision
+`649d5f126c3b7da49e3019407ea1a94652d32eea` and verified against
+`target/tools/.crates2.json`. It never uses a `ckdev-mutate` from `PATH` or
+`~/.cargo/bin`: those are shared with every other repository on the machine,
+and another repository installing a different version there must not change
+this replay. The wrapper never installs the runner itself. When the runner is
+missing, or is not the pinned version and revision, it stops and prints the
+install command (each worktree has its own `target/`, and `cargo clean`
+removes the runner too). From the repository root:
+
+```sh
+cargo install --locked --root "$PWD/target/tools" \
+  --git https://github.com/cortexkit/commons \
+  --rev 649d5f126c3b7da49e3019407ea1a94652d32eea cortexkit-mutate
+```
+
 The regular fast gate stays quick and leaves mutation replay opt-in. To include
 the narrow replay for the fast gate's selected base, run
 `scripts/fast-gate.sh --mutations` (or pass the base explicitly with

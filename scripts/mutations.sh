@@ -45,22 +45,31 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# The runner lives in this checkout's own install root. ~/.cargo/bin is shared
+# by every repository on the machine, so another repository installing a
+# different ckdev-mutate there would silently change, or block, this replay.
+# The script never looks on PATH or in ~/.cargo/bin, and never installs on its
+# own: it names the exact install command and stops.
 # Cargo's install record distinguishes the reviewed source revision from another
 # binary that happens to report the same semantic version.
 expected_version="0.12.3"
 expected_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-mutate="$cargo_home/bin/ckdev-mutate"
+tools_root="$repo_root/target/tools"
+mutate="$tools_root/bin/ckdev-mutate"
+refuse_runner() {
+  echo "mutations: $1" >&2
+  echo "mutations: install the pinned runner into this checkout with:" >&2
+  echo "  cargo install --locked --root \"$tools_root\" --git https://github.com/cortexkit/commons --rev $expected_revision cortexkit-mutate" >&2
+  exit 2
+}
 if [ ! -x "$mutate" ]; then
-  echo "mutations: ckdev-mutate is missing from $cargo_home/bin" >&2
-  exit 2
+  refuse_runner "ckdev-mutate is missing from $tools_root/bin"
 fi
-actual_version="$("$mutate" --version)"
+actual_version="$("$mutate" --version)" || refuse_runner "$mutate --version failed"
 if [ "$actual_version" != "ckdev-mutate $expected_version" ]; then
-  echo "mutations: expected ckdev-mutate $expected_version from revision $expected_revision; found '$actual_version'" >&2
-  exit 2
+  refuse_runner "expected ckdev-mutate $expected_version from revision $expected_revision in $tools_root; found '$actual_version'"
 fi
-python3 - "$cargo_home/.crates2.json" "$expected_version" "$expected_revision" <<'PY'
+python3 - "$tools_root/.crates2.json" "$expected_version" "$expected_revision" <<'PY' || refuse_runner "$tools_root does not record ckdev-mutate from commons revision $expected_revision"
 import json
 from pathlib import Path
 import sys
