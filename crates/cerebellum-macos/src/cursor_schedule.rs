@@ -51,6 +51,12 @@ impl<P> CursorSchedule<P> {
         Some(&mut live.picture)
     }
 
+    /// A late raster may decorate a live picture, but must not revive it or
+    /// restart its glide and fade timer.
+    pub(crate) fn picture_for_update(&mut self, agent: &str) -> Option<&mut P> {
+        self.pictures.get_mut(agent).map(|live| &mut live.picture)
+    }
+
     /// Hide a fully faded picture exactly once, then release it. Only retained
     /// pictures need another frame; an empty schedule has no timer to service.
     pub(crate) fn advance(
@@ -80,6 +86,20 @@ impl<P> CursorSchedule<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_avatar_updates_cannot_revive_or_extend_a_picture() {
+        let start = Instant::now();
+        let mut schedule = CursorSchedule::<u32>::new();
+        assert!(schedule.picture_for_update("agent").is_none());
+        schedule.picture_for_event("agent".into(), start, || 7);
+        *schedule.picture_for_update("agent").unwrap() = 8;
+        assert_eq!(
+            schedule.advance(start + Duration::from_secs(2), |_, _| {}),
+            Wait::Event
+        );
+        assert!(schedule.picture_for_update("agent").is_none());
+    }
 
     #[test]
     fn faded_picture_is_dropped_and_never_ticked_again() {

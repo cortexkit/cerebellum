@@ -1,7 +1,6 @@
 //! The capture's one vault call: deposit the captured cookie in claustrum.
 //!
-//! Every other call this module makes rides a route a caller opened. This one
-//! opens a route of its own, because the vault is not the caller: a second,
+//! The vault opens a route of its own, because the vault is not the caller: a second,
 //! consumer connection to the daemon, authenticated with the same connection
 //! file and HMAC handshake as the module connection, opens a route to
 //! claustrum presenting this module's launch nonce as `consumer_identity`. The
@@ -205,6 +204,8 @@ pub struct ClaustrumVault {
     connection_file: PathBuf,
     module_id: String,
     launch_nonce: Option<String>,
+    target_module: String,
+    bind_session: &'static str,
 }
 
 impl std::fmt::Debug for ClaustrumVault {
@@ -227,6 +228,8 @@ impl ClaustrumVault {
             connection_file,
             module_id,
             launch_nonce,
+            target_module: vault_wire::VAULT_MODULE_ID.to_owned(),
+            bind_session: BIND_SESSION,
         }
     }
 
@@ -235,6 +238,17 @@ impl ClaustrumVault {
     pub(crate) fn supervised(connection_file: PathBuf, module_id: String) -> Self {
         let nonce = crate::launch_nonce::for_consumer_identity();
         Self::new(connection_file, module_id, nonce)
+    }
+
+    /// Reuse the authenticated, one-call transport for another management read.
+    /// The caller owns the deadline and dropping the route closes its connection.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn management(connection_file: PathBuf, module_id: String, target: &str) -> Self {
+        Self {
+            target_module: target.to_owned(),
+            bind_session: "computer.agent_cursor",
+            ..Self::supervised(connection_file, module_id)
+        }
     }
 
     async fn open_route(&self) -> Result<ClaustrumRoute, VaultReachError> {
@@ -261,7 +275,7 @@ impl ClaustrumVault {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_default();
-        let identity = BindIdentity::new(project_root, BIND_HARNESS, BIND_SESSION);
+        let identity = BindIdentity::new(project_root, BIND_HARNESS, self.bind_session);
         let consumer = self
             .launch_nonce
             .as_deref()
@@ -269,8 +283,9 @@ impl ClaustrumVault {
                 module_id: &self.module_id,
                 launch_nonce,
             });
-        let open = vault_wire::route_open_request(&identity, consumer)
-            .map_err(|_| VaultReachError::Unreachable)?;
+        let open =
+            vault_wire::management_route_open_request(&identity, consumer, &self.target_module)
+                .map_err(|_| VaultReachError::Unreachable)?;
         send_request(
             &mut stream,
             crate::control_flags(),

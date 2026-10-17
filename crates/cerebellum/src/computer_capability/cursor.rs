@@ -14,10 +14,35 @@ use tokio::sync::mpsc;
 const READ_BUDGET: Duration = Duration::from_millis(50);
 const CAPACITY: usize = 32;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod avatar;
+
+tokio::task_local! {
+    pub(crate) static ACTING_AGENT: Option<String>;
+}
+
+pub(crate) struct Identity {
+    badge: String,
+    avatar_agent: Option<String>,
+}
+
+impl Identity {
+    pub(crate) fn current(fallback: String) -> Self {
+        let avatar_agent = ACTING_AGENT.try_with(Clone::clone).ok().flatten();
+        Self {
+            badge: avatar_agent.clone().unwrap_or(fallback),
+            avatar_agent,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     stopped: std::sync::atomic::AtomicBool,
     sender: OnceLock<mpsc::Sender<CursorEvent>>,
+    serial: std::sync::atomic::AtomicU64,
+    #[cfg(target_os = "macos")]
+    avatars: OnceLock<Arc<avatar::Avatars>>,
     #[cfg(target_os = "macos")]
     generation: std::sync::Mutex<Option<cerebellum_macos::ProcessGeneration>>,
 }
@@ -54,6 +79,10 @@ impl RestartLimit {
 }
 
 impl Coordinator {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_avatars(&self, avatars: Arc<avatar::Avatars>) {
+        let _ = self.0.avatars.set(avatars);
+    }
     /// Tests may supply a blocked or closed receiver without drawing a window.
     /// All production planes start disabled; only the module's config loader
     /// enables the native transport.
@@ -96,7 +125,7 @@ impl Coordinator {
     /// action. Do not change a retained AX element's timeout: dispatch shares it.
     pub(crate) fn schedule(
         &self,
-        agent: String,
+        identity: Identity,
         kind: CursorKind,
         grant: ProcessGrant,
         source: Arc<dyn AppStateSource>,
@@ -109,7 +138,14 @@ impl Coordinator {
             return;
         }
         let cursor = self.clone();
+        let serial = self
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
+            let agent = identity.badge;
+            #[cfg(not(target_os = "macos"))]
+            let _ = identity.avatar_agent;
             let read = tokio::task::spawn_blocking(move || {
                 let (title, secure, frame) = match handle {
                     Some(handle) => {
@@ -133,10 +169,24 @@ impl Coordinator {
                     width: frame.map_or(24.0, |f| f[2].min(f[3]).max(1.0)),
                     label: label(kind, title.as_deref(), secure),
                     kind,
+                    serial,
+                    avatar_rgba: None,
+                    avatar_update: false,
                 })
             });
             if let Ok(Ok(Some(event))) = tokio::time::timeout(READ_BUDGET, read).await {
-                cursor.send(event);
+                cursor.send(event.clone());
+                #[cfg(target_os = "macos")]
+                if let (Some(agent), Some(avatars)) =
+                    (identity.avatar_agent, cursor.0.avatars.get())
+                {
+                    if let Some(pixels) = avatars.fetch_and_render(&agent).await {
+                        let mut update = event;
+                        update.avatar_rgba = Some(pixels);
+                        update.avatar_update = true;
+                        cursor.send(update);
+                    }
+                }
             }
         });
     }
@@ -166,6 +216,9 @@ impl Coordinator {
                 width: 1.0,
                 label: None,
                 kind: CursorKind::Reading,
+                serial: 0,
+                avatar_rgba: None,
+                avatar_update: false,
             });
         }
     }
@@ -264,7 +317,7 @@ mod tests {
         };
         let start = Instant::now();
         cursor.schedule(
-            "agent".into(),
+            Identity::current("agent".into()),
             CursorKind::Press,
             grant,
             Arc::new(SlowGeometry),
@@ -303,6 +356,9 @@ mod tests {
             width: 20.0,
             label: None,
             kind: CursorKind::Press,
+            serial: 0,
+            avatar_rgba: None,
+            avatar_update: false,
         };
         for _ in 0..CAPACITY {
             cursor.send(event.clone());

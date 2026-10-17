@@ -1985,6 +1985,13 @@ async fn run(
         None
     };
     if let Some(cursor) = planes_cursor(&planes) {
+        #[cfg(target_os = "macos")]
+        cursor.set_avatars(Arc::new(
+            computer_capability::cursor::avatar::Avatars::supervised(
+                config.connection_file_path.clone(),
+                config.module_id.clone(),
+            ),
+        ));
         cursor.enable(config.agent_cursor);
     }
     // Recovery publishes the service before module_loop takes the transport, so
@@ -3596,10 +3603,14 @@ async fn handle_route_request(
     } else {
         None
     };
+    let cursor_agent = permission_scope::cursor_agent(&facts, worker.as_ref());
     permission_scope::WORKER_HOLDER
         .scope(
             worker,
-            dispatch_resolved_route(frame, writer, planes, &facts),
+            computer_capability::cursor::ACTING_AGENT.scope(
+                cursor_agent,
+                dispatch_resolved_route(frame, writer, planes, &facts),
+            ),
         )
         .await
 }
@@ -7823,6 +7834,17 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
     } = &mut report
     {
         let counts = browser_crash_reports::leftover_counts();
+        #[cfg(target_os = "macos")]
+        {
+            metrics.insert(
+                "cursorAvatarMalformedRows".into(),
+                json!(computer_capability::cursor::avatar::malformed_rows()),
+            );
+            metrics.insert(
+                "cursorAvatarReadRefusals".into(),
+                json!(computer_capability::cursor::avatar::read_refusals()),
+            );
+        }
         metrics.insert(
             "privateStateTightenFailures".to_string(),
             serde_json::Value::from(

@@ -37,7 +37,7 @@ fn agent_cursor() {}
 
 #[cfg(target_os = "macos")]
 fn agent_cursor() {
-    use cerebellum_computer::cursor::{CursorEvent, CursorKind};
+    use cerebellum_computer::cursor::{CursorEvent, CursorKind, MAX_CURSOR_LINE};
     use std::io::{BufRead, Read};
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
@@ -46,15 +46,21 @@ fn agent_cursor() {
         loop {
             let mut line = Vec::new();
             if !matches!(
-                input.by_ref().take(4097).read_until(b'\n', &mut line),
+                input
+                    .by_ref()
+                    .take((MAX_CURSOR_LINE + 1) as u64)
+                    .read_until(b'\n', &mut line),
                 Ok(1..)
-            ) || line.len() > 4096
+            ) || line.len() > MAX_CURSOR_LINE
             {
                 break;
             }
             let Ok(event) = serde_json::from_slice::<CursorEvent>(&line) else {
                 continue;
             };
+            if !event.valid() {
+                continue;
+            }
             let _ = sender.try_send(cerebellum_macos::OverlayEvent {
                 agent: event.agent,
                 initial: event.initial,
@@ -62,6 +68,9 @@ fn agent_cursor() {
                 width: event.width,
                 label: event.label,
                 reading: event.kind == CursorKind::Reading,
+                serial: event.serial,
+                avatar_rgba: event.avatar_rgba,
+                avatar_update: event.avatar_update,
             });
         }
     });

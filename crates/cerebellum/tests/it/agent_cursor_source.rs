@@ -72,3 +72,18 @@ fn cursor_helper_mode_is_selected_before_the_runtime_is_built() {
     assert!(helper_branch < runtime);
     assert!(!source.contains("#[tokio::main]"));
 }
+
+#[test]
+fn cursor_avatar_work_never_runs_on_the_frame_reader() {
+    let source = source_scan::shipped_code(include_str!("../../src/lib.rs"));
+    let start = source.find("async fn module_loop<").unwrap();
+    let end = source[start..].find("async fn send_hello(").unwrap() + start;
+    let reader = &source[start..end];
+    assert!(reader.contains("read_frame(read_half)"));
+    for token in ["avatar", "render_tree", "fetch_and_render", "rasterize"] {
+        assert!(
+            !reader.contains(token),
+            "avatar work on the frame reader: {token}"
+        );
+    }
+}

@@ -1032,7 +1032,7 @@ where
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
         self.cursor.schedule(
-            identity.agent_project_id.clone(),
+            cursor::Identity::current(identity.agent_project_id.clone()),
             cerebellum_computer::cursor::CursorKind::Reading,
             grant.clone(),
             self.app_state_source.clone(),
@@ -1383,7 +1383,7 @@ where
         {
             let predicate = parsed.predicate;
             self.cursor.schedule(
-                identity.agent_project_id.clone(),
+                cursor::Identity::current(identity.agent_project_id.clone()),
                 cerebellum_computer::cursor::CursorKind::Reading,
                 grant.clone(),
                 self.app_state_source.clone(),
@@ -1575,7 +1575,7 @@ where
             }
         };
         self.cursor.schedule(
-            identity.agent_project_id.clone(),
+            cursor::Identity::current(identity.agent_project_id.clone()),
             if capability == ComputerCapability::Type {
                 cerebellum_computer::cursor::CursorKind::Type
             } else {

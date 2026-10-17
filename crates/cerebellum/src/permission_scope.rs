@@ -25,6 +25,28 @@ pub(crate) enum HeadRefusal {
     Unavailable,
 }
 
+/// Session stamps are the daemon-accepted identity records. A worker's record
+/// names its parent head session rather than an agent, so use the head resolved
+/// for this call. A head already carries its agent id; a project path proves none.
+pub(crate) fn cursor_agent(
+    facts: &AcceptedBindFacts,
+    worker: Option<&ResolvedWorker>,
+) -> Option<String> {
+    if is_worker(facts) {
+        return worker.map(|worker| match &worker.holder {
+            GrantHolder::Head { agent_id } | GrantHolder::Worker { agent_id, .. } => {
+                agent_id.clone()
+            }
+        });
+    }
+    facts
+        .scope
+        .as_ref()
+        .filter(|stamp| stamp.kind == ScopeKind::Head && stamp.owner_authorized)
+        .and_then(|stamp| stamp.attributes.agent_id.clone())
+        .filter(|id| !id.is_empty())
+}
+
 fn worker_parent(facts: &AcceptedBindFacts) -> Option<ScopeKey> {
     let stamp = facts.scope.as_ref()?;
     let parent = stamp.parent.as_ref()?;

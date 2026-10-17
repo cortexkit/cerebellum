@@ -172,9 +172,19 @@ pub fn route_open_request(
     identity: &BindIdentity,
     consumer_identity: Option<ConsumerIdentity<'_>>,
 ) -> Result<SecretBytes, RequestBuildError> {
+    management_route_open_request(identity, consumer_identity, VAULT_MODULE_ID)
+}
+
+pub(crate) fn management_route_open_request(
+    identity: &BindIdentity,
+    consumer_identity: Option<ConsumerIdentity<'_>>,
+    module_id: &str,
+) -> Result<SecretBytes, RequestBuildError> {
     let request = RouteOpenRequest {
         op: "route.open",
-        target: vault_route_target(),
+        target: RouteTarget::ManagementSurface {
+            module_id: module_id.to_owned(),
+        },
         identity,
         consumer_identity,
     };
@@ -185,7 +195,10 @@ pub fn route_open_request(
     let consumer_bound = request.consumer_identity.as_ref().map_or(0, |consumer| {
         encoded_bound(consumer.module_id) + encoded_bound(consumer.launch_nonce)
     });
-    SecretBytes::encode(&request, identity_bound + consumer_bound + 256)
+    SecretBytes::encode(
+        &request,
+        identity_bound + consumer_bound + encoded_bound(module_id) + 256,
+    )
 }
 
 /// The daemon's answer to an accepted `route.open`: the channel and epoch the

@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const AVATAR_SIZE: u32 = 32;
+pub const MAX_CURSOR_LINE: usize = 24_576;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CursorKind {
@@ -48,16 +51,29 @@ pub struct CursorEvent {
     pub width: f64,
     pub label: Option<String>,
     pub kind: CursorKind,
+    pub serial: u64,
+    pub avatar_rgba: Option<Vec<u8>>,
+    pub avatar_update: bool,
 }
 
 impl CursorEvent {
     pub fn encode_line(&self) -> Option<Vec<u8>> {
-        if !self.to.iter().all(|v| v.is_finite()) || !self.width.is_finite() {
+        if !self.valid() {
             return None;
         }
         let mut line = serde_json::to_vec(self).ok()?;
         line.push(b'\n');
-        (line.len() <= 4096).then_some(line)
+        (line.len() <= MAX_CURSOR_LINE).then_some(line)
+    }
+
+    pub fn valid(&self) -> bool {
+        self.to.iter().all(|v| v.is_finite())
+            && self.width.is_finite()
+            && self
+                .avatar_rgba
+                .as_ref()
+                .is_none_or(|rgba| rgba.len() == (AVATAR_SIZE * AVATAR_SIZE * 4) as usize)
+            && (!self.avatar_update || self.avatar_rgba.is_some())
     }
 }
 
@@ -143,6 +159,9 @@ mod tests {
             width: 20.0,
             label: label(CursorKind::Type, Some("Message"), false),
             kind: CursorKind::Type,
+            serial: 0,
+            avatar_rgba: None,
+            avatar_update: false,
         };
         let encoded = event.encode_line().unwrap();
         assert_eq!(encoded.iter().filter(|c| **c == b'\n').count(), 1);
@@ -156,5 +175,29 @@ mod tests {
             serde_json::from_slice::<CursorEvent>(&encoded).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn cursor_pipe_bounds_pixels_and_rejects_malformed_updates() {
+        let mut event = CursorEvent {
+            agent: "agent".into(),
+            initial: 'A',
+            to: [1.0, 2.0],
+            width: 24.0,
+            label: None,
+            kind: CursorKind::Press,
+            serial: 7,
+            avatar_rgba: Some(vec![255; (AVATAR_SIZE * AVATAR_SIZE * 4) as usize]),
+            avatar_update: true,
+        };
+        let line = event.encode_line().unwrap();
+        assert!(line.len() <= MAX_CURSOR_LINE);
+        assert_eq!(serde_json::from_slice::<CursorEvent>(&line).unwrap(), event);
+        event.avatar_rgba.as_mut().unwrap().pop();
+        assert!(event.encode_line().is_none());
+        event.avatar_rgba = None;
+        assert!(!event.valid());
+        event.avatar_update = false;
+        assert!(event.encode_line().is_some());
     }
 }
