@@ -65,9 +65,16 @@ fn agent_cursor() {
                 agent: event.agent,
                 initial: event.initial,
                 to: event.to,
-                width: event.width,
+                target: event.target,
+                resting: event.resting,
                 label: event.label,
-                reading: event.kind == CursorKind::Reading,
+                gesture: match event.kind {
+                    CursorKind::Press => cerebellum_macos::OverlayGesture::Press,
+                    CursorKind::Write | CursorKind::Type | CursorKind::Keys => {
+                        cerebellum_macos::OverlayGesture::Type
+                    }
+                    CursorKind::Reading => cerebellum_macos::OverlayGesture::Read,
+                },
                 serial: event.serial,
                 avatar_rgba: event.avatar_rgba,
                 avatar_update: event.avatar_update,
@@ -76,7 +83,11 @@ fn agent_cursor() {
     });
     cerebellum_macos::run_agent_cursor(
         receiver,
-        cerebellum_computer::cursor::duration_ms,
-        cerebellum_computer::cursor::position,
+        cerebellum_macos::CursorMotion {
+            duration_ms: cerebellum_computer::cursor::duration_ms,
+            position: cerebellum_computer::cursor::position,
+            settle_scale: cerebellum_computer::cursor::settle_scale,
+            fade_alpha: cerebellum_computer::cursor::fade_alpha,
+        },
     );
 }

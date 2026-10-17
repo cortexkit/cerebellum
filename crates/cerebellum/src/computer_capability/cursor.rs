@@ -149,24 +149,34 @@ impl Coordinator {
             let read = tokio::task::spawn_blocking(move || {
                 let (title, secure, frame) = match handle {
                     Some(handle) => {
-                        let (title, secure) = source.cursor_label(&handle).unwrap_or((None, true));
+                        // A read's picture has no label, so it reads no title.
+                        let (title, secure) = if kind == CursorKind::Reading {
+                            (None, false)
+                        } else {
+                            source.cursor_label(&handle).unwrap_or((None, true))
+                        };
                         let frame = source.cursor_frame(&handle);
                         (title, secure, frame)
                     }
                     None => (None, false, None),
                 };
-                let requested =
-                    point.or_else(|| frame.map(|f| [f[0] + f[2] / 2.0, f[1] + f[3] / 2.0]));
-                // Only focused-element and Reading badges have a corner fallback.
-                if requested.is_none() && matches!(kind, CursorKind::Press | CursorKind::Write) {
+                // Element actions without an exact point aim at the frame's
+                // visible centre, never its origin. Only reads may appear with
+                // nothing to aim at; a press or a write with no geometry shows
+                // no picture rather than a misleading one.
+                if point.is_none()
+                    && frame.is_none()
+                    && matches!(kind, CursorKind::Press | CursorKind::Write)
+                {
                     return None;
                 }
-                let to = source.visible_cursor_point(&grant, requested)?;
+                let to = source.visible_cursor_point(&grant, point, frame)?;
                 Some(CursorEvent {
                     initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
                     agent,
                     to,
-                    width: frame.map_or(24.0, |f| f[2].min(f[3]).max(1.0)),
+                    target: frame,
+                    resting: point.is_none() && frame.is_none(),
                     label: label(kind, title.as_deref(), secure),
                     kind,
                     serial,
@@ -213,7 +223,8 @@ impl Coordinator {
                 agent: String::new(),
                 initial: 'A',
                 to: [0.0, 0.0],
-                width: 1.0,
+                target: None,
+                resting: true,
                 label: None,
                 kind: CursorKind::Reading,
                 serial: 0,
@@ -302,7 +313,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             Some([0.0, 0.0, 10.0, 10.0])
         }
-        fn visible_cursor_point(&self, _: &ProcessGrant, p: Option<[f64; 2]>) -> Option<[f64; 2]> {
+        fn visible_cursor_point(
+            &self,
+            _: &ProcessGrant,
+            p: Option<[f64; 2]>,
+            _: Option<[f64; 4]>,
+        ) -> Option<[f64; 2]> {
             p
         }
     }
@@ -353,7 +369,8 @@ mod tests {
             agent: "agent".into(),
             initial: 'A',
             to: [1.0, 1.0],
-            width: 20.0,
+            target: None,
+            resting: false,
             label: None,
             kind: CursorKind::Press,
             serial: 0,
