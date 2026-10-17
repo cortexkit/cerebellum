@@ -72,7 +72,7 @@ mod cursor_schedule;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use cursor_overlay::{run_agent_cursor, OverlayEvent};
+pub use cursor_overlay::{run_agent_cursor, OverlayEvent, OverlayMessage};
 #[cfg(target_os = "macos")]
 mod peer_attestation;
 #[cfg(target_os = "macos")]

@@ -37,7 +37,7 @@ fn agent_cursor() {}
 
 #[cfg(target_os = "macos")]
 fn agent_cursor() {
-    use cerebellum_computer::cursor::{CursorEvent, CursorKind, MAX_CURSOR_LINE};
+    use cerebellum_computer::cursor::{CursorKind, CursorLine, MAX_CURSOR_LINE};
     use std::io::{BufRead, Read};
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
@@ -55,23 +55,41 @@ fn agent_cursor() {
             {
                 break;
             }
-            let Ok(event) = serde_json::from_slice::<CursorEvent>(&line) else {
+            let Ok(line) = serde_json::from_slice::<CursorLine>(&line) else {
                 continue;
             };
-            if !event.valid() {
+            if !line.valid() {
                 continue;
             }
-            let _ = sender.try_send(cerebellum_macos::OverlayEvent {
-                agent: event.agent,
-                initial: event.initial,
-                to: event.to,
-                width: event.width,
-                label: event.label,
-                reading: event.kind == CursorKind::Reading,
-                serial: event.serial,
-                avatar_rgba: event.avatar_rgba,
-                avatar_update: event.avatar_update,
-            });
+            let message = match line {
+                // A hide is waited for rather than dropped on a full queue: a
+                // lost picture is cosmetic, but a lost hide leaves a finished
+                // agent's badge on screen until it idles out. Only this reader
+                // thread waits; the main thread keeps draining the queue.
+                CursorLine::Hide(hide) => {
+                    if sender
+                        .send(cerebellum_macos::OverlayMessage::Hide { agent: hide.agent })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                CursorLine::Picture(event) => {
+                    cerebellum_macos::OverlayMessage::Show(cerebellum_macos::OverlayEvent {
+                        agent: event.agent,
+                        initial: event.initial,
+                        to: event.to,
+                        width: event.width,
+                        label: event.label,
+                        reading: event.kind == CursorKind::Reading,
+                        serial: event.serial,
+                        avatar_rgba: event.avatar_rgba,
+                        avatar_update: event.avatar_update,
+                    })
+                }
+            };
+            let _ = sender.try_send(message);
         }
     });
     cerebellum_macos::run_agent_cursor(

@@ -1,29 +1,54 @@
 //! A lossy, memory-only picture alongside an admitted action. Nothing here
 //! returns an action outcome or receives a request body.
 
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(any(target_os = "macos", test))]
 use std::time::Instant;
 
 use cerebellum_computer::app_state::source::{AppStateSource, ElementHandle};
-use cerebellum_computer::cursor::{label, CursorEvent, CursorKind};
+use cerebellum_computer::cursor::{label, CursorEvent, CursorHide, CursorKind, CursorLine};
 use cerebellum_computer::platform::ProcessGrant;
 use tokio::sync::mpsc;
 
+use crate::terminal_arbiter::TerminalArbiter;
+
 const READ_BUDGET: Duration = Duration::from_millis(50);
 const CAPACITY: usize = 32;
+/// Bounds each memory-only record of who drew a badge. Far more than the agents
+/// one person runs at once; past it the oldest record goes, and that agent's
+/// badge still idles out on its own.
+const RECORD_CAP: usize = 256;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod avatar;
 
 tokio::task_local! {
     pub(crate) static ACTING_AGENT: Option<String>;
+    /// The daemon-stamped scope of the head session this call belongs to,
+    /// so that session's turn ending can hide the badge the call drew.
+    pub(crate) static ACTING_SESSION: Option<SessionScope>;
+}
+
+/// A head session's scope as the daemon stamped it on the route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionScope {
+    pub(crate) scope_ref: String,
+    /// Kept with the record but never compared: a revived session keeps its
+    /// ref and takes a new epoch, and its turn ending must still find the
+    /// badge drawn before the revival.
+    #[allow(dead_code)]
+    pub(crate) epoch: u64,
 }
 
 pub(crate) struct Identity {
     badge: String,
     avatar_agent: Option<String>,
+    /// The route call drawing the badge. Captured here because the drawing may
+    /// be scheduled from a blocking thread, where task-locals are not visible.
+    call: Option<Arc<TerminalArbiter>>,
+    session: Option<SessionScope>,
 }
 
 impl Identity {
@@ -32,15 +57,41 @@ impl Identity {
         Self {
             badge: avatar_agent.clone().unwrap_or(fallback),
             avatar_agent,
+            call: TerminalArbiter::current(),
+            session: ACTING_SESSION.try_with(Clone::clone).ok().flatten(),
         }
     }
+}
+
+/// How a head session's turn ended, as its owner reported it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnOutcome {
+    Completed,
+    Stopped,
+    Failed,
+}
+
+/// Who drew which badge, so that a route closing, a call being cancelled, or a
+/// session's turn ending can hide exactly those badges.
+#[derive(Default)]
+struct Drawn {
+    /// For each agent, the serial counter's value when its badge was last
+    /// ended. A picture scheduled before that end is still reading geometry
+    /// and must not bring the badge back once its read finishes.
+    ended_at: HashMap<String, u64>,
+    /// Agents whose badges each `(channel, epoch)` route has drawn.
+    routes: HashMap<(u16, u32), BTreeSet<String>>,
+    /// Which head session drew which agent's badge, least recently drawn
+    /// first.
+    sessions: VecDeque<(SessionScope, String)>,
 }
 
 #[derive(Default)]
 struct State {
     stopped: std::sync::atomic::AtomicBool,
-    sender: OnceLock<mpsc::Sender<CursorEvent>>,
+    sender: OnceLock<mpsc::Sender<CursorLine>>,
     serial: std::sync::atomic::AtomicU64,
+    drawn: std::sync::Mutex<Drawn>,
     #[cfg(target_os = "macos")]
     avatars: OnceLock<Arc<avatar::Avatars>>,
     #[cfg(target_os = "macos")]
@@ -87,7 +138,7 @@ impl Coordinator {
     /// All production planes start disabled; only the module's config loader
     /// enables the native transport.
     #[doc(hidden)]
-    pub fn channel() -> (Self, mpsc::Receiver<CursorEvent>) {
+    pub fn channel() -> (Self, mpsc::Receiver<CursorLine>) {
         let result = Self::default();
         let (tx, rx) = mpsc::channel(CAPACITY);
         let _ = result.0.sender.set(tx);
@@ -112,12 +163,133 @@ impl Coordinator {
 
     /// No lock, await, backpressure, journal, or call-record writer on this path.
     pub fn send(&self, event: CursorEvent) {
+        self.send_line(CursorLine::Picture(event));
+    }
+
+    fn send_line(&self, line: CursorLine) {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         if let Some(sender) = self.0.sender.get() {
-            let _ = sender.try_send(event);
+            let _ = sender.try_send(line);
         }
+    }
+
+    fn drawn(&self) -> std::sync::MutexGuard<'_, Drawn> {
+        self.0
+            .drawn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The one way to say an agent is done with the computer: its badge comes
+    /// off the screen now instead of idling out. Every end signal (route
+    /// closed, computer call cancelled, the session's turn ended) comes here.
+    /// A later action by the same agent draws a fresh badge.
+    pub fn end(&self, agent: &str) {
+        if self.0.sender.get().is_none() {
+            return;
+        }
+        let mut drawn = self.drawn();
+        if drawn.ended_at.len() >= RECORD_CAP && !drawn.ended_at.contains_key(agent) {
+            // Each entry only matters for the few milliseconds a geometry read
+            // can still be running, so forgetting old ones loses nothing real.
+            drawn.ended_at.clear();
+        }
+        drawn.ended_at.insert(
+            agent.to_owned(),
+            self.0.serial.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        // Sent while holding the record, so a picture whose read finishes now
+        // either goes out before this hide or sees the end and is dropped.
+        self.send_line(CursorLine::Hide(CursorHide::new(agent)));
+    }
+
+    /// A route closed: end every badge it drew.
+    pub(crate) fn end_route(&self, channel: u16, epoch: u32) {
+        let agents = self.drawn().routes.remove(&(channel, epoch));
+        for agent in agents.into_iter().flatten() {
+            self.end(&agent);
+        }
+    }
+
+    /// A head session's turn ended: end every badge that session's calls drew.
+    /// This is the single internal entry for that signal, whatever delivers it
+    /// (today a management call from Prefrontal core; later the harness's
+    /// turn-ended event), so changing the source never touches the mapping.
+    ///
+    /// Badges are matched on the daemon-stamped `scope_ref`, the only session
+    /// name a computer call carries. `session_ref` is the harness runner's own
+    /// ref; nothing records it against badges yet, so a source that knows only
+    /// that ref ends nothing until such a record exists. It is in the signature
+    /// so that source can be wired without changing every caller.
+    ///
+    /// An unknown session is not an error; it simply drew nothing that is
+    /// still recorded. Every outcome ends the badge the same way: a turn that
+    /// stopped or failed is just as finished with the computer as one that
+    /// completed, so `outcome` is carried for the record only.
+    pub(crate) fn turn_ended(
+        &self,
+        session_ref: &str,
+        scope_ref: Option<&str>,
+        outcome: TurnOutcome,
+    ) {
+        let _ = (session_ref, outcome);
+        let Some(scope_ref) = scope_ref else {
+            return;
+        };
+        let agents: BTreeSet<String> = self
+            .drawn()
+            .sessions
+            .iter()
+            .filter(|(session, _)| session.scope_ref == scope_ref)
+            .map(|(_, agent)| agent.clone())
+            .collect();
+        for agent in agents {
+            self.end(&agent);
+        }
+    }
+
+    /// Remember who is drawing this badge, before any read starts, so an end
+    /// that arrives while the read is still running still finds it.
+    fn record(&self, identity: &Identity) {
+        let agent = &identity.badge;
+        if let Some(call) = &identity.call {
+            call.note_cursor_agent(agent);
+        }
+        let mut drawn = self.drawn();
+        if let Some(call) = &identity.call {
+            drawn
+                .routes
+                .entry(call.route())
+                .or_default()
+                .insert(agent.clone());
+        }
+        if let Some(session) = &identity.session {
+            // One record per (ref, agent): a revival's new epoch replaces the
+            // old one rather than adding a second record for the same badge.
+            drawn.sessions.retain(|(recorded, recorded_agent)| {
+                recorded.scope_ref != session.scope_ref || recorded_agent != agent
+            });
+            if drawn.sessions.len() >= RECORD_CAP {
+                drawn.sessions.pop_front();
+            }
+            drawn.sessions.push_back((session.clone(), agent.clone()));
+        }
+    }
+
+    /// Send a scheduled picture unless its agent was ended after it was
+    /// scheduled.
+    fn send_unless_ended(&self, event: CursorEvent) {
+        let drawn = self.drawn();
+        if drawn
+            .ended_at
+            .get(&event.agent)
+            .is_some_and(|ended| event.serial < *ended)
+        {
+            return;
+        }
+        self.send(event);
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
@@ -138,10 +310,13 @@ impl Coordinator {
             return;
         }
         let cursor = self.clone();
+        // Numbered before it is recorded: an end that lands in between then
+        // counts this picture as scheduled before it, and drops it.
         let serial = self
             .0
             .serial
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        cursor.record(&identity);
         tokio::spawn(async move {
             let agent = identity.badge;
             #[cfg(not(target_os = "macos"))]
@@ -175,7 +350,7 @@ impl Coordinator {
                 })
             });
             if let Ok(Ok(Some(event))) = tokio::time::timeout(READ_BUDGET, read).await {
-                cursor.send(event.clone());
+                cursor.send_unless_ended(event.clone());
                 #[cfg(target_os = "macos")]
                 if let (Some(agent), Some(avatars)) =
                     (identity.avatar_agent, cursor.0.avatars.get())
@@ -209,7 +384,7 @@ impl Coordinator {
         if let Some(sender) = self.0.sender.get() {
             // Wake an idle transport so it can reap its child. A full channel
             // already guarantees a wake; the stopped flag prevents any drawing.
-            let _ = sender.try_send(CursorEvent {
+            let _ = sender.try_send(CursorLine::Picture(CursorEvent {
                 agent: String::new(),
                 initial: 'A',
                 to: [0.0, 0.0],
@@ -219,13 +394,39 @@ impl Coordinator {
                 serial: 0,
                 avatar_rgba: None,
                 avatar_update: false,
-            });
+            }));
         }
     }
 }
 
+impl Identity {
+    /// An identity as a computer call would capture it, for tests of the end
+    /// signals that do not drive a whole computer call.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        badge: &str,
+        call: Option<Arc<TerminalArbiter>>,
+        session: Option<SessionScope>,
+    ) -> Self {
+        Self {
+            badge: badge.to_owned(),
+            avatar_agent: None,
+            call,
+            session,
+        }
+    }
+}
+
+impl Coordinator {
+    /// Record a badge as `schedule` does, without reading any geometry.
+    #[cfg(test)]
+    pub(crate) fn draw_for_test(&self, identity: &Identity) {
+        self.record(identity);
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorEvent>) {
+fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
     use std::io::Write;
     let mut helper: Option<(cerebellum_macos::ReleasedChild, std::fs::File)> = None;
     let mut restarts = RestartLimit::default();
@@ -238,6 +439,11 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorEvent>) {
             continue;
         }
         if helper.is_none() {
+            // No helper means no badge on screen, so there is nothing to hide;
+            // never launch a helper just to hide nothing.
+            if matches!(event, CursorLine::Hide(_)) {
+                continue;
+            }
             if !restarts.admit(Instant::now()) {
                 continue;
             }
@@ -283,7 +489,8 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorEvent>) {
 mod tests {
     use super::*;
 
-    struct SlowGeometry;
+    /// Geometry that takes the given time to read.
+    struct SlowGeometry(Duration);
     impl AppStateSource for SlowGeometry {
         fn read_app_state(
             &self,
@@ -299,7 +506,7 @@ mod tests {
             Some((Some("Send".into()), false))
         }
         fn cursor_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(self.0);
             Some([0.0, 0.0, 10.0, 10.0])
         }
         fn visible_cursor_point(&self, _: &ProcessGrant, p: Option<[f64; 2]>) -> Option<[f64; 2]> {
@@ -320,7 +527,7 @@ mod tests {
             Identity::current("agent".into()),
             CursorKind::Press,
             grant,
-            Arc::new(SlowGeometry),
+            Arc::new(SlowGeometry(Duration::from_millis(150))),
             Some(cerebellum_computer::app_state::source::RawElement::fixture(1, "AXButton").handle),
             None,
         );
@@ -334,6 +541,103 @@ mod tests {
                 .is_err(),
             "late geometry must not reach the helper"
         );
+    }
+
+    const SESSION: &str = "0123456789abcdef0123456789abcdef";
+
+    fn grant() -> ProcessGrant {
+        ProcessGrant {
+            bundle_identity: "test.app".into(),
+            pid: 7,
+            process_generation_evidence: "generation".into(),
+        }
+    }
+
+    fn hidden(line: CursorLine) -> String {
+        match line {
+            CursorLine::Hide(hide) => hide.agent,
+            CursorLine::Picture(event) => {
+                panic!("expected a hide, got a picture for {}", event.agent)
+            }
+        }
+    }
+
+    fn head(scope_ref: &str, epoch: u64) -> Option<SessionScope> {
+        Some(SessionScope {
+            scope_ref: scope_ref.into(),
+            epoch,
+        })
+    }
+
+    #[test]
+    fn end_hides_only_the_named_agent_and_needs_a_transport() {
+        // A disabled cursor has nowhere to send a hide, and must not panic.
+        Coordinator::default().end("agent-a");
+        let (cursor, mut receiver) = Coordinator::channel();
+        cursor.end("agent-a");
+        assert_eq!(hidden(receiver.try_recv().unwrap()), "agent-a");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn turn_ended_matches_the_scope_ref_whatever_its_epoch() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        cursor.draw_for_test(&Identity::for_test("agent-a", None, head("head-a", 1)));
+        cursor.draw_for_test(&Identity::for_test("agent-b", None, head("head-b", 1)));
+        // The same session revived: same ref, new epoch, same badge.
+        cursor.draw_for_test(&Identity::for_test("agent-a", None, head("head-a", 2)));
+        cursor.turn_ended(SESSION, Some("unknown"), TurnOutcome::Completed);
+        assert!(
+            receiver.try_recv().is_err(),
+            "an unknown session ends nothing"
+        );
+        cursor.turn_ended(SESSION, None, TurnOutcome::Completed);
+        assert!(
+            receiver.try_recv().is_err(),
+            "no scope, nothing to match yet"
+        );
+        cursor.turn_ended(SESSION, Some("head-a"), TurnOutcome::Stopped);
+        assert_eq!(hidden(receiver.try_recv().unwrap()), "agent-a");
+        assert!(
+            receiver.try_recv().is_err(),
+            "agent-b's session did not end"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picture_scheduled_before_an_end_does_not_bring_the_badge_back() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let schedule = || {
+            cursor.schedule(
+                Identity::for_test("agent-a", None, None),
+                CursorKind::Press,
+                grant(),
+                // Well inside the read budget, so the picture would be sent.
+                Arc::new(SlowGeometry(Duration::from_millis(20))),
+                Some(
+                    cerebellum_computer::app_state::source::RawElement::fixture(1, "AXButton")
+                        .handle,
+                ),
+                None,
+            )
+        };
+        schedule();
+        cursor.end("agent-a");
+        assert_eq!(hidden(receiver.recv().await.unwrap()), "agent-a");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), receiver.recv())
+                .await
+                .is_err(),
+            "the read that finished after the end must not redraw the badge"
+        );
+        schedule();
+        let picture = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .picture()
+            .expect("an action after the end draws the badge again");
+        assert_eq!(picture.agent, "agent-a");
     }
 
     #[test]

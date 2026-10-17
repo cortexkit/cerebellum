@@ -50,6 +50,9 @@ pub const SCOPE_ADMISSION_CAPABILITY: &str = "cerebellum-scope-admission/v1";
 
 /// Lets route openers discover that keyed calls can settle after their reply.
 pub const LATE_RESULTS_CAPABILITY: &str = "late-results/v1";
+/// This module serves `session.turn_ended`, so Prefrontal core can tell it a
+/// head session's turn ended and that session's cursor badge should go.
+pub const SESSION_TURN_ENDED_CAPABILITY: &str = "session-turn-ended/v1";
 
 pub fn browser_wire_tools() -> Vec<Tool> {
     crate::browser::tool_definitions()
@@ -199,6 +202,12 @@ fn management_surface() -> ProviderRole {
             ),
             (crate::permissions::LIST, "List live agent and worker permissions. Cingulate aggregator only."),
             (crate::permissions::REVOKE, "Revoke a permission by id and stop work using it. Cingulate aggregator only."),
+            (
+                crate::management::SESSION_TURN_ENDED,
+                "Report that a head session's turn ended, so its agent cursor badge leaves the \
+                 screen at once. Always acknowledges. Prefrontal core only; interim until the \
+                 harness publishes turn-ended events.",
+            ),
         ]
         .into_iter()
         .map(|(name, description)| ManagementOperation {
@@ -441,6 +450,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::call_mode::CALL_MODES_CAPABILITY.to_string(),
                 LATE_RESULTS_CAPABILITY.to_string(),
+                SESSION_TURN_ENDED_CAPABILITY.to_string(),
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
             ],
             requires: Vec::new(),
@@ -976,6 +986,7 @@ mod tests {
                 crate::management::LIST_GRANTS,
                 crate::permissions::LIST,
                 crate::permissions::REVOKE,
+                crate::management::SESSION_TURN_ENDED,
             ]
         );
         let dispatchable = crate::management::OPERATIONS
@@ -986,6 +997,30 @@ mod tests {
         assert!(advertised
             .iter()
             .all(|name| crate::dispatchable_management_operation(name)));
+    }
+
+    #[test]
+    fn session_turn_ended_is_declared_beside_late_results_and_changes_nothing_durable() {
+        let manifest = build("cerebellum");
+        let provides = manifest.capabilities.as_ref().unwrap().provides.clone();
+        let late = provides
+            .iter()
+            .position(|name| name == LATE_RESULTS_CAPABILITY)
+            .unwrap();
+        assert_eq!(provides[late + 1], SESSION_TURN_ENDED_CAPABILITY);
+        let Some(ProviderRole::ManagementSurface { operations, .. }) = manifest
+            .provides
+            .iter()
+            .find(|role| matches!(role, ProviderRole::ManagementSurface { .. }))
+        else {
+            panic!("expected a ManagementSurface role");
+        };
+        let operation = operations
+            .iter()
+            .find(|operation| operation.name == crate::management::SESSION_TURN_ENDED)
+            .unwrap();
+        // It hides a cosmetic badge and stores nothing.
+        assert_eq!(operation.kind, ManagementOperationKind::Query);
     }
 
     #[test]

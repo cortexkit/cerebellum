@@ -714,6 +714,12 @@ async fn hello_manifest_declares_late_results_capability() {
         capabilities.contains(&json!("tool-provider/v1")),
         "HELLO must declare the catalog provider role"
     );
+    // Declared beside late results: both tell Prefrontal core which of its
+    // calls this module serves.
+    assert!(
+        capabilities.contains(&json!("session-turn-ended/v1")),
+        "HELLO does not declare session.turn_ended support: {capabilities:?}"
+    );
 }
 
 #[tokio::test]

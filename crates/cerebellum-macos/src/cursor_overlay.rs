@@ -2,7 +2,7 @@
 //! This module has no input posting, target-app activation, or capture APIs.
 
 use std::cell::{Cell, RefCell};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Instant;
 
 use crate::cursor_schedule::{CursorSchedule, PictureStep, Wait};
@@ -26,6 +26,13 @@ pub struct OverlayEvent {
     pub serial: u64,
     pub avatar_rgba: Option<Vec<u8>>,
     pub avatar_update: bool,
+}
+
+/// One message from the module: a picture to show or move, or one agent's
+/// picture to take off the screen now because that agent is done.
+pub enum OverlayMessage {
+    Show(OverlayEvent),
+    Hide { agent: String },
 }
 
 pub type GlideDuration = fn(f64, f64, bool) -> f64;
@@ -183,7 +190,15 @@ impl Picture {
         self.badge.setNeedsDisplay(true);
     }
 
-    fn tick(&mut self, elapsed: f64, alpha: f64, desktop_top: f64, position: GlidePosition) {
+    /// Draw one frame and answer whether the picture is still gliding or
+    /// pulsing. A picture at rest needs no further frames until it fades.
+    fn tick(
+        &mut self,
+        elapsed: f64,
+        alpha: f64,
+        desktop_top: f64,
+        position: GlidePosition,
+    ) -> bool {
         let fraction = if self.duration_ms <= 0.0 {
             1.0
         } else {
@@ -204,13 +219,14 @@ impl Picture {
         self.badge.ivars().pulse.set(pulse);
         self.badge.setNeedsDisplay(true);
         self.panel.setAlphaValue(alpha);
+        fraction < 1.0 || (!self.reduce && since_arrival < 250.0)
     }
 }
 
 /// Run only in the hidden helper mode, before any asynchronous runtime exists.
 /// EOF closes the channel and ends the main-thread run loop without saving state.
 pub fn run_agent_cursor(
-    events: Receiver<OverlayEvent>,
+    events: Receiver<OverlayMessage>,
     duration: GlideDuration,
     position: GlidePosition,
 ) {
@@ -232,7 +248,10 @@ pub fn run_agent_cursor(
             // a noisy agent is continuously sending events.
             for _ in 0..32 {
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
-                    Ok(event) => {
+                    Ok(OverlayMessage::Hide { agent }) => {
+                        pictures.end(&agent, |picture, _| picture.panel.orderOut(None));
+                    }
+                    Ok(OverlayMessage::Show(event)) => {
                         if !event.to.iter().all(|v| v.is_finite()) {
                             continue;
                         }
@@ -258,9 +277,12 @@ pub fn run_agent_cursor(
             }
             let wait = pictures.advance(Instant::now(), |picture, step| match step {
                 PictureStep::Draw { elapsed_ms, alpha } => {
-                    picture.tick(elapsed_ms, alpha, desktop_top, position);
+                    picture.tick(elapsed_ms, alpha, desktop_top, position)
                 }
-                PictureStep::Hide => picture.panel.orderOut(None),
+                PictureStep::Hide => {
+                    picture.panel.orderOut(None);
+                    false
+                }
             });
             if let Wait::Frame(interval) = wait {
                 let date = NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64());
@@ -274,7 +296,23 @@ pub fn run_agent_cursor(
                     app.sendEvent(&event);
                 }
             }
-            // Flush the final orderOut before sleeping without any live panels.
+            if let Wait::Timed(_) = wait {
+                // About to sleep for up to the idle fade time with panels on
+                // screen. Handle whatever AppKit already queued so it is not
+                // left waiting that long; never blocks.
+                for _ in 0..16 {
+                    let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                        NSEventMask::Any,
+                        Some(&NSDate::distantPast()),
+                        unsafe { NSDefaultRunLoopMode },
+                        true,
+                    ) else {
+                        break;
+                    };
+                    app.sendEvent(&event);
+                }
+            }
+            // Flush the final draw or orderOut before sleeping.
             app.updateWindows();
             Some(wait)
         });
@@ -287,6 +325,16 @@ pub fn run_agent_cursor(
                 match events.recv() {
                     Ok(event) => pending = Some(event),
                     Err(_) => break,
+                }
+            }
+            Some(Wait::Timed(until_fade)) => {
+                // Every picture is resting. Sleep until the next event or until
+                // the oldest one is due to fade, with no frames in between, so
+                // a badge left on screen costs no CPU while its agent thinks.
+                match events.recv_timeout(until_fade) {
+                    Ok(event) => pending = Some(event),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             Some(Wait::Frame(_)) => {}

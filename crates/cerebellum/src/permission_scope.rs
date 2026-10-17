@@ -47,6 +47,29 @@ pub(crate) fn cursor_agent(
         .filter(|id| !id.is_empty())
 }
 
+/// The head session a call's cursor badge belongs to, as the scope the daemon
+/// stamped on the head's route. A worker's calls belong to the head it works
+/// for, through the parent link the daemon also stamped, so the head's turn
+/// ending covers its workers' badges too. Nothing here is read from a request
+/// body.
+pub(crate) fn cursor_session(
+    facts: &AcceptedBindFacts,
+) -> Option<crate::computer_capability::cursor::SessionScope> {
+    use crate::computer_capability::cursor::SessionScope;
+    let stamp = facts.scope.as_ref()?;
+    match stamp.kind {
+        ScopeKind::Head if stamp.owner_authorized => Some(SessionScope {
+            scope_ref: stamp.scope_ref.clone(),
+            epoch: stamp.scope_epoch,
+        }),
+        ScopeKind::Worker => worker_parent(facts).map(|parent| SessionScope {
+            scope_ref: parent.scope_ref,
+            epoch: parent.scope_epoch,
+        }),
+        _ => None,
+    }
+}
+
 fn worker_parent(facts: &AcceptedBindFacts) -> Option<ScopeKey> {
     let stamp = facts.scope.as_ref()?;
     let parent = stamp.parent.as_ref()?;
