@@ -92,8 +92,8 @@ by `documentId` when exposed by both APIs. It verifies webNavigation document id
 before and after discovery and compares the CDP tree across the read. A changing
 tree is retried once; if it changes again, only affected child subtrees are
 omitted. URL duplicates without a document-id proof are marked ambiguous, never
-resolved to an arbitrary sibling. Stray navigation entries and sessions absent
-from the claimed tab's tree do not invalidate readable documents. Cerebellum
+resolved to an arbitrary sibling. Stray navigation entries and sessions without
+a reachable parent in the claimed tab's tree do not invalidate readable documents. Cerebellum
 renders `[embedded frame not readable: ambiguous|stale]` at the iframe owner,
 removes its refs, and reports `truncated:true`. The top document stays readable
 even if its webNavigation mapping is unavailable. Input and scoped child commands
@@ -107,6 +107,11 @@ flatten:true,filter:[{type:"iframe",exclude:false},{exclude:true}]}` to the clai
 tab and recursively to its attached iframe sessions (Chrome 125+, below the
 manifest's minimum version). Child `Page.getFrameTree` roots establish which
 stable target owns each frame, without assuming target ids equal frame ids.
+Chrome can omit OOPIFs entirely from the parent's tree; child roots are grafted
+using their explicit CDP `parentId`, only beneath an already reachable parent.
+An iframe owner in the parent AX tree whose child was not included (including
+undiscovered, failed, empty or bounded captures) is also marked unreadable and
+cannot retain an actionable ref, even if discovery returned no child entry.
 Only descendants of this attachment are addressable; caller-supplied raw sessions
 or target attach commands are not admitted. Detaching the tab after every plan
 detaches its children too; nothing is retained across actions except ref identity.

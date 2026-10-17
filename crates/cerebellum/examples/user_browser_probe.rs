@@ -313,7 +313,12 @@ fn reference(snapshot: &Value, name: &str) -> Result<String, String> {
         .and_then(|text| text.lines().find(|line| line.contains(name)))
         .and_then(|line| line.split_whitespace().next())
         .map(str::to_owned)
-        .ok_or_else(|| format!("snapshot lacks {name}"))
+        .ok_or_else(|| {
+            format!(
+                "snapshot lacks {name}; state_text:\n{}",
+                snapshot["state_text"].as_str().unwrap_or("<missing>")
+            )
+        })
 }
 
 fn fixture_page_target(targets: &Value, origin: &str) -> Result<String, String> {

@@ -108,10 +108,16 @@ export class Frames {
       const replacement = trees.get(node.frame.id);
       if (replacement && owner !== replacement.owner) return expand({ ...replacement.tree, frame: { ...replacement.tree.frame, ...(node.frame.parentId ? { parentId: node.frame.parentId } : {}) } }, replacement.owner, depth + 1);
       owners.set(node.frame.id, owner);
-      return { ...node, frame: { ...node.frame, url: frameUrl(node.frame) }, childFrames: (node.childFrames ?? []).map(child => expand(child, owner, depth + 1)) };
+      const children = [...(node.childFrames ?? [])];
+      // Chrome can omit OOPIFs entirely from parent Page.getFrameTree. Their own
+      // session trees carry parentId; join only to a parent already reachable
+      // from this tab, never by URL or by an unrelated target's existence.
+      for (const { tree: child } of trees.values()) {
+        if (child.frame.parentId === node.frame.id && !children.some(node => node.frame.id === child.frame.id)) children.push(child);
+      }
+      return { ...node, frame: { ...node.frame, url: frameUrl(node.frame) }, childFrames: children.map(child => expand(child, owner, depth + 1)) };
     }
-    // Expand only nodes in the claimed tab's tree. A session whose root has
-    // no tree position is ignored rather than supplying unrelated content.
+    // A child session without a reachable parent cannot supply tab content.
     const firstTree = expand(root.frameTree);
     const latestRoot = await this.send({ tabId: this.state.tabId }, "Page.getFrameTree");
     const tree = expand(latestRoot.frameTree);

@@ -1976,7 +1976,7 @@ fn mark_unreadable_frame(
     record_frames: &mut Vec<String>,
     snapshot: &mut Snapshot,
     facts: &mut HashMap<String, state_text::NodeFacts>,
-    frame: &FrameDocument,
+    frame_id: &str,
     owner_index: Option<usize>,
     reason: FrameReadFailure,
 ) {
@@ -2002,10 +2002,10 @@ fn mark_unreadable_frame(
             }
         }
         records.splice(index..end, [marker]);
-        record_frames.splice(index..end, [frame.frame_id.clone()]);
+        record_frames.splice(index..end, [frame_id.to_owned()]);
     } else {
         records.push(marker);
-        record_frames.push(frame.frame_id.clone());
+        record_frames.push(frame_id.to_owned());
     }
 }
 
@@ -2023,6 +2023,7 @@ async fn capture_attempt(
     let mut records = Vec::new();
     let mut record_frames = Vec::new();
     let mut frame_owners = BTreeMap::new();
+    let mut included_owners = BTreeSet::new();
     let mut failed_frames = BTreeSet::new();
     let mut facts = HashMap::new();
     let mut html = Vec::new();
@@ -2062,8 +2063,6 @@ async fn capture_attempt(
         }
         if records.len() >= crate::snapshot_store::MAX_REFS {
             refs_truncated = true;
-            omitted_frames += 1;
-            continue;
         }
         if !context.granted(
             &origin(&document.committed.url)?,
@@ -2099,7 +2098,7 @@ async fn capture_attempt(
                             &mut record_frames,
                             &mut snapshot,
                             &mut facts,
-                            frame,
+                            &frame.frame_id,
                             None,
                             FrameReadFailure::from_reply(&reply).unwrap(),
                         );
@@ -2141,14 +2140,17 @@ async fn capture_attempt(
                 .unreadable_frames
                 .get(&frame.frame_id)
                 .copied()
-                .or_else(|| owner_index.is_none().then_some(FrameReadFailure::Stale))
+                .or_else(|| {
+                    (owner_index.is_none() || records.len() >= crate::snapshot_store::MAX_REFS)
+                        .then_some(FrameReadFailure::Stale)
+                })
             {
                 mark_unreadable_frame(
                     &mut records,
                     &mut record_frames,
                     &mut snapshot,
                     &mut facts,
-                    frame,
+                    &frame.frame_id,
                     owner_index,
                     reason,
                 );
@@ -2185,7 +2187,7 @@ async fn capture_attempt(
                     &mut record_frames,
                     &mut snapshot,
                     &mut facts,
-                    frame,
+                    &frame.frame_id,
                     owner_index,
                     FrameReadFailure::from_reply(&reply).unwrap(),
                 );
@@ -2222,7 +2224,7 @@ async fn capture_attempt(
                     &mut record_frames,
                     &mut snapshot,
                     &mut facts,
-                    frame,
+                    &frame.frame_id,
                     owner_index,
                     FrameReadFailure::Stale,
                 );
@@ -2234,6 +2236,33 @@ async fn capture_attempt(
         ax_truncated |= observation.ax_truncated;
         refs_truncated |= observation.refs_truncated;
         let remaining = crate::snapshot_store::MAX_REFS.saturating_sub(records.len());
+        if let Some(index) = owner_index {
+            if observation.records.is_empty()
+                || observation.ax_truncated
+                || observation.refs_truncated
+                || observation.records.len() > remaining
+                || snapshot.refs.len() + observation.refs.len() > crate::snapshot_store::MAX_REFS
+            {
+                // No child records, or records/refs cut by a capture limit,
+                // cannot establish a complete embedded document. Replace the
+                // iframe element with an unreadable marker, not just a flag.
+                refs_truncated |= observation.records.len() > remaining;
+                mark_unreadable_frame(
+                    &mut records,
+                    &mut record_frames,
+                    &mut snapshot,
+                    &mut facts,
+                    &frame.frame_id,
+                    Some(index),
+                    FrameReadFailure::Stale,
+                );
+                omitted_frames += 1;
+                continue;
+            }
+            if let Some(reference) = &records[index].reference {
+                included_owners.insert(reference.clone());
+            }
+        }
         if observation.records.len() > remaining {
             observation.records.truncate(remaining);
             ax_truncated = true;
@@ -2331,6 +2360,37 @@ async fn capture_attempt(
                     .to_owned(),
             ));
         }
+    }
+    // A parent AX tree can expose an iframe that neither frame discovery nor
+    // auto-attach accounted for. Completeness must be checked against visible
+    // owners too; checking only the discovered child list silently loses them.
+    let mut index = 0;
+    while index < records.len() {
+        let record = &records[index];
+        if (record.role.eq_ignore_ascii_case("iframe")
+            || record.role.eq_ignore_ascii_case("iframepresentational"))
+            && !record
+                .reference
+                .as_ref()
+                .is_some_and(|reference| included_owners.contains(reference))
+        {
+            let frame_id = frame_owners
+                .iter()
+                .find(|(_, owner)| record.reference.as_ref() == Some(owner))
+                .map(|(frame, _)| frame.clone())
+                .unwrap_or_else(|| format!("unmapped-owner-{index}"));
+            mark_unreadable_frame(
+                &mut records,
+                &mut record_frames,
+                &mut snapshot,
+                &mut facts,
+                &frame_id,
+                Some(index),
+                FrameReadFailure::Stale,
+            );
+            omitted_frames += 1;
+        }
+        index += 1;
     }
     let omitted_zoom = expected_zoom.is_some_and(|reference| {
         document
@@ -2430,7 +2490,7 @@ async fn capture_attempt(
                 &mut record_frames,
                 &mut snapshot,
                 &mut facts,
-                &frame,
+                &frame.frame_id,
                 owner_index,
                 reason,
             );
@@ -2509,6 +2569,11 @@ async fn capture_attempt(
             } else if let Some((_, html)) = html.iter().find(|(owner, _)| owner == &frame.frame_id)
             {
                 documents.push(html.as_str());
+            }
+        }
+        for (record, frame) in records.iter().zip(&record_frames) {
+            if !seen.contains(frame) && record.name.starts_with("[embedded frame not readable:") {
+                documents.push(record.name.as_str());
             }
         }
         crate::snapshot_store::encode_dom_text(&documents.join("\n"), max_bytes)

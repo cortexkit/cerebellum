@@ -101,6 +101,7 @@ struct DoubleState {
     untyped_button: bool,
     ax_override: Option<Value>,
     top_level_only: bool,
+    unmapped_child_owner: bool,
     same_origin_child: bool,
     ambiguous_frames: bool,
     frame_pair: bool,
@@ -109,6 +110,7 @@ struct DoubleState {
     moving_child: bool,
     child_loader: u64,
     child_ax_unavailable: bool,
+    child_ax_oversized: bool,
     plan_delay: Duration,
     consent_delay: Duration,
     plan_count: usize,
@@ -745,11 +747,15 @@ fn execute(
                 if command["frame_id"] == "foreign" && state.child_ax_unavailable {
                     json!({"nodes":[]})
                 } else if command["frame_id"] == "foreign" {
-                    json!({"nodes":[
+                    let mut ax = json!({"nodes":[
                         {"nodeId":"child-root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Embedded page"},"backendDOMNodeId":1,"frameId":"foreign","childIds":["child-field","child-button"]},
                         {"nodeId":"child-field","ignored":false,"role":{"value":"textbox"},"name":{"value":"Child message"},"value":{"value":"child field value"},"backendDOMNodeId":4},
                         {"nodeId":"child-button","ignored":false,"role":{"value":"button"},"name":{"value":"Child go"},"backendDOMNodeId":3}
-                    ]})
+                    ]});
+                    if state.child_ax_oversized {
+                        ax["nodes"][1]["name"]["value"] = json!("X".repeat(8192));
+                    }
+                    ax
                 } else if command["frame_id"]
                     .as_str()
                     .is_some_and(|id| id.starts_with("pair-"))
@@ -760,6 +766,16 @@ fn execute(
                     ]})
                 } else {
                     let mut ax = state.ax_override.clone().unwrap_or_else(ax);
+                    // A page with no child documents normally has no iframe
+                    // element. Retain that element to simulate a child missing
+                    // from discovery but still visible in the parent's AX tree.
+                    if state.top_level_only
+                        && !state.unmapped_child_owner
+                        && state.ax_override.is_none()
+                    {
+                        ax["nodes"][0]["childIds"] = json!(["button", "text", "secret"]);
+                        ax["nodes"].as_array_mut().unwrap().pop();
+                    }
                     if state.frame_pair {
                         for (id, backend) in [("pair-one", 7), ("pair-two", 8)] {
                             ax["nodes"][0]["childIds"]
@@ -2662,6 +2678,68 @@ async fn a_child_without_an_accessibility_tree_does_not_hide_the_top_page() {
     assert!(text.contains("Message"));
     assert!(text.contains("[embedded frame not readable: stale]"));
     assert!(!text.contains("Child message"));
+    assert!(!text.contains("Embedded page"));
+    let state = fixture.planes.user_browser.target().state();
+    let retained = &state.snapshots[snapshot["snapshot_id"].as_str().unwrap()];
+    assert!(retained.refs.values().all(|reference| {
+        reference.frame.frame_id == "main" && reference.identity.backend_node_id != 6
+    }));
+}
+
+#[tokio::test]
+async fn an_iframe_owner_without_a_discovered_child_is_marked_partial() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.top_level_only = true;
+            state.unmapped_child_owner = true;
+        }
+        let (snapshot, _) = fixture
+            .call(
+                1,
+                json!({"browser":"user","action":"snapshot","tab":tab,"mode":mode}),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], true, "{snapshot}");
+        assert_eq!(snapshot["omitted_frames"], 1);
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(
+            text.contains("[embedded frame not readable: stale]"),
+            "{text}"
+        );
+        assert!(!text.contains("Embedded page"), "{text}");
+        assert!(text.contains(if mode == "dom_full" {
+            "HTML-main"
+        } else {
+            "Message"
+        }));
+        let state = fixture.planes.user_browser.target().state();
+        let retained = &state.snapshots[snapshot["snapshot_id"].as_str().unwrap()];
+        assert!(retained
+            .refs
+            .values()
+            .all(|reference| reference.identity.backend_node_id != 6));
+    }
+}
+
+#[tokio::test]
+async fn a_bounded_child_capture_marks_its_iframe_owner_instead_of_silently_cutting_it() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().child_ax_oversized = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["refs_truncated"], true);
+    assert_eq!(snapshot["omitted_frames"], 1);
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert!(text.contains("[embedded frame not readable: stale]"));
+    assert!(!text.contains("Embedded page"));
+    assert!(!text.contains("Child go"));
 }
 
 #[tokio::test]
