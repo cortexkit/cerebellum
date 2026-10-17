@@ -80,6 +80,13 @@ const SUMMARY_LABEL_CHARS: usize = 40;
 /// timeline's posts under the timeline, without each post's parts as well.
 const OUTLINE_NESTING: usize = 2;
 
+/// A table, outline or grid with at most this many rows is printed row by
+/// row wherever the outline reaches it, instead of as one summary line or a
+/// `<count> rows` run: a short table is usually what the caller came to read
+/// (a settings list, a dashboard's entries), and twenty rows of a few cells
+/// each still fit the outline's byte budget, which keeps cutting past it.
+pub const SMALL_TABLE_ROWS: usize = 20;
+
 /// What one element renders as, before an id is attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElementDescription {
@@ -501,6 +508,85 @@ struct View<'a> {
     bytes: usize,
     /// How many lines the same printing takes.
     lines: usize,
+    /// For a table cell, its label with the text inside it folded in (see
+    /// [`fold_cell_text`]); `None` for every other element.
+    folded: Option<String>,
+}
+
+impl View<'_> {
+    /// The label the view prints: a cell's folded text, else its own.
+    fn label(&self) -> &str {
+        self.folded
+            .as_deref()
+            .unwrap_or(&self.node.description.label)
+    }
+
+    /// The view's line, with a cell's folded text as its label.
+    fn line(&self) -> (String, bool) {
+        line_with_label(self.id, &self.node.description, self.label())
+    }
+}
+
+fn is_cell(node: &ObservedNode) -> bool {
+    raw_role(node) == "AXCell"
+}
+
+/// Text that only shows something: static text with no state or value.
+fn is_plain_text(node: &ObservedNode) -> bool {
+    raw_role(node) == "AXStaticText"
+        && node.description.markers.is_empty()
+        && node.description.value.is_none()
+        && !node.description.secure
+}
+
+/// Fold the text inside a table cell into the cell's own line.
+///
+/// Applications put a cell's content in static text (often wrapped in
+/// groups) beneath an unlabelled cell, so a row printed as is reads as a run
+/// of empty `cell` lines with the words one level further down, or as
+/// `4 cells (zoom: …)`. Folding gives each cell the words it shows,
+/// `cell Map memories · Maps each memory…`, so a row reads as its content.
+/// Only plain text and the unlabelled groups around it are folded: anything a
+/// caller could press, type into or set stays a line of its own beneath the
+/// cell. Returns the children left after folding.
+fn fold_cell_text<'a>(children: Vec<View<'a>>, texts: &mut Vec<String>) -> Vec<View<'a>> {
+    let mut kept = Vec::new();
+    for child in children {
+        if is_plain_text(child.node) {
+            let text = one_line(&child.node.description.label);
+            if !text.is_empty() && texts.last() != Some(&text) {
+                texts.push(text);
+            }
+            kept.extend(fold_cell_text(child.children, texts));
+        } else if is_plain_container(child.node)
+            && one_line(&child.node.description.label).is_empty()
+        {
+            let inner = fold_cell_text(child.children, texts);
+            if !inner.is_empty() {
+                kept.push(View {
+                    children: inner,
+                    ..child
+                });
+            }
+        } else {
+            kept.push(child);
+        }
+    }
+    kept
+}
+
+/// Whether a view is a table, outline or grid short enough to print row by
+/// row (see [`SMALL_TABLE_ROWS`]).
+fn is_small_table(view: &View<'_>) -> bool {
+    if !matches!(raw_role(view.node), "AXTable" | "AXOutline" | "AXGrid") {
+        return false;
+    }
+    let rows = view
+        .children
+        .iter()
+        .filter(|child| raw_role(child.node) == "AXRow")
+        .count();
+    (1..=SMALL_TABLE_ROWS).contains(&rows)
 }
 
 fn raw_role(node: &ObservedNode) -> &str {
@@ -598,12 +684,16 @@ fn region_priority(node: &ObservedNode) -> u8 {
 ///
 /// `inherited_label` is the one-line label of the nearest labelled ancestor.
 /// `keep_root` keeps the element itself whatever it is, for the element a
-/// caller zoomed into and for the top-level windows.
+/// caller zoomed into and for the top-level windows. `fold_cells` folds the
+/// text inside table cells into the cell's line (see [`fold_cell_text`]);
+/// diffs and filters leave it off, because they name the very text element
+/// that changed or matched.
 fn build<'a>(
     node: &'a ObservedNode,
     inherited_label: &str,
     keep_root: bool,
     expand_menus: bool,
+    fold_cells: bool,
 ) -> Vec<View<'a>> {
     let Some(id) = node.element_id.as_deref() else {
         return Vec::new();
@@ -621,7 +711,7 @@ fn build<'a>(
         .children
         .iter()
         .filter(|_| expand_menus || !is_closed_menu(node))
-        .flat_map(|child| build(child, passed_label, false, expand_menus))
+        .flat_map(|child| build(child, passed_label, false, expand_menus, fold_cells))
         .collect();
     children.sort_by_key(|view| region_priority(view.node));
     if children.len() == 1
@@ -638,7 +728,19 @@ fn build<'a>(
             return children;
         }
     }
-    let (own, _) = line(id, &node.description);
+    let mut folded = None;
+    if fold_cells && is_cell(node) {
+        let mut texts = Vec::new();
+        if !label.is_empty() {
+            texts.push(label.clone());
+        }
+        children = fold_cell_text(children, &mut texts);
+        if !texts.is_empty() {
+            folded = Some(texts.join(LINE_BREAK));
+        }
+    }
+    let own_label = folded.as_deref().unwrap_or(&node.description.label);
+    let (own, _) = line_with_label(id, &node.description, own_label);
     let mut bytes = own.len() + 1;
     let mut lines = 1;
     for run in runs(&children) {
@@ -659,6 +761,7 @@ fn build<'a>(
         children,
         bytes,
         lines,
+        folded,
     }]
 }
 
@@ -677,14 +780,18 @@ fn label_shape(label: &str) -> String {
 fn runs(views: &[View<'_>]) -> Vec<std::ops::Range<usize>> {
     let mut runs = Vec::new();
     let mut start = 0;
-    let key = |view: &View<'_>| {
+    // A row's cells are its columns, not repeats of one another: each cell
+    // is its own run, so a row is never summarised as `<count> cells`.
+    let key = |index: usize| {
+        let view = &views[index];
         (
             view.node.description.role_words.clone(),
-            label_shape(&view.node.description.label),
+            label_shape(view.label()),
+            is_cell(view.node).then_some(index),
         )
     };
     for index in 1..=views.len() {
-        if index == views.len() || key(&views[index]) != key(&views[start]) {
+        if index == views.len() || key(index) != key(start) {
             if start < views.len() {
                 runs.push(start..index);
             }
@@ -706,7 +813,7 @@ fn plural(words: &str) -> String {
 /// The one line a long run of repeated siblings becomes.
 fn repeat_summary(members: &[View<'_>], parent_id: &str) -> String {
     let first = &members[0].node.description;
-    let (label, _) = clipped(&first.label, SUMMARY_LABEL_CHARS);
+    let (label, _) = clipped(members[0].label(), SUMMARY_LABEL_CHARS);
     let like = if label.is_empty() {
         String::new()
     } else {
@@ -722,11 +829,17 @@ fn repeat_summary(members: &[View<'_>], parent_id: &str) -> String {
 /// One element's line, without indentation. Says whether a label or value
 /// was cut.
 fn line(id: &str, description: &ElementDescription) -> (String, bool) {
+    line_with_label(id, description, &description.label)
+}
+
+/// [`line`] with `label` in place of the element's own label, for a cell
+/// whose line carries the text folded into it.
+fn line_with_label(id: &str, description: &ElementDescription, label: &str) -> (String, bool) {
     let mut text = format!("{id} {}", description.role_words);
     if !description.markers.is_empty() {
         text.push_str(&format!(" ({})", description.markers.join(", ")));
     }
-    let (label, mut truncated) = clipped(&description.label, MAX_LABEL_CHARS);
+    let (label, mut truncated) = clipped(label, MAX_LABEL_CHARS);
     if !label.is_empty() {
         text.push(' ');
         text.push_str(&label);
@@ -779,7 +892,7 @@ impl Emitter {
     }
 
     fn element(&mut self, depth: usize, view: &View<'_>) {
-        let (mut text, truncated) = line(view.id, &view.node.description);
+        let (mut text, truncated) = view.line();
         if is_closed_menu(view.node) && view.children.is_empty() {
             text.push_str(&format!(
                 "  [{} children; closed]",
@@ -810,6 +923,9 @@ fn print_full(view: &View<'_>, depth: usize, expand: Expand, out: &mut Emitter) 
     let expand = if view.node.menu_open && matches!(raw_role(view.node), "AXMenuBarItem" | "AXMenu")
     {
         Expand::Everything
+    } else if expand == Expand::Nothing && is_small_table(view) {
+        // A short table lists its rows wherever it is printed.
+        Expand::Children
     } else {
         expand
     };
@@ -862,7 +978,7 @@ fn region_summary(view: &View<'_>) -> String {
     };
     let labels: Vec<String> = members
         .iter()
-        .map(|member| clipped(&member.node.description.label, SUMMARY_LABEL_CHARS).0)
+        .map(|member| clipped(member.label(), SUMMARY_LABEL_CHARS).0)
         .filter(|label| !label.is_empty())
         .collect();
     let taste = if members.len() <= SUMMARY_LABELS_LISTED && !labels.is_empty() {
@@ -876,7 +992,7 @@ fn region_summary(view: &View<'_>) -> String {
 }
 
 fn emit_region(view: &View<'_>, depth: usize, out: &mut Emitter) {
-    let (text, truncated) = line(view.id, &view.node.description);
+    let (text, truncated) = view.line();
     if out.push(depth, &format!("{text}  [{}]", region_summary(view))) {
         out.labels_truncated |= truncated;
     }
@@ -910,6 +1026,8 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
                 }
             } else if view.bytes <= INLINE_REGION_BYTES {
                 print_full(view, depth, Expand::Nothing, out);
+            } else if is_small_table(view) {
+                print_full(view, depth, Expand::Children, out);
             } else if is_transparent(view) {
                 outline(&view.children, view.id, depth, out);
             } else {
@@ -941,6 +1059,8 @@ fn outline_regions(
         for view in members {
             if out.text.len() > MAX_OUTLINE_BYTES {
                 out.omitted += 1;
+            } else if is_small_table(view) {
+                print_full(view, depth, Expand::Children, out);
             } else if is_region(view.node) {
                 emit_region(view, depth, out);
                 if view.bytes > INLINE_REGION_BYTES && nesting < OUTLINE_NESTING {
@@ -1158,11 +1278,11 @@ pub fn render_state_bounded(
     };
     let zoom_found = request.zoom.is_none() || target.is_some();
     let scope: Vec<View<'_>> = match (request.zoom, target) {
-        (Some(_), Some(target)) => build(target, "", true, true),
+        (Some(_), Some(target)) => build(target, "", true, true, !request.narrows()),
         (Some(_), None) => Vec::new(),
         (None, _) => roots
             .iter()
-            .flat_map(|root| build(root, "", true, false))
+            .flat_map(|root| build(root, "", true, false, !request.narrows()))
             .collect(),
     };
     let mut scope = scope;
@@ -1422,7 +1542,7 @@ pub fn render_diff(
     let added: HashSet<&str> = diff.added.iter().map(String::as_str).collect();
     let views: Vec<View<'_>> = roots
         .iter()
-        .flat_map(|root| build(root, "", true, false))
+        .flat_map(|root| build(root, "", true, false, false))
         .collect();
     let mut views = views;
     views.sort_by_key(|view| region_priority(view.node));

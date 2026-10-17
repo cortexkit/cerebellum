@@ -853,47 +853,76 @@ where
             return self.finish_reply(capability.capability(), reply);
         }
         let grant_cancel = context.cancel.clone();
+        let matched_app = Arc::new(std::sync::Mutex::new(None));
         // Capability work holds the app-consent wait and eventual platform
         // call. Keep that future on the heap before the grant watcher adds
         // polling and cancellation-cleanup frames around it.
-        let mut reply = crate::grant_enforcement::scope(
-            grant_cancel,
-            Box::pin(work.scope(async {
-                match capability.0 {
-                    Served::ReadState => {
-                        self.serve_read_state(arguments, context, make_backend)
-                            .await
-                    }
-                    Served::Wait => self.serve_wait(arguments, context).await,
-                    Served::OpenApp => self.serve_open_app(arguments, context).await,
-                    Served::ListApps => self.serve_list_apps(arguments, context).await,
-                    Served::PressElement => self.serve_press_element(arguments, context).await,
-                    Served::PressPoint => self.serve_press_point(arguments, context).await,
-                    Served::WriteText => self.serve_write_text(arguments, context).await,
-                    Served::Type => synthetic_wire_envelope(
-                        self.serve_synthetic(ComputerCapability::Type, arguments, context)
-                            .await,
-                    ),
-                    Served::Keys => synthetic_wire_envelope(
-                        self.serve_synthetic(ComputerCapability::Keys, arguments, context)
-                            .await,
-                    ),
-                    Served::TakeoverMove => {
-                        self.serve_takeover(ComputerCapability::TakeoverMove, arguments, context)
-                            .await
-                    }
-                    Served::TakeoverDrag => {
-                        self.serve_takeover(ComputerCapability::TakeoverDrag, arguments, context)
-                            .await
-                    }
-                    Served::TakeoverScroll => {
-                        self.serve_takeover(ComputerCapability::TakeoverScroll, arguments, context)
-                            .await
-                    }
-                }
-            })),
-        )
-        .await;
+        let mut reply = MATCHED_APP
+            .scope(
+                Arc::clone(&matched_app),
+                crate::grant_enforcement::scope(
+                    grant_cancel,
+                    Box::pin(work.scope(async {
+                        match capability.0 {
+                            Served::ReadState => {
+                                self.serve_read_state(arguments, context, make_backend)
+                                    .await
+                            }
+                            Served::Wait => self.serve_wait(arguments, context).await,
+                            Served::OpenApp => self.serve_open_app(arguments, context).await,
+                            Served::ListApps => self.serve_list_apps(arguments, context).await,
+                            Served::PressElement => {
+                                self.serve_press_element(arguments, context).await
+                            }
+                            Served::PressPoint => self.serve_press_point(arguments, context).await,
+                            Served::WriteText => self.serve_write_text(arguments, context).await,
+                            Served::Type => synthetic_wire_envelope(
+                                self.serve_synthetic(ComputerCapability::Type, arguments, context)
+                                    .await,
+                            ),
+                            Served::Keys => synthetic_wire_envelope(
+                                self.serve_synthetic(ComputerCapability::Keys, arguments, context)
+                                    .await,
+                            ),
+                            Served::TakeoverMove => {
+                                self.serve_takeover(
+                                    ComputerCapability::TakeoverMove,
+                                    arguments,
+                                    context,
+                                )
+                                .await
+                            }
+                            Served::TakeoverDrag => {
+                                self.serve_takeover(
+                                    ComputerCapability::TakeoverDrag,
+                                    arguments,
+                                    context,
+                                )
+                                .await
+                            }
+                            Served::TakeoverScroll => {
+                                self.serve_takeover(
+                                    ComputerCapability::TakeoverScroll,
+                                    arguments,
+                                    context,
+                                )
+                                .await
+                            }
+                        }
+                    })),
+                ),
+            )
+            .await;
+        // A target that named a running application only in part was taken
+        // to mean the one application it fits; the reply names it, so the
+        // caller can tell if that was not the application it meant.
+        let matched_app = matched_app
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let (Some(name), Some(object)) = (matched_app, reply.as_object_mut()) {
+            object.insert("matched_app".into(), json!(name));
+        }
         // The call went ahead without knowing whether the screen was locked.
         // Said on the reply so an empty tree or a missing element is not
         // taken for an application that has nothing there.
@@ -2025,7 +2054,18 @@ where
         .await
         .unwrap_or(Err(AppStateReadError::Unreadable));
         match listed {
-            Ok(apps) => match_target_name(target, &apps),
+            Ok(apps) => match_target_name(target, &apps).map(|matched| {
+                // `serve` writes this name on the reply as matched_app, so the
+                // caller learns which application a partial name was taken to
+                // mean. The queueing step that resolves a target before
+                // `serve` runs has no MATCHED_APP slot, so it records nothing.
+                if let Some(name) = matched.partial_name {
+                    let _ = MATCHED_APP.try_with(|slot| {
+                        *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(name);
+                    });
+                }
+                matched.bundle_identity
+            }),
             Err(_) => Ok(target.to_string()),
         }
     }
@@ -2037,15 +2077,21 @@ where
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
-        if let Err(refusal) = parse_list_apps_request(arguments) {
-            return refusal;
-        }
+        let filter = match parse_list_apps_request(arguments) {
+            Ok(filter) => filter,
+            Err(refusal) => return refusal,
+        };
         let source = self.app_state_source.clone();
         let listed = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
-            let running = source.running_apps()?;
-            let installed = source
+            let mut running = source.running_apps()?;
+            let mut installed = source
                 .installed_apps(std::time::Duration::from_secs(2).saturating_sub(start.elapsed()));
+            let filter = filter.as_deref();
+            running.retain(|app| listed_by_filter(filter, &app.name, &app.bundle_identity));
+            installed
+                .apps
+                .retain(|app| listed_by_filter(filter, &app.name, &app.bundle_identity));
             Ok::<_, AppStateReadError>((running, installed))
         })
         .await
@@ -2339,15 +2385,33 @@ pub(crate) fn looks_like_bundle_identity(target: &str) -> bool {
     target.contains('.') && !target.contains(char::is_whitespace)
 }
 
-/// Every field `computer.list_apps` accepts: none.
-fn parse_list_apps_request(arguments: &Value) -> Result<(), Value> {
+/// The one field `computer.list_apps` accepts: an optional `text_filter`,
+/// returned trimmed, or `None` when absent or blank.
+fn parse_list_apps_request(arguments: &Value) -> Result<Option<String>, Value> {
     let Some(object) = arguments.as_object() else {
         return Err(invalid_read_state_request("$", "wrong_type"));
     };
-    match object.keys().min() {
-        Some(field) => Err(invalid_read_state_request(field, "unknown_field")),
-        None => Ok(()),
+    if let Some(field) = object.keys().filter(|field| *field != "text_filter").min() {
+        return Err(invalid_read_state_request(field, "unknown_field"));
     }
+    match object.get("text_filter") {
+        None => Ok(None),
+        Some(Value::String(filter)) => {
+            Ok(Some(filter.trim().to_string()).filter(|filter| !filter.is_empty()))
+        }
+        Some(_) => Err(invalid_read_state_request("text_filter", "wrong_type")),
+    }
+}
+
+/// Whether an application is kept by a `list_apps` text filter: its name or
+/// bundle identity contains the filter, ignoring case. A full Applications
+/// folder is several hundred entries, so the filter lets a caller find one
+/// installed application without reading all of them.
+fn listed_by_filter(filter: Option<&str>, name: &str, bundle_identity: &str) -> bool {
+    filter.is_none_or(|filter| {
+        let filter = filter.to_lowercase();
+        name.to_lowercase().contains(&filter) || bundle_identity.to_lowercase().contains(&filter)
+    })
 }
 
 /// The running applications as `list_apps` prints them: one per line.
@@ -2370,33 +2434,125 @@ fn running_apps_text(apps: &[RunningApp]) -> String {
     text
 }
 
-/// What a `target` given as a name resolves to among the running
-/// applications: the one bundle identity carrying that name, or the refusal
-/// that says why there is not exactly one.
-///
-/// A name is matched whole and without regard to case. Several processes of
-/// one application are one match here; resolving the bundle identity then
-/// refuses them as `ambiguous` exactly as it always has.
-fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<String, Value> {
-    let wanted = target.trim();
-    if let Some(app) = apps
-        .iter()
-        .find(|app| app.bundle_identity.eq_ignore_ascii_case(wanted))
-    {
-        return Ok(app.bundle_identity.clone());
+/// A target name resolved to a running application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatchedTarget {
+    bundle_identity: String,
+    /// The application's full name when the target named it only in part
+    /// (a prefix or whole words of its name); `None` for an exact match.
+    partial_name: Option<String>,
+}
+
+tokio::task_local! {
+    /// Where name resolution leaves the full name of an application a call's
+    /// target matched only in part, for `serve` to say on the reply.
+    static MATCHED_APP: Arc<std::sync::Mutex<Option<String>>>;
+}
+
+/// Whether `wanted` names `name` in part: the name starts with it, or it is
+/// one or more whole words of the name in order ("Context Dashboard" in
+/// "Magic Context Dashboard"). Case is ignored. An empty `wanted` names
+/// nothing, so it can never match every application at once.
+fn names_in_part(name: &str, wanted: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    let wanted = wanted.trim().to_lowercase();
+    if wanted.is_empty() {
+        return false;
     }
-    let named: Vec<&RunningApp> = apps
-        .iter()
-        .filter(|app| app.name.trim().eq_ignore_ascii_case(wanted))
-        .collect();
-    let mut identities: Vec<&str> = named
+    if name.starts_with(&wanted) {
+        return true;
+    }
+    let name_words: Vec<&str> = name.split_whitespace().collect();
+    let wanted_words: Vec<&str> = wanted.split_whitespace().collect();
+    name_words
+        .windows(wanted_words.len())
+        .any(|window| window == wanted_words.as_slice())
+}
+
+/// The candidates a refusal lists: each running application once per
+/// process, as name, bundle identity and pid.
+fn candidate_list(apps: &[&RunningApp]) -> Vec<Value> {
+    apps.iter()
+        .map(|app| {
+            json!({
+                "name": app.name,
+                "bundle_identity": app.bundle_identity,
+                "pid": app.pid,
+            })
+        })
+        .collect()
+}
+
+/// The distinct bundle identities among `apps`, sorted.
+fn distinct_identities<'a>(apps: &[&'a RunningApp]) -> Vec<&'a str> {
+    let mut identities: Vec<&str> = apps
         .iter()
         .map(|app| app.bundle_identity.as_str())
         .collect();
     identities.sort_unstable();
     identities.dedup();
-    match identities.as_slice() {
-        [only] => Ok((*only).to_string()),
+    identities
+}
+
+/// What a `target` given as a name resolves to among the running
+/// applications: the one bundle identity carrying that name, or the refusal
+/// that says why there is not exactly one.
+///
+/// A name is matched whole and without regard to case first. Only when no
+/// application has exactly that name is it matched in part (see
+/// [`names_in_part`]), so a model that shortens "Magic Context Dashboard"
+/// to "Magic Context" still reaches it; the reply then names the application
+/// it picked. A partial name fitting several applications is refused with
+/// all of them listed, never guessed between. Several processes of one
+/// application are one match here; resolving the bundle identity then
+/// refuses them as `ambiguous` exactly as it always has.
+fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<MatchedTarget, Value> {
+    let wanted = target.trim();
+    if let Some(app) = apps
+        .iter()
+        .find(|app| app.bundle_identity.eq_ignore_ascii_case(wanted))
+    {
+        return Ok(MatchedTarget {
+            bundle_identity: app.bundle_identity.clone(),
+            partial_name: None,
+        });
+    }
+    let named: Vec<&RunningApp> = apps
+        .iter()
+        .filter(|app| app.name.trim().eq_ignore_ascii_case(wanted))
+        .collect();
+    match distinct_identities(&named).as_slice() {
+        [only] => {
+            return Ok(MatchedTarget {
+                bundle_identity: (*only).to_string(),
+                partial_name: None,
+            })
+        }
+        [] => {}
+        _ => {
+            return Err(json!({
+                "outcome": "ambiguous_app",
+                "target": wanted,
+                "candidates": candidate_list(&named),
+                // Named rather than chosen between: picking one would act on an
+                // application the caller did not single out.
+                "remedy": "several running applications have this name; retry with the bundle \
+                           identity of the one you mean",
+            }));
+        }
+    }
+    let partly: Vec<&RunningApp> = apps
+        .iter()
+        .filter(|app| names_in_part(&app.name, wanted))
+        .collect();
+    match distinct_identities(&partly).as_slice() {
+        [only] => Ok(MatchedTarget {
+            bundle_identity: (*only).to_string(),
+            partial_name: partly
+                .iter()
+                .find(|app| app.bundle_identity == *only)
+                .map(|app| app.name.trim().to_string()),
+        }),
         [] => Err(json!({
             "outcome": "no_running_app_named",
             "target": wanted,
@@ -2407,18 +2563,9 @@ fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<String, Value>
         _ => Err(json!({
             "outcome": "ambiguous_app",
             "target": wanted,
-            "candidates": named
-                .iter()
-                .map(|app| json!({
-                    "name": app.name,
-                    "bundle_identity": app.bundle_identity,
-                    "pid": app.pid,
-                }))
-                .collect::<Vec<_>>(),
-            // Named rather than chosen between: picking one would act on an
-            // application the caller did not single out.
-            "remedy": "several running applications have this name; retry with the bundle \
-                       identity of the one you mean",
+            "candidates": candidate_list(&partly),
+            "remedy": "this name fits several running applications; retry with the full name or \
+                       the bundle identity of the one you mean",
         })),
     }
 }
@@ -2497,7 +2644,7 @@ pub(crate) fn served_request_fields(
             &element_actions::WRITE_TEXT_REQUIRED,
         )),
         ComputerCapability::OpenApp => Some((&["target", "url"], &["target"])),
-        ComputerCapability::ListApps => Some((&[], &[])),
+        ComputerCapability::ListApps => Some((&["text_filter"], &[])),
         ComputerCapability::Type | ComputerCapability::Keys => {
             let fields = synthetic_request_fields(capability)?;
             Some((
@@ -2530,7 +2677,7 @@ pub(crate) fn parse_served_request(
     match capability {
         ComputerCapability::ReadState => parse_read_state_request(arguments).map(|_| ()),
         ComputerCapability::OpenApp => open_app::parse_request(arguments).map(|_| ()),
-        ComputerCapability::ListApps => parse_list_apps_request(arguments),
+        ComputerCapability::ListApps => parse_list_apps_request(arguments).map(|_| ()),
         ComputerCapability::Wait => parse_wait_request(arguments).map(|_| ()),
         ComputerCapability::PressElement => {
             element_actions::parse_press_element(arguments).map(|_| ())
@@ -4294,4 +4441,115 @@ fn unit_tests_keep_the_native_computer_driver_type() {
         std::any::TypeId::of::<NativeComputerPlatformDriver>(),
         std::any::TypeId::of::<cerebellum_computer::platform::MacOs26PlatformDriver>(),
     );
+}
+
+#[cfg(test)]
+mod name_match_tests {
+    use super::*;
+
+    fn app(name: &str, bundle_identity: &str, pid: u32) -> RunningApp {
+        RunningApp {
+            name: name.into(),
+            bundle_identity: bundle_identity.into(),
+            pid,
+            frontmost: false,
+        }
+    }
+
+    fn desk() -> Vec<RunningApp> {
+        vec![
+            app("Magic Context Dashboard", "com.example.dashboard", 1),
+            app("Magic Mouse Utility", "com.example.mouse", 2),
+            app("Mail", "com.apple.mail", 3),
+            app("Mailspring", "com.example.mailspring", 4),
+        ]
+    }
+
+    #[test]
+    fn a_partial_name_fitting_one_app_resolves_and_names_it() {
+        for wanted in [
+            "Magic Context",
+            "magic context dash",
+            "Context Dashboard",
+            "dashboard",
+        ] {
+            assert_eq!(
+                match_target_name(wanted, &desk()).unwrap(),
+                MatchedTarget {
+                    bundle_identity: "com.example.dashboard".into(),
+                    partial_name: Some("Magic Context Dashboard".into()),
+                },
+                "{wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_name_wins_over_a_longer_one_it_prefixes() {
+        assert_eq!(
+            match_target_name("mail", &desk()).unwrap(),
+            MatchedTarget {
+                bundle_identity: "com.apple.mail".into(),
+                partial_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_name_fitting_several_apps_refuses_listing_them() {
+        let refusal = match_target_name("Magic", &desk()).unwrap_err();
+        assert_eq!(refusal["outcome"], "ambiguous_app");
+        assert_eq!(refusal["target"], "Magic");
+        let names: Vec<_> = refusal["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Magic Context Dashboard", "Magic Mouse Utility"]);
+    }
+
+    #[test]
+    fn a_word_inside_another_word_or_an_empty_name_matches_nothing() {
+        for wanted in ["agic", "ontext Dash", "", "   "] {
+            assert_eq!(
+                match_target_name(wanted, &desk()).unwrap_err()["outcome"],
+                "no_running_app_named",
+                "{wanted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_apps_takes_only_an_optional_text_filter() {
+        assert_eq!(parse_list_apps_request(&json!({})), Ok(None));
+        assert_eq!(
+            parse_list_apps_request(&json!({"text_filter":"  Mail "})),
+            Ok(Some("Mail".into()))
+        );
+        assert_eq!(
+            parse_list_apps_request(&json!({"text_filter":" "})),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_list_apps_request(&json!({"text_filter":3})).unwrap_err()["field"],
+            "text_filter"
+        );
+        assert_eq!(
+            parse_list_apps_request(&json!({"zoom":"x"})).unwrap_err()["field"],
+            "zoom"
+        );
+        assert!(listed_by_filter(
+            Some("MAIL"),
+            "Mailspring",
+            "com.example.mailspring"
+        ));
+        assert!(listed_by_filter(Some("apple.ma"), "Mail", "com.apple.mail"));
+        assert!(!listed_by_filter(
+            Some("mail"),
+            "Calendar",
+            "com.apple.iCal"
+        ));
+        assert!(listed_by_filter(None, "Calendar", "com.apple.iCal"));
+    }
 }

@@ -5,6 +5,8 @@ use crate::ModuleError;
 use cortexkit_role_tool_provider::result::{self, ContentPart, ImageContent, ToolResult};
 use serde_json::{json, Map, Value};
 
+mod plain;
+
 tokio::task_local! {
     pub(crate) static RESULT_BIND: Option<(String, cerebellum_core::identity::AcceptedBindFacts)>;
 }
@@ -16,21 +18,7 @@ fn notice(id: Option<&str>, reason: &str) -> String {
     )
 }
 
-fn compact_members(members: impl IntoIterator<Item = (String, Value)>) -> String {
-    let members = members
-        .into_iter()
-        .map(|(key, value)| {
-            format!(
-                "{}:{}",
-                serde_json::to_string(&key).expect("key serializes"),
-                value
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("{{{}}}", members.join(","))
-}
-
-fn image_projection(value: &Value) -> (String, Option<ImageContent>, Option<String>) {
+fn image_projection(value: &Value) -> (Option<ImageContent>, Option<String>) {
     let mut descriptor = value
         .as_object()
         .cloned()
@@ -84,26 +72,7 @@ fn image_projection(value: &Value) -> (String, Option<ImageContent>, Option<Stri
     } else {
         Some("invalid_image_shape")
     };
-    let mut members = descriptor.into_iter().collect::<Vec<_>>();
-    if let Some(reason) = reason {
-        // JSON.stringify preserves existing key positions and appends new ones.
-        // Preserve that ordering in the legacy descriptor's model-facing text.
-        for (key, value) in [
-            ("delivery_status", json!("not_delivered")),
-            ("delivery_reason", json!(reason)),
-        ] {
-            if let Some(member) = members.iter_mut().find(|(name, _)| name == key) {
-                member.1 = value;
-            } else {
-                members.push((key.into(), value));
-            }
-        }
-    }
-    (
-        compact_members(members),
-        image,
-        reason.map(|reason| notice(id.as_deref(), reason)),
-    )
+    (image, reason.map(|reason| notice(id.as_deref(), reason)))
 }
 
 fn is_success(code: &str) -> bool {
@@ -149,53 +118,48 @@ fn login_notice(object: &Map<String, Value>) -> Option<String> {
 
 fn project(reply: Value) -> ToolResult {
     let Some(object) = reply.as_object() else {
-        return ToolResult::new(vec![ContentPart::text(reply.to_string())]);
+        // Every provider reply is an object. Anything else has no fields to
+        // describe: a non-empty string is shown as itself, and any other value
+        // is replaced by a notice rather than printed as JSON.
+        let text = match &reply {
+            Value::String(text) if !text.trim().is_empty() => text.clone(),
+            _ => "The tool returned a reply this module cannot describe.".to_string(),
+        };
+        return ToolResult::new(vec![ContentPart::text(text)]);
     };
+    // The text parts are the whole model view: a reader shows only them, and
+    // keeps structuredContent for programs. They are written as sentences and
+    // short lines, never as JSON (see `plain`).
     let mut content = Vec::new();
-    if let Some(state) = object.get("state_text").and_then(Value::as_str) {
-        content.push(ContentPart::text(state));
+    if let Some(body) = plain::body(object).filter(|body| !body.trim().is_empty()) {
+        content.push(ContentPart::text(body));
     }
     let projected_image = object.get("image").map(image_projection);
-    // State and notices are verbatim. Metadata uses serde_json instead of
-    // emulating JSON.stringify: integral floats retain .0, negative zero and
-    // exponent formatting can differ, and numeric keys keep serde_json order.
-    // These host-formatting differences never alter the state or notice parts.
-    let mut members = Vec::new();
-    for (key, value) in object {
-        if key == "state_text" && value.is_string() {
-            continue;
-        }
-        let value = if key == "image" {
-            projected_image.as_ref().unwrap().0.clone()
-        } else {
-            value.to_string()
-        };
-        members.push(format!(
-            "{}:{value}",
-            serde_json::to_string(key).expect("key serializes")
-        ));
+    let facts = plain::facts(object, login_notice(object));
+    if !facts.is_empty() {
+        content.push(ContentPart::text(facts.join("\n")));
     }
-    // State the sign-in outcome and next step in plain text, retaining the
-    // original fields in structuredContent for both live replies and late pulls.
-    content.push(ContentPart::text(
-        login_notice(object).unwrap_or_else(|| format!("{{{}}}", members.join(","))),
-    ));
-    let image = projected_image.and_then(|(_, image, note)| {
+    let image = projected_image.and_then(|(image, note)| {
         if let Some(note) = note {
             content.push(ContentPart::text(note));
         }
         image
     });
+    let code = object.get("outcome").and_then(Value::as_str);
+    // A reader that finds no text shows structuredContent as JSON instead, so
+    // even a plain success with nothing else to say carries one line.
+    if !content.iter().any(|part| match part {
+        ContentPart::Text { text } => !text.trim().is_empty(),
+        _ => false,
+    }) {
+        content.push(ContentPart::text(match code {
+            Some(code) if !is_success(code) => plain::sentence(&code.replace('_', " ")),
+            _ => "Done.".to_string(),
+        }));
+    }
     let mut result = ToolResult::new(content).with_structured_content(object.clone());
-    if let Some(code) = object
-        .get("outcome")
-        .and_then(Value::as_str)
-        .filter(|code| !is_success(code))
-    {
+    if let Some(code) = code.filter(|code| !is_success(code)) {
         result = result.with_error(code);
-        if let Some(remedy) = object.get("remedy").and_then(Value::as_str) {
-            result.content.push(ContentPart::text(remedy));
-        }
     }
     if let Some(image) = image {
         result.content.push(ContentPart::image(image));
@@ -259,6 +223,46 @@ pub(crate) fn encode(reply: Value) -> Result<Vec<u8>, ModuleError> {
     }
 }
 
+/// Why a content/v1 result would not give the model a plain view, or an
+/// empty list when it would. Two rules, both from how readers render a reply:
+///
+/// * at least one text part says something, because a reader that finds no
+///   text shows the structured copy to the model as JSON instead;
+/// * no text part contains a JSON object or array with two or more members.
+///   Every `{` and `[` is tried as the start of a JSON value, so a fragment
+///   is found wherever it sits in a line. One-member values are let through
+///   because ordinary text such as `[value withheld]` or `[2]` is not JSON
+///   worth refusing, and the replies this guards never print one.
+#[cfg(test)]
+pub(crate) fn model_view_problems(result: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    let parts = result["content"].as_array().cloned().unwrap_or_default();
+    let texts: Vec<&str> = parts
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    if !texts.iter().any(|text| !text.trim().is_empty()) {
+        problems.push("no text part says anything".to_string());
+    }
+    for text in texts {
+        for (start, _) in text.match_indices(['{', '[']) {
+            let mut values =
+                serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+            let members = match values.next() {
+                Some(Ok(Value::Object(object))) => object.len(),
+                Some(Ok(Value::Array(array))) => array.len(),
+                _ => continue,
+            };
+            if members >= 2 {
+                problems.push(format!("JSON in a text part: {text:?}"));
+                break;
+            }
+        }
+    }
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +271,20 @@ mod tests {
         serde_json::from_slice(&encode(reply).unwrap()).unwrap()
     }
 
+    fn texts(result: &Value) -> Vec<String> {
+        result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .map(|part| part["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // These tests used to pin a second text part holding the reply's other
+    // fields printed as JSON. No JSON may reach the model, so each now pins
+    // the plain words that replace it, while the same reply still travels
+    // whole as structuredContent.
     #[test]
     fn snapshot_state_text_is_verbatim_first_part() {
         let reply = json!({"outcome":"ok", "state_text":"article\n  r1 link \"quoted\" — café", "snapshot_id":"snap-1"});
@@ -275,12 +293,18 @@ mod tests {
             result["content"][0],
             json!({"type":"text", "text":"article\n  r1 link \"quoted\" — café"})
         );
-        assert_eq!(
-            result["content"][1]["text"],
-            r#"{"outcome":"ok","snapshot_id":"snap-1"}"#
-        );
+        assert_eq!(result["content"][1]["text"], "snapshot_id: snap-1");
         assert_eq!(result["structuredContent"], reply);
         assert!(result.get("isError").is_none());
+    }
+
+    #[test]
+    fn a_snapshot_whose_header_names_its_id_does_not_repeat_it() {
+        let reply = json!({"outcome":"ok", "state_text":"news.example · snapshot snap-1\ne1 button Go", "snapshot_id":"snap-1", "document_epoch":1, "context":{"profile_name":"default"}});
+        assert_eq!(
+            texts(&decoded(reply)),
+            ["news.example · snapshot snap-1\ne1 button Go"]
+        );
     }
 
     fn read_state_reply() -> Value {
@@ -297,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             result["content"][1],
-            json!({"type":"text", "text":r#"{"image":{"height_px":8,"image_id":"image-1","mime":"image/png","width_px":12},"outcome":"ok"}"#})
+            json!({"type":"text", "text":"Image image-1, 12×8 px."})
         );
         assert_eq!(
             result["content"][2],
@@ -314,8 +338,8 @@ mod tests {
         assert_eq!(result["isError"], true);
         assert_eq!(result["errorCode"], "consent_unavailable");
         assert_eq!(
-            result["content"][1],
-            json!({"type":"text", "text":"an agent run cannot ask a person"})
+            texts(&result),
+            ["Consent unavailable.\nAn agent run cannot ask a person.\nReason: agent run."]
         );
     }
 
@@ -333,7 +357,10 @@ mod tests {
             .unwrap()
             .iter()
             .any(|part| part["type"] == "image"));
-        assert!(result["content"][1]["text"].as_str().unwrap().ends_with(r#""delivery_status":"not_delivered","delivery_reason":"invalid_base64"},"outcome":"ok"}"#));
+        assert_eq!(
+            result["structuredContent"]["image"]["data_b64"], "AB==",
+            "programs still receive the reply as it was"
+        );
     }
 
     #[test]
@@ -383,17 +410,115 @@ mod tests {
     }
 
     #[test]
-    fn non_string_state_and_missing_image_bytes_match_legacy_projection() {
+    fn non_string_state_and_missing_image_bytes_are_described_in_words() {
         let result = decoded(
             json!({"state_text":false, "image":{"image_id":"reference-1", "mime":"video/mp4", "width":1,"height":1}}),
         );
         assert_eq!(
-            result["content"][1]["text"],
-            "Image reference-1 was not delivered: inline_bytes_missing"
+            texts(&result),
+            [
+                "Image reference-1, 1×1 px.",
+                "Image reference-1 was not delivered: inline_bytes_missing"
+            ]
         );
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .ends_with(r#", "state_text":false}"#.replace(", ", ",").as_str()));
+    }
+
+    #[test]
+    fn a_plain_success_says_done_rather_than_nothing() {
+        let result = decoded(json!({"outcome":"completed", "unreadable_subtrees":0}));
+        assert_eq!(texts(&result), ["Done."]);
+        let result = decoded(
+            json!({"outcome":"completed", "focused_element_id":"mp3", "unreadable_subtrees":3, "state_text":"+ e1 button Go\n"}),
+        );
+        assert_eq!(
+            texts(&result),
+            [
+                "+ e1 button Go\n",
+                "Focused: mp3.\n3 parts couldn't be read."
+            ]
+        );
+    }
+
+    #[test]
+    fn list_apps_reads_as_a_list_not_an_array() {
+        let mut apps = vec![
+            json!({"name":"Finder","bundle_identity":"com.apple.finder","running":true,"pid":101,"frontmost":true}),
+            json!({"name":"Mail","bundle_identity":"com.apple.mail","running":true,"pid":102,"frontmost":false}),
+        ];
+        apps.extend(["Calculator", "Chess"].map(|name| {
+            json!({"name":name,"bundle_identity":format!("com.apple.{name}"),"running":false,"frontmost":false})
+        }));
+        let result = decoded(
+            json!({"outcome":"completed", "state_text":"legacy text", "apps":apps, "truncated":false, "installed_list":"complete"}),
+        );
+        assert_eq!(
+            texts(&result),
+            ["Running apps:\nFinder · com.apple.finder · pid 101 · frontmost\nMail · com.apple.mail · pid 102\nInstalled, not running (2): Calculator, Chess\n"]
+        );
+        let many: Vec<Value> = (0..400)
+            .map(|index| json!({"name":format!("Application {index}"),"bundle_identity":format!("com.example.app{index}"),"running":false,"frontmost":false}))
+            .collect();
+        let result = decoded(
+            json!({"outcome":"completed", "apps":many, "truncated":false, "installed_list":"partial"}),
+        );
+        assert_eq!(
+            texts(&result),
+            [
+                "No running app is listed.\n400 installed apps that are not running are not shown; call list_apps with text_filter to find one by name or bundle id.\n",
+                "Not every installed app could be read in time, so the installed list is partial."
+            ]
+        );
+    }
+
+    #[test]
+    fn name_refusals_list_candidates_by_name() {
+        let result = decoded(
+            json!({"outcome":"no_running_app_named", "target":"Magic", "remedy":"list_apps shows the running applications"}),
+        );
+        assert_eq!(
+            texts(&result),
+            ["No running app is named Magic.\nlist_apps shows the running applications."]
+        );
+        let result = decoded(
+            json!({"outcome":"ambiguous_app", "target":"Magic", "candidates":[
+            {"name":"Magic Context Dashboard","bundle_identity":"com.example.dashboard","pid":1},
+            {"name":"Magic Mouse Utility","bundle_identity":"com.example.mouse","pid":2}],
+            "remedy":"retry with the full name"}),
+        );
+        assert_eq!(
+            texts(&result),
+            ["Magic matches more than one app: Magic Context Dashboard (com.example.dashboard), Magic Mouse Utility (com.example.mouse).\nRetry with the full name."]
+        );
+    }
+
+    #[test]
+    fn consent_pending_names_the_question_and_what_to_do() {
+        let result = decoded(
+            json!({"outcome":"consent_pending", "ask_id":"ask-7", "remedy":"the person has been asked; the answer arrives as a notice", "detail":{"grant":"app","grant_label":"Use TextEdit"}}),
+        );
+        assert_eq!(
+            texts(&result),
+            ["Waiting for the person to answer a consent question (ask_id ask-7).\nThe person has been asked; the answer arrives as a notice.\nGrant asked for: Use TextEdit."]
+        );
+    }
+
+    #[test]
+    fn the_guard_finds_json_wherever_it_sits_and_passes_plain_text() {
+        let plain = decoded(
+            json!({"outcome":"completed", "state_text":"e1 text field, Value: [value withheld]\ne2 menu  [3 children; closed]"}),
+        );
+        assert_eq!(model_view_problems(&plain), Vec::<String>::new());
+        for text in [
+            r#"{"outcome":"ok","snapshot_id":"x"}"#,
+            r#"Done. trailing ["a", "b"] list"#,
+            r#"prefix {"a": {"b": 1}, "c": 2} suffix"#,
+        ] {
+            let result = json!({"content":[{"type":"text","text":text}]});
+            assert_eq!(model_view_problems(&result).len(), 1, "{text}");
+        }
+        assert_eq!(
+            model_view_problems(&json!({"content":[{"type":"text","text":"  "}]})),
+            ["no text part says anything"]
+        );
     }
 }
