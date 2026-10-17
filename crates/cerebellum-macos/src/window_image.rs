@@ -261,9 +261,14 @@ fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
     Some(entries)
 }
 
-/// Uses the same front-to-back list as the image visibility reading.
-pub fn visible_cursor_point(pid: u32, point: Option<[f64; 2]>) -> Option<[f64; 2]> {
-    crate::window_visibility::cursor_point_from_windows(pid, point, &cursor_window_list()?)
+/// Uses the same front-to-back list as the image visibility reading. `frame`
+/// is the acted-on element's frame, used only when there is no exact point.
+pub fn visible_cursor_point(
+    pid: u32,
+    point: Option<[f64; 2]>,
+    frame: Option<[f64; 4]>,
+) -> Option<[f64; 2]> {
+    crate::window_visibility::cursor_point_from_windows(pid, point, frame, &cursor_window_list()?)
 }
 
 pub(crate) fn normal_frontmost_process_id() -> Option<i32> {

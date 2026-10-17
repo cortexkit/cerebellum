@@ -67,9 +67,19 @@ pub(crate) fn frontmost_from_windows(windows: &[Window]) -> Option<i32> {
     })
 }
 
+/// A standard title bar's height. A picture with nothing to point at appears
+/// below it, never over the window's close and minimise buttons.
+const TITLE_BAR: f64 = 28.0;
+
+/// Where the cursor picture's tip goes in the granted app's window. An exact
+/// point wins. An element frame gives the centre of the part of the frame that
+/// lies inside the window, so a half-scrolled element still gets a visible
+/// point. With neither, the middle of the window's content. Any of these
+/// covered by another app's normal window gives no point at all.
 pub(crate) fn cursor_point_from_windows(
     pid: u32,
     point: Option<[f64; 2]>,
+    frame: Option<[f64; 4]>,
     windows: &[Window],
 ) -> Option<[f64; 2]> {
     let inside = |rect: Rect, p: [f64; 2]| {
@@ -80,6 +90,14 @@ pub(crate) fn cursor_point_from_windows(
             && p[1] >= rect.y
             && p[1] < rect.y + rect.height
     };
+    let frame = frame
+        .map(|[x, y, width, height]| Rect {
+            x,
+            y,
+            width,
+            height,
+        })
+        .filter(|frame| frame.valid());
     for (index, target) in windows.iter().enumerate() {
         if target.pid != Some(pid)
             || target.layer != Some(0)
@@ -88,7 +106,24 @@ pub(crate) fn cursor_point_from_windows(
             continue;
         }
         let bounds = target.bounds?;
-        let p = point.unwrap_or([bounds.x + 12.0, bounds.y + 12.0]);
+        let p = match (point, frame) {
+            (Some(p), _) => p,
+            (None, Some(frame)) => match frame.intersection(bounds) {
+                Some(seen) => [seen.x + seen.width / 2.0, seen.y + seen.height / 2.0],
+                None => continue,
+            },
+            (None, None) => {
+                let title = if bounds.height > 2.0 * TITLE_BAR {
+                    TITLE_BAR
+                } else {
+                    0.0
+                };
+                [
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + title + (bounds.height - title) / 2.0,
+                ]
+            }
+        };
         if !inside(bounds, p) {
             continue;
         }
@@ -306,20 +341,70 @@ mod tests {
             ..layered(2, layer, rect(20.0, 120.0))
         };
         assert_eq!(
-            cursor_point_from_windows(7, Some([40.0, 40.0]), &[cover(3), target()]),
+            cursor_point_from_windows(7, Some([40.0, 40.0]), None, &[cover(3), target()]),
             Some([40.0, 40.0])
         );
         assert_eq!(
-            cursor_point_from_windows(7, Some([40.0, 40.0]), &[cover(0), target()]),
+            cursor_point_from_windows(7, Some([40.0, 40.0]), None, &[cover(0), target()]),
             None
         );
         assert_eq!(
-            cursor_point_from_windows(7, Some([1200.0, 40.0]), &[target()]),
+            cursor_point_from_windows(7, Some([1200.0, 40.0]), None, &[target()]),
             None
         );
+    }
+
+    #[test]
+    fn cursor_without_an_element_appears_mid_content_below_the_title_bar() {
+        // A 1000x100 window: the title bar takes the top 28 points, and the
+        // picture appears in the middle of what is left, not at the corner
+        // where the window buttons are.
+        let target = window(1, Some(rect(0.0, 1000.0)));
         assert_eq!(
-            cursor_point_from_windows(7, None, &[target()]),
-            Some([12.0, 12.0])
+            cursor_point_from_windows(7, None, None, &[target]),
+            Some([500.0, 64.0])
+        );
+        let short = window(
+            1,
+            Some(Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 40.0,
+                height: 40.0,
+            }),
+        );
+        assert_eq!(
+            cursor_point_from_windows(7, None, None, &[short]),
+            Some([30.0, 30.0])
+        );
+    }
+
+    #[test]
+    fn cursor_element_point_is_the_centre_of_the_frame_s_visible_part() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        assert_eq!(
+            cursor_point_from_windows(7, None, Some([100.0, 20.0, 200.0, 40.0]), &[target()]),
+            Some([200.0, 40.0])
+        );
+        // Half scrolled out of the bottom of the window: the centre of what is
+        // still visible, not the frame's own centre outside the window.
+        assert_eq!(
+            cursor_point_from_windows(7, None, Some([100.0, 80.0, 200.0, 60.0]), &[target()]),
+            Some([200.0, 90.0])
+        );
+        // An exact point wins over the frame.
+        assert_eq!(
+            cursor_point_from_windows(
+                7,
+                Some([110.0, 30.0]),
+                Some([100.0, 20.0, 200.0, 40.0]),
+                &[target()]
+            ),
+            Some([110.0, 30.0])
+        );
+        assert_eq!(
+            cursor_point_from_windows(7, None, Some([2000.0, 20.0, 50.0, 40.0]), &[target()]),
+            None
         );
     }
 

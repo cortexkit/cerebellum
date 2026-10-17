@@ -1060,14 +1060,6 @@ where
 
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
-        self.cursor.schedule(
-            cursor::Identity::current(identity.agent_project_id.clone()),
-            cerebellum_computer::cursor::CursorKind::Reading,
-            grant.clone(),
-            self.app_state_source.clone(),
-            None,
-            None,
-        );
         let expand_menus =
             sessions.zoom_expands_menus(&conversation_key, &grant, parsed.zoom.as_deref());
         let read_work = work.clone();
@@ -1140,6 +1132,16 @@ where
                 return reply;
             }
         };
+        // Scheduled after the read so the picture can aim at the element that
+        // has focus; with no focused element it stays where it already is.
+        self.cursor.schedule(
+            cursor::Identity::current(identity.agent_project_id.clone()),
+            cerebellum_computer::cursor::CursorKind::Reading,
+            grant.clone(),
+            self.app_state_source.clone(),
+            raw.focused.clone(),
+            None,
+        );
 
         let unpopulated = raw.mark_unpopulated_content();
         let observed = sessions.observe(&conversation_key, &grant, &raw);

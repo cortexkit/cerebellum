@@ -1,0 +1,125 @@
+[[control]]
+id = "agent-cursor-tip-is-the-anchor"
+guards = "the agent cursor's panel is placed so the arrow's tip, not the panel's corner, lands on the requested point on every display"
+file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+old = "    let frame = panel.offset(tip);"
+new = "    let frame = Rect { x: tip[0], y: tip[1], ..panel }; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_geometry::tests::tip_lands_on_the_requested_point_on_a_scaled_display",
+    "cursor_geometry::tests::tip_lands_on_the_requested_point_on_a_secondary_display_with_negative_origin",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-label-never-covers-the-target"
+guards = "the agent cursor's label pill is never placed over the element or point being acted on"
+file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+old = "        screen.contains_rect(*label) && !label.intersects(target) && !label.intersects(badge)"
+new = "        screen.contains_rect(*label) && !label.intersects(badge) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_geometry::tests::label_never_covers_the_target_and_stays_on_screen",
+    "cursor_geometry::tests::label_prefers_beside_the_chip_then_the_side_with_room",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-badge-stays-while-its-agent-acts"
+guards = "an agent cursor badge stays fully visible until its agent has sent no event for 30 s, rather than fading 1.5 s after each action"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(30);"
+new = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_millis(1500); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::picture_stays_fully_visible_for_29_seconds_then_fades_after_30",
+    "cursor_schedule::tests::event_at_20_seconds_keeps_the_picture_visible_until_50",
+    "cursor_schedule::tests::resting_picture_asks_for_a_timed_wait_not_frame_ticks",
+    "cursor_schedule::tests::earliest_fade_deadline_wins_across_resting_pictures",
+    "cursor_schedule::tests::faded_picture_is_dropped_and_never_ticked_again",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-helper-end-hides-at-once"
+guards = "a hide line takes that agent's picture off the screen at once in the helper, and a later event draws a fresh one"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "        if let Some(mut live) = self.pictures.remove(agent) {"
+new = "        if let Some(mut live) = self.pictures.remove(\"\").filter(|_| !agent.is_empty()) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::end_hides_at_once_and_a_later_event_creates_it_again",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-end-sends-the-hide"
+guards = "Coordinator::end, the one entry for route close, computer-call cancel and turn end, actually sends that agent's hide line"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        self.send_line(CursorLine::Hide(CursorHide::new(agent)));"
+new = "        let _ = CursorHide::new(agent); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/cursor_end_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::end_hides_only_the_named_agent_and_needs_a_transport",
+    "computer_capability::cursor::tests::turn_ended_matches_the_scope_ref_whatever_its_epoch",
+    "computer_capability::cursor::tests::a_picture_scheduled_before_an_end_does_not_bring_the_badge_back",
+    "cursor_end_tests::cancel_of_a_computer_call_ends_only_that_calls_badge",
+    "cursor_end_tests::goodbye_ends_only_the_badges_its_route_drew",
+    "cursor_end_tests::turn_ended_for_one_session_hides_its_badge_and_not_another",
+    "cursor_end_tests::a_failed_turn_with_its_error_class_hides_the_badge",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "session-turn-ended-admits-only-prefrontal-core"
+guards = "session.turn_ended is served only to reserved:prefrontal-core; every other principal is refused principal_denied"
+file = "crates/cerebellum/src/lib.rs"
+old = "    if !cerebellum_core::principal::admits_session_calls(&facts.principal) {"
+new = "    if false && !cerebellum_core::principal::admits_session_calls(&facts.principal) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/cursor_end_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_end_tests::turn_ended_from_any_other_principal_is_refused",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

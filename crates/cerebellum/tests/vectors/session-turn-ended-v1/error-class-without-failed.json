@@ -1,0 +1,24 @@
+{
+  "case": "error-class-without-failed",
+  "contract": "session-turn-ended-v1",
+  "principal": "reserved:prefrontal-core",
+  "reply": {
+    "body_length": 122,
+    "body_utf8": "{\"context\":null,\"detail\":{\"field\":\"error_class\",\"reason_code\":\"invalid_value\"},\"outcome\":\"invalid_request\",\"session\":null}",
+    "channel": 4,
+    "corr": 505,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "7a000000020102040001000000f9010000000000007b22636f6e74657874223a6e756c6c2c2264657461696c223a7b226669656c64223a226572726f725f636c617373222c22726561736f6e5f636f6465223a22696e76616c69645f76616c7565227d2c226f7574636f6d65223a22696e76616c69645f72657175657374222c2273657373696f6e223a6e756c6c7d"
+  },
+  "request": {
+    "body_length": 340,
+    "body_utf8": "{\"method\":\"session.turn_ended\",\"params\":{\"at_ms\":1700000000000,\"error_class\":\"auth\",\"harness\":\"claude-code\",\"outcome\":\"completed\",\"quality\":\"strong\",\"scope\":{\"epoch\":3,\"owner\":{\"kind\":\"reserved\",\"module_id\":\"prefrontal-core\"},\"ref\":\"head-a\"},\"seq\":7,\"session_ref\":\"0123456789abcdef0123456789abcdef\",\"source\":\"stop-hook\",\"turn_id\":\"turn-1\"}}",
+    "channel": 4,
+    "corr": 505,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "54010000020002040001000000f9010000000000007b226d6574686f64223a2273657373696f6e2e7475726e5f656e646564222c22706172616d73223a7b2261745f6d73223a313730303030303030303030302c226572726f725f636c617373223a2261757468222c226861726e657373223a22636c617564652d636f6465222c226f7574636f6d65223a22636f6d706c65746564222c227175616c697479223a227374726f6e67222c2273636f7065223a7b2265706f6368223a332c226f776e6572223a7b226b696e64223a227265736572766564222c226d6f64756c655f6964223a2270726566726f6e74616c2d636f7265227d2c22726566223a22686561642d61227d2c22736571223a372c2273657373696f6e5f726566223a223031323334353637383961626364656630313233343536373839616263646566222c22736f75726365223a2273746f702d686f6f6b222c227475726e5f6964223a227475726e2d31227d7d"
+  },
+  "state": "head-a drew agent-a's badge"
+}

@@ -447,6 +447,7 @@ mod tests {
             &self,
             _: &cerebellum_computer::platform::ProcessGrant,
             _: Option<[f64; 2]>,
+            _: Option<[f64; 4]>,
         ) -> Option<[f64; 2]> {
             Some([10.0, 20.0])
         }
@@ -455,12 +456,14 @@ mod tests {
     async fn scheduled(
         avatars: Arc<Avatars>,
     ) -> tokio::sync::mpsc::Receiver<cerebellum_computer::cursor::CursorEvent> {
-        let (cursor, receiver) = super::super::Coordinator::channel();
+        let (cursor, mut lines) = super::super::Coordinator::channel();
         cursor.set_avatars(avatars);
         cursor.schedule(
             super::super::Identity {
                 badge: "agent-a".into(),
                 avatar_agent: Some("agent-a".into()),
+                call: None,
+                session: None,
             },
             cerebellum_computer::cursor::CursorKind::Reading,
             cerebellum_computer::platform::ProcessGrant {
@@ -472,6 +475,17 @@ mod tests {
             None,
             None,
         );
+        // Nothing here ends a badge, so every line is a picture; forwarding
+        // only pictures keeps these tests about the pictures themselves.
+        let (pictures, receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(line) = lines.recv().await {
+                let picture = line.picture().expect("no badge was ended");
+                if pictures.send(picture).await.is_err() {
+                    break;
+                }
+            }
+        });
         receiver
     }
 
