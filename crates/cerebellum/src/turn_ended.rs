@@ -169,8 +169,9 @@ pub(crate) fn parse(params: &Map<String, Value>) -> Result<TurnEnded, ParamsErro
     }
     string(params, "source", "source")?;
     unsigned(params, "seq", "seq")?;
-    // Nothing here depends on when the turn ended: the badge goes as soon as
-    // the call arrives. It is still part of the agreed shape.
+    // `at_ms` is required by the call's parameter shape, but this module
+    // ignores its value: the session's cursor badge is hidden as soon as the
+    // call arrives, whenever the turn actually ended.
     unsigned(params, "at_ms", "at_ms")?;
     Ok(TurnEnded {
         session_ref: session_ref.to_string(),
