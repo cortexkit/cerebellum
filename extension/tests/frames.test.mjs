@@ -57,10 +57,13 @@ async function framed(cross = true) {
   const base = f.chrome.debugger.sendCommand;
   f.chrome.debugger.sendCommand = async (target, method, params) => {
     if (method === "Target.setAutoAttach" && !target.sessionId && cross) {
-      f.chrome.debugger.onEvent.emit(target, "Target.attachedToTarget", { sessionId: "ephemeral-child-session", targetInfo: { type: "iframe", targetId: "stable-target-not-frame-id" } });
+      f.chrome.debugger.onEvent.emit(target, "Target.attachedToTarget", { sessionId: "ephemeral-child-session", targetInfo: { type: "iframe", targetId: child.id, parentFrameId: root.id, url: crossChild.url } });
     }
     await base(target, method, params);
-    if (method === "Page.getFrameTree") return { frameTree: target.sessionId ? { frame: crossChild } : { frame: root, childFrames: [{ frame: crossChild }] } };
+    // Real Chrome reports the OOPIF only in its own session, not as a stub
+    // in the parent's tree. webNavigation still lists both documents.
+    if (method === "Page.getFrameTree") return { frameTree: target.sessionId ? { frame: crossChild } : cross ? { frame: root } : { frame: root, childFrames: [{ frame: crossChild }] } };
+    if (method === "Accessibility.getFullAXTree" && target.sessionId) return { nodes: [{ nodeId: "child-input", role: { value: "textbox" }, name: { value: "Iframe input" }, backendDOMNodeId: 42, frameId: child.id }] };
     return { nodes: [] };
   };
   const discover = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
@@ -70,12 +73,49 @@ async function framed(cross = true) {
 test("OOPIF commands resolve fresh flattened sessions and detach with their tab", async () => {
   const f = await framed();
   const { frame_id, loader_id, session_id } = f.scope;
-  assert.equal(session_id, "stable-target-not-frame-id");
-  await f.run(f.cdp([{ method: "Accessibility.getFullAXTree", params: { frameId: frame_id }, frame_id, loader_id, session_id }]));
+  assert.equal(session_id, child.id);
+  const reply = await f.run(f.cdp([{ method: "Accessibility.getFullAXTree", params: { frameId: frame_id }, frame_id, loader_id, session_id }]));
+  assert.equal(reply.results[0].result.nodes[0].name.value, "Iframe input");
   const dispatched = f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Accessibility.getFullAXTree");
   assert.deepEqual(dispatched.map(call => call[1]), [{ tabId: 2, sessionId: "ephemeral-child-session" }]);
   assert.equal(f.chrome.calls.filter(call => call[0] === "attach").length, f.chrome.calls.filter(call => call[0] === "detach").length);
   assert.equal(f.chrome.debugger.onEvent.listeners.size, 0);
+});
+
+test("nested OOPIFs join reachable parents after pending child auto-attach", async () => {
+  const f = await setup();
+  const nested = { id: "nested-frame", parentId: child.id, loaderId: "nested-loader", url: "https://nested.example/" };
+  f.chrome.webNavigation.getAllFrames = async () => [...navigation(), { frameId: 18, parentFrameId: 17, documentId: "nested-doc", url: nested.url }];
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    await send(target, method, params);
+    if (method === "Target.setAutoAttach" && !target.sessionId) {
+      f.chrome.debugger.onEvent.emit(target, "Target.attachedToTarget", { sessionId: "child-session", targetInfo: { type: "iframe", targetId: child.id } });
+    } else if (method === "Target.setAutoAttach" && target.sessionId === "child-session") {
+      await new Promise(resolve => setImmediate(resolve));
+      f.chrome.debugger.onEvent.emit(target, "Target.attachedToTarget", { sessionId: "nested-session", targetInfo: { type: "iframe", targetId: nested.id } });
+    }
+    if (method === "Page.getFrameTree") return { frameTree: { frame: target.sessionId === "nested-session" ? nested : target.sessionId ? child : root } };
+    return {};
+  };
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.deepEqual(reply.frame_mappings.map(frame => [frame.frame_id, frame.session_id]), [[root.id, "root"], [child.id, child.id], [nested.id, nested.id]]);
+  assert.equal(reply.results[0].result.frameTree.childFrames[0].childFrames[0].frame.id, nested.id);
+});
+
+test("an OOPIF stub is replaced rather than duplicated by its session tree", async () => {
+  const f = await framed();
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    const reply = await send(target, method, params);
+    if (method === "Page.getFrameTree" && !target.sessionId) reply.frameTree.childFrames = [{ frame: { ...child, loaderId: "", url: "" } }];
+    return reply;
+  };
+  const reply = await f.run(f.cdp([{ method: "Page.getFrameTree", params: {} }]));
+  assert.equal(reply.results[0].result.frameTree.childFrames.length, 1);
+  assert.equal(reply.frame_mappings[1].loader_id, child.loaderId);
+  assert.equal(reply.frame_mappings[1].session_id, child.id);
+  assert.equal(reply.frame_mappings[1].unreadable_reason, undefined);
 });
 
 test("same-origin child commands stay on the root target", async () => {

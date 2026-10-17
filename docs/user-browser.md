@@ -23,7 +23,9 @@ cross-origin frames. Clicking or typing in a frame needs that frame's own site
 permission. Ambiguous or stale embedded frames are omitted from reads, with an
 `[embedded frame not readable: ambiguous|stale]` marker and a partial-snapshot
 flag; the top page and other readable frames remain available. Input into those
-frames still refuses rather than guessing which frame to use. Credential and
+frames still refuses rather than guessing which frame to use. The same marker
+and partial flag cover an iframe whose child was never discovered, whose read
+failed or returned no content, or whose capture exceeded a limit. Credential and
 payment fields still refuse typing in every frame.
 
 Chrome shows a debugging bar during an action. The debugger detaches between
