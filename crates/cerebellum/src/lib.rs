@@ -1617,7 +1617,12 @@ impl computer_grants::QuestionCarrier for RouteCarrier {
             return Err(NotLive::Unscoped);
         }
         let guard = self.guard.as_ref().ok_or(NotLive::CallEnded)?;
-        LiveCall::from_inbound(stamp, guard, Arc::clone(&self.route))
+        LiveCall::from_inbound(stamp, guard, Arc::clone(&self.route)).map(|live| {
+            live.with_authorizing_agent(
+                permission_scope::authorizing_holder(&self.facts)
+                    .map(|holder| holder.agent_id().to_string()),
+            )
+        })
     }
     fn requester_ref(&self) -> Option<String> {
         self.call_key.clone()
@@ -4985,6 +4990,14 @@ async fn complete_login_import(
             }
         }
     }
+    if plan.permits_transfer(decision) {
+        if let Some(id) = execution.as_ref().and_then(|answer| answer.elicitation_id.as_deref()) {
+            if planes.consent.begin_execution(id).is_err() {
+                execution_result = json!({"outcome":"consent_unavailable", "reason":"grant_store_unavailable"});
+                return execution_result.clone();
+            }
+        }
+    }
     let result = match &answer {
         Some(answer) => plan.conclude(answer),
         // A caller stop authorizes no transfer and is not a person's denial.
@@ -7276,6 +7289,9 @@ async fn serve_browser_with_consent(
     drop(parked);
     match ending {
         InCall::Settled(_) if matches!(settled, management::BrowserGrantSettlement::Granted(_)) => {
+            if let Some(terminal) = TerminalArbiter::current() {
+                terminal.track_consent(Arc::clone(&planes.consent), &id);
+            }
             authorization::with_standing_caller(
                 standing_caller(facts),
                 planes.browser.serve(&facts.identity, capability, arguments),
@@ -8803,8 +8819,8 @@ mod tests {
                 "question omitted {disclosed}: {question}"
             );
         }
-        // A grant is usually answered from a phone, so the deadline the
-        // question carries on the wire is the 30-minute one.
+        // Legacy peers still receive the original deadline; capable peers
+        // omit it when the card is raised.
         assert_eq!(question["params"]["expires_in_ms"], json!(1_800_000));
 
         assert!(planes.consent_test.as_ref().unwrap().answer(
@@ -10040,7 +10056,7 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).unwrap();
             Self {
-                script: cingulate_client::ScriptedCingulate::new(),
+                script: cingulate_client::ScriptedCingulate::new().accept_execution_reports(),
                 dir,
             }
         }
@@ -10796,7 +10812,8 @@ mod tests {
             cingulate.methods(),
             [
                 cingulate_client::wire::CONSENT_REQUEST,
-                cingulate_client::wire::CONSENT_AWAIT
+                cingulate_client::wire::CONSENT_AWAIT,
+                cingulate_client::wire::CONSENT_REPORT_EXECUTION
             ]
         );
         let asked = cingulate.cards().remove(0);
@@ -11002,7 +11019,7 @@ mod tests {
         );
     }
 
-    /// The capture card goes out with a thirty-minute life, and asks core
+    /// Older consent servers receive the original thirty-minute deadline. Core
     /// only to notify the agent when it settles.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_capture_card_is_sent_for_thirty_minutes_notify_only() {
@@ -11244,7 +11261,12 @@ mod tests {
             fixture.vault.request_params()[0]["consent_ref"],
             "el_cap_360"
         );
-        assert!(cingulate.store().load().unwrap().is_empty());
+        assert!(cingulate
+            .store()
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked));
         assert!(!restarted.consent.has_single_use_approvals());
 
         let again = cingulate.planes(&fixture);
@@ -11277,7 +11299,7 @@ mod tests {
         assert_eq!(first["outcome"], "consent_pending", "{first}");
         cingulate.feed(late_answer("el_cap_330", "deny"));
         await_remembered(&planes, true).await;
-        let before = cingulate.methods().len();
+        let before = cingulate.cards().len();
         let body = capture_reply(
             &planes,
             &writer_tx,
@@ -11288,11 +11310,7 @@ mod tests {
         .await;
         assert_eq!(body["outcome"], "capture_consent_not_given", "{body}");
         assert_eq!(body["reason"], "deny", "{body}");
-        assert_eq!(
-            cingulate.methods().len(),
-            before,
-            "a second card was raised"
-        );
+        assert_eq!(cingulate.cards().len(), before, "a second card was raised");
         assert_eq!(
             fixture
                 .launcher
@@ -13214,7 +13232,12 @@ mod login_import_consent_tests {
         let before = consent.methods().len();
         computer_grants::tests::drain_call(&restarted, 1, 1).await;
         assert_eq!(consent.methods()[before..], [CONSENT_ANSWERS, CONSENT_ACK]);
-        assert!(consent.store().load().unwrap().is_empty());
+        assert!(consent
+            .store()
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked));
         consent.takes_report("el_imp_restart");
         let (card, reply) = import(&restarted, &consent, &root, &tx).await;
         assert!(card.is_none(), "a second card was raised");

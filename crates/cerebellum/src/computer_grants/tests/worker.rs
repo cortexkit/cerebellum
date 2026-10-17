@@ -33,7 +33,7 @@ pub(super) fn scripted(planes: Planes, choice: &str) -> (Planes, Arc<ScriptedCin
 }
 
 pub(super) fn scripted_consent(planes: Planes, choice: &str) -> (Planes, Arc<ScriptedCingulate>) {
-    let script = ScriptedCingulate::new();
+    let script = ScriptedCingulate::new().accept_execution_reports();
     script
         .then(wire::CONSENT_REQUEST, Reply::Result(json!({"elicitation_id":"el_worker"})))
         .then(wire::CONSENT_AWAIT, Reply::Result(json!({"elicitation_id":"el_worker","state":"answered","answered_choice_id":choice})));

@@ -558,7 +558,6 @@ pub(crate) struct PendingLaunchRecoveryClear {
     /// one: after a restart, recovery has run again and the question no
     /// longer describes what it kept.
     incarnation: String,
-    asked_at: Instant,
 }
 
 /// What one answer to a clear question did.
@@ -1827,7 +1826,6 @@ impl ManagementPlane {
             prepared: PreparedConsent::Clear(PendingLaunchRecoveryClear {
                 preview: preview.clone(),
                 incarnation,
-                asked_at: Instant::now(),
             }),
             body: launch_recovery_clear_question(&preview),
             deadline: PHONE_CONSENT_DEADLINE,
@@ -1892,7 +1890,7 @@ impl ManagementPlane {
         &self,
         ask_id: &str,
         ending: &Ending,
-        answered_at: Instant,
+        _answered_at: Instant,
     ) -> ClearSettlement {
         let incarnation = self.launch_recovery.incarnation();
         let pending = self
@@ -1904,10 +1902,8 @@ impl ManagementPlane {
             None => return ClearSettlement::UnknownAsk,
             Some(pending) => {
                 let project = pending.preview.agent_project_id.clone();
-                // A question that ended without an answer is reported as that
-                // ending before the deadline is looked at: silence is only
-                // reported once the deadline has passed, so checking the
-                // deadline first would call every silence a late answer.
+                // The consent service decides whether the card can still be
+                // answered. Recheck the retained recovery evidence, not its age.
                 let settlement = if pending.incarnation != incarnation {
                     ClearSettlement::AskedByEarlierStart
                 } else {
@@ -1917,12 +1913,6 @@ impl ManagementPlane {
                         Ending::NotPutToAnyone => ClearSettlement::NotPutToAnyone,
                         Ending::DeliveryFailed | Ending::NoCard(_) => {
                             ClearSettlement::Undeliverable
-                        }
-                        Ending::Granted { .. } | Ending::Declined { .. }
-                            if answered_at.saturating_duration_since(pending.asked_at)
-                                > PHONE_CONSENT_DEADLINE =>
-                        {
-                            ClearSettlement::Expired
                         }
                         Ending::Granted { choice_id } | Ending::Declined { choice_id } => {
                             match Some(choice_id.as_str()) {

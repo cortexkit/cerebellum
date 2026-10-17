@@ -311,6 +311,7 @@ impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
         Some(cerebellum::cingulate_client::features::CingulateFeatures {
             option_group: true,
             single_use: false,
+            no_expiry: false,
         })
     }
     fn call<'a>(

@@ -1169,9 +1169,9 @@ mod every_card_kind {
         assert_golden("login-capture.json", &params);
     }
 
-    /// A login card stays open for thirty minutes, and core only notifies the
-    /// agent when it settles: the capability never runs on a late answer by
-    /// itself, it waits for the agent's retry.
+    /// The original deadline is retained for older consent servers. Core
+    /// only notifies the agent when the card settles; the capability never
+    /// runs on a late answer by itself, it waits for the agent's retry.
     fn assert_login_card_life(kind: &str, params: &Value) {
         assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
         assert_eq!(

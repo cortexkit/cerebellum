@@ -1,21 +1,13 @@
 //! Cerebellum's consent cards, as Cingulate `consent.request` params.
 //!
-//! Every card cerebellum raises is built by the builders that also served the
-//! reverse elicitation lane (see the module docs in `mod.rs`)
-//! (`management::browser_grant_question`, `computer_grants::question_body`,
-//! `login_import::import_question`, `login_capture::consent_question`,
-//! `management::profile_root_rebind_question`,
-//! `management::launch_recovery_clear_question`,
-//! `user_browser::site_question`), which render a `{"params": ...}` body
-//! holding the card as that lane sent it. This file lifts those `params` into
-//! Cingulate's generic `consent` request and changes only what Cingulate's
-//! closed request format requires, so the phone sees the same title, prompt,
-//! target, facts, options, default, urgency, scope, lifetime and duration as
-//! it did on the reverse elicitation lane. The differences:
+//! The browser, computer and login card builders render a `{"params": ...}`
+//! body. This adapter preserves the phone's display text and choices while
+//! converting those params to Cingulate's generic consent request, whose schema
+//! rejects unknown fields. The differences:
 //!
-//! - `expires_in_ms` is stamped from the deadline the call site enforces, as
-//!   that lane stamped it, so the number on the card is the number the
-//!   code waits on.
+//! - `expires_in_ms` preserves the legacy deadline for older servers. Feature
+//!   negotiation removes it only when Cingulate advertises no-expiry support;
+//!   the bounded in-call wait never determines the card's lifetime.
 //! - The originating call's key travels as `requester_ref` (opaque
 //!   correlation, no dedup meaning), not `call_key`, which Cingulate refuses.
 //! - `requestedSchema` is dropped: Cingulate checks it against the option
@@ -52,8 +44,7 @@ pub enum CardKind {
     ProfileReidentification,
     /// A browser profile stuck in launch recovery, to be cleared.
     StuckProfileClearance,
-    /// Access to one site in the person's own signed-in browser, asked while
-    /// the call is held and never left open after it.
+    /// Access to one site in the person's own signed-in browser.
     UserBrowserSite,
 }
 

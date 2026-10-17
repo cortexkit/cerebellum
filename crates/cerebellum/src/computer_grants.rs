@@ -79,17 +79,14 @@ pub const GRANT_STORE_FORMAT: cerebellum_core::format_floor::DurableFormat =
 /// away. The question itself stays open longer (see the deadlines below).
 pub const CONSENT_PARK_LIMIT: Duration = Duration::from_secs(120);
 
-/// How long an app question stays open.
+/// Legacy deadline sent only to consent servers without no-expiry support.
 ///
-/// The same span a browser origin grant question stays open: both are answered
-/// from a phone, and a person takes minutes to notice a phone prompt.
+/// The original thirty-minute lifetime matches browser site cards on those
+/// servers, allowing time to notice a phone prompt.
 pub const APP_QUESTION_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-/// How long a takeover question stays open.
-///
-/// Short on purpose. Approving a takeover hands the agent the real pointer, and
-/// an approval given long after the ask may arrive when nobody is watching the
-/// screen it takes.
+/// Legacy takeover deadline, retained for older consent servers. New servers
+/// keep the card open until answered; dispatch still rechecks the live target.
 pub const TAKEOVER_QUESTION_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 const ALLOW_30M: &str = "allow_30m";
@@ -1024,7 +1021,7 @@ struct OpenQuestion {
     next_waiter: u64,
     settled: SettledSignal,
     completion: Arc<watch::Sender<bool>>,
-    /// Set only for a login card: what its answers mean and when it expires.
+    /// Set only for a login card: what its answers mean.
     login: Option<LoginCard>,
 }
 
@@ -1032,14 +1029,12 @@ struct OpenQuestion {
 struct LoginCard {
     /// The option id whose effect is to decline.
     decline: Option<String>,
-    expires_at: tokio::time::Instant,
 }
 
-/// The card's explicit login refusal, kept until its original expiry so a
+/// The card's explicit login refusal, kept until the session ends so a
 /// retry does not prompt again for a decision the person already declined.
 struct RememberedLoginAnswer {
     answer: LoginAnswer,
-    expires_at: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -1337,6 +1332,13 @@ impl ComputerGrants {
         let mut signature_changed = false;
         match self.standing(caller, need) {
             Standing::Granted(used) => {
+                if let (Some(carrier), Some(id), Some(terminal)) = (
+                    &context.carrier,
+                    used.row().card_ref.as_deref(),
+                    crate::TerminalArbiter::current(),
+                ) {
+                    terminal.track_consent(carrier.desk(), id);
+                }
                 crate::grant_enforcement::track(&used);
                 return Ok(GrantAdmission {
                     row: Some(used),
@@ -1434,6 +1436,9 @@ impl ComputerGrants {
         };
         match result {
             Ending::Settled(Settlement::Once, executor) if executor == Some(waiter.id) => {
+                if let Some(terminal) = crate::TerminalArbiter::current() {
+                    terminal.track_consent(Arc::clone(&desk), &waiter.ask_id);
+                }
                 Ok(GrantAdmission {
                     waited: true,
                     ..GrantAdmission::default()
@@ -1445,12 +1450,20 @@ impl ComputerGrants {
                     return Err(ConsentRefusal::GrantedNotExecuted);
                 }
                 let Some(used) = self.authorizing_row(caller, need) else {
+                    let _ = desk.finish_execution(
+                        &waiter.ask_id,
+                        Execution::ApprovedNotExecuted,
+                        Some(crate::cingulate_client::wire::ExecutionReason::GrantStoreUnavailable),
+                    );
                     return Err(ConsentRefusal::Unavailable {
                         reason: "grant_not_recorded",
                         remedy: "retry this call",
                     });
                 };
                 crate::grant_enforcement::track(&used);
+                if let Some(terminal) = crate::TerminalArbiter::current() {
+                    terminal.track_consent(Arc::clone(&desk), &waiter.ask_id);
+                }
                 Ok(GrantAdmission {
                     row: Some(used),
                     waited: true,
@@ -1539,6 +1552,9 @@ impl ComputerGrants {
             parameters: request.parameters.clone(),
         };
         let key = subject.desk_subject();
+        if desk.take_lost_answer(live.session(), &key) {
+            return failed(CardEnding::NoAnswer);
+        }
         let park_end = tokio::time::Instant::now() + self.login_park_limit();
         loop {
             let _creation = self.creation.lock().await;
@@ -1554,10 +1570,7 @@ impl ComputerGrants {
             let joined = {
                 let mut state = lock(&self.state);
                 if let Some(answer) = state.login_answers.get(&subject) {
-                    if answer.expires_at > tokio::time::Instant::now() {
-                        return LoginConsent::Ended(answer.answer.clone());
-                    }
-                    state.login_answers.remove(&subject);
+                    return LoginConsent::Ended(answer.answer.clone());
                 }
                 join_open(&mut state, &subject)
             };
@@ -1607,11 +1620,7 @@ impl ComputerGrants {
                             next_waiter: 1,
                             settled: settled_tx,
                             completion: Arc::new(completion_tx),
-                            login: Some(LoginCard {
-                                decline,
-                                expires_at: tokio::time::Instant::now()
-                                    + crate::consent_card::LOGIN_CARD_LIFETIME,
-                            }),
+                            login: Some(LoginCard { decline }),
                         },
                     );
                     state
@@ -1658,8 +1667,23 @@ impl ComputerGrants {
                 {
                     continue
                 }
-                Ending::Settled(Settlement::Login { outcome, .. }, _) => {
-                    return LoginConsent::Ended(outcome)
+                Ending::Settled(
+                    Settlement::Login {
+                        mut outcome,
+                        allows,
+                    },
+                    _,
+                ) => {
+                    if allows {
+                        if let Some(id) = outcome.elicitation_id.as_deref() {
+                            if desk.claim_execution(id).is_err() {
+                                let _ = desk.finish_execution(id, Execution::ApprovedNotExecuted, Some(crate::cingulate_client::wire::ExecutionReason::GrantStoreUnavailable));
+                                return failed(CardEnding::DeliveryFailed);
+                            }
+                        }
+                        outcome.taken_approval = true;
+                    }
+                    return LoginConsent::Ended(outcome);
                 }
                 Ending::TimedOut => {
                     return LoginConsent::Pending {
@@ -1735,6 +1759,7 @@ impl ComputerGrants {
                         .await
                         .is_err()
                 {
+                    let _ = session.detach(&waiter.ask_id).await;
                     return Ending::TimedOut;
                 }
             }
@@ -1894,7 +1919,6 @@ impl ComputerGrants {
         let completion = Arc::clone(&question.completion);
         if let (Some(card), CardEnding::Declined { choice_id }) = (&question.login, ending) {
             if card.decline.as_deref() == Some(choice_id) {
-                let expires_at = card.expires_at;
                 state.login_answers.insert(
                     open.subject.clone(),
                     RememberedLoginAnswer {
@@ -1903,7 +1927,6 @@ impl ComputerGrants {
                             elicitation_id: Some(ask_id.to_string()),
                             taken_approval: false,
                         },
-                        expires_at,
                     },
                 );
             }
@@ -2383,13 +2406,61 @@ pub(crate) async fn report_login_execution(
     let Some(id) = answer.elicitation_id.as_deref() else {
         return;
     };
+    let desk = carrier.desk();
+    let (execution, reason) = login_execution_outcome(reply, success);
+    if desk.finish_execution(id, execution, reason).is_err() {
+        return;
+    }
     let Ok(live) = carrier.live() else {
         return;
     };
-    let desk = carrier.desk();
-    let Ok(mut session) = desk.session(&live).await else {
-        return;
-    };
+    // Opening the live route retries the durable report, including a send whose
+    // previous response was lost. No autonomous route is opened after a call ends.
+    let _ = desk.session(&live).await;
+}
+
+pub(crate) fn execution_refusal_reason(
+    reply: &Value,
+) -> Option<crate::cingulate_client::wire::ExecutionReason> {
+    use crate::cingulate_client::wire::ExecutionReason;
+    let reason = reply["reason"]
+        .as_str()
+        .or_else(|| reply["detail"]["reason"].as_str())
+        .unwrap_or_default();
+    let outcome = reply["outcome"].as_str().unwrap_or_default();
+    Some(
+        if matches!(reason, "session_ended" | "scope_ended")
+            || matches!(outcome, "session_ended" | "route_closed" | "cancelled")
+        {
+            ExecutionReason::SessionEnded
+        } else if matches!(
+            reason,
+            "target_gone" | "app_not_found" | "profile_not_found"
+        ) || matches!(
+            outcome,
+            "target_gone" | "app_not_found" | "profile_not_found"
+        ) {
+            ExecutionReason::TargetGone
+        } else if reason.starts_with("grant_store_")
+            || matches!(
+                reason,
+                "grant_not_recorded" | "vault_unreachable" | "vault_store_unavailable"
+            )
+        {
+            ExecutionReason::GrantStoreUnavailable
+        } else {
+            ExecutionReason::RefusedAtDispatch
+        },
+    )
+}
+
+pub(crate) fn login_execution_outcome(
+    reply: &Value,
+    success: &str,
+) -> (
+    Execution,
+    Option<crate::cingulate_client::wire::ExecutionReason>,
+) {
     let outcome = reply["outcome"].as_str().unwrap_or_default();
     let reason = reply["reason"].as_str().unwrap_or_default();
     let execution = if outcome == success {
@@ -2405,7 +2476,12 @@ pub(crate) async fn report_login_execution(
     } else {
         Execution::ApprovedNotExecuted
     };
-    let _ = session.report_execution(id, execution).await;
+    (
+        execution,
+        (execution == Execution::ApprovedNotExecuted)
+            .then(|| execution_refusal_reason(reply))
+            .flatten(),
+    )
 }
 
 #[cfg(test)]

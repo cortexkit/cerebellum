@@ -61,6 +61,7 @@ fn every_worker_card_kind_has_only_thirty_minute_or_single_use_options() {
             decline_id: card.decline_id,
             next_steps: card.next_steps,
             applied: false,
+            lifecycle: Default::default(),
         };
         for forbidden in [
             "allow_always",

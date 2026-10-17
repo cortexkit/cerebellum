@@ -5167,21 +5167,22 @@ mod orphan_recovery_tests {
         }
 
         #[tokio::test]
-        async fn a_late_answer_or_one_from_an_earlier_start_does_nothing() {
+        async fn an_arbitrarily_late_answer_rechecks_evidence_but_an_earlier_start_grants_nothing()
+        {
             let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
             let (_, ask_id) = fixture.ask().await;
-            let late = Instant::now() + Duration::from_secs(31 * 60);
+            let late = Instant::now() + Duration::from_secs(2 * 24 * 60 * 60);
             assert_eq!(
                 fixture
                     .plane
                     .settle_launch_recovery_clear_at(&ask_id, Some(&clear()), late)
                     .await,
-                ClearSettlement::Expired
+                ClearSettlement::Cleared { sequence: SEQUENCE }
             );
-            fixture.assert_still_held(RecoveryPendingReason::AttestationUntrusted, "late");
 
             // The module restarted: a new plane with a new startup identity
             // receives an answer to the old question.
+            let fixture = retained(RecoveryPendingReason::AttestationUntrusted);
             let (_, ask_id) = fixture.ask().await;
             let restarted = ManagementPlane::new(Arc::new(NoTargets));
             restarted

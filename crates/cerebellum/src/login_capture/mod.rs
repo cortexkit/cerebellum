@@ -1190,6 +1190,7 @@ impl CaptureModule {
             return record.ended("cancelled", None);
         }
         let question = consent_question(request);
+        let consent_desk = call.consent.carrier.desk();
         // The consent wait owns detaching or withdrawing the card. A polling
         // cancellation must signal that wait and keep it alive until cleanup
         // finishes, even when Cingulate's detach reply is not ready yet.
@@ -1353,6 +1354,10 @@ impl CaptureModule {
 
         let accepted = call.accepted.clone();
         let launch_placement = placement.clone();
+        if consent_desk.begin_execution(&consent_ref).is_err() {
+            let disposal = self.dispose(None, &placement).await;
+            return record.with_deletion(disposal.deleted).refused("consent_unavailable", json!({"reason":"grant_store_unavailable", "remedy":"The consent registry could not be saved; retry when storage is available."}));
+        }
         let launched = tokio::task::spawn_blocking(move || {
             launcher.launch_capture(
                 &accepted,
@@ -1996,7 +2001,7 @@ fn consent_refusal(ending: &Ending) -> Option<&'static str> {
 fn consent_refusal_remedy(reason: &str) -> &'static str {
     match reason {
         "deny" => "nothing was captured; the person declined. Ask again only if they now want this login held.",
-        "no_answer" => "nothing was captured; the person was asked but did not answer in time. Ask again when they are available.",
+        "no_answer" => "nothing was captured; the answer is unavailable or was lost. Ask again.",
         "not_put_to_anyone" => "nothing was captured; the question reached nobody, so asking again will not help until a person can be reached through the caller's consent route.",
         "undeliverable" => "nothing was captured; the question could not be sent. Retry once; if it fails again, the module needs attention.",
         _ => "nothing was captured; the answer was not one this question offered. Ask again.",

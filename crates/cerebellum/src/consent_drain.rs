@@ -108,8 +108,8 @@ impl ConsentDrain {
     pub async fn run(&self, desk: &ConsentDesk, live: &LiveCall) -> Result<DrainReport, Ending> {
         let lock = self.session_lock(live.session());
         let _pass = lock.lock().await;
-        let cards = desk.unapplied(live.session());
-        if cards.is_empty() {
+        let cards = desk.unapplied_for(live);
+        if cards.is_empty() && !desk.has_pending_reports() {
             return Ok(DrainReport::default());
         }
         let effects = self.effects.lock().unwrap().clone();
@@ -117,12 +117,15 @@ impl ConsentDrain {
             .session(live)
             .await
             .map_err(|error| Ending::of_refusal(&error))?;
+        if cards.is_empty() {
+            return Ok(DrainReport::default());
+        }
         for card in &cards {
             let Some(adapter) = effects.get(&card.kind) else {
                 // Absence of an adapter is not proof of a lost pending record.
                 continue;
             };
-            if card.kind.single_use() || adapter.has_pending(card) {
+            if card.kind.single_use() || card.lifecycle.deferred_use || adapter.has_pending(card) {
                 continue;
             }
             let record = session.get(&card.elicitation_id).await?;
@@ -185,6 +188,12 @@ pub fn live_call(
             conversation_key: facts.identity.conversation_key.clone(),
         }),
     )
+    .map(|live| {
+        live.with_authorizing_agent(
+            crate::permission_scope::authorizing_holder(facts)
+                .map(|holder| holder.agent_id().to_string()),
+        )
+    })
 }
 
 /// Plane constructors without daemon configuration cannot open a route to
@@ -276,6 +285,7 @@ mod tests {
             decline_id: "deny".into(),
             next_steps: Default::default(),
             applied: false,
+            lifecycle: Default::default(),
         }
     }
 
@@ -577,7 +587,11 @@ mod tests {
                     wire::CONSENT_ACK
                 ]
             );
-            assert!(store.load().unwrap().is_empty());
+            assert!(store
+                .load()
+                .unwrap()
+                .iter()
+                .all(|card| card.applied && card.lifecycle.acked));
             assert_eq!(effects.applied.load(Ordering::SeqCst), 0);
         }
     }
@@ -606,7 +620,11 @@ mod tests {
                 .register(CardKind::AppControl, effects.clone());
             ordinary_reply(&invoke(&planes, 1).await);
             assert_eq!(cingulate.methods().last().unwrap(), wire::CONSENT_ACK);
-            assert!(store.load().unwrap().is_empty());
+            assert!(store
+                .load()
+                .unwrap()
+                .iter()
+                .all(|card| card.applied && card.lifecycle.acked));
             assert_eq!(effects.applied.load(Ordering::SeqCst), 0);
             assert!(!*effects.completion.borrow());
         }
@@ -704,7 +722,11 @@ mod tests {
             "the second call must recheck under the session lock"
         );
         assert_eq!(effects.applied.load(Ordering::SeqCst), 1);
-        assert!(store.load().unwrap().is_empty());
+        assert!(store
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked));
     }
 
     #[tokio::test]
@@ -731,13 +753,17 @@ mod tests {
                 .take_single_use_approval(&card(CardKind::LoginImport).session, "test-subject"),
             Some(("el_1".into(), "allow".into()))
         );
-        assert!(store.load().unwrap().is_empty());
+        assert!(store
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked));
     }
 
     #[tokio::test]
     async fn rebuilt_login_desk_records_a_single_use_approval() {
         for kind in [CardKind::LoginImport, CardKind::LoginCapture] {
-            let cingulate = ScriptedCingulate::new();
+            let cingulate = ScriptedCingulate::new().accept_execution_reports();
             feed(&cingulate);
             let (planes, _dir, store) = planes(&[card(kind)], Arc::new(cingulate.clone()));
             ordinary_reply(&invoke(&planes, 1).await);
@@ -761,7 +787,11 @@ mod tests {
             );
             rebuilt.routes.insert(1, 1, facts());
             ordinary_reply(&invoke(&rebuilt, 1).await);
-            assert_eq!(cingulate.opens(), 1);
+            assert_eq!(cingulate.opens(), 2);
+            assert_eq!(
+                cingulate.calls().last().unwrap().1["execution"],
+                "approved_not_executed"
+            );
             assert_eq!(
                 rebuilt
                     .consent

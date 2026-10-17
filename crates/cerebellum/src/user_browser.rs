@@ -697,11 +697,8 @@ fn consent_unavailable(ending: &Ending) -> Value {
 /// The subjects of the site cards that calls in this process are raising or
 /// holding, each with how many calls are doing so.
 ///
-/// A site card is answered only to the call that holds it. The session's
-/// next-call drain (`consent_drain`) must leave a card alone while a call
-/// holds it, but should withdraw one nobody holds any more: a card left over
-/// from before a restart, or from a call that was dropped mid-wait before it
-/// could withdraw its own card.
+/// A holder applies its own answer. After detachment, the registry preserves
+/// the approval for a retry with the same origin, severity and hazards.
 #[derive(Default)]
 pub(crate) struct SiteCardHolders(Mutex<BTreeMap<String, usize>>);
 
@@ -752,22 +749,26 @@ impl Drop for SiteCardHold<'_> {
     }
 }
 
-/// What the next-call drain does with a site card's answer: nothing. The
-/// call holding the card acts on the answer itself, and a card no call holds
-/// has nobody left to act for, so its settlement is only acknowledged.
+/// Held calls apply their own answers. Detached approvals are saved by the
+/// desk for a matching retry; the drain must not steal a holder's settlement.
 struct SiteCardEffects(Arc<SiteCardHolders>);
 
 impl ConsentEffects for SiteCardEffects {
     fn has_pending(&self, card: &RaisedCard) -> bool {
-        self.0.holds(&card.subject)
+        card.lifecycle.deferred_use || self.0.holds(&card.subject)
     }
 
     fn apply(
         &self,
-        _card: &RaisedCard,
+        card: &RaisedCard,
         _record: &Record,
         _ending: &Ending,
     ) -> Result<AppliedSettlement, ApplyFailed> {
+        if self.0.holds(&card.subject) {
+            return Err(ApplyFailed(
+                "the held site call has not stored its answer yet".into(),
+            ));
+        }
         Ok(AppliedSettlement {
             effect: Apply::Applied,
             completion: None,
@@ -1498,16 +1499,53 @@ impl Context<'_> {
             .session(&live)
             .await
             .map_err(|error| consent_unavailable(&Ending::of_refusal(&error)))?;
-        let subject = subject::user_browser_site(origin);
+        let subject = format!(
+            "{}:demand={}",
+            subject::user_browser_site(origin),
+            json!([severity.tier, grant.hazards])
+        );
+        if self
+            .planes
+            .consent
+            .take_lost_answer(live.session(), &subject)
+        {
+            return Err(
+                json!({"browser":"user", "outcome":"refused", "reason":"answer_lost", "remedy":"The answer was lost; ask again.", "input_dispatched":false}),
+            );
+        }
+        if let Some((ask_id, choice_id)) = self
+            .planes
+            .consent
+            .take_single_use_approval(live.session(), &subject)
+        {
+            let Some(choice) = choices
+                .iter()
+                .find(|choice| choice.option_id() == choice_id)
+            else {
+                let _ = self.planes.consent.finish_execution(
+                    &ask_id,
+                    crate::cingulate_client::wire::Execution::ApprovedNotExecuted,
+                    Some(crate::cingulate_client::wire::ExecutionReason::RefusedAtDispatch),
+                );
+                return Err(refusal("unrecognized_answer"));
+            };
+            if let Some(terminal) = crate::TerminalArbiter::current() {
+                terminal.track_consent(Arc::clone(&self.planes.consent), &ask_id);
+            }
+            return self.record_agent_answer(grant, &ask_id, *choice);
+        }
         // Count this call as holding the card before raising it, so a drain
         // run by another call of this session never mistakes the card for an
         // abandoned one and withdraws it while this call raises or waits on
         // it.
         let _holding = SiteCardHold::enter(&self.planes.user_browser_cards, &subject);
-        let ask_id = session
-            .raise(card, &subject)
-            .await
-            .map_err(|ending| consent_unavailable(&ending))?;
+        let ask_id = match self.planes.consent.open_card_for(live.session(), &subject) {
+            Some(card) => card.elicitation_id,
+            None => session
+                .raise(card, &subject)
+                .await
+                .map_err(|ending| consent_unavailable(&ending))?,
+        };
         let mut drain = self.planes.drain_signal.subscribe();
         let cancel = &self.cancel;
         let cancelled = async move {
@@ -1518,8 +1556,8 @@ impl Context<'_> {
         };
         let guard = crate::call_context::ROUTE_GUARD.try_with(Arc::clone).ok();
         let parked = guard.as_ref().map(|guard| guard.park_on_consent());
-        // Held, never detached: the answer is wanted only by this call, and
-        // any ending other than an answer withdraws the card and forgets it.
+        // A bounded call cannot hold an unanswered card forever. Detachment
+        // transfers responsibility for waking the agent to the consent service.
         let work_park = EXECUTION.try_with(|execution| execution.park()).ok();
         let ended = session.hold(&ask_id, CONSENT_DEADLINE, cancelled).await;
         drop(work_park);
@@ -1535,14 +1573,20 @@ impl Context<'_> {
                 }))
             }
             InCall::RouteClosed => return Err(refusal("route_closed")),
-            // `hold` never detaches the card (leaves it open for a later
-            // answer), so it never reports one pending; read it as silence.
-            InCall::Pending { .. } => return Err(consent_unavailable(&Ending::NoAnswer)),
+            InCall::Pending { ask_id } => {
+                let mut pending = crate::cingulate_client::desk::pending_reply(&ask_id);
+                pending["browser"] = json!("user");
+                pending["input_dispatched"] = json!(false);
+                return Err(pending);
+            }
         };
         let decided = match &ending {
             Ending::Granted { choice_id }
                 if choices.iter().any(|choice| choice.option_id() == choice_id) =>
             {
+                if let Some(terminal) = crate::TerminalArbiter::current() {
+                    terminal.track_consent(Arc::clone(&self.planes.consent), &ask_id);
+                }
                 let choice = choices
                     .iter()
                     .find(|choice| choice.option_id() == choice_id)
@@ -1562,8 +1606,8 @@ impl Context<'_> {
                     json!("The answer could not be read; retry this call to ask again.");
                 Err(reply)
             }
-            // Silence, a card nobody was shown, or one that could not be
-            // carried: `hold` already withdrew and forgot the card.
+            // No readable answer grants access. A still-pending card returned
+            // above remains detached rather than being withdrawn here.
             ending => return Err(consent_unavailable(ending)),
         };
         // The answer has been acted on (a standing grant is stored first), so

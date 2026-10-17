@@ -94,6 +94,7 @@ pub fn refusal(code: &str) -> CallError {
 
 #[derive(Default)]
 pub struct ScriptedCingulate {
+    accept_reports: std::sync::atomic::AtomicBool,
     features: Mutex<Option<super::features::CingulateFeatures>>,
     pub opens: AtomicUsize,
     pub calls: Mutex<Vec<(String, Value)>>,
@@ -107,11 +108,18 @@ pub struct ScriptedCingulate {
 }
 
 impl ScriptedCingulate {
+    /// Flow fixtures can accept reports without scripting their unrelated
+    /// result. Wire tests leave this off and pin the exact calls themselves.
+    pub fn accept_execution_reports(self: &Arc<Self>) -> Arc<Self> {
+        self.accept_reports.store(true, Ordering::SeqCst);
+        Arc::clone(self)
+    }
     pub fn new() -> Arc<Self> {
         let service = Arc::new(Self::default());
         service.report_features(Some(super::features::CingulateFeatures {
             option_group: true,
             single_use: false,
+            no_expiry: false,
         }));
         service
     }
@@ -177,6 +185,21 @@ impl CingulateRoute for ScriptedRoute {
                 .lock()
                 .unwrap()
                 .push((method.to_string(), params));
+            if method == super::wire::CONSENT_REPORT_EXECUTION
+                && self.0.accept_reports.load(Ordering::SeqCst)
+                && self
+                    .0
+                    .script
+                    .lock()
+                    .unwrap()
+                    .front()
+                    .is_none_or(|(next, _)| *next != method)
+            {
+                let params = self.0.calls.lock().unwrap().last().unwrap().1.clone();
+                return Ok(
+                    serde_json::json!({"elicitation_id": params["elicitation_id"], "state":"answered", "execution":params["execution"]}),
+                );
+            }
             let next = self.0.script.lock().unwrap().pop_front();
             let Some((expected, reply)) = next else {
                 panic!("the script has no reply left for {method}");
