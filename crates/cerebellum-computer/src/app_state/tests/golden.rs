@@ -865,3 +865,77 @@ fn a_diff_past_the_cap_counts_what_it_left_out() {
     );
     assert_every_change_is_labelled(&diff);
 }
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+/// A memories table as a web dashboard exposes it: each cell unlabelled, its
+/// words in static text wrapped in a group, one cell holding a button.
+fn memories_table(tokens: &Tokens, rows: usize) -> RawElement {
+    let rows = (0..rows)
+        .map(|index| {
+            let cell = |text: &str| {
+                tokens
+                    .element("AXCell")
+                    .with_children(vec![tokens.wrap(vec![tokens.text(text)])])
+            };
+            tokens.element("AXRow").with_children(vec![
+                cell(&format!("Memory {index}")),
+                cell("Maps each memory to its source"),
+                cell("2 days ago"),
+                tokens
+                    .element("AXCell")
+                    .with_children(vec![tokens.text("Open"), tokens.titled("AXButton", "Edit")]),
+            ])
+        })
+        .collect();
+    tokens.titled("AXTable", "Memories").with_children(rows)
+}
+
+fn window_with(table: RawElement, tokens: &Tokens) -> RawElement {
+    tokens.titled("AXWindow", "Dashboard").with_children(vec![
+        tokens.wrap(vec![table, tokens.titled("AXButton", "Refresh")])
+    ])
+}
+
+#[test]
+fn a_short_table_reads_row_by_row_with_each_cells_text_on_its_line() {
+    let tokens = Tokens::new();
+    let read = observe(vec![window_with(memories_table(&tokens, 6), &tokens)]);
+    let outline = outline_of("Dashboard", &read);
+    assert!(
+        !outline.contains("cells (zoom") && !outline.contains("rows (zoom"),
+        "{outline}"
+    );
+    let cells = outline
+        .lines()
+        .filter(|line| line.trim_start().split(' ').nth(1) == Some("cell"))
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), 24, "{outline}");
+    assert!(cells[0].ends_with(" cell Memory 0"), "{outline}");
+    assert!(
+        cells[1].ends_with(" cell Maps each memory to its source"),
+        "{outline}"
+    );
+    assert!(cells[2].ends_with(" cell 2 days ago"), "{outline}");
+    // A cell's button stays a line of its own beneath the cell, so it can
+    // still be pressed by id; only the plain text joined the cell's line.
+    assert!(cells[3].ends_with(" cell Open"), "{outline}");
+    assert_eq!(outline.matches(" button Edit").count(), 6, "{outline}");
+    assert_eq!(outline.matches(" text ").count(), 0, "{outline}");
+}
+
+#[test]
+fn a_long_table_keeps_its_summary_and_the_outline_cap() {
+    let tokens = Tokens::new();
+    let read = observe(vec![window_with(memories_table(&tokens, 40), &tokens)]);
+    let outline = outline_of("Dashboard", &read);
+    assert!(outline.contains(" table Memories  [40 rows"), "{outline}");
+    assert!(!outline.contains("Memory 39"), "{outline}");
+    // Zooming into one row prints its cells with their text.
+    let row = &find(&read.roots, "Dashboard").children[0].children[0].children[5];
+    let zoomed = zoom_of("Dashboard", &read, id(row));
+    assert!(zoomed.contains(" cell Memory 5\n"), "{zoomed}");
+    assert!(!zoomed.contains("cells (zoom"), "{zoomed}");
+}
