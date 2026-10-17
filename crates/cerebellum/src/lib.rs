@@ -10682,6 +10682,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn capture_login_without_live_carrier_refuses_before_readiness_or_effects() {
+        use login_capture::test_support::{fixture, fixture_without_launcher};
+        use std::sync::atomic::Ordering;
+
+        for configured in [false, true] {
+            let fixture = if configured {
+                fixture()
+            } else {
+                fixture_without_launcher()
+            };
+            let cingulate = ScriptedConsent::new();
+            let planes = cingulate.planes(&fixture);
+            let admitted = planes.routes.get(4, 1).unwrap();
+            assert!(computer_grants::admits_consent(&admitted));
+            let facts = admitted.clone().with_scope(None);
+            planes.routes.insert(4, 1, facts);
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+            let reply = capture_initial_reply(
+                &planes,
+                &writer_tx,
+                &mut writer_rx,
+                401,
+                ollama_capture_params(),
+            )
+            .await;
+
+            // A call without an admitted agent session gets the same refusal
+            // whether or not a browser executable is configured; it cannot ask
+            // the person to approve it.
+            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+            assert_eq!(reply["detail"]["reason"], "no_agent_session", "{reply}");
+
+            // An admitted route is not sufficient after its call has ended. The
+            // frame dispatcher normally installs an in-flight guard; invoking
+            // this production handler without it exercises RouteCarrier::live's
+            // CallEnded refusal before browser configuration is examined.
+            planes.routes.insert(4, 1, admitted.clone());
+            let request = login_capture::CaptureRequest {
+                credential_domain: "ollama.com".into(),
+                account: "work".into(),
+                fetch_url: "https://ollama.com/settings".into(),
+                login_url: "https://ollama.com/login".into(),
+            };
+            let consent = login_consent_request(
+                &planes,
+                &admitted,
+                &writer_tx,
+                (4, 1),
+                computer_grants::LoginCapability::CaptureLogin,
+                request.consent_parameters(),
+                None,
+            );
+            assert!(matches!(
+                consent.carrier.live(),
+                Err(cingulate_client::live_call::NotLive::CallEnded)
+            ));
+            let reply = capture_browser_login(
+                &planes,
+                &admitted,
+                &writer_tx,
+                (4, 1, 402),
+                &request,
+                "ended-capture-call",
+            )
+            .await;
+            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+            assert!(cingulate.methods().is_empty());
+            assert_eq!(cingulate.script.opens(), 0);
+            assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.vault.opens.load(Ordering::SeqCst), 0);
+            assert!(fixture.vault.requests.lock().unwrap().is_empty());
+            assert!(fixture.fs.contents().is_empty());
+            assert!(fixture.events.snapshot().is_empty());
+        }
+    }
+
     /// Through the production frame dispatcher and the Withhold reply boundary:
     /// the planted cookie value reaches the vault request, and is absent from
     /// the card put to the person, the pending reply, the late entry and every

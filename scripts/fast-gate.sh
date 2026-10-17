@@ -35,6 +35,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+./scripts/check-mutation-tree.sh
+
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 
 plan_for_files() {

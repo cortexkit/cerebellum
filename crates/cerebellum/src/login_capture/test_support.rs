@@ -632,7 +632,21 @@ pub(crate) fn fixture_without_vault() -> Fixture {
     fixture_without_vault_with(|_| {})
 }
 
+/// A module with no configured browser executable. Keep the fake browser,
+/// filesystem and vault handles so tests can assert zero launches, writes and
+/// vault requests.
+pub(crate) fn fixture_without_launcher() -> Fixture {
+    fixture_configuring_launcher(|_| {}, false)
+}
+
 fn fixture_without_vault_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
+    fixture_configuring_launcher(adjust, true)
+}
+
+fn fixture_configuring_launcher(
+    adjust: impl FnOnce(&mut CaptureEnv),
+    configure_launcher: bool,
+) -> Fixture {
     let events = Events::default();
     let fs = Arc::new(FakeFs::new(events.clone()));
     let exclusion = Arc::new(FakeExclusion {
@@ -675,7 +689,9 @@ fn fixture_without_vault_with(adjust: impl FnOnce(&mut CaptureEnv)) -> Fixture {
     };
     adjust(&mut env);
     let module = Arc::new(CaptureModule::new(env));
-    module.set_launcher(launcher.clone());
+    if configure_launcher {
+        module.set_launcher(launcher.clone());
+    }
     Fixture {
         module,
         fs,
