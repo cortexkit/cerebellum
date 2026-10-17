@@ -1,19 +1,22 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+static HELD_FIXTURE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+static PRUNE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 /// Keep fixture paths stable across test runs so macOS does not reassess a new
 /// executable on every run. `/tmp` is intentional: codesign can hang during
 /// system-policy evaluation of files under the per-user `$TMPDIR` on macOS 27.
-/// Old content versions are pruned only when they are older than a day and
-/// outside the three newest siblings, protecting concurrent test executables.
+/// Only the three newest copies are retained; a copy locked by a running test
+/// remains available even when it is older than those three.
 pub(crate) fn content_named_fixture(
     label: &str,
     file_name: &str,
@@ -36,9 +39,11 @@ pub(crate) fn content_named_fixture(
     );
     let digest = format!("{:x}", Sha256::digest(bytes));
     let directory = Path::new("/tmp").join(format!("cerebellum-fixture-{label}-{digest}"));
+    hold_fixture_lock(&directory).expect("lock content-named fixture");
     fs::create_dir_all(&directory).expect("create content-named fixture directory");
     let path = directory.join(file_name);
     if matches_fixture(&path, bytes, mode) {
+        remove_stale_siblings(label);
         return path;
     }
 
@@ -82,35 +87,110 @@ pub(crate) fn content_named_fixture(
 
 fn remove_stale_siblings(label: &str) {
     let prefix = format!("cerebellum-fixture-{label}-");
-    let mut siblings = fs::read_dir("/tmp")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            let digest = name.strip_prefix(&prefix)?;
-            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return None;
+    let entries = match fs::read_dir("/tmp") {
+        Ok(entries) => entries,
+        Err(_) => {
+            count_prune_failure();
+            return;
+        }
+    };
+    let mut siblings = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                count_prune_failure();
+                continue;
             }
-            let metadata = entry.metadata().ok()?;
-            if metadata.is_dir() {
-                Some((entry.path(), metadata.modified().ok()?))
-            } else {
-                None
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(digest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                count_prune_failure();
+                continue;
             }
-        })
-        .collect::<Vec<_>>();
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(_) => {
+                count_prune_failure();
+                continue;
+            }
+        };
+        siblings.push((entry.path(), modified));
+    }
     siblings.sort_by_key(|sibling| std::cmp::Reverse(sibling.1));
-    let cutoff = SystemTime::now().checked_sub(Duration::from_secs(24 * 60 * 60));
-    if let Some(cutoff) = cutoff {
-        let old_siblings = siblings
-            .into_iter()
-            .filter(|(_, modified)| *modified < cutoff);
-        for (path, _) in old_siblings.skip(3) {
-            let _ = fs::remove_dir_all(path);
+    for (path, _) in siblings.into_iter().skip(3) {
+        let lock_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture_lock_path(&path))
+        {
+            Ok(file) => file,
+            Err(_) => {
+                count_prune_failure();
+                continue;
+            }
+        };
+        match lock_file.try_lock() {
+            Ok(()) => {
+                if fs::remove_dir_all(path).is_err() {
+                    count_prune_failure();
+                }
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(_)) => count_prune_failure(),
         }
     }
+}
+
+fn hold_fixture_lock(directory: &Path) -> std::io::Result<()> {
+    let lock_path = fixture_lock_path(directory);
+    let mut held = HELD_FIXTURE_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if held.contains_key(&lock_path) {
+        return Ok(());
+    }
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_shared()?;
+    held.insert(lock_path, lock_file);
+    Ok(())
+}
+
+fn fixture_lock_path(directory: &Path) -> PathBuf {
+    Path::new("/tmp").join(format!(
+        ".{}.lock",
+        directory
+            .file_name()
+            .expect("fixture directory has a name")
+            .to_string_lossy()
+    ))
+}
+
+fn count_prune_failure() {
+    PRUNE_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
 fn matches_fixture(path: &Path, bytes: &[u8], mode: u32) -> bool {
@@ -123,7 +203,7 @@ fn matches_fixture(path: &Path, bytes: &[u8], mode: u32) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     fn set_directory_mtime(path: &Path, modified: SystemTime) {
         File::open(path)
@@ -133,44 +213,110 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_old_siblings_beyond_three_newest() {
+    fn cleanup_keeps_only_three_newest_recent_siblings() {
         let label = format!("cleanup-test-{}", std::process::id());
         let prefix = format!("cerebellum-fixture-{label}-");
         let now = SystemTime::now();
-        let old = now - Duration::from_secs(48 * 60 * 60);
         let mut paths = Vec::new();
-        for (index, age) in [0, 1, 2, 3, 4].into_iter().enumerate() {
+        for index in 0..10 {
             let path = Path::new("/tmp").join(format!("{prefix}{index:064x}"));
-            fs::create_dir_all(&path).expect("create old sibling");
-            set_directory_mtime(&path, old - Duration::from_secs(age));
+            fs::create_dir_all(&path).expect("create recent sibling");
+            set_directory_mtime(&path, now - Duration::from_secs(index));
             paths.push(path);
         }
-        let recent = Path::new("/tmp").join(format!("{prefix}{:064x}", 99));
-        fs::create_dir_all(&recent).expect("create recent sibling");
-        set_directory_mtime(&recent, now);
         let other_label =
             Path::new("/tmp").join(format!("cerebellum-fixture-other-{}", "a".repeat(64)));
         fs::create_dir_all(&other_label).expect("create other-label sibling");
-        set_directory_mtime(&other_label, old);
+        set_directory_mtime(&other_label, now - Duration::from_secs(100));
         let malformed = Path::new("/tmp").join(format!("{prefix}{}g", "a".repeat(63)));
         fs::create_dir_all(&malformed).expect("create malformed sibling");
-        set_directory_mtime(&malformed, old);
+        set_directory_mtime(&malformed, now - Duration::from_secs(100));
 
         remove_stale_siblings(&label);
 
         assert!(
             paths[..3].iter().all(|path| path.exists()),
-            "three newest old siblings remain"
+            "three newest siblings remain"
         );
         assert!(
             paths[3..].iter().all(|path| !path.exists()),
-            "older siblings outside the three newest are removed"
+            "all siblings after the three newest are removed"
         );
-        assert!(recent.exists(), "recent sibling remains");
         assert!(other_label.exists(), "other label remains");
         assert!(malformed.exists(), "non-hex suffix remains");
-        for path in paths.into_iter().chain([recent, other_label, malformed]) {
+        for path in paths.iter().chain([&other_label, &malformed]) {
             let _ = fs::remove_dir_all(path);
+            let _ = fs::remove_file(fixture_lock_path(path));
+        }
+    }
+
+    #[test]
+    fn cleanup_never_removes_a_held_oldest_sibling() {
+        let label = format!("held-cleanup-test-{}", std::process::id());
+        let prefix = format!("cerebellum-fixture-{label}-");
+        let now = SystemTime::now();
+        let paths = (0..5)
+            .map(|index| {
+                let path = Path::new("/tmp").join(format!("{prefix}{index:064x}"));
+                fs::create_dir_all(&path).expect("create sibling");
+                set_directory_mtime(&path, now - Duration::from_secs(index));
+                path
+            })
+            .collect::<Vec<_>>();
+        let held_path = &paths[4];
+        let held_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture_lock_path(held_path))
+            .expect("open oldest sibling lock");
+        held_file.lock_shared().expect("hold oldest sibling lock");
+
+        remove_stale_siblings(&label);
+
+        assert!(paths[0..3].iter().all(|path| path.exists()));
+        assert!(!paths[3].exists(), "unheld old sibling is removed");
+        assert!(held_path.exists(), "a live process keeps its fixture copy");
+        drop(held_file);
+        for path in &paths {
+            let _ = fs::remove_dir_all(path);
+            let _ = fs::remove_file(fixture_lock_path(path));
+        }
+    }
+
+    #[test]
+    fn cleanup_never_removes_the_current_process_fixture() {
+        let label = format!("current-cleanup-test-{}", std::process::id());
+        let current = content_named_fixture(&label, "fixture", b"current fixture", 0o600);
+        let now = SystemTime::now();
+        set_directory_mtime(
+            current.parent().expect("current fixture directory"),
+            now - Duration::from_secs(30),
+        );
+        let prefix = format!("cerebellum-fixture-{label}-");
+        let mut newer = Vec::new();
+        for index in 0..3 {
+            let path = Path::new("/tmp").join(format!("{prefix}{:064x}", 100 + index));
+            fs::create_dir_all(&path).expect("create newer sibling");
+            set_directory_mtime(&path, now - Duration::from_secs(index));
+            newer.push(path);
+        }
+
+        remove_stale_siblings(&label);
+
+        assert!(
+            current.exists(),
+            "the fixture returned to this process survives"
+        );
+        assert!(newer.iter().all(|path| path.exists()));
+        for path in newer
+            .iter()
+            .map(|path| path.as_path())
+            .chain([current.parent().expect("current fixture directory")])
+        {
+            let _ = fs::remove_dir_all(path);
+            let _ = fs::remove_file(fixture_lock_path(path));
         }
     }
 
