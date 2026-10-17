@@ -113,3 +113,27 @@ build_timeout_s = 1800
 [control.scope]
 after = "pub(super) fn mutating_plan("
 before = "fn mutating_commands("
+
+[[control]]
+id = "public-web-predicate-requires-listed-domain"
+guards = "the public-web baseline applies only to listed registrable domains"
+file = "crates/cerebellum/src/browser_standing_grants.rs"
+old = "crate::public_suffix::registrable_domain_listed(host).is_some()"
+new = "false"
+edits = []
+test_file = "crates/cerebellum/tests/it/browser_standing_grants.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["browser_standing_grants::baseline_public_reads_and_ordinary_clicks_need_no_card"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn origin_is_public("
+before = """
+
+}
+"""
