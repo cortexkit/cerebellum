@@ -8731,6 +8731,39 @@ async fn flow_missing_browser_grant_refuses_before_launch_or_navigation() {
 }
 
 #[tokio::test]
+async fn nondelegating_basal_flow_cannot_use_its_agents_standing_grant() {
+    let (planes, launcher) = flow_planes();
+    seed_scope_standing_grant(&planes).await;
+    let store = planes.management.agent_grants();
+    let before = store.live_rows(None, store.now_ms()).unwrap();
+    assert_eq!(before.len(), 1, "the matching owner grant must exist");
+    let mut stamp = flow_stamp();
+    stamp.attributes.delegates = false;
+    bind_flow_wire(&planes, Some(stamp), reserved("basal")).await;
+
+    // Flow admission admits the carrier, not the owner's authority. Identity
+    // normalization must strip that authority before any grant lookup can run.
+    let facts = planes.routes.accepted_bind_for_test(9, 3).unwrap();
+    assert_eq!(facts.flow_id.as_deref(), Some("flow-7"));
+    assert!(!facts.acts_as_agent);
+    assert!(!facts.agent_project_id_attested);
+    assert!(!facts.session_kind_attested);
+    assert!(facts.identity.agent_project_id.is_empty());
+
+    let reply = flow_wire_call(
+        &planes,
+        2,
+        json!({"action":"navigate","url":"https://page.example:8443/page","intent":"read the page","severity":{"tier":2,"credential":false,"financial":false}}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+    assert_eq!(store.live_rows(None, store.now_ms()).unwrap(), before);
+    assert!(!store.is_in_use(&before[0].id));
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
     for no_agent in [true, false] {
         let (planes, launcher) = flow_planes();

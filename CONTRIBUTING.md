@@ -57,6 +57,19 @@ the narrow replay for the fast gate's selected base, run
 `scripts/fast-gate.sh --mutations` (or pass the base explicitly with
 `scripts/fast-gate.sh --base REF --mutations`).
 
+The runner edits source **in place**, not in a scratch checkout. It restores
+saved bytes on normal exits, handled interrupts and timeouts, but cannot restore
+after SIGKILL or power loss. Both gates run `scripts/check-mutation-tree.sh`
+before compiling, even without mutation replay: it checks the original catalogue
+anchors and rejects insertion mutants that retain their original anchor. Stop
+the replay and its children before restoring an interrupted edit; never check out
+a target while its tests are running. If a guard was intentionally changed,
+update its catalogue row rather than bypassing this check.
+
+A surviving mutant is not automatically equivalent. An `equivalent` disposition
+must name the production invariant that preserves the result, and an outer-entry
+regression must still pin that result. Such a row claims no caught test.
+
 ## Dependencies
 
 Subconscious and commons crates come from crates.io at exact versions, or as

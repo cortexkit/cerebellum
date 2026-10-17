@@ -1,0 +1,14 @@
+[[control]]
+id = "flow-delegation-is-normalized-at-bind"
+guards = "a nondelegating Basal flow cannot inherit its owner's standing grants"
+file = "crates/cerebellum/src/permission_scope.rs"
+old = "&& stamp.attributes.delegates"
+new = "&& true"
+test_file = "crates/cerebellum/tests/browser_session_wire.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test browser_session_wire"
+expect_red = []
+only = true
+equivalent = "On production RouteBind paths, with_scope clears identity, both attestations and acts_as_agent for admitted flows, and reconstructs them only when delegates is true. Nondelegating flows fail the earlier holder checks even without this redundant conjunct. The wire regression pins the outer refusal; this row deliberately claims no kill."
+equivalent_guard = "crates/cerebellum-core/src/identity.rs::AcceptedBindFacts::with_scope; crates/cerebellum/src/lib.rs RouteBind calls with_scope before retaining route facts, and dispatch changes only call origin and witness"

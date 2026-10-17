@@ -1,0 +1,23 @@
+
+[[control]]
+id = "public-origin-requires-listed-registrable-domain"
+guards = "public-web grants exclude DNS suffixes absent from the public suffix list"
+file = "crates/cerebellum/src/browser_standing_grants.rs"
+old = "crate::public_suffix::registrable_domain_listed(host).is_some()"
+new = "true /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/cerebellum/src/browser_standing_grants.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser_standing_grants::tests::public_dns_names_require_a_label_beyond_the_public_suffix"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn origin_is_public(origin: &str) -> bool {"
+before = """
+
+#[cfg(test)]"""

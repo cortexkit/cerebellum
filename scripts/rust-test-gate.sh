@@ -15,6 +15,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+./scripts/check-mutation-tree.sh
+
 # Snapshot the tree before anything builds, so the final phase can attribute a
 # change to the build rather than to uncommitted work the author already had.
 tree_before_build="$(git status --porcelain)"

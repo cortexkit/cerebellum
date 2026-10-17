@@ -5,6 +5,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+./scripts/check-mutation-tree.sh
+
 base="${MUTATION_BASE:-origin/main}"
 narrow=1
 full=1
