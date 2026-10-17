@@ -126,12 +126,12 @@ fi
 # the floor on the machine it places onto rather than trusting this host's.
 cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
 
-# The backup catalog travels with the binary. It lives in the repo because it is
-# a reviewable declaration rather than generated state, and it is placed into the
-# module's data directory, where the fleet's enrollment scanner looks for it. A
-# catalog that stays in the repo declares nothing: an undeclared data directory
-# is backed up by nobody and excluded by nobody, and its absence from a sweep
-# looks the same as an oversight.
+# The backup catalog travels with the binary as a reviewable copy. It lives in
+# the repo because it is a declaration rather than generated state. The module
+# compiles these same bytes in and writes them into its own data directory at
+# startup, where the fleet's enrollment scanner looks for them, so no placement
+# step has to copy it: a catalog that needs a manual copy is missing on every
+# machine where nobody made the copy.
 cp engram-catalog.json "$STAGE/"
 
 # --options runtime turns on hardened runtime, so no other same-user process
@@ -260,10 +260,6 @@ echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo "    reads:       $(cat "$STAGE/format-versions.json")  ($CARD.format-versions.json beside the card)"
-echo
-echo "Place engram-catalog.json into the module data directory"
-echo "(~/.local/share/cortexkit/cerebellum/) alongside the binary placement, or"
-echo "the browser profile is neither captured nor deliberately excluded."
 echo
 echo "Placement is a PLAIN COPY -- never re-sign at placement, because a"
 echo "re-sign replaces the pin and invalidates the sha above. After the copy,"

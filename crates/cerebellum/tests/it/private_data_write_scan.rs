@@ -5,6 +5,7 @@ use crate::support::source_scan;
 
 const STORE_FILES: &[&str] = &[
     "crates/cerebellum-core/src/format_floor.rs",
+    "crates/cerebellum-core/src/engram_catalog.rs",
     "crates/cerebellum-core/src/journal/storage.rs",
     "crates/cerebellum-core/src/journal/refusal_ring.rs",
     "crates/cerebellum/src/computer_grants.rs",
@@ -127,5 +128,37 @@ fn prepared_test_entry_does_not_tighten_operator_state() {
     assert!(
         production.contains("record_private_state_tightening"),
         "production entry must tighten state before running"
+    );
+}
+
+/// The backup catalog is written into the data home that `XDG_DATA_HOME` and
+/// `HOME` resolve to, which during a test run is the operator's own. So only
+/// the production entry point may write it; the entry child-process tests run
+/// must not, or every test run would rewrite the operator's live catalog.
+#[test]
+fn prepared_test_entry_does_not_write_the_engram_catalog() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let source = std::fs::read_to_string(workspace.join("crates/cerebellum/src/lib.rs"))
+        .expect("read production entry points");
+    let code = source_scan::shipped_code(&source);
+    let prepared = function_body(&code, "pub async fn run_entry_prepared_for_test");
+    assert!(
+        !prepared.contains("record_engram_catalog_write"),
+        "prepared test entry must not write the operator's backup catalog"
+    );
+    let production = function_body(&code, "pub async fn run_entry()");
+    assert!(
+        production.contains("record_engram_catalog_write"),
+        "production entry must write the backup catalog at startup"
+    );
+    // The catalog writer is reached from the production entry point and
+    // nowhere else in shipped code.
+    assert_eq!(
+        code.matches("record_engram_catalog_write()").count(),
+        2,
+        "expected exactly the definition and the production call"
     );
 }

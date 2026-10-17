@@ -4,13 +4,15 @@
   "entries": [
     {
       "entry_id": "cerebellum/browser-profiles",
-      "class": "device-local",
+      "class": "excluded",
+      "reason": "The agent browser profiles hold signed-in browser sessions (cookies and site storage). Those are secrets and are bound to this machine, so they are never backed up; on a new machine the agent signs in again.",
       "mechanism": "filetree",
       "path": "browser"
     },
     {
       "entry_id": "cerebellum/audit-journal",
-      "class": "portable",
+      "class": "device-local",
+      "reason": "Audit journals, call records, grant stores, launch history, signed-in-domain records and the raised-card registry. Grants are machine-local by design, and the audit trail is this machine's own history, so none of it moves to another machine.",
       "mechanism": "filetree",
       "path": "journal"
     }

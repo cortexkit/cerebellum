@@ -985,8 +985,10 @@ async fn a_failing_dispatch_still_finalises_its_audit_entry() {
 /// Typed text must not reach the durable journal.
 ///
 /// `computer.type` carries whatever a caller sends, which on a login form is a
-/// password. The journal is durable AND enrolled for fleet backup in
-/// engram-catalog.json, so text landing there is text that gets backed up.
+/// password. The journal is durable and outlives the session, so text landing
+/// there stays on disk. It is declared device-local in engram-catalog.json and
+/// is not backed up today, but a later reclassification must not be what keeps
+/// a password out of a backup.
 ///
 /// Today the actuation descriptor carries capability, containment and
 /// observation and nothing else, so this holds by construction rather than by a
