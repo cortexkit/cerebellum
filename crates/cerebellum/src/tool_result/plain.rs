@@ -168,9 +168,17 @@ fn image_caption(object: &Map<String, Value>) -> Option<String> {
 /// What a refusal's `detail` adds that a model can act on. The rest of it
 /// (internal step names, node ids, classifier facts) is diagnostics for
 /// programs and stays structured.
-fn detail_lines(detail: &Map<String, Value>, lines: &mut Vec<String>) {
+fn detail_lines(detail: &Map<String, Value>, remedy: Option<&str>, lines: &mut Vec<String>) {
     if let Some(reason) = text(detail, "reason") {
         lines.push(format!("Reason: {}.", words(reason)));
+    }
+    match (text(detail, "field"), text(detail, "reason_code")) {
+        (Some(field), Some(code)) => lines.push(format!("Field {field}: {}.", words(code))),
+        (Some(field), None) => lines.push(format!("Field: {field}.")),
+        (None, Some(code)) if text(detail, "reason").is_none() => {
+            lines.push(format!("Reason: {}.", words(code)))
+        }
+        _ => {}
     }
     if let Some(permission) = text(detail, "permission") {
         lines.push(format!("Missing permission: {}.", words(permission)));
@@ -221,6 +229,31 @@ fn detail_lines(detail: &Map<String, Value>, lines: &mut Vec<String>) {
     }
     if text(detail, "held_state") == Some("unknown") {
         lines.push("Whether input is still held down is unknown.".into());
+    }
+    // A remedy that points at `detail.<name>` needs that value in front of
+    // the model, which cannot see the structured copy it names.
+    let said = [
+        "reason",
+        "field",
+        "reason_code",
+        "permission",
+        "grant_label",
+        "attempted_origin",
+        "missing_hazard",
+        "grant_request",
+        "step",
+        "dispatched",
+        "held_state",
+    ];
+    for (key, value) in detail {
+        if said.contains(&key.as_str())
+            || !remedy.is_some_and(|remedy| remedy.contains(&format!("detail.{key}")))
+        {
+            continue;
+        }
+        if let Some(value) = scalar(value) {
+            lines.push(format!("detail.{key}: {value}"));
+        }
     }
 }
 
@@ -303,7 +336,12 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
         lines.push(line);
     }
     if let Some(remedy) = text(object, "remedy").filter(|remedy| !remedy.trim().is_empty()) {
-        lines.push(sentence(remedy));
+        // Some remedies are only the next call's name, `browser.launch`.
+        if remedy.trim().contains(char::is_whitespace) {
+            lines.push(sentence(remedy));
+        } else {
+            lines.push(format!("Next: {}.", remedy.trim()));
+        }
     }
     if let Some(name) = text(object, "matched_app") {
         lines.push(format!("Using the running app {name}."));
@@ -396,7 +434,11 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
     if let Some(terminal) = text(object, "terminal_outcome") {
         lines.push(format!("The session ended: {}.", words(terminal)));
     }
-    if let Some(revoked) = object.get("revoked").and_then(Value::as_u64) {
+    if let Some(revoked) = object
+        .get("revoked")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
         lines.push(format!("Revoked: {revoked}."));
     }
     if let Some(pid) = object.get("pid").and_then(Value::as_i64) {
@@ -500,6 +542,6 @@ fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String
         lines.push(format!("Stage: {}.", words(stage)));
     }
     if let Some(detail) = object.get("detail").and_then(Value::as_object) {
-        detail_lines(detail, lines);
+        detail_lines(detail, text(object, "remedy"), lines);
     }
 }

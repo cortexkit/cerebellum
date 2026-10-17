@@ -549,3 +549,24 @@ fn every_keys_outcome_survives_withholding() {
         &["chord_blocked", "modifier_chord_needs_foreground"],
     );
 }
+
+/// Every reply shape the inventories above build with the production
+/// builders, as a content/v1 reader would show it to a model: some plain
+/// text, and no JSON object or array anywhere in that text. The frame-loop
+/// test in `model_view_tests` covers the replies only a live call produces.
+#[test]
+fn every_inventoried_reply_reads_as_plain_words() {
+    let mut shapes = bounded_call_replies();
+    shapes.extend(replies(ComputerCapability::Type));
+    shapes.extend(replies(ComputerCapability::Keys));
+    let mut failures = Vec::new();
+    for reply in shapes {
+        let encoded: Value =
+            serde_json::from_slice(&crate::tool_result::encode(reply.clone()).unwrap()).unwrap();
+        let problems = crate::tool_result::model_view_problems(&encoded);
+        if !problems.is_empty() {
+            failures.push(format!("{reply}: {problems:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

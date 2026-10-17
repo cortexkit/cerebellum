@@ -57,6 +57,8 @@ pub mod login_import;
 pub mod management;
 mod management_bounds;
 pub mod manifest;
+#[cfg(test)]
+mod model_view_tests;
 pub mod network;
 mod open_app_history;
 mod permission_cards;

@@ -1,0 +1,45 @@
+
+[[control]]
+id = "model-view-carries-no-json"
+guards = "no content/v1 text part a model reads carries a JSON object or array"
+file = "crates/cerebellum/src/tool_result.rs"
+old = "    let mut result = ToolResult::new(content).with_structured_content(object.clone());"
+new = "    let mut result = ToolResult::new({ let mut content = content; content.push(ContentPart::text(Value::Object(object.clone()).to_string())); content }).with_structured_content(object.clone()); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/model_view_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::outcome_tests::every_inventoried_reply_reads_as_plain_words",
+    "model_view_tests::every_browser_action_reads_as_plain_words",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn project(reply: Value) -> ToolResult {"
+before = "fn strip_inline_image(result: &mut ToolResult, reason: &str) -> Option<String> {"
+
+[[control]]
+id = "model-view-always-says-something"
+guards = "a content/v1 reply always carries a non-empty text part, so no reader falls back to showing structuredContent as JSON"
+file = "crates/cerebellum/src/tool_result.rs"
+old = "    if !content.iter().any(|part| match part {"
+new = "    if false && !content.iter().any(|part| match part { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/tool_result.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["tool_result::tests::a_plain_success_says_done_rather_than_nothing"]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn project(reply: Value) -> ToolResult {"
+before = "fn strip_inline_image(result: &mut ToolResult, reason: &str) -> Option<String> {"
