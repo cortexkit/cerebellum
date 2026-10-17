@@ -187,8 +187,10 @@ async fn every_browser_action_reads_as_plain_words() {
     );
 }
 
-// The computer plane is served on macOS only, so this half runs there.
-// Its planes, consent card answering and consent-park scope are copied from
+// The computer plane is served on macOS only, so this half runs there. Its
+// `Planes` setup, the way it answers consent cards, and its use of
+// COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST (how long a call waits for a consent
+// answer before replying consent_pending) are copied from
 // `computer_consent_wire_tests` and `relayed_computer_call_tests`.
 #[cfg(target_os = "macos")]
 mod computer {
@@ -429,8 +431,9 @@ mod computer {
         let planes = planes();
         let mut views = Views::default();
 
-        // A call parked on the person's answer replies consent_pending; the
-        // late answer then grants the app for the calls that follow.
+        // A read that waits for the person's consent answer replies
+        // consent_pending; answering afterwards grants the dashboard app, so
+        // the reads and actions below run without asking again.
         let (tx, mut rx) = mpsc::channel(8);
         COMPUTER_CONSENT_PARK_LIMIT_FOR_TEST
             .scope(
@@ -551,8 +554,8 @@ mod computer {
                     .map(str::to_owned)
             })
             .collect();
-        // The walk reached successes as well as refusals, so the guard below
-        // judged both kinds of reply.
+        // The calls above produced successes as well as refusals, so the
+        // model-view check below judged both kinds of reply.
         for expected in [
             "completed",
             "consent_pending",

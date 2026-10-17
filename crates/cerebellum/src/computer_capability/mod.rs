@@ -2053,9 +2053,10 @@ where
         .unwrap_or(Err(AppStateReadError::Unreadable));
         match listed {
             Ok(apps) => match_target_name(target, &apps).map(|matched| {
-                // Said on the reply (see `serve`) so the caller learns which
-                // application a partial name was taken to mean. Lane lookups
-                // run outside that scope and record nothing.
+                // `serve` writes this name on the reply as matched_app, so the
+                // caller learns which application a partial name was taken to
+                // mean. The queueing step that resolves a target before
+                // `serve` runs has no MATCHED_APP slot, so it records nothing.
                 if let Some(name) = matched.partial_name {
                     let _ = MATCHED_APP.try_with(|slot| {
                         *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(name);

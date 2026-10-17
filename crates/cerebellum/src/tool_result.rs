@@ -118,8 +118,9 @@ fn login_notice(object: &Map<String, Value>) -> Option<String> {
 
 fn project(reply: Value) -> ToolResult {
     let Some(object) = reply.as_object() else {
-        // Every provider reply is an object; anything else has no fields to
-        // describe, so the model is told that rather than shown the value.
+        // Every provider reply is an object. Anything else has no fields to
+        // describe: a non-empty string is shown as itself, and any other value
+        // is replaced by a notice rather than printed as JSON.
         let text = match &reply {
             Value::String(text) if !text.trim().is_empty() => text.clone(),
             _ => "The tool returned a reply this module cannot describe.".to_string(),
@@ -280,10 +281,10 @@ mod tests {
             .collect()
     }
 
-    // The metadata line these tests once pinned was the reply's other fields
-    // printed as JSON. The operator ruled that no JSON reaches the model, so
-    // each now pins the plain words that replace it, and the same reply
-    // still travels whole as structuredContent.
+    // These tests used to pin a second text part holding the reply's other
+    // fields printed as JSON. No JSON may reach the model, so each now pins
+    // the plain words that replace it, while the same reply still travels
+    // whole as structuredContent.
     #[test]
     fn snapshot_state_text_is_verbatim_first_part() {
         let reply = json!({"outcome":"ok", "state_text":"article\n  r1 link \"quoted\" — café", "snapshot_id":"snap-1"});
