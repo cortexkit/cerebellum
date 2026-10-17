@@ -1,0 +1,39 @@
+[[control]]
+id = "agent-cursor-tip-is-the-anchor"
+guards = "the agent cursor's panel is placed so the arrow's tip, not the panel's corner, lands on the requested point on every display"
+file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+old = "    let frame = panel.offset(tip);"
+new = "    let frame = Rect { x: tip[0], y: tip[1], ..panel }; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_geometry::tests::tip_lands_on_the_requested_point_on_a_scaled_display",
+    "cursor_geometry::tests::tip_lands_on_the_requested_point_on_a_secondary_display_with_negative_origin",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-label-never-covers-the-target"
+guards = "the agent cursor's label pill is never placed over the element or point being acted on"
+file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+old = "        screen.contains_rect(*label) && !label.intersects(target) && !label.intersects(badge)"
+new = "        screen.contains_rect(*label) && !label.intersects(badge) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_geometry::tests::label_never_covers_the_target_and_stays_on_screen",
+    "cursor_geometry::tests::label_prefers_beside_the_chip_then_the_side_with_room",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

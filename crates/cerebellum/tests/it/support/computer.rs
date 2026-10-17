@@ -826,10 +826,17 @@ impl AppStateSource for Desk {
         self.state().cursor_frame
     }
 
-    fn visible_cursor_point(&self, _: &ProcessGrant, point: Option<[f64; 2]>) -> Option<[f64; 2]> {
-        self.state()
-            .cursor_visible
-            .then_some(point.unwrap_or([112.0, 62.0]))
+    fn visible_cursor_point(
+        &self,
+        _: &ProcessGrant,
+        point: Option<[f64; 2]>,
+        frame: Option<[f64; 4]>,
+    ) -> Option<[f64; 2]> {
+        self.state().cursor_visible.then_some(
+            point
+                .or_else(|| frame.map(|f| [f[0] + f[2] / 2.0, f[1] + f[3] / 2.0]))
+                .unwrap_or([112.0, 62.0]),
+        )
     }
     fn read_app_state(
         &self,

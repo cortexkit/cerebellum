@@ -447,6 +447,7 @@ mod tests {
             &self,
             _: &cerebellum_computer::platform::ProcessGrant,
             _: Option<[f64; 2]>,
+            _: Option<[f64; 4]>,
         ) -> Option<[f64; 2]> {
             Some([10.0, 20.0])
         }
