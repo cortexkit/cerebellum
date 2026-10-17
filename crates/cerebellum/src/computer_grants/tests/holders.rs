@@ -101,6 +101,37 @@ fn parent_only_facts(planes: &Planes) -> crate::AcceptedBindFacts {
 }
 
 #[tokio::test]
+async fn cursor_avatar_identity_is_the_stamped_head_or_resolved_workers_head() {
+    let planes = app_planes();
+    let mut head = planes.routes.get(1, 1).unwrap();
+    head.identity.agent_project_id = "forged-project-directory".into();
+    head.scope = None;
+    assert_eq!(crate::permission_scope::cursor_agent(&head, None), None);
+    head.scope = Some(
+        serde_json::from_value(crate::permission_scope::test_support::live_head()["scope"].clone())
+            .unwrap(),
+    );
+    assert_eq!(
+        crate::permission_scope::cursor_agent(&head, None).as_deref(),
+        Some("test-project")
+    );
+
+    let worker = parent_only_facts(&planes);
+    assert_eq!(crate::permission_scope::cursor_agent(&worker, None), None);
+    crate::permission_scope::test_support::describe(
+        &planes,
+        crate::permission_scope::test_support::live_head(),
+    );
+    let resolved = crate::permission_scope::resolve_worker(&worker, &planes.scopes)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::permission_scope::cursor_agent(&worker, resolved.as_ref()).as_deref(),
+        Some("test-project")
+    );
+}
+
+#[tokio::test]
 async fn parent_only_worker_mints_and_lists_under_the_described_heads_agent_id() {
     let planes = app_planes();
     let facts = parent_only_facts(&planes);

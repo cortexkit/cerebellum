@@ -1,18 +1,18 @@
 //! Main-thread-only pictures in small, click-through, non-key floating panels.
 //! This module has no input posting, target-app activation, or capture APIs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 
 use crate::cursor_schedule::{CursorSchedule, PictureStep, Wait};
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSEventMask, NSFont, NSPanel, NSScreen, NSTextField, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSBitmapFormat,
+    NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSEventMask, NSFont, NSImage, NSPanel,
+    NSScreen, NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
@@ -23,6 +23,9 @@ pub struct OverlayEvent {
     pub width: f64,
     pub label: Option<String>,
     pub reading: bool,
+    pub serial: u64,
+    pub avatar_rgba: Option<Vec<u8>>,
+    pub avatar_update: bool,
 }
 
 pub type GlideDuration = fn(f64, f64, bool) -> f64;
@@ -43,6 +46,7 @@ define_class!(
 #[derive(Default)]
 struct BadgeIvars {
     pulse: Cell<f64>,
+    image: RefCell<Option<Retained<NSImage>>>,
 }
 
 define_class!(
@@ -56,6 +60,9 @@ define_class!(
             let radius = 12.0 + self.ivars().pulse.get() * 4.0;
             NSColor::colorWithCalibratedRed_green_blue_alpha(0.24, 0.45, 0.95, 0.85).setFill();
             NSBezierPath::bezierPathWithOvalInRect(rect(42.0-radius, 32.0-radius, radius*2.0, radius*2.0)).fill();
+            if let Some(image) = self.ivars().image.borrow().as_ref() {
+                image.drawInRect(rect(26.0, 16.0, 32.0, 32.0));
+            }
         }
     }
 );
@@ -75,6 +82,7 @@ struct Picture {
     current: [f64; 2],
     duration_ms: f64,
     reduce: bool,
+    serial: u64,
 }
 
 impl Picture {
@@ -125,10 +133,13 @@ impl Picture {
             current: to,
             duration_ms: 0.0,
             reduce: false,
+            serial: 0,
         }
     }
 
     fn update(&mut self, event: OverlayEvent, duration: GlideDuration) {
+        self.serial = event.serial;
+        self.set_avatar(event.avatar_rgba.as_deref());
         self.glyph.setHidden(event.reading);
         self.initial
             .setStringValue(&NSString::from_str(&event.initial.to_string()));
@@ -148,6 +159,28 @@ impl Picture {
         };
         self.panel.setAlphaValue(1.0);
         self.panel.orderFrontRegardless();
+    }
+
+    fn set_avatar(&self, pixels: Option<&[u8]>) {
+        let image = pixels.and_then(|pixels| {
+            if pixels.len() != 32 * 32 * 4 { return None; }
+            // SAFETY: AppKit allocates a 32x32, four-channel premultiplied RGBA
+            // bitmap. Its 4096-byte buffer is filled before the image is used.
+            unsafe {
+                let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(), std::ptr::null_mut(), 32, 32, 8, 4, true, false,
+                    NSDeviceRGBColorSpace, NSBitmapFormat::empty(), 32 * 4, 32)?;
+                let data = rep.bitmapData();
+                if data.is_null() { return None; }
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), data, pixels.len());
+                let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(32.0, 32.0));
+                image.addRepresentation(&rep);
+                Some(image)
+            }
+        });
+        self.initial.setHidden(image.is_some());
+        *self.badge.ivars().image.borrow_mut() = image;
+        self.badge.setNeedsDisplay(true);
     }
 
     fn tick(&mut self, elapsed: f64, alpha: f64, desktop_top: f64, position: GlidePosition) {
@@ -201,6 +234,14 @@ pub fn run_agent_cursor(
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
                     Ok(event) => {
                         if !event.to.iter().all(|v| v.is_finite()) {
+                            continue;
+                        }
+                        if event.avatar_update {
+                            if let Some(picture) = pictures.picture_for_update(&event.agent) {
+                                if picture.serial == event.serial {
+                                    picture.set_avatar(event.avatar_rgba.as_deref());
+                                }
+                            }
                             continue;
                         }
                         if let Some(picture) =

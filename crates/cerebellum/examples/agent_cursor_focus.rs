@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let before = front_asn()?;
     for point in points {
         let event = CursorEvent {
+            serial: 0,
+            avatar_rgba: None,
+            avatar_update: false,
             agent: "Focus probe".into(),
             initial: 'F',
             to: point,

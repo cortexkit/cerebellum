@@ -1423,7 +1423,7 @@ where
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
         self.cursor.schedule(
-            identity.agent_project_id.clone(),
+            super::cursor::Identity::current(identity.agent_project_id.clone()),
             cerebellum_computer::cursor::CursorKind::Write,
             grant.clone(),
             self.app_state_source.clone(),
@@ -1552,6 +1552,9 @@ where
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
         let cursor = self.cursor.clone();
+        // Capture the acting agent before the blocking accessibility task: Tokio
+        // task-local session identity does not follow work onto another thread.
+        let cursor_identity = super::cursor::Identity::current(identity.agent_project_id.clone());
         tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
@@ -1579,7 +1582,7 @@ where
                     }
                 }
             };
-            cursor.schedule(identity.agent_project_id.clone(), cerebellum_computer::cursor::CursorKind::Press,
+            cursor.schedule(cursor_identity, cerebellum_computer::cursor::CursorKind::Press,
                 grant.clone(), source.clone(), Some(handle.clone()), point);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
