@@ -1,0 +1,147 @@
+
+[[control]]
+id = "flow-carrier-exact-basal-principal"
+guards = "only the basal principal can use an authorized core flow carrier"
+file = "crates/cerebellum-core/src/identity.rs"
+old = """
+principal.as_ref()
+            == Some(&Principal::Reserved {
+                module_id: "basal".into(),
+            })"""
+new = "true"
+edits = []
+test_file = "crates/cerebellum/tests/browser_session_wire.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test browser_session_wire"
+select = "expected"
+expect_red = ["flow_carrier_requires_exact_basal_authorized_core_stamp"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn flow_carrier_admitted("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "permissions-v1-direct-call-refused"
+guards = "only the permissions aggregator can list or revoke grant rows"
+file = "crates/cerebellum/src/permissions.rs"
+old = "if !is_aggregator(&facts.principal) {"
+new = "if false {"
+edits = []
+test_file = "crates/cerebellum/src/permissions/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["permissions::tests::provider_refuses_direct_and_every_non_aggregator_before_reading_or_mutating"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) async fn handle("
+before = "let empty = serde_json::Map::new();"
+
+
+[[control]]
+id = "permissions-v1-route-target-bound"
+guards = "the permissions aggregator binds only to cerebellum's management surface"
+file = "crates/cerebellum/src/permissions.rs"
+old = 'module_id == "cerebellum"'
+new = "true"
+edits = []
+test_file = "crates/cerebellum/src/permissions/tests/routes.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["permissions::tests::routes::cingulate_session_and_other_targets_stay_principal_denied"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn bind_admitted("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "session-calls-require-exact-prefrontal-principal"
+guards = "only exact reserved:prefrontal-core may call in a session's name"
+file = "crates/cerebellum-core/src/principal.rs"
+old = "module_id == SESSION_CALLER_MODULE_ID"
+new = "true"
+edits = []
+test_file = "crates/cerebellum-core/src/principal.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["principal::tests::other_first_party_principals_make_no_session_calls"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn admits_session_calls("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "flow-scope-without-admitted-flow-refused"
+guards = "a flow scope stamp without an admitted flow cannot dispatch session calls"
+file = "crates/cerebellum/src/lib.rs"
+old = "stamp.attributes.flow_id.is_some() && facts.flow_id.is_none()"
+new = "stamp.attributes.flow_id.is_some() && false"
+edits = []
+test_file = "crates/cerebellum/tests/browser_session_wire.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test browser_session_wire"
+select = "expected"
+expect_red = ["flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_refusal"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn session_flow_refusal("
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "consent-card-names-child-frame-origin"
+guards = "a consent card for child-frame typing names the child's actual origin"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "site_question_with_choices(origin, severity.tier, &grant.hazards, &choices)"
+new = 'site_question_with_choices("https://example.com", severity.tier, &grant.hazards, &choices)'
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::cross_origin_child_typing_requires_its_own_origin_card"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn authorize("
+before = "let card = consent_request("

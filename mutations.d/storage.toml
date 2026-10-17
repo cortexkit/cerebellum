@@ -1,0 +1,118 @@
+
+[[control]]
+id = "format-floor-raise-records-before-write"
+guards = "a format floor is durably raised before the writer records its format"
+file = "crates/cerebellum-core/src/format_floor.rs"
+old = "raise_on_disk(path, format)?;"
+new = "Ok(())?;"
+edits = []
+test_file = "crates/cerebellum-core/src/format_floor.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["format_floor::tests::a_raise_records_the_version_in_the_floor_file"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn raise(&self, format: DurableFormat) -> Result<(), FloorError> {"
+before = """
+
+}
+"""
+
+
+[[control]]
+id = "format-floor-never-lowers-recorded-version"
+guards = "raising a format floor never lowers a version already written"
+file = "crates/cerebellum-core/src/format_floor.rs"
+old = "if current >= format.version {"
+new = "if current == format.version {"
+edits = []
+test_file = "crates/cerebellum-core/src/format_floor.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["format_floor::tests::the_floor_is_never_lowered"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn raise_on_disk(path: &Path, format: DurableFormat) -> Result<(), FloorError> {"
+before = "floors.insert(format.name.to_string(), format.version);"
+
+
+[[control]]
+id = "private-files-are-owner-only"
+guards = "private filesystem files are created with owner-only mode bits"
+file = "crates/cerebellum-core/src/private_fs.rs"
+old = "options.mode(0o600);"
+new = "options.mode(0o644);"
+edits = []
+test_file = "crates/cerebellum-core/src/private_fs.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["private_fs::tests::private_creation_uses_owner_only_modes"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = """
+#[cfg(not(windows))]
+pub fn create_new_file(path: &Path) -> io::Result<File> {"""
+before = "pub fn open_append(path: &Path) -> io::Result<File> {"
+
+
+[[control]]
+id = "private-tree-tightening-never-follows-links"
+guards = "tightening private data trees never changes permissions through a directory symlink"
+file = "crates/cerebellum-core/src/private_fs.rs"
+old = "match fs::symlink_metadata(&directory) {"
+new = "match fs::metadata(&directory) {"
+edits = []
+test_file = "crates/cerebellum-core/src/private_fs.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["private_fs::tests::tightening_does_not_follow_directory_symlinks"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = """
+#[cfg(unix)]
+pub fn tighten_data_tree(root: &Path) -> usize {"""
+before = """
+#[cfg(not(any(unix, windows)))]
+pub fn tighten_data_tree"""
+
+
+[[control]]
+id = "profile-implementation-digest-stays-pinned"
+guards = "the checked-in profile registry implementation digest matches module source bytes"
+file = "crates/cerebellum/src/profile/mod.rs"
+old = "//! This module is intentionally standalone and provides the browser-profile"
+new = "//! This module provides the browser-profile"
+edits = []
+test_file = "crates/cerebellum/tests/it/b2b_s8_profile.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["b2b_s8_profile::pinned_implementation_digest_matches_the_module_source"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "//! Browser-profile registry and lifecycle boundary."
+before = "#![allow(clippy::result_large_err)]"
