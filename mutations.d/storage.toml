@@ -116,3 +116,26 @@ build_timeout_s = 1800
 [control.scope]
 after = "//! Browser-profile registry and lifecycle boundary."
 before = "#![allow(clippy::result_large_err)]"
+
+[[control]]
+id = "format-floor-selection-does-not-write-lazily"
+guards = "selecting the data-tree floor does not create its directory or floor file"
+file = "crates/cerebellum-core/src/format_floor.rs"
+old = "let raised = SHARED"
+new = """
+let _ = fs::create_dir_all(path.parent().unwrap());
+        let _ = fs::write(&path, b"{}");
+        let raised = SHARED"""
+edits = []
+test_file = "crates/cerebellum-core/src/format_floor.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = ["format_floor::tests::each_data_tree_is_governed_by_the_floor_inside_it"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn shared(path: PathBuf) -> Self {"
