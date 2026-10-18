@@ -245,6 +245,10 @@ trait Driver {
     fn failure_diagnostics(&mut self) -> Value;
     async fn restart(&mut self) -> Result<(), String>;
     fn outside_tab(&self) -> String;
+    async fn hand_fixture(&mut self, active: bool) -> Result<String, String>;
+    fn defer_site_answer(&mut self);
+    fn answer_late(&mut self) -> Result<(), String>;
+    async fn link_observation(&mut self) -> Result<Value, String>;
 }
 
 #[derive(Default)]
@@ -281,6 +285,8 @@ fn fixture_pages_only(targets: &Value, origin: &str) -> bool {
         && pages.all(|target| {
             target["url"] == format!("{origin}/")
                 || target["url"] == format!("{origin}/outside-secret")
+                || target["url"] == format!("{origin}/handed-active")
+                || target["url"] == format!("{origin}/handed-background")
         })
 }
 
@@ -511,6 +517,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         ok(&child_typed) && driver.observe()?["child_typed"] == "iframe-only",
     )?;
     detached_and_unfocused(driver)?;
+    handed_checks(driver, origin).await?;
     let old_epoch = opened["connection_epoch"].clone();
     driver.restart().await?;
     let (reconnected, _) = driver.call(json!({"action":"status"})).await?;
@@ -534,6 +541,67 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         "close releases without closing unrelated tab",
         closed["outcome"] == "closed" && driver.observe()?["outside_group"] == -1,
     )?;
+    Ok(())
+}
+
+async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
+    for active in [true, false] {
+        let tab = driver.hand_fixture(active).await?;
+        let (claimed, _) = driver.call(json!({"action":"claim_tab","tab":tab})).await?;
+        check("drag-in group member is handed and claimable", ok(&claimed))?;
+        if active {
+            let (revoked, _) = driver
+                .call(json!({"action":"revoke_access","origin":origin}))
+                .await?;
+            check(
+                "scratch site grant revoked before late-answer check",
+                revoked["outcome"] == "revoked",
+            )?;
+            driver.defer_site_answer();
+            let (pending, asks) = driver.call(json!({"action":"open_grant","origins":[origin],"hazards":[],"severity_tier":2})).await?;
+            check(
+                "site card detaches before late allow_30m",
+                pending["outcome"] == "consent_pending" && asks == 1,
+            )?;
+            driver.answer_late()?;
+        }
+        let (first, asks) = driver
+            .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
+            .await?;
+        check(
+            "late allow_30m covers a different action without a new card",
+            ok(&first) && asks == 0,
+        )?;
+        let link = reference(&first, "Probe link")?;
+        check(
+            "user refs use short e-number names",
+            link.starts_with('e')
+                && link.len() < 10
+                && link[1..].chars().all(|c| c.is_ascii_digit()),
+        )?;
+        let (second, asks) = driver
+            .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
+            .await?;
+        check(
+            "short refs stay stable across snapshots",
+            ok(&second) && asks == 0 && reference(&second, "Probe link")? == link,
+        )?;
+        let (clicked, asks) = driver.call(json!({"action":"click","tab":tab,"ref":link,"snapshot_id":second["snapshot_id"],"intent":"click visible handed fixture link","severity":{"tier":2,"credential":false,"financial":false}})).await?;
+        let observation = driver.link_observation().await?;
+        println!("handed link diagnostics: {observation}; reply: {clicked}");
+        check(
+            if active {
+                "visible link delivered on handed active tab"
+            } else {
+                "visible link delivered on handed background tab"
+            },
+            ok(&clicked)
+                && asks == 0
+                && observation["page_links"] == 1
+                && observation["active"] == active,
+        )?;
+        detached_and_unfocused(driver)?;
+    }
     Ok(())
 }
 
@@ -921,6 +989,8 @@ mod live {
                         "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
                     } else if path == "/" {
                         r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
+                    } else if path == "/handed-active" || path == "/handed-background" {
+                        r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><div style="height:2000px"></div>"##
                     } else if path == "/iframe" {
                         r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
                     } else {
@@ -1118,6 +1188,11 @@ mod live {
         worker_target: String,
         service_session: String,
         outside_id: String,
+        active_id: String,
+        handed_id: Option<i64>,
+        handed_url: String,
+        defer_answer: bool,
+        late_card: Option<String>,
         origin: String,
         page: Page,
         focus: Focus,
@@ -1355,6 +1430,13 @@ mod live {
                 .as_str()
                 .is_some_and(|s| s.ends_with("/155.0.8059.39")),
         )?;
+        // The first page in this scratch-only window is selected by Chrome.
+        // Keep that selection; subsequent fixtures are created in the background.
+        cdp.call(
+            "Target.createTarget",
+            json!({"url":format!("{}/handed-active",page.origin),"background":true}),
+            None,
+        )?;
         let outside_target = cdp.call(
             "Target.createTarget",
             json!({"url":format!("{}/outside-secret",page.origin),"background":true}),
@@ -1404,6 +1486,17 @@ mod live {
             .as_i64()
             .ok_or("outside fixture Chrome tab missing")?
             .to_string();
+        let active_id = cdp
+            .eval(
+                &worker_session,
+                &format!(
+                    "chrome.tabs.query({{}}).then(tabs => tabs.find(t => t.url === {})?.id)",
+                    json!(format!("{}/handed-active", page.origin))
+                ),
+            )?
+            .as_i64()
+            .ok_or("active fixture Chrome tab missing")?
+            .to_string();
         // Instrument only after creating the unrelated fixture. OS focus has
         // been sampled since BEFORE Chrome started, so startup is still covered.
         instrument(&mut cdp, &worker_session)?;
@@ -1426,6 +1519,11 @@ mod live {
             worker_target,
             service_session,
             outside_id,
+            active_id,
+            handed_id: None,
+            handed_url: String::new(),
+            defer_answer: false,
+            late_card: None,
             origin: origin.clone(),
             page,
             focus,
@@ -1454,6 +1552,11 @@ mod live {
     #[async_trait::async_trait(?Send)]
     impl Driver for Live {
         async fn call(&mut self, mut args: Value) -> Result<(Value, usize), String> {
+            let deferred = std::mem::take(&mut self.defer_answer);
+            let calls_before = self.consent.calls().len();
+            if deferred {
+                self.consent.defer_awaits();
+            }
             args["browser"] = json!("user");
             self.corr += 1;
             let opening = frame(
@@ -1480,7 +1583,9 @@ mod live {
                         self.origin
                     );
                     let id = card["id"].as_str().ok_or("the card has no id")?;
-                    if !self.consent.answer_id(
+                    if deferred {
+                        self.late_card = Some(id.to_owned());
+                    } else if !self.consent.answer_id(
                         id,
                         cerebellum::cingulate_client::ScriptedAnswer::Answered(
                             json!({"decision":"allow_30m"}),
@@ -1488,6 +1593,18 @@ mod live {
                     ) {
                         return Err(format!("the scripted Cingulate does not hold card {id}"));
                     }
+                }
+                if deferred
+                    && self
+                        .consent
+                        .calls()
+                        .iter()
+                        .skip(calls_before)
+                        .any(|(method, _)| method == "consent.await")
+                {
+                    // Return a pending await deterministically rather than spend
+                    // the live probe's budget waiting two minutes for its timer.
+                    self.consent.resume_awaits();
                 }
                 let response = match frames.try_recv() {
                     Ok(response) => response,
@@ -1561,10 +1678,13 @@ mod live {
                 r#"(() => {
                     const button = document.querySelector('[aria-label="Probe button"]');
                     return {visibilityState: document.visibilityState,
-                        innerWidth, innerHeight, buttonRect: button?.getBoundingClientRect().toJSON(),
+                        innerWidth, innerHeight, devicePixelRatio, scrollX, scrollY, buttonRect: button?.getBoundingClientRect().toJSON(),
                         page_clicks: window.__clicks, hasFocus: document.hasFocus()};
                 })()"#,
             );
+            let metrics = self
+                .cdp
+                .call("Page.getLayoutMetrics", json!({}), Some(&session));
             let detached = self.cdp.call(
                 "Target.detachFromTarget",
                 json!({"sessionId":session}),
@@ -1572,11 +1692,12 @@ mod live {
             );
             let mut observation = result?;
             detached?;
+            observation["metrics"] = metrics?;
             observation["beacon_clicks"] = json!(self.page.reports.lock().unwrap().0);
             Ok(observation)
         }
         fn failure_diagnostics(&mut self) -> Value {
-            // The scratch browser should contain only the two loopback pages.
+            // The scratch browser should contain only our loopback fixture pages.
             // Verify that through its own CDP observer before printing any text;
             // unknown targets or a failed provenance check withhold the prefix.
             let fixture_text_allowed = self
@@ -1666,6 +1787,101 @@ mod live {
         fn outside_tab(&self) -> String {
             self.outside_id.clone()
         }
+        async fn hand_fixture(&mut self, active: bool) -> Result<String, String> {
+            let url = format!(
+                "{}/handed-{}",
+                self.origin,
+                if active { "active" } else { "background" }
+            );
+            // A group move emits the same groupId update as a person dragging a
+            // tab into the group; do not call the extension's adoption helper.
+            let expression = format!(
+                r#"(async () => {{
+                const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
+                if (!saved) throw new Error('probe Agent group missing');
+                const tab = {tab};
+                if (tab.active !== {active}) throw new Error('fixture active state differs; probe never switches tabs');
+                await chrome.tabs.group({{groupId:saved.id, tabIds:[tab.id]}});
+                return tab.id;
+            }})()"#,
+                tab = if active {
+                    format!("await chrome.tabs.get({})", self.active_id)
+                } else {
+                    format!(
+                        "await chrome.tabs.create({{url:{}, active:false}})",
+                        json!(url)
+                    )
+                }
+            );
+            self.handed_id = self.cdp.eval(&self.worker_session, &expression)?.as_i64();
+            self.handed_url = url;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (status, _) = self.call(json!({"action":"status"})).await?;
+                let members: Vec<_> = status["tabs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|tab| tab["handed"] == true && tab["claimed"] == false)
+                    .collect();
+                if members.len() == 1 {
+                    return members[0]["tab"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or("handed handle missing".into());
+                }
+                if Instant::now() > deadline {
+                    return Err("drag-in member never appeared as handed".into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        fn defer_site_answer(&mut self) {
+            self.defer_answer = true;
+        }
+        fn answer_late(&mut self) -> Result<(), String> {
+            let id = self.late_card.take().ok_or("late site card missing")?;
+            if !self.consent.answer_id(
+                &id,
+                cerebellum::cingulate_client::ScriptedAnswer::Answered(
+                    json!({"decision":"allow_30m"}),
+                ),
+            ) {
+                return Err("late site answer could not be recorded".into());
+            }
+            Ok(())
+        }
+        async fn link_observation(&mut self) -> Result<Value, String> {
+            let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
+            let target = targets["targetInfos"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|target| target["type"] == "page" && target["url"] == self.handed_url)
+                .and_then(|target| target["targetId"].as_str())
+                .ok_or("handed page target missing")?;
+            let session = self.cdp.attach(target)?;
+            let result = self.cdp.eval(&session, "({page_links:window.__links, linkRect:document.querySelector('a')?.getBoundingClientRect().toJSON(), scrollX, scrollY, devicePixelRatio})");
+            let metrics = self
+                .cdp
+                .call("Page.getLayoutMetrics", json!({}), Some(&session));
+            let detached = self.cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId":session}),
+                None,
+            );
+            let mut observation = result?;
+            observation["metrics"] = metrics?;
+            detached?;
+            observation["active"] = self.cdp.eval(
+                &self.worker_session,
+                &format!(
+                    "chrome.tabs.get({}).then(tab => tab.active)",
+                    self.handed_id.ok_or("handed tab id missing")?
+                ),
+            )?;
+            Ok(observation)
+        }
     }
 }
 
@@ -1681,6 +1897,10 @@ struct Double {
     click_observations: usize,
     last_reply: LastReply,
     failure: Option<Value>,
+    handed_active: bool,
+    link_clicks: usize,
+    deferred: bool,
+    late_answered: bool,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -1693,6 +1913,10 @@ impl Double {
             click_observations: 0,
             last_reply: LastReply::default(),
             failure: None,
+            handed_active: false,
+            link_clicks: 0,
+            deferred: false,
+            late_answered: false,
         }
     }
 }
@@ -1714,6 +1938,20 @@ impl Driver for Double {
             "navigate" => {
                 asks = if self.fault == "ask" { 0 } else { 1 };
             }
+            "claim_tab" => {
+                if self.fault == "drag_in" {
+                    reply["outcome"] = json!("refused");
+                }
+            }
+            "revoke_access" => {
+                reply["outcome"] = json!("revoked");
+            }
+            "open_grant" => {
+                asks = 1;
+                if self.deferred {
+                    reply["outcome"] = json!("consent_pending");
+                }
+            }
             "snapshot" if args["tab"] == "outside" => {
                 reply["outcome"] = json!("refused");
             }
@@ -1721,7 +1959,13 @@ impl Driver for Double {
                 asks = 0;
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
-                    json!("button-ref button Probe button\ninput-ref textbox Probe input\nchild-ref textbox Iframe input");
+                    json!("e1 button Probe button\ne2 textbox Probe input\ne3 textbox Iframe input\ne4 link Probe link");
+                if self.fault == "long_refs" {
+                    reply["state_text"] = json!("e1 button Probe button\ne2 textbox Probe input\ne3 textbox Iframe input\nur12345678901234567890123456789012 link Probe link");
+                }
+                if self.late_answered && self.fault == "late_card" {
+                    asks = 1;
+                }
                 if self.fault == "snapshot_text" {
                     reply["state_text"] = json!("fixture-only".repeat(50));
                 }
@@ -1730,12 +1974,22 @@ impl Driver for Double {
                 reply["outcome"] = json!("refused");
             }
             "click" => {
-                if self.fault != "missed_click" {
+                if args["ref"] == "e4" {
+                    if self.fault
+                        != (if self.handed_active {
+                            "active_link"
+                        } else {
+                            "background_link"
+                        })
+                    {
+                        self.link_clicks += 1;
+                    }
+                } else if self.fault != "missed_click" {
                     self.clicked += 1;
                 }
             }
             "type" => {
-                if args["ref"] == "child-ref" {
+                if args["ref"] == "e3" {
                     if self.fault != "iframe" {
                         self.child_typed = args["text"].as_str().unwrap().to_owned();
                     }
@@ -1783,6 +2037,27 @@ impl Driver for Double {
     }
     fn outside_tab(&self) -> String {
         "outside".into()
+    }
+    async fn hand_fixture(&mut self, active: bool) -> Result<String, String> {
+        self.handed_active = active;
+        self.link_clicks = 0;
+        Ok(if active {
+            "handed-active"
+        } else {
+            "handed-background"
+        }
+        .into())
+    }
+    fn defer_site_answer(&mut self) {
+        self.deferred = true;
+    }
+    fn answer_late(&mut self) -> Result<(), String> {
+        self.deferred = false;
+        self.late_answered = true;
+        Ok(())
+    }
+    async fn link_observation(&mut self) -> Result<Value, String> {
+        Ok(json!({"page_links":self.link_clicks,"active":self.handed_active}))
     }
 }
 
@@ -2124,6 +2399,31 @@ async fn self_test() -> Result<(), String> {
         ));
     }
     for (fault, name, expected) in [
+        (
+            "drag_in",
+            "acceptance_rejects_unadopted_group_member",
+            "drag-in group member is handed and claimable",
+        ),
+        (
+            "late_card",
+            "acceptance_rejects_second_card_after_late_durable_answer",
+            "late allow_30m covers a different action without a new card",
+        ),
+        (
+            "long_refs",
+            "acceptance_rejects_long_user_refs",
+            "user refs use short e-number names",
+        ),
+        (
+            "active_link",
+            "acceptance_rejects_undelivered_handed_active_link",
+            "visible link delivered on handed active tab",
+        ),
+        (
+            "background_link",
+            "acceptance_rejects_undelivered_handed_background_link",
+            "visible link delivered on handed background tab",
+        ),
         (
             "iframe",
             "acceptance_rejects_undelivered_iframe_input",
