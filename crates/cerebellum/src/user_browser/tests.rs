@@ -1776,6 +1776,12 @@ fn late_snapshot_results_cannot_restore_goodbye_handles_or_cross_connection_refs
 fn user_result_envelopes_are_closed_and_target_tagged() {
     let valid = json!({"browser":"user","outcome":"ok","tab":"t","state_text":"page","snapshot_id":"s","interaction_epoch":1,"connection_epoch":7});
     assert!(crate::browser::validate_user_browser_result("snapshot", &valid).is_ok());
+    let authorized = json!({"browser":"user","outcome":"ok","origin":"https://example.test","input_dispatched":false});
+    assert!(crate::browser::validate_user_browser_result("open_grant", &authorized).is_ok());
+    let mut unknown_origin = authorized.clone();
+    unknown_origin["unexpected"] = json!(true);
+    assert!(crate::browser::validate_user_browser_result("open_grant", &unknown_origin).is_err());
+
     let mut partial = valid.clone();
     partial["truncated"] = json!(true);
     partial["refs_truncated"] = json!(false);

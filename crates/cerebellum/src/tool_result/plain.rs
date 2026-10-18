@@ -76,7 +76,7 @@ fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 fn outcome_line(code: &str, object: &Map<String, Value>) -> Option<String> {
     let target = text(object, "target");
     Some(match code {
-        "ok" | "completed" => return None,
+        "ok" | "completed" | "ready" => return None,
         "consent_pending" => match text(object, "ask_id") {
             Some(ask) => format!("Waiting for the person to answer a consent question (ask_id {ask})."),
             None => "Waiting for the person to answer a consent question.".into(),
@@ -321,7 +321,15 @@ pub(super) fn body(object: &Map<String, Value>) -> Option<String> {
     if let Some(apps) = object.get("apps").and_then(Value::as_array) {
         return Some(list_apps_text(object, apps));
     }
-    text(object, "state_text").map(str::to_owned)
+    // If the reply has no top-level page text, use text from its optional read_page object.
+    text(object, "state_text")
+        .or_else(|| {
+            object
+                .get("read_page")
+                .and_then(Value::as_object)
+                .and_then(|read_page| text(read_page, "state_text"))
+        })
+        .map(str::to_owned)
 }
 
 /// Every fact line for a reply, in reading order: what happened, the
@@ -357,6 +365,82 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
     if let Some(line) = text(object, "effect_status").and_then(|status| effect_line(status, object))
     {
         lines.push(line);
+    }
+    if text(object, "browser") == Some("user")
+        && object.get("input_dispatched").and_then(Value::as_bool) == Some(true)
+    {
+        lines.push("Input was dispatched to the person's browser.".into());
+    }
+    if text(object, "browser") == Some("user") {
+        // The tab handle and interaction epoch identify a tab the agent can use and whether its page has changed.
+        if let Some(connected) = object.get("connected").and_then(Value::as_bool) {
+            lines.push(if connected {
+                "The Chrome extension is connected.".into()
+            } else {
+                "The Chrome extension is not connected.".into()
+            });
+            let tabs = object.get("tabs").and_then(Value::as_array);
+            if let Some(tabs) = tabs.filter(|tabs| !tabs.is_empty()) {
+                for tab in tabs {
+                    let Some(handle) = text_of(tab, "tab") else {
+                        continue;
+                    };
+                    let claimed = text_of(tab, "claim") == Some("claimed_by_this_route");
+                    let claim = if claimed { "claimed" } else { "not claimed" };
+                    match tab.get("interaction_epoch").and_then(Value::as_u64) {
+                        Some(epoch) => lines.push(format!(
+                            "Available tab {handle} is {claim} (interaction epoch {epoch})."
+                        )),
+                        None => lines.push(format!("Available tab {handle} is {claim}.")),
+                    }
+                }
+            } else {
+                lines.push("No tabs are available. Ask the person to move a tab into the Agent group or hand one over with the toolbar button.".into());
+            }
+        }
+    }
+    if text(object, "browser") == Some("user") && text(object, "outcome") == Some("ok") {
+        if let Some(origin) = text(object, "origin") {
+            lines.push(format!("Site access is authorized for {origin}."));
+        }
+    }
+    if text(object, "browser") != Some("user") && text(object, "outcome") == Some("ready") {
+        let session = text(object, "browser_session_id").unwrap_or("unknown");
+        lines.push(format!("Own browser session {session} is ready."));
+        if let Some(disposition) = text(object, "profile_disposition") {
+            lines.push(format!("Profile disposition: {}.", words(disposition)));
+        }
+        if let Some(lease) = object.get("lease").and_then(Value::as_object) {
+            if let Some(timeout) = lease.get("idle_timeout_ms").and_then(Value::as_u64) {
+                lines.push(format!("Idle timeout: {timeout} ms."));
+            }
+            if let Some(expiry) = text(lease, "idle_expires_at") {
+                lines.push(format!("Idle lease expires at {expiry}."));
+            }
+        }
+    }
+    if object.get("settled").and_then(Value::as_bool) == Some(false) {
+        lines.push("Page settlement was not confirmed.".into());
+        if let Some(reason) = text(object, "settlement_reason") {
+            lines.push(sentence(reason));
+        }
+    }
+    if object
+        .get("popup_activated_briefly")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        lines.push("A popup was activated briefly.".into());
+    }
+    if object.get("refs_truncated").and_then(Value::as_bool) == Some(true) {
+        lines.push("Some actionable references were left out; take another snapshot with filters or zoom before acting on missing controls.".into());
+    }
+    if let Some(frames) = object
+        .get("omitted_frames")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        lines.push(format!("Omitted {frames} embedded page frames."));
     }
     if let Some(steps) = object.get("steps").and_then(Value::as_array) {
         let steps = steps
@@ -409,13 +493,24 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
             lines.push(format!("No image: {}.", words(reason)));
         }
     }
-    if let Some(snapshot) = text(object, "snapshot_id") {
+    let read_page = object.get("read_page").and_then(Value::as_object);
+    let snapshot_id = text(object, "snapshot_id")
+        .or_else(|| read_page.and_then(|read_page| text(read_page, "snapshot_id")));
+    if let Some(snapshot) = snapshot_id {
         // A snapshot's own header already names its id; say it once.
-        if !text(object, "state_text").is_some_and(|state| state.contains(snapshot)) {
+        let state = text(object, "state_text")
+            .or_else(|| read_page.and_then(|read_page| text(read_page, "state_text")));
+        if !state.is_some_and(|state| state.contains(snapshot)) {
             lines.push(format!("snapshot_id: {snapshot}"));
         }
     }
     for key in ["browser_session_id", "tab"] {
+        if key == "browser_session_id"
+            && text(object, "browser") != Some("user")
+            && text(object, "outcome") == Some("ready")
+        {
+            continue;
+        }
         if let Some(value) = object.get(key).and_then(scalar) {
             lines.push(format!("{key}: {value}"));
         }
