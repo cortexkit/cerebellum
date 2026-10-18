@@ -18,6 +18,7 @@ the daemon before a granting choice can be offered.
 | `head-website-public-in-advance.json` | `worker-website-public-in-advance.json` | Public site and all-sites choices, asked ahead |
 | `head-user-browser-site.json` | `worker-user-browser-site.json` | Person's Chrome, sign-in site only |
 | `head-user-browser-public.json` | `worker-user-browser-public.json` | Person's Chrome, public site only |
+| `head-user-browser-ordinary.json` | `worker-user-browser-ordinary.json` | Person's Chrome, read request granting reading, clicking and typing |
 | `head-login-import.json` | `worker-login-import.json` | Login import, no capability marker |
 | `head-login-capture.json` | `worker-login-capture.json` | Login capture, no capability marker |
 | `head-login-import-single-use.json` | `worker-login-import-single-use.json` | Login import, single-use feature |
@@ -30,7 +31,7 @@ options are removed, along with their remembered granting answer ids, when
 Cingulate's catalog declaration is missing or cannot be read. Takeover's
 non-danger once option writes no reusable permission row.
 
-The `SHA256SUMS` file in this directory pins all 28 exported head and worker
+The `SHA256SUMS` file in this directory pins all 30 exported head and worker
 card JSON files; it excludes itself and this README. Existing changed
 card goldens are `app-control.json`, `takeover.json`,
 `website-access-in-call.json`, `website-access-in-advance.json` and
@@ -58,3 +59,6 @@ This records receiver acceptance for the phone release; the local shape checks
 alone cannot establish it. Validation used Cingulate commit `9986456` and
 Cerebellum export `05142d0b1d2ee1593dd114c170734f0c0ac14d7a`. Subsequent fixture
 and retained-operation routing changes preserve those JSON bytes.
+
+The two `user-browser-ordinary` exports are new and need receiver-side validation
+in CKIOS; the earlier receiver acceptance above does not cover these new files.

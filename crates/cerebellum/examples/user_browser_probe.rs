@@ -248,6 +248,7 @@ trait Driver {
     async fn hand_fixture(&mut self, active: bool) -> Result<String, String>;
     fn defer_site_answer(&mut self);
     fn answer_late(&mut self) -> Result<(), String>;
+    fn decline_next_site_answer(&mut self);
     async fn link_observation(&mut self) -> Result<Value, String>;
 }
 
@@ -558,9 +559,11 @@ async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), Str
                 revoked["outcome"] == "revoked",
             )?;
             driver.defer_site_answer();
-            let (pending, asks) = driver.call(json!({"action":"open_grant","origins":[origin],"hazards":[],"severity_tier":2})).await?;
+            let (pending, asks) = driver
+                .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
+                .await?;
             check(
-                "site card detaches before late allow_30m",
+                "read site card detaches before late allow_30m",
                 pending["outcome"] == "consent_pending" && asks == 1,
             )?;
             driver.answer_late()?;
@@ -587,6 +590,10 @@ async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), Str
             ok(&second) && asks == 0 && reference(&second, "Probe link")? == link,
         )?;
         let (clicked, asks) = driver.call(json!({"action":"click","tab":tab,"ref":link,"snapshot_id":second["snapshot_id"],"intent":"click visible handed fixture link","severity":{"tier":2,"credential":false,"financial":false}})).await?;
+        check(
+            "late read allow_30m covers clicking without a new card",
+            ok(&clicked) && asks == 0,
+        )?;
         let observation = driver.link_observation().await?;
         println!("handed link diagnostics: {observation}; reply: {clicked}");
         check(
@@ -601,6 +608,16 @@ async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), Str
                 && observation["active"] == active,
         )?;
         detached_and_unfocused(driver)?;
+        if active {
+            driver.decline_next_site_answer();
+            let submit = reference(&second, "Probe submit")?;
+            let (refused, asks) = driver.call(json!({"action":"click","tab":tab,"ref":submit,"snapshot_id":second["snapshot_id"],"intent":"submit fixture form","severity":{"tier":3,"credential":false,"financial":false}})).await?;
+            check(
+                "form submit still needs a separate approval",
+                refused["reason"] == "consent_declined" && asks == 1,
+            )?;
+            detached_and_unfocused(driver)?;
+        }
     }
     Ok(())
 }
@@ -990,7 +1007,7 @@ mod live {
                     } else if path == "/" {
                         r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
                     } else if path == "/handed-active" || path == "/handed-background" {
-                        r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><div style="height:2000px"></div>"##
+                        r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><form style="position:fixed;left:8px;top:40px" method="post" action="/submitted"><button aria-label="Probe submit">Submit</button></form><div style="height:2000px"></div>"##
                     } else if path == "/iframe" {
                         r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
                     } else {
@@ -1193,6 +1210,7 @@ mod live {
         handed_url: String,
         defer_answer: bool,
         late_card: Option<String>,
+        decline_answer: bool,
         origin: String,
         page: Page,
         focus: Focus,
@@ -1524,6 +1542,7 @@ mod live {
             handed_url: String::new(),
             defer_answer: false,
             late_card: None,
+            decline_answer: false,
             origin: origin.clone(),
             page,
             focus,
@@ -1553,6 +1572,7 @@ mod live {
     impl Driver for Live {
         async fn call(&mut self, mut args: Value) -> Result<(Value, usize), String> {
             let deferred = std::mem::take(&mut self.defer_answer);
+            let decline = std::mem::take(&mut self.decline_answer);
             let calls_before = self.consent.calls().len();
             if deferred {
                 self.consent.defer_awaits();
@@ -1578,8 +1598,9 @@ mod live {
                     self.cards_seen += 1;
                     consent_for_fixture(&card, &self.origin)?;
                     asks += 1;
+                    let decision = if decline { "deny" } else { "allow_30m" };
                     println!(
-                        "PASS per-site card: your own Chrome, signed in as you; {} -> allow_30m",
+                        "PASS per-site card: your own Chrome, signed in as you; {} -> {decision}",
                         self.origin
                     );
                     let id = card["id"].as_str().ok_or("the card has no id")?;
@@ -1588,7 +1609,7 @@ mod live {
                     } else if !self.consent.answer_id(
                         id,
                         cerebellum::cingulate_client::ScriptedAnswer::Answered(
-                            json!({"decision":"allow_30m"}),
+                            json!({"decision":decision}),
                         ),
                     ) {
                         return Err(format!("the scripted Cingulate does not hold card {id}"));
@@ -1839,6 +1860,9 @@ mod live {
         fn defer_site_answer(&mut self) {
             self.defer_answer = true;
         }
+        fn decline_next_site_answer(&mut self) {
+            self.decline_answer = true;
+        }
         fn answer_late(&mut self) -> Result<(), String> {
             let id = self.late_card.take().ok_or("late site card missing")?;
             if !self.consent.answer_id(
@@ -1901,6 +1925,7 @@ struct Double {
     link_clicks: usize,
     deferred: bool,
     late_answered: bool,
+    decline_answer: bool,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -1917,6 +1942,7 @@ impl Double {
             link_clicks: 0,
             deferred: false,
             late_answered: false,
+            decline_answer: false,
         }
     }
 }
@@ -1925,6 +1951,7 @@ impl Driver for Double {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String> {
         let mut reply = json!({"browser":"user","outcome":"ok"});
         let mut asks = 0;
+        let decline = std::mem::take(&mut self.decline_answer);
         match args["action"].as_str().unwrap_or("") {
             "open_tab" => {
                 reply["tab"] = json!("opaque-agent-tab");
@@ -1955,11 +1982,15 @@ impl Driver for Double {
             "snapshot" if args["tab"] == "outside" => {
                 reply["outcome"] = json!("refused");
             }
+            "snapshot" if self.deferred => {
+                asks = 1;
+                reply["outcome"] = json!("consent_pending");
+            }
             "snapshot" => {
                 asks = 0;
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
-                    json!("e1 button Probe button\ne2 textbox Probe input\ne3 textbox Iframe input\ne4 link Probe link");
+                    json!("e1 button Probe button\ne2 textbox Probe input\ne3 textbox Iframe input\ne4 link Probe link\ne5 button Probe submit");
                 if self.fault == "long_refs" {
                     reply["state_text"] = json!("e1 button Probe button\ne2 textbox Probe input\ne3 textbox Iframe input\nur12345678901234567890123456789012 link Probe link");
                 }
@@ -1974,7 +2005,16 @@ impl Driver for Double {
                 reply["outcome"] = json!("refused");
             }
             "click" => {
-                if args["ref"] == "e4" {
+                if args["severity"]["tier"] == 3 && self.fault != "submit_without_card" {
+                    asks = 1;
+                    if decline {
+                        reply["outcome"] = json!("refused");
+                        reply["reason"] = json!("consent_declined");
+                    }
+                } else if args["ref"] == "e4" {
+                    if self.late_answered && self.fault == "read_tier_one" {
+                        asks = 1;
+                    }
                     if self.fault
                         != (if self.handed_active {
                             "active_link"
@@ -2050,6 +2090,9 @@ impl Driver for Double {
     }
     fn defer_site_answer(&mut self) {
         self.deferred = true;
+    }
+    fn decline_next_site_answer(&mut self) {
+        self.decline_answer = true;
     }
     fn answer_late(&mut self) -> Result<(), String> {
         self.deferred = false;
@@ -2399,6 +2442,16 @@ async fn self_test() -> Result<(), String> {
         ));
     }
     for (fault, name, expected) in [
+        (
+            "read_tier_one",
+            "acceptance_rejects_read_grant_that_cannot_click",
+            "late read allow_30m covers clicking without a new card",
+        ),
+        (
+            "submit_without_card",
+            "acceptance_rejects_submit_without_separate_approval",
+            "form submit still needs a separate approval",
+        ),
         (
             "drag_in",
             "acceptance_rejects_unadopted_group_member",
