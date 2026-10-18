@@ -37,8 +37,13 @@ fn agent_cursor() {}
 
 #[cfg(target_os = "macos")]
 fn agent_cursor() {
-    use cerebellum_computer::cursor::{CursorKind, CursorLine, MAX_CURSOR_LINE};
+    use cerebellum_computer::cursor::{accent, CursorKind, CursorLine, MAX_CURSOR_LINE};
     use std::io::{BufRead, Read};
+    // The module renders avatars at one size and the helper draws exactly that
+    // size; a mismatch would silently drop every avatar.
+    const _: () = assert!(
+        cerebellum_computer::cursor::AVATAR_SIZE as usize == cerebellum_macos::AVATAR_PIXELS
+    );
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
         let input = std::io::stdin();
@@ -77,6 +82,9 @@ fn agent_cursor() {
                 }
                 CursorLine::Picture(event) => {
                     cerebellum_macos::OverlayMessage::Show(cerebellum_macos::OverlayEvent {
+                        // Derived here from the agent's id rather than sent,
+                        // so the pipe vocabulary stays as it is.
+                        accent: accent(&event.agent),
                         agent: event.agent,
                         initial: event.initial,
                         to: event.to,
@@ -106,6 +114,9 @@ fn agent_cursor() {
             position: cerebellum_computer::cursor::position,
             settle_scale: cerebellum_computer::cursor::settle_scale,
             fade_alpha: cerebellum_computer::cursor::fade_alpha,
+            arrival_ms: cerebellum_computer::cursor::ARRIVAL_MS,
+            arrival_start: cerebellum_computer::cursor::arrival_start,
+            arrival_alpha: cerebellum_computer::cursor::arrival_alpha,
         },
     );
 }

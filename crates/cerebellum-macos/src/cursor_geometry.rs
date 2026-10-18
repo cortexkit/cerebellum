@@ -1,6 +1,6 @@
-//! Host-neutral geometry for the agent cursor picture: the arrow's shape, where
-//! the avatar chip and label pill sit, and where the panel must go so that the
-//! arrow's tip lands exactly on the target.
+//! Host-neutral geometry for the agent cursor picture: the pointer's shape,
+//! where the avatar chip and label pill sit, and where the panel must go so
+//! that the pointer's tip lands exactly on the target.
 //!
 //! Unless a name says otherwise, coordinates are global top-down screen points,
 //! the space accessibility frames and CoreGraphics window bounds use: the origin
@@ -82,44 +82,54 @@ impl Rect {
     }
 }
 
-/// The pointer outline, relative to its tip at (0, 0), y downward. It is the
-/// classic arrow with a short stem, close to the system pointer's size so it
-/// reads as "a pointer" without hiding much of what it points at.
-pub(crate) const ARROW: [[f64; 2]; 7] = [
-    [0.0, 0.0],
-    [0.0, 17.0],
-    [4.0, 13.0],
-    [6.6, 18.8],
-    [9.4, 17.6],
-    [6.9, 11.9],
-    [12.2, 11.9],
-];
-/// The light outline drawn around the dark fill, in points.
-pub(crate) const OUTLINE: f64 = 1.25;
-/// The avatar chip sits at the arrow's tail, just touching the stem's end.
-pub(crate) const CHIP_CENTER: [f64; 2] = [16.0, 24.0];
-pub(crate) const CHIP_DIAMETER: f64 = 19.0;
-pub(crate) const LABEL_HEIGHT: f64 = 20.0;
-pub(crate) const LABEL_MAX_WIDTH: f64 = 200.0;
-pub(crate) const LABEL_PADDING: f64 = 8.0;
+/// The pointer, relative to its tip at (0, 0), y downward: a broad, stubby
+/// arrowhead with no stem, drawn filled in the agent's accent colour with
+/// rounded back corners. The system pointer is a slim black arrow with a stem,
+/// so this shape and its colour cannot be mistaken for it. It is symmetric
+/// about the diagonal, pointing up and to the left like a map's location
+/// arrow, where the system pointer has a vertical left edge. The vertices
+/// are, in order: the tip, the lower wing, the notch in the back, the upper
+/// wing. Only the tip stays sharp, so the target point is unambiguous.
+pub(crate) const POINTER: [[f64; 2]; 4] = [[0.0, 0.0], [6.5, 21.0], [9.0, 9.0], [21.0, 6.5]];
+/// How round each back corner is, in points, in `POINTER` order (the tip
+/// has none).
+pub(crate) const POINTER_CORNER: [f64; 4] = [0.0, 3.0, 2.0, 3.0];
+/// The white outline drawn around the coloured fill, in points: it keeps the
+/// pointer legible on dark backgrounds, where the accent alone is too dim.
+pub(crate) const OUTLINE: f64 = 1.5;
+/// The avatar chip sits further along the pointer's axis, just touching the
+/// back of the arrowhead, so pointer and avatar read as one marker.
+pub(crate) const CHIP_CENTER: [f64; 2] = [22.5, 22.5];
+/// Large enough for the avatar to be recognisable at a glance.
+pub(crate) const CHIP_DIAMETER: f64 = 32.0;
+/// The accent ring just inside the chip's edge.
+pub(crate) const CHIP_RING: f64 = 2.5;
+/// The white rim just outside the chip's edge: like the pointer's outline,
+/// it separates the chip from a dark background.
+pub(crate) const CHIP_RIM: f64 = 1.5;
+pub(crate) const LABEL_HEIGHT: f64 = 24.0;
+pub(crate) const LABEL_MAX_WIDTH: f64 = 220.0;
+pub(crate) const LABEL_PADDING: f64 = 10.0;
 /// Clear space between the label and whatever it must not cover.
 const LABEL_GAP: f64 = 6.0;
 /// Room around the drawing for the soft drop shadow.
-const SHADOW_MARGIN: f64 = 6.0;
+const SHADOW_MARGIN: f64 = 8.0;
 /// The label must not touch the area right around a bare point either, so a
 /// pointed-at pixel with no element frame still gets this much clear space.
 const POINT_TARGET: f64 = 12.0;
 
-/// What the arrow and chip cover, relative to the tip, outline included.
+/// What the pointer and chip cover, relative to the tip, outline and rim
+/// included.
 pub(crate) fn badge_bounds() -> Rect {
+    let outer = CHIP_DIAMETER + 2.0 * CHIP_RIM;
     let chip = Rect::new(
-        CHIP_CENTER[0] - CHIP_DIAMETER / 2.0,
-        CHIP_CENTER[1] - CHIP_DIAMETER / 2.0,
-        CHIP_DIAMETER,
-        CHIP_DIAMETER,
+        CHIP_CENTER[0] - outer / 2.0,
+        CHIP_CENTER[1] - outer / 2.0,
+        outer,
+        outer,
     );
     let (mut right, mut bottom) = (0.0_f64, 0.0_f64);
-    for [x, y] in ARROW {
+    for [x, y] in POINTER {
         right = right.max(x);
         bottom = bottom.max(y);
     }
@@ -162,7 +172,7 @@ pub(crate) fn display_at(point: [f64; 2], displays: &[Display]) -> Option<Displa
 }
 
 /// Put the tip on the corner of the device pixel that contains `point`, so the
-/// tip pixel is exactly the requested one and the arrow's edges stay crisp
+/// tip pixel is exactly the requested one and the pointer's edges stay crisp
 /// instead of smearing across two pixels.
 pub(crate) fn snap_tip(point: [f64; 2], scale: f64) -> [f64; 2] {
     let scale = if scale.is_finite() && scale >= 1.0 {
@@ -191,7 +201,7 @@ pub(crate) fn target_rect(tip: [f64; 2], frame: Option<[f64; 4]>) -> Rect {
 }
 
 /// Where the label pill goes, in global points, or `None` when no candidate
-/// fits. The pill never covers the target or the arrow and chip, and stays
+/// fits. The pill never covers the target or the pointer and chip, and stays
 /// inside the screen's visible area. It prefers the side next to the chip, then
 /// the other side of the tip, then below or above the target.
 pub(crate) fn label_rect(
@@ -265,7 +275,7 @@ pub(crate) fn layout(
     }
 }
 
-/// The AppKit (bottom-up) window origin that puts the arrow's tip on `tip`.
+/// The AppKit (bottom-up) window origin that puts the pointer's tip on `tip`.
 /// `primary_height` is the primary display's height: AppKit's y axis starts at
 /// that display's bottom edge, the top-down one at its top edge, on every
 /// display alike.
@@ -377,22 +387,35 @@ mod tests {
     }
 
     #[test]
-    fn the_tip_is_the_arrow_s_first_vertex_and_the_chip_hangs_off_the_tail() {
-        assert_eq!(ARROW[0], [0.0, 0.0]);
+    fn the_tip_is_the_pointer_s_first_vertex_and_the_chip_touches_its_back() {
+        // The tip is the first vertex and has no rounding, so the requested
+        // point is the pointer's exact corner.
+        assert_eq!(POINTER[0], [0.0, 0.0]);
+        assert_eq!(POINTER_CORNER[0], 0.0);
+        // Every other vertex lies below and to the right of the tip, so the
+        // tip is the extreme corner and nothing is drawn beyond it but the
+        // outline.
+        for [x, y] in &POINTER[1..] {
+            assert!(*x > 0.0 && *y > 0.0, "vertex ({x}, {y})");
+        }
         let badge = badge_bounds();
         assert_eq!(badge.x, -OUTLINE);
         assert_eq!(badge.y, -OUTLINE);
-        // Roughly the system pointer plus a 19-point chip: small enough not to
-        // hide the control it points at.
-        assert!(badge.width <= 27.0 && badge.height <= 35.0, "{badge:?}");
-        // The stem's end touches the chip, so they read as one object.
-        let stem_end = [
-            (ARROW[3][0] + ARROW[4][0]) / 2.0,
-            (ARROW[3][1] + ARROW[4][1]) / 2.0,
-        ];
-        let gap = (stem_end[0] - CHIP_CENTER[0]).hypot(stem_end[1] - CHIP_CENTER[1])
-            - CHIP_DIAMETER / 2.0;
-        assert!(gap.abs() < 1.0, "stem to chip gap {gap}");
+        // A chip of about 28-36 points, big enough to recognise the avatar.
+        assert!((28.0..=36.0).contains(&CHIP_DIAMETER));
+        // Both wings touch the chip (within the outline's width), so pointer
+        // and avatar read as one marker rather than two loose shapes.
+        for wing in [POINTER[1], POINTER[3]] {
+            let gap =
+                (wing[0] - CHIP_CENTER[0]).hypot(wing[1] - CHIP_CENTER[1]) - CHIP_DIAMETER / 2.0;
+            assert!((0.0..=OUTLINE).contains(&gap), "wing to chip gap {gap}");
+        }
+        // The back's notch stays clear of the chip, so the arrowhead's shape
+        // is not swallowed by it.
+        let notch = POINTER[2];
+        let notch_gap =
+            (notch[0] - CHIP_CENTER[0]).hypot(notch[1] - CHIP_CENTER[1]) - CHIP_DIAMETER / 2.0;
+        assert!(notch_gap > OUTLINE, "notch to chip gap {notch_gap}");
     }
 
     fn screen() -> Rect {
@@ -426,7 +449,7 @@ mod tests {
             assert!(!label.intersects(target), "{label:?} covers {target:?}");
             assert!(
                 !label.intersects(badge_bounds().offset(tip)),
-                "{label:?} covers the arrow"
+                "{label:?} covers the pointer"
             );
             assert!(screen().contains_rect(label), "{label:?} leaves the screen");
         }
