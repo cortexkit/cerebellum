@@ -1,9 +1,10 @@
 export class BrowserEvents {
-  constructor(chrome, tabs, epochs, agent) {
+  constructor(chrome, tabs, epochs, agent, handoverFailed = (_tabId, error) => console.error("Agent handover failed", error)) {
     this.chrome = chrome;
     this.tabs = tabs;
     this.epochs = epochs;
     this.agent = agent;
+    this.handoverFailed = handoverFailed;
     this.activeTabs = new Map();
     this.focusedWindow = null;
     this.popupSources = new Map();
@@ -19,8 +20,11 @@ export class BrowserEvents {
 
   listen() {
     this.chrome.tabs.onUpdated.addListener((tabId, change) => {
-      if (!this.tabs.tabs.has(tabId)) return;
-      if ("groupId" in change && change.groupId !== this.tabs.group?.id) this.tabs.withdraw(tabId);
+      if (!("groupId" in change)) return;
+      if (change.groupId !== this.tabs.group?.id) this.tabs.withdraw(tabId);
+      else void this.tabs.adoptMember(tabId).then(async adopted => {
+        if (adopted) await this.epochs.install(tabId);
+      }).catch(error => this.handoverFailed(tabId, error));
     });
     this.chrome.tabs.onRemoved.addListener(tabId => {
       this.tabs.withdraw(tabId);

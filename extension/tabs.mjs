@@ -10,6 +10,7 @@ export class AgentTabs {
     this.tabs = new Map();
     this.extensionCreated = new Set();
     this.creations = new Set();
+    this.joining = new Set();
     this.ready = this.restore();
   }
 
@@ -55,6 +56,12 @@ export class AgentTabs {
   }
 
   async join(tabId, kind) {
+    this.joining.add(tabId);
+    try { return await this.joinTab(tabId, kind); }
+    finally { this.joining.delete(tabId); }
+  }
+
+  async joinTab(tabId, kind) {
     if (this.group) {
       try { await this.chrome.tabGroups.get(this.group.id); } catch { this.group = null; }
     }
@@ -72,6 +79,20 @@ export class AgentTabs {
     await this.save();
     await this.eligible(tabId);
     return record;
+  }
+
+  async adoptMember(tabId) {
+    await this.ready;
+    if (!this.group || this.tabs.has(tabId) || this.joining.has(tabId)) return false;
+    const tab = await this.chrome.tabs.get(tabId);
+    // Only the recorded group's identity conveys handover, never its title.
+    // A delayed group event must not re-adopt a tab the person already removed.
+    if (!this.group || this.tabs.has(tabId) || this.joining.has(tabId)
+      || tab.groupId !== this.group.id || tab.windowId !== this.group.windowId) return false;
+    this.tabs.set(tabId, { handle: crypto.randomUUID(), kind: "handed" });
+    await this.save();
+    await this.eligible(tabId);
+    return true;
   }
 
   async open({ url = "about:blank", opener_tab } = {}) {
@@ -110,12 +131,15 @@ export class AgentTabs {
     if (!this.group) throw new Refusal("tab_not_in_agent_group");
     // Script popups may start in a new window. Moving only that popup into the
     // recorded group is the narrowly scoped popup-disposition exception.
-    await this.chrome.tabs.group({ groupId: this.group.id, tabIds: [tabId] });
-    const record = { handle: crypto.randomUUID(), kind: "opened" };
-    this.tabs.set(tabId, record);
-    await this.save();
-    await this.eligible(tabId);
-    return record;
+    this.joining.add(tabId);
+    try {
+      await this.chrome.tabs.group({ groupId: this.group.id, tabIds: [tabId] });
+      const record = { handle: crypto.randomUUID(), kind: "opened" };
+      this.tabs.set(tabId, record);
+      await this.save();
+      await this.eligible(tabId);
+      return record;
+    } finally { this.joining.delete(tabId); }
   }
 
   async toggle(tabId) {

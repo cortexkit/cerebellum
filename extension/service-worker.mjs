@@ -6,22 +6,35 @@ import { BrowserEvents } from "./events.mjs";
 import { bounded } from "./errors.mjs";
 
 export function start(chrome) {
+  const handoverFailed = async (tabId, error) => {
+    const reason = String(error?.reason ?? error?.message ?? "handover_failed").slice(0, 120);
+    console.error(`Agent handover failed: ${reason}`);
+    // A toolbar click has no reply channel. Keep the failure visible on that
+    // tab until another handover succeeds, rather than leaving a silent group.
+    await Promise.allSettled([
+      chrome.action.setBadgeText({ tabId, text: "!" }),
+      chrome.action.setTitle({ tabId, title: `Agent handover failed: ${reason}` }),
+    ]);
+  };
   let agent;
   const tabs = new AgentTabs(chrome, tabId => agent?.withdraw(tabId));
   const epochs = new InteractionEpochs(chrome, tabs);
   agent = new Agent(chrome, tabs, epochs);
   const bridge = new NativeBridge(chrome, agent);
-  const events = new BrowserEvents(chrome, tabs, epochs, agent);
+  const events = new BrowserEvents(chrome, tabs, epochs, agent, handoverFailed);
   events.listen();
   const toggle = async tab => {
     if (!tab?.id) return;
     events.remember(tab);
     const handed = await tabs.toggle(tab.id);
     if (handed) await epochs.install(tab.id);
+    await chrome.action.setBadgeText({ tabId: tab.id, text: "" });
+    await chrome.action.setTitle({ tabId: tab.id, title: "Hand tab to Agent / take it back" });
   };
-  chrome.action.onClicked.addListener(tab => { void toggle(tab).catch(() => {}); });
+  const handover = tab => { void toggle(tab).catch(error => handoverFailed(tab?.id, error)); };
+  chrome.action.onClicked.addListener(handover);
   chrome.contextMenus.onClicked.addListener((info, tab) => {
-    if (info.menuItemId === "agent-handover") void toggle(tab).catch(() => {});
+    if (info.menuItemId === "agent-handover") handover(tab);
   });
   const menu = async () => {
     await chrome.contextMenus.removeAll();
