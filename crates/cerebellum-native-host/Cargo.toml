@@ -25,4 +25,4 @@ cortexkit-paths = "=0.1.2"
 
 [dev-dependencies]
 cerebellum-core = { path = "../cerebellum-core" }
-cortexkit-test-support = "=0.1.9"
+cortexkit-test-support = "=0.1.10"
