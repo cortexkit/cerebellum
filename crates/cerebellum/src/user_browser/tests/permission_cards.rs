@@ -230,6 +230,12 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
     let script = ScriptedCingulate::new();
     let fixture = Fixture::scripted(&script);
     fixture.state.lock().unwrap().top_level_only = true;
+    let args = if tier == 1 {
+        let tab = fixture.claim(1).await;
+        snapshot_args(&tab)
+    } else {
+        ask(tier, json!([]), "https://example.com")
+    };
     script
         .then(
             wire::CONSENT_REQUEST,
@@ -245,9 +251,7 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
                 json!({"elicitation_id":"el_late_site","state":"pending","detached":true}),
             ),
         );
-    let (reply, _) = fixture
-        .call(1, ask(tier, json!([]), "https://example.com"), "")
-        .await;
+    let (reply, _) = fixture.call(1, args, "").await;
     assert_eq!(reply["outcome"], "consent_pending", "{reply}");
     assert!(rows(&fixture).is_empty());
     script
@@ -271,8 +275,8 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
 }
 
 #[tokio::test]
-async fn late_thirty_minute_site_answer_mints_before_a_different_action() {
-    let fixture = late_site_answer("allow_30m", 2).await;
+async fn late_read_site_answer_covers_click_without_another_card() {
+    let fixture = late_site_answer("allow_30m", 1).await;
     let granted = rows(&fixture);
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].max_level, 2);
@@ -305,12 +309,12 @@ async fn late_thirty_minute_site_answer_mints_before_a_different_action() {
 }
 
 #[tokio::test]
-async fn late_always_read_answer_keeps_the_in_call_read_ceiling() {
+async fn late_always_read_answer_grants_ordinary_site_use() {
     let fixture = late_site_answer("allow_origin_always", 1).await;
     let granted = rows(&fixture);
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].expires_at_ms, None);
-    assert_eq!(granted[0].max_level, 1);
+    assert_eq!(granted[0].max_level, 2);
     let holder = &granted[0].holder;
     assert!(fixture
         .planes
@@ -325,7 +329,7 @@ async fn late_always_read_answer_keeps_the_in_call_read_ceiling() {
                 hazards: BTreeSet::new(),
             }
         )
-        .is_none());
+        .is_some());
     let tab = fixture.claim(1).await;
     let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
@@ -333,33 +337,91 @@ async fn late_always_read_answer_keeps_the_in_call_read_ceiling() {
 }
 
 #[tokio::test]
-async fn read_thirty_minute_late_answer_matches_the_in_call_ceiling() {
-    let fixture = late_site_answer("allow_30m", 1).await;
-    let granted = rows(&fixture);
-    assert_eq!(granted.len(), 1);
-    assert_eq!(granted[0].max_level, 1);
-    assert_eq!(
-        granted[0].expires_at_ms,
-        Some(granted[0].granted_at_ms + 1_800_000)
-    );
-    assert!(fixture
-        .planes
-        .management
-        .agent_grants()
-        .authorize(
-            &granted[0].holder,
-            crate::agent_grants::GrantDemand::Browser {
-                target: BrowserTarget::UserBrowser,
-                origin: "https://example.com".into(),
-                severity: Severity::new(2, false, false),
-                hazards: BTreeSet::new(),
-            }
-        )
-        .is_none());
-    let tab = fixture.claim(1).await;
-    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
-    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert!(cards.is_empty());
+async fn in_call_read_site_answers_cover_clicks_and_typing() {
+    for decision in ["allow_30m", "allow_origin_always"] {
+        let fixture = Fixture::new();
+        fixture.state.lock().unwrap().top_level_only = true;
+        let tab = fixture.claim(1).await;
+        let (snapshot, cards) = fixture.snapshot(1, &tab, decision).await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(rows(&fixture)[0].max_level, 2);
+        assert_eq!(cards[0]["scope"]["severity_tier"], 2);
+        assert_eq!(
+            cards[0]["options"][0]["label"],
+            "Allow on example.com for 30 minutes"
+        );
+        assert_eq!(cards[0]["options"][0]["detail"], "Covers reading, clicking and typing on this site; submitting forms and credential or financial actions still need approval.");
+        let (clicked, cards) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Go")),
+                "deny",
+            )
+            .await;
+        assert_eq!(clicked["outcome"], "ok", "{clicked}");
+        assert!(cards.is_empty());
+        let (typed, cards) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"ordinary site use","clear_first":true}), "deny").await;
+        assert_eq!(typed["outcome"], "ok", "{typed}");
+        assert!(cards.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ordinary_read_site_grant_still_asks_for_tier_three_actions_and_submits() {
+    for form_submit in [false, true] {
+        let fixture = Fixture::new();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.top_level_only = true;
+            state.submit_button = form_submit;
+        }
+        let tab = fixture.claim(1).await;
+        let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(cards.len(), 1);
+        let mut action = click(&tab, &snapshot, &reference(&snapshot, "Go"));
+        action["severity"]["tier"] = json!(3);
+        action["intent"] = json!(if form_submit {
+            "submit fixture form"
+        } else {
+            "perform tier-three fixture action"
+        });
+        let (reply, cards) = fixture.call(1, action, "deny").await;
+        assert_eq!(reply["reason"], "consent_declined", "{reply}");
+        assert_eq!(cards.len(), 1);
+        // A form owner's submit keeps its existing tier-four floor even when
+        // the form has no credential or payment controls to disclose. An
+        // ordinary target declared at tier three asks at exactly tier three.
+        assert_eq!(
+            cards[0]["scope"]["severity_tier"],
+            if form_submit { 4 } else { 3 }
+        );
+        assert_eq!(cards[0]["scope"]["hazards"], json!([]));
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+        let granted = rows(&fixture);
+        assert_eq!(granted.len(), 1);
+        assert_eq!(granted[0].max_level, 2);
+        for hazard in [
+            HazardClass::CredentialFormSubmit,
+            HazardClass::FinancialFormSubmit,
+        ] {
+            assert!(fixture
+                .planes
+                .management
+                .agent_grants()
+                .authorize(
+                    &granted[0].holder,
+                    crate::agent_grants::GrantDemand::Browser {
+                        target: BrowserTarget::UserBrowser,
+                        origin: "https://example.com".into(),
+                        severity: Severity::new(2, false, false),
+                        hazards: [hazard].into_iter().collect(),
+                    }
+                )
+                .is_none());
+        }
+    }
 }
 
 #[tokio::test]

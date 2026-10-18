@@ -648,6 +648,7 @@ pub(crate) fn site_question_with_choices(
     choices: &[crate::management::BrowserGrantChoice],
 ) -> Value {
     use crate::consent_card::*;
+    let tier = site_grant_tier(tier);
     let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
     let host = crate::login_import::origin_host(origin).unwrap_or_else(|| origin.into());
     let scope = crate::browser_standing_grants::domain_scope(origin).map_or_else(
@@ -664,7 +665,7 @@ pub(crate) fn site_question_with_choices(
             )
         })
         .map(|choice| {
-            crate::management::browser_grant_option(
+            let option = crate::management::browser_grant_option(
                 *choice,
                 &[
                     if *choice == crate::management::BrowserGrantChoice::SiteThirtyMinutes {
@@ -674,7 +675,12 @@ pub(crate) fn site_question_with_choices(
                     },
                 ],
                 Severity::new(tier, false, false),
-            )
+            );
+            if tier == authorization::COMPOSE && hazards.is_empty() {
+                option.with_detail("Covers reading, clicking and typing on this site; submitting forms and credential or financial actions still need approval.")
+            } else {
+                option
+            }
         })
         .collect();
     ConsentCard {
@@ -703,6 +709,12 @@ pub(crate) fn site_question_with_choices(
         duration: None,
     }
     .render()
+}
+
+/// A durable site answer covers reading, clicking and typing even when a read
+/// raised the card. More consequential actions still need a higher ceiling.
+fn site_grant_tier(tier: u8) -> u8 {
+    tier.max(authorization::COMPOSE)
 }
 
 /// The refusal when the site card ended without an answer, or could not be
@@ -1612,7 +1624,11 @@ impl Context<'_> {
                 crate::cingulate_client::desk::UserBrowserGrant {
                     holder: holder.ok_or_else(|| refusal("agent_not_attested"))?,
                     origin: grant.origin.clone(),
-                    severity: grant.severity,
+                    severity: Severity::new(
+                        site_grant_tier(grant.severity.tier),
+                        grant.severity.credential,
+                        grant.severity.financial,
+                    ),
                     hazards: grant.hazards.clone(),
                 },
             )
@@ -2898,7 +2914,14 @@ async fn input(
         declared_severity(args)?
     };
     let read_grant = context
-        .authorize(&input_origin, requested, BTreeSet::new())
+        // Classification reads the frame; it does not perform the declared
+        // action. Ask for that action only after its hazards are known, so a
+        // form submit gets one correctly disclosed higher-risk approval.
+        .authorize(
+            &input_origin,
+            Severity::new(authorization::OBSERVE, false, false),
+            BTreeSet::new(),
+        )
         .await?;
     let mut observed = context
         .cdp_frame(

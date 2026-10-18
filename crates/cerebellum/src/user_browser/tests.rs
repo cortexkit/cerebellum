@@ -101,6 +101,7 @@ struct DoubleState {
     /// `<button>` defaults to type submit, so this checks that a submit-type
     /// control without a form owner is not rated as a form submit.
     untyped_button: bool,
+    submit_button: bool,
     ax_override: Option<Value>,
     top_level_only: bool,
     unmapped_child_owner: bool,
@@ -802,6 +803,17 @@ fn execute(
                     state.payment,
                     state.untyped_button,
                 );
+                if state.submit_button {
+                    let button = dom["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|node| node["backendNodeId"] == 3)
+                        .unwrap();
+                    button["parentId"] = json!(7);
+                    button["attributes"] = json!(["type", "submit"]);
+                    dom["nodes"].as_array_mut().unwrap().push(json!({"nodeId":7,"parentId":2,"backendNodeId":7,"nodeType":1,"nodeName":"FORM","localName":"form","attributes":["method","post","action","/submit"]}));
+                }
                 if state.frame_pair {
                     for id in [7, 8] {
                         dom["nodes"].as_array_mut().unwrap().push(json!({"nodeId":id,"parentId":2,"backendNodeId":id,"nodeType":1,"nodeName":"IFRAME","localName":"iframe","attributes":[]}));
@@ -1097,14 +1109,15 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
 }
 
 #[tokio::test]
-async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
+async fn a_form_less_untyped_button_click_reuses_the_ordinary_site_grant() {
     // A <button> defaults to type submit, but with no form owner it submits
-    // nothing. It must classify at the declared level, so the read card is the
-    // only card: one invocation, one allow_30m ask.
+    // nothing. The read card covers ordinary use, so classification must not
+    // turn this form-less button into a submit that needs another approval.
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().untyped_button = true;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (snapshot, read_cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(read_cards.len(), 1);
     let (clicked, cards) = fixture
         .call(
             1,
@@ -1113,8 +1126,8 @@ async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
         )
         .await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
-    assert_eq!(cards.len(), 1, "{cards:?}");
-    assert_eq!(cards[0]["scope"]["severity_tier"], 2);
+    assert!(cards.is_empty(), "{cards:?}");
+    assert_eq!(read_cards[0]["scope"]["severity_tier"], 2);
 }
 
 #[tokio::test]
@@ -2449,7 +2462,7 @@ async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card
         )
         .await;
     assert_eq!(top_clicked["outcome"], "ok");
-    assert_eq!(top_cards.len(), 1);
+    assert!(top_cards.is_empty());
     let (reply, cards) = fixture
         .call(
             1,

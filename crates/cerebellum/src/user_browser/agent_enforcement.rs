@@ -39,7 +39,7 @@ pub(super) fn store_answer(
                 granted_at_ms: now,
                 expires_at_ms: (!always).then_some(now.saturating_add(30 * 60 * 1000)),
                 card_ref: Some(card_ref.into()),
-                max_level: intent.severity.tier,
+                max_level: super::site_grant_tier(intent.severity.tier),
                 hazards: intent.hazards.iter().copied().collect(),
                 team_id: None,
                 designated_requirement: None,
