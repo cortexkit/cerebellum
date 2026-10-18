@@ -7660,6 +7660,7 @@ async fn handle_session_turn_ended(
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
 ) -> Result<(), ModuleError> {
     if !cerebellum_core::principal::admits_session_calls(&facts.principal) {
+        record_turn_ended_refused();
         return send_route_error(
             writer,
             ver,
@@ -7673,6 +7674,7 @@ async fn handle_session_turn_ended(
     }
     let params = object.get("params").cloned().unwrap_or(json!({}));
     let Some(params) = params.as_object() else {
+        record_turn_ended_refused();
         return send_invalid_request_response(
             writer,
             ver,
@@ -7687,6 +7689,7 @@ async fn handle_session_turn_ended(
     let request = match turn_ended::parse(params) {
         Ok(request) => request,
         Err(error) => {
+            record_turn_ended_refused();
             return send_invalid_request_response(
                 writer,
                 ver,
@@ -7696,15 +7699,18 @@ async fn handle_session_turn_ended(
                 &error.field,
                 error.reason,
             )
-            .await
+            .await;
         }
     };
     if let Some(cursor) = planes_cursor(planes) {
-        cursor.turn_ended(
+        let matched = cursor.turn_ended(
             &request.session_ref,
             Some(&request.scope_ref),
             request.outcome,
         );
+        if matched {
+            record_turn_ended_matched_badge();
+        }
     }
     send_tool_response(
         writer,
@@ -7714,7 +7720,9 @@ async fn handle_session_turn_ended(
         corr,
         json!({"acknowledged": true}),
     )
-    .await
+    .await?;
+    record_turn_ended_received(request.at_ms);
+    Ok(())
 }
 
 async fn send_invalid_request_response(
@@ -7971,6 +7979,31 @@ fn record_private_state_tightening() {
 static ENGRAM_CATALOG_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Process-lifetime observations for the quiet session-turn-ended adapter.
+/// Keeping only counts and the event timestamp lets health show whether core's
+/// calls are reaching this module without exposing session or scope references.
+static TURN_ENDED_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TURN_ENDED_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TURN_ENDED_MATCHED_BADGE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static TURN_ENDED_LAST_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TURN_ENDED_HAS_LAST_AT_MS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn record_turn_ended_refused() {
+    TURN_ENDED_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_turn_ended_matched_badge() {
+    TURN_ENDED_MATCHED_BADGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_turn_ended_received(at_ms: u64) {
+    TURN_ENDED_LAST_AT_MS.store(at_ms, std::sync::atomic::Ordering::Relaxed);
+    TURN_ENDED_HAS_LAST_AT_MS.store(true, std::sync::atomic::Ordering::Release);
+    TURN_ENDED_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Write `engram-catalog.json` into the module's data directory, so the
 /// fleet's backup module knows what that directory holds on every machine,
 /// including a new one where nobody placed the file by hand.
@@ -7998,6 +8031,9 @@ fn record_engram_catalog_write() {
 ///   whose owner-only mode could not be enforced at startup;
 /// - `engramCatalogWriteFailures`, the number of startup attempts to write the
 ///   backup catalog (`engram-catalog.json`) that failed;
+/// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
+///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
+///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
@@ -8040,6 +8076,24 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
                 ENGRAM_CATALOG_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
             ),
         );
+        metrics.insert(
+            "turnEndedReceived".into(),
+            json!(TURN_ENDED_RECEIVED.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        metrics.insert(
+            "turnEndedRefused".into(),
+            json!(TURN_ENDED_REFUSED.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        metrics.insert(
+            "turnEndedMatchedBadge".into(),
+            json!(TURN_ENDED_MATCHED_BADGE.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        let last_at_ms = if TURN_ENDED_HAS_LAST_AT_MS.load(std::sync::atomic::Ordering::Acquire) {
+            json!(TURN_ENDED_LAST_AT_MS.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            Value::Null
+        };
+        metrics.insert("turnEndedLastAtMs".into(), last_at_ms);
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),
