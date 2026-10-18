@@ -42,7 +42,7 @@ build_timeout_s = 1800
 id = "agent-cursor-badge-stays-while-its-agent-acts"
 guards = "a resting agent cursor badge stays at full opacity while its agent works, for minutes without an event, instead of greying out after 30 s in the middle of a turn"
 file = "crates/cerebellum-macos/src/cursor_schedule.rs"
-old = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(10 * 60);"
+old = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(2 * 60);"
 new = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(30); // NON-VACUITY BREAK"
 edits = []
 test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"

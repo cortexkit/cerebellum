@@ -15,9 +15,10 @@ const MAX_PICTURES: usize = 64;
 /// like the agent has gone. So a resting badge stays at full opacity; the
 /// normal way it leaves is an explicit end (the turn ended, the route closed,
 /// the call was cancelled), which hides it at once. This timeout is only the
-/// safety net for an end signal that never arrives, so it is long enough that
-/// no working agent ever reaches it.
-pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(10 * 60);
+/// safety net for an end signal that never arrives: two minutes outlasts an
+/// ordinary pause between actions while not leaving a stale badge on screen
+/// for long if an end is lost.
+pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(2 * 60);
 
 /// The fade itself stays short: once the agent is idle, the badge should go.
 const FADE: Duration = Duration::from_millis(250);
@@ -189,7 +190,7 @@ mod tests {
         let start = Instant::now();
         let mut schedule = CursorSchedule::new();
         schedule.picture_for_event("agent".into(), start, || ());
-        for at in [1, 29, 31, 60, 120, 300, 540, 599] {
+        for at in [1, 29, 31, 60, 90, 119] {
             let (steps, wait) = resting_steps(&mut schedule, start + SECOND * at);
             assert_eq!(alpha(&steps), Some(1.0), "dimmed at {at} s of rest");
             assert!(
