@@ -34,6 +34,7 @@ fn snapshot_and_ref_reuse_is_scoped_to_route_tab_and_connection() {
         tab: "tab1".into(),
         connection: 7,
         interaction: 2,
+        observer_continuity: 0,
         document: CommittedDocument::new("https://example.com/", 1, "loader"),
         refs: BTreeMap::new(),
         image: None,
@@ -116,9 +117,16 @@ struct DoubleState {
     child_ax_oversized: bool,
     plan_delay: Duration,
     consent_delay: Duration,
+    observer_unavailable: bool,
+    observer_missing_on_blank: bool,
+    observer_continuity: u64,
+    metadata_unready: usize,
+    observer_loss_during_classification: bool,
+    human_during_card: bool,
     plan_count: usize,
     attaches: usize,
     hang_plan: Option<usize>,
+    hang_method: Option<&'static str>,
     hang_action: Option<&'static str>,
     hang_attach: bool,
     ignore_cancel: bool,
@@ -161,6 +169,12 @@ impl CingulateRoute for SiteCingulateRoute {
                     let mut cards = self.0.cards.lock().unwrap();
                     cards.push(params);
                     let mut state = self.0.state.lock().unwrap();
+                    if state.human_during_card {
+                        state.human_during_card = false;
+                        for tab in state.tabs.values_mut().filter(|tab| tab.owner.is_some()) {
+                            tab.interaction += 1;
+                        }
+                    }
                     if state.remove_group_on_card {
                         state.remove_group_on_card = false;
                         state.tabs.get_mut("handed").unwrap().group = false;
@@ -328,7 +342,15 @@ impl Fixture {
                         if cdp {
                             state.plan_count += 1;
                         }
-                        let hanging = (cdp && state.hang_plan == Some(state.plan_count))
+                        let hanging = (cdp
+                            && (state.hang_plan == Some(state.plan_count)
+                                || state.hang_method.is_some_and(|method| {
+                                    command["commands"]
+                                        .as_array()
+                                        .into_iter()
+                                        .flatten()
+                                        .any(|step| step["method"] == method)
+                                })))
                             || state.hang_action == command["action"].as_str();
                         let result = execute(&mut state, route, epoch, &command);
                         let input = result.as_ref().is_ok_and(|(_, input)| *input);
@@ -683,11 +705,38 @@ fn execute(
         tab.interaction += 1;
         state.human_before_input = false;
     }
+    let modifying = commands.iter().any(|step| {
+        step["method"].as_str().is_some_and(|method| {
+            method.starts_with("Input.")
+                || matches!(
+                    method,
+                    "DOM.focus"
+                        | "DOM.scrollIntoViewIfNeeded"
+                        | "Runtime.callFunctionOn"
+                        | "Emulation.setFocusEmulationEnabled"
+                )
+        })
+    });
+    if modifying && command["observer_continuity"].as_u64() != Some(state.observer_continuity) {
+        return Err("observer_unavailable".into());
+    }
     if command
         .get("interaction_epoch")
         .is_some_and(|expected| expected != tab.interaction)
     {
         return Err("state_changed_by_person".into());
+    }
+    if state.observer_loss_during_classification
+        && commands
+            .iter()
+            .any(|step| step["method"] == "DOM.getFlattenedDocument")
+        && !commands
+            .iter()
+            .any(|step| step["method"] == "Accessibility.getFullAXTree")
+    {
+        state.observer_loss_during_classification = false;
+        state.observer_continuity += 1;
+        tab.interaction += 1;
     }
     let metadata_popup = state.popup_once_on_metadata
         && commands
@@ -721,7 +770,12 @@ fn execute(
         dom_enabled |= method == "DOM.enable";
         let result = match method {
             "Page.getNavigationHistory" => {
-                json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
+                if state.metadata_unready > 0 {
+                    state.metadata_unready -= 1;
+                    json!({"currentIndex":0,"entries":[]})
+                } else {
+                    json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
+                }
             }
             "Page.getFrameTree" => {
                 let mut tree = json!({"frameTree":{"frame":{"id":"main","loaderId":format!("l{}",tab.loader),"url":tab.url},"childFrames":[{"frame":{"id":"foreign","parentId":"main","loaderId":child_loader,"url":child_url}}]}});
@@ -899,7 +953,7 @@ fn execute(
             .remove("web_navigation_frame_id");
     }
     Ok((
-        json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
+        json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"observer_available":!state.observer_unavailable && !(state.observer_missing_on_blank && tab.url == "about:blank"),"observer_continuity":state.observer_continuity,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
         input,
     ))
 }
@@ -1329,6 +1383,142 @@ async fn outside_group_tab_is_refused_before_any_cdp_command() {
         before,
         "outside-group action reached the bridge"
     );
+}
+
+#[tokio::test]
+async fn missing_observation_is_honest_and_never_reported_as_person_input() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().observer_unavailable = true;
+    let tab = fixture.claim(1).await;
+    let (read, cards) = fixture.snapshot(1, &tab, "deny").await;
+    assert_eq!(read["reason"], "observer_unavailable", "{read}");
+    assert!(cards.is_empty());
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .tabs
+        .get_mut(&tab)
+        .unwrap()
+        .url = "about:blank".into();
+    let (navigate, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"navigate fixture","severity":{"tier":1,"credential":false,"financial":false}}), "deny").await;
+    assert_eq!(navigate["reason"], "observer_unavailable", "{navigate}");
+    assert!(cards.is_empty());
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test]
+async fn agent_created_blank_navigates_then_reads_and_clicks_with_one_site_card() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.observer_missing_on_blank = true;
+        state.metadata_unready = 1;
+        state.top_level_only = true;
+    }
+    let (opened, _) = fixture
+        .call(1, json!({"browser":"user","action":"open_tab"}), "deny")
+        .await;
+    let tab = opened["tab"].as_str().unwrap();
+    let (navigated, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"navigate agent-created blank fixture","severity":{"tier":1,"credential":false,"financial":false}}), "allow_30m").await;
+    assert_eq!(navigated["outcome"], "ok", "{navigated}");
+    assert_eq!(cards.len(), 1);
+    {
+        let state = fixture.state.lock().unwrap();
+        let has = |plan: &Value, method: &str| {
+            plan["commands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|command| command["method"] == method)
+        };
+        let navigation = state
+            .commands
+            .iter()
+            .position(|plan| has(plan, "Page.navigate"))
+            .unwrap();
+        assert_eq!(
+            state.commands[..navigation]
+                .iter()
+                .filter(|plan| has(plan, "Page.getNavigationHistory"))
+                .count(),
+            3
+        );
+    }
+    let (read, cards) = fixture.snapshot(1, tab, "deny").await;
+    assert_eq!(read["outcome"], "ok", "{read}");
+    assert!(cards.is_empty());
+    let (clicked, cards) = fixture
+        .call(1, click(tab, &read, &reference(&read, "Go")), "deny")
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(cards.is_empty());
+    fixture.state.lock().unwrap().tabs.get_mut(tab).unwrap().url = "about:blank".into();
+    let (again, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"repeat blank exemption must refuse","severity":{"tier":1,"credential":false,"financial":false}}), "deny").await;
+    assert_eq!(again["reason"], "observer_unavailable", "{again}");
+    assert!(cards.is_empty());
+}
+
+#[tokio::test]
+async fn observed_blank_navigation_does_not_ignore_person_input_during_consent() {
+    let fixture = Fixture::new();
+    let (opened, _) = fixture
+        .call(1, json!({"browser":"user","action":"open_tab"}), "deny")
+        .await;
+    let tab = opened["tab"].as_str().unwrap();
+    fixture.state.lock().unwrap().human_during_card = true;
+    let (reply, cards) = fixture.call(1, json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"navigate observed blank fixture","severity":{"tier":1,"credential":false,"financial":false}}), "allow_30m").await;
+    assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
+    assert_eq!(cards.len(), 1);
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.tabs[tab].url, "about:blank");
+    assert!(!state.commands.iter().any(|plan| plan["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|step| step["method"] == "Page.navigate")));
+}
+
+#[tokio::test]
+async fn observer_loss_during_classification_cannot_scroll_or_click_saved_ref() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().top_level_only = true;
+    let tab = fixture.claim(1).await;
+    let (read, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .observer_loss_during_classification = true;
+    let (reply, cards) = fixture
+        .call(1, click(&tab, &read, &reference(&read, "Go")), "deny")
+        .await;
+    assert_eq!(reply["reason"], "observer_unavailable", "{reply}");
+    assert!(cards.is_empty());
+    let state = fixture.state.lock().unwrap();
+    assert!(state.inputs.is_empty());
+    assert!(!state.scrolled);
+}
+
+#[tokio::test]
+async fn observer_continuity_loss_requires_a_new_read_not_a_person_change() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().top_level_only = true;
+    let tab = fixture.claim(1).await;
+    let (old, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    fixture.state.lock().unwrap().observer_continuity += 1;
+    let (refused, cards) = fixture
+        .call(1, click(&tab, &old, &reference(&old, "Go")), "deny")
+        .await;
+    assert_eq!(refused["reason"], "observer_unavailable", "{refused}");
+    assert!(cards.is_empty());
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    let (fresh, _) = fixture.snapshot(1, &tab, "deny").await;
+    let (clicked, cards) = fixture
+        .call(1, click(&tab, &fresh, &reference(&fresh, "Go")), "deny")
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(cards.is_empty());
 }
 
 #[tokio::test]
@@ -1932,6 +2122,7 @@ fn late_snapshot_results_cannot_restore_goodbye_handles_or_cross_connection_refs
         tab: "t".into(),
         connection: 7,
         interaction: 1,
+        observer_continuity: 0,
         document: CommittedDocument::new("https://example.com/", 1, "l"),
         refs: BTreeMap::new(),
         image: None,
@@ -3107,7 +3298,7 @@ async fn user_stuck_mouse_plan_quarantines_the_tab_before_the_next_call() {
     {
         let mut state = f.state.lock().unwrap();
         state.plan_count = 0;
-        state.hang_plan = Some(8);
+        state.hang_method = Some("Input.dispatchMouseEvent");
         state.ignore_cancel = true;
     }
     tokio::time::pause();

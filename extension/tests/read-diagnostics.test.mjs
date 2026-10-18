@@ -39,17 +39,16 @@ test("probe read diagnostics allow only fixed metadata and normalize exceptions"
   assert.equal(diagnosticReason(new Error("arbitrary SECRET")), "other_error");
 });
 
-test("probe diagnostics expose swallowed pre and post coverage errors without changing refusal", async t => {
+test("probe diagnostics explain unavailable observation without blaming person", async t => {
   const { rows } = capture(t, true);
   const f = await setup();
   f.chrome.tabs.sendMessage = async () => { throw new Error("Could not establish connection. Receiving end does not exist."); };
   const read = await f.fresh();
   assert.equal(read.results.length, 1);
   assert.equal(f.agent.baselines.has(2), false);
-  await assert.rejects(f.run(f.input(0)), { reason: "fresh_read_required" });
-  for (const stage of ["pre_read", "post_plan"]) {
-    assert.ok(rows().some(row => row.event === "sample_failed" && row.stage === stage && row.step === "frame_message" && row.reason === "no_receiver" && row.frameId === 0));
-  }
+  await assert.rejects(f.run(f.input(0)), { reason: "observer_unavailable" });
+  assert.ok(rows().some(row => row.event === "sample_failed" && row.stage === "pre_read" && row.step === "frame_message" && row.reason === "no_receiver" && row.frameId === 0));
+  assert.ok(rows().some(row => row.event === "sample_failed" && row.stage === "post_plan" && row.reason === "observer_unavailable"));
   assert.ok(rows().some(row => row.event === "baseline_deleted" && row.covered === false && row.readObserved === false));
   assert.ok(rows().some(row => row.event === "input_baseline_refused" && row.reason === "baseline_missing" && row.baselinePresent === false && row.planEpoch === 0));
   assert.equal(f.chrome.calls.some(call => call[0] === "cdp" && call[2].startsWith("Input.")), false);
@@ -81,7 +80,7 @@ test("probe observer-install diagnostics redact Chrome exception text and preser
   const f = await setup();
   const previous = f.epochs.record(2).continuity;
   f.chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of url "https://private.invalid/SECRET"'); };
-  await f.epochs.install(2);
+  await f.epochs.install(2, 0, "blocked-document");
   assert.equal(f.epochs.record(2).continuity, previous + 1);
   assert.ok(rows().some(row => row.event === "observer_install_failed" && row.tabId === 2 && row.reason === "access_denied"));
   assert.ok(lines.every(line => !line.includes("SECRET") && !line.includes("private.invalid")));

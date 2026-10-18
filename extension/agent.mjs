@@ -1,3 +1,4 @@
+import { observerUnavailable } from "./epochs.mjs";
 import { bounded, Refusal } from "./errors.mjs";
 import { classifyCommand, resolveParams, verifyRuntime } from "./commands.mjs";
 import { Frames } from "./frames.mjs";
@@ -25,11 +26,11 @@ export function debuggerError(error) {
 }
 
 export function validatePlan(plan) {
-  if (!closed(plan, ["version", "action", "tab", "url", "opener_tab", "interaction_epoch", "commands"]) || plan.version !== 2) throw new Refusal("invalid_plan", "update cerebellum and the extension together");
+  if (!closed(plan, ["version", "action", "tab", "url", "opener_tab", "interaction_epoch", "observer_continuity", "commands"]) || plan.version !== 2) throw new Refusal("invalid_plan", "update cerebellum and the extension together");
   const fields = {
     status: ["version", "action"], close: ["version", "action"],
     open_tab: ["version", "action", "url", "opener_tab"], claim_tab: ["version", "action", "tab"],
-    cdp: ["version", "action", "tab", "interaction_epoch", "commands"],
+    cdp: ["version", "action", "tab", "interaction_epoch", "observer_continuity", "commands"],
   }[plan.action];
   if (!fields || !closed(plan, fields)) throw new Refusal("invalid_plan", "use a supported extension action");
   if (["claim_tab", "cdp"].includes(plan.action) && typeof plan.tab !== "string") throw new Refusal("invalid_plan");
@@ -53,6 +54,7 @@ export class Agent {
     this.epochs = epochs;
     this.claims = new Map();
     this.baselines = new Map();
+    this.blankNavigations = new Map();
     this.active = new Set();
     this.connectionEpoch = null;
     this.navigation = new Map();
@@ -63,6 +65,7 @@ export class Agent {
   connect(epoch) {
     this.connectionEpoch = epoch;
     this.claims.clear();
+    this.blankNavigations.clear();
     probeReadDiagnostic("baseline_cleared", { reason: "connected", baselineCount: this.baselines.size });
     this.baselines.clear();
   }
@@ -78,6 +81,7 @@ export class Agent {
   }
 
   withdraw(tabId) {
+    this.blankNavigations.delete(tabId);
     this.claims.delete(tabId);
     probeReadDiagnostic("baseline_cleared", { tabId, reason: "withdrawn", baselinePresent: this.baselines.has(tabId) });
     this.baselines.delete(tabId);
@@ -93,6 +97,7 @@ export class Agent {
     for (const [tabId, owner] of this.claims) {
       if (owner !== key) continue;
       this.claims.delete(tabId);
+      this.blankNavigations.delete(tabId);
       probeReadDiagnostic("baseline_cleared", { tabId, reason: "released", baselinePresent: this.baselines.has(tabId) });
       this.baselines.delete(tabId);
       const record = this.tabs.tabs.get(tabId);
@@ -238,6 +243,7 @@ export class Agent {
       state.tabId = tab.tabId;
       this.alive(state);
       this.claims.set(tab.tabId, state.route);
+      if (!p.opener_tab && (!p.url || p.url === "about:blank")) this.blankNavigations.set(tab.tabId, state.route);
       await this.guard(state);
       await this.epochs.install(tab.tabId);
       return { tab: tab.handle, interaction_epoch: this.epochs.record(tab.tabId).epoch, connection_epoch: state.epoch };
@@ -276,15 +282,22 @@ export class Agent {
       await state.frames.start();
     }
     let readObservation = null;
+    let preSampleAttempted = false;
     let readFailure;
     const hasInput = state.plan.commands.some(command => classifyCommand(command) === "input");
     const hasRead = state.plan.commands.some(command => ["Accessibility.getFullAXTree", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "Page.captureScreenshot"].includes(command.method));
+    const metadataOnly = state.plan.commands.every(command => classifyCommand(command) === "read") && !hasRead;
     const baseline = this.baselines.get(state.tabId);
     probeReadDiagnostic("plan_baseline", { tabId: state.tabId, hasInput, hasRead, baselinePresent: !!baseline, baselineEpoch: baseline?.epoch, planEpoch: state.plan.interaction_epoch, commandCount: state.plan.commands.length });
     if (hasInput && (!baseline || !Number.isSafeInteger(state.plan.interaction_epoch) || baseline.epoch !== state.plan.interaction_epoch)) {
       const reason = !baseline ? "baseline_missing" : !Number.isSafeInteger(state.plan.interaction_epoch) ? "plan_epoch_missing" : "epoch_mismatch";
       probeReadDiagnostic("input_baseline_refused", { tabId: state.tabId, reason, baselinePresent: !!baseline, baselineEpoch: baseline?.epoch, planEpoch: state.plan.interaction_epoch, continuity: baseline?.continuity });
+      if (this.epochs.record(state.tabId).coverageLost) throw observerUnavailable();
       throw new Refusal("fresh_read_required");
+    }
+    if (hasInput && (!Number.isSafeInteger(state.plan.observer_continuity) || state.plan.observer_continuity !== baseline.continuity || state.plan.observer_continuity !== this.epochs.record(state.tabId).continuity)) {
+      probeReadDiagnostic("input_baseline_refused", { tabId: state.tabId, reason: "observer_unavailable", planContinuity: state.plan.observer_continuity, baselineContinuity: baseline.continuity, continuity: this.epochs.record(state.tabId).continuity });
+      throw observerUnavailable();
     }
     for (const planned of state.plan.commands) {
       const command = { ...planned, params: resolveParams(planned.params, results) };
@@ -293,9 +306,10 @@ export class Agent {
       const scope = command.frame_id ? await state.frames.resolve(command, kind === "read" && !hasInput) : null;
       const target = scope?.target ?? { tabId: state.tabId };
       const frameId = scope?.frame.web_navigation_frame_id ?? 0;
-      if (!hasInput && hasRead && kind === "read" && !readObservation) {
+      if (!hasInput && hasRead && kind === "read" && !preSampleAttempted) {
+        preSampleAttempted = true;
         try {
-          const epoch = await this.epochs.sample(state.tabId, "pre_read");
+          const epoch = await this.epochs.sample(state.tabId, "pre_read", true);
           readObservation = { epoch, continuity: this.epochs.record(state.tabId).continuity };
         } catch (error) {
           // A failed pre-read interaction sample cannot authorize later input.
@@ -305,13 +319,26 @@ export class Agent {
       }
       try {
         if (kind === "input") {
-          await this.epochs.check(state.tabId, state.plan.interaction_epoch);
-          if (this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
+          await this.epochs.check(state.tabId, state.plan.interaction_epoch, state.plan.observer_continuity);
+          if (this.epochs.record(state.tabId).continuity !== baseline.continuity) throw observerUnavailable();
         }
         await this.guard(state);
         if (kind === "input" && this.epochs.record(state.tabId).epoch !== state.plan.interaction_epoch) throw new Refusal("interaction_epoch_changed");
-        if (kind === "input" && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
-        if (kind === "navigate") this.navigation.set(state.tabId, { state, frameId, started: false, url: command.params.url, deadline: Date.now() + 30000 });
+        if (kind === "input" && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw observerUnavailable();
+        if (kind === "navigate") {
+          if (Number.isSafeInteger(state.plan.interaction_epoch)) await this.epochs.check(state.tabId, state.plan.interaction_epoch, state.plan.observer_continuity);
+          else {
+            // Only an openerless agent-created blank tab may navigate without observation:
+            // HTTP host permissions alone do not guarantee script access there.
+            const tree = await bounded(this.chrome.debugger.sendCommand(target, "Page.getFrameTree", {}), "reply");
+            await this.guard(state);
+            if (this.blankNavigations.get(state.tabId) !== state.route || this.tabs.tabs.get(state.tabId)?.kind !== "opened" || tree.frameTree?.frame?.url !== "about:blank") throw observerUnavailable();
+          }
+          await this.guard(state);
+          if (Number.isSafeInteger(state.plan.interaction_epoch) && state.plan.observer_continuity !== this.epochs.record(state.tabId).continuity) throw observerUnavailable();
+          this.blankNavigations.delete(state.tabId);
+          this.navigation.set(state.tabId, { state, frameId, started: false, url: command.params.url, deadline: Date.now() + 30000 });
+        }
         if (kind === "input") state.input = true;
         if (command.method === "Input.dispatchMouseEvent") {
           if (command.params.type === "mousePressed") state.heldMouse = { target, params: { ...command.params, type: "mouseReleased" } };
@@ -340,7 +367,7 @@ export class Agent {
     // leaves the adapter. A refused input never creates a new read baseline.
     let epoch;
     let covered = true;
-    try { epoch = await this.epochs.sample(state.tabId, "post_plan"); } catch (error) {
+    try { epoch = await this.epochs.sample(state.tabId, "post_plan", metadataOnly); } catch (error) {
       readFailure = diagnosticReason(error);
       probeReadDiagnostic("sample_failed", { tabId: state.tabId, stage: "post_plan", reason: readFailure });
       if (hasInput) throw error;
@@ -350,8 +377,8 @@ export class Agent {
     await this.guard(state);
     if (!hasInput && hasRead && !results.some(entry => entry.error)) {
       if (covered && readObservation) {
+        if (readObservation.continuity !== this.epochs.record(state.tabId).continuity) throw observerUnavailable();
         if (readObservation.epoch !== epoch) throw new Refusal("interaction_epoch_changed");
-        if (readObservation.continuity !== this.epochs.record(state.tabId).continuity) throw new Refusal("interaction_continuity_lost");
         this.baselines.set(state.tabId, readObservation);
         probeReadDiagnostic("baseline_set", { tabId: state.tabId, epoch: readObservation.epoch, continuity: readObservation.continuity });
       } else {
@@ -359,10 +386,10 @@ export class Agent {
         probeReadDiagnostic("baseline_deleted", { tabId: state.tabId, reason: readFailure, covered, readObserved: !!readObservation, epoch });
       }
     }
+    if (hasInput && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw observerUnavailable();
     if (hasInput && epoch !== state.plan.interaction_epoch) throw new Refusal("interaction_epoch_changed");
-    if (hasInput && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");
     await this.guard(state);
-    const result = { tab: state.plan.tab, results, interaction_epoch: epoch, connection_epoch: state.epoch };
+    const result = { tab: state.plan.tab, results, interaction_epoch: epoch, observer_available: covered, observer_continuity: this.epochs.record(state.tabId).continuity, connection_epoch: state.epoch };
     if (frameMappings) result.frame_mappings = frameMappings;
     if (this.popupFlags.delete(state.tabId)) result.popup_activated_briefly = true;
     return result;

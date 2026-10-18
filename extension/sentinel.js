@@ -2,7 +2,10 @@
 // reads page text, field values or URLs; only trusted interaction times.
 (() => {
   if (globalThis.__ckAgentSentinel) return;
-  const documentId = crypto.randomUUID();
+  // randomUUID is secure-context-only; getRandomValues also works on HTTP.
+  // Keep a cryptographically random identity even on an insecure document.
+  const documentId = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
+    : Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
   let sequence = 0;
   let enabled = true;
   const interactions = [];

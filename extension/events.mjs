@@ -49,6 +49,9 @@ export class BrowserEvents {
       void this.tabs.save();
     });
     this.chrome.tabs.onActivated.addListener(info => {
+      // Selection is not a person-input count, but an unobserved blank tab may
+      // no longer use the narrow first-hop exception once someone selects it.
+      this.agent.blankNavigations.delete(info.tabId);
       const popup = this.popupSources.get(info.tabId);
       if (popup) {
         popup.activated = true;
@@ -81,14 +84,16 @@ export class BrowserEvents {
         navigation.started = true;
         return;
       }
+      if (info.frameId === 0 && info.url && info.url !== "about:blank") this.agent.blankNavigations.delete(info.tabId);
       this.epochs.bump(info.tabId);
     });
     this.chrome.webNavigation.onCommitted.addListener(info => {
       if (!this.tabs.tabs.has(info.tabId)) return;
       const navigation = this.agent.navigation.get(info.tabId);
       if (navigation?.started && navigation.state.epoch === this.agent.connectionEpoch && navigation.deadline >= Date.now() && navigation.frameId === info.frameId) this.agent.navigation.delete(info.tabId);
-      else this.epochs.bump(info.tabId);
-      void this.epochs.install(info.tabId, info.frameId).catch(() => {});
+      // A commit invalidates document continuity, not proof of a person's input.
+      // In particular, an unobserved initial blank commit must not mint a human epoch.
+      void this.epochs.committed(info.tabId, info.frameId, info.documentId).catch(() => {});
     });
     this.chrome.webNavigation.onErrorOccurred.addListener(info => {
       if (this.agent.navigation.get(info.tabId)?.frameId === info.frameId) this.agent.navigation.delete(info.tabId);

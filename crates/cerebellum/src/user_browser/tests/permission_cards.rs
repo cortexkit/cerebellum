@@ -254,6 +254,9 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
     let (reply, _) = fixture.call(1, args, "").await;
     assert_eq!(reply["outcome"], "consent_pending", "{reply}");
     assert!(rows(&fixture).is_empty());
+    // The observer may be replaced while consent is detached. The retry's new
+    // read, not a pre-card observation, must authorize the following input.
+    fixture.state.lock().unwrap().observer_continuity += 1;
     script
         .then(wire::CONSENT_ANSWERS, Reply::Result(json!({"records":[{"elicitation_id":"el_late_site","state":"answered","answered_choice_id":choice}],"cursor":1})))
         .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));

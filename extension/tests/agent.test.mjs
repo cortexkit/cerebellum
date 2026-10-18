@@ -194,9 +194,11 @@ test("restart clears baselines even when interaction epoch happens to match", as
 test("missing frame coverage cannot establish an input baseline", async () => {
   const f = await setup();
   f.chrome.webNavigation.getAllFrames = async () => [{ frameId: 0 }, { frameId: 5 }];
+  const inject = f.chrome.scripting.executeScript;
+  f.chrome.scripting.executeScript = options => options.target.frameIds?.includes(5) ? Promise.reject(new Error("The frame was removed.")) : inject(options);
   await f.fresh();
   assert.equal(f.agent.baselines.has(2), false);
-  await assert.rejects(f.run(f.input(f.epochs.record(2).epoch)), { reason: "fresh_read_required" });
+  await assert.rejects(f.run(f.input(f.epochs.record(2).epoch)), { reason: "observer_unavailable" });
 });
 
 test("all focus target and arbitrary runtime escape hatches refuse before attach", async () => {
@@ -292,8 +294,11 @@ test("trusted input during an attached snapshot does not invalidate its baseline
 test("agent document changes lose continuity without pretending to be human input", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
-  await f.epochs.install(2);
-  await assert.rejects(f.run(f.input(epoch)), { reason: "interaction_continuity_lost" });
+  f.chrome.observations.delete("2:0");
+  f.chrome.sentinels.delete("2:0");
+  f.chrome.tabData.get(2).documentId = "new-document";
+  await f.epochs.committed(2, 0, "new-document");
+  await assert.rejects(f.run(f.input(epoch)), { reason: "observer_unavailable" });
   assert.equal(f.epochs.record(2).epoch, epoch);
   assert.equal(inputs(f.chrome).length, 0);
   await f.fresh();
