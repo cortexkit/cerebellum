@@ -325,3 +325,34 @@ test("a restored worker discovers later group members even without membership ev
   assert.ok(status.some(tab => tab.tab === restarted.tabs.get(3).handle));
   assert.deepEqual(adopted, [3]);
 });
+
+test("recorded groupId update then move then status exposes the handed handle to its route", async () => {
+  const f = await setup();
+  listen(f);
+  const order = [];
+  f.chrome.tabs.onUpdated.addListener(id => { if (id === 1) order.push("onUpdated"); });
+  f.chrome.tabs.onMoved.addListener(id => { if (id === 1) order.push("onMoved"); });
+  await f.chrome.tabs.group({ groupId: 7, tabIds: [1] });
+  f.chrome.tabs.onUpdated.emit(1, { groupId: 7 }, { ...f.chrome.tabData.get(1) });
+  f.chrome.tabs.onMoved.emit(1, { fromIndex: 0, toIndex: 1, windowId: 3 });
+  order.push("status");
+  const status = await f.run({ version: 2, action: "status" });
+  assert.deepEqual(order, ["onUpdated", "onMoved", "status"]);
+  const record = f.tabs.tabs.get(1);
+  assert.equal(record.kind, "handed");
+  assert.equal(f.agent.claims.has(1), false);
+  assert.deepEqual(status.tabs.find(tab => tab.tab === record.handle), {
+    tab: record.handle, claimed: false, handed: true, interaction_epoch: 0,
+  });
+  assert.notEqual(record.handle, "1");
+  assert.equal(f.chrome.calls.filter(call => call[0] === "inject" && call[1].target.tabId === 1).length, 1);
+  assert.equal(f.chrome.tabData.get(1).groupId, 7);
+  assert.equal(f.chrome.tabData.get(1).windowId, 3);
+  const claimed = await f.run({ version: 2, action: "claim_tab", tab: record.handle });
+  assert.equal(claimed.tab, record.handle);
+  const own = await f.run({ version: 2, action: "status" });
+  assert.equal(own.tabs.find(tab => tab.tab === record.handle).claimed, true);
+  const other = await f.run({ version: 2, action: "status" }, { channel: 9, epoch: 1 });
+  assert.equal(other.tabs.some(tab => tab.tab === record.handle), false);
+  assert.equal(f.chrome.tabData.get(1).active, true);
+});
