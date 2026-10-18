@@ -33,8 +33,8 @@ use crate::snapshot_store::{BackendNodeIdentity, CommittedDocument, FrameDocumen
 use crate::user_browser_bridge::{Route, Terminal, UserBrowserBridge};
 use crate::{AcceptedBindFacts, CancelHandle, Planes};
 
-/// How long a user-browser site card waits for the person. The card expires
-/// at the same moment, so it is never left open after the call stops waiting.
+/// Bound the in-call site-card wait. If the person has not answered, detach the
+/// card so a later admitted session call can apply the answer without holding work.
 pub(crate) const CONSENT_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_SNAPSHOTS: usize = 64;
 pub(crate) const NAVIGATION_READ_DEADLINE: Duration = Duration::from_secs(30);
@@ -345,6 +345,7 @@ struct State {
 
 pub(crate) struct UserBrowser {
     state: Mutex<State>,
+    next_ref: std::sync::atomic::AtomicU64,
     grants: Arc<StandingBrowserGrants>,
     workers: crate::blocking_permits::PermitPool,
 }
@@ -353,6 +354,7 @@ impl UserBrowser {
     pub(crate) fn new(grants: Arc<StandingBrowserGrants>) -> Self {
         Self {
             state: Mutex::new(State::default()),
+            next_ref: std::sync::atomic::AtomicU64::new(1),
             grants,
             workers: crate::blocking_permits::PermitPool::new(
                 crate::budgets::MAX_BLOCKING_WORKERS_BROWSER,
@@ -536,6 +538,33 @@ impl UserBrowser {
         }
     }
 
+    fn prior_refs(&self, snapshot: &Snapshot) -> HashMap<(String, u64), (String, FrameDocument)> {
+        let state = self.state();
+        let mut refs = HashMap::new();
+        for previous in state
+            .snapshot_order
+            .iter()
+            .rev()
+            .filter_map(|id| state.snapshots.get(id))
+        {
+            if previous.route != snapshot.route
+                || previous.tab != snapshot.tab
+                || previous.connection != snapshot.connection
+                || previous.document != snapshot.document
+            {
+                continue;
+            }
+            for (name, shown) in &previous.refs {
+                refs.entry((
+                    shown.identity.frame_id.clone(),
+                    shown.identity.backend_node_id,
+                ))
+                .or_insert_with(|| (name.clone(), shown.frame.clone()));
+            }
+        }
+        refs
+    }
+
     fn covers(
         &self,
         agent: &str,
@@ -697,8 +726,8 @@ fn consent_unavailable(ending: &Ending) -> Value {
 /// The subjects of the site cards that calls in this process are raising or
 /// holding, each with how many calls are doing so.
 ///
-/// A holder applies its own answer. After detachment, the registry preserves
-/// the approval for a retry with the same origin, severity and hazards.
+/// A holder applies its own answer. After detachment, the session drain stores
+/// durable answers using the authority retained with the card.
 #[derive(Default)]
 pub(crate) struct SiteCardHolders(Mutex<BTreeMap<String, usize>>);
 
@@ -749,25 +778,51 @@ impl Drop for SiteCardHold<'_> {
     }
 }
 
-/// Held calls apply their own answers. Detached approvals are saved by the
-/// desk for a matching retry; the drain must not steal a holder's settlement.
-struct SiteCardEffects(Arc<SiteCardHolders>);
+/// Calls still waiting on a site card store their own answers. For answers that
+/// arrive after the wait ends, ConsentDrain uses the card's retained holder,
+/// site and severity, not the action requested by the call reading the answer feed.
+struct SiteCardEffects {
+    holders: Arc<SiteCardHolders>,
+    management: std::sync::Weak<crate::management::ManagementPlane>,
+}
 
 impl ConsentEffects for SiteCardEffects {
     fn has_pending(&self, card: &RaisedCard) -> bool {
-        card.lifecycle.deferred_use || self.0.holds(&card.subject)
+        card.lifecycle.deferred_use || self.holders.holds(&card.subject)
     }
 
     fn apply(
         &self,
         card: &RaisedCard,
         _record: &Record,
-        _ending: &Ending,
+        ending: &Ending,
     ) -> Result<AppliedSettlement, ApplyFailed> {
-        if self.0.holds(&card.subject) {
+        if self.holders.holds(&card.subject) {
             return Err(ApplyFailed(
                 "the held site call has not stored its answer yet".into(),
             ));
+        }
+        if let (Some(intent), Ending::Granted { choice_id }) =
+            (&card.lifecycle.user_browser_grant, ending)
+        {
+            let choice = match choice_id.as_str() {
+                "allow_30m" => Some(crate::management::BrowserGrantChoice::SiteThirtyMinutes),
+                "allow_origin_always" => Some(crate::management::BrowserGrantChoice::OriginAlways),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                let management = self
+                    .management
+                    .upgrade()
+                    .ok_or_else(|| ApplyFailed("grant store is unavailable".into()))?;
+                agent_enforcement::store_answer(
+                    management.agent_grants(),
+                    intent,
+                    &card.elicitation_id,
+                    choice,
+                )
+                .map_err(|_| ApplyFailed("site grant could not be recorded".into()))?;
+            }
         }
         Ok(AppliedSettlement {
             effect: Apply::Applied,
@@ -780,7 +835,10 @@ impl ConsentEffects for SiteCardEffects {
 pub(crate) fn register(planes: &Planes) {
     planes.consent_drain.register(
         CardKind::UserBrowserSite,
-        Arc::new(SiteCardEffects(Arc::clone(&planes.user_browser_cards))),
+        Arc::new(SiteCardEffects {
+            holders: Arc::clone(&planes.user_browser_cards),
+            management: Arc::downgrade(&planes.management),
+        }),
     );
 }
 
@@ -1477,6 +1535,7 @@ impl Context<'_> {
         let body = site_question_with_choices(origin, severity.tier, &grant.hazards, &choices);
         crate::permission_cards::require_grant_choice(&body, holder.as_ref())
             .map_err(|error| refusal(error.reason()))?;
+        register(self.planes);
         let card = consent_request(
             CardKind::UserBrowserSite,
             &body,
@@ -1546,6 +1605,18 @@ impl Context<'_> {
                 .await
                 .map_err(|ending| consent_unavailable(&ending))?,
         };
+        self.planes
+            .consent
+            .retain_user_browser_grant(
+                &ask_id,
+                crate::cingulate_client::desk::UserBrowserGrant {
+                    holder: holder.ok_or_else(|| refusal("agent_not_attested"))?,
+                    origin: grant.origin.clone(),
+                    severity: grant.severity,
+                    hazards: grant.hazards.clone(),
+                },
+            )
+            .map_err(|_| refusal("grant_storage_unavailable"))?;
         let mut drain = self.planes.drain_signal.subscribe();
         let cancel = &self.cancel;
         let cancelled = async move {
@@ -2065,6 +2136,7 @@ async fn capture_attempt(
 ) -> Result<Value, Value> {
     let id = opaque("us");
     let mut snapshot = baseline(context, tab, document);
+    let prior_refs = context.target().prior_refs(&snapshot);
     let mut records = Vec::new();
     let mut record_frames = Vec::new();
     let mut frame_owners = BTreeMap::new();
@@ -2328,7 +2400,21 @@ async fn capture_attempt(
                 continue;
             }
             identity.target_id = tab.into();
-            let fresh = opaque("ur");
+            let fresh = prior_refs
+                .get(&(identity.frame_id.clone(), identity.backend_node_id))
+                .filter(|(_, previous)| previous.same_document(frame))
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| {
+                    // Never recycle numbers after releasing a route or reconnecting:
+                    // a ref from another tab must not accidentally name a local node.
+                    format!(
+                        "e{}",
+                        context
+                            .target()
+                            .next_ref
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                });
             if expected_zoom.is_some_and(|expected| expected.identity == identity) {
                 zoom_target = Some(fresh.clone());
             }
@@ -2942,13 +3028,26 @@ async fn input(
                 tab,
                 Some(snapshot.interaction),
                 &frame,
-                vec![command(
-                    "DOM.getContentQuads",
-                    json!({"backendNodeId":identity.backend_node_id}),
-                )],
+                vec![
+                    // CDP scrolls the node without page-supplied JavaScript or
+                    // activating its tab. Measure in the same attachment after
+                    // scrolling, not against the snapshot's old page position.
+                    command(
+                        "DOM.scrollIntoViewIfNeeded",
+                        json!({"backendNodeId":identity.backend_node_id}),
+                    ),
+                    command("Page.getLayoutMetrics", json!({})),
+                    command(
+                        "DOM.getContentQuads",
+                        json!({"backendNodeId":identity.backend_node_id}),
+                    ),
+                ],
             )
             .await?;
-        Some(quad_center(&quad.results[0])?)
+        Some(quad_center(
+            &quad.results[2],
+            &quad.results[1]["cssVisualViewport"],
+        )?)
     };
     let mut steps = Vec::new();
     if action == "type" {
@@ -3211,7 +3310,8 @@ async fn verify_input(
     Ok(())
 }
 
-fn quad_center(result: &Value) -> Result<(f64, f64), Value> {
+fn quad_center(result: &Value, viewport: &Value) -> Result<(f64, f64), Value> {
+    let rect = viewport_transform(viewport)?.input_rect();
     for quad in result["quads"]
         .as_array()
         .ok_or_else(|| refusal("no_geometry"))?
@@ -3230,8 +3330,61 @@ fn quad_center(result: &Value) -> Result<(f64, f64), Value> {
             (numbers[4], numbers[5]),
             (numbers[6], numbers[7]),
         ]);
-        if let Ok(center) = quad.midpoint() {
-            return Ok(center);
+        if quad.midpoint().is_err() {
+            continue;
+        }
+        // Content quads and mouse input are viewport CSS pixels. A long link
+        // can intersect the viewport while its full quad's center is offscreen.
+        // Clip the polygon before selecting a point; never use deprecated
+        // device-pixel layout metrics or add the document's scroll offset here.
+        let mut polygon = vec![
+            (numbers[0], numbers[1]),
+            (numbers[2], numbers[3]),
+            (numbers[4], numbers[5]),
+            (numbers[6], numbers[7]),
+        ];
+        for (axis, edge, minimum) in [
+            (0, rect.x_input_css, true),
+            (0, rect.x_input_css + rect.width_input_css, false),
+            (1, rect.y_input_css, true),
+            (1, rect.y_input_css + rect.height_input_css, false),
+        ] {
+            let coordinate = |point: (f64, f64)| if axis == 0 { point.0 } else { point.1 };
+            let inside = |point| {
+                if minimum {
+                    coordinate(point) >= edge
+                } else {
+                    coordinate(point) <= edge
+                }
+            };
+            let mut clipped = Vec::new();
+            if let Some(mut previous) = polygon.last().copied() {
+                for point in polygon {
+                    if inside(previous) != inside(point) {
+                        let fraction = (edge - coordinate(previous))
+                            / (coordinate(point) - coordinate(previous));
+                        clipped.push((
+                            previous.0 + fraction * (point.0 - previous.0),
+                            previous.1 + fraction * (point.1 - previous.1),
+                        ));
+                    }
+                    if inside(point) {
+                        clipped.push(point);
+                    }
+                    previous = point;
+                }
+            }
+            polygon = clipped;
+        }
+        if polygon.len() >= 3 {
+            let count = polygon.len() as f64;
+            let center = polygon.iter().fold((0.0, 0.0), |sum, point| {
+                (sum.0 + point.0 / count, sum.1 + point.1 / count)
+            });
+            if crate::browser::geometry::require_point_in_viewport(center.0, center.1, rect).is_ok()
+            {
+                return Ok(center);
+            }
         }
     }
     Err(refusal("no_geometry"))

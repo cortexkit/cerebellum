@@ -226,6 +226,142 @@ async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clo
     assert!(rows(&fixture).is_empty());
 }
 
+async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    fixture.state.lock().unwrap().top_level_only = true;
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id":"el_late_site"})),
+        )
+        .then(
+            wire::CONSENT_AWAIT,
+            Reply::Result(json!({"elicitation_id":"el_late_site","state":"pending"})),
+        )
+        .then(
+            wire::CONSENT_DETACH,
+            Reply::Result(
+                json!({"elicitation_id":"el_late_site","state":"pending","detached":true}),
+            ),
+        );
+    let (reply, _) = fixture
+        .call(1, ask(tier, json!([]), "https://example.com"), "")
+        .await;
+    assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    assert!(rows(&fixture).is_empty());
+    script
+        .then(wire::CONSENT_ANSWERS, Reply::Result(json!({"records":[{"elicitation_id":"el_late_site","state":"answered","answered_choice_id":choice}],"cursor":1})))
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
+    // Status does not retry the original demand. Its admitted-call drain must
+    // nevertheless make the durable answer available to subsequent actions.
+    let (status, _) = fixture
+        .call(1, json!({"browser":"user","action":"status"}), "")
+        .await;
+    assert_eq!(status["outcome"], "ok", "{status}");
+    assert_eq!(
+        script
+            .methods()
+            .iter()
+            .filter(|m| m.as_str() == wire::CONSENT_REQUEST)
+            .count(),
+        1
+    );
+    fixture
+}
+
+#[tokio::test]
+async fn late_thirty_minute_site_answer_mints_before_a_different_action() {
+    let fixture = late_site_answer("allow_30m", 2).await;
+    let granted = rows(&fixture);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].max_level, 2);
+    assert_eq!(granted[0].card_ref.as_deref(), Some("el_late_site"));
+    assert_eq!(granted[0].browser_target, Some(BrowserTarget::UserBrowser));
+    assert_eq!(
+        granted[0].expires_at_ms,
+        Some(granted[0].granted_at_ms + 1_800_000)
+    );
+    let tab = fixture.claim(1).await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(cards.is_empty());
+    let (clicked, cards) = fixture.call(1, json!({"browser":"user","action":"click","tab":tab,"ref":reference(&snapshot, "Go"),"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture","severity":{"tier":2,"credential":false,"financial":false}}), "").await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(cards.is_empty());
+    assert!(fixture
+        .planes
+        .consent
+        .take_single_use_approval(
+            &this_session(),
+            &fixture
+                .planes
+                .consent
+                .raised("el_late_site")
+                .unwrap()
+                .subject
+        )
+        .is_none());
+}
+
+#[tokio::test]
+async fn late_always_read_answer_keeps_the_in_call_read_ceiling() {
+    let fixture = late_site_answer("allow_origin_always", 1).await;
+    let granted = rows(&fixture);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].expires_at_ms, None);
+    assert_eq!(granted[0].max_level, 1);
+    let holder = &granted[0].holder;
+    assert!(fixture
+        .planes
+        .management
+        .agent_grants()
+        .authorize(
+            holder,
+            crate::agent_grants::GrantDemand::Browser {
+                target: BrowserTarget::UserBrowser,
+                origin: "https://example.com".into(),
+                severity: Severity::new(2, false, false),
+                hazards: BTreeSet::new(),
+            }
+        )
+        .is_none());
+    let tab = fixture.claim(1).await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(cards.is_empty());
+}
+
+#[tokio::test]
+async fn read_thirty_minute_late_answer_matches_the_in_call_ceiling() {
+    let fixture = late_site_answer("allow_30m", 1).await;
+    let granted = rows(&fixture);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].max_level, 1);
+    assert_eq!(
+        granted[0].expires_at_ms,
+        Some(granted[0].granted_at_ms + 1_800_000)
+    );
+    assert!(fixture
+        .planes
+        .management
+        .agent_grants()
+        .authorize(
+            &granted[0].holder,
+            crate::agent_grants::GrantDemand::Browser {
+                target: BrowserTarget::UserBrowser,
+                origin: "https://example.com".into(),
+                severity: Severity::new(2, false, false),
+                hazards: BTreeSet::new(),
+            }
+        )
+        .is_none());
+    let tab = fixture.claim(1).await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(cards.is_empty());
+}
+
 #[tokio::test]
 async fn forged_user_browser_all_sites_answers_never_write_a_row() {
     for choice in ["allow_all_sites_30m", "allow_all_sites_always"] {

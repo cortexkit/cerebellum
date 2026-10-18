@@ -179,7 +179,8 @@ plan; they are not new caller commands and do not extend that deadline.
 - `Page.getNavigationHistory`, `Page.getFrameTree`, `Page.navigate`, `Page.captureScreenshot`, `Page.getLayoutMetrics`
 - `Accessibility.enable`, `Accessibility.getFullAXTree`
 - `DOM.enable`, `DOM.getFlattenedDocument`, `DOM.getOuterHTML`, `DOM.getContentQuads`,
-  `DOM.getNodeForLocation`, `DOM.focus`, `DOM.resolveNode`, `DOM.getFrameOwner`
+  `DOM.getNodeForLocation`, `DOM.focus`, `DOM.resolveNode`, `DOM.getFrameOwner`,
+  `DOM.scrollIntoViewIfNeeded` (modifying, requires the last read's interaction epoch)
 - `Runtime.enable`, `Runtime.callFunctionOn` (hash-pinned only, below)
 - `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText`
 - `Emulation.setFocusEmulationEnabled` (only `{enabled:true}`)

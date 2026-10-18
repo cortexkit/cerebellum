@@ -92,6 +92,8 @@ struct DoubleState {
     remove_group_on_card: bool,
     foreign_hit: bool,
     viewport_changed: bool,
+    clipped_click: bool,
+    scrolled: bool,
     /// Chrome's CDP error for the next plan command with this method.
     fail_method: Option<(&'static str, i64, String)>,
     /// The "Go" button has no type attribute and no form, like the button in
@@ -807,6 +809,17 @@ fn execute(
                 }
                 dom
             }
+            "DOM.scrollIntoViewIfNeeded" => {
+                state.scrolled = true;
+                json!({})
+            }
+            "DOM.getContentQuads" if state.clipped_click => {
+                if state.scrolled {
+                    json!({"quads":[[10,20,590,20,590,1000,10,1000]]})
+                } else {
+                    json!({"quads":[[10,1200,590,1200,590,2180,10,2180]]})
+                }
+            }
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
             "DOM.getOuterHTML" => {
                 json!({"outerHTML":format!("HTML-{}", command["frame_id"].as_str().unwrap())})
@@ -818,7 +831,11 @@ fn execute(
                 json!({"backendNodeId":3,"frameId":if state.foreign_hit || command["frame_id"] == "foreign" { "foreign" } else { "main" }})
             }
             "Page.getLayoutMetrics" => {
-                json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
+                if state.clipped_click {
+                    json!({"layoutViewport":{"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800},"visualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800,"scale":1},"cssLayoutViewport":{"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400},"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400,"scale":1}})
+                } else {
+                    json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
+                }
             }
             "Page.captureScreenshot" => {
                 json!({"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="})
@@ -918,6 +935,87 @@ fn reference(reply: &Value, name: &str) -> String {
 
 fn click(tab: &str, snapshot: &Value, reference: &str) -> Value {
     json!({"browser":"user","action":"click","tab":tab,"snapshot_id":snapshot["snapshot_id"],"ref":reference,"intent":"press Go","severity":{"tier":2,"credential":false,"financial":false}})
+}
+
+#[tokio::test]
+async fn click_scrolls_and_clips_in_css_viewport_without_device_or_document_offsets() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.clipped_click = true;
+    }
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    let commands: Vec<_> = state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .collect();
+    let methods: Vec<_> = commands
+        .iter()
+        .map(|command| command["method"].as_str().unwrap())
+        .collect();
+    let scroll = methods
+        .iter()
+        .position(|method| *method == "DOM.scrollIntoViewIfNeeded")
+        .unwrap();
+    assert_eq!(
+        &methods[scroll..scroll + 3],
+        [
+            "DOM.scrollIntoViewIfNeeded",
+            "Page.getLayoutMetrics",
+            "DOM.getContentQuads"
+        ]
+    );
+    let mouse: Vec<_> = commands
+        .iter()
+        .filter(|command| command["method"] == "Input.dispatchMouseEvent")
+        .collect();
+    assert_eq!(mouse.len(), 2);
+    for command in mouse {
+        assert_eq!(command["params"]["x"], 300.0);
+        assert_eq!(command["params"]["y"], 210.0);
+    }
+}
+
+#[tokio::test]
+async fn short_refs_are_stable_only_for_the_same_route_tab_and_document() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().top_level_only = true;
+    let tab = fixture.claim(1).await;
+    let (first, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let name = reference(&first, "Go");
+    assert!(
+        name.starts_with('e') && name[1..].chars().all(|c| c.is_ascii_digit()),
+        "{name}"
+    );
+    assert!(name.len() < 8, "{name}");
+    let (second, _) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(reference(&second, "Go"), name);
+    assert_ne!(first["snapshot_id"], second["snapshot_id"]);
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .tabs
+        .get_mut(&tab)
+        .unwrap()
+        .loader += 1;
+    let (third, _) = fixture.snapshot(1, &tab, "").await;
+    assert_ne!(reference(&third, "Go"), name);
+    let (stale, _) = fixture.call(1, click(&tab, &third, &name), "").await;
+    assert_eq!(stale["reason"], "ref_scope_mismatch", "{stale}");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
 }
 
 #[tokio::test]

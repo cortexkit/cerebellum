@@ -17,6 +17,7 @@
 //!   the two re-reads it and applies it again, idempotently, rather than
 //!   losing it.
 
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -311,6 +312,19 @@ pub struct CardLifecycle {
     pub ended: bool,
     pub acked: bool,
     pub deferred_use: bool,
+    /// The exact authority offered by a person's Chrome site card. Retaining it
+    /// with the card lets a later call store a durable answer before acking it,
+    /// even when that call requests a different action or the process restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_browser_grant: Option<UserBrowserGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserBrowserGrant {
+    pub holder: crate::agent_grants::GrantHolder,
+    pub origin: String,
+    pub severity: crate::authorization::Severity,
+    pub hazards: BTreeSet<crate::authorization::HazardClass>,
 }
 
 impl CardLifecycle {
@@ -680,6 +694,18 @@ impl ConsentDesk {
     /// The card cerebellum raised under `elicitation_id`, if it still holds it.
     pub fn raised(&self, elicitation_id: &str) -> Option<RaisedCard> {
         lock(&self.registry).get(elicitation_id).cloned()
+    }
+
+    pub(crate) fn retain_user_browser_grant(
+        &self,
+        id: &str,
+        grant: UserBrowserGrant,
+    ) -> Result<(), String> {
+        let mut registry = lock(&self.registry);
+        let card = registry.get_mut(id).ok_or("site card is not recorded")?;
+        card.lifecycle.user_browser_grant = Some(grant);
+        drop(registry);
+        self.save()
     }
 
     /// The open card this session raised about `subject`, for a call that
@@ -1460,7 +1486,15 @@ impl DeskSession<'_> {
                     && (card.kind.single_use() || card.lifecycle.deferred_use)
                 {
                     if let Ending::Granted { choice_id } = &ending {
-                        self.desk.record_single_use_approval(&card, choice_id);
+                        // Durable site answers have already been minted by the
+                        // adapter. Keeping a second approval would resurrect a
+                        // revoked or expired grant when the original call retries.
+                        let durable_site = card.kind == CardKind::UserBrowserSite
+                            && card.lifecycle.user_browser_grant.is_some()
+                            && matches!(choice_id.as_str(), "allow_30m" | "allow_origin_always");
+                        if !durable_site {
+                            self.desk.record_single_use_approval(&card, choice_id);
+                        }
                     }
                 }
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {

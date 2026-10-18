@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { FrameGeometry, transformPoint } from "../frame-geometry.mjs";
 import { classifyCommand } from "../commands.mjs";
+import { fakeChrome } from "./fake-chrome.mjs";
 
 const geometry = { quad: [100, 50, 500, 50, 500, 250, 100, 250], width: 200, height: 100 };
 test("frame geometry converts local input to root hit coordinates and back", () => {
@@ -81,4 +82,29 @@ test("point and ref hit tests preserve an omitted child's ambiguity refusal", as
     await assert.rejects(f.helper.hit(scoped ? { x: 20, y: 30 } : { x: 140, y: 110 }, scoped ? f.child : null, {}), { reason: "frame_ambiguous" });
     assert(!f.calls.some(call => call.target.sessionId));
   }
+});
+
+test("background tab hit testing uses CSS viewport bounds and adds document scroll exactly once", async () => {
+  const chrome = fakeChrome();
+  assert.equal(chrome.tabData.get(2).active, false);
+  const root = { frame_id: "root", session_id: "root" };
+  const calls = [];
+  const frames = { state: { tabId: 2 }, sessions: new Map(), async send(target, method, params) {
+    calls.push({ target, method, params });
+    assert.deepEqual(target, { tabId: 2 });
+    if (method === "Page.getLayoutMetrics") return {
+      layoutViewport: { clientWidth: 1200, clientHeight: 800, pageX: 0, pageY: 1800 },
+      visualViewport: { clientWidth: 1200, clientHeight: 800, offsetX: 0, offsetY: 0, pageX: 0, pageY: 1800 },
+      cssLayoutViewport: { clientWidth: 600, clientHeight: 400, pageX: 0, pageY: 900 },
+      cssVisualViewport: { clientWidth: 600, clientHeight: 400, offsetX: 0, offsetY: 0, pageX: 0, pageY: 900, scale: 1 },
+    };
+    if (method === "DOM.getNodeForLocation") return { frameId: "root", backendNodeId: 9 };
+    throw new Error(`unexpected method: ${method}`);
+  } };
+  const helper = new FrameGeometry(frames, [root]);
+  const hit = await helper.hit({ x: 300, y: 210 }, root, {});
+  assert.deepEqual(hit.frame_point, { x: 300, y: 210 });
+  assert.deepEqual(calls.at(-1).params, { x: 300, y: 1110 });
+  await assert.rejects(helper.hit({ x: 900, y: 210 }, root, {}), { reason: "point_outside_viewport" });
+  assert.equal(chrome.tabData.get(2).active, false);
 });
