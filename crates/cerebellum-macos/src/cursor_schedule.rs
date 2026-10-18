@@ -10,11 +10,14 @@ const MAX_PICTURES: usize = 64;
 ///
 /// The badge means "this agent is using the computer", the way ChatGPT's agent
 /// cursor stays on screen for the whole time its agent works, not a flash per
-/// action. Agents pause between actions to think, read, or wait on a person, so
-/// the badge rests at its last spot and only fades once its agent has sent no
-/// event for this long. An explicit end (route closed, call cancelled) hides it
-/// sooner; this is the fallback for an agent that simply stops.
-pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(30);
+/// action. Agents pause between actions for minutes at a time, to think, read,
+/// or write a long reply, and a badge that dims during such a pause looks
+/// like the agent has gone. So a resting badge stays at full opacity; the
+/// normal way it leaves is an explicit end (the turn ended, the route closed,
+/// the call was cancelled), which hides it at once. This timeout is only the
+/// safety net for an end signal that never arrives, so it is long enough that
+/// no working agent ever reaches it.
+pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// The fade itself stays short: once the agent is idle, the badge should go.
 const FADE: Duration = Duration::from_millis(250);
@@ -134,6 +137,10 @@ mod tests {
 
     const SECOND: Duration = Duration::from_secs(1);
 
+    fn ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
     /// One `advance` at `at`, with every drawn picture already at rest. Returns
     /// what each picture was told to do and the wait the schedule asked for.
     fn resting_steps<P: Copy>(
@@ -173,49 +180,95 @@ mod tests {
     }
 
     #[test]
-    fn picture_stays_fully_visible_for_29_seconds_then_fades_after_30() {
+    fn resting_badge_stays_fully_opaque_while_its_agent_works() {
+        // An agent that acts once and then thinks or writes for minutes is
+        // still working: its badge must neither dim nor ask for frames. These
+        // are wall-clock times on purpose, not offsets from the timeout, so a
+        // short timeout (the old 30 seconds, which greyed the badge out in the
+        // middle of a turn) fails here.
         let start = Instant::now();
         let mut schedule = CursorSchedule::new();
         schedule.picture_for_event("agent".into(), start, || ());
-        for second in [0, 1, 10, 29] {
-            let (steps, _) = resting_steps(&mut schedule, start + SECOND * second);
-            assert_eq!(alpha(&steps), Some(1.0), "at {second} s");
+        for at in [1, 29, 31, 60, 120, 300, 540, 599] {
+            let (steps, wait) = resting_steps(&mut schedule, start + SECOND * at);
+            assert_eq!(alpha(&steps), Some(1.0), "dimmed at {at} s of rest");
+            assert!(
+                matches!(wait, Wait::Timed(_)),
+                "a resting badge asked for {wait:?} at {at} s"
+            );
         }
-        let (steps, wait) = resting_steps(&mut schedule, start + SECOND * 30 + FADE / 2);
+    }
+
+    #[test]
+    fn idle_timeout_fades_the_picture_then_drops_it_and_asks_for_no_frames() {
+        let start = Instant::now();
+        let mut schedule = CursorSchedule::new();
+        schedule.picture_for_event("agent".into(), start, || ());
+        let (steps, _) = resting_steps(&mut schedule, start + IDLE_FADE_AFTER - SECOND);
+        assert_eq!(alpha(&steps), Some(1.0), "just before the timeout");
+        let (steps, wait) = resting_steps(&mut schedule, start + IDLE_FADE_AFTER + FADE / 2);
         assert_eq!(alpha(&steps), Some(0.5), "half way through the fade");
         assert_eq!(wait, Wait::Frame(FRAME_INTERVAL), "a fade is animated");
-        let (steps, wait) = resting_steps(&mut schedule, start + SECOND * 30 + FADE);
+        let (steps, wait) = resting_steps(&mut schedule, start + IDLE_FADE_AFTER + FADE);
         assert_eq!(steps, [((), PictureStep::Hide)]);
         assert_eq!(wait, Wait::Event);
+        // Dropped: never drawn again, no frame and no timer requested, and a
+        // late avatar has nothing to decorate.
+        let wait = schedule.advance(start + IDLE_FADE_AFTER * 2, |_, step| {
+            panic!("a faded picture was given {step:?}")
+        });
+        assert_eq!(wait, Wait::Event);
+        assert!(schedule.picture_for_update("agent").is_none());
     }
 
     #[test]
-    fn event_at_20_seconds_keeps_the_picture_visible_until_50() {
+    fn an_event_restarts_the_idle_clock() {
         let start = Instant::now();
         let mut schedule = CursorSchedule::new();
         schedule.picture_for_event("agent".into(), start, || ());
-        resting_steps(&mut schedule, start + SECOND * 20);
-        schedule.picture_for_event("agent".into(), start + SECOND * 20, || ());
-        for second in [21, 31, 40, 49, 50] {
-            let (steps, _) = resting_steps(&mut schedule, start + SECOND * second);
-            assert_eq!(alpha(&steps), Some(1.0), "at {second} s");
+        let half = IDLE_FADE_AFTER / 2;
+        resting_steps(&mut schedule, start + half);
+        schedule.picture_for_event("agent".into(), start + half, || ());
+        for at in [IDLE_FADE_AFTER, half + IDLE_FADE_AFTER] {
+            let (steps, _) = resting_steps(&mut schedule, start + at);
+            assert_eq!(alpha(&steps), Some(1.0), "at {at:?}");
         }
-        let (steps, _) = resting_steps(&mut schedule, start + SECOND * 50 + FADE);
+        let (steps, _) = resting_steps(&mut schedule, start + half + IDLE_FADE_AFTER + FADE);
         assert_eq!(steps, [((), PictureStep::Hide)]);
     }
 
     #[test]
-    fn end_hides_at_once_and_a_later_event_creates_it_again() {
+    fn end_removes_the_picture_at_once_and_asks_for_no_more_frames() {
         let start = Instant::now();
         let mut schedule = CursorSchedule::new();
         schedule.picture_for_event("ending".into(), start, || "first");
-        schedule.picture_for_event("other".into(), start, || "other");
-        let mut hidden = Vec::new();
-        schedule.end("ending", |picture, step| hidden.push((*picture, step)));
-        assert_eq!(hidden, [("first", PictureStep::Hide)]);
-        // Released: nothing left to hide twice, and a late raster has no target.
+        // Still gliding when the turn ends: it needs frames until the end.
+        assert_eq!(
+            schedule.advance(start, |_, _| true),
+            Wait::Frame(FRAME_INTERVAL)
+        );
+        let mut removed = Vec::new();
+        schedule.end("ending", |picture, step| removed.push((*picture, step)));
+        assert_eq!(
+            removed,
+            [("first", PictureStep::Hide)],
+            "end must take the window off the screen, once"
+        );
+        // Released: nothing left to hide twice, no frame or timer is asked
+        // for, and a late raster has no target.
         schedule.end("ending", |_, _| panic!("already hidden"));
+        assert_eq!(
+            schedule.advance(start + SECOND, |_, step| panic!(
+                "ended picture got {step:?}"
+            )),
+            Wait::Event
+        );
         assert!(schedule.picture_for_update("ending").is_none());
+
+        // Ending one agent leaves another agent's picture alone.
+        schedule.picture_for_event("ending".into(), start, || "first");
+        schedule.picture_for_event("other".into(), start, || "other");
+        schedule.end("ending", |_, _| {});
         let (steps, _) = resting_steps(&mut schedule, start + SECOND);
         assert_eq!(
             steps,
@@ -226,7 +279,6 @@ mod tests {
                     alpha: 1.0
                 }
             )],
-            "ending one agent leaves another agent's picture alone"
         );
         let mut created = false;
         schedule.picture_for_event("ending".into(), start + SECOND * 2, || {
@@ -285,7 +337,7 @@ mod tests {
         schedule.picture_for_event("new".into(), start + SECOND * 10, || ());
         assert_eq!(
             resting_steps(&mut schedule, start + SECOND * 12).1,
-            Wait::Timed(SECOND * 18)
+            Wait::Timed(IDLE_FADE_AFTER - SECOND * 12)
         );
     }
 
@@ -300,7 +352,7 @@ mod tests {
         assert!(steps.contains(&(
             "old",
             PictureStep::Draw {
-                elapsed_ms: 30_125.0,
+                elapsed_ms: ms(IDLE_FADE_AFTER + FADE / 2),
                 alpha: 0.5,
             }
         )));
@@ -311,7 +363,7 @@ mod tests {
                 (
                     "live",
                     PictureStep::Draw {
-                        elapsed_ms: 29_250.0,
+                        elapsed_ms: ms(IDLE_FADE_AFTER + FADE - SECOND),
                         alpha: 1.0
                     }
                 ),
@@ -325,7 +377,7 @@ mod tests {
             [(
                 "live",
                 PictureStep::Draw {
-                    elapsed_ms: 29_500.0,
+                    elapsed_ms: ms(IDLE_FADE_AFTER + SECOND / 2 - SECOND),
                     alpha: 1.0
                 }
             )]

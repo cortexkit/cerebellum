@@ -78,8 +78,8 @@ mod cursor_schedule;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
-    render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot, OverlayEvent,
-    OverlayGesture, OverlayMessage,
+    probe_cursor_hide, render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot,
+    HideProbe, OverlayEvent, OverlayGesture, OverlayMessage, AVATAR_PIXELS,
 };
 #[cfg(target_os = "macos")]
 mod peer_attestation;

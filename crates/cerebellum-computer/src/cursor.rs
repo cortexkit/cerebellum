@@ -2,8 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const AVATAR_SIZE: u32 = 32;
-pub const MAX_CURSOR_LINE: usize = 24_576;
+/// The avatar raster's side in pixels. The chip is 32 points across and a
+/// Retina display draws each point as two pixels, so 64 pixels keep the avatar
+/// sharp; a smaller raster is upscaled and blurs into an unrecognisable blob.
+pub const AVATAR_SIZE: u32 = 64;
+/// The longest pipe line. The largest is an avatar update: 64 x 64 x 4 bytes,
+/// each written in JSON as at most three digits and a comma (64 KiB), plus
+/// the event's other fields.
+pub const MAX_CURSOR_LINE: usize = 72 * 1024;
 const MAX_LABEL_CHARS: usize = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +63,7 @@ pub fn label(kind: CursorKind, title: Option<&str>, secure: bool) -> Option<Stri
 pub struct CursorEvent {
     pub agent: String,
     pub initial: char,
-    /// Where the arrow's tip goes, in global top-down screen points.
+    /// Where the pointer's tip goes, in global top-down screen points.
     pub to: [f64; 2],
     /// The acted-on element's frame (x, y, width, height), when one is known.
     /// The label pill is placed so it never covers this rectangle.
@@ -207,7 +213,7 @@ pub fn position(from: [f64; 2], to: [f64; 2], fraction: f64, reduce_motion: bool
     [from[0] + dx * s + dy * bow, from[1] + dy * s - dx * bow]
 }
 
-/// The arrow's scale after it lands, applied about the tip so the tip stays on
+/// The pointer's scale after it lands, applied about the tip so the tip stays on
 /// the target. A press dips to 0.9 and back like a tap; anything else swells
 /// 4% and back as a settle. Reduce Motion keeps the scale at exactly 1.
 pub fn settle_scale(since_arrival_ms: f64, press: bool, reduce_motion: bool) -> f64 {
@@ -234,9 +240,153 @@ pub fn fade_alpha(fraction: f64, reduce_motion: bool) -> f64 {
     (2.0 * fraction - 1.0).abs()
 }
 
+/// How long a badge's first appearance takes, in ms. It glides in from a
+/// little way off while it fades up, so it reads as the agent arriving at the
+/// spot rather than popping into place.
+pub const ARRIVAL_MS: f64 = 260.0;
+
+/// Where an arrival glide starts, relative to the tip's destination: down and
+/// to the right, the side the avatar chip trails on, so the pointer leads the
+/// way in. About 45 points: far enough to read as motion, near enough that the
+/// badge is plainly arriving at this spot and not crossing the screen.
+const ARRIVAL_OFFSET: [f64; 2] = [34.0, 30.0];
+
+/// The share of the arrival over which the badge fades up; it is fully opaque
+/// for the rest of the glide and the whole time it rests.
+const ARRIVAL_FADE_SHARE: f64 = 0.6;
+
+/// Where the tip starts on a badge's first appearance. With Reduce Motion it
+/// does not travel: it fades in where it lands.
+pub fn arrival_start(to: [f64; 2], reduce_motion: bool) -> [f64; 2] {
+    if reduce_motion {
+        return to;
+    }
+    [to[0] + ARRIVAL_OFFSET[0], to[1] + ARRIVAL_OFFSET[1]]
+}
+
+/// Opacity on a badge's first appearance, for a fraction of `ARRIVAL_MS`. It
+/// rises from 0 with an ease-out and is exactly 1 from `ARRIVAL_FADE_SHARE`
+/// on; with Reduce Motion the fade takes the whole arrival, since there is no
+/// glide to carry the eye. A malformed fraction answers 1: a badge that is
+/// meant to be visible must never be left dimmed.
+pub fn arrival_alpha(fraction: f64, reduce_motion: bool) -> f64 {
+    if !fraction.is_finite() || fraction >= 1.0 {
+        return 1.0;
+    }
+    if fraction <= 0.0 {
+        return 0.0;
+    }
+    let share = if reduce_motion {
+        1.0
+    } else {
+        ARRIVAL_FADE_SHARE
+    };
+    let t = (fraction / share).min(1.0);
+    1.0 - (1.0 - t).powi(2)
+}
+
+/// The colours a badge can be drawn in, sRGB in [0, 1]. Each is saturated, so
+/// the badge cannot be mistaken for the black-and-white system pointer, and
+/// dark enough for the white outline and white label text drawn on it. None
+/// is red, which would read as an error, and none is grey, which reads as
+/// disabled.
+const ACCENTS: [[f64; 3]; 6] = [
+    // Violet.
+    [0.427, 0.290, 1.000],
+    // Blue.
+    [0.122, 0.435, 0.922],
+    // Teal.
+    [0.000, 0.537, 0.482],
+    // Magenta.
+    [0.761, 0.094, 0.545],
+    // Orange.
+    [0.851, 0.282, 0.059],
+    // Green.
+    [0.118, 0.557, 0.243],
+];
+
+/// The agent's accent colour: the same agent always gets the same colour, so
+/// two agents working at once are told apart at a glance. Picked by a stable
+/// hash of the agent's id (64-bit FNV-1a), never by process state, so the
+/// colour survives a helper restart.
+pub fn accent(agent: &str) -> [f64; 3] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in agent.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    ACCENTS[(hash % ACCENTS.len() as u64) as usize]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WCAG relative luminance of an sRGB colour.
+    fn luminance(colour: [f64; 3]) -> f64 {
+        let linear = |c: f64| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(colour[0]) + 0.7152 * linear(colour[1]) + 0.0722 * linear(colour[2])
+    }
+
+    #[test]
+    fn accent_is_stable_per_agent_and_legible_under_white_text() {
+        assert_eq!(accent("agent-a"), accent("agent-a"));
+        let used: std::collections::BTreeSet<usize> = (0..60)
+            .map(|n| {
+                let colour = accent(&format!("agent-{n}"));
+                ACCENTS.iter().position(|c| *c == colour).unwrap()
+            })
+            .collect();
+        assert_eq!(used.len(), ACCENTS.len(), "agents spread over every colour");
+        for colour in ACCENTS {
+            // White label text and the white outline need at least 4:1.
+            let contrast = 1.05 / (luminance(colour) + 0.05);
+            assert!(contrast >= 4.0, "{colour:?} gives white {contrast:.2}:1");
+            // Saturated: far from any grey, so never the system pointer's look.
+            let spread = colour.iter().cloned().fold(0.0, f64::max)
+                - colour.iter().cloned().fold(1.0, f64::min);
+            assert!(spread >= 0.4, "{colour:?} is too grey");
+        }
+    }
+
+    #[test]
+    fn arrival_glides_in_from_nearby_and_is_fully_opaque_once_it_lands() {
+        let to = [400.0, 300.0];
+        let from = arrival_start(to, false);
+        let distance = (from[0] - to[0]).hypot(from[1] - to[1]);
+        assert!(
+            (30.0..=60.0).contains(&distance),
+            "starts {distance} pt off"
+        );
+        assert!((200.0..=300.0).contains(&ARRIVAL_MS));
+        assert_eq!(arrival_start(to, true), to, "Reduce Motion does not travel");
+        assert_eq!(arrival_alpha(0.0, false), 0.0);
+        assert_eq!(arrival_alpha(-1.0, false), 0.0);
+        assert_eq!(arrival_alpha(f64::NAN, false), 1.0);
+        let mut last = 0.0;
+        for step in 1..=100 {
+            let fraction = f64::from(step) / 100.0;
+            let alpha = arrival_alpha(fraction, false);
+            assert!(alpha >= last, "the fade-in never dips at {fraction}");
+            last = alpha;
+            if fraction >= ARRIVAL_FADE_SHARE {
+                assert_eq!(alpha, 1.0, "opaque from {ARRIVAL_FADE_SHARE} on");
+            }
+            assert!((0.0..=1.0).contains(&arrival_alpha(fraction, true)));
+        }
+        assert!(
+            arrival_alpha(0.5, true) < 1.0,
+            "Reduce Motion fades all the way"
+        );
+        assert_eq!(arrival_alpha(1.0, true), 1.0);
+        assert_eq!(arrival_alpha(5.0, false), 1.0);
+    }
 
     #[test]
     fn glide_time_grows_with_distance_within_its_bounds() {
