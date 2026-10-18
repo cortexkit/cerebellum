@@ -28,7 +28,8 @@ fn bind_content_reader(planes: &Planes) {
             Some(&json!({
                 "agentProjectId": "test-project",
                 "sessionKind": "primary",
-                "effectiveCapabilityScope": ["*"],
+                      "effectiveCapabilityScope": ["*"],
+                      "browserControlOperations": [crate::browser_session::BROWSER_STATUS],
             })),
             Some(&[
                 "elicitation".to_string(),
@@ -63,7 +64,7 @@ struct Views {
 }
 
 impl Views {
-    fn check(&mut self, label: &str, frame: &Frame) -> Value {
+    fn check(&mut self, action: &str, label: &str, frame: &Frame) -> Value {
         assert_eq!(
             frame.header.ty,
             FrameType::Response,
@@ -75,10 +76,14 @@ impl Views {
             serde_json::from_value(result.clone())
                 .unwrap_or_else(|error| panic!("{label}: not a content/v1 result: {error}"));
         cortexkit_role_tool_provider::result::validate(&typed).unwrap();
-        for problem in crate::tool_result::model_view_problems(&result) {
+        for problem in crate::tool_result::model_view_problems_for_action(&result, action) {
             self.failures.push(format!("{label}: {problem}"));
         }
         self.results.push((label.to_string(), result.clone()));
+        println!(
+            "MODEL_VIEW AUDIT {label} [{action}]: {}",
+            texts(&result).replace('\n', " | ")
+        );
         result
     }
 
@@ -107,6 +112,7 @@ fn browser_calls() -> Vec<(&'static str, Value)> {
         ("open_tab", json!({"browser": "user"})),
         ("claim_tab", json!({"browser": "user", "tab": "tab-1"})),
         ("status", json!({})),
+        ("status", json!({"browser": "user"})),
         ("close", json!({"browser_session_id": "session-1"})),
         (
             "navigate",
@@ -166,7 +172,7 @@ async fn every_browser_action_reads_as_plain_words() {
         // A request the flat tool refuses before dispatch is a route error,
         // not a tool result, and carries no model view of its own.
         if frame.header.ty == FrameType::Response {
-            views.check(&format!("browser {action} {arguments}"), &frame);
+            views.check(action, &format!("browser {action} {arguments}"), &frame);
         }
     }
     views.assert_clean();
@@ -518,7 +524,7 @@ mod computer {
             .await
             .expect("the parked read replied")
             .unwrap();
-        let pending = views.check("read_state while consent is pending", &reply);
+        let pending = views.check("read_state", "read_state while consent is pending", &reply);
         assert_eq!(
             pending["structuredContent"]["outcome"], "consent_pending",
             "the first read of an ungranted app must ask: {pending}"
@@ -551,6 +557,7 @@ mod computer {
 
         let (id, arguments) = next(json!({"action": "read_state", "target": "Magic Context"}));
         let read = views.check(
+            "read_state",
             "read_state by partial name",
             &call(&planes, id, arguments).await,
         );
@@ -569,7 +576,11 @@ mod computer {
         let field = id_of(&read_text, "text field");
 
         let (id, arguments) = next(json!({"action": "list_apps"}));
-        let listed = views.check("list_apps", &call(&planes, id, arguments).await);
+        let listed = views.check(
+            "list_apps",
+            "list_apps",
+            &call(&planes, id, arguments).await,
+        );
         assert!(
             texts(&listed).starts_with("Running apps:\nMagic Context Dashboard · com.example.dashboard · pid 4242 · frontmost\n"),
             "{listed}"
@@ -598,12 +609,13 @@ mod computer {
         for arguments in calls {
             let (id, arguments) = next(arguments);
             let label = format!("computer {arguments}");
+            let action = arguments["action"].as_str().unwrap_or("unknown");
             let frame = call(&planes, id, arguments).await;
             // A request the flat tool refuses before dispatch (a missing
             // required field) is a route error, not a tool result, and
             // carries no model view of its own.
             if frame.header.ty == FrameType::Response {
-                views.check(&label, &frame);
+                views.check(action, &label, &frame);
                 answered += 1;
             }
         }

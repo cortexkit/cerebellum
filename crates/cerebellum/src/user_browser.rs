@@ -1865,7 +1865,8 @@ async fn serve_inner(
                 hazards,
             )
             .await?;
-        return Ok(json!({"browser":"user","outcome":"ok","input_dispatched":false}));
+        // The next user-browser call is scoped to this site, so name what was authorized.
+        return Ok(json!({"browser":"user","outcome":"ok","origin":site,"input_dispatched":false}));
     }
     let tab = args["tab"].as_str().expect("validated tab");
     let current = context.document(tab).await?;

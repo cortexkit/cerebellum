@@ -7,6 +7,12 @@ use serde_json::{json, Map, Value};
 
 mod plain;
 
+const GENERIC_SUCCESS_FALLBACK: &str = "Done.";
+const UNDESCRIBABLE_REPLY_FALLBACK: &str = "The tool returned a reply this module cannot describe.";
+// Closing a session has no useful continuing state; other actions must describe their result.
+#[cfg(test)]
+const GENERIC_FALLBACK_ACTION_ALLOWLIST: &[&str] = &["close"];
+
 tokio::task_local! {
     pub(crate) static RESULT_BIND: Option<(String, cerebellum_core::identity::AcceptedBindFacts)>;
 }
@@ -123,7 +129,7 @@ fn project(reply: Value) -> ToolResult {
         // is replaced by a notice rather than printed as JSON.
         let text = match &reply {
             Value::String(text) if !text.trim().is_empty() => text.clone(),
-            _ => "The tool returned a reply this module cannot describe.".to_string(),
+            _ => UNDESCRIBABLE_REPLY_FALLBACK.to_string(),
         };
         return ToolResult::new(vec![ContentPart::text(text)]);
     };
@@ -154,7 +160,7 @@ fn project(reply: Value) -> ToolResult {
     }) {
         content.push(ContentPart::text(match code {
             Some(code) if !is_success(code) => plain::sentence(&code.replace('_', " ")),
-            _ => "Done.".to_string(),
+            _ => GENERIC_SUCCESS_FALLBACK.to_string(),
         }));
     }
     let mut result = ToolResult::new(content).with_structured_content(object.clone());
@@ -258,6 +264,33 @@ pub(crate) fn model_view_problems(result: &Value) -> Vec<String> {
                 problems.push(format!("JSON in a text part: {text:?}"));
                 break;
             }
+        }
+    }
+    problems
+}
+
+/// Apply the normal model-view checks and reject generic fallback text unless
+/// the action is explicitly one whose successful reply has nothing useful to add.
+#[cfg(test)]
+pub(crate) fn model_view_problems_for_action(result: &Value, action: &str) -> Vec<String> {
+    let mut problems = model_view_problems(result);
+    if GENERIC_FALLBACK_ACTION_ALLOWLIST.contains(&action) {
+        return problems;
+    }
+    for part in result["content"].as_array().into_iter().flatten() {
+        if part["type"] != "text" {
+            continue;
+        }
+        let Some(text) = part["text"].as_str() else {
+            continue;
+        };
+        if matches!(
+            text,
+            GENERIC_SUCCESS_FALLBACK | UNDESCRIBABLE_REPLY_FALLBACK
+        ) {
+            problems.push(format!(
+                "action {action} used generic fallback text {text:?}"
+            ));
         }
     }
     problems
@@ -421,6 +454,302 @@ mod tests {
                 "Image reference-1 was not delivered: inline_bytes_missing"
             ]
         );
+    }
+
+    #[test]
+    fn action_success_projection_audit_prints_plain_text() {
+        let cases = [
+            (
+                "browser own launch",
+                json!({"outcome":"launched","browser_session_id":"session-1"}),
+            ),
+            (
+                "browser own status",
+                json!({"outcome":"ready","browser_session_id":"session-1","profile_disposition":"disposable","lease":{"idle_timeout_ms":60000,"idle_expires_at":"2026-10-17T13:14:15.000Z"}}),
+            ),
+            (
+                "browser user status",
+                json!({"browser":"user","outcome":"ok","connected":false,"tabs":[]}),
+            ),
+            (
+                "browser user status",
+                json!({"browser":"user","outcome":"ok","connected":true,"tabs":[{"tab":"tab-1","claim":"claimed_by_this_route","interaction_epoch":1}]}),
+            ),
+            (
+                "browser own close",
+                json!({"outcome":"closed","browser_session_id":"session-1"}),
+            ),
+            (
+                "browser user open_tab",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1"}),
+            ),
+            (
+                "browser user claim_tab",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1"}),
+            ),
+            (
+                "browser own navigate",
+                json!({"outcome":"completed","url_final":"https://example.test/"}),
+            ),
+            (
+                "browser own snapshot",
+                json!({"outcome":"completed","snapshot_id":"snap-1","state_text":"Page at example.test; Continue button"}),
+            ),
+            (
+                "browser own screenshot",
+                json!({"outcome":"completed","snapshot_id":"snap-2","image":{"image_id":"image-2","width_px":320,"height_px":240}}),
+            ),
+            (
+                "browser own scroll",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "browser own click",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "browser own type",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "browser own click_point",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "browser own open_grant",
+                json!({"outcome":"granted","expires_in_ms":60000}),
+            ),
+            (
+                "browser user open_grant",
+                json!({"browser":"user","outcome":"ok","origin":"https://example.test"}),
+            ),
+            (
+                "browser own present",
+                json!({"outcome":"presented","expires_in_ms":60000}),
+            ),
+            ("browser own resume", json!({"outcome":"resumed"})),
+            (
+                "browser own import_login",
+                json!({"outcome":"imported","browser_session_id":"session-1"}),
+            ),
+            (
+                "browser own capture_login",
+                json!({"outcome":"captured","origin":"https://example.test"}),
+            ),
+            (
+                "browser own revoke_access",
+                json!({"outcome":"revoked","revoked":1}),
+            ),
+            (
+                "browser user close",
+                json!({"browser":"user","outcome":"closed"}),
+            ),
+            (
+                "browser user navigate",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","read_page":{"state_text":"Page URL: https://example.test/; Continue button","snapshot_id":"snap-3"},"settled":false,"settlement_reason":"Page settlement is not observed on the person's browser."}),
+            ),
+            (
+                "browser user snapshot",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","snapshot_id":"snap-4","state_text":"Page URL: https://example.test/; Continue button"}),
+            ),
+            (
+                "browser user screenshot",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","snapshot_id":"snap-5","image":{"mime":"image/png","width_px":320,"height_px":240}}),
+            ),
+            (
+                "browser user scroll",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","input_dispatched":true}),
+            ),
+            (
+                "browser user click",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","input_dispatched":true}),
+            ),
+            (
+                "browser user type",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","input_dispatched":true}),
+            ),
+            (
+                "browser user click_point",
+                json!({"browser":"user","outcome":"ok","tab":"tab-1","input_dispatched":true}),
+            ),
+            (
+                "browser user revoke_access",
+                json!({"browser":"user","outcome":"revoked","revoked":1}),
+            ),
+            (
+                "computer read_state",
+                json!({"outcome":"completed","state_text":"Save button"}),
+            ),
+            (
+                "computer press_element",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer press_point",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer write_text",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer type",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer keys",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer takeover_move",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer takeover_drag",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            (
+                "computer takeover_scroll",
+                json!({"outcome":"completed","effect_status":"effect_observed"}),
+            ),
+            ("computer wait", json!({"outcome":"predicate_satisfied"})),
+            (
+                "computer list_apps",
+                json!({"outcome":"completed","apps":[{"name":"Dashboard","running":true,"bundle_identity":"com.example.dashboard","pid":4242,"frontmost":true}]}),
+            ),
+            (
+                "computer open_app",
+                json!({"outcome":"launched","target":"Dashboard","pid":4242,"has_window":true,"frontmost":true}),
+            ),
+        ];
+        for (label, reply) in cases {
+            let result = decoded(reply);
+            let rendered = texts(&result).join(" ");
+            println!("MODEL_VIEW AUDIT {label}: {rendered}");
+            assert!(
+                !matches!(
+                    rendered.as_str(),
+                    GENERIC_SUCCESS_FALLBACK | UNDESCRIBABLE_REPLY_FALLBACK
+                ),
+                "{label} used generic fallback text: {rendered}"
+            );
+            let action = label.split_whitespace().last().unwrap();
+            let problems = model_view_problems_for_action(&result, action);
+            assert!(problems.is_empty(), "{label}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn user_browser_status_names_connection_and_available_tabs() {
+        let connected = decoded(json!({
+            "browser":"user",
+            "outcome":"ok",
+            "connected":true,
+            "tabs":[
+                {"tab":"tab-1","claim":"claimed_by_this_route","interaction_epoch":7},
+                {"tab":"tab-2","claim":"unclaimed_handed","interaction_epoch":2}
+            ]
+        }));
+        let connected_text = texts(&connected).join("\n");
+        assert!(connected_text.contains("The Chrome extension is connected."));
+        assert!(connected_text.contains("Available tab tab-1 is claimed (interaction epoch 7)."));
+        assert!(
+            connected_text.contains("Available tab tab-2 is not claimed (interaction epoch 2).")
+        );
+        assert!(!connected_text.contains("Done."));
+        assert!(model_view_problems_for_action(&connected, "status").is_empty());
+        assert_eq!(connected["structuredContent"]["connected"], true);
+        assert_eq!(
+            connected["structuredContent"]["tabs"][0]["interaction_epoch"],
+            7
+        );
+
+        let no_tabs = decoded(json!({
+            "browser":"user","outcome":"ok","connected":false,"tabs":[]
+        }));
+        let no_tabs_text = texts(&no_tabs).join("\n");
+        assert!(no_tabs_text.contains("The Chrome extension is not connected."));
+        assert!(no_tabs_text.contains("move a tab into the Agent group"));
+        assert!(no_tabs_text.contains("toolbar button"));
+        assert!(!no_tabs_text.contains("Done."));
+        assert!(model_view_problems_for_action(&no_tabs, "status").is_empty());
+    }
+
+    #[test]
+    fn user_open_grant_names_the_site_that_is_now_authorized() {
+        let result = decoded(json!({
+            "browser":"user","outcome":"ok","origin":"https://example.test"
+        }));
+        assert!(texts(&result)
+            .join("\n")
+            .contains("Site access is authorized for https://example.test."));
+        assert!(model_view_problems_for_action(&result, "open_grant").is_empty());
+        assert_eq!(
+            result["structuredContent"]["origin"],
+            "https://example.test"
+        );
+    }
+
+    #[test]
+    fn user_browser_success_says_when_input_was_dispatched() {
+        let result = decoded(json!({
+            "browser":"user","outcome":"ok","tab":"tab-1","input_dispatched":true
+        }));
+        assert!(texts(&result)
+            .join("\n")
+            .contains("Input was dispatched to the person's browser."));
+    }
+
+    #[test]
+    fn nested_user_navigate_read_is_visible_with_its_snapshot_handle() {
+        let result = decoded(json!({
+            "browser":"user",
+            "outcome":"ok",
+            "tab":"tab-1",
+            "read_page":{"state_text":"Page URL: https://example.test/; Continue button","snapshot_id":"snap-3"},
+            "settled":false,
+            "settlement_reason":"Page settlement is not observed on the person's browser."
+        }));
+        let rendered = texts(&result).join("\n");
+        assert!(rendered.contains("Continue button"), "{rendered}");
+        assert!(rendered.contains("snapshot_id: snap-3"), "{rendered}");
+        assert!(
+            rendered.contains("Page settlement was not confirmed."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn own_browser_status_names_session_readiness_profile_and_lease() {
+        let status = decoded(json!({
+            "outcome":"ready",
+            "browser_session_id":"session-1",
+            "profile_disposition":"disposable",
+            "lease":{"idle_timeout_ms":60000,"idle_expires_at":"2026-10-17T13:14:15.000Z"}
+        }));
+        let status_text = texts(&status).join("\n");
+        assert!(status_text.contains("Own browser session session-1 is ready."));
+        assert!(status_text.contains("Profile disposition: disposable."));
+        assert!(status_text.contains("Idle timeout: 60000 ms."));
+        assert!(status_text.contains("Idle lease expires at 2026-10-17T13:14:15.000Z."));
+        assert_eq!(
+            status["structuredContent"]["browser_session_id"],
+            "session-1"
+        );
+        assert!(!status_text.contains("URL unavailable"));
+    }
+
+    #[test]
+    fn generic_fallback_is_rejected_except_for_allowlisted_actions() {
+        let result = decoded(json!({"outcome":"completed","unreadable_subtrees":0}));
+        assert!(model_view_problems_for_action(&result, "status")
+            .iter()
+            .any(|problem| problem.contains("action status") && problem.contains("Done.")));
+        assert!(model_view_problems_for_action(&result, "close").is_empty());
+        let undescribable = decoded(Value::Null);
+        assert!(model_view_problems_for_action(&undescribable, "status")
+            .iter()
+            .any(|problem| problem.contains("cannot describe")));
     }
 
     #[test]
