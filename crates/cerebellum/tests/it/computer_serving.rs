@@ -90,6 +90,43 @@ fn predicate() -> Value {
     })
 }
 
+#[tokio::test]
+async fn string_wait_predicates_reach_the_real_handler() {
+    let clock = FakeClock::new();
+    let management = granted_management().await;
+    let json_predicate = predicate();
+    let predicates = [
+        json!("element_present Identifier=ready"),
+        json!("element_absent Role:Title=AXWindow:Dialog"),
+        json!("element_focused Identifier=search"),
+        json!("element_enabled_is true Role:Title=AXButton:Save"),
+        json!("element_value_equals Identifier=query => hello world"),
+        json!(serde_json::to_string(&json_predicate).unwrap()),
+        json_predicate,
+    ];
+
+    for predicate in predicates {
+        let reply = serve_wait(
+            &management,
+            &clock,
+            json!({
+                "app": "com.apple.Safari",
+                "predicate": predicate,
+                "timeout_ms": 0,
+            }),
+        )
+        .await;
+        assert_ne!(
+            reply["outcome"], "invalid_request",
+            "the handler refused a supported predicate: {reply}"
+        );
+        assert_ne!(
+            reply["outcome"], "consent_unavailable",
+            "the named app grant did not admit the wait: {reply}"
+        );
+    }
+}
+
 async fn serve_wait(
     management: &Arc<ManagementPlane>,
     clock: &FakeClock,

@@ -2713,8 +2713,7 @@ fn parse_wait_request(arguments: &Value) -> Result<ParsedWait, Value> {
     let Some(predicate) = object.get("predicate") else {
         return Err(invalid_wait_request("predicate", "missing_field"));
     };
-    let predicate = serde_json::from_value::<PostCondition>(predicate.clone())
-        .map_err(|_| invalid_wait_request("predicate", "invalid_predicate"))?;
+    let predicate = parse_wait_predicate(predicate).ok_or_else(invalid_wait_predicate_request)?;
     if !predicate.element().is_usable() {
         return Err(invalid_wait_request("predicate", "unusable_element_name"));
     }
@@ -2735,6 +2734,76 @@ fn parse_wait_request(arguments: &Value) -> Result<ParsedWait, Value> {
         app,
         predicate,
         timeout_ms,
+    })
+}
+
+/// Flat calls may send readable text or a JSON string; first-party callers
+/// can continue sending the typed object.
+fn parse_wait_predicate(value: &Value) -> Option<PostCondition> {
+    match value {
+        Value::String(text) => serde_json::from_str::<PostCondition>(text)
+            .ok()
+            .or_else(|| parse_text_wait_predicate(text)),
+        _ => serde_json::from_value::<PostCondition>(value.clone()).ok(),
+    }
+}
+
+/// Map each readable spelling directly to the closed predicate vocabulary.
+fn parse_text_wait_predicate(text: &str) -> Option<PostCondition> {
+    let (kind, body) = text.split_once(' ')?;
+    match kind {
+        "element_present" => Some(PostCondition::ElementPresent {
+            element: parse_wait_element(body)?,
+        }),
+        "element_absent" => Some(PostCondition::ElementAbsent {
+            element: parse_wait_element(body)?,
+        }),
+        "element_focused" => Some(PostCondition::ElementFocused {
+            element: parse_wait_element(body)?,
+        }),
+        "element_enabled_is" => {
+            let (expected, element) = body.split_once(' ')?;
+            let expected = match expected {
+                "true" => true,
+                "false" => false,
+                _ => return None,
+            };
+            Some(PostCondition::ElementEnabledIs {
+                element: parse_wait_element(element)?,
+                expected,
+            })
+        }
+        "element_value_equals" => {
+            let (element, expected) = body.split_once(" => ")?;
+            Some(PostCondition::ElementValueEquals {
+                element: parse_wait_element(element)?,
+                expected: expected.to_owned(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A selector is either an accessibility identifier or an exact role/title
+/// pair, the two element keys the wait engine can resolve without guessing.
+fn parse_wait_element(selector: &str) -> Option<AccessibilityElementName> {
+    let (form, value) = selector.split_once('=')?;
+    match form {
+        "Identifier" => Some(AccessibilityElementName::Identifier(value.to_owned())),
+        "Role:Title" => {
+            let (role, title) = value.split_once(':')?;
+            Some(AccessibilityElementName::role_and_title(role, title))
+        }
+        _ => None,
+    }
+}
+
+fn invalid_wait_predicate_request() -> Value {
+    json!({
+        "outcome": "invalid_request",
+        "field": "predicate",
+        "reason": "invalid_predicate",
+        "remedy": "Use <kind> Identifier=<identifier> (for example, element_present Identifier=ready) or <kind> Role:Title=<role>:<title> (for example, element_present Role:Title=AXButton:Save). For element_enabled_is, put true or false before the selector; for element_value_equals, append => <expected text>. JSON strings containing the existing predicate object are also accepted.",
     })
 }
 
@@ -3359,16 +3428,86 @@ mod wait_tests {
     }
 
     #[test]
-    fn request_inventory_is_timeout_ms_plus_a_typed_predicate_not_a_string() {
+    fn wait_parses_every_text_predicate_kind_with_existing_element_keys() {
+        let cases = [
+            (
+                "element_present Identifier=ready",
+                PostCondition::ElementPresent {
+                    element: AccessibilityElementName::Identifier("ready".to_string()),
+                },
+            ),
+            (
+                "element_absent Role:Title=AXWindow:Dialog",
+                PostCondition::ElementAbsent {
+                    element: AccessibilityElementName::role_and_title("AXWindow", "Dialog"),
+                },
+            ),
+            (
+                "element_focused Identifier=search",
+                PostCondition::ElementFocused {
+                    element: AccessibilityElementName::Identifier("search".to_string()),
+                },
+            ),
+            (
+                "element_enabled_is true Role:Title=AXButton:Save",
+                predicate(),
+            ),
+            (
+                "element_value_equals Identifier=query => hello world",
+                PostCondition::ElementValueEquals {
+                    element: AccessibilityElementName::Identifier("query".to_string()),
+                    expected: "hello world".to_string(),
+                },
+            ),
+        ];
+
+        for (text, expected) in cases {
+            let parsed = parse_wait_request(&json!({
+                "app": "com.example.Editor",
+                "predicate": text,
+                "timeout_ms": 250,
+            }))
+            .unwrap_or_else(|refusal| panic!("{text:?} refused: {refusal}"));
+            assert_eq!(parsed.predicate, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn wait_accepts_json_string_and_first_party_object_predicates() {
+        let expected = predicate();
+        for wire_predicate in [
+            json!(serde_json::to_string(&expected).unwrap()),
+            json!(expected.clone()),
+        ] {
+            let parsed = parse_wait_request(&json!({
+                "app": "com.example.Editor",
+                "predicate": wire_predicate,
+                "timeout_ms": 250,
+            }))
+            .expect("the string and object predicate forms parse");
+            assert_eq!(parsed.predicate, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_wait_predicates_name_the_supported_text_and_json_forms() {
         let refusal = parse_wait_request(&json!({
             "app": "com.example.Editor",
-            "predicate": "element_present",
+            "predicate": "element_present Title=Save",
             "timeout_ms": 250,
         }))
-        .expect_err("the frozen artifact's string predicate remains a schema mismatch");
+        .expect_err("title-only selectors are not in the typed predicate vocabulary");
 
         assert_eq!(refusal["field"], "predicate");
         assert_eq!(refusal["reason"], "invalid_predicate");
+        let remedy = refusal["remedy"].as_str().expect("remedy is readable");
+        assert!(remedy.contains("Identifier=ready"));
+        assert!(remedy.contains("Role:Title=AXButton:Save"));
+        assert!(remedy.contains("JSON strings"));
+        assert_eq!(
+            validate_capability_result("computer.wait", &refusal),
+            Ok(())
+        );
     }
 
     #[test]
