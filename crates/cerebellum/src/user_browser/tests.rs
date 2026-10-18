@@ -1332,6 +1332,67 @@ async fn outside_group_tab_is_refused_before_any_cdp_command() {
 }
 
 #[tokio::test]
+async fn status_maps_handed_inventory_to_public_claim_labels_before_and_after_claim() {
+    let fixture = Fixture::new();
+    let owned = fixture.claim(1).await;
+    let handed = "dragged-opaque-handle";
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let mut tab = state.tabs["handed"].clone();
+        tab.owner = None;
+        tab.interaction = 37;
+        state.tabs.insert(handed.into(), tab);
+    }
+    let (status, cards) = fixture
+        .call(1, json!({"browser":"user","action":"status"}), "deny")
+        .await;
+    assert_eq!(status["outcome"], "ok", "{status}");
+    assert_eq!(status["connected"], true);
+    assert!(cards.is_empty());
+    let rows = status["tabs"].as_array().unwrap();
+    assert_eq!(
+        rows.iter().find(|tab| tab["tab"] == handed).unwrap(),
+        &json!({"tab":handed,"claim":"unclaimed_handed","interaction_epoch":37})
+    );
+    assert_eq!(
+        rows.iter().find(|tab| tab["tab"] == owned).unwrap()["claim"],
+        "claimed_by_this_route"
+    );
+    assert!(rows
+        .iter()
+        .all(|tab| tab.get("handed").is_none() && tab.get("claimed").is_none()));
+    let (claimed, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"claim_tab","tab":handed}),
+            "deny",
+        )
+        .await;
+    assert_eq!(claimed["outcome"], "ok", "{claimed}");
+    assert_eq!(claimed["tab"], handed);
+    let (status, _) = fixture
+        .call(1, json!({"browser":"user","action":"status"}), "deny")
+        .await;
+    assert_eq!(
+        status["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tab| tab["tab"] == handed)
+            .unwrap()["claim"],
+        "claimed_by_this_route"
+    );
+    let (other, _) = fixture
+        .call(2, json!({"browser":"user","action":"status"}), "deny")
+        .await;
+    assert!(!other["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tab| tab["tab"] == handed));
+}
+
+#[tokio::test]
 async fn handed_tab_claims_refs_and_snapshots_are_route_tab_and_epoch_scoped() {
     let fixture = Fixture::new();
     let (unclaimed, _) = fixture.snapshot(1, "handed", "allow_30m").await;

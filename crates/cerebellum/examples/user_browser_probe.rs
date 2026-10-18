@@ -250,6 +250,34 @@ fn fixture_site_answer_line(card: &Value, origin: &str, decision: &str) -> Resul
     ))
 }
 
+fn unclaimed_handed_tab(status: &Value) -> Result<Option<String>, String> {
+    if !ok(status) || status["connected"] != true {
+        return Err("handover status is not connected and successful".into());
+    }
+    let tabs = status["tabs"]
+        .as_array()
+        .ok_or("handover status has no tab list")?;
+    let mut candidate = None;
+    for tab in tabs {
+        // browser_use translates the extension's claimed/handed booleans into
+        // a public claim label. The probe receives that public reply, not the
+        // extension bridge inventory, so looking for the booleans would miss every tab.
+        match tab["claim"].as_str() {
+            Some("claimed_by_this_route") => continue,
+            Some("unclaimed_handed") => {}
+            _ => return Err("handover status tab has no recognized public claim label".into()),
+        }
+        let handle = tab["tab"]
+            .as_str()
+            .filter(|handle| !handle.is_empty())
+            .ok_or("handed handle missing")?;
+        if candidate.replace(handle.to_owned()).is_some() {
+            return Err("handover status has more than one unclaimed handed tab".into());
+        }
+    }
+    Ok(candidate)
+}
+
 #[async_trait::async_trait(?Send)]
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
@@ -1879,14 +1907,10 @@ mod live {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let (status, _) = self.call(json!({"action":"status"})).await?;
-                let members: Vec<_> = status["tabs"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|tab| tab["handed"] == true && tab["claimed"] == false)
-                    .collect();
+                let member = unclaimed_handed_tab(&status);
                 let timed_out = Instant::now() > deadline;
-                if members.len() == 1 || timed_out {
+                if member.as_ref().is_ok_and(Option::is_some) || member.is_err() || timed_out {
+                    println!("handover public status: {status}");
                     let observed = self.cdp.eval(&self.worker_session, r#"(async () => {
                         const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
                         const tabs = saved ? await chrome.tabs.query({groupId:saved.id, windowId:saved.windowId}) : [];
@@ -1901,11 +1925,8 @@ mod live {
                         }
                     }
                 }
-                if members.len() == 1 {
-                    return members[0]["tab"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or("handed handle missing".into());
+                if let Some(handle) = member? {
+                    return Ok(handle);
                 }
                 if timed_out {
                     return Err("drag-in member never appeared as handed".into());
@@ -2287,6 +2308,37 @@ fn site_card_answer_line_control() -> Result<(), String> {
     Ok(())
 }
 
+fn handover_status_control() -> Result<(), String> {
+    let status = json!({"browser":"user","outcome":"ok","connected":true,"connection_epoch":9,"tabs":[
+        {"tab":"owned-handle","claim":"claimed_by_this_route","interaction_epoch":2},
+        {"tab":"handed-handle","claim":"unclaimed_handed","interaction_epoch":0}
+    ]});
+    if unclaimed_handed_tab(&status)? != Some("handed-handle".into()) {
+        return Err("handover did not select the public unclaimed_handed handle".into());
+    }
+    let mut empty = status.clone();
+    empty["tabs"] = json!([]);
+    if unclaimed_handed_tab(&empty)?.is_some() {
+        return Err("empty status invented a handed handle".into());
+    }
+    let mut raw = status.clone();
+    raw["tabs"] =
+        json!([{"tab":"bridge-handle","handed":true,"claimed":false,"interaction_epoch":0}]);
+    let mut ambiguous = status.clone();
+    ambiguous["tabs"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"tab":"another-handle","claim":"unclaimed_handed","interaction_epoch":0}));
+    let mut disconnected = status;
+    disconnected["connected"] = json!(false);
+    for invalid in [raw, ambiguous, disconnected] {
+        if unclaimed_handed_tab(&invalid).is_ok() {
+            return Err("handover accepted raw bridge inventory, ambiguous handles, or a disconnected status".into());
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_line_control() -> Result<(), String> {
     let passed = cleanup_line(&Ok(()));
     let failed = cleanup_line(&Err("helper survived".into()));
@@ -2398,6 +2450,10 @@ async fn self_test() -> Result<(), String> {
     tests.push((
         "site_card_answer_lines_name_the_card_origin",
         site_card_answer_line_control(),
+    ));
+    tests.push((
+        "handover_uses_public_status_claim_labels",
+        handover_status_control(),
     ));
     tests.push(("cleanup_line_reports_cleanup_alone", cleanup_line_control()));
     tests.push((
