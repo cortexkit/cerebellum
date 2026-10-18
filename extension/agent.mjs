@@ -2,6 +2,7 @@ import { bounded, Refusal } from "./errors.mjs";
 import { classifyCommand, resolveParams, verifyRuntime } from "./commands.mjs";
 import { Frames } from "./frames.mjs";
 import { FrameGeometry } from "./frame-geometry.mjs";
+import { diagnosticReason, probeReadDiagnostic } from "./read-diagnostics.mjs";
 
 const routeKey = route => `${route.channel}:${route.epoch}`;
 const closed = (value, fields) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
@@ -62,6 +63,7 @@ export class Agent {
   connect(epoch) {
     this.connectionEpoch = epoch;
     this.claims.clear();
+    probeReadDiagnostic("baseline_cleared", { reason: "connected", baselineCount: this.baselines.size });
     this.baselines.clear();
   }
 
@@ -71,11 +73,13 @@ export class Agent {
     for (const state of active) state.cancelled = true;
     await Promise.all(active.map(state => this.detach(state)));
     for (const key of new Set(this.claims.values())) await this.release(key);
+    probeReadDiagnostic("baseline_cleared", { reason: "disconnected", baselineCount: this.baselines.size });
     this.baselines.clear();
   }
 
   withdraw(tabId) {
     this.claims.delete(tabId);
+    probeReadDiagnostic("baseline_cleared", { tabId, reason: "withdrawn", baselinePresent: this.baselines.has(tabId) });
     this.baselines.delete(tabId);
     this.epochs.forget(tabId);
     for (const state of this.active) if (state.tabId === tabId) {
@@ -89,6 +93,7 @@ export class Agent {
     for (const [tabId, owner] of this.claims) {
       if (owner !== key) continue;
       this.claims.delete(tabId);
+      probeReadDiagnostic("baseline_cleared", { tabId, reason: "released", baselinePresent: this.baselines.has(tabId) });
       this.baselines.delete(tabId);
       const record = this.tabs.tabs.get(tabId);
       if (!record) continue;
@@ -271,10 +276,16 @@ export class Agent {
       await state.frames.start();
     }
     let readObservation = null;
+    let readFailure;
     const hasInput = state.plan.commands.some(command => classifyCommand(command) === "input");
     const hasRead = state.plan.commands.some(command => ["Accessibility.getFullAXTree", "DOM.getFlattenedDocument", "DOM.getOuterHTML", "Page.captureScreenshot"].includes(command.method));
     const baseline = this.baselines.get(state.tabId);
-    if (hasInput && (!baseline || !Number.isSafeInteger(state.plan.interaction_epoch) || baseline.epoch !== state.plan.interaction_epoch)) throw new Refusal("fresh_read_required");
+    probeReadDiagnostic("plan_baseline", { tabId: state.tabId, hasInput, hasRead, baselinePresent: !!baseline, baselineEpoch: baseline?.epoch, planEpoch: state.plan.interaction_epoch, commandCount: state.plan.commands.length });
+    if (hasInput && (!baseline || !Number.isSafeInteger(state.plan.interaction_epoch) || baseline.epoch !== state.plan.interaction_epoch)) {
+      const reason = !baseline ? "baseline_missing" : !Number.isSafeInteger(state.plan.interaction_epoch) ? "plan_epoch_missing" : "epoch_mismatch";
+      probeReadDiagnostic("input_baseline_refused", { tabId: state.tabId, reason, baselinePresent: !!baseline, baselineEpoch: baseline?.epoch, planEpoch: state.plan.interaction_epoch, continuity: baseline?.continuity });
+      throw new Refusal("fresh_read_required");
+    }
     for (const planned of state.plan.commands) {
       const command = { ...planned, params: resolveParams(planned.params, results) };
       await this.guard(state);
@@ -284,9 +295,13 @@ export class Agent {
       const frameId = scope?.frame.web_navigation_frame_id ?? 0;
       if (!hasInput && hasRead && kind === "read" && !readObservation) {
         try {
-          const epoch = await this.epochs.sample(state.tabId);
+          const epoch = await this.epochs.sample(state.tabId, "pre_read");
           readObservation = { epoch, continuity: this.epochs.record(state.tabId).continuity };
-        } catch { /* Readable pages without sentinel coverage cannot authorize later input. */ }
+        } catch (error) {
+          // A failed pre-read interaction sample cannot authorize later input.
+          readFailure = diagnosticReason(error);
+          probeReadDiagnostic("sample_failed", { tabId: state.tabId, stage: "pre_read", reason: readFailure });
+        }
       }
       try {
         if (kind === "input") {
@@ -325,7 +340,9 @@ export class Agent {
     // leaves the adapter. A refused input never creates a new read baseline.
     let epoch;
     let covered = true;
-    try { epoch = await this.epochs.sample(state.tabId); } catch (error) {
+    try { epoch = await this.epochs.sample(state.tabId, "post_plan"); } catch (error) {
+      readFailure = diagnosticReason(error);
+      probeReadDiagnostic("sample_failed", { tabId: state.tabId, stage: "post_plan", reason: readFailure });
       if (hasInput) throw error;
       covered = false;
       epoch = this.epochs.record(state.tabId).epoch;
@@ -336,7 +353,11 @@ export class Agent {
         if (readObservation.epoch !== epoch) throw new Refusal("interaction_epoch_changed");
         if (readObservation.continuity !== this.epochs.record(state.tabId).continuity) throw new Refusal("interaction_continuity_lost");
         this.baselines.set(state.tabId, readObservation);
-      } else this.baselines.delete(state.tabId);
+        probeReadDiagnostic("baseline_set", { tabId: state.tabId, epoch: readObservation.epoch, continuity: readObservation.continuity });
+      } else {
+        this.baselines.delete(state.tabId);
+        probeReadDiagnostic("baseline_deleted", { tabId: state.tabId, reason: readFailure, covered, readObserved: !!readObservation, epoch });
+      }
     }
     if (hasInput && epoch !== state.plan.interaction_epoch) throw new Refusal("interaction_epoch_changed");
     if (hasInput && this.epochs.record(state.tabId).continuity !== baseline.continuity) throw new Refusal("interaction_continuity_lost");

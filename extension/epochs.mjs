@@ -1,4 +1,5 @@
 import { bounded, Refusal } from "./errors.mjs";
+import { diagnosticReason, probeReadDiagnostic } from "./read-diagnostics.mjs";
 
 // Only group members are instrumented. The observer has no debugger dependency,
 // so human input while the per-action debugger is detached still invalidates refs.
@@ -66,26 +67,51 @@ export class InteractionEpochs {
     record.documents.set(frameId, { documentId: observation.documentId, sequence, observedAt: Math.max(sameDocument ? previous.observedAt : 0, observation.observedAt) });
   }
 
-  async sample(tabId) {
-    await this.tabs.eligible(tabId);
-    const frames = await bounded(this.chrome.webNavigation.getAllFrames({ tabId }), "dispatch");
-    if (!frames?.length) throw new Refusal("interaction_continuity_lost");
+  async sample(tabId, stage = "sample") {
+    try { await this.tabs.eligible(tabId); }
+    catch (error) {
+      probeReadDiagnostic("sample_failed", { tabId, stage, step: "membership", reason: diagnosticReason(error) });
+      throw error;
+    }
+    let frames;
+    try { frames = await bounded(this.chrome.webNavigation.getAllFrames({ tabId }), "dispatch"); }
+    catch (error) {
+      probeReadDiagnostic("sample_failed", { tabId, stage, step: "frame_list", reason: diagnosticReason(error) });
+      throw error;
+    }
+    if (!frames?.length) {
+      probeReadDiagnostic("sample_failed", { tabId, stage, step: "frame_list", reason: "no_frames", frameCount: 0 });
+      throw new Refusal("interaction_continuity_lost");
+    }
     const record = this.record(tabId);
     const live = new Set(frames.map(frame => frame.frameId));
     for (const id of record.documents.keys()) {
       if (!live.has(id)) { record.documents.delete(id); record.continuity += 1; }
     }
     for (const frame of frames) {
-      await this.tabs.eligible(tabId);
+      try { await this.tabs.eligible(tabId); }
+      catch (error) {
+        probeReadDiagnostic("sample_failed", { tabId, stage, step: "membership", frameId: frame.frameId, reason: diagnosticReason(error) });
+        throw error;
+      }
       let observation;
       try {
         observation = await bounded(this.chrome.tabs.sendMessage(tabId, { kind: "agent-sentinel", operation: "sample" }, { frameId: frame.frameId }), "dispatch");
-      } catch {
+      } catch (error) {
         // Missing frame coverage invalidates input; it is never inferred from a
         // previous successful snapshot or an observer in a different document.
+        probeReadDiagnostic("sample_failed", { tabId, stage, step: "frame_message", frameId: frame.frameId, reason: diagnosticReason(error) });
         throw new Refusal("interaction_continuity_lost");
       }
-      this.accept(tabId, frame.frameId, observation);
+      const previous = record.documents.get(frame.frameId);
+      try { this.accept(tabId, frame.frameId, observation); }
+      catch (error) {
+        probeReadDiagnostic("sample_failed", { tabId, stage, step: "observation", frameId: frame.frameId,
+          reason: diagnosticReason(error), enabled: observation?.enabled, sequence: observation?.sequence,
+          previousSequence: previous?.sequence, historyLength: Array.isArray(observation?.interactions) ? observation.interactions.length : undefined,
+          sameDocument: typeof observation?.documentId === "string" && observation.documentId === previous?.documentId });
+        throw error;
+      }
     }
     await this.tabs.eligible(tabId);
     // Once every live frame has been sampled beyond a closed window, later
@@ -100,15 +126,16 @@ export class InteractionEpochs {
     try {
       const target = frameId === undefined ? { tabId, allFrames: true } : { tabId, frameIds: [frameId] };
       await bounded(this.chrome.scripting.executeScript({ target, files: ["sentinel.js"], world: "ISOLATED" }), "dispatch");
-    } catch {
+    } catch (error) {
       // Restricted pages, about:blank and frames without coverage remain readable
       // by CDP, but cannot establish an input baseline until observers are live.
       this.record(tabId).continuity += 1;
+      probeReadDiagnostic("observer_install_failed", { tabId, frameId, step: "observer_install", reason: diagnosticReason(error), continuity: this.record(tabId).continuity });
     }
   }
 
   async check(tabId, expected) {
-    const actual = await this.sample(tabId);
+    const actual = await this.sample(tabId, "input_check");
     if (!Number.isSafeInteger(expected) || actual !== expected) throw new Refusal("interaction_epoch_changed");
   }
 

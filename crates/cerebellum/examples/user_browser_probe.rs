@@ -1328,6 +1328,8 @@ mod live {
         // such as an unchecked native-port error; it is best effort because
         // not every Chrome build offers it on worker targets.
         cdp.call("Runtime.enable", json!({}), Some(session))?;
+        #[cfg(feature = "chrome-for-testing-parent-probe")]
+        cdp.eval(session, "globalThis.__ckProbeReadDiagnostics = true")?;
         let _ = cdp.call("Log.enable", json!({}), Some(session));
         cdp.eval(
             session,
