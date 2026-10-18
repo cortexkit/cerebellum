@@ -609,13 +609,13 @@ mod computer {
         for arguments in calls {
             let (id, arguments) = next(arguments);
             let label = format!("computer {arguments}");
-            let action = arguments["action"].as_str().unwrap_or("unknown");
+            let action = arguments["action"].as_str().unwrap_or("unknown").to_owned();
             let frame = call(&planes, id, arguments).await;
             // A request the flat tool refuses before dispatch (a missing
             // required field) is a route error, not a tool result, and
             // carries no model view of its own.
             if frame.header.ty == FrameType::Response {
-                views.check(action, &label, &frame);
+                views.check(&action, &label, &frame);
                 answered += 1;
             }
         }
