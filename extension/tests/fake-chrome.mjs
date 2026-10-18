@@ -38,13 +38,13 @@ export function fakeChrome() {
     },
     storage: { session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } } },
     tabs: {
-      onUpdated: new Event(), onRemoved: new Event(), onActivated: new Event(), onCreated: new Event(),
+      onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onActivated: new Event(), onCreated: new Event(),
       async get(id) { calls.push(["get", id]); if (!tabData.has(id)) throw new Error("closed"); return { ...tabData.get(id) }; },
       async query(query) {
         if (query.active === true && query.lastFocusedWindow === true) return [...tabData.values()].filter(tab => tab.active).map(({ id, windowId }) => ({ id, windowId }));
         if (!Number.isInteger(query.groupId)) throw new Error("outside enumeration forbidden");
         calls.push(["query", query]);
-        return [...tabData.values()].filter(tab => tab.groupId === query.groupId).map(tab => ({ ...tab }));
+        return [...tabData.values()].filter(tab => tab.groupId === query.groupId && (query.windowId === undefined || tab.windowId === query.windowId)).map(tab => ({ ...tab }));
       },
       async create(options) {
         if (options.active !== false) throw new Error("activation forbidden");
@@ -58,7 +58,6 @@ export function fakeChrome() {
         if (!groups.has(id)) groups.set(id, { id, windowId: tabData.get(tabIds[0]).windowId });
         for (const tabId of tabIds) {
           tabData.get(tabId).groupId = id; tabData.get(tabId).windowId = groups.get(id).windowId;
-          chrome.tabs.onUpdated.emit(tabId, { groupId: id });
         }
         calls.push(["group", tabIds, id]);
         return id;

@@ -3,14 +3,16 @@ import { Refusal } from "./errors.mjs";
 const STORAGE_KEY = "agentGroup";
 
 export class AgentTabs {
-  constructor(chrome, onWithdraw = () => {}) {
+  constructor(chrome, onWithdraw = () => {}, onAdopt = async () => {}) {
     this.chrome = chrome;
     this.onWithdraw = onWithdraw;
+    this.onAdopt = onAdopt;
     this.group = null;
     this.tabs = new Map();
     this.extensionCreated = new Set();
     this.creations = new Set();
     this.joining = new Set();
+    this.adopting = new Map();
     this.ready = this.restore();
   }
 
@@ -81,18 +83,74 @@ export class AgentTabs {
     return record;
   }
 
-  async adoptMember(tabId) {
+  adoptionDecision(tabId, source, decision) {
+    // Log identities and fixed decisions only, never a tab's URL or title.
+    console.info(`Agent group adoption: source=${source} tab=${tabId} group=${this.group?.id ?? "none"} decision=${decision}`);
+  }
+
+  async adoptMember(tabId, source = "tabs.onUpdated") {
     await this.ready;
-    if (!this.group || this.tabs.has(tabId) || this.joining.has(tabId)) return false;
-    const tab = await this.chrome.tabs.get(tabId);
+    if (this.adopting.has(tabId)) return this.adopting.get(tabId);
+    const task = this.adoptMemberNow(tabId, source);
+    this.adopting.set(tabId, task);
+    try { return await task; }
+    finally { this.adopting.delete(tabId); }
+  }
+
+  async adoptMemberNow(tabId, source) {
+    if (!this.group || this.tabs.has(tabId) || this.joining.has(tabId)) {
+      this.adoptionDecision(tabId, source, !this.group ? "no_recorded_group" : this.joining.has(tabId) ? "owned_join_in_progress" : "already_recorded");
+      return false;
+    }
+    let tab;
+    try { tab = await this.chrome.tabs.get(tabId); }
+    catch { this.adoptionDecision(tabId, source, "tab_unavailable"); return false; }
     // Only the recorded group's identity conveys handover, never its title.
     // A delayed group event must not re-adopt a tab the person already removed.
     if (!this.group || this.tabs.has(tabId) || this.joining.has(tabId)
-      || tab.groupId !== this.group.id || tab.windowId !== this.group.windowId) return false;
+      || tab.groupId !== this.group.id || tab.windowId !== this.group.windowId) {
+      this.adoptionDecision(tabId, source, "membership_changed_or_recorded");
+      return false;
+    }
     this.tabs.set(tabId, { handle: crypto.randomUUID(), kind: "handed" });
-    await this.save();
-    await this.eligible(tabId);
-    return true;
+    try {
+      await this.save();
+      await this.eligible(tabId);
+      await this.onAdopt(tabId);
+      await this.eligible(tabId);
+      this.adoptionDecision(tabId, source, "adopted_handed");
+      return true;
+    } catch (error) {
+      this.withdraw(tabId);
+      this.adoptionDecision(tabId, source, error?.reason ?? "adoption_failed");
+      throw error;
+    }
+  }
+
+  async reconcile(source = "status") {
+    await this.ready;
+    const group = this.group;
+    if (!group) return;
+    // Membership changes need not emit tabs.onUpdated with changeInfo.groupId.
+    // Query only the recorded group so status discovers a drag-in even when no
+    // event arrives, without enumerating the person's other tabs or groups.
+    let members;
+    try { members = await this.chrome.tabs.query({ groupId: group.id, windowId: group.windowId }); }
+    catch (error) {
+      this.adoptionDecision("none", source, "group_query_failed");
+      throw error;
+    }
+    if (this.group?.id !== group.id || this.group?.windowId !== group.windowId) return;
+    const ids = new Set(members.map(tab => tab.id));
+    for (const tabId of this.tabs.keys()) {
+      if (!ids.has(tabId) && !this.joining.has(tabId)) {
+        this.adoptionDecision(tabId, source, "withdrawn_from_group");
+        this.withdraw(tabId);
+      }
+    }
+    for (const tab of members) {
+      if (!this.tabs.has(tab.id) || this.adopting.has(tab.id)) await this.adoptMember(tab.id, source);
+    }
   }
 
   async open({ url = "about:blank", opener_tab } = {}) {
@@ -145,8 +203,11 @@ export class AgentTabs {
   async toggle(tabId) {
     await this.ready;
     if (this.tabs.has(tabId)) {
-      this.withdraw(tabId);
-      await this.chrome.tabs.ungroup(tabId);
+      this.joining.add(tabId);
+      try {
+        this.withdraw(tabId);
+        await this.chrome.tabs.ungroup(tabId);
+      } finally { this.joining.delete(tabId); }
       return false;
     }
     await this.join(tabId, "handed");
@@ -162,6 +223,7 @@ export class AgentTabs {
 
   async list() {
     await this.ready;
+    await this.reconcile();
     const result = [];
     for (const [tabId, record] of this.tabs) {
       try {

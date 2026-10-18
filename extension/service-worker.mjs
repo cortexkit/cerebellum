@@ -17,7 +17,7 @@ export function start(chrome) {
     ]);
   };
   let agent;
-  const tabs = new AgentTabs(chrome, tabId => agent?.withdraw(tabId));
+  const tabs = new AgentTabs(chrome, tabId => agent?.withdraw(tabId), tabId => epochs.install(tabId));
   const epochs = new InteractionEpochs(chrome, tabs);
   agent = new Agent(chrome, tabs, epochs);
   const bridge = new NativeBridge(chrome, agent);
