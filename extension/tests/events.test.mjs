@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { BrowserEvents } from "../events.mjs";
 import { setup, turn } from "./harness.mjs";
 import { start } from "../service-worker.mjs";
-import { fakeChrome } from "./fake-chrome.mjs";
+import { deferred, fakeChrome } from "./fake-chrome.mjs";
 
 function listen(f) {
   const events = new BrowserEvents(f.chrome, f.tabs, f.epochs, f.agent);
@@ -208,4 +208,120 @@ test("a delayed group event cannot adopt an outside tab or a namesake group", as
   f.chrome.tabs.onUpdated.emit(1, { groupId: 99 });
   await turn();
   assert.equal(f.tabs.tabs.has(1), false);
+});
+
+test("status adopts a grouped active tab without a groupId event and logs only membership metadata", async t => {
+  const f = await setup();
+  const logs = [];
+  t.mock.method(console, "info", line => logs.push(line));
+  f.chrome.tabData.get(1).url = "https://private.invalid/do-not-log";
+  f.chrome.tabData.get(1).title = "PRIVATE_TITLE";
+  f.chrome.calls.length = 0;
+  await f.chrome.tabs.group({ groupId: f.tabs.group.id, tabIds: [1] });
+  assert.equal(f.tabs.tabs.has(1), false, "group API must not invent an onUpdated groupId delta");
+  const status = await f.run({ version: 2, action: "status" });
+  const record = f.tabs.tabs.get(1);
+  assert.equal(record.kind, "handed");
+  assert.ok(status.tabs.some(tab => tab.tab === record.handle && tab.handed && !tab.claimed));
+  assert.equal(f.chrome.calls.filter(call => call[0] === "inject" && call[1].target.tabId === 1).length, 1);
+  assert.ok(logs.some(line => line.includes("source=status tab=1 group=7 decision=adopted_handed")));
+  assert.ok(logs.every(line => !line.includes("private.invalid") && !line.includes("PRIVATE_TITLE")));
+  assert.ok(f.chrome.calls.filter(call => call[0] === "query").every(call => call[1].groupId === 7 && call[1].windowId === 3));
+  const again = await f.run({ version: 2, action: "status" });
+  assert.ok(again.tabs.some(tab => tab.tab === record.handle));
+  assert.equal(f.chrome.tabData.get(1).active, true);
+  assert.equal(f.chrome.tabData.get(2).active, false);
+  assert.equal(f.chrome.calls.some(call => ["restoreTab", "restoreWindow"].includes(call[0])), false);
+});
+
+test("a full-tab update adopts a background group member when changeInfo has no groupId", async () => {
+  const f = await setup();
+  listen(f);
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: -1, active: false });
+  await f.chrome.tabs.group({ groupId: f.tabs.group.id, tabIds: [3] });
+  f.chrome.tabs.onUpdated.emit(3, { status: "complete" }, { ...f.chrome.tabData.get(3) });
+  await turn();
+  assert.equal(f.tabs.tabs.get(3).kind, "handed");
+  assert.ok(f.chrome.calls.some(call => call[0] === "inject" && call[1].target.tabId === 3));
+  f.chrome.tabData.get(3).groupId = -1;
+  f.chrome.tabs.onUpdated.emit(3, { status: "complete" }, { ...f.chrome.tabData.get(3) });
+  await turn();
+  assert.equal(f.tabs.tabs.has(3), false);
+  assert.equal(f.chrome.tabData.get(3).active, false);
+});
+
+test("move and group-property hints reconcile only the recorded group without reclassifying owned tabs", async () => {
+  const f = await setup();
+  listen(f);
+  const original = f.tabs.tabs.get(2);
+  f.chrome.calls.length = 0;
+  f.chrome.tabs.onMoved.emit(1, { windowId: 3, fromIndex: 0, toIndex: 1 });
+  f.chrome.tabGroups.onUpdated.emit({ id: 7, windowId: 3, collapsed: true });
+  await turn();
+  assert.deepEqual([...f.tabs.tabs.keys()], [2]);
+  assert.equal(f.tabs.tabs.get(2), original);
+  assert.equal(f.chrome.calls.some(call => call[0] === "get" && call[1] === 1), false);
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: -1, active: false });
+  await f.chrome.tabs.group({ groupId: 7, tabIds: [3] });
+  f.chrome.tabs.onMoved.emit(3, { windowId: 3, fromIndex: 2, toIndex: 1 });
+  await turn();
+  assert.equal(f.tabs.tabs.get(3).kind, "handed");
+  assert.ok(f.chrome.calls.filter(call => call[0] === "query").every(call => call[1].groupId === 7));
+});
+
+test("status reconciliation cannot adopt a tab while our own join is pending", async () => {
+  const f = await setup();
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: -1, active: false });
+  const gate = deferred();
+  const group = f.chrome.tabs.group;
+  f.chrome.tabs.group = async options => { const id = await group(options); await gate.promise; return id; };
+  const joining = f.tabs.join(3, "opened");
+  await turn();
+  await f.tabs.list();
+  assert.equal(f.tabs.tabs.has(3), false);
+  gate.resolve();
+  const record = await joining;
+  assert.equal(record.kind, "opened");
+  assert.equal(f.tabs.tabs.get(3), record);
+});
+
+test("status cannot re-adopt a handed tab while take-back waits for ungroup", async () => {
+  const f = await setup();
+  const gate = deferred();
+  const ungroup = f.chrome.tabs.ungroup;
+  f.chrome.tabs.ungroup = async id => { await gate.promise; return ungroup(id); };
+  const takingBack = f.tabs.toggle(2);
+  await turn();
+  assert.equal((await f.tabs.list()).length, 0);
+  gate.resolve();
+  await takingBack;
+  assert.equal(f.tabs.tabs.has(2), false);
+  assert.equal(f.chrome.tabData.get(2).groupId, -1);
+});
+
+test("concurrent update hints and status install a new member observer once", async () => {
+  const f = await setup();
+  listen(f);
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: 7, active: false });
+  f.chrome.tabs.onUpdated.emit(3, { status: "complete" }, { ...f.chrome.tabData.get(3) });
+  f.chrome.tabs.onMoved.emit(3, { windowId: 3, fromIndex: 2, toIndex: 1 });
+  const status = await f.run({ version: 2, action: "status" });
+  await turn();
+  assert.equal(f.chrome.calls.filter(call => call[0] === "inject" && call[1].target.tabId === 3).length, 1);
+  const record = f.tabs.tabs.get(3);
+  assert.ok(status.tabs.some(tab => tab.tab === record.handle && tab.handed));
+});
+
+test("a restored worker discovers later group members even without membership events", async () => {
+  const f = await setup();
+  const { AgentTabs } = await import("../tabs.mjs");
+  const adopted = [];
+  const restarted = new AgentTabs(f.chrome, () => {}, async id => { adopted.push(id); });
+  await restarted.ready;
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: -1, active: false });
+  await f.chrome.tabs.group({ groupId: 7, tabIds: [3] });
+  const status = await restarted.list();
+  assert.equal(restarted.tabs.get(3).kind, "handed");
+  assert.ok(status.some(tab => tab.tab === restarted.tabs.get(3).handle));
+  assert.deepEqual(adopted, [3]);
 });

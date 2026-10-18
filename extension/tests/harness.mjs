@@ -10,7 +10,7 @@ export const release = { method: "Input.dispatchMouseEvent", params: { type: "mo
 export async function setup() {
   const chrome = fakeChrome();
   let agent;
-  const tabs = new AgentTabs(chrome, id => agent?.withdraw(id));
+  const tabs = new AgentTabs(chrome, id => agent?.withdraw(id), id => epochs.install(id));
   await tabs.ready;
   const epochs = new InteractionEpochs(chrome, tabs, () => chrome.now());
   agent = new Agent(chrome, tabs, epochs);

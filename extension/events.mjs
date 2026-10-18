@@ -19,12 +19,24 @@ export class BrowserEvents {
   }
 
   listen() {
-    this.chrome.tabs.onUpdated.addListener((tabId, change) => {
-      if (!("groupId" in change)) return;
-      if (change.groupId !== this.tabs.group?.id) this.tabs.withdraw(tabId);
-      else void this.tabs.adoptMember(tabId).then(async adopted => {
-        if (adopted) await this.epochs.install(tabId);
-      }).catch(error => this.handoverFailed(tabId, error));
+    this.chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+      const groupId = Number.isInteger(tab?.groupId) ? tab.groupId : change.groupId;
+      if (!Number.isInteger(groupId)) return;
+      if (groupId !== this.tabs.group?.id) {
+        if (this.tabs.tabs.has(tabId)) this.tabs.adoptionDecision(tabId, "tabs.onUpdated", "withdrawn_from_group");
+        this.tabs.withdraw(tabId);
+      } else if (!this.tabs.tabs.has(tabId) || this.tabs.adopting.has(tabId)) {
+        const source = "groupId" in change ? "tabs.onUpdated:groupId" : "tabs.onUpdated:tab";
+        void this.tabs.adoptMember(tabId, source).catch(error => this.handoverFailed(tabId, error));
+      }
+    });
+    // Position and group-property events are hints, not membership authority.
+    // Re-read only our recorded group; status also reconciles if no hint arrives.
+    this.chrome.tabs.onMoved.addListener(tabId => {
+      void this.tabs.reconcile("tabs.onMoved").catch(error => this.handoverFailed(tabId, error));
+    });
+    this.chrome.tabGroups.onUpdated.addListener(group => {
+      if (group.id === this.tabs.group?.id) void this.tabs.reconcile("tabGroups.onUpdated").catch(error => this.handoverFailed(undefined, error));
     });
     this.chrome.tabs.onRemoved.addListener(tabId => {
       this.tabs.withdraw(tabId);
@@ -92,6 +104,7 @@ export class BrowserEvents {
         if (!state.detaching) state.cancelled = true;
       }
     });
+    console.info("Agent group listeners registered: tabs.onUpdated, tabs.onMoved, tabGroups.onUpdated; status reconciliation enabled");
   }
 
   notePopup(tabId, openerTabId, windowId, activated = false) {

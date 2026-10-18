@@ -237,6 +237,19 @@ fn consent_for_fixture(card: &Value, origin: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn fixture_site_answer_line(card: &Value, origin: &str, decision: &str) -> Result<String, String> {
+    consent_for_fixture(card, origin)?;
+    // The iframe deliberately uses localhost rather than 127.0.0.1. Print the
+    // validated card's site, not the top page's site, so its separate approval
+    // cannot look like a duplicate decision for the parent origin.
+    let site = card["params"]["target"]["label"]
+        .as_str()
+        .expect("validated fixture origin");
+    Ok(format!(
+        "PASS per-site card: your own Chrome, signed in as you; {site} -> {decision}"
+    ))
+}
+
 #[async_trait::async_trait(?Send)]
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
@@ -512,10 +525,16 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
     )?;
     detached_and_unfocused(driver)?;
     let child_input = reference(&fresh, "Iframe input")?;
-    let (child_typed, _) = driver.call(json!({"action":"type","tab":tab,"ref":child_input,"text":"iframe-only","clear_first":true})).await?;
+    let (child_typed, asks) = driver.call(json!({"action":"type","tab":tab,"ref":child_input,"text":"iframe-only","clear_first":true})).await?;
     check(
         "type delivered inside iframe fixture",
-        ok(&child_typed) && driver.observe()?["child_typed"] == "iframe-only",
+        ok(&child_typed) && asks == 1 && driver.observe()?["child_typed"] == "iframe-only",
+    )?;
+    detached_and_unfocused(driver)?;
+    let (child_reused, asks) = driver.call(json!({"action":"type","tab":tab,"ref":child_input,"text":"iframe-reused","clear_first":true})).await?;
+    check(
+        "iframe typing reuses its own site grant",
+        ok(&child_reused) && asks == 0 && driver.observe()?["child_typed"] == "iframe-reused",
     )?;
     detached_and_unfocused(driver)?;
     handed_checks(driver, origin).await?;
@@ -1286,16 +1305,33 @@ mod live {
             session,
             r#"(() => {
           globalThis.__probeFocus = 0;
+          globalThis.__probeMembership = [];
           chrome.tabs.onActivated.addListener(() => { globalThis.__probeFocus++; });
           chrome.windows.onFocusChanged.addListener(() => { globalThis.__probeFocus++; });
+          const note = (event, details) => {
+            const rows = globalThis.__probeMembership;
+            if (rows.length >= 32) rows.shift();
+            rows.push({event, ...details});
+          };
+          chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+            if (tabId !== globalThis.__probeHandTab) return;
+            note('tabs.onUpdated', {tabId, keys:Object.keys(change), deltaGroupId:change.groupId ?? null,
+              groupId:tab?.groupId ?? null, windowId:tab?.windowId ?? null, active:tab?.active ?? null});
+          });
+          chrome.tabs.onMoved.addListener((tabId, move) => {
+            if (tabId === globalThis.__probeHandTab) note('tabs.onMoved', {tabId, ...move});
+          });
+          chrome.tabGroups.onUpdated.addListener(group => {
+            if (group.id === globalThis.__probeHandGroup) note('tabGroups.onUpdated', {groupId:group.id, windowId:group.windowId});
+          });
           return true;
         })()"#,
         )?;
         Ok(())
     }
 
-    // Print what the extension worker reported, after a failed check and
-    // before the bridge is shut down, so the output reflects the failure.
+    // Print the extension's own console before shutdown on success as well as
+    // failure, so the group-adoption decision can be matched to Chrome's events.
     fn print_worker_events(cdp: &mut Cdp, session: &str) {
         // Events that arrived after the last reply are still unread on the
         // socket; a trivial call drains them into the event buffer.
@@ -1551,9 +1587,9 @@ mod live {
             last_reply: LastReply::default(),
         };
         let result = exercise(&mut driver, &origin).await;
+        let session = driver.worker_session.clone();
+        print_worker_events(&mut driver.cdp, &session);
         if result.is_err() {
-            let session = driver.worker_session.clone();
-            print_worker_events(&mut driver.cdp, &session);
             host_exits.print();
         }
         host_exits.armed = false;
@@ -1596,13 +1632,10 @@ mod live {
                 // Cingulate, after checking it is the fixture's own site card.
                 for card in self.consent.questions().into_iter().skip(self.cards_seen) {
                     self.cards_seen += 1;
-                    consent_for_fixture(&card, &self.origin)?;
-                    asks += 1;
                     let decision = if decline { "deny" } else { "allow_30m" };
-                    println!(
-                        "PASS per-site card: your own Chrome, signed in as you; {} -> {decision}",
-                        self.origin
-                    );
+                    let line = fixture_site_answer_line(&card, &self.origin, decision)?;
+                    asks += 1;
+                    println!("{line}");
                     let id = card["id"].as_str().ok_or("the card has no id")?;
                     if deferred {
                         self.late_card = Some(id.to_owned());
@@ -1814,15 +1847,22 @@ mod live {
                 self.origin,
                 if active { "active" } else { "background" }
             );
-            // A group move emits the same groupId update as a person dragging a
-            // tab into the group; do not call the extension's adoption helper.
+            // Move the fixture through Chrome's group API, not the extension's
+            // adoption helper. Record the actual event shapes instead of assuming
+            // Chrome reports membership in an onUpdated groupId delta.
             let expression = format!(
                 r#"(async () => {{
                 const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
                 if (!saved) throw new Error('probe Agent group missing');
                 const tab = {tab};
                 if (tab.active !== {active}) throw new Error('fixture active state differs; probe never switches tabs');
+                globalThis.__probeHandTab = tab.id;
+                globalThis.__probeHandGroup = saved.id;
+                globalThis.__probeMembership = [];
+                globalThis.__probeGroupMove = {{tabId:tab.id, beforeGroupId:tab.groupId, active:tab.active, windowId:tab.windowId}};
                 await chrome.tabs.group({{groupId:saved.id, tabIds:[tab.id]}});
+                const grouped = await chrome.tabs.get(tab.id);
+                Object.assign(globalThis.__probeGroupMove, {{afterGroupId:grouped.groupId, afterWindowId:grouped.windowId, afterActive:grouped.active}});
                 return tab.id;
             }})()"#,
                 tab = if active {
@@ -1845,13 +1885,29 @@ mod live {
                     .flatten()
                     .filter(|tab| tab["handed"] == true && tab["claimed"] == false)
                     .collect();
+                let timed_out = Instant::now() > deadline;
+                if members.len() == 1 || timed_out {
+                    let observed = self.cdp.eval(&self.worker_session, r#"(async () => {
+                        const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
+                        const tabs = saved ? await chrome.tabs.query({groupId:saved.id, windowId:saved.windowId}) : [];
+                        return {move:globalThis.__probeGroupMove, events:globalThis.__probeMembership,
+                            recordedGroup:saved ? {id:saved.id, windowId:saved.windowId} : null,
+                            members:tabs.map(tab => ({id:tab.id, groupId:tab.groupId, windowId:tab.windowId, active:tab.active}))};
+                    })()"#);
+                    match observed {
+                        Ok(observed) => println!("handover membership diagnostics: {observed}"),
+                        Err(error) => {
+                            println!("handover membership diagnostics unavailable: {error}")
+                        }
+                    }
+                }
                 if members.len() == 1 {
                     return members[0]["tab"]
                         .as_str()
                         .map(str::to_owned)
                         .ok_or("handed handle missing".into());
                 }
-                if Instant::now() > deadline {
+                if timed_out {
                     return Err("drag-in member never appeared as handed".into());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2030,6 +2086,11 @@ impl Driver for Double {
             }
             "type" => {
                 if args["ref"] == "e3" {
+                    asks = if self.child_typed.is_empty() || self.fault == "iframe_repeat_card" {
+                        1
+                    } else {
+                        0
+                    };
                     if self.fault != "iframe" {
                         self.child_typed = args["text"].as_str().unwrap().to_owned();
                     }
@@ -2211,6 +2272,21 @@ fn cingulate_answer_control() -> Result<(), String> {
     Ok(())
 }
 
+fn site_card_answer_line_control() -> Result<(), String> {
+    let origin = "http://127.0.0.1:12345";
+    for (site, expected) in [
+        (origin, "PASS per-site card: your own Chrome, signed in as you; http://127.0.0.1:12345 -> allow_30m"),
+        ("http://localhost:12345", "PASS per-site card: your own Chrome, signed in as you; http://localhost:12345 -> allow_30m"),
+    ] {
+        let card = json!({"id":"el_site","params":{"kind":"consent","scope":{"browser":"user","origins":[site]},"target":{"label":site},"prompt":"Let the agent use your own Chrome, signed in as you, on this site?","options":[{"id":"allow_30m"},{"id":"deny"}]}});
+        let line = fixture_site_answer_line(&card, origin, "allow_30m")?;
+        if line != expected {
+            return Err(format!("site-card answer named the wrong origin: {line}"));
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_line_control() -> Result<(), String> {
     let passed = cleanup_line(&Ok(()));
     let failed = cleanup_line(&Err("helper survived".into()));
@@ -2318,6 +2394,10 @@ async fn self_test() -> Result<(), String> {
     tests.push((
         "cingulate_answers_only_fixture_site_and_user_target",
         cingulate_answer_control(),
+    ));
+    tests.push((
+        "site_card_answer_lines_name_the_card_origin",
+        site_card_answer_line_control(),
     ));
     tests.push(("cleanup_line_reports_cleanup_alone", cleanup_line_control()));
     tests.push((
@@ -2442,6 +2522,11 @@ async fn self_test() -> Result<(), String> {
         ));
     }
     for (fault, name, expected) in [
+        (
+            "iframe_repeat_card",
+            "acceptance_rejects_repeated_iframe_site_card",
+            "iframe typing reuses its own site grant",
+        ),
         (
             "read_tier_one",
             "acceptance_rejects_read_grant_that_cannot_click",
