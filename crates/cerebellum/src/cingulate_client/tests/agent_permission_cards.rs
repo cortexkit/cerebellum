@@ -61,22 +61,24 @@ fn exported() -> Vec<(String, CardRequest)> {
                 request_for(kind, &body, crate::management::PHONE_CONSENT_DEADLINE),
             ));
         }
-        let body = crate::user_browser::site_question_with_choices(
-            &origins[0],
-            3,
-            &Default::default(),
-            &crate::permission_cards::user_browser_choices(
-                &origins,
+        for (tier, name) in [(1, "user-browser-ordinary"), (3, "user-browser-public")] {
+            let body = crate::user_browser::site_question_with_choices(
+                &origins[0],
+                tier,
                 &Default::default(),
-                Severity::new(3, false, false),
-                Some(&holder(head)),
-                true,
-            ),
-        );
-        result.push((
-            format!("{prefix}-user-browser-public.json"),
-            request_for(CardKind::UserBrowserSite, &body, USER_BROWSER_SITE_DEADLINE),
-        ));
+                &crate::permission_cards::user_browser_choices(
+                    &origins,
+                    &Default::default(),
+                    Severity::new(tier, false, false),
+                    Some(&holder(head)),
+                    true,
+                ),
+            );
+            result.push((
+                format!("{prefix}-{name}.json"),
+                request_for(CardKind::UserBrowserSite, &body, USER_BROWSER_SITE_DEADLINE),
+            ));
+        }
     }
     for head in [true, false] {
         let prefix = if head { "head" } else { "worker" };
@@ -110,7 +112,7 @@ fn exported_permission_cards_match_goldens_and_fail_closed() {
     let write = std::env::var_os("CEREBELLUM_WRITE_AGENT_PERMISSION_CARDS").is_some();
     let mut sums = String::new();
     let cards = exported();
-    assert_eq!(cards.len(), 28);
+    assert_eq!(cards.len(), 30);
     for (name, card) in cards {
         assert_eq!(
             card.params.get("single_use") == Some(&serde_json::Value::Bool(true)),

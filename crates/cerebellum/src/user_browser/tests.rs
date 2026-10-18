@@ -92,6 +92,8 @@ struct DoubleState {
     remove_group_on_card: bool,
     foreign_hit: bool,
     viewport_changed: bool,
+    clipped_click: bool,
+    scrolled: bool,
     /// Chrome's CDP error for the next plan command with this method.
     fail_method: Option<(&'static str, i64, String)>,
     /// The "Go" button has no type attribute and no form, like the button in
@@ -99,6 +101,7 @@ struct DoubleState {
     /// `<button>` defaults to type submit, so this checks that a submit-type
     /// control without a form owner is not rated as a form submit.
     untyped_button: bool,
+    submit_button: bool,
     ax_override: Option<Value>,
     top_level_only: bool,
     unmapped_child_owner: bool,
@@ -800,12 +803,34 @@ fn execute(
                     state.payment,
                     state.untyped_button,
                 );
+                if state.submit_button {
+                    let button = dom["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|node| node["backendNodeId"] == 3)
+                        .unwrap();
+                    button["parentId"] = json!(7);
+                    button["attributes"] = json!(["type", "submit"]);
+                    dom["nodes"].as_array_mut().unwrap().push(json!({"nodeId":7,"parentId":2,"backendNodeId":7,"nodeType":1,"nodeName":"FORM","localName":"form","attributes":["method","post","action","/submit"]}));
+                }
                 if state.frame_pair {
                     for id in [7, 8] {
                         dom["nodes"].as_array_mut().unwrap().push(json!({"nodeId":id,"parentId":2,"backendNodeId":id,"nodeType":1,"nodeName":"IFRAME","localName":"iframe","attributes":[]}));
                     }
                 }
                 dom
+            }
+            "DOM.scrollIntoViewIfNeeded" => {
+                state.scrolled = true;
+                json!({})
+            }
+            "DOM.getContentQuads" if state.clipped_click => {
+                if state.scrolled {
+                    json!({"quads":[[10,20,590,20,590,1000,10,1000]]})
+                } else {
+                    json!({"quads":[[10,1200,590,1200,590,2180,10,2180]]})
+                }
             }
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
             "DOM.getOuterHTML" => {
@@ -818,7 +843,11 @@ fn execute(
                 json!({"backendNodeId":3,"frameId":if state.foreign_hit || command["frame_id"] == "foreign" { "foreign" } else { "main" }})
             }
             "Page.getLayoutMetrics" => {
-                json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
+                if state.clipped_click {
+                    json!({"layoutViewport":{"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800},"visualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800,"scale":1},"cssLayoutViewport":{"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400},"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400,"scale":1}})
+                } else {
+                    json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
+                }
             }
             "Page.captureScreenshot" => {
                 json!({"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="})
@@ -921,6 +950,87 @@ fn click(tab: &str, snapshot: &Value, reference: &str) -> Value {
 }
 
 #[tokio::test]
+async fn click_scrolls_and_clips_in_css_viewport_without_device_or_document_offsets() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.clipped_click = true;
+    }
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    let commands: Vec<_> = state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .collect();
+    let methods: Vec<_> = commands
+        .iter()
+        .map(|command| command["method"].as_str().unwrap())
+        .collect();
+    let scroll = methods
+        .iter()
+        .position(|method| *method == "DOM.scrollIntoViewIfNeeded")
+        .unwrap();
+    assert_eq!(
+        &methods[scroll..scroll + 3],
+        [
+            "DOM.scrollIntoViewIfNeeded",
+            "Page.getLayoutMetrics",
+            "DOM.getContentQuads"
+        ]
+    );
+    let mouse: Vec<_> = commands
+        .iter()
+        .filter(|command| command["method"] == "Input.dispatchMouseEvent")
+        .collect();
+    assert_eq!(mouse.len(), 2);
+    for command in mouse {
+        assert_eq!(command["params"]["x"], 300.0);
+        assert_eq!(command["params"]["y"], 210.0);
+    }
+}
+
+#[tokio::test]
+async fn short_refs_are_stable_only_for_the_same_route_tab_and_document() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().top_level_only = true;
+    let tab = fixture.claim(1).await;
+    let (first, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let name = reference(&first, "Go");
+    assert!(
+        name.starts_with('e') && name[1..].chars().all(|c| c.is_ascii_digit()),
+        "{name}"
+    );
+    assert!(name.len() < 8, "{name}");
+    let (second, _) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(reference(&second, "Go"), name);
+    assert_ne!(first["snapshot_id"], second["snapshot_id"]);
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .tabs
+        .get_mut(&tab)
+        .unwrap()
+        .loader += 1;
+    let (third, _) = fixture.snapshot(1, &tab, "").await;
+    assert_ne!(reference(&third, "Go"), name);
+    let (stale, _) = fixture.call(1, click(&tab, &third, &name), "").await;
+    assert_eq!(stale["reason"], "ref_scope_mismatch", "{stale}");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test]
 async fn cdp_errors_name_the_failing_method_with_chromes_code_and_message() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
@@ -999,14 +1109,15 @@ async fn input_plans_enable_the_dom_agent_before_each_flattened_document_read() 
 }
 
 #[tokio::test]
-async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
+async fn a_form_less_untyped_button_click_reuses_the_ordinary_site_grant() {
     // A <button> defaults to type submit, but with no form owner it submits
-    // nothing. It must classify at the declared level, so the read card is the
-    // only card: one invocation, one allow_30m ask.
+    // nothing. The read card covers ordinary use, so classification must not
+    // turn this form-less button into a submit that needs another approval.
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     fixture.state.lock().unwrap().untyped_button = true;
-    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (snapshot, read_cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(read_cards.len(), 1);
     let (clicked, cards) = fixture
         .call(
             1,
@@ -1015,8 +1126,8 @@ async fn a_form_less_untyped_button_click_asks_once_at_its_declared_level() {
         )
         .await;
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
-    assert_eq!(cards.len(), 1, "{cards:?}");
-    assert_eq!(cards[0]["scope"]["severity_tier"], 2);
+    assert!(cards.is_empty(), "{cards:?}");
+    assert_eq!(read_cards[0]["scope"]["severity_tier"], 2);
 }
 
 #[tokio::test]
@@ -2351,7 +2462,7 @@ async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card
         )
         .await;
     assert_eq!(top_clicked["outcome"], "ok");
-    assert_eq!(top_cards.len(), 1);
+    assert!(top_cards.is_empty());
     let (reply, cards) = fixture
         .call(
             1,

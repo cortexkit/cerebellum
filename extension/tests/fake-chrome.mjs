@@ -56,7 +56,10 @@ export function fakeChrome() {
       async group({ tabIds, groupId }) {
         const id = groupId ?? 7;
         if (!groups.has(id)) groups.set(id, { id, windowId: tabData.get(tabIds[0]).windowId });
-        for (const tabId of tabIds) { tabData.get(tabId).groupId = id; tabData.get(tabId).windowId = groups.get(id).windowId; }
+        for (const tabId of tabIds) {
+          tabData.get(tabId).groupId = id; tabData.get(tabId).windowId = groups.get(id).windowId;
+          chrome.tabs.onUpdated.emit(tabId, { groupId: id });
+        }
         calls.push(["group", tabIds, id]);
         return id;
       },
@@ -100,7 +103,10 @@ export function fakeChrome() {
       async detach(target) { calls.push(["detach", target]); },
       async sendCommand(target, method, params) { calls.push(["cdp", target, method, params]); return { method }; },
     },
-    action: { onClicked: new Event() },
+    action: { onClicked: new Event(),
+      async setBadgeText(options) { calls.push(["badge", options]); },
+      async setTitle(options) { calls.push(["title", options]); },
+    },
     contextMenus: { onClicked: new Event(), create(options) { calls.push(["menu", options]); }, async removeAll() {} },
     alarms: { onAlarm: new Event(), async create(name, options) { calls.push(["alarm", name, options]); } },
     windows: { onFocusChanged: new Event(), async update(id, options) {

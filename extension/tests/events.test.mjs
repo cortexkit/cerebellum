@@ -137,3 +137,75 @@ test("worker restart recovers only its recorded group and rotates handles", asyn
   assert.equal(restarted.tabs.has(1), false);
   assert.ok(f.chrome.calls.some(call => call[0] === "query" && call[1].groupId === 7));
 });
+
+test("handover failures are visible on the toolbar and log the refusal reason", async t => {
+  const chrome = fakeChrome();
+  const worker = start(chrome);
+  await turn();
+  const errors = [];
+  t.mock.method(console, "error", message => errors.push(message));
+  worker.tabs.toggle = async () => { throw new Error("agent_group_other_window"); };
+  for (const source of ["toolbar", "menu"]) {
+    chrome.calls.length = 0;
+    if (source === "toolbar") chrome.action.onClicked.emit(chrome.tabData.get(2));
+    else chrome.contextMenus.onClicked.emit({ menuItemId: "agent-handover" }, chrome.tabData.get(2));
+    await turn();
+    assert.deepEqual(chrome.calls.find(call => call[0] === "badge"), ["badge", { tabId: 2, text: "!" }]);
+    assert.deepEqual(chrome.calls.find(call => call[0] === "title"), ["title", { tabId: 2, title: "Agent handover failed: agent_group_other_window" }]);
+  }
+  assert.deepEqual(errors, ["Agent handover failed: agent_group_other_window", "Agent handover failed: agent_group_other_window"]);
+  worker.bridge.drop();
+  await worker.bridge.disconnecting;
+});
+
+test("a tab in a person-made Agent group moves into our group without adopting its neighbors", async () => {
+  const chrome = fakeChrome();
+  chrome.groups.set(99, { id: 99, title: "Agent", windowId: 3 });
+  for (const tab of chrome.tabData.values()) tab.groupId = 99;
+  const worker = start(chrome);
+  await turn();
+  chrome.action.onClicked.emit(chrome.tabData.get(2));
+  await turn();
+  assert.notEqual(worker.tabs.group.id, 99);
+  assert.equal(chrome.tabData.get(2).groupId, worker.tabs.group.id);
+  assert.equal(chrome.tabData.get(1).groupId, 99);
+  assert.equal(worker.tabs.tabs.has(1), false);
+  assert.equal(worker.tabs.tabs.get(2).kind, "handed");
+  assert.ok(chrome.calls.some(call => call[0] === "badge" && call[1].text === ""));
+  worker.bridge.drop();
+  await worker.bridge.disconnecting;
+});
+
+test("dragging into the recorded group hands over a background tab and moving out withdraws it", async () => {
+  const f = await setup();
+  listen(f);
+  f.chrome.tabData.set(3, { id: 3, windowId: 3, groupId: f.tabs.group.id, active: false });
+  f.chrome.tabs.onUpdated.emit(3, { groupId: f.tabs.group.id });
+  await turn();
+  const record = f.tabs.tabs.get(3);
+  assert.equal(record.kind, "handed");
+  assert.ok(f.chrome.calls.some(call => call[0] === "inject" && call[1].target.tabId === 3));
+  assert.ok((await f.tabs.list()).some(tab => tab.tab === record.handle));
+  assert.equal(f.chrome.tabData.get(3).active, false);
+  f.chrome.tabs.onUpdated.emit(3, { title: "ignored" });
+  await turn();
+  assert.equal(f.tabs.tabs.get(3).handle, record.handle);
+  f.chrome.tabData.get(3).groupId = -1;
+  f.chrome.tabs.onUpdated.emit(3, { groupId: -1 });
+  await turn();
+  assert.equal(f.tabs.tabs.has(3), false);
+  assert.equal(f.chrome.calls.some(call => ["restoreTab", "restoreWindow"].includes(call[0])), false);
+});
+
+test("a delayed group event cannot adopt an outside tab or a namesake group", async () => {
+  const f = await setup();
+  listen(f);
+  f.chrome.tabs.onUpdated.emit(1, { groupId: f.tabs.group.id });
+  await turn();
+  assert.equal(f.tabs.tabs.has(1), false);
+  f.chrome.groups.set(99, { id: 99, title: "Agent", windowId: 3 });
+  f.chrome.tabData.get(1).groupId = 99;
+  f.chrome.tabs.onUpdated.emit(1, { groupId: 99 });
+  await turn();
+  assert.equal(f.tabs.tabs.has(1), false);
+});

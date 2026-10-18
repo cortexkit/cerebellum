@@ -58,7 +58,8 @@ test("the exact admitted CDP subset excludes broader driver commands", () => {
   }
   assert.equal(classifyCommand({ method: "Page.navigate", params: { url: "http://localhost/" } }), "navigate");
   assert.equal(classifyCommand({ method: "Emulation.setFocusEmulationEnabled", params: { enabled: true } }), "input");
-  for (const method of ["Runtime.resolveNode", "Runtime.evaluate", "Page.enable", "Page.createIsolatedWorld", "DOM.getDocument", "Accessibility.getRootAXNode", "DOM.scrollIntoViewIfNeeded", "Input.dispatchTouchEvent", "Target.setAutoAttach", "Network.enable"]) {
+  assert.equal(classifyCommand({ method: "DOM.scrollIntoViewIfNeeded", params: { backendNodeId: 9 } }), "input");
+  for (const method of ["Runtime.resolveNode", "Runtime.evaluate", "Page.enable", "Page.createIsolatedWorld", "DOM.getDocument", "Accessibility.getRootAXNode", "Input.dispatchTouchEvent", "Target.setAutoAttach", "Network.enable"]) {
     assert.throws(() => classifyCommand({ method, params: {} }), { reason: "unsupported_cdp_method" });
   }
 });
@@ -93,7 +94,7 @@ test("terminal read accounting covers frame queries without admitting target mut
     assert.ok(readOnly.includes(method), `${method} must not mark a child read dispatched`);
     assert.equal(classifyCommand({ method, params: {} }), "read");
   }
-  for (const method of ["Input.dispatchMouseEvent", "Input.insertText", "DOM.focus", "Runtime.callFunctionOn", "Target.setAutoAttach", "Page.createIsolatedWorld", "DOM.newReadMethod"]) {
+  for (const method of ["Input.dispatchMouseEvent", "Input.insertText", "DOM.focus", "DOM.scrollIntoViewIfNeeded", "Runtime.callFunctionOn", "Target.setAutoAttach", "Page.createIsolatedWorld", "DOM.newReadMethod"]) {
     assert.ok(!readOnly.includes(method), `${method} must not become unconditionally read-only`);
   }
 });

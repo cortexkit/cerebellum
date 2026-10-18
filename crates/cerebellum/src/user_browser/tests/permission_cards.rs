@@ -226,6 +226,204 @@ async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clo
     assert!(rows(&fixture).is_empty());
 }
 
+async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    fixture.state.lock().unwrap().top_level_only = true;
+    let args = if tier == 1 {
+        let tab = fixture.claim(1).await;
+        snapshot_args(&tab)
+    } else {
+        ask(tier, json!([]), "https://example.com")
+    };
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id":"el_late_site"})),
+        )
+        .then(
+            wire::CONSENT_AWAIT,
+            Reply::Result(json!({"elicitation_id":"el_late_site","state":"pending"})),
+        )
+        .then(
+            wire::CONSENT_DETACH,
+            Reply::Result(
+                json!({"elicitation_id":"el_late_site","state":"pending","detached":true}),
+            ),
+        );
+    let (reply, _) = fixture.call(1, args, "").await;
+    assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+    assert!(rows(&fixture).is_empty());
+    script
+        .then(wire::CONSENT_ANSWERS, Reply::Result(json!({"records":[{"elicitation_id":"el_late_site","state":"answered","answered_choice_id":choice}],"cursor":1})))
+        .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
+    // Status does not retry the original demand. Its admitted-call drain must
+    // nevertheless make the durable answer available to subsequent actions.
+    let (status, _) = fixture
+        .call(1, json!({"browser":"user","action":"status"}), "")
+        .await;
+    assert_eq!(status["outcome"], "ok", "{status}");
+    assert_eq!(
+        script
+            .methods()
+            .iter()
+            .filter(|m| m.as_str() == wire::CONSENT_REQUEST)
+            .count(),
+        1
+    );
+    fixture
+}
+
+#[tokio::test]
+async fn late_read_site_answer_covers_click_without_another_card() {
+    let fixture = late_site_answer("allow_30m", 1).await;
+    let granted = rows(&fixture);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].max_level, 2);
+    assert_eq!(granted[0].card_ref.as_deref(), Some("el_late_site"));
+    assert_eq!(granted[0].browser_target, Some(BrowserTarget::UserBrowser));
+    assert_eq!(
+        granted[0].expires_at_ms,
+        Some(granted[0].granted_at_ms + 1_800_000)
+    );
+    let tab = fixture.claim(1).await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(cards.is_empty());
+    let (clicked, cards) = fixture.call(1, json!({"browser":"user","action":"click","tab":tab,"ref":reference(&snapshot, "Go"),"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture","severity":{"tier":2,"credential":false,"financial":false}}), "").await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(cards.is_empty());
+    assert!(fixture
+        .planes
+        .consent
+        .take_single_use_approval(
+            &this_session(),
+            &fixture
+                .planes
+                .consent
+                .raised("el_late_site")
+                .unwrap()
+                .subject
+        )
+        .is_none());
+}
+
+#[tokio::test]
+async fn late_always_read_answer_grants_ordinary_site_use() {
+    let fixture = late_site_answer("allow_origin_always", 1).await;
+    let granted = rows(&fixture);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].expires_at_ms, None);
+    assert_eq!(granted[0].max_level, 2);
+    let holder = &granted[0].holder;
+    assert!(fixture
+        .planes
+        .management
+        .agent_grants()
+        .authorize(
+            holder,
+            crate::agent_grants::GrantDemand::Browser {
+                target: BrowserTarget::UserBrowser,
+                origin: "https://example.com".into(),
+                severity: Severity::new(2, false, false),
+                hazards: BTreeSet::new(),
+            }
+        )
+        .is_some());
+    let tab = fixture.claim(1).await;
+    let (snapshot, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert!(cards.is_empty());
+}
+
+#[tokio::test]
+async fn in_call_read_site_answers_cover_clicks_and_typing() {
+    for decision in ["allow_30m", "allow_origin_always"] {
+        let fixture = Fixture::new();
+        fixture.state.lock().unwrap().top_level_only = true;
+        let tab = fixture.claim(1).await;
+        let (snapshot, cards) = fixture.snapshot(1, &tab, decision).await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(rows(&fixture)[0].max_level, 2);
+        assert_eq!(cards[0]["scope"]["severity_tier"], 2);
+        assert_eq!(
+            cards[0]["options"][0]["label"],
+            "Allow on example.com for 30 minutes"
+        );
+        assert_eq!(cards[0]["options"][0]["detail"], "Covers reading, clicking and typing on this site; submitting forms and credential or financial actions still need approval.");
+        let (clicked, cards) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Go")),
+                "deny",
+            )
+            .await;
+        assert_eq!(clicked["outcome"], "ok", "{clicked}");
+        assert!(cards.is_empty());
+        let (typed, cards) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"ordinary site use","clear_first":true}), "deny").await;
+        assert_eq!(typed["outcome"], "ok", "{typed}");
+        assert!(cards.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ordinary_read_site_grant_still_asks_for_tier_three_actions_and_submits() {
+    for form_submit in [false, true] {
+        let fixture = Fixture::new();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.top_level_only = true;
+            state.submit_button = form_submit;
+        }
+        let tab = fixture.claim(1).await;
+        let (snapshot, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(cards.len(), 1);
+        let mut action = click(&tab, &snapshot, &reference(&snapshot, "Go"));
+        action["severity"]["tier"] = json!(3);
+        action["intent"] = json!(if form_submit {
+            "submit fixture form"
+        } else {
+            "perform tier-three fixture action"
+        });
+        let (reply, cards) = fixture.call(1, action, "deny").await;
+        assert_eq!(reply["reason"], "consent_declined", "{reply}");
+        assert_eq!(cards.len(), 1);
+        // A form owner's submit keeps its existing tier-four floor even when
+        // the form has no credential or payment controls to disclose. An
+        // ordinary target declared at tier three asks at exactly tier three.
+        assert_eq!(
+            cards[0]["scope"]["severity_tier"],
+            if form_submit { 4 } else { 3 }
+        );
+        assert_eq!(cards[0]["scope"]["hazards"], json!([]));
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+        let granted = rows(&fixture);
+        assert_eq!(granted.len(), 1);
+        assert_eq!(granted[0].max_level, 2);
+        for hazard in [
+            HazardClass::CredentialFormSubmit,
+            HazardClass::FinancialFormSubmit,
+        ] {
+            assert!(fixture
+                .planes
+                .management
+                .agent_grants()
+                .authorize(
+                    &granted[0].holder,
+                    crate::agent_grants::GrantDemand::Browser {
+                        target: BrowserTarget::UserBrowser,
+                        origin: "https://example.com".into(),
+                        severity: Severity::new(2, false, false),
+                        hazards: [hazard].into_iter().collect(),
+                    }
+                )
+                .is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn forged_user_browser_all_sites_answers_never_write_a_row() {
     for choice in ["allow_all_sites_30m", "allow_all_sites_always"] {
