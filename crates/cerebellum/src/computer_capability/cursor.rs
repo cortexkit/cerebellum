@@ -233,10 +233,10 @@ impl Coordinator {
         session_ref: &str,
         scope_ref: Option<&str>,
         outcome: TurnOutcome,
-    ) {
+    ) -> bool {
         let _ = (session_ref, outcome);
         let Some(scope_ref) = scope_ref else {
-            return;
+            return false;
         };
         let agents: BTreeSet<String> = self
             .drawn()
@@ -245,9 +245,11 @@ impl Coordinator {
             .filter(|(session, _)| session.scope_ref == scope_ref)
             .map(|(_, agent)| agent.clone())
             .collect();
+        let matched = !agents.is_empty();
         for agent in agents {
             self.end(&agent);
         }
+        matched
     }
 
     /// Remember who is drawing this badge, before any read starts, so an end

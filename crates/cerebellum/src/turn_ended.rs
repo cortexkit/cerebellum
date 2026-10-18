@@ -23,6 +23,8 @@ pub(crate) struct TurnEnded {
     /// new epoch.
     pub(crate) scope_ref: String,
     pub(crate) outcome: TurnOutcome,
+    /// The event timestamp is the only request value exposed in health metrics.
+    pub(crate) at_ms: u64,
 }
 
 /// Which parameter was refused, and why, for an `invalid_request` reply.
@@ -169,14 +171,14 @@ pub(crate) fn parse(params: &Map<String, Value>) -> Result<TurnEnded, ParamsErro
     }
     string(params, "source", "source")?;
     unsigned(params, "seq", "seq")?;
-    // `at_ms` is required by the call's parameter shape, but this module
-    // ignores its value: the session's cursor badge is hidden as soon as the
-    // call arrives, whenever the turn actually ended.
-    unsigned(params, "at_ms", "at_ms")?;
+    // The timestamp is retained for health visibility; the handler still hides
+    // the badge as soon as the call arrives, whenever the turn actually ended.
+    let at_ms = unsigned(params, "at_ms", "at_ms")?;
     Ok(TurnEnded {
         session_ref: session_ref.to_string(),
         scope_ref,
         outcome,
+        at_ms,
     })
 }
 

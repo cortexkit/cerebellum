@@ -11,6 +11,14 @@ use crate::computer_capability::cursor::{Coordinator, Identity, SessionScope};
 use cerebellum_computer::cursor::CursorLine;
 use sha2::{Digest, Sha256};
 
+// These tests inspect process-lifetime atomics; serialize every call here so
+// another handler test cannot make a counter assertion pass or fail by luck.
+static TURN_ENDED_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn lock_turn_ended_metrics() -> tokio::sync::MutexGuard<'static, ()> {
+    TURN_ENDED_TEST_LOCK.lock().await
+}
+
 fn planes_with_cursor() -> (Planes, mpsc::Receiver<CursorLine>) {
     let mut planes = Planes::with_browser_config_journaling(
         Arc::new(HealthState::default()),
@@ -206,6 +214,30 @@ async fn served(planes: &Planes, request: &Frame) -> Frame {
     reply
 }
 
+async fn health_metrics(planes: &Planes) -> Value {
+    let (tx, mut rx) = mpsc::channel(8);
+    let request = Frame::build_with_version(
+        subc_protocol::PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        900,
+        serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+    )
+    .unwrap();
+    handle_frame(request, &tx, planes).await.unwrap();
+    let reply = rx.recv().await.expect("health response");
+    let ModuleControlResponse::HealthCheck {
+        metrics: Some(metrics),
+        ..
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("health reply")
+    };
+    metrics
+}
+
 fn body(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
@@ -226,6 +258,7 @@ fn two_sessions(planes: &Planes) {
 
 #[tokio::test]
 async fn turn_ended_for_one_session_hides_its_badge_and_not_another() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     let (planes, mut lines) = planes_with_cursor();
     bind_management(&planes, prefrontal());
     two_sessions(&planes);
@@ -245,6 +278,7 @@ async fn turn_ended_for_one_session_hides_its_badge_and_not_another() {
 
 #[tokio::test]
 async fn turn_ended_for_an_unknown_session_still_acknowledges() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     let (planes, mut lines) = planes_with_cursor();
     bind_management(&planes, prefrontal());
     two_sessions(&planes);
@@ -262,6 +296,7 @@ async fn turn_ended_for_an_unknown_session_still_acknowledges() {
 
 #[tokio::test]
 async fn turn_ended_with_an_unknown_outcome_is_refused_naming_the_field() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     let (planes, mut lines) = planes_with_cursor();
     bind_management(&planes, prefrontal());
     two_sessions(&planes);
@@ -283,6 +318,7 @@ async fn turn_ended_with_an_unknown_outcome_is_refused_naming_the_field() {
 
 #[tokio::test]
 async fn a_failed_turn_with_its_error_class_hides_the_badge() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     let (planes, mut lines) = planes_with_cursor();
     bind_management(&planes, prefrontal());
     two_sessions(&planes);
@@ -303,6 +339,7 @@ async fn a_failed_turn_with_its_error_class_hides_the_badge() {
 
 #[tokio::test]
 async fn an_error_class_on_a_turn_that_did_not_fail_is_refused() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     let (planes, mut lines) = planes_with_cursor();
     bind_management(&planes, prefrontal());
     two_sessions(&planes);
@@ -323,6 +360,7 @@ async fn an_error_class_on_a_turn_that_did_not_fail_is_refused() {
 
 #[tokio::test]
 async fn turn_ended_from_any_other_principal_is_refused() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
     for principal in [
         None,
         Some(subc_protocol::Principal::Direct),
@@ -348,6 +386,127 @@ async fn turn_ended_from_any_other_principal_is_refused() {
         assert_eq!(body(&reply)["code"], "principal_denied", "{principal:?}");
         assert_eq!(hidden(&mut lines), Vec::<String>::new(), "{principal:?}");
     }
+}
+
+#[tokio::test]
+async fn health_reports_turn_ended_counts_and_last_admitted_timestamp() {
+    let _metrics_guard = lock_turn_ended_metrics().await;
+    let (planes, mut lines) = planes_with_cursor();
+    bind_management(&planes, prefrontal());
+    two_sessions(&planes);
+
+    let before = health_metrics(&planes).await;
+    for key in [
+        "turnEndedReceived",
+        "turnEndedRefused",
+        "turnEndedMatchedBadge",
+        "turnEndedLastAtMs",
+    ] {
+        assert!(before.get(key).is_some(), "health includes {key}");
+    }
+    let received_before = before["turnEndedReceived"].as_u64().unwrap();
+    let refused_before = before["turnEndedRefused"].as_u64().unwrap();
+    let matched_before = before["turnEndedMatchedBadge"].as_u64().unwrap();
+
+    let mut matched = params("head-a", "completed");
+    matched["at_ms"] = json!(1_700_000_000_101u64);
+    assert_eq!(
+        body(&served(&planes, &turn_ended_request(901, matched)).await),
+        json!({"acknowledged": true})
+    );
+    let after_match = health_metrics(&planes).await;
+    assert_eq!(
+        after_match["turnEndedReceived"].as_u64(),
+        Some(received_before + 1)
+    );
+    assert_eq!(
+        after_match["turnEndedMatchedBadge"].as_u64(),
+        Some(matched_before + 1)
+    );
+    assert_eq!(
+        after_match["turnEndedRefused"].as_u64(),
+        Some(refused_before)
+    );
+    assert_eq!(
+        after_match["turnEndedLastAtMs"],
+        json!(1_700_000_000_101u64)
+    );
+    assert_eq!(hidden(&mut lines), ["agent-a"]);
+
+    let mut unmatched = params("head-unknown", "completed");
+    unmatched["at_ms"] = json!(1_700_000_000_202u64);
+    assert_eq!(
+        body(&served(&planes, &turn_ended_request(902, unmatched)).await),
+        json!({"acknowledged": true})
+    );
+    let after_unmatched = health_metrics(&planes).await;
+    assert_eq!(
+        after_unmatched["turnEndedReceived"].as_u64(),
+        Some(received_before + 2)
+    );
+    assert_eq!(
+        after_unmatched["turnEndedMatchedBadge"].as_u64(),
+        Some(matched_before + 1)
+    );
+    assert_eq!(
+        after_unmatched["turnEndedRefused"].as_u64(),
+        Some(refused_before)
+    );
+    assert_eq!(
+        after_unmatched["turnEndedLastAtMs"],
+        json!(1_700_000_000_202u64)
+    );
+    assert_eq!(hidden(&mut lines), Vec::<String>::new());
+
+    let mut invalid = params("head-a", "paused");
+    invalid["at_ms"] = json!(1_700_000_000_303u64);
+    let invalid_reply = served(&planes, &turn_ended_request(903, invalid)).await;
+    assert_eq!(body(&invalid_reply)["outcome"], "invalid_request");
+    let after_invalid = health_metrics(&planes).await;
+    assert_eq!(
+        after_invalid["turnEndedReceived"],
+        after_unmatched["turnEndedReceived"]
+    );
+    assert_eq!(
+        after_invalid["turnEndedMatchedBadge"],
+        after_unmatched["turnEndedMatchedBadge"]
+    );
+    assert_eq!(
+        after_invalid["turnEndedRefused"].as_u64(),
+        Some(refused_before + 1)
+    );
+    assert_eq!(
+        after_invalid["turnEndedLastAtMs"],
+        after_unmatched["turnEndedLastAtMs"]
+    );
+
+    bind_management(
+        &planes,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "basal".to_string(),
+        }),
+    );
+    let mut denied = params("head-a", "completed");
+    denied["at_ms"] = json!(1_700_000_000_404u64);
+    let denied_reply = served(&planes, &turn_ended_request(904, denied)).await;
+    assert_eq!(body(&denied_reply)["code"], "principal_denied");
+    let after_denied = health_metrics(&planes).await;
+    assert_eq!(
+        after_denied["turnEndedReceived"],
+        after_invalid["turnEndedReceived"]
+    );
+    assert_eq!(
+        after_denied["turnEndedMatchedBadge"],
+        after_invalid["turnEndedMatchedBadge"]
+    );
+    assert_eq!(
+        after_denied["turnEndedRefused"].as_u64(),
+        Some(refused_before + 2)
+    );
+    assert_eq!(
+        after_denied["turnEndedLastAtMs"],
+        after_unmatched["turnEndedLastAtMs"]
+    );
 }
 
 /// Byte-for-byte `session-turn-ended-v1` examples for core, captured from the

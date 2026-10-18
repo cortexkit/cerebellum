@@ -330,9 +330,14 @@ async fn health_check_returns_insulated_report() {
                 "queueAgeThresholdSecs",
                 "inFlightAgeThresholdSecs",
                 "awaitingConsent",
+                "turnEndedReceived",
+                "turnEndedRefused",
+                "turnEndedMatchedBadge",
+                "turnEndedLastAtMs",
             ] {
                 assert!(obj.contains_key(key), "metrics include {key}");
             }
+            assert_eq!(obj["turnEndedLastAtMs"], serde_json::Value::Null);
         }
         _ => panic!("expected HealthCheck response"),
     }
