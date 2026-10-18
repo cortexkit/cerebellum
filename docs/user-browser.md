@@ -204,9 +204,10 @@ bash -n scripts/install-native-host.sh
 bash scripts/rust-test-gate.sh
 ```
 
-The explicit self-test runs 20 portable checks (21 on macOS, including process-
-group and directory cleanup) with driver doubles and scratch manifest
-fixtures, without Chrome, a socket, a durable journal or any live profile. Its
+The explicit self-test runs 34 portable checks (35 on macOS, including process-
+group and directory cleanup) with driver doubles, scratch manifest fixtures and
+real loopback HTTP socket controls. It uses no Chrome, native bridge socket,
+durable journal or live profile. Its
 negative controls deliberately fail named acceptance checks; the final named
 self-test results distinguish these expected refusals from a test failure.
 It does not substitute for the operator-approved real run. Passing doubles must

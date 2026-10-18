@@ -26,6 +26,9 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[path = "user_browser_probe/fixture_http.rs"]
+mod fixture_http;
+
 const HOST: &str = "com.cortexkit.cerebellum";
 const CHROME_MANIFEST_DIR: &str = "Library/Application Support/Google/Chrome/NativeMessagingHosts";
 const BUDGET_SECS: u64 = 180;
@@ -1032,36 +1035,7 @@ mod live {
                             continue;
                         }
                     };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                    let mut bytes = [0u8; 8192];
-                    let size = stream.read(&mut bytes).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&bytes[..size]);
-                    let path = request.split_whitespace().nth(1).unwrap_or("");
-                    let mut report = state.lock().unwrap();
-                    if path == "/click" {
-                        report.0 += 1;
-                    }
-                    if let Some(text) = path.strip_prefix("/type?") {
-                        report.1 = text.to_owned();
-                    }
-                    if let Some(text) = path.strip_prefix("/child-type?") {
-                        report.2 = text.to_owned();
-                    }
-                    drop(report);
-                    let body = if path == "/outside-secret" {
-                        "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
-                    } else if path == "/" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
-                    } else if path == "/handed-active" || path == "/handed-background" {
-                        r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><form style="position:fixed;left:8px;top:40px" method="post" action="/submitted"><button aria-label="Probe submit">Submit</button></form><div style="height:2000px"></div>"##
-                    } else if path == "/iframe" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
-                    } else {
-                        "ok"
-                    };
-                    let body = body.replace("IFRAME_ORIGIN", &child_origin);
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = fixture_http::serve(&mut stream, &child_origin, &state);
                 }
             });
             Ok(Self {
@@ -1906,12 +1880,20 @@ mod live {
             );
             self.handed_id = self.cdp.eval(&self.worker_session, &expression)?.as_i64();
             self.handed_url = url;
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let (status, _) = self.call(json!({"action":"status"})).await?;
                 let member = unclaimed_handed_tab(&status);
+                // Handover can finish before the fixture's HTTP load. Wait for
+                // this created tab, not for an agent snapshot to happen to pass.
+                let readiness = self.cdp.eval(&self.worker_session, &format!("chrome.tabs.get({}).then(tab => ({{url_matches:tab.url === {}, complete:tab.status === 'complete'}}))", self.handed_id.ok_or("handed fixture Chrome id missing")?, json!(self.handed_url)))?;
+                let ready = readiness["url_matches"] == true && readiness["complete"] == true;
                 let timed_out = Instant::now() > deadline;
-                if member.as_ref().is_ok_and(Option::is_some) || member.is_err() || timed_out {
+                if member.as_ref().is_ok_and(Option::is_some) && ready
+                    || member.is_err()
+                    || timed_out
+                {
+                    println!("handover fixture readiness: {readiness}");
                     println!("handover public status: {status}");
                     let observed = self.cdp.eval(&self.worker_session, r#"(async () => {
                         const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
@@ -1928,7 +1910,14 @@ mod live {
                     }
                 }
                 if let Some(handle) = member? {
-                    return Ok(handle);
+                    if ready {
+                        return Ok(handle);
+                    }
+                    if timed_out {
+                        return Err(
+                            "handed fixture did not finish loading at its expected URL".into()
+                        );
+                    }
                 }
                 if timed_out {
                     return Err("drag-in member never appeared as handed".into());
@@ -2396,6 +2385,7 @@ fn host_exit_control() -> Result<(), String> {
 
 async fn self_test() -> Result<(), String> {
     let mut tests: Vec<(&str, Result<(), String>)> = Vec::new();
+    tests.extend(fixture_http::controls());
     let args = vec![
         "--chrome".into(),
         "/some/Google Chrome for Testing".into(),
@@ -2680,7 +2670,7 @@ async fn self_test() -> Result<(), String> {
             }
         }
     }
-    println!("user_browser_probe {}: {count} offline checks, {failed} failures; no Chrome, live profile, socket or durable journal", env!("CARGO_PKG_VERSION"));
+    println!("user_browser_probe {}: {count} offline checks, {failed} failures; loopback HTTP sockets only, no Chrome, live profile, bridge socket or durable journal", env!("CARGO_PKG_VERSION"));
     if failed == 0 {
         Ok(())
     } else {
