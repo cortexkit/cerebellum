@@ -5,6 +5,7 @@
 
 use super::support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cerebellum::computer_capability::{
@@ -13,7 +14,8 @@ use cerebellum::computer_capability::{
 use cerebellum::computer_grants::{ConsentContext, GrantCaller, QuestionCarrier};
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::app_state::source::{
-    AppStateReadError, AppStateSource, ElementValue, RawAppState, RawElement, ReadBounds,
+    AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
+    ElementReadError, ElementValue, RawAppState, RawElement, ReadBounds,
 };
 use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, WindowFrame};
 use cerebellum_computer::platform::{PermissionLiveness, ProcessGrant};
@@ -48,6 +50,23 @@ impl FixtureSource {
     }
 }
 
+fn find_raw_element<'a>(
+    roots: &'a [RawElement],
+    element: &ElementHandle,
+) -> Option<&'a RawElement> {
+    roots.iter().find_map(|node| {
+        if node.handle.same_element(element.as_ref()) {
+            Some(node)
+        } else {
+            find_raw_element(&node.children, element)
+        }
+    })
+}
+
+fn unreadable_count(node: &RawElement) -> usize {
+    node.unreadable_children + node.children.iter().map(unreadable_count).sum::<usize>()
+}
+
 impl AppStateSource for FixtureSource {
     fn read_app_state(
         &self,
@@ -55,6 +74,119 @@ impl AppStateSource for FixtureSource {
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         self.0.lock().unwrap().clone()
+    }
+
+    fn read_element_state(
+        &self,
+        _target: &ProcessGrant,
+        element: &ElementHandle,
+        _bounds: ReadBounds,
+        _expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        let state = self.0.lock().unwrap().clone();
+        let raw = match state {
+            Ok(raw) => raw,
+            Err(AppStateReadError::TargetGone) => return Err(ElementReadError::Gone),
+            Err(_) => return Err(ElementReadError::Unreadable),
+        };
+        match find_raw_element(&raw.roots, element) {
+            Some(root) => Ok(RawAppState {
+                roots: vec![root.clone()],
+                focused: None,
+                unreadable_subtrees: unreadable_count(root),
+                read_bound_reached: false,
+            }),
+            None if !raw.is_complete() => Err(ElementReadError::Unreadable),
+            None => Err(ElementReadError::Gone),
+        }
+    }
+
+    fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        let state = self.0.lock().unwrap();
+        let raw = match &*state {
+            Ok(raw) => raw,
+            Err(AppStateReadError::TargetGone) => return Err(ElementActionError::Gone),
+            Err(_) => return Err(ElementActionError::Indeterminate),
+        };
+        if find_raw_element(&raw.roots, element).is_some() {
+            Ok(ElementFacts {
+                pid: Some(grant().pid),
+                ..Default::default()
+            })
+        } else if raw.is_complete() {
+            Err(ElementActionError::Gone)
+        } else {
+            Err(ElementActionError::Indeterminate)
+        }
+    }
+}
+
+struct BudgetedFixtureSource {
+    complete_tree: RawAppState,
+    root_reads: AtomicUsize,
+    subtree_reads: AtomicUsize,
+}
+
+impl BudgetedFixtureSource {
+    fn new(root: RawElement) -> Self {
+        Self {
+            complete_tree: RawAppState {
+                roots: vec![root],
+                focused: None,
+                unreadable_subtrees: 0,
+                read_bound_reached: false,
+            },
+            root_reads: AtomicUsize::new(0),
+            subtree_reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl AppStateSource for BudgetedFixtureSource {
+    fn read_app_state(
+        &self,
+        _target: &ProcessGrant,
+        _bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        if self.root_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(self.complete_tree.clone());
+        }
+        let mut truncated = self.complete_tree.clone();
+        let window = &mut truncated.roots[0];
+        window.children.pop();
+        window.unreadable_children = 1;
+        truncated.unreadable_subtrees = 1;
+        truncated.read_bound_reached = true;
+        Ok(truncated)
+    }
+
+    fn read_element_state(
+        &self,
+        _target: &ProcessGrant,
+        element: &ElementHandle,
+        _bounds: ReadBounds,
+        _expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        self.subtree_reads.fetch_add(1, Ordering::SeqCst);
+        let root =
+            find_raw_element(&self.complete_tree.roots, element).ok_or(ElementReadError::Gone)?;
+        Ok(RawAppState {
+            roots: vec![root.clone()],
+            focused: None,
+            unreadable_subtrees: unreadable_count(root),
+            read_bound_reached: false,
+        })
+    }
+
+    fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        if find_raw_element(&self.complete_tree.roots, element).is_some() {
+            Ok(ElementFacts {
+                pid: Some(grant().pid),
+                ..Default::default()
+            })
+        } else {
+            Err(ElementActionError::Gone)
+        }
     }
 }
 
@@ -87,7 +219,7 @@ type Plane<S = cerebellum_core::journal::InMemoryJournalStorage> = ComputerPlane
     S,
 >;
 
-fn plane(source: Arc<FixtureSource>) -> Plane {
+fn plane(source: Arc<dyn AppStateSource>) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
         .with_permission_liveness(super::support::computer::live_permissions())
         .with_app_state_source(source)
@@ -322,6 +454,63 @@ async fn zoom_works_with_an_id_from_a_text_filtered_read() {
         .as_str()
         .unwrap()
         .contains("PathTextField"));
+}
+
+fn big_sibling_window() -> RawElement {
+    let siblings = (0..4_050)
+        .map(|index| {
+            RawElement::fixture(10_000 + index, "AXStaticText").titled(&format!("Item {index}"))
+        })
+        .collect();
+    let details = RawElement::fixture(30_001, "AXStaticText").titled("Share options");
+    let share = RawElement::fixture(30_000, "AXButton")
+        .titled("Share")
+        .with_children(vec![details]);
+    RawElement::fixture(1, "AXWindow")
+        .titled("Finder")
+        .with_children(vec![
+            RawElement::fixture(2, "AXGroup").with_children(siblings),
+            share,
+        ])
+}
+
+#[tokio::test]
+async fn zoom_reads_only_the_target_subtree_when_a_large_sibling_exhausts_the_root_budget() {
+    let management = granted_management().await;
+    let source = Arc::new(BudgetedFixtureSource::new(big_sibling_window()));
+    let plane = plane(source.clone());
+    let filtered = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "text_filter": "Share"}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(filtered["outcome"], "completed", "{filtered}");
+    let target = id_on_line(line_with(
+        filtered["state_text"].as_str().unwrap(),
+        "button Share",
+    ))
+    .to_owned();
+
+    let zoomed = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": target}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(zoomed["outcome"], "completed", "{zoomed}");
+    assert!(zoomed["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Share options"));
+    assert_eq!(source.root_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(source.subtree_reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

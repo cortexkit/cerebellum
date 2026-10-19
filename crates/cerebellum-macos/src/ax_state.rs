@@ -602,3 +602,54 @@ pub fn read_app_state_with_menus(
         bound_reached: reader.bound_reached,
     })
 }
+
+/// Read only one retained element and its descendants, within one bounded traversal.
+pub fn read_element_state(
+    element: &AxRetainedElement,
+    bounds: AxAppStateBounds,
+    expand_menus: bool,
+) -> Result<AxAppState, AxAppStateError> {
+    // SAFETY: AXIsProcessTrusted checks current trust without showing the
+    // Accessibility permission prompt.
+
+    if !unsafe { AXIsProcessTrusted() } {
+        return Err(AxAppStateError::NotPermitted);
+    }
+    let deadline = Instant::now() + crate::ax_budget::messaging_timeout(bounds.timeout);
+    let names: Vec<CFRetained<CFString>> = ATTRIBUTES
+        .iter()
+        .map(|name| CFString::from_static_str(name))
+        .collect();
+    let mut reader = Reader {
+        expand_menus,
+        visited_elements: std::collections::HashMap::new(),
+        names: CFArray::from_retained_objects(&names),
+        value_name: CFString::from_static_str("AXValue"),
+        deadline,
+        max_elements: bounds.max_elements,
+        max_depth: bounds.max_depth,
+        visited: 0,
+        unreadable: 0,
+        bound_reached: false,
+    };
+    reader.first_visit(element);
+    let roots = if reader.visited >= reader.max_elements {
+        reader.bound_reached = true;
+        Vec::new()
+    } else {
+        reader.visited += 1;
+        match reader.read(AxRetainedElement(element.0.clone()), 0) {
+            ElementRead::Read(root) => vec![*root],
+            ElementRead::Unreadable => {
+                reader.unreadable += 1;
+                Vec::new()
+            }
+        }
+    };
+    Ok(AxAppState {
+        roots,
+        focused: None,
+        unreadable_subtrees: reader.unreadable,
+        bound_reached: reader.bound_reached,
+    })
+}

@@ -10,8 +10,8 @@ use cerebellum_macos::{
 
 use super::source::{
     AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
-    ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds, RunningApp,
-    TextAttribute, WindowMark,
+    ElementReadError, ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds,
+    RunningApp, TextAttribute, WindowMark,
 };
 use crate::platform::native::{verify_grant, GrantVerification};
 use crate::platform::ProcessGrant;
@@ -168,6 +168,45 @@ impl AppStateSource for MacAppStateSource {
         bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         self.read_native(target, bounds, true)
+    }
+
+    fn read_element_state(
+        &self,
+        target: &ProcessGrant,
+        element: &ElementHandle,
+        bounds: ReadBounds,
+        expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        match verify_grant(target.pid, target) {
+            GrantVerification::Current => {}
+            GrantVerification::TargetGone | GrantVerification::TargetReplaced => {
+                return Err(ElementReadError::Gone)
+            }
+            _ => return Err(ElementReadError::Unreadable),
+        }
+        let element = retained(element).map_err(|error| match error {
+            ElementActionError::Gone => ElementReadError::Gone,
+            _ => ElementReadError::Unreadable,
+        })?;
+        let bounds = AxAppStateBounds {
+            max_elements: bounds.max_elements,
+            max_depth: bounds.max_depth,
+            timeout: bounds.timeout,
+        };
+        let state = cerebellum_macos::read_element_state(element, bounds, expand_menus).map_err(
+            |error| match error {
+                AxAppStateError::ProcessGone => ElementReadError::Gone,
+                AxAppStateError::NotPermitted | AxAppStateError::Unreadable { .. } => {
+                    ElementReadError::Unreadable
+                }
+            },
+        )?;
+        Ok(RawAppState {
+            roots: state.roots.into_iter().map(convert).collect(),
+            focused: state.focused.map(handle),
+            unreadable_subtrees: state.unreadable_subtrees,
+            read_bound_reached: state.bound_reached,
+        })
     }
 
     fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
