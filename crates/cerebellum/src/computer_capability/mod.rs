@@ -1162,9 +1162,16 @@ where
             rendered.text.push_str("Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n");
         }
         if !rendered.zoom_found {
-            let mut reply = stale_zoom_reply();
-            admission.decorate(&mut reply);
-            return reply;
+            if !observed.complete && matches!(zoom, Some(Zoom::Element(_))) {
+                // An incomplete read cannot prove that a previously live element is gone.
+                rendered.text.push_str(
+                    "That part couldn't be read this time; read the state again without zoom, then try again.\n",
+                );
+            } else {
+                let mut reply = stale_zoom_reply();
+                admission.decorate(&mut reply);
+                return reply;
+            }
         }
 
         let mut reply = json!({

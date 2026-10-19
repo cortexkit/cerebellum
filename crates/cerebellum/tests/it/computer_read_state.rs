@@ -171,6 +171,12 @@ fn line_with<'a>(tree: &'a str, needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no line with {needle} in\n{tree}"))
 }
 
+fn id_on_line(line: &str) -> &str {
+    line.split_whitespace()
+        .next()
+        .expect("rendered element line has an id")
+}
+
 /// The tree comes back through `serve` under a held app grant and passes the
 /// row's result schema: the sheet sits under its window, the composer is
 /// settable, and the secure field's value never appears.
@@ -244,6 +250,163 @@ async fn filters_and_a_stale_zoom_id_are_served_through_withholding() {
     .await;
     assert_eq!(invalid["outcome"], "invalid_request");
     assert_eq!(invalid["field"], "role_filter");
+}
+
+#[tokio::test]
+async fn zoom_works_with_an_id_from_a_role_filtered_read() {
+    let management = granted_management().await;
+    let plane = plane(FixtureSource::new(vec![chat_window()]));
+    let filtered = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXTextArea"]}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(filtered["outcome"], "completed", "{filtered}");
+    let target = id_on_line(line_with(
+        filtered["state_text"].as_str().unwrap(),
+        "Message @IceTea",
+    ))
+    .to_owned();
+
+    let zoomed = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": target}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(zoomed["outcome"], "completed", "{zoomed}");
+    assert!(zoomed["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Message @IceTea"));
+}
+
+#[tokio::test]
+async fn zoom_works_with_an_id_from_a_text_filtered_read() {
+    let management = granted_management().await;
+    let plane = plane(FixtureSource::new(vec![chat_window()]));
+    let filtered = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "text_filter": "PathTextField"}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(filtered["outcome"], "completed", "{filtered}");
+    let target = id_on_line(line_with(
+        filtered["state_text"].as_str().unwrap(),
+        "PathTextField",
+    ))
+    .to_owned();
+
+    let zoomed = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": target}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(zoomed["outcome"], "completed", "{zoomed}");
+    assert!(zoomed["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("PathTextField"));
+}
+
+#[tokio::test]
+async fn a_removed_zoom_target_still_refuses_as_stale() {
+    let management = granted_management().await;
+    let source = FixtureSource::new(vec![chat_window()]);
+    let plane = plane(source.clone());
+    let first = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    let target = id_on_line(line_with(
+        first["state_text"].as_str().unwrap(),
+        "Message @IceTea",
+    ))
+    .to_owned();
+    source.replace(vec![RawElement::fixture(1, "AXWindow")
+        .titled("Discord")
+        .with_children(
+            vec![RawElement::fixture(8, "AXButton").titled("More")],
+        )]);
+
+    let stale = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": target}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(stale["outcome"], "stale_element", "{stale}");
+}
+
+#[tokio::test]
+async fn a_zoom_target_in_an_unreadable_part_is_not_called_stale() {
+    let management = granted_management().await;
+    let source = FixtureSource::new(vec![chat_window()]);
+    let plane = plane(source.clone());
+    let first = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    let target = id_on_line(line_with(
+        first["state_text"].as_str().unwrap(),
+        "Message @IceTea",
+    ))
+    .to_owned();
+    {
+        let mut state = source.0.lock().unwrap();
+        let raw = state.as_mut().unwrap();
+        let group = &mut raw.roots[0].children[0];
+        group.children.clear();
+        group.unreadable_children = 1;
+        raw.unreadable_subtrees = 1;
+    }
+
+    let unreadable = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": target}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(unreadable["outcome"], "completed", "{unreadable}");
+    assert!(
+        unreadable["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("That part couldn't be read this time"),
+        "{unreadable}"
+    );
+    assert_eq!(unreadable["unreadable_subtrees"], 1);
 }
 
 /// Two conversations reading the same application hold disjoint ids, and a
