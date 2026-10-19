@@ -1,6 +1,9 @@
 //! A run's route lifetime must not outlive its in-flight browser calls.
 
 use crate::*;
+
+#[path = "held_reply_tests.rs"]
+mod held_reply_tests;
 use subc_protocol::call_mode::CallMode;
 use subc_protocol::scope::{ParentState, ScopeAttributes, ScopeKind, ScopeParent, ScopeStamp};
 

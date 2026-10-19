@@ -146,6 +146,12 @@ pub(crate) async fn raise(
     question: &Question,
     detached: bool,
 ) -> Result<(String, Arc<Completion>), Ending> {
+    let serialization = desk.settlement_lock(live.session());
+    let _settlement = if crate::codemode::accepts_held() {
+        Some(serialization.lock().await)
+    } else {
+        None
+    };
     let _creation = management.browser_consent.creation.lock().await;
     management
         .browser_consent
@@ -166,6 +172,7 @@ pub(crate) async fn raise(
             .cloned();
         if let Some(completion) = completion {
             management.rekey_consent(kind, &question.ask_id, None);
+            crate::codemode::prepare_consent(&card.elicitation_id, kind).await?;
             return Ok((card.elicitation_id, completion));
         }
         return Err(Ending::DeliveryFailed);
@@ -195,6 +202,7 @@ pub(crate) async fn raise(
     } else {
         session.raise(card, &subject).await?
     };
+    crate::codemode::prepare_consent(&ask_id, kind).await?;
     management.record_prepared_consent(question, &ask_id);
     let completion = Completion::new();
     management

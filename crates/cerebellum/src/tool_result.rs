@@ -190,7 +190,19 @@ fn strip_inline_image(result: &mut ToolResult, reason: &str) -> Option<String> {
 }
 
 pub(crate) fn encode(reply: Value) -> Result<Vec<u8>, ModuleError> {
+    encode_with_held(reply, None)
+}
+
+pub(crate) fn encode_with_held(
+    reply: Value,
+    held: Option<result::HeldReply>,
+) -> Result<Vec<u8>, ModuleError> {
     let mut result = project(reply);
+    if let Some(held) = held {
+        result.is_error = None;
+        result.error_code = None;
+        result.held = Some(held);
+    }
     // Programs use screenshot handles and dimensions; image bytes are for the
     // model's direct view, not a JavaScript round trip through the carrier.
     if crate::codemode::active() {

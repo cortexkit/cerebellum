@@ -1397,6 +1397,12 @@ impl ComputerGrants {
             }
             GrantNeed::Takeover => None,
         };
+        let serialization = desk.settlement_lock(live.session());
+        let settlement = if crate::codemode::accepts_held() {
+            Some(serialization.lock().await)
+        } else {
+            None
+        };
         let (waiter, settled, completion) = self
             .join_or_ask(
                 caller,
@@ -1409,6 +1415,13 @@ impl ComputerGrants {
             )
             .await?;
         if crate::codemode::active() {
+            let kind = match need {
+                GrantNeed::App { .. } => CardKind::AppControl,
+                GrantNeed::Takeover => CardKind::Takeover,
+            };
+            crate::codemode::prepare_consent(&waiter.ask_id, kind)
+                .await
+                .map_err(|ending| card_refusal(&ending))?;
             crate::codemode::app(match need {
                 GrantNeed::App {
                     bundle_identity, ..
@@ -1419,6 +1432,7 @@ impl ComputerGrants {
                 ask_id: waiter.ask_id.clone(),
             });
         }
+        drop(settlement);
         let parked = context
             .park_guard
             .as_ref()
@@ -1571,6 +1585,12 @@ impl ComputerGrants {
         }
         let park_end = tokio::time::Instant::now() + self.login_park_limit();
         loop {
+            let serialization = desk.settlement_lock(live.session());
+            let settlement = if crate::codemode::accepts_held() {
+                Some(serialization.lock().await)
+            } else {
+                None
+            };
             let _creation = self.creation.lock().await;
             if let Some((ask_id, choice_id)) = desk.take_single_use_approval(live.session(), &key) {
                 // A session call already read the late answer, stored this
@@ -1654,10 +1674,18 @@ impl ComputerGrants {
                 id,
             };
             if crate::codemode::active() {
+                let kind = match request.capability {
+                    LoginCapability::ImportLogin => CardKind::LoginImport,
+                    LoginCapability::CaptureLogin => CardKind::LoginCapture,
+                };
+                if let Err(ending) = crate::codemode::prepare_consent(&waiter.ask_id, kind).await {
+                    return failed(ending);
+                }
                 return LoginConsent::Pending {
                     ask_id: waiter.ask_id.clone(),
                 };
             }
+            drop(settlement);
             let parked = request
                 .park_guard
                 .as_ref()
