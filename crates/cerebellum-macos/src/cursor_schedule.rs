@@ -50,15 +50,15 @@ impl FrameClock {
 
 /// How long a first appearance takes, in ms: the avatar pops in large on the
 /// target, holds a moment, then shrinks onto its place behind the pointer as
-/// the pointer and label come in. Long enough to be noticed as "an agent has
-/// started working here", short enough not to hold up the action it marks.
-pub(crate) const ENTRY_MS: f64 = 520.0;
+/// the pointer and label come in. The original entry felt too quick, so each
+/// phase now takes twice as long while the gentler Reduce Motion fade stays short.
+pub(crate) const ENTRY_MS: f64 = 1040.0;
 /// The avatar alone fades in, at its large entry size, over this long.
-const ENTRY_POP_MS: f64 = 100.0;
+const ENTRY_POP_MS: f64 = 200.0;
 /// Then it shrinks from here to the end of the entry.
-const ENTRY_SHRINK_FROM_MS: f64 = 180.0;
+const ENTRY_SHRINK_FROM_MS: f64 = 360.0;
 /// The pointer and the label grow and fade in from here to the end.
-const ENTRY_POINTER_FROM_MS: f64 = 260.0;
+const ENTRY_POINTER_FROM_MS: f64 = 520.0;
 /// Under Reduce Motion an entry is a plain fade of the resting badge, with
 /// no scaling and no travel.
 const REDUCED_ENTRY_MS: f64 = 300.0;
@@ -764,8 +764,9 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_shows_the_avatar_large_first_then_settles_it_and_brings_the_pointer_in() {
-        assert!((400.0..=600.0).contains(&ENTRY_MS));
+    fn the_entry_takes_about_twice_as_long_while_reduce_motion_stays_short() {
+        assert!((1000.0..=1100.0).contains(&ENTRY_MS));
+        assert_eq!(REDUCED_ENTRY_MS, 300.0);
         let first = entry_frame(0.0, false).unwrap();
         assert_eq!(first.chip, 0.0, "the avatar starts large, on the target");
         assert_eq!(first.pointer, 0.0, "the pointer is not there yet");
@@ -828,7 +829,7 @@ mod tests {
         // More actions, during the entry and after it: no second entry, and
         // the one running carries on from where it was.
         let mut now = start;
-        while now < start + Duration::from_millis(250) {
+        while now < start + Duration::from_millis(ENTRY_SHRINK_FROM_MS as u64 + 100) {
             now += FRAME;
             schedule.picture_for_update("agent").unwrap().frame(now);
         }

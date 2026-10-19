@@ -132,6 +132,13 @@ struct Follow {
     _watch: Box<dyn CursorWindowWatch>,
 }
 
+/// Preferred element for a read picture and the focused element to use when
+/// the preferred element has no readable frame.
+pub(crate) struct ReadAim {
+    pub(crate) preferred: Option<ElementHandle>,
+    pub(crate) focused: Option<ElementHandle>,
+}
+
 #[derive(Clone, Default)]
 pub struct Coordinator(Arc<State>);
 
@@ -529,6 +536,31 @@ impl Coordinator {
         handle: Option<ElementHandle>,
         point: Option<[f64; 2]>,
     ) {
+        self.schedule_with_fallback(
+            identity,
+            kind,
+            grant,
+            source,
+            ReadAim {
+                preferred: handle,
+                focused: None,
+            },
+            point,
+        );
+    }
+
+    /// Schedule a read with a focused fallback if its preferred element has
+    /// no readable frame. The emitted picture and its follow watch use the
+    /// same element, so later window moves stay tied to what was shown.
+    pub(crate) fn schedule_with_fallback(
+        &self,
+        identity: Identity,
+        kind: CursorKind,
+        grant: ProcessGrant,
+        source: Arc<dyn AppStateSource>,
+        aim: ReadAim,
+        point: Option<[f64; 2]>,
+    ) {
         if self.0.sender.get().is_none()
             || self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
         {
@@ -542,25 +574,39 @@ impl Coordinator {
             .serial
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cursor.record(&identity);
-        let follow_with = (grant.clone(), source.clone(), handle.clone());
+        let source_for_follow = source.clone();
+        let read_grant = grant.clone();
         tokio::spawn(async move {
             let agent = identity.badge;
             #[cfg(not(target_os = "macos"))]
             let _ = identity.avatar_agent;
             let read = tokio::task::spawn_blocking(move || {
-                let (title, secure, frame) = match handle {
+                let mut aimed_handle = aim.preferred;
+                let (title, secure, mut frame) = match aimed_handle.as_ref() {
                     Some(handle) => {
                         // A read's picture has no label, so it reads no title.
                         let (title, secure) = if kind == CursorKind::Reading {
                             (None, false)
                         } else {
-                            source.cursor_label(&handle).unwrap_or((None, true))
+                            source.cursor_label(handle).unwrap_or((None, true))
                         };
-                        let frame = source.cursor_frame(&handle);
-                        (title, secure, frame)
+                        (title, secure, source.cursor_frame(handle))
                     }
                     None => (None, false, None),
                 };
+                if kind == CursorKind::Reading && frame.is_none() {
+                    if let Some(fallback) = aim.focused {
+                        let already_focused = aimed_handle
+                            .as_ref()
+                            .is_some_and(|current| current.same_element(fallback.as_ref()));
+                        if !already_focused {
+                            aimed_handle = Some(fallback);
+                            frame = aimed_handle
+                                .as_ref()
+                                .and_then(|element| source.cursor_frame(element));
+                        }
+                    }
+                }
                 // Element actions without an exact point aim at the frame's
                 // visible centre, never its origin. Only reads may appear with
                 // nothing to aim at; a press or a write with no geometry shows
@@ -571,27 +617,32 @@ impl Coordinator {
                 {
                     return None;
                 }
-                let to = source.visible_cursor_point(&grant, point, frame)?;
-                Some(CursorEvent {
-                    initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
-                    agent,
-                    to,
-                    target: frame,
-                    resting: point.is_none() && frame.is_none(),
-                    label: label(kind, title.as_deref(), secure),
-                    kind,
-                    serial,
-                    avatar_rgba: None,
-                    avatar_update: false,
-                })
+                let to = source.visible_cursor_point(&read_grant, point, frame)?;
+                Some((
+                    CursorEvent {
+                        initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
+                        agent,
+                        to,
+                        target: frame,
+                        resting: point.is_none() && frame.is_none(),
+                        label: label(kind, title.as_deref(), secure),
+                        kind,
+                        serial,
+                        avatar_rgba: None,
+                        avatar_update: false,
+                    },
+                    aimed_handle,
+                ))
             });
-            if let Ok(Ok(Some(event))) = tokio::time::timeout(READ_BUDGET, read).await {
+            if let Ok(Ok(Some((event, followed_element)))) =
+                tokio::time::timeout(READ_BUDGET, read).await
+            {
                 cursor.send_unless_ended(event.clone());
                 // Off the read's deadline: following the window is a nicety
                 // that must never hold up or drop the picture itself.
                 let follower = cursor.clone();
                 let followed = event.clone();
-                let (grant, source, handle) = follow_with;
+                let (grant, source, handle) = (grant, source_for_follow, followed_element);
                 let _ = tokio::task::spawn_blocking(move || {
                     follower.follow(&followed, &grant, &source, handle)
                 })
@@ -1011,6 +1062,168 @@ mod tests {
             self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(Box::new(FakeWatch(self.live.clone())))
         }
+    }
+
+    struct AimedWindowGeometry {
+        target: ElementHandle,
+        focused: ElementHandle,
+        target_window: ElementHandle,
+        focused_window: ElementHandle,
+        target_frame: Option<[f64; 4]>,
+        focused_frame: Option<[f64; 4]>,
+        watched: std::sync::Mutex<Vec<ElementHandle>>,
+    }
+
+    struct NoopWindowWatch;
+    impl CursorWindowWatch for NoopWindowWatch {}
+
+    impl AimedWindowGeometry {
+        fn new(target_frame: Option<[f64; 4]>) -> Arc<Self> {
+            Arc::new(Self {
+                target: cerebellum_computer::app_state::source::RawElement::fixture(
+                    201, "AXButton",
+                )
+                .handle,
+                focused: cerebellum_computer::app_state::source::RawElement::fixture(
+                    202,
+                    "AXTextField",
+                )
+                .handle,
+                target_window: cerebellum_computer::app_state::source::RawElement::fixture(
+                    203, "AXWindow",
+                )
+                .handle,
+                focused_window: cerebellum_computer::app_state::source::RawElement::fixture(
+                    204, "AXWindow",
+                )
+                .handle,
+                target_frame,
+                focused_frame: Some([210.0, 310.0, 40.0, 20.0]),
+                watched: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn watched_window(&self) -> Option<ElementHandle> {
+            self.watched.lock().unwrap().last().cloned()
+        }
+    }
+
+    impl AppStateSource for AimedWindowGeometry {
+        fn read_app_state(
+            &self,
+            _: &ProcessGrant,
+            _: cerebellum_computer::app_state::source::ReadBounds,
+        ) -> Result<
+            cerebellum_computer::app_state::source::RawAppState,
+            cerebellum_computer::app_state::source::AppStateReadError,
+        > {
+            Err(cerebellum_computer::app_state::source::AppStateReadError::Unreadable)
+        }
+
+        fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+            if element.same_element(self.target.as_ref()) {
+                self.target_frame
+            } else if element.same_element(self.focused.as_ref()) {
+                self.focused_frame
+            } else if element.same_element(self.target_window.as_ref()) {
+                Some([100.0, 80.0, 800.0, 600.0])
+            } else if element.same_element(self.focused_window.as_ref()) {
+                Some([50.0, 60.0, 800.0, 600.0])
+            } else {
+                None
+            }
+        }
+
+        fn visible_cursor_point(
+            &self,
+            _: &ProcessGrant,
+            point: Option<[f64; 2]>,
+            frame: Option<[f64; 4]>,
+        ) -> Option<[f64; 2]> {
+            Some(point.unwrap_or_else(|| match frame {
+                Some([x, y, width, height]) => [x + width / 2.0, y + height / 2.0],
+                None => [500.0, 380.0],
+            }))
+        }
+
+        fn cursor_window(
+            &self,
+            _: &ProcessGrant,
+            element: Option<&ElementHandle>,
+        ) -> Option<ElementHandle> {
+            Some(
+                if element.is_some_and(|element| element.same_element(self.target.as_ref())) {
+                    self.target_window.clone()
+                } else {
+                    self.focused_window.clone()
+                },
+            )
+        }
+
+        fn watch_cursor_window(
+            &self,
+            window: &ElementHandle,
+            _: Box<dyn Fn(WindowChange) + Send + Sync>,
+        ) -> Option<Box<dyn CursorWindowWatch>> {
+            self.watched.lock().unwrap().push(window.clone());
+            Some(Box::new(NoopWindowWatch))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unframed_filtered_target_falls_back_to_focus_without_origin_aiming() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = AimedWindowGeometry::new(None);
+        cursor.schedule_with_fallback(
+            Identity::for_test(AGENT, None, None),
+            CursorKind::Reading,
+            grant(),
+            geometry.clone(),
+            ReadAim {
+                preferred: Some(geometry.target.clone()),
+                focused: Some(geometry.focused.clone()),
+            },
+            None,
+        );
+        let picture = next_line(&mut receiver).await.picture().unwrap();
+        assert_eq!(picture.target, geometry.focused_frame);
+        assert_eq!(picture.to, [230.0, 320.0]);
+        assert_ne!(picture.to, [0.0, 0.0]);
+        until("watched the focused element's window", || {
+            geometry.watched_window().is_some()
+        })
+        .await;
+        assert!(geometry
+            .watched_window()
+            .unwrap()
+            .same_element(geometry.focused_window.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn follow_watches_the_window_of_the_element_that_was_aimed_at() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = AimedWindowGeometry::new(Some([400.0, 120.0, 90.0, 22.0]));
+        cursor.schedule_with_fallback(
+            Identity::for_test(AGENT, None, None),
+            CursorKind::Reading,
+            grant(),
+            geometry.clone(),
+            ReadAim {
+                preferred: Some(geometry.target.clone()),
+                focused: Some(geometry.focused.clone()),
+            },
+            None,
+        );
+        let picture = next_line(&mut receiver).await.picture().unwrap();
+        assert_eq!(picture.target, geometry.target_frame);
+        until("watched the aimed element's window", || {
+            geometry.watched_window().is_some()
+        })
+        .await;
+        assert!(geometry
+            .watched_window()
+            .unwrap()
+            .same_element(geometry.target_window.as_ref()));
     }
 
     fn schedule_on(cursor: &Coordinator, geometry: &Arc<FollowGeometry>, kind: CursorKind) {
