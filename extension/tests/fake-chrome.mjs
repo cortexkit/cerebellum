@@ -37,6 +37,7 @@ export function fakeChrome() {
       },
     },
     storage: { session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } } },
+    permissions: { async contains(options) { calls.push(["hostPermission", options]); return true; } },
     tabs: {
       onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onActivated: new Event(), onCreated: new Event(),
       async get(id) { calls.push(["get", id]); if (!tabData.has(id)) throw new Error("closed"); return { ...tabData.get(id) }; },
@@ -49,7 +50,7 @@ export function fakeChrome() {
       async create(options) {
         if (options.active !== false) throw new Error("activation forbidden");
         calls.push(["create", options]);
-        const tab = { id: nextTab++, windowId: options.windowId ?? 3, groupId: -1, active: false };
+        const tab = { id: nextTab++, windowId: options.windowId ?? 3, groupId: -1, active: false, url: options.url };
         tabData.set(tab.id, tab);
         return { ...tab };
       },
@@ -65,10 +66,11 @@ export function fakeChrome() {
       async ungroup(tabId) { calls.push(["ungroup", tabId]); tabData.get(tabId).groupId = -1; },
       async sendMessage(tabId, message, options = { frameId: 0 }) {
         calls.push(["sentinel", tabId, message, options]);
+        if (options.documentId && options.documentId !== (tabData.get(tabId)?.documentId ?? `document-${tabId}`)) throw new Error("Could not establish connection. Receiving end does not exist.");
         const key = `${tabId}:${options.frameId ?? 0}`;
-        if (!observations.has(key)) throw new Error("no observer");
+        if (!observations.has(key)) throw new Error("Could not establish connection. Receiving end does not exist.");
         const observation = sentinels.get(key).send(message.operation);
-        if (!observation) throw new Error("no observer");
+       if (!observation) throw new Error("Could not establish connection. Receiving end does not exist.");
         observations.set(key, observation);
         return observation;
       },
@@ -86,21 +88,24 @@ export function fakeChrome() {
     },
     scripting: { async executeScript(options) {
       calls.push(["inject", options]);
-      const key = `${options.target.tabId}:0`;
+      const frameId = options.target.frameIds?.[0] ?? 0;
+      const key = `${options.target.tabId}:${frameId}`;
+      const existing = sentinels.get(key)?.send("sample");
+      if (existing?.enabled) { observations.set(key, existing); return []; }
       const observer = sentinel({ now: () => chrome.now(), documentId: `doc-${++nextDocument}`, onInteraction: message => {
         observations.set(key, message);
-        chrome.runtime.onMessage.emit(message, { id: chrome.runtime.id, tab: { id: options.target.tabId }, frameId: 0 });
+        chrome.runtime.onMessage.emit(message, { id: chrome.runtime.id, tab: { id: options.target.tabId }, frameId });
       } });
       sentinels.set(key, observer);
       observations.set(key, observer.send("sample"));
       return [];
     } },
-    webNavigation: { onCreatedNavigationTarget: new Event(), onCommitted: new Event(), onBeforeNavigate: new Event(), onErrorOccurred: new Event(), async getAllFrames({ tabId }) { return [{ tabId, frameId: 0 }]; } },
+    webNavigation: { onCreatedNavigationTarget: new Event(), onCommitted: new Event(), onBeforeNavigate: new Event(), onErrorOccurred: new Event(), async getAllFrames({ tabId }) { return [{ tabId, frameId: 0, url: tabData.get(tabId)?.url ?? "https://example.com/", documentId: tabData.get(tabId)?.documentId ?? `document-${tabId}` }]; } },
     debugger: {
       onEvent: new Event(), onDetach: new Event(),
       async attach(target, version) { calls.push(["attach", target, version]); },
       async detach(target) { calls.push(["detach", target]); },
-      async sendCommand(target, method, params) { calls.push(["cdp", target, method, params]); return { method }; },
+      async sendCommand(target, method, params) { calls.push(["cdp", target, method, params]); return method === "Page.getFrameTree" ? { frameTree: { frame: { id: "root", loaderId: "loader", url: tabData.get(target.tabId)?.url ?? "about:blank" } } } : { method }; },
     },
     action: { onClicked: new Event(),
       async setBadgeText(options) { calls.push(["badge", options]); },

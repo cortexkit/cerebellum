@@ -24,7 +24,7 @@ export async function setup() {
     const state = await agent.prepare(owner, plan, agent.connectionEpoch);
     try { return await agent.execute(state); } finally { await agent.finish(state); }
   };
-  const cdp = commands => ({ version: 2, action: "cdp", tab: record.handle, commands });
+  const cdp = commands => ({ version: 2, action: "cdp", tab: record.handle, commands, ...(agent.baselines.has(2) ? { observer_continuity: agent.baselines.get(2).continuity } : {}) });
   const fresh = () => run(cdp([read]));
   const input = epoch => ({ ...cdp([press, release]), interaction_epoch: epoch });
   return { chrome, tabs, epochs, agent, record, run, cdp, fresh, input };

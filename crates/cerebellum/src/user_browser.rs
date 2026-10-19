@@ -78,12 +78,26 @@ tokio::task_local! {
     pub(super) static EXECUTION_PERMITS: Arc<crate::blocking_permits::CallPermits>;
 }
 
+// Bind plans to the document being read or acted on. Reference input keeps its
+// saved snapshot's generation: internal classification reads must not lend a
+// repaired observer's baseline to that older snapshot.
+fn bind_observer_continuity(continuity: u64) {
+    let _ = EXECUTION.try_with(|execution| {
+        execution
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observer_continuity = Some(continuity);
+    });
+}
+
 #[derive(Default)]
 struct ExecutionState {
     stopped: bool,
     in_flight: bool,
     quarantined: bool,
     held: bool,
+    observer_continuity: Option<u64>,
 }
 
 // Permission waits pause work only for time actually spent waiting. An unused
@@ -260,6 +274,8 @@ struct PlanReply {
     tab: String,
     results: Vec<CommandResult>,
     interaction_epoch: u64,
+    observer_available: bool,
+    observer_continuity: u64,
     connection_epoch: u64,
     #[serde(default)]
     popup_activated_briefly: bool,
@@ -328,6 +344,7 @@ struct Snapshot {
     tab: String,
     connection: u64,
     interaction: u64,
+    observer_continuity: u64,
     document: CommittedDocument,
     refs: BTreeMap<String, ShownRef>,
     image: Option<Image>,
@@ -338,6 +355,7 @@ struct State {
     connection: Option<u64>,
     ended_routes: BTreeSet<Route>,
     claims: BTreeMap<String, Route>,
+    unobserved_blank: BTreeSet<String>,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: Vec<String>,
     executions: BTreeMap<String, Arc<UserExecution>>,
@@ -371,6 +389,8 @@ impl UserBrowser {
     pub(crate) fn release(&self, route: Route) {
         let mut state = self.state();
         state.claims.retain(|_, owner| *owner != route);
+        let claimed: BTreeSet<_> = state.claims.keys().cloned().collect();
+        state.unobserved_blank.retain(|tab| claimed.contains(tab));
         state
             .snapshots
             .retain(|_, snapshot| snapshot.route != route);
@@ -597,6 +617,12 @@ fn opaque(prefix: &str) -> String {
 
 fn refusal(reason: &str) -> Value {
     json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false})
+}
+
+fn observer_unavailable() -> Value {
+    let mut reply = refusal("observer_unavailable");
+    reply["remedy"] = json!("The interaction observer is unavailable; take a fresh read after the page commits. If it stays unavailable, restore extension access or reload the page.");
+    reply
 }
 
 fn read_again(input_dispatched: bool) -> Value {
@@ -908,6 +934,8 @@ async fn invoke(
 struct Plan {
     results: Vec<Value>,
     interaction: u64,
+    observer_available: bool,
+    observer_continuity: u64,
     popup: bool,
     frame_mappings: Vec<FrameMapping>,
 }
@@ -941,6 +969,19 @@ async fn plan(
         })
         .collect();
     let mut command = json!({"tab":tab,"commands":commands});
+    let observer_continuity = EXECUTION
+        .try_with(|execution| {
+            execution
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observer_continuity
+        })
+        .ok()
+        .flatten();
+    if let Some(continuity) = observer_continuity {
+        command["observer_continuity"] = json!(continuity);
+    }
     if let Some(epoch) = interaction {
         command["interaction_epoch"] = json!(epoch);
     }
@@ -974,15 +1015,27 @@ async fn plan(
     {
         return Err(read_again(dispatched));
     }
-    if interaction.is_some_and(|expected| expected != reply.interaction_epoch) {
+    let navigates = methods.iter().any(|method| method == "Page.navigate");
+    if interaction.is_some() && !reply.observer_available && !navigates {
+        return Err(prior_input(observer_unavailable(), dispatched));
+    }
+    if !navigates
+        && interaction.is_some()
+        && observer_continuity.is_some_and(|expected| expected != reply.observer_continuity)
+    {
+        return Err(prior_input(observer_unavailable(), dispatched));
+    }
+    if !navigates && interaction.is_some_and(|expected| expected != reply.interaction_epoch) {
         return Err(read_again(dispatched));
     }
     if results.len() != count {
-        return Err(refusal("protocol_error"));
+        return Err(prior_input(refusal("protocol_error"), dispatched));
     }
     Ok(Plan {
         results,
         interaction: reply.interaction_epoch,
+        observer_available: reply.observer_available,
+        observer_continuity: reply.observer_continuity,
         popup: reply.popup_activated_briefly,
         frame_mappings: reply.frame_mappings,
     })
@@ -1033,6 +1086,8 @@ struct Document {
     committed: CommittedDocument,
     frames: Vec<FrameDocument>,
     interaction: u64,
+    observer_available: bool,
+    observer_continuity: u64,
     unreadable_frames: BTreeMap<String, FrameReadFailure>,
 }
 
@@ -1079,6 +1134,8 @@ async fn document(
         committed,
         frames,
         interaction: plan.interaction,
+        observer_available: plan.observer_available,
+        observer_continuity: plan.observer_continuity,
         unreadable_frames,
     })
 }
@@ -1226,6 +1283,7 @@ async fn serve_scoped(
     if POPUP_SEEN.with(Cell::get) {
         reply["popup_activated_briefly"] = json!(true);
     }
+    reply = dispatched_outcome(reply);
     if crate::browser::validate_user_browser_result(action, &reply).is_err() {
         let input = reply
             .get("input_dispatched")
@@ -1234,6 +1292,7 @@ async fn serve_scoped(
         reply = refusal("result_schema_violation");
         reply["input_dispatched"] = input;
     }
+    reply = dispatched_outcome(reply);
     let record_origin = args
         .get("url")
         .and_then(Value::as_str)
@@ -1258,7 +1317,7 @@ async fn serve_scoped(
         if POPUP_SEEN.with(Cell::get) {
             failure["popup_activated_briefly"] = json!(true);
         }
-        return failure;
+        return dispatched_outcome(failure);
     }
     reply
 }
@@ -1754,15 +1813,29 @@ impl Context<'_> {
     }
 
     async fn document(&self, tab: &str) -> Result<Document, Value> {
-        self.target().owned(self.route, tab, self.connection)?;
-        document(
-            self.bridge(),
-            self.route,
-            tab,
-            self.connection,
-            &self.cancel,
-        )
-        .await
+        for attempt in 0..3 {
+            self.target().owned(self.route, tab, self.connection)?;
+            let observed = document(
+                self.bridge(),
+                self.route,
+                tab,
+                self.connection,
+                &self.cancel,
+            )
+            .await;
+            if observed
+                .as_ref()
+                .is_err_and(|reply| reply["reason"] == "document_not_ready")
+                && attempt < 2
+            {
+                // History and frame metadata can straddle the first document
+                // commit. Retry only that incomplete read, never stale input.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            return observed;
+        }
+        unreachable!("the bounded document loop returns on its last attempt")
     }
 }
 
@@ -1923,6 +1996,15 @@ async fn serve_inner(
             return Err(refusal("tab_already_claimed"));
         }
         state.claims.insert(claimed.tab.clone(), route);
+        if action == "open_tab"
+            && args.get("opener_tab").is_none()
+            && args
+                .get("url")
+                .and_then(Value::as_str)
+                .is_none_or(|url| url == "about:blank")
+        {
+            state.unobserved_blank.insert(claimed.tab.clone());
+        }
         return Ok(
             json!({"browser":"user","outcome":"ok","tab":claimed.tab,"interaction_epoch":claimed.interaction_epoch,"connection_epoch":connection,"input_dispatched":false}),
         );
@@ -1957,6 +2039,12 @@ async fn serve_inner(
     }
     let tab = args["tab"].as_str().expect("validated tab");
     let current = context.document(tab).await?;
+    let created_blank = action == "navigate"
+        && current.committed.url == "about:blank"
+        && target.state().unobserved_blank.contains(tab);
+    if !current.observer_available && !created_blank {
+        return Err(observer_unavailable());
+    }
     if matches!(action, "snapshot" | "screenshot" | "navigate") {
         let site = if action == "navigate" {
             origin(args["url"].as_str().unwrap())?
@@ -1971,22 +2059,45 @@ async fn serve_inner(
         };
         let once = context.authorize(&site, severity, BTreeSet::new()).await?;
         if action == "navigate" {
-            // The grant is checked again before dispatch; answering a card must
-            // not select a newer page or a different tab implicitly.
-            context.document(tab).await?;
+            let observed = context.document(tab).await?;
+            let created_blank = current.committed.url == "about:blank"
+                && observed.committed.url == "about:blank"
+                && target.state().unobserved_blank.contains(tab)
+                && (!current.observer_available || !observed.observer_available);
+            // An openerless agent-created blank document may not have an observer
+            // before an HTTP document commits. Only explicit initial navigation may lack
+            // observation; reference input and handed tabs never receive this exception.
+            if !created_blank
+                && (!current.observer_available
+                    || !observed.observer_available
+                    || current.observer_continuity != observed.observer_continuity)
+            {
+                return Err(observer_unavailable());
+            }
+            if !created_blank
+                && (current.committed != observed.committed
+                    || current.interaction != observed.interaction)
+            {
+                return Err(read_again(false));
+            }
+            if !created_blank {
+                bind_observer_continuity(observed.observer_continuity);
+            }
             let navigation = context
                 .cdp(
                     tab,
-                    Some(current.interaction),
+                    (!created_blank).then_some(observed.interaction),
                     vec![command("Page.navigate", json!({"url":args["url"]}))],
                 )
                 .await?;
             if navigation.results[0].get("errorText").is_some() {
                 return Err(refusal("navigation_failed"));
             }
+            target.state().unobserved_blank.remove(tab);
             let loader = navigation.results[0]["loaderId"].as_str();
             let deadline = tokio::time::Instant::now() + NAVIGATION_READ_DEADLINE;
             let mut ticks = tokio::time::interval(Duration::from_millis(25));
+            let mut observer_deadline = None;
             let landed = loop {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(refusal("navigation_read_deadline"));
@@ -1998,7 +2109,15 @@ async fn serve_inner(
                         && (landed.committed.url == args["url"].as_str().unwrap()
                             || landed.committed.url != current.committed.url))
                 {
-                    break landed;
+                    if landed.observer_available {
+                        break landed;
+                    }
+                    let limit = observer_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + Duration::from_secs(5)
+                    });
+                    if tokio::time::Instant::now() >= *limit {
+                        return Err(observer_unavailable());
+                    }
                 }
             };
             let landing = origin(&landed.committed.url)?;
@@ -2021,15 +2140,22 @@ async fn serve_inner(
                 reply["popup_activated_briefly"] = json!(true);
             }
             if args["read_page"] == true {
+                bind_observer_continuity(landed.observer_continuity);
                 let read = capture(&context, tab, args, &landed, &once, None).await?;
                 reply["read_page"] = read;
             }
             return Ok(reply);
         }
         let observed = context.document(tab).await?;
+        if !observed.observer_available
+            || observed.observer_continuity != current.observer_continuity
+        {
+            return Err(observer_unavailable());
+        }
         if observed.committed != current.committed || observed.interaction != current.interaction {
             return Err(read_again(false));
         }
+        bind_observer_continuity(observed.observer_continuity);
         if action == "screenshot" {
             return screenshot(&context, tab, args, &observed, &once).await;
         }
@@ -2049,6 +2175,7 @@ fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
         tab: tab.into(),
         connection: context.connection,
         interaction: document.interaction,
+        observer_continuity: document.observer_continuity,
         document: document.committed.clone(),
         refs: BTreeMap::new(),
         image: None,
@@ -2057,6 +2184,10 @@ fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
 
 async fn confirm(context: &Context<'_>, tab: &str, expected: &Document) -> Result<(), Value> {
     let observed = context.document(tab).await?;
+    if !observed.observer_available || observed.observer_continuity != expected.observer_continuity
+    {
+        return Err(observer_unavailable());
+    }
     if observed.committed != expected.committed
         || observed.interaction != expected.interaction
         || observed.frames.len() != expected.frames.len()
@@ -2552,6 +2683,10 @@ async fn capture_attempt(
         return Err(refusal("ref_scope_mismatch"));
     }
     let observed = context.document(tab).await?;
+    if !observed.observer_available || observed.observer_continuity != document.observer_continuity
+    {
+        return Err(observer_unavailable());
+    }
     if observed.committed != document.committed || observed.interaction != document.interaction {
         return Err(read_again(false));
     }
@@ -2824,6 +2959,10 @@ async fn input(
     let snapshot = context
         .target()
         .snapshot(context.route, tab, context.connection, args)?;
+    if !current.observer_available || snapshot.observer_continuity != current.observer_continuity {
+        return Err(observer_unavailable());
+    }
+    bind_observer_continuity(snapshot.observer_continuity);
     if snapshot.document != current.committed || snapshot.interaction != current.interaction {
         return Err(read_again(false));
     }
@@ -3046,6 +3185,7 @@ async fn input(
     } else if position.is_some() {
         position
     } else {
+        input_document(context, tab, &snapshot, false).await?;
         let quad = context
             .cdp_frame(
                 tab,
@@ -3224,6 +3364,9 @@ async fn input(
         }
         reply
     })?;
+    if !landed.observer_available {
+        return Err(prior_input(observer_unavailable(), dispatched));
+    }
     let landing_origin = landed
         .frames
         .iter()
@@ -3260,6 +3403,26 @@ async fn input(
     Ok(reply)
 }
 
+async fn input_document(
+    context: &Context<'_>,
+    tab: &str,
+    snapshot: &Snapshot,
+    dispatched: bool,
+) -> Result<Document, Value> {
+    let observed = context
+        .document(tab)
+        .await
+        .map_err(|reply| prior_input(reply, dispatched))?;
+    if !observed.observer_available || observed.observer_continuity != snapshot.observer_continuity
+    {
+        return Err(prior_input(observer_unavailable(), dispatched));
+    }
+    if observed.interaction != snapshot.interaction || observed.committed != snapshot.document {
+        return Err(read_again(dispatched));
+    }
+    Ok(observed)
+}
+
 async fn verify_input(
     context: &Context<'_>,
     tab: &str,
@@ -3269,15 +3432,7 @@ async fn verify_input(
     expected: &NonTypeClassificationRecord,
     dispatched: bool,
 ) -> Result<(), Value> {
-    let observed = context.document(tab).await.map_err(|mut reply| {
-        if dispatched {
-            reply["input_dispatched"] = json!(true);
-        }
-        reply
-    })?;
-    if observed.interaction != snapshot.interaction || observed.committed != snapshot.document {
-        return Err(read_again(dispatched));
-    }
+    let observed = input_document(context, tab, snapshot, dispatched).await?;
     if let Some(reason) = observed.unreadable_frames.get(&frame.frame_id) {
         return Err(prior_input(reason.refusal(), dispatched));
     }
@@ -3330,6 +3485,7 @@ async fn verify_input(
             return Err(refusal("credential_payment_or_ineligible_field"));
         }
     }
+    input_document(context, tab, snapshot, dispatched).await?;
     Ok(())
 }
 
@@ -3523,6 +3679,16 @@ async fn verify_click_position(
 fn prior_input(mut reply: Value, dispatched: bool) -> Value {
     if dispatched {
         reply["input_dispatched"] = json!(true);
+    }
+    reply
+}
+
+fn dispatched_outcome(mut reply: Value) -> Value {
+    if reply["outcome"] == "refused" && reply["input_dispatched"] == true {
+        // A refusal promises that nothing ran. Once input was sent, failed
+        // observation cannot make that promise or safely invite a retry.
+        reply["outcome"] = json!("outcome_unknown");
+        reply["remedy"] = json!("Input was dispatched and may have taken effect. Do not repeat this action; take a fresh read before deciding what to do next.");
     }
     reply
 }

@@ -3,13 +3,14 @@ import vm from "node:vm";
 
 const source = await readFile(new URL("../sentinel.js", import.meta.url), "utf8");
 
-export function sentinel({ now, documentId = "document-one", onInteraction = () => {} } = {}) {
+export function sentinel({ now, documentId = "document-one", onInteraction = () => {}, randomUUIDAvailable = true } = {}) {
   const handlers = new Map();
   let receiver;
   let clock = 0;
   const messages = [];
+  let randomValuesCalls = 0;
   const context = {
-    crypto: { randomUUID: () => documentId },
+    crypto: { ...(randomUUIDAvailable ? { randomUUID: () => documentId } : {}), getRandomValues: bytes => { randomValuesCalls++; bytes.fill(0x5a); return bytes; } },
     performance: { timeOrigin: 0, now: now ?? (() => clock) },
     addEventListener(type, fn) { handlers.set(type, fn); },
     removeEventListener(type) { handlers.delete(type); },
@@ -31,5 +32,6 @@ export function sentinel({ now, documentId = "document-one", onInteraction = () 
       return result;
     },
     get listeners() { return handlers.size; },
+    get randomValuesCalls() { return randomValuesCalls; },
   };
 }

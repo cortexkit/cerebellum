@@ -26,6 +26,9 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[path = "user_browser_probe/fixture_http.rs"]
+mod fixture_http;
+
 const HOST: &str = "com.cortexkit.cerebellum";
 const CHROME_MANIFEST_DIR: &str = "Library/Application Support/Google/Chrome/NativeMessagingHosts";
 const BUDGET_SECS: u64 = 180;
@@ -281,6 +284,7 @@ fn unclaimed_handed_tab(status: &Value) -> Result<Option<String>, String> {
 #[async_trait::async_trait(?Send)]
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
+    async fn fixture_readiness(&mut self) -> Result<Value, String>;
     fn observe(&mut self) -> Result<Value, String>;
     async fn click_observation(&mut self) -> Result<Value, String>;
     fn failure_diagnostics(&mut self) -> Value;
@@ -509,6 +513,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         ok(&navigated) && asks == 1,
     )?;
     detached_and_unfocused(driver)?;
+    wait_for_fixture(driver, std::time::Duration::from_secs(5)).await?;
     let (snapshot, asks) = driver
         .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
         .await?;
@@ -526,6 +531,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
     let button = reference(&snapshot, "Probe button")?;
     let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":input_severity})).await?;
     println!("click reply: {clicked}");
+    println!("focus before click readback: {}", driver.observe()?);
     let observation = driver.click_observation().await.map_err(|error| {
         println!("click diagnostics unavailable: {error}");
         error
@@ -590,6 +596,31 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         closed["outcome"] == "closed" && driver.observe()?["outside_group"] == -1,
     )?;
     Ok(())
+}
+
+fn fixture_ready(observed: &Value) -> bool {
+    observed["document_complete"] == true
+        && observed["iframe_ready"] == true
+        && observed["url_matches"] == true
+}
+
+async fn wait_for_fixture(
+    driver: &mut impl Driver,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let observed = driver.fixture_readiness().await?;
+        if fixture_ready(&observed) {
+            println!("fixture readiness: {observed}");
+            return check("fixture document and iframe finished loading", true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            println!("fixture readiness: {observed}");
+            return check("fixture document and iframe finished loading", false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
@@ -968,6 +999,7 @@ mod live {
     struct Focus {
         stop: Arc<AtomicBool>,
         changed: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<Value>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Focus {
@@ -978,10 +1010,24 @@ mod live {
             let changed = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
             let result = changed.clone();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = events.clone();
             let thread = std::thread::spawn(move || {
+                let mut previous = Some(initial);
                 while !flag.load(Ordering::SeqCst) {
-                    if cerebellum_macos::frontmost_process_id() != Some(initial) {
+                    let current = cerebellum_macos::frontmost_process_id();
+                    if current != Some(initial) {
                         result.store(true, Ordering::SeqCst);
+                    }
+                    if current != previous {
+                        let event =
+                            json!({"at":wall_millis(),"previous_pid":previous,"pid":current});
+                        eprintln!("foreground transition: {event}");
+                        let mut rows = recorded.lock().unwrap();
+                        if rows.len() < 64 {
+                            rows.push(event);
+                        }
+                        previous = current;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -989,6 +1035,7 @@ mod live {
             Ok(Self {
                 stop,
                 changed,
+                events,
                 thread: Some(thread),
             })
         }
@@ -1032,36 +1079,7 @@ mod live {
                             continue;
                         }
                     };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                    let mut bytes = [0u8; 8192];
-                    let size = stream.read(&mut bytes).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&bytes[..size]);
-                    let path = request.split_whitespace().nth(1).unwrap_or("");
-                    let mut report = state.lock().unwrap();
-                    if path == "/click" {
-                        report.0 += 1;
-                    }
-                    if let Some(text) = path.strip_prefix("/type?") {
-                        report.1 = text.to_owned();
-                    }
-                    if let Some(text) = path.strip_prefix("/child-type?") {
-                        report.2 = text.to_owned();
-                    }
-                    drop(report);
-                    let body = if path == "/outside-secret" {
-                        "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>"
-                    } else if path == "/" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
-                    } else if path == "/handed-active" || path == "/handed-background" {
-                        r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><form style="position:fixed;left:8px;top:40px" method="post" action="/submitted"><button aria-label="Probe submit">Submit</button></form><div style="height:2000px"></div>"##
-                    } else if path == "/iframe" {
-                        r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
-                    } else {
-                        "ok"
-                    };
-                    let body = body.replace("IFRAME_ORIGIN", &child_origin);
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = fixture_http::serve(&mut stream, &child_origin, &state);
                 }
             });
             Ok(Self {
@@ -1181,6 +1199,12 @@ mod live {
             params: Value,
             session: Option<&str>,
         ) -> Result<Value, String> {
+            if matches!(method, "Target.attachToTarget" | "Target.detachFromTarget") {
+                println!(
+                    "probe CDP timing: {}",
+                    json!({"at":wall_millis(),"stage":"start","method":method,"params":params})
+                );
+            }
             self.seq += 1;
             let mut request = json!({"id":self.seq,"method":method,"params":params});
             if let Some(s) = session {
@@ -1196,6 +1220,12 @@ mod live {
                 if reply["id"] == self.seq {
                     if reply.get("error").is_some() {
                         return Err(format!("CDP {method}: {}", reply["error"]));
+                    }
+                    if matches!(method, "Target.attachToTarget" | "Target.detachFromTarget") {
+                        println!(
+                            "probe CDP timing: {}",
+                            json!({"at":wall_millis(),"stage":"done","method":method})
+                        );
                     }
                     return Ok(reply["result"].clone());
                 }
@@ -1328,14 +1358,24 @@ mod live {
         // such as an unchecked native-port error; it is best effort because
         // not every Chrome build offers it on worker targets.
         cdp.call("Runtime.enable", json!({}), Some(session))?;
+        #[cfg(feature = "chrome-for-testing-parent-probe")]
+        cdp.eval(session, "globalThis.__ckProbeReadDiagnostics = true")?;
         let _ = cdp.call("Log.enable", json!({}), Some(session));
         cdp.eval(
             session,
             r#"(() => {
           globalThis.__probeFocus = 0;
+          globalThis.__probeFocusEvents = [];
+          globalThis.__probePhase = 'startup';
           globalThis.__probeMembership = [];
-          chrome.tabs.onActivated.addListener(() => { globalThis.__probeFocus++; });
-          chrome.windows.onFocusChanged.addListener(() => { globalThis.__probeFocus++; });
+          const focus = (event, details) => {
+            globalThis.__probeFocus++;
+            const row = {at:Date.now(), event, phase:globalThis.__probePhase, ...details};
+            if (globalThis.__probeFocusEvents.length < 64) globalThis.__probeFocusEvents.push(row);
+            console.info('Agent probe focus: ' + JSON.stringify(row));
+          };
+          chrome.tabs.onActivated.addListener(info => focus('tab_activated', {tabId:info.tabId,windowId:info.windowId}));
+          chrome.windows.onFocusChanged.addListener(windowId => focus('window_focus', {windowId}));
           const note = (event, details) => {
             const rows = globalThis.__probeMembership;
             if (rows.length >= 32) rows.shift();
@@ -1358,6 +1398,13 @@ mod live {
         Ok(())
     }
 
+    fn wall_millis() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
     // Print the extension's own console before shutdown on success as well as
     // failure, so the group-adoption decision can be matched to Chrome's events.
     fn print_worker_events(cdp: &mut Cdp, session: &str) {
@@ -1368,9 +1415,15 @@ mod live {
         if lines.is_empty() {
             println!("worker: no console, exception or log events");
         }
-        // Keep the tail: the events nearest the failure matter most.
-        for line in &lines[lines.len().saturating_sub(50)..] {
-            println!("worker {line}");
+        // Keep all timestamped probe metadata, including initial blank-page
+        // failures; a tail alone can make an old error look post-click.
+        for (index, line) in lines.iter().enumerate() {
+            if index >= lines.len().saturating_sub(50)
+                || line.contains("Agent probe read:")
+                || line.contains("Agent probe focus:")
+            {
+                println!("worker {line}");
+            }
         }
     }
 
@@ -1470,6 +1523,10 @@ mod live {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
+        println!(
+            "Chrome process: {}",
+            json!({"at":wall_millis(),"pid":chrome.id()})
+        );
         // Declared after the listener so it is dropped first (Rust drops
         // locals in reverse order). On an early return the host's exit record
         // is printed before the listener drops and tears down the bridge;
@@ -1635,6 +1692,18 @@ mod live {
     #[async_trait::async_trait(?Send)]
     impl Driver for Live {
         async fn call(&mut self, mut args: Value) -> Result<(Value, usize), String> {
+            let action = args["action"].as_str().unwrap_or("unknown").to_owned();
+            self.cdp.eval(
+                &self.worker_session,
+                &format!(
+                    "globalThis.__probePhase = {}",
+                    json!(format!("tool:{action}"))
+                ),
+            )?;
+            println!(
+                "tool timing: {}",
+                json!({"at":wall_millis(),"stage":"start","action":action})
+            );
             let deferred = std::mem::take(&mut self.defer_answer);
             let decline = std::mem::take(&mut self.decline_answer);
             let calls_before = self.consent.calls().len();
@@ -1719,15 +1788,20 @@ mod live {
                         reply: body.clone(),
                         asks,
                     };
+                    println!(
+                        "tool timing: {}",
+                        json!({"at":wall_millis(),"stage":"done","action":action})
+                    );
                     return Ok((body, asks));
                 }
             }
         }
         fn observe(&mut self) -> Result<Value, String> {
-            let mut observation = self.cdp.eval(&self.worker_session, &format!(r#"Promise.all([chrome.tabs.query({{}}), chrome.debugger.getTargets()]).then(([tabs, targets]) => {{
+            let mut observation = self.cdp.eval(&self.worker_session, &format!(r#"Promise.all([chrome.tabs.query({{}}), chrome.debugger.getTargets(), chrome.windows.getAll()]).then(([tabs, targets, windows]) => {{
               const agent = tabs.filter(t => t.groupId !== -1);
               return {{agent_tabs:agent.length, outside_group:tabs.find(t => t.id === {})?.groupId,
-                agent_attached:targets.some(t => t.attached && agent.some(a => a.id === t.tabId)), focus_events:globalThis.__probeFocus}};
+                agent_attached:targets.some(t => t.attached && agent.some(a => a.id === t.tabId)), focus_events:globalThis.__probeFocus, chrome_focus_events:globalThis.__probeFocusEvents,
+                active_tabs:tabs.filter(t => t.active).map(t => ({{tabId:t.id,windowId:t.windowId,groupId:t.groupId}})), windows:windows.map(w => ({{windowId:w.id,focused:w.focused}}))}};
             }})"#, self.outside_id))?;
             let reports = self.page.reports.lock().unwrap();
             observation["clicks"] = json!(reports.0);
@@ -1736,9 +1810,36 @@ mod live {
             if self.focus.changed.load(Ordering::SeqCst) {
                 observation["focus_events"] = json!(1);
             }
+            observation["foreground_events"] = json!(self.focus.events.lock().unwrap().clone());
+            if observation["focus_events"] != 0 {
+                println!("focus attribution: {observation}");
+            }
             Ok(observation)
         }
+        async fn fixture_readiness(&mut self) -> Result<Value, String> {
+            self.cdp.eval(
+                &self.worker_session,
+                "globalThis.__probePhase = 'probe:fixture_readiness'",
+            )?;
+            let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
+            let target = fixture_page_target(&targets, &self.origin)?;
+            let session = self.cdp.attach(&target)?;
+            // This observer-only read is restricted to the scratch fixture. The
+            // child signals readiness after its input and load handler exist.
+            let result = self.cdp.eval(&session, &format!(r#"({{document_complete:document.readyState === 'complete', iframe_ready:window.__probeIframeReady === true, url_matches:location.href === {}}})"#, json!(format!("{}/", self.origin))));
+            let detached = self.cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId":session}),
+                None,
+            );
+            detached?;
+            result
+        }
         async fn click_observation(&mut self) -> Result<Value, String> {
+            self.cdp.eval(
+                &self.worker_session,
+                "globalThis.__probePhase = 'probe:click_readback'",
+            )?;
             // The page counter records handler execution independently of the
             // beacon, which can arrive after the tool has acknowledged input.
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1904,12 +2005,20 @@ mod live {
             );
             self.handed_id = self.cdp.eval(&self.worker_session, &expression)?.as_i64();
             self.handed_url = url;
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let (status, _) = self.call(json!({"action":"status"})).await?;
                 let member = unclaimed_handed_tab(&status);
+                // Handover can finish before the fixture's HTTP load. Wait for
+                // this created tab, not for an agent snapshot to happen to pass.
+                let readiness = self.cdp.eval(&self.worker_session, &format!("chrome.tabs.get({}).then(tab => ({{url_matches:tab.url === {}, complete:tab.status === 'complete'}}))", self.handed_id.ok_or("handed fixture Chrome id missing")?, json!(self.handed_url)))?;
+                let ready = readiness["url_matches"] == true && readiness["complete"] == true;
                 let timed_out = Instant::now() > deadline;
-                if member.as_ref().is_ok_and(Option::is_some) || member.is_err() || timed_out {
+                if member.as_ref().is_ok_and(Option::is_some) && ready
+                    || member.is_err()
+                    || timed_out
+                {
+                    println!("handover fixture readiness: {readiness}");
                     println!("handover public status: {status}");
                     let observed = self.cdp.eval(&self.worker_session, r#"(async () => {
                         const saved = (await chrome.storage.session.get('agentGroup')).agentGroup;
@@ -1926,7 +2035,14 @@ mod live {
                     }
                 }
                 if let Some(handle) = member? {
-                    return Ok(handle);
+                    if ready {
+                        return Ok(handle);
+                    }
+                    if timed_out {
+                        return Err(
+                            "handed fixture did not finish loading at its expected URL".into()
+                        );
+                    }
                 }
                 if timed_out {
                     return Err("drag-in member never appeared as handed".into());
@@ -2003,6 +2119,7 @@ struct Double {
     deferred: bool,
     late_answered: bool,
     decline_answer: bool,
+    fixture_polls: usize,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -2020,6 +2137,7 @@ impl Double {
             deferred: false,
             late_answered: false,
             decline_answer: false,
+            fixture_polls: 0,
         }
     }
 }
@@ -2064,6 +2182,9 @@ impl Driver for Double {
                 reply["outcome"] = json!("consent_pending");
             }
             "snapshot" => {
+                if self.fixture_polls < 2 {
+                    return Err("snapshot reached the fixture before its iframe was ready".into());
+                }
                 asks = 0;
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
@@ -2129,6 +2250,11 @@ impl Driver for Double {
             asks,
         };
         Ok((reply, asks))
+    }
+    async fn fixture_readiness(&mut self) -> Result<Value, String> {
+        self.fixture_polls += 1;
+        Ok(json!({"document_complete":true,"url_matches":true,
+            "iframe_ready":self.fixture_polls >= 2 && self.fault != "iframe_unready"}))
     }
     fn observe(&mut self) -> Result<Value, String> {
         Ok(
@@ -2394,6 +2520,36 @@ fn host_exit_control() -> Result<(), String> {
 
 async fn self_test() -> Result<(), String> {
     let mut tests: Vec<(&str, Result<(), String>)> = Vec::new();
+    tests.extend(fixture_http::controls());
+    tests.push((
+        "fixture_readiness_waits_for_the_child_not_just_the_top_page",
+        async {
+            for missing in ["document_complete", "url_matches", "iframe_ready"] {
+                let mut observed =
+                    json!({"document_complete":true,"url_matches":true,"iframe_ready":true});
+                observed[missing] = json!(false);
+                if fixture_ready(&observed) {
+                    return Err(format!("fixture readiness ignored {missing}"));
+                }
+            }
+            let mut fixture = Double::new("");
+            wait_for_fixture(&mut fixture, std::time::Duration::from_secs(1)).await?;
+            if fixture.fixture_polls < 2 {
+                return Err("fixture read did not wait for the child".into());
+            }
+            if wait_for_fixture(
+                &mut Double::new("iframe_unready"),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_ok()
+            {
+                return Err("fixture read accepted a child that never became ready".into());
+            }
+            Ok(())
+        }
+        .await,
+    ));
     let args = vec![
         "--chrome".into(),
         "/some/Google Chrome for Testing".into(),
@@ -2678,7 +2834,7 @@ async fn self_test() -> Result<(), String> {
             }
         }
     }
-    println!("user_browser_probe {}: {count} offline checks, {failed} failures; no Chrome, live profile, socket or durable journal", env!("CARGO_PKG_VERSION"));
+    println!("user_browser_probe {}: {count} offline checks, {failed} failures; loopback HTTP sockets only, no Chrome, live profile, bridge socket or durable journal", env!("CARGO_PKG_VERSION"));
     if failed == 0 {
         Ok(())
     } else {

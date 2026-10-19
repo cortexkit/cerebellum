@@ -95,7 +95,7 @@ test("focus never counts as interaction but unattributed navigation still invali
     }
     return send(...args);
   };
-  await f.run(f.cdp([{ method: "Page.navigate", params: { url: "http://localhost/" } }]));
+  await f.run({ ...f.cdp([{ method: "Page.navigate", params: { url: "http://localhost/" } }]), interaction_epoch: epoch });
   assert.equal(f.epochs.record(2).epoch, epoch);
 });
 

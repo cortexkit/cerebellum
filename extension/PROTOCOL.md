@@ -67,12 +67,36 @@ are omitted, not null.
 | `open_tab` | optional `url` (HTTP(S), default `about:blank`), optional `opener_tab` (claimed handle from this route) | `{tab, interaction_epoch, connection_epoch}` |
 | `claim_tab` | required `tab` (unclaimed handed handle, or already claimed by this route) | `{tab, interaction_epoch, connection_epoch}` |
 | `close` | none | `{connection_epoch}` |
-| `cdp` | required `tab`, required nonempty `commands` (maximum 256), optional `interaction_epoch` (required for every input/modifying plan) | `{tab, results:[...], interaction_epoch, connection_epoch, popup_activated_briefly?:true}` |
+| `cdp` | required `tab`, required nonempty `commands` (maximum 256), optional `interaction_epoch` and `observer_continuity` (both required for input and observed navigation) | `{tab, results:[...], interaction_epoch, observer_available, observer_continuity, connection_epoch, popup_activated_briefly?:true}` |
 
 `tab` is an opaque string, never a Chrome tab id. Status lists only this route's
 claims and unclaimed handed tabs, not another route's claims or unclaimed
 agent-opened tabs. Closing drops/rotates old handles. Agent-opened tabs remain in
 the group; handed tabs are ungrouped. No close path closes Chrome or a tab.
+
+CDP replies pair `interaction_epoch`, the counter of observed interactions and
+unattributed navigation, with `observer_available`, which is true only after all
+live frames answered the observer sample.
+`observer_available:false` never means no interaction occurred; its numeric counter
+cannot authorize input. `observer_continuity` fences snapshots across observer loss
+and replacement independently of the human-input counter. Unknown observation
+refuses as `observer_unavailable`, not as a person-change accusation. This reply
+shape requires matching current extension and Cerebellum builds.
+Modifying plans carry the saved snapshot's continuity, not a newer baseline from
+an internal classification read; a repaired observer cannot silently rebase old refs.
+
+Observer injection is immediate and document-id scoped after `onCommitted`.
+Before injection, the extension confirms Chrome's HTTP/S host access for that
+document. Agent site consent is a separate permission and cannot grant Chrome
+extension access. An initial blank tab without a live HTTP parent is deferred;
+an embedded blank document may inherit its live parent's host access. A host-permission
+binding error may retry once after reconfirming access and the same document;
+this shares a two-injection budget with a fresh read's missing-receiver repair.
+Input checks never reinstall or rebase a snapshot. Only an
+agent-created `about:blank` tab without an opener may make its explicit first navigation without
+observation: HTTP host permissions alone do not guarantee injection there. Both sides verify that
+exception, and navigation success waits for confirmed observation on the landing
+document. A handed or already-loaded HTTP tab has no such exception.
 
 Each command is `{method:<string>, params:<object>}` with an optional complete
 scope `{frame_id:<CDP string id>, loader_id:<CDP loader id>, session_id:<owner>}`.

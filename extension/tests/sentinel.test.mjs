@@ -58,6 +58,19 @@ test("missing interaction history refuses instead of hiding unknown input", asyn
   const epoch = await f.epochs.sample(2);
   for (let i = 0; i < 257; i++) f.chrome.input(2, { type: "click" });
   assert.equal(f.chrome.sentinels.get("2:0").send("sample").interactions.length, 256);
-  await assert.rejects(f.epochs.sample(2), { reason: "interaction_continuity_lost" });
+  await assert.rejects(f.epochs.sample(2), { reason: "observer_unavailable" });
   assert.equal(f.epochs.record(2).epoch, epoch);
+});
+
+
+test("observer installs when secure-context randomUUID is unavailable", () => {
+  const observer = sentinel({ randomUUIDAvailable: false });
+  const first = observer.send("sample");
+  assert.equal(first.enabled, true);
+  assert.equal(first.documentId, "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
+  assert.equal(observer.randomValuesCalls, 1);
+  observer.event({ type: "click", isTrusted: true });
+  const second = observer.send("sample");
+  assert.equal(second.documentId, first.documentId);
+  assert.equal(second.sequence, 1);
 });
