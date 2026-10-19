@@ -34,6 +34,7 @@ pub mod capability;
 pub mod cdp;
 pub mod cingulate_client;
 pub mod classification;
+mod codemode;
 pub mod computer_capability;
 pub mod computer_grants;
 pub mod connector_evidence;
@@ -3591,6 +3592,36 @@ async fn handle_route_request(
         )
         .await;
     };
+    if facts.codemode_head.is_some() {
+        let resolved = planes
+            .routes
+            .run_head(facts.scope.as_ref().expect("admitted run stamp"));
+        let refusal = match resolved {
+            Err(refusal) => Some(refusal),
+            Ok(head)
+                if head.identity.conversation_key != facts.identity.conversation_key
+                    || head
+                        .scope
+                        .as_ref()
+                        .is_some_and(|stamp| planes.scopes.is_superseded(stamp)) =>
+            {
+                Some(codemode::ParentRefusal::NoLiveHead)
+            }
+            Ok(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code(),
+                refusal.message(),
+            )
+            .await;
+        }
+    }
     if let Some(method) = permissions::refused_method(&frame, &facts) {
         return send_route_error(writer, ver, channel, epoch, corr, "principal_denied",
             &format!("reserved:cingulate may call only permissions.list or permissions.revoke, not '{method}'"))
@@ -5527,7 +5558,14 @@ async fn handle_control_request(
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
+            let mode = call_mode
+                .clone()
+                .unwrap_or(subc_protocol::call_mode::CallMode::Classic);
+            let run_candidate = scope.as_ref().is_some_and(|stamp| {
+                cerebellum_core::identity::codemode_carrier_candidate(stamp, &principal, &mode)
+            });
             if !trust.is_first_party()
+                && !run_candidate
                 && !scope.as_ref().is_some_and(|stamp| {
                     cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
                 })
@@ -5588,6 +5626,28 @@ async fn handle_control_request(
             .with_scope(scope);
             accepted_facts.call_mode =
                 call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic);
+            if run_candidate {
+                let stamp = accepted_facts
+                    .scope
+                    .as_ref()
+                    .expect("run candidate has a scope");
+                let head = match route_bindings.run_head(stamp) {
+                    Ok(head) => head,
+                    Err(refusal) => {
+                        return send_route_error(
+                            writer,
+                            frame.header.ver,
+                            0,
+                            0,
+                            frame.header.corr,
+                            refusal.code(),
+                            refusal.message(),
+                        )
+                        .await;
+                    }
+                };
+                accepted_facts = accepted_facts.with_codemode_head(&head);
+            }
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}

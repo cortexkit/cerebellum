@@ -341,6 +341,10 @@ pub struct AcceptedBindFacts {
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
     /// Execution mode stamped by the daemon, never chosen by tool arguments.
     pub call_mode: subc_protocol::call_mode::CallMode,
+    /// The provider-admitted head route a codemode run borrows. The carrier
+    /// chooses the run bind's session id; only this head route may select the
+    /// browser session, handle tables and execution lane used by the run.
+    pub codemode_head: Option<Box<AcceptedBindFacts>>,
     /// The flow's id, fixed at bind time and retained only for an admitted carrier.
     ///
     /// A **flow** is an unattended workflow that the Basal module runs on an
@@ -385,6 +389,7 @@ impl AcceptedBindFacts {
             surface: RouteSurface::from_target(target),
             scope: None,
             call_mode: subc_protocol::call_mode::CallMode::Classic,
+            codemode_head: None,
             flow_id: None,
         }
     }
@@ -544,7 +549,28 @@ impl AcceptedBindFacts {
     /// admission facts on the bind say which conversation a call would act in,
     /// never whether this caller may act in one.
     pub fn admits_session_calls(&self) -> bool {
-        self.flow_id.is_some() || crate::principal::admits_session_calls(&self.principal)
+        self.codemode_head.is_some()
+            || self.flow_id.is_some()
+            || crate::principal::admits_session_calls(&self.principal)
+    }
+
+    /// Borrow only an already-admitted head, never identity supplied by Basal.
+    /// Keep the run's principal, scope and result-reader declarations: those
+    /// still govern call records, withdrawal and the reply to the carrier.
+    pub fn with_codemode_head(mut self, head: &Self) -> Self {
+        self.identity = head.identity.clone();
+        self.agent_project_id_attested = head.agent_project_id_attested;
+        self.session_kind_attested = head.session_kind_attested;
+        self.acts_as_agent = head.acts_as_agent;
+        self.control_operations = head.control_operations.clone();
+        self.codemode_head = Some(Box::new(head.clone()));
+        self
+    }
+
+    /// Consent and cursor attribution belong to the head, while cancellation
+    /// and call records remain attached to the inbound run route.
+    pub fn head_context(&self) -> &Self {
+        self.codemode_head.as_deref().unwrap_or(self)
     }
 
     /// These facts as an operator's call outside any conversation sees them.
@@ -577,6 +603,7 @@ impl AcceptedBindFacts {
             consumer_capabilities: self.consumer_capabilities.clone(),
             surface: self.surface,
             call_mode: self.call_mode.clone(),
+            codemode_head: None,
             // A scope is session identity, like the conversation above, so an
             // operator's view outside any session carries none.
             scope: None,
@@ -596,6 +623,28 @@ impl AcceptedBindFacts {
                 || (entry.ends_with(":*") && capability.starts_with(&entry[..entry.len() - 1]))
         })
     }
+}
+
+/// A candidate is not admitted until the provider resolves its live parent
+/// route. In particular, neither a bare Basal bind nor a legacy run qualifies.
+pub fn codemode_carrier_candidate(
+    stamp: &subc_protocol::scope::ScopeStamp,
+    principal: &Option<Principal>,
+    mode: &subc_protocol::call_mode::CallMode,
+) -> bool {
+    stamp.kind == subc_protocol::scope::ScopeKind::Ephemeral
+        && stamp.attributes.run_id.is_some()
+        && stamp.attributes.flow_id.is_none()
+        && stamp.owner_authorized
+        && stamp.owner
+            == Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            }
+        && principal.as_ref()
+            == Some(&Principal::Reserved {
+                module_id: "basal".into(),
+            })
+        && *mode == subc_protocol::call_mode::CallMode::Codemode
 }
 
 fn scope_admission_eligible(
