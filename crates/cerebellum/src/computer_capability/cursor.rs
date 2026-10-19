@@ -905,9 +905,10 @@ mod tests {
     /// A watch's report callback, as the fake platform keeps it.
     type Report = Arc<dyn Fn(WindowChange) + Send + Sync>;
 
-    /// A window with one element in it, whose frames a test sets by hand,
-    /// and window watches the test fires by hand, the way the platform's
-    /// observer reports a move.
+    /// A fake platform: one window holding one element, whose frames each
+    /// test sets directly. Every window watch it hands out keeps its report
+    /// callback, and a test calls that callback itself to stand in for the
+    /// platform's observer reporting a move, a resize or a closed window.
     struct FollowGeometry {
         window: ElementHandle,
         window_frame: std::sync::Mutex<[f64; 4]>,

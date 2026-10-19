@@ -708,8 +708,9 @@ impl Picture {
         };
         self.to = to;
         if first {
-            // A first appearance does not travel: the entry plays on the
-            // target itself, and is that picture's landing.
+            // A first appearance does not glide in from anywhere: the badge
+            // starts on the target, and the entry animation (not a settle)
+            // is what marks its arrival there.
             self.from = to;
             self.current = to;
             self.duration_ms = 0.0;

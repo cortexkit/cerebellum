@@ -80,8 +80,10 @@ fn agent_cursor() {
                     }
                     continue;
                 }
-                // Lossy like a picture: each report carries the whole offset,
-                // so the next one makes up for a dropped one.
+                // Dropped on a full queue, as a picture is. That loses nothing
+                // lasting: each report carries the element's total offset since
+                // the badge's latest event, not a step, so the next report
+                // puts the badge in the right place anyway.
                 CursorLine::Follow(follow) => cerebellum_macos::OverlayMessage::Follow {
                     agent: follow.agent,
                     serial: follow.serial,

@@ -125,7 +125,8 @@ fn percentile(sorted: &[f64], share: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * share).round() as usize]
 }
 
-/// Print the measurement for one run and return what was wrong with it.
+/// Print the measurement for one probe run and return its failures, one
+/// message each; an empty list means the run passed.
 #[cfg(target_os = "macos")]
 fn check(probe: &cerebellum_macos::MotionProbe, run: &str, with_activity: bool) -> Vec<String> {
     let mut failures = Vec::new();

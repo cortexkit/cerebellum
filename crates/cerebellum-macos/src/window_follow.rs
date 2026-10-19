@@ -163,7 +163,8 @@ fn run_follower(ready: std::sync::mpsc::Sender<Option<Follower>>) {
         let _ = ready.send(None);
         return;
     };
-    // SAFETY: a process-lifetime Core Foundation constant.
+    // SAFETY: kCFRunLoopDefaultMode is a constant string Core Foundation
+    // exports for the life of the process, so the reference never dangles.
     let mode = unsafe { kCFRunLoopDefaultMode };
     run_loop.add_source(Some(&source), mode);
     descriptor.enable_call_backs(kCFFileDescriptorReadCallBack);
@@ -266,7 +267,8 @@ fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
     // here; the cast only names its Core Foundation type.
     let source = unsafe { &*AXObserverGetRunLoopSource(observer_ptr).cast::<CFRunLoopSource>() };
     if let Some(run_loop) = CFRunLoop::current() {
-        // SAFETY: a process-lifetime Core Foundation constant.
+        // SAFETY: kCFRunLoopDefaultMode is a constant string Core Foundation
+        // exports for the life of the process, so the reference never dangles.
         run_loop.add_source(Some(source), unsafe { kCFRunLoopDefaultMode });
     }
     watch_exit(pid, EV_ADD | EV_ONESHOT);
@@ -299,10 +301,13 @@ fn remove(id: u64) {
             )
         };
     }
-    // SAFETY: as in `add`.
+    // SAFETY: the observer owns its run-loop source and is still alive here
+    // (it is released only when `watch` drops, after this); the cast only
+    // names the source's Core Foundation type.
     let source = unsafe { &*AXObserverGetRunLoopSource(observer).cast::<CFRunLoopSource>() };
     if let Some(run_loop) = CFRunLoop::current() {
-        // SAFETY: a process-lifetime Core Foundation constant.
+        // SAFETY: kCFRunLoopDefaultMode is a constant string Core Foundation
+        // exports for the life of the process, so the reference never dangles.
         run_loop.remove_source(Some(source), unsafe { kCFRunLoopDefaultMode });
     }
     let still_watched = WATCHES.with(|watches| {
@@ -331,7 +336,9 @@ fn watch_exit(pid: c_int, flags: u16) {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    // SAFETY: one change, no event buffer, no wait.
+    // SAFETY: `change` is one valid kevent registration read for the call;
+    // passing no output buffer and a zero event count asks the kernel only to
+    // apply it, so nothing is written back and the call never blocks.
     unsafe {
         kevent(
             follower.exits,
