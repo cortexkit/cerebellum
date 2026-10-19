@@ -509,7 +509,7 @@ async fn codemode_app_consent_detaches_and_standing_grants_short_circuit() {
         .any(|method| method == cingulate_client::wire::CONSENT_AWAIT));
 }
 
-fn seed_app(planes: &Planes, bundle: &str) {
+pub(crate) fn seed_app(planes: &Planes, bundle: &str) {
     use agent_grants::{AgentGrant, GrantHolder, GrantSubject};
     let store = planes.management.agent_grants();
     let now = store.now_ms();
@@ -636,6 +636,10 @@ async fn codemode_capture_consent_detaches_without_starting_a_handoff() {
     let reply: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
     assert_eq!(reply["structuredContent"]["detail"]["step"], "consent");
+    assert_eq!(
+        reply["structuredContent"]["detail"]["origin"],
+        "https://ollama.com"
+    );
     assert_eq!(consent.cards().len(), 1);
     assert!(!consent
         .methods()
@@ -719,4 +723,314 @@ async fn codemode_covering_site_grant_never_asks_or_holds() {
     assert_eq!(reply["structuredContent"]["outcome"], "granted", "{reply}");
     assert_ne!(reply["isError"], true);
     assert!(consent.cards().is_empty());
+}
+
+async fn start_queued_run(planes: &Planes, key: &str) -> (mpsc::Receiver<Frame>, CancelHandle) {
+    let (tx, rx) = mpsc::channel(8);
+    handle_frame_for_test(
+        request(
+            9,
+            30,
+            json!({"name":"browser_use","call_key":key,"arguments":{"action":"snapshot"}}),
+        ),
+        &tx,
+        planes,
+    )
+    .await
+    .unwrap();
+    let cancel = planes.cancellations.get((9, 3, 30)).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                planes.calls.lookup_exact("reserved:basal", key),
+                journal::call_records::Lookup::Own(_)
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("keyed call admitted before withdrawal");
+    (rx, cancel)
+}
+
+async fn withdraw(planes: &Planes, channel: u16, key: &str, carrier: Option<&str>) -> Value {
+    let mut args = json!({"call_key":key});
+    if let Some(carrier) = carrier {
+        args["carrier"] = json!(carrier);
+    }
+    let reply = exchange(
+        planes,
+        channel,
+        40,
+        json!({"name":"tool.withdraw","arguments":args}),
+    )
+    .await;
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+async fn bind_carrier(planes: &Planes, module: &str, scope: ScopeStamp) {
+    let mut bind = run_bind(scope);
+    if let ModuleControlRequest::RouteBind {
+        route_channel,
+        principal,
+        call_mode,
+        ..
+    } = &mut bind
+    {
+        *route_channel = 10;
+        *principal = Some(subc_protocol::Principal::Reserved {
+            module_id: module.into(),
+        });
+        *call_mode = None;
+    }
+    assert_eq!(
+        exchange(planes, 0, 4, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+}
+
+#[tokio::test]
+async fn withdraw_fires_run_cancellation_and_reports_started_honestly() {
+    let planes = bound_run().await;
+    let (lane, _) = planes
+        .browser_queue
+        .arrive("head-conversation".into(), None)
+        .acquire()
+        .await;
+    let (mut replies, cancel) = start_queued_run(&planes, "cancel-run").await;
+    let answer = withdraw(&planes, 9, "cancel-run", None).await;
+    assert_eq!(answer["answer"], "already_started", "{answer}");
+    assert!(cancel.is_cancelled());
+    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["code"], "cancelled", "{reply}");
+    drop(lane);
+}
+
+#[tokio::test]
+async fn withdraw_cannot_cancel_another_carriers_matching_key() {
+    let planes = bound_run().await;
+    bind_carrier(&planes, "aft", run_stamp()).await;
+    let (lane, _) = planes
+        .browser_queue
+        .arrive("head-conversation".into(), None)
+        .acquire()
+        .await;
+    let (_replies, cancel) = start_queued_run(&planes, "shared-key").await;
+    let scope = journal::call_records::ScopeIdentity::from_stamp(&run_stamp());
+    assert!(matches!(
+        planes.calls.begin_attributed(
+            "reserved:aft",
+            "shared-key",
+            "other-conversation",
+            Some(scope),
+            Default::default(),
+            wall_clock_ms()
+        ),
+        journal::call_records::Begin::Execute(_)
+    ));
+    let answer = withdraw(&planes, 10, "shared-key", None).await;
+    assert_eq!(answer["answer"], "already_started", "{answer}");
+    assert!(
+        !cancel.is_cancelled(),
+        "another carrier's same call_key cannot cancel Basal"
+    );
+    let answer = withdraw(&planes, 10, "shared-key", Some("reserved:basal")).await;
+    assert_eq!(answer["code"], "withdraw_carrier_mismatch", "{answer}");
+    assert!(!cancel.is_cancelled());
+    withdraw(&planes, 9, "shared-key", None).await;
+    drop(lane);
+}
+
+#[tokio::test]
+async fn authorized_owner_can_withdraw_basal_but_other_scopes_cannot() {
+    let planes = bound_run().await;
+    let (lane, _) = planes
+        .browser_queue
+        .arrive("head-conversation".into(), None)
+        .acquire()
+        .await;
+    let (_replies, cancel) = start_queued_run(&planes, "owner-key").await;
+    let mut wrong = run_stamp();
+    wrong.scope_ref = "different-run".into();
+    bind_carrier(&planes, "prefrontal-core", wrong).await;
+    let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
+    assert_eq!(answer["code"], "withdraw_not_permitted", "{answer}");
+    assert!(!cancel.is_cancelled());
+    bind_carrier(
+        &planes,
+        "prefrontal-core",
+        run_stamp().with_owner_authorized(false),
+    )
+    .await;
+    let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
+    assert_eq!(answer["code"], "withdraw_not_permitted", "{answer}");
+    assert!(!cancel.is_cancelled());
+    bind_carrier(&planes, "prefrontal-core", run_stamp()).await;
+    let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
+    assert_eq!(answer["answer"], "already_started", "{answer}");
+    assert!(cancel.is_cancelled());
+    drop(lane);
+}
+
+#[tokio::test]
+async fn flow_and_worker_admission_stay_separate_from_run_context() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    let mut stamp = run_stamp();
+    stamp.attributes.run_id = None;
+    stamp.attributes.flow_id = Some("flow-test".into());
+    stamp.attributes.delegates = true;
+    stamp.kind = ScopeKind::Head;
+    let mut bind = run_bind(stamp);
+    if let ModuleControlRequest::RouteBind { call_mode, .. } = &mut bind {
+        *call_mode = Some(CallMode::Flow);
+    }
+    assert_eq!(
+        exchange(&planes, 0, 1, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let flow = planes.routes.get(9, 3).unwrap();
+    assert_eq!(flow.flow_id.as_deref(), Some("flow-test"));
+    assert!(flow.admits_session_calls());
+    assert!(flow.codemode_head.is_none());
+    assert_eq!(flow.identity.agent_project_id, "test-project");
+    assert!(flow.agent_project_id_attested && flow.acts_as_agent);
+    let mut stamp = run_stamp();
+    stamp.kind = ScopeKind::Worker;
+    stamp.attributes.run_id = None;
+    stamp.attributes.agent_id = None;
+    let mut bind = run_bind(stamp);
+    if let ModuleControlRequest::RouteBind {
+        principal,
+        call_mode,
+        ..
+    } = &mut bind
+    {
+        *principal = session_caller_principal_for_test();
+        *call_mode = None;
+    }
+    assert_eq!(
+        exchange(&planes, 0, 2, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let worker = planes.routes.get(9, 3).unwrap();
+    assert!(worker.admits_session_calls());
+    assert!(worker.flow_id.is_none() && worker.codemode_head.is_none());
+    assert_eq!(worker.identity.conversation_key, "misleading-session");
+    assert_eq!(worker.scope.as_ref().unwrap().kind, ScopeKind::Worker);
+}
+
+#[tokio::test]
+async fn codemode_image_results_keep_handles_and_dimensions_without_bytes() {
+    let reply = json!({"outcome":"ok","image":{"image_id":"head-image","mime":"image/png","width_px":1,"height_px":1,"data_b64":"AA=="}});
+    let direct: Value =
+        serde_json::from_slice(&tool_result::encode(reply.clone()).unwrap()).unwrap();
+    assert!(direct["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part["type"] == "image"));
+    codemode::CALL_DETAIL
+        .scope(
+            std::cell::RefCell::new(Some(json!({"action":"screenshot"}))),
+            async {
+                let encoded: Value =
+                    serde_json::from_slice(&tool_result::encode(reply.clone()).unwrap()).unwrap();
+                assert_eq!(
+                    encoded["structuredContent"]["image"]["image_id"],
+                    "head-image"
+                );
+                assert_eq!(encoded["structuredContent"]["image"]["width_px"], 1);
+                assert_eq!(encoded["structuredContent"]["image"]["height_px"], 1);
+                assert!(encoded["structuredContent"]["image"]
+                    .get("data_b64")
+                    .is_none());
+                assert!(!encoded["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["type"] == "image"));
+                let (tx, mut rx) = mpsc::channel(1);
+                send_tool_response(&tx, PROTOCOL_VERSION, 9, 3, 1, reply)
+                    .await
+                    .unwrap();
+                let raw: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert_eq!(raw["image"]["image_id"], "head-image");
+                assert!(raw["image"].get("data_b64").is_none());
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn run_rejects_superseded_head_routes_before_bind() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    bind_head(&planes).await;
+    let old = planes.routes.get(8, 3).unwrap();
+    let mut newer = old.scope.unwrap();
+    newer.scope_epoch += 1;
+    let mut bind = run_bind(newer);
+    if let ModuleControlRequest::RouteBind {
+        route_channel,
+        principal,
+        call_mode,
+        ..
+    } = &mut bind
+    {
+        *route_channel = 11;
+        *principal = session_caller_principal_for_test();
+        *call_mode = None;
+    }
+    assert_eq!(
+        exchange(&planes, 0, 2, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    assert!(
+        planes.routes.get(8, 3).is_some(),
+        "a superseded route can await its GOODBYE"
+    );
+    refused_run(&planes, run_bind(run_stamp()), "run_parent_unavailable").await;
+}
+
+#[tokio::test]
+async fn live_run_cancellation_is_bound_to_its_record_scope() {
+    let planes = bound_run().await;
+    let facts = planes.routes.get(9, 3).unwrap();
+    let handle = CancelHandle::pending();
+    let _registered = planes
+        .run_calls
+        .register(&facts, "scope-key", Some(handle.clone()))
+        .unwrap();
+    let scope = journal::call_records::ScopeIdentity::from_stamp(facts.scope.as_ref().unwrap());
+    assert!(planes
+        .run_calls
+        .cancellation("reserved:basal", "scope-key", Some(&scope))
+        .is_some());
+    let mut wrong = scope;
+    wrong.scope_epoch += 1;
+    assert!(planes
+        .run_calls
+        .cancellation("reserved:basal", "scope-key", Some(&wrong))
+        .is_none());
+    assert!(planes
+        .run_calls
+        .cancellation("reserved:basal", "scope-key", None)
+        .is_none());
 }

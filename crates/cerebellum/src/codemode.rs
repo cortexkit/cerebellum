@@ -3,8 +3,80 @@
 use crate::{AcceptedBindFacts, RouteBindings};
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use subc_protocol::scope::{ParentState, ScopeKind, ScopeStamp};
 use subc_protocol::Principal;
+
+type CallKey = (String, String);
+type InFlight = (
+    crate::journal::call_records::ScopeIdentity,
+    crate::CancelHandle,
+);
+
+/// Live interruption is separate from durable call history. Exact carrier keys
+/// prevent a withdrawal from discovering or cancelling another module's call.
+#[derive(Clone, Default)]
+pub(crate) struct RunCalls(Arc<Mutex<HashMap<CallKey, InFlight>>>);
+
+pub(crate) struct RunCall {
+    registry: RunCalls,
+    key: CallKey,
+    handle: crate::CancelHandle,
+}
+
+impl RunCalls {
+    pub(crate) fn register(
+        &self,
+        facts: &AcceptedBindFacts,
+        key: &str,
+        handle: Option<crate::CancelHandle>,
+    ) -> Option<RunCall> {
+        facts.codemode_head.as_ref()?;
+        let handle = handle?;
+        let scope = crate::journal::call_records::ScopeIdentity::from_stamp(facts.scope.as_ref()?);
+        let key = (
+            crate::journal::call_records::principal_label(facts.principal.as_ref()),
+            key.to_owned(),
+        );
+        let mut calls = self.0.lock().unwrap();
+        if calls.contains_key(&key) {
+            return None;
+        }
+        calls.insert(key.clone(), (scope, handle.clone()));
+        Some(RunCall {
+            registry: self.clone(),
+            key,
+            handle,
+        })
+    }
+
+    pub(crate) fn cancellation(
+        &self,
+        carrier: &str,
+        key: &str,
+        scope: Option<&crate::journal::call_records::ScopeIdentity>,
+    ) -> Option<crate::CancelHandle> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&(carrier.to_owned(), key.to_owned()))
+            .filter(|(recorded, _)| Some(recorded) == scope)
+            .map(|(_, handle)| handle.clone())
+    }
+}
+
+impl Drop for RunCall {
+    fn drop(&mut self) {
+        let mut calls = self.registry.0.lock().unwrap();
+        if calls
+            .get(&self.key)
+            .is_some_and(|(_, handle)| Arc::ptr_eq(&handle.0, &self.handle.0))
+        {
+            calls.remove(&self.key);
+        }
+    }
+}
 
 tokio::task_local! {
     pub(crate) static CALL_DETAIL: RefCell<Option<Value>>;
@@ -58,7 +130,7 @@ pub(crate) fn call_detail(
             args.get("url")
                 .or_else(|| args.get("login_url"))?
                 .as_str()
-                .and_then(crate::classification::canonical_grant_origin)
+                .and_then(crate::classification::canonical_origin_from_url)
         })
     {
         detail["origin"] = json!(origin);
@@ -90,7 +162,7 @@ pub(crate) fn unsupported(reply: Value) -> Value {
         Some("capture_pending") => "login_capture",
         _ => "consent",
     });
-    if let Some(origin) = reply.get("origin") {
+    if let Some(origin) = reply.get("origin").or_else(|| reply["origins"].get(0)) {
         detail["origin"] = origin.clone();
     }
     if let Some(ask) = reply.get("ask_id") {

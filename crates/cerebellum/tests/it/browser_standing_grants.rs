@@ -2536,3 +2536,92 @@ async fn codemode_missing_browser_grant_refuses_without_elicitation() {
 }
 
 mod worker;
+
+#[tokio::test]
+async fn basal_run_uses_head_browser_snapshot_and_standing_site_grant() {
+    use subc_protocol::scope::{ParentState, ScopeAttributes, ScopeKind, ScopeParent, ScopeStamp};
+    let mut fixture = Fixture::new();
+    fixture.seed(AGENT, GrantSubject::AllSites, 2, &[]);
+    let head = fixture
+        .route(Session::primary("real-head-session", AGENT).asking())
+        .await;
+    let facts = fixture
+        .planes
+        .routes
+        .accepted_bind_for_test(head.channel, 1)
+        .unwrap();
+    let stamp = facts.scope.as_ref().unwrap();
+    let scope = ScopeStamp::new(stamp.owner.clone(), "basal-run", 1, ScopeKind::Ephemeral)
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some(AGENT.into()))
+                .with_run_id(Some("basal-run".into())),
+        )
+        .with_owner_authorized(true)
+        .with_parent(Some(ScopeParent::new(
+            stamp.owner.clone(),
+            stamp.scope_ref.clone(),
+            stamp.scope_epoch,
+        )))
+        .with_parent_state(Some(ParentState::Linked));
+    let run = Route {
+        channel: fixture.next_channel,
+        next_corr: Arc::new(Mutex::new(100)),
+        identity: head.identity.clone(),
+    };
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: run.channel,
+        epoch: 1,
+        principal: Some(subc_protocol::Principal::Reserved {
+            module_id: "basal".into(),
+        }),
+        identity: BindIdentity::new("/misleading/run", "run", "wrong-session"),
+        admission_facts: None,
+        consumer_capabilities: None,
+        target: RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        scope: Some(scope),
+        call_mode: Some(subc_protocol::call_mode::CallMode::Codemode),
+        role_versions: None,
+    };
+    let (tx, mut rx) = mpsc::channel(4);
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(frame, &tx, &fixture.planes)
+        .await
+        .unwrap();
+    let reply = rx.recv().await.unwrap();
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let head_status = fixture.call(&head, "browser.status", json!({})).await;
+    let run_status = fixture.call(&run, "browser.status", json!({})).await;
+    assert_eq!(
+        run_status["browser_session_id"],
+        head_status["browser_session_id"]
+    );
+    let navigation = fixture.call(&run,"browser_use",json!({"action":"navigate","url":PUBLIC,"intent":"read","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    assert_eq!(navigation["outcome"], "ok", "{navigation}");
+    let snapshot = fixture
+        .call(&head, "browser.snapshot", json!({"mode":"ax"}))
+        .await;
+    let click = fixture.call(&run,"browser_use",json!({"action":"click","ref":named_ref(&snapshot,"Button"),"snapshot_id":snapshot["snapshot_id"],"intent":"ordinary click","severity":{"tier":2,"credential":false,"financial":false}})).await;
+    assert_eq!(click["outcome"], "ok", "{click}");
+    assert!(fixture
+        .browser
+        .effects()
+        .iter()
+        .any(|effect| effect == &format!("navigate {PUBLIC}")));
+}

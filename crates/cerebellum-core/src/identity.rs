@@ -545,9 +545,9 @@ impl AcceptedBindFacts {
 
     /// Whether this route's opener may make calls in a conversation's name.
     ///
-    /// Read from the daemon-stamped principal alone: the conversation key and
-    /// admission facts on the bind say which conversation a call would act in,
-    /// never whether this caller may act in one.
+    /// Requires an admitted flow/run carrier context or the daemon-stamped
+    /// session-caller principal. A conversation key or raw identity attribute
+    /// alone never admits a caller to act in that conversation.
     pub fn admits_session_calls(&self) -> bool {
         self.codemode_head.is_some()
             || self.flow_id.is_some()
@@ -663,7 +663,8 @@ fn scope_admission_eligible(
 
 /// Check that `flow_id` is present, `owner_authorized` is true, the stamp owner
 /// is `reserved:prefrontal-core`, and the route principal is `reserved:basal`.
-/// This is the only way a module outside the first-party list may bind a route.
+/// This admits flow carriers without first-party membership. Codemode runs
+/// require a separate resolution of the provider's own admitted head route.
 /// For flow vocabulary, see [`AcceptedBindFacts::flow_id`].
 pub fn flow_carrier_admitted(
     stamp: &subc_protocol::scope::ScopeStamp,
