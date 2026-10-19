@@ -329,13 +329,13 @@ mod tests {
             "cerebellum".into(),
             Some("n0nce".into()),
         );
-        let scope = ScopeSelector {
-            owner: Principal::Reserved {
+        let scope = ScopeSelector::new(
+            Principal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
-            scope_ref: "sc_head_alf".into(),
-            scope_epoch: Some(3),
-        };
+            "sc_head_alf",
+            Some(3),
+        );
         let body: serde_json::Value = serde_json::from_slice(&cingulate.open_body(&scope)).unwrap();
         assert_eq!(body["op"], "route.open");
         assert_eq!(

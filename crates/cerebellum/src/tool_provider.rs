@@ -337,8 +337,8 @@ pub(crate) async fn serve(
                     "role.describe takes no arguments",
                 ))
             } else {
-                Ok(serde_json::to_value(RoleDescribe {
-                    majors: vec![Major {
+                Ok(serde_json::to_value(RoleDescribe::new(
+                    vec![Major {
                         version: PROVIDES.into(),
                         ops: vec![
                             ops::ROLE_DESCRIBE.into(),
@@ -349,9 +349,8 @@ pub(crate) async fn serve(
                         ],
                         stability: "alpha".into(),
                     }],
-                    implementation_version: env!("CARGO_PKG_VERSION").into(),
-                    capabilities: Vec::new(),
-                })
+                    env!("CARGO_PKG_VERSION"),
+                ))
                 .expect("role description serializes"))
             }
         }

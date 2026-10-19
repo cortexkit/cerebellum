@@ -123,11 +123,11 @@ impl LiveCall {
         }
         let owner = serde_json::to_string(&stamp.owner).unwrap_or_default();
         Ok(Self {
-            scope: ScopeSelector {
-                owner: stamp.owner.clone(),
-                scope_ref: stamp.scope_ref.clone(),
-                scope_epoch: Some(stamp.scope_epoch),
-            },
+            scope: ScopeSelector::new(
+                stamp.owner.clone(),
+                stamp.scope_ref.clone(),
+                Some(stamp.scope_epoch),
+            ),
             session: SessionKey {
                 owner,
                 scope_ref: stamp.scope_ref.clone(),

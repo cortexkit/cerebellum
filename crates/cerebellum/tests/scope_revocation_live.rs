@@ -184,13 +184,13 @@ async fn open_scoped_route(
             }),
             consumer_capabilities: Some(vec!["elicitation".into()]),
             admission_facts: None,
-            scope: Some(ScopeSelector {
-                owner: Principal::Reserved {
+            scope: Some(ScopeSelector::new(
+                Principal::Reserved {
                     module_id: OWNER.into(),
                 },
-                scope_ref: SCOPE_REF.into(),
-                scope_epoch: Some(1),
-            }),
+                SCOPE_REF,
+                Some(1),
+            )),
         },
     )
     .await;
