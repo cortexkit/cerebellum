@@ -686,9 +686,7 @@ impl AppStateSessions {
         latest.unreadable_subtrees = before
             .as_ref()
             .map_or(read.unreadable_subtrees, |previous| {
-                previous
-                    .unreadable_subtrees
-                    .saturating_add(read.unreadable_subtrees)
+                previous.unreadable_subtrees
             });
         latest.complete = false;
         if let Some(session) = self.lock().sessions.get_mut(&key) {
