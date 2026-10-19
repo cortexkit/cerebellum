@@ -284,6 +284,7 @@ fn unclaimed_handed_tab(status: &Value) -> Result<Option<String>, String> {
 #[async_trait::async_trait(?Send)]
 trait Driver {
     async fn call(&mut self, args: Value) -> Result<(Value, usize), String>;
+    async fn fixture_readiness(&mut self) -> Result<Value, String>;
     fn observe(&mut self) -> Result<Value, String>;
     async fn click_observation(&mut self) -> Result<Value, String>;
     fn failure_diagnostics(&mut self) -> Value;
@@ -512,6 +513,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         ok(&navigated) && asks == 1,
     )?;
     detached_and_unfocused(driver)?;
+    wait_for_fixture(driver, std::time::Duration::from_secs(5)).await?;
     let (snapshot, asks) = driver
         .call(json!({"action":"snapshot","tab":tab,"mode":"ax"}))
         .await?;
@@ -593,6 +595,31 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
         closed["outcome"] == "closed" && driver.observe()?["outside_group"] == -1,
     )?;
     Ok(())
+}
+
+fn fixture_ready(observed: &Value) -> bool {
+    observed["document_complete"] == true
+        && observed["iframe_ready"] == true
+        && observed["url_matches"] == true
+}
+
+async fn wait_for_fixture(
+    driver: &mut impl Driver,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let observed = driver.fixture_readiness().await?;
+        if fixture_ready(&observed) {
+            println!("fixture readiness: {observed}");
+            return check("fixture document and iframe finished loading", true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            println!("fixture readiness: {observed}");
+            return check("fixture document and iframe finished loading", false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 async fn handed_checks(driver: &mut impl Driver, origin: &str) -> Result<(), String> {
@@ -1714,6 +1741,21 @@ mod live {
             }
             Ok(observation)
         }
+        async fn fixture_readiness(&mut self) -> Result<Value, String> {
+            let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
+            let target = fixture_page_target(&targets, &self.origin)?;
+            let session = self.cdp.attach(&target)?;
+            // This observer-only read is restricted to the scratch fixture. The
+            // child signals readiness after its input and load handler exist.
+            let result = self.cdp.eval(&session, &format!(r#"({{document_complete:document.readyState === 'complete', iframe_ready:window.__probeIframeReady === true, url_matches:location.href === {}}})"#, json!(format!("{}/", self.origin))));
+            let detached = self.cdp.call(
+                "Target.detachFromTarget",
+                json!({"sessionId":session}),
+                None,
+            );
+            detached?;
+            result
+        }
         async fn click_observation(&mut self) -> Result<Value, String> {
             // The page counter records handler execution independently of the
             // beacon, which can arrive after the tool has acknowledged input.
@@ -1994,6 +2036,7 @@ struct Double {
     deferred: bool,
     late_answered: bool,
     decline_answer: bool,
+    fixture_polls: usize,
 }
 impl Double {
     fn new(fault: &'static str) -> Self {
@@ -2011,6 +2054,7 @@ impl Double {
             deferred: false,
             late_answered: false,
             decline_answer: false,
+            fixture_polls: 0,
         }
     }
 }
@@ -2055,6 +2099,9 @@ impl Driver for Double {
                 reply["outcome"] = json!("consent_pending");
             }
             "snapshot" => {
+                if self.fixture_polls < 2 {
+                    return Err("snapshot reached the fixture before its iframe was ready".into());
+                }
                 asks = 0;
                 reply["snapshot_id"] = json!("fresh-snapshot");
                 reply["state_text"] =
@@ -2120,6 +2167,11 @@ impl Driver for Double {
             asks,
         };
         Ok((reply, asks))
+    }
+    async fn fixture_readiness(&mut self) -> Result<Value, String> {
+        self.fixture_polls += 1;
+        Ok(json!({"document_complete":true,"url_matches":true,
+            "iframe_ready":self.fixture_polls >= 2 && self.fault != "iframe_unready"}))
     }
     fn observe(&mut self) -> Result<Value, String> {
         Ok(
@@ -2386,6 +2438,35 @@ fn host_exit_control() -> Result<(), String> {
 async fn self_test() -> Result<(), String> {
     let mut tests: Vec<(&str, Result<(), String>)> = Vec::new();
     tests.extend(fixture_http::controls());
+    tests.push((
+        "fixture_readiness_waits_for_the_child_not_just_the_top_page",
+        async {
+            for missing in ["document_complete", "url_matches", "iframe_ready"] {
+                let mut observed =
+                    json!({"document_complete":true,"url_matches":true,"iframe_ready":true});
+                observed[missing] = json!(false);
+                if fixture_ready(&observed) {
+                    return Err(format!("fixture readiness ignored {missing}"));
+                }
+            }
+            let mut fixture = Double::new("");
+            wait_for_fixture(&mut fixture, std::time::Duration::from_secs(1)).await?;
+            if fixture.fixture_polls < 2 {
+                return Err("fixture read did not wait for the child".into());
+            }
+            if wait_for_fixture(
+                &mut Double::new("iframe_unready"),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_ok()
+            {
+                return Err("fixture read accepted a child that never became ready".into());
+            }
+            Ok(())
+        }
+        .await,
+    ));
     let args = vec![
         "--chrome".into(),
         "/some/Google Chrome for Testing".into(),

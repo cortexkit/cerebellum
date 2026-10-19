@@ -95,13 +95,15 @@ fn page(target: &str, child_origin: &str) -> Option<String> {
     let body = match target {
         "/outside-secret" => "<!doctype html><title>OUTSIDE_SECRET</title><p>OUTSIDE_SECRET</p>",
         "/" => {
-            r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
+            r#"<!doctype html><meta charset="utf-8"><title>Local user browser probe</title><script>window.__clicks = 0; window.__probeIframeReady = false; addEventListener('message', event => { if (event.origin === 'IFRAME_ORIGIN' && event.source === document.querySelector('iframe')?.contentWindow && event.data === 'probe-iframe-ready') window.__probeIframeReady = true; });</script><button aria-label="Probe button" onclick="window.__clicks++; navigator.sendBeacon('/click')">Probe button</button><input aria-label="Probe input" oninput="navigator.sendBeacon('/type?'+encodeURIComponent(this.value))"><iframe src="IFRAME_ORIGIN/iframe" title="Embedded probe"></iframe>"#
         }
         "/handed-active" | "/handed-background" => {
             r##"<!doctype html><meta charset="utf-8"><title>Handed fixture</title><script>window.__links=0;addEventListener('load',()=>scrollTo(0,900))</script><a style="position:fixed;left:8px;top:8px" href="#clicked" onclick="event.preventDefault(); window.__links++">Probe link</a><form style="position:fixed;left:8px;top:40px" method="post" action="/submitted"><button aria-label="Probe submit">Submit</button></form><div style="height:2000px"></div>"##
         }
         "/iframe" => {
-            r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))">"#
+            // The fixed message discloses no page data. The parent verifies both
+            // the sender window and origin before accepting child readiness.
+            r#"<!doctype html><meta charset="utf-8"><title>Embedded probe</title><input aria-label="Iframe input" oninput="navigator.sendBeacon('/child-type?'+encodeURIComponent(this.value))"><script>addEventListener('load', () => parent.postMessage('probe-iframe-ready', '*'));</script>"#
         }
         _ => return None,
     };
