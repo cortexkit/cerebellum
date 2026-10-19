@@ -62,6 +62,15 @@ workspace_wide = any(
 selected_packages = set()
 selected_suites = set()
 
+# Some sources live at the repo root but are compiled into a crate with
+# include_str!, so a path-containment match never selects that crate. Map them
+# explicitly, or a change to the data slips past the test that parses it.
+root_file_packages = {"engram-catalog.json": "cerebellum-core"}
+for path in files:
+    owner = root_file_packages.get(path)
+    if owner:
+        selected_packages.add(owner)
+
 for package in packages:
     manifest = Path(package["manifest_path"]).resolve()
     package_root = manifest.parent
@@ -130,6 +139,14 @@ if [ "$self_test" -eq 1 ]; then
     exit 1
   fi
   echo "SELF-TEST PASSED: a planted flat_tools.rs change keeps catalog and fingerprint checks"
+
+  catalog_plan="$(plan_for_files 'engram-catalog.json')"
+  if ! printf '%s\n' "$catalog_plan" | grep -Fxq 'P|cerebellum-core' || \
+     ! printf '%s\n' "$catalog_plan" | grep -Fxq 'L|cerebellum-core'; then
+    echo "SELF-TEST FAILED: engram-catalog.json did not select cerebellum-core --lib" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a root engram-catalog.json change runs cerebellum-core --lib"
 
   if plan_for_files '' >/dev/null 2>&1; then
     echo "SELF-TEST FAILED: an empty diff was accepted" >&2

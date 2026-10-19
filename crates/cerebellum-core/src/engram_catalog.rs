@@ -247,13 +247,15 @@ mod tests {
         }
     }
 
-    /// Nothing this module keeps should follow the operator to another
-    /// machine: browser sessions are secrets bound to this one, and grants
-    /// and the audit trail describe this machine. Each tree the module
-    /// writes under its data directory is declared, so none is left to read
-    /// as an oversight.
+    /// Every tree the module writes under its data directory is declared, so
+    /// none is left to read as an oversight. Browser sessions are excluded:
+    /// they are signed-in secrets bound to this machine. The audit journal is
+    /// portable so it lands in every backup; engram does not capture its
+    /// device-local class at all, so marking the journal device-local would drop
+    /// the audit trail from backups. Restoring it onto another Mac stays an
+    /// explicit operator action.
     #[test]
-    fn the_catalog_declares_every_tree_and_nothing_portable() {
+    fn the_catalog_declares_every_tree_with_browser_excluded_and_journal_portable() {
         let descriptor = parsed();
         let by_path: Vec<_> = descriptor
             .entries
@@ -262,10 +264,7 @@ mod tests {
             .collect();
         assert_eq!(
             by_path,
-            [
-                ("browser", Class::Excluded),
-                ("journal", Class::DeviceLocal)
-            ]
+            [("browser", Class::Excluded), ("journal", Class::Portable)]
         );
         let browser = &descriptor.entries[0];
         assert!(
