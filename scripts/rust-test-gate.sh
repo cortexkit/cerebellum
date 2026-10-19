@@ -287,6 +287,7 @@ start_parallel_phase "scripts/module-wiring-gate.sh" ./scripts/module-wiring-gat
 start_parallel_phase "scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 start_parallel_phase "scripts/watch-ci.test.sh" scripts/watch-ci.test.sh
 start_parallel_phase "scripts/mutations.test.sh" scripts/mutations.test.sh
+start_parallel_phase "scripts/install-extension.test.sh" scripts/install-extension.test.sh
 wait_parallel_phases
 
 # Phase 1: format workspace members. Keep the scope explicit so only this
