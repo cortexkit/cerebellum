@@ -1709,6 +1709,7 @@ fn a_recorded_condition_can_be_decided_when_it_is_read_back() {
             focused: None,
             enabled: None,
             value: Some("typed".into()),
+            unreadable_subtrees: 0,
         },
     );
     assert_eq!(outcome, ConditionOutcome::Satisfied);

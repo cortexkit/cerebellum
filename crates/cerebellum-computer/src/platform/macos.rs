@@ -1267,6 +1267,8 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 focused: readback.focused,
                 enabled: readback.enabled,
                 value: readback.value,
+                unreadable_subtrees: u64::try_from(readback.unreadable_subtrees)
+                    .unwrap_or(u64::MAX),
             })
         }
 
@@ -1648,6 +1650,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 focused: readback.focused,
                 enabled: readback.enabled,
                 value: readback.value,
+                unreadable_subtrees: readback.unreadable_subtrees,
             };
             let status = match evaluate(&envelope.condition, &observed) {
                 ConditionOutcome::Satisfied => EffectStatus::EffectObserved,

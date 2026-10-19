@@ -860,6 +860,27 @@ impl PlatformDriver for WindowsPlatformDriver {
                 .ok_or(DriverError::ElementNotFound)?;
             let mut matches = Vec::new();
             collect_matches(&cached.roots, &request.element_name, &mut matches);
+            let unreadable_subtrees = u64::try_from(cached.unreadable_subtrees).unwrap_or(u64::MAX);
+            if request.attribute == AccessibilityReadbackAttribute::Presence {
+                return Ok(AccessibilityElementReadResult {
+                    element_name: request.element_name,
+                    present: !matches.is_empty(),
+                    focused: None,
+                    enabled: None,
+                    value: None,
+                    unreadable_subtrees,
+                });
+            }
+            if unreadable_subtrees > 0 {
+                return Ok(AccessibilityElementReadResult {
+                    element_name: request.element_name,
+                    present: !matches.is_empty(),
+                    focused: None,
+                    enabled: None,
+                    value: None,
+                    unreadable_subtrees,
+                });
+            }
             if matches.len() > 1 {
                 return Err(DriverError::Semantic(
                     SemanticDriverError::ElementNameAmbiguous {
@@ -875,10 +896,11 @@ impl PlatformDriver for WindowsPlatformDriver {
                     focused: None,
                     enabled: None,
                     value: None,
+                    unreadable_subtrees,
                 });
             };
             let (focused, enabled) = match request.attribute {
-                AccessibilityReadbackAttribute::Presence => (None, None),
+                AccessibilityReadbackAttribute::Presence => unreachable!("presence returned above"),
                 AccessibilityReadbackAttribute::Focused => (Some(element.focused), None),
                 AccessibilityReadbackAttribute::Enabled => (None, Some(element.enabled)),
                 AccessibilityReadbackAttribute::Value => {
@@ -891,6 +913,7 @@ impl PlatformDriver for WindowsPlatformDriver {
                 focused,
                 enabled,
                 value: None,
+                unreadable_subtrees,
             })
         }
         #[cfg(not(target_os = "windows"))]
@@ -1062,6 +1085,7 @@ impl PlatformDriver for WindowsPlatformDriver {
                 focused: readback.focused,
                 enabled: readback.enabled,
                 value: readback.value,
+                unreadable_subtrees: readback.unreadable_subtrees,
             };
             let status = match evaluate(&envelope.condition, &observed) {
                 ConditionOutcome::Satisfied => EffectStatus::EffectObserved,

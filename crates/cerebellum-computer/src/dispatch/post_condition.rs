@@ -118,6 +118,8 @@ pub struct ObservedElement {
     pub focused: Option<bool>,
     pub enabled: Option<bool>,
     pub value: Option<String>,
+    /// Descendant parts the scoped search could not inspect before its bound.
+    pub unreadable_subtrees: u64,
 }
 
 impl ObservedElement {
@@ -128,6 +130,7 @@ impl ObservedElement {
             focused: None,
             enabled: None,
             value: None,
+            unreadable_subtrees: 0,
         }
     }
 }
@@ -156,6 +159,16 @@ pub enum ConditionOutcome {
 /// UNSATISFIED rather than indeterminate: the element being gone is a definite
 /// observation, not a failure to observe.
 pub fn evaluate(condition: &PostCondition, observed: &ObservedElement) -> ConditionOutcome {
+    if observed.unreadable_subtrees > 0 {
+        // An observed match proves presence. Absence, uniqueness and attributes
+        // cannot be established until every accessibility branch was searched.
+        return if matches!(condition, PostCondition::ElementPresent { .. }) && observed.present {
+            ConditionOutcome::Satisfied
+        } else {
+            ConditionOutcome::Indeterminate
+        };
+    }
+
     if condition.expects_absence() {
         return if observed.present {
             ConditionOutcome::Unsatisfied
@@ -208,6 +221,7 @@ mod tests {
             focused,
             enabled,
             value: value.map(str::to_string),
+            unreadable_subtrees: 0,
         }
     }
 

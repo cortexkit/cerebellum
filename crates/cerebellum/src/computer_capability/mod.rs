@@ -3409,6 +3409,7 @@ mod wait_tests {
             focused: None,
             enabled: Some(enabled),
             value: None,
+            unreadable_subtrees: 0,
         }
     }
 

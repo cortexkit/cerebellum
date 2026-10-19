@@ -22,8 +22,8 @@ use crate::platform::{
 /// or evidence, once `AXObserver` notifications are wired into this crate.
 pub const WAIT_POLL_INTERVAL_MS: u64 = 50;
 
-/// No single accessibility call may consume more than half a second.
-const MAX_SCOPED_READ_MS: u64 = 500;
+/// Match the full-tree reader's four-second bound while remaining inside the wait deadline.
+const MAX_SCOPED_READ_MS: u64 = 4_000;
 
 /// The terminal fact produced by a bounded wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +116,7 @@ impl<D: PlatformDriver> PredicatePoller for PlatformPredicatePoller<D> {
             focused: readback.focused,
             enabled: readback.enabled,
             value: readback.value,
+            unreadable_subtrees: readback.unreadable_subtrees,
         })
     }
 
@@ -232,8 +233,12 @@ pub fn wait_until_predicate<P: PredicatePoller>(
             }
         };
 
-        match evaluate(&predicate, &observed) {
-            ConditionOutcome::Satisfied => {
+        if observed.unreadable_subtrees > 0 {
+            last_readback = observed.clone();
+            // Seeing a named element proves presence even if other branches are
+            // unreadable. Every other predicate needs a complete search to
+            // prove absence, uniqueness, or the selected element's attributes.
+            if matches!(predicate, PostCondition::ElementPresent { .. }) && observed.present {
                 return WaitResult {
                     outcome: WaitOutcome::Settled,
                     evidence: WaitEvidence::Settled {
@@ -241,20 +246,33 @@ pub fn wait_until_predicate<P: PredicatePoller>(
                         readback: observed,
                     },
                     attempts,
-                }
+                };
             }
-            ConditionOutcome::Indeterminate => {
-                return WaitResult {
-                    outcome: WaitOutcome::Indeterminate,
-                    evidence: WaitEvidence::Indeterminate {
-                        predicate,
-                        readback: Some(observed),
-                        reason: "predicate_attribute_unavailable".to_string(),
-                    },
-                    attempts,
+        } else {
+            match evaluate(&predicate, &observed) {
+                ConditionOutcome::Satisfied => {
+                    return WaitResult {
+                        outcome: WaitOutcome::Settled,
+                        evidence: WaitEvidence::Settled {
+                            predicate,
+                            readback: observed,
+                        },
+                        attempts,
+                    }
                 }
+                ConditionOutcome::Indeterminate => {
+                    return WaitResult {
+                        outcome: WaitOutcome::Indeterminate,
+                        evidence: WaitEvidence::Indeterminate {
+                            predicate,
+                            readback: Some(observed),
+                            reason: "predicate_attribute_unavailable".to_string(),
+                        },
+                        attempts,
+                    }
+                }
+                ConditionOutcome::Unsatisfied => last_readback = observed,
             }
-            ConditionOutcome::Unsatisfied => last_readback = observed,
         }
 
         if poller.elapsed() >= timeout {
@@ -295,6 +313,17 @@ fn deadline_result(
     ever_read: bool,
     last_read_failure: Option<String>,
 ) -> WaitResult {
+    if last_readback.unreadable_subtrees > 0 {
+        return WaitResult {
+            outcome: WaitOutcome::Indeterminate,
+            evidence: WaitEvidence::Indeterminate {
+                predicate,
+                readback: Some(last_readback),
+                reason: "partial_accessibility_tree".to_string(),
+            },
+            attempts,
+        };
+    }
     match last_read_failure {
         Some(reason) if !ever_read => WaitResult {
             outcome: WaitOutcome::Indeterminate,
@@ -347,6 +376,7 @@ mod tests {
         reads: VecDeque<Result<ObservedElement, String>>,
         repeat: Result<ObservedElement, String>,
         read_count: Rc<Cell<u64>>,
+        read_deadlines_ms: Vec<u32>,
         sleep_count: u64,
         cancel_on_sleep: Option<Rc<Cell<bool>>>,
         advance_sleep: bool,
@@ -364,6 +394,7 @@ mod tests {
                 reads: reads.into(),
                 repeat,
                 read_count: Rc::new(Cell::new(0)),
+                read_deadlines_ms: Vec::new(),
                 sleep_count: 0,
                 cancel_on_sleep: None,
                 advance_sleep: true,
@@ -376,6 +407,7 @@ mod tests {
                 reads: VecDeque::new(),
                 repeat: readback,
                 read_count: Rc::new(Cell::new(0)),
+                read_deadlines_ms: Vec::new(),
                 sleep_count: 0,
                 cancel_on_sleep: None,
                 advance_sleep: true,
@@ -391,9 +423,10 @@ mod tests {
         fn read(
             &mut self,
             _predicate: &PostCondition,
-            _deadline_ms: u32,
+            deadline_ms: u32,
         ) -> Result<ObservedElement, String> {
             self.read_count.set(self.read_count.get() + 1);
+            self.read_deadlines_ms.push(deadline_ms);
             self.reads
                 .pop_front()
                 .unwrap_or_else(|| self.repeat.clone())
@@ -422,6 +455,17 @@ mod tests {
             focused: Some(value),
             enabled: None,
             value: None,
+            unreadable_subtrees: 0,
+        }
+    }
+
+    fn partial_observation(present: bool, unreadable_subtrees: u64) -> ObservedElement {
+        ObservedElement {
+            present,
+            focused: None,
+            enabled: None,
+            value: None,
+            unreadable_subtrees,
         }
     }
 
@@ -493,6 +537,7 @@ mod tests {
                 focused: Some(true),
                 enabled: None,
                 value: None,
+                unreadable_subtrees: 0,
             }),
         ]);
 
@@ -661,5 +706,133 @@ mod tests {
 
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
         assert_eq!(poller.read_count.get(), 4);
+    }
+
+    #[test]
+    fn element_present_is_satisfied_when_found_in_a_partial_accessibility_read() {
+        let predicate = PostCondition::ElementPresent {
+            element: AccessibilityElementName::identifier("ready"),
+        };
+        let readback = partial_observation(true, 101);
+        let mut poller = FakePoller::repeating(Ok(readback.clone()));
+
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 6_000, &never_cancelled);
+
+        assert_eq!(result.outcome, WaitOutcome::Settled);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(
+            result.evidence,
+            WaitEvidence::Settled {
+                predicate,
+                readback,
+            }
+        );
+    }
+
+    #[test]
+    fn element_absent_is_indeterminate_when_the_accessibility_read_is_partial() {
+        let predicate = PostCondition::ElementAbsent {
+            element: AccessibilityElementName::identifier("dialog"),
+        };
+        let readback = ObservedElement {
+            present: true,
+            focused: Some(true),
+            enabled: Some(true),
+            value: Some("ready".to_string()),
+            unreadable_subtrees: 101,
+        };
+        assert_eq!(
+            evaluate(&predicate, &readback),
+            ConditionOutcome::Indeterminate
+        );
+        for attribute_predicate in [
+            PostCondition::ElementFocused {
+                element: predicate.element().clone(),
+            },
+            PostCondition::ElementEnabledIs {
+                element: predicate.element().clone(),
+                expected: true,
+            },
+            PostCondition::ElementValueEquals {
+                element: predicate.element().clone(),
+                expected: "ready".to_string(),
+            },
+        ] {
+            assert_eq!(
+                evaluate(&attribute_predicate, &readback),
+                ConditionOutcome::Indeterminate,
+                "partial trees cannot establish {attribute_predicate:?}"
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &PostCondition::ElementPresent {
+                    element: predicate.element().clone(),
+                },
+                &readback
+            ),
+            ConditionOutcome::Satisfied,
+            "a visible match proves presence even when other parts were unreadable"
+        );
+        let mut poller = FakePoller::repeating(Ok(readback.clone()));
+
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 100, &never_cancelled);
+
+        assert_eq!(result.outcome, WaitOutcome::Indeterminate);
+        assert_eq!(
+            result.evidence,
+            WaitEvidence::Indeterminate {
+                predicate,
+                readback: Some(readback),
+                reason: "partial_accessibility_tree".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn element_present_not_found_in_partial_reads_times_out_as_indeterminate() {
+        let predicate = PostCondition::ElementPresent {
+            element: AccessibilityElementName::identifier("ready"),
+        };
+        let readback = partial_observation(false, 101);
+        let mut poller = FakePoller::repeating(Ok(readback.clone()));
+
+        let result = wait_until_predicate(&mut poller, predicate.clone(), 100, &never_cancelled);
+
+        assert_eq!(result.outcome, WaitOutcome::Indeterminate);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(
+            result.evidence,
+            WaitEvidence::Indeterminate {
+                predicate,
+                readback: Some(readback),
+                reason: "partial_accessibility_tree".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_wait_poll_uses_the_full_tree_read_budget_without_exceeding_its_timeout() {
+        let mut poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let _ = wait_until_predicate(
+            &mut poller,
+            focused("AXTextField", "Account"),
+            10_000,
+            &never_cancelled,
+        );
+        assert_eq!(poller.read_deadlines_ms[0], 4_000);
+
+        let mut short_poller = FakePoller::repeating(Ok(observed_focus(false)));
+        let _ = wait_until_predicate(
+            &mut short_poller,
+            focused("AXTextField", "Account"),
+            2_500,
+            &never_cancelled,
+        );
+        assert_eq!(short_poller.read_deadlines_ms[0], 2_500);
+        assert!(short_poller
+            .read_deadlines_ms
+            .iter()
+            .all(|deadline| *deadline <= 2_500));
     }
 }

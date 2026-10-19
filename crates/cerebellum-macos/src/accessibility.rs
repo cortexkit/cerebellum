@@ -203,7 +203,7 @@ pub enum AxReadbackAttribute {
     Value,
 }
 
-/// State read from one uniquely named accessibility element.
+/// State read from a named accessibility element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxElementReadback {
     pub element_name: AxElementName,
@@ -211,6 +211,8 @@ pub struct AxElementReadback {
     pub focused: Option<bool>,
     pub enabled: Option<bool>,
     pub value: Option<String>,
+    /// Descendant parts the search could not inspect before reaching its bound.
+    pub unreadable_subtrees: usize,
 }
 
 impl AxElementReadback {
@@ -221,6 +223,7 @@ impl AxElementReadback {
             focused: None,
             enabled: None,
             value: None,
+            unreadable_subtrees: 0,
         }
     }
 }
@@ -1203,8 +1206,23 @@ fn read_element_from<Source: ActionSource>(
         Ok(()) => {}
         Err(ActionSearchError::Read(error)) => return Err(error.into()),
     }
+    if attribute == AxReadbackAttribute::Presence {
+        return Ok(AxElementReadback {
+            element_name: element_name.clone(),
+            present: search.match_count > 0,
+            focused: None,
+            enabled: None,
+            value: None,
+            unreadable_subtrees: search.unreadable_subtrees,
+        });
+    }
     if search.unreadable_subtrees > 0 {
-        return Err(AxElementReadError::IncompleteSearch {
+        return Ok(AxElementReadback {
+            element_name: element_name.clone(),
+            present: search.match_count > 0,
+            focused: None,
+            enabled: None,
+            value: None,
             unreadable_subtrees: search.unreadable_subtrees,
         });
     }
@@ -1227,6 +1245,7 @@ fn read_element_from<Source: ActionSource>(
         focused: readback.focused,
         enabled: readback.enabled,
         value: readback.value,
+        unreadable_subtrees: 0,
     })
 }
 
@@ -2107,11 +2126,10 @@ mod platform {
         super::read_tree_from(&mut MacElementSource::new(), pid, options)
     }
 
-    /// Read one attribute from a uniquely named current element.
+    /// Read presence or one attribute from a named current element.
     ///
-    /// The traversal reads only the keys needed to find the target. After
-    /// uniqueness is established it reads only `attribute`; it never builds an
-    /// accessibility tree or reads unrelated element values.
+    /// A match proves presence even if another branch could not be searched;
+    /// attribute values and absence still require a complete unique search.
     pub fn read_accessibility_element(
         pid: u32,
         element_name: &AxElementName,
@@ -2483,6 +2501,49 @@ mod tests {
         assert_eq!(readback.value, None);
         assert_eq!(source.calls, 0, "a scoped read must not build a full tree");
         assert_eq!(source.action_name_calls, 0);
+    }
+
+    #[test]
+    fn a_partial_scoped_read_keeps_observed_presence_and_marks_unreadable_parts() {
+        let partial_source = || {
+            let mut source = FakeSource::with_nodes(vec![
+                action_node(None, &[], vec![1, 2]),
+                action_node(Some("ready"), &[], Vec::new()),
+                action_node(Some("other"), &[], Vec::new()),
+            ]);
+            source.action_search_error_at = Some((
+                2,
+                SourceError::Ax {
+                    operation: "AXUIElementCopyAttributeValue",
+                    code: AX_ERROR_FAILURE,
+                },
+            ));
+            source
+        };
+
+        let mut found_source = partial_source();
+        let found = read_element_from(
+            &mut found_source,
+            42,
+            &element_name("ready"),
+            AxReadbackAttribute::Presence,
+            options(4, 10),
+        )
+        .expect("a readable match establishes presence despite an unreadable sibling");
+        assert!(found.present);
+        assert_eq!(found.unreadable_subtrees, 1);
+
+        let mut absent_source = partial_source();
+        let not_found = read_element_from(
+            &mut absent_source,
+            42,
+            &element_name("missing"),
+            AxReadbackAttribute::Presence,
+            options(4, 10),
+        )
+        .expect("a partial search returns its completeness rather than claiming absence");
+        assert!(!not_found.present);
+        assert_eq!(not_found.unreadable_subtrees, 1);
     }
 
     fn identifier_outcome(

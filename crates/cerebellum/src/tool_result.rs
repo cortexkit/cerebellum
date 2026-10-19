@@ -840,6 +840,102 @@ mod tests {
     }
 
     #[test]
+    fn wait_reply_text_never_contains_json_for_any_outcome() {
+        let cases = [
+            (
+                "predicate_satisfied",
+                json!({
+                    "status":"settled",
+                    "predicate":{"kind":"element_present"},
+                    "readback":{"present":true,"focused":null,"enabled":null,"value":null,"unreadable_subtrees":0}
+                }),
+            ),
+            (
+                "timeout",
+                json!({
+                    "status":"timed_out",
+                    "predicate":{"kind":"element_absent"},
+                    "readback":{"present":true,"focused":null,"enabled":null,"value":null,"unreadable_subtrees":0}
+                }),
+            ),
+            (
+                "indeterminate",
+                json!({
+                    "status":"indeterminate",
+                    "predicate":{"kind":"element_absent"},
+                    "readback":{"present":false,"focused":null,"enabled":null,"value":null,"unreadable_subtrees":101},
+                    "reason":"partial_accessibility_tree"
+                }),
+            ),
+            (
+                "indeterminate",
+                json!({
+                    "status":"indeterminate",
+                    "predicate":null,
+                    "readback":null,
+                    "reason":{"reason":"polling_task_unavailable"}
+                }),
+            ),
+            (
+                "indeterminate",
+                json!({
+                    "status":"indeterminate",
+                    "predicate":{"kind":"element_present"},
+                    "readback":null,
+                    "reason":"{\"reason\":\"read_deadline_exceeded\"}"
+                }),
+            ),
+            (
+                "cancelled",
+                json!({
+                    "status":"cancelled",
+                    "predicate":{"kind":"element_present"},
+                    "readback":{"present":false,"focused":null,"enabled":null,"value":null,"unreadable_subtrees":0}
+                }),
+            ),
+            (
+                "cancelled",
+                json!({
+                    "status":"indeterminate",
+                    "predicate":{"kind":"element_present"},
+                    "readback":null,
+                    "reason":"cancelled_while_awaiting_consent"
+                }),
+            ),
+        ];
+
+        for (outcome, evidence) in cases {
+            let names_predicate = evidence["predicate"].is_object();
+            let evidence = evidence.to_string();
+            let result = decoded(json!({
+                "outcome":outcome,
+                "attempts":1,
+                "settle_path":"poll_with_deadline",
+                "evidence":evidence,
+            }));
+            let text = texts(&result).join("\n");
+            assert!(!text.trim().is_empty(), "{outcome} has plain-text content");
+            assert!(
+                !text.contains("{\""),
+                "{outcome} leaked JSON into the model text: {text}"
+            );
+            if names_predicate {
+                assert!(
+                    text.contains("predicate"),
+                    "{outcome} names the predicate in words: {text}"
+                );
+            } else {
+                assert!(text.contains("wait result"), "{outcome}: {text}");
+            }
+            assert_eq!(
+                result["structuredContent"]["evidence"], evidence,
+                "structured wait evidence remains available to programs"
+            );
+            assert_eq!(model_view_problems(&result), Vec::<String>::new());
+        }
+    }
+
+    #[test]
     fn the_guard_finds_json_wherever_it_sits_and_passes_plain_text() {
         let plain = decoded(
             json!({"outcome":"completed", "state_text":"e1 text field, Value: [value withheld]\ne2 menu  [3 children; closed]"}),

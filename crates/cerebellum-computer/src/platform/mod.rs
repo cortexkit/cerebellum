@@ -965,8 +965,9 @@ impl AccessibilityElementName {
 
 /// The one predicate attribute a scoped accessibility read must retrieve.
 ///
-/// Presence needs only a complete uniqueness search. The other variants read
-/// exactly one attribute from the uniquely named element after that search.
+/// Presence reports whether any named match was observed, along with how many
+/// parts were unreadable: an observed match proves presence, but an incomplete
+/// search cannot prove absence. Attribute reads require a complete unique match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessibilityReadbackAttribute {
@@ -984,7 +985,8 @@ pub struct AccessibilityElementReadRequest {
     pub deadline_ms: u32,
 }
 
-/// The scoped state read from one uniquely named accessibility element.
+/// The scoped state read for a named accessibility element, including any
+/// unreadable parts that prevent callers from claiming absence or uniqueness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessibilityElementReadResult {
     pub element_name: AccessibilityElementName,
@@ -992,6 +994,8 @@ pub struct AccessibilityElementReadResult {
     pub focused: Option<bool>,
     pub enabled: Option<bool>,
     pub value: Option<String>,
+    /// Descendant parts the search could not inspect before reaching its bound.
+    pub unreadable_subtrees: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

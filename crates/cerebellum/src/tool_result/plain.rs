@@ -143,6 +143,114 @@ fn effect_line(status: &str, object: &Map<String, Value>) -> Option<String> {
     })
 }
 
+/// Turn the structured wait record into the sentence the model reads.
+/// Predicate kinds and read failures are codes in structured content, not
+/// text for a model to parse as JSON.
+fn wait_evidence_line(evidence: &str, outcome: Option<&str>) -> Option<String> {
+    let evidence: Value = serde_json::from_str(evidence).ok()?;
+    let status = evidence.get("status")?.as_str()?;
+    let predicate = evidence
+        .get("predicate")
+        .and_then(|predicate| predicate.get("kind"))
+        .and_then(Value::as_str)
+        .map(|kind| match kind {
+            "element_present" => "element presence",
+            "element_absent" => "element absence",
+            "element_focused" => "element focus",
+            "element_value_equals" => "element value equality",
+            "element_enabled_is" => "element enabled state",
+            _ => "requested element",
+        });
+
+    if outcome == Some("cancelled") {
+        return Some(match predicate {
+            Some(predicate) => {
+                format!(
+                    "The wait for the {predicate} predicate was cancelled before it could finish."
+                )
+            }
+            None => "The wait was cancelled before it could finish.".into(),
+        });
+    }
+
+    match (outcome.unwrap_or(status), predicate) {
+        ("predicate_satisfied" | "settled", Some(predicate)) => {
+            Some(format!("The {predicate} predicate was satisfied."))
+        }
+        ("timeout" | "timed_out", Some(predicate)) => Some(format!(
+            "The {predicate} predicate was not satisfied before the wait timed out."
+        )),
+        ("indeterminate", Some(predicate)) => {
+            let unreadable = evidence
+                .get("readback")
+                .and_then(|readback| readback.get("unreadable_subtrees"))
+                .and_then(Value::as_u64);
+            if let Some(unreadable) = unreadable.filter(|count| *count > 0) {
+                let parts = if unreadable == 1 { "part" } else { "parts" };
+                Some(format!(
+                    "The accessibility tree was incomplete ({unreadable} {parts} unreadable), so the {predicate} predicate could not be confirmed."
+                ))
+            } else {
+                let reason = evidence
+                    .get("reason")
+                    .and_then(wait_reason_words)
+                    .unwrap_or_else(|| "the target could not be read completely".into());
+                Some(format!(
+                    "The {predicate} predicate could not be confirmed because {reason}."
+                ))
+            }
+        }
+        ("indeterminate", None) => {
+            let reason = evidence
+                .get("reason")
+                .and_then(wait_reason_words)
+                .unwrap_or_else(|| "wait polling was unavailable".into());
+            Some(format!(
+                "The wait result could not be determined because {reason}."
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn wait_reason_words(reason: &Value) -> Option<String> {
+    let reason = match reason {
+        Value::Object(object) => object.get("reason").and_then(Value::as_str)?.to_owned(),
+        Value::String(reason) => {
+            if let Ok(Value::Object(object)) = serde_json::from_str(reason) {
+                object.get("reason").and_then(Value::as_str)?.to_owned()
+            } else {
+                reason.to_owned()
+            }
+        }
+        _ => return None,
+    };
+    Some(
+        match reason.as_str() {
+            "partial_accessibility_tree" => "some accessibility parts could not be read",
+            "read_deadline_exceeded" => {
+                "the accessibility tree could not be read completely within the time limit"
+            }
+            "target_not_inspectable" => "the target application could not be read",
+            "target_gone" => "the target application is no longer running",
+            "target_replaced" => "the target application restarted during the read",
+            "accessibility_permission_required" => "accessibility permission is required",
+            "predicate_attribute_unavailable" => {
+                "the requested accessibility attribute is unavailable"
+            }
+            "scoped_accessibility_read_unsupported" => {
+                "scoped accessibility reading is unsupported on this platform"
+            }
+            "polling_task_unavailable" => "wait polling could not start",
+            "cancelled_while_awaiting_consent" => {
+                "the wait was cancelled while consent was pending"
+            }
+            _ => "the target could not be read completely",
+        }
+        .to_owned(),
+    )
+}
+
 /// The caption that goes with an image part, and the facts a later
 /// coordinate call must echo: its id and its pixel size.
 fn image_caption(object: &Map<String, Value>) -> Option<String> {
@@ -552,7 +660,10 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
         lines.push(sentence(note));
     }
     if let Some(evidence) = text(object, "evidence") {
-        lines.push(format!("Evidence: {evidence}."));
+        lines.push(
+            wait_evidence_line(evidence, outcome)
+                .unwrap_or_else(|| format!("Evidence: {evidence}.")),
+        );
     }
     if text(object, "installed_list") == Some("partial") {
         lines.push(
