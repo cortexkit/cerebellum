@@ -135,6 +135,24 @@ struct DoubleState {
     stop_after_plan: Option<usize>,
     cancel_on_stop: bool,
     terminal: Option<Arc<crate::TerminalArbiter>>,
+    /// The contract revision the double stamps on its replies and refusals:
+    /// `None` stamps the current [`EXTENSION_REVISION`], `Some(None)` stamps
+    /// nothing (an extension older than the handshake), and `Some(Some(n))`
+    /// stamps `n`.
+    extension_revision: Option<Option<u64>>,
+    /// A field removed from every CDP plan reply, as an extension built
+    /// against an older reply shape would omit it.
+    drop_plan_reply_field: Option<&'static str>,
+}
+
+/// `value` (a reply or refusal object) with the double's revision stamp.
+fn stamp_revision(state: &DoubleState, mut value: Value) -> Value {
+    match state.extension_revision {
+        None => value["extension_revision"] = json!(EXTENSION_REVISION),
+        Some(Some(revision)) => value["extension_revision"] = json!(revision),
+        Some(None) => {}
+    }
+    value
 }
 
 /// Cingulate as the site-card tests need it: every card is answered at once
@@ -365,17 +383,24 @@ impl Fixture {
                         });
                         let body = match result {
                             Ok(_) if input && state.observer_unavailable && state.observer_refusal_after_click => MessageBody::Refused {
-                                reason: json!({"reason":"observer_unavailable","remedy":"read again"}).to_string(),
+                                reason: stamp_revision(&state, json!({"reason":"observer_unavailable","remedy":"read again"})).to_string(),
                                 input_dispatched: true,
                                 detached: true,
                             },
-                            Ok((result, _)) => MessageBody::Completed {
-                                result,
-                                input_dispatched: input,
-                                detached: true,
-                            },
+                            Ok((mut result, _)) => {
+                                if cdp {
+                                    if let Some(field) = state.drop_plan_reply_field {
+                                        result.as_object_mut().unwrap().remove(field);
+                                    }
+                                }
+                                MessageBody::Completed {
+                                    result: stamp_revision(&state, result),
+                                    input_dispatched: input,
+                                    detached: true,
+                                }
+                            }
                             Err(reason) => MessageBody::Refused {
-                                reason: json!({"reason":reason,"remedy":if reason == "state_changed_by_person" { "read again" } else { "use an eligible claimed Agent-group tab" }}).to_string(),
+                                reason: stamp_revision(&state, json!({"reason":reason,"remedy":if reason == "state_changed_by_person" { "read again" } else { "use an eligible claimed Agent-group tab" }})).to_string(),
                                 input_dispatched: false,
                                 detached: true,
                             },
@@ -3639,4 +3664,252 @@ async fn child_type_keeps_the_same_deadline_after_switching_sessions() {
             .iter()
             .all(|command| command["frame_id"] == "foreign"
                 && command["session_id"] == "child-target")));
+}
+
+#[test]
+fn required_extension_revision_matches_the_extension_source() {
+    let source = include_str!("../../../../extension/revision.mjs");
+    let declared = source
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("export const EXTENSION_REVISION = ")?
+                .strip_suffix(';')
+        })
+        .expect("revision.mjs declares EXTENSION_REVISION");
+    assert_eq!(declared.parse::<u64>().unwrap(), EXTENSION_REVISION);
+}
+
+/// The plans the double executed whose `action` is `name`.
+fn sent(fixture: &Fixture, name: &str) -> Vec<Value> {
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|command| command["action"] == name)
+        .cloned()
+        .collect()
+}
+
+fn assert_outdated(reply: &Value, found: Value) {
+    assert_eq!(reply["outcome"], "refused", "{reply}");
+    assert_eq!(reply["reason"], "extension_outdated", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("Ask the person to reload it in chrome://extensions"),
+        "{reply}"
+    );
+    assert_eq!(reply["detail"]["extension_revision"], found, "{reply}");
+    assert_eq!(
+        reply["detail"]["required_revision"], EXTENSION_REVISION,
+        "{reply}"
+    );
+    assert!(crate::browser::validate_user_browser_result("snapshot", reply).is_ok());
+}
+
+#[tokio::test]
+async fn an_old_revision_reply_is_extension_outdated_not_protocol_error() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    // Every field the reply types require is present, so only the revision
+    // check can refuse this read.
+    fixture.state.lock().unwrap().extension_revision = Some(Some(EXTENSION_REVISION - 1));
+    let (reply, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_outdated(&reply, json!(EXTENSION_REVISION - 1));
+    assert!(cards.is_empty(), "no site card before a usable read");
+    assert!(reply.get("state_text").is_none());
+}
+
+#[tokio::test]
+async fn a_missing_revision_is_outdated_for_every_extension_action() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    {
+        // The live failure: an extension copy from before the observer
+        // fields omits them and sends no revision at all.
+        let mut state = fixture.state.lock().unwrap();
+        state.extension_revision = Some(None);
+        state.drop_plan_reply_field = Some("observer_continuity");
+    }
+    let snapshot = json!({"browser":"user","action":"snapshot","tab":tab});
+    let screenshot = json!({"browser":"user","action":"screenshot","tab":tab});
+    let navigate = json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/","intent":"read","severity":{"tier":1,"credential":false,"financial":false}});
+    let open = json!({"browser":"user","action":"open_tab"});
+    // The double refuses this one; an unstamped refusal is outdated too.
+    let claim_outside = json!({"browser":"user","action":"claim_tab","tab":"outside"});
+    for args in [snapshot, screenshot, navigate, open, claim_outside] {
+        let (reply, _) = fixture.call(1, args.clone(), "allow_30m").await;
+        assert_outdated(&reply, Value::Null);
+        assert_ne!(reply["reason"], "protocol_error", "{args}");
+    }
+}
+
+#[tokio::test]
+async fn status_reports_an_outdated_or_newer_extension_before_any_action() {
+    let fixture = Fixture::new();
+    let status = json!({"browser":"user","action":"status"});
+    fixture.state.lock().unwrap().extension_revision = Some(None);
+    let (reply, _) = fixture.call(1, status.clone(), "allow_30m").await;
+    assert_outdated(&reply, Value::Null);
+    fixture.state.lock().unwrap().extension_revision = Some(Some(EXTENSION_REVISION + 1));
+    let (reply, _) = fixture.call(1, status.clone(), "allow_30m").await;
+    assert_eq!(reply["reason"], "extension_newer", "{reply}");
+    assert!(reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("newer than this cerebellum"));
+    assert_eq!(
+        reply["detail"]["extension_revision"],
+        EXTENSION_REVISION + 1
+    );
+    fixture.state.lock().unwrap().extension_revision = None;
+    let (reply, _) = fixture.call(1, status, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["connected"], true);
+}
+
+#[tokio::test]
+async fn an_undecodable_current_reply_names_the_step_and_missing_field() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().drop_plan_reply_field = Some("observer_available");
+    let (reply, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(reply["reason"], "protocol_error", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"step":"cdp_reply","field":"observer_available","problem":"missing_field"})
+    );
+    assert!(crate::browser::validate_user_browser_result("snapshot", &reply).is_ok());
+}
+
+#[test]
+fn decode_errors_never_quote_reply_values() {
+    let Err(error) = serde_json::from_value::<Claimed>(
+        json!({"tab":"t","interaction_epoch":"page secret","connection_epoch":1}),
+    ) else {
+        panic!("a string epoch must not decode");
+    };
+    let reply = protocol_error("tab_reply", Some(&error));
+    assert_eq!(
+        reply["detail"],
+        json!({"step":"tab_reply","problem":"wrong_type"})
+    );
+    assert!(!reply.to_string().contains("page secret"));
+}
+
+#[tokio::test]
+async fn open_tab_with_a_url_asks_for_the_site_then_opens_blank_and_navigates() {
+    let fixture = Fixture::new();
+    let before = fixture.state.lock().unwrap().tabs.len();
+    let (refused, cards) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"open_tab","url":"https://example.com/start"}),
+            "deny",
+        )
+        .await;
+    assert_ne!(refused["outcome"], "ok", "{refused}");
+    assert_eq!(cards.len(), 1, "the site is asked about before opening");
+    assert_eq!(fixture.state.lock().unwrap().tabs.len(), before);
+    assert!(
+        sent(&fixture, "open_tab").is_empty(),
+        "a denied site opens no tab"
+    );
+
+    let (opened, cards) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"open_tab","url":"https://example.com/start"}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(opened["outcome"], "ok", "{opened}");
+    assert_eq!(cards.len(), 1);
+    assert_eq!(
+        cards[0]["scope"]["origins"],
+        json!(["https://example.com"]),
+        "{cards:?}"
+    );
+    let tab = opened["tab"].as_str().unwrap();
+    assert_eq!(opened["settled"], false);
+    let opens = sent(&fixture, "open_tab");
+    assert_eq!(opens.len(), 1);
+    assert!(
+        opens[0].get("url").is_none(),
+        "the tab opens blank: {}",
+        opens[0]
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.tabs[tab].url, "https://example.com/start");
+    assert_eq!(
+        state.tabs[tab].owner,
+        Some(Route {
+            channel: 1,
+            epoch: 1
+        })
+    );
+    assert!(state.commands.iter().any(|plan| plan["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|step| step["method"] == "Page.navigate"
+            && step["params"]["url"] == "https://example.com/start")));
+}
+
+#[tokio::test]
+async fn open_tab_with_a_url_checks_the_landing_site_and_names_the_opened_tab() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().redirect = Some("https://ungranted.example/private".into());
+    let (reply, cards) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"open_tab","url":"https://example.com/go"}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["reason"], "landing_site_not_authorized", "{reply}");
+    assert_eq!(cards.len(), 1);
+    let tab = reply["tab"]
+        .as_str()
+        .expect("the refusal names the opened tab");
+    assert!(fixture.state.lock().unwrap().tabs.contains_key(tab));
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
+}
+
+#[tokio::test]
+async fn snapshot_accepts_wait_none_and_refuses_wait_settle_by_name() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (read, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"wait":"none"}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(read["outcome"], "ok", "{read}");
+    let before = fixture.state.lock().unwrap().commands.len();
+    for action in ["snapshot", "screenshot"] {
+        let (reply, cards) = fixture
+            .call(
+                1,
+                json!({"browser":"user","action":action,"tab":tab,"wait":"settle"}),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(reply["reason"], "unsupported_on_user_browser", "{reply}");
+        assert_eq!(
+            reply["detail"],
+            json!({"field":"wait","reason_code":"unsupported_value"})
+        );
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("wait: settle doesn't apply"));
+        assert!(cards.is_empty());
+    }
+    assert_eq!(fixture.state.lock().unwrap().commands.len(), before);
 }

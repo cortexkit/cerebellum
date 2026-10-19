@@ -64,12 +64,25 @@ Use an unpacked extension for development. Branded Chrome 137 and later ignores
 2. Run `scripts/install-native-host.sh` with the absolute path to the signed host.
    It writes only Chrome's native-host manifest, under
    `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`.
-3. Open **`chrome://extensions`** in your normal Google Chrome.
-4. Turn **Developer mode** on, click **Load unpacked**, and select this
-   repository's `extension/` directory. Do not regenerate its manifest key: the
-   key pins the extension id accepted by the native host.
-5. Start your configured cerebellum instance. The extension connects its native
+3. Install the extension with `scripts/install-extension.sh`. It copies this
+   repository's `extension/` (without its tests) to
+   `~/.local/share/cortexkit/cerebellum-extension`, replacing any earlier copy
+   as a whole. When placing a staged cerebellum build, install the extension
+   staged beside it instead, as `scripts/stage.sh` prints.
+4. Open **`chrome://extensions`** in your normal Google Chrome.
+5. Turn **Developer mode** on, click **Load unpacked**, and select
+   `~/.local/share/cortexkit/cerebellum-extension`. Do not regenerate its
+   manifest key: the key pins the extension id accepted by the native host.
+   After each later install, click the extension's reload button there.
+6. Start your configured cerebellum instance. The extension connects its native
    host automatically; use its toolbar button to hand over a tab when desired.
+
+Cerebellum and the extension share a contract revision (`EXTENSION_REVISION`
+in `extension/revision.mjs`), stamped on every extension reply. If the copy
+Chrome runs is older or newer than the cerebellum build, every `browser:"user"`
+action, `status` included, refuses as `extension_outdated` or
+`extension_newer` with a remedy to reload the extension; install the matching
+copy and reload it.
 
 Only Google Chrome is supported for this feature. The helper does not install
 into Brave, Edge or Arc, modify browser profiles, launch a browser, or install
@@ -201,6 +214,7 @@ limitation is outside this probe's top-level click/type checks.
 ```sh
 cargo run --locked -p cerebellum --example user_browser_probe -- --self-test
 bash -n scripts/install-native-host.sh
+scripts/install-extension.test.sh
 bash scripts/rust-test-gate.sh
 ```
 

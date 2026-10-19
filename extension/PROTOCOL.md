@@ -61,6 +61,22 @@ second hidden queue.
 All plans have `version:2` (the native socket envelope remains protocol 1). Unknown plan/command fields refuse. Optional fields
 are omitted, not null.
 
+### Contract revision
+
+Every `completed` result (including a chunked one) carries
+`extension_revision:<positive integer>` beside the fields below, and every
+`refused` reason JSON carries it beside `reason` and `remedy`. The value is
+`EXTENSION_REVISION` in `revision.mjs`; cerebellum requires exactly its own
+`EXTENSION_REVISION` (in `crates/cerebellum/src/user_browser.rs`) and checks it
+before decoding anything else. A missing or lower revision refuses as
+`extension_outdated` and a higher one as `extension_newer`, both with a remedy
+asking the person to reload the extension in `chrome://extensions`, for every
+action including `status`. Raise both constants together whenever a plan, reply
+or refusal shape in this document changes; a test compares them. The manifest
+`version` is not this revision: Chrome keeps running whichever unpacked copy it
+loaded, and that copy's `version` says nothing about the reply shapes it sends.
+The result tables below omit `extension_revision`.
+
 | action | fields besides version/action | result |
 | --- | --- | --- |
 | `status` | none | `{tabs:[{tab, claimed, handed, interaction_epoch}], connection_epoch}` |

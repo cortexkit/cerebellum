@@ -134,6 +134,19 @@ cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
 # machine where nobody made the copy.
 cp engram-catalog.json "$STAGE/"
 
+# The Chrome extension this build talks to, from the same commit (the tree is
+# clean, refused above otherwise). Chrome keeps running whichever unpacked copy
+# it was pointed at and nothing else updates that copy, so one left behind by an
+# earlier build makes every browser:"user" action refuse as extension_outdated.
+# It is staged here, not installed: installing it before this binary is placed
+# would put a newer extension in front of the cerebellum still running.
+# scripts/install-extension.sh installs it after placement, as the last lines
+# this script prints say.
+mkdir -p "$STAGE/extension"
+cp -R extension/. "$STAGE/extension/"
+rm -rf "$STAGE/extension/tests"
+EXTENSION_REVISION="$(sed -n 's/^export const EXTENSION_REVISION = \([0-9][0-9]*\);$/\1/p' "$STAGE/extension/revision.mjs")"
+
 # --options runtime turns on hardened runtime, so no other same-user process
 # can attach a debugger to the module. No entitlements file, on purpose: the
 # module needs none under hardened runtime (every live computer-control check
@@ -260,6 +273,7 @@ echo "    sha256:      $(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")  (sidecar
 echo "    lc_uuid:     $(dwarfdump --uuid "$STAGE/$DEPLOYED_NAME" | awk '{print $2}')"
 echo "    requirement: $requirement"
 echo "    reads:       $(cat "$STAGE/format-versions.json")  ($CARD.format-versions.json beside the card)"
+echo "    extension:   $STAGE/extension  (contract revision ${EXTENSION_REVISION:-unknown})"
 echo
 echo "Placement is a PLAIN COPY -- never re-sign at placement, because a"
 echo "re-sign replaces the pin and invalidates the sha above. After the copy,"
@@ -269,3 +283,8 @@ echo "and no get-task-allow, or a same-user debugger can read it. Gatekeeper"
 echo "assesses each file on its own first exec, so warm the PLACED copy on the"
 echo "deploy path: a multi-second first exec inside a supervisor health window"
 echo "reads as a failed start."
+echo
+echo "Then install the Chrome extension staged with this build, so the copy Chrome"
+echo "runs speaks the same contract, and ask the person to reload it in"
+echo "chrome://extensions:"
+echo "    scripts/install-extension.sh $STAGE/extension"
