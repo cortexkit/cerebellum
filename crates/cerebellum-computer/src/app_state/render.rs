@@ -1200,6 +1200,67 @@ fn collect_matches<'v, 'a>(
     true
 }
 
+fn collect_single_filter_match<'a>(
+    view: &View<'a>,
+    request: &StateRequest<'_>,
+    count: &mut usize,
+    candidate: &mut Option<&'a ObservedNode>,
+) {
+    if role_matches(&view.node.description, request.roles)
+        && text_matches(&view.node.description, request.text)
+    {
+        *count += 1;
+        if *count == 1 {
+            *candidate = Some(view.node);
+        } else {
+            return;
+        }
+    }
+    for child in &view.children {
+        if *count > 1 {
+            return;
+        }
+        collect_single_filter_match(child, request, count, candidate);
+    }
+}
+
+/// The one element a filter names, when exactly one rendered element matches.
+///
+/// A filtered read also prints labelled ancestors to place its matches; those
+/// ancestors must not make one matching control look like several targets.
+pub fn single_filter_match<'a>(
+    roots: &'a [ObservedNode],
+    request: &StateRequest<'_>,
+) -> Option<&'a ObservedNode> {
+    if !request.narrows() {
+        return None;
+    }
+    let target = match request.zoom {
+        None => None,
+        Some(Zoom::MenuBar) => roots.iter().find(|root| is_menu_bar(root)),
+        Some(Zoom::Element(id)) => find_node(roots, id),
+    };
+    let mut scope: Vec<View<'_>> = match (request.zoom, target) {
+        (Some(_), Some(target)) => build(target, "", true, true, false),
+        (Some(_), None) => Vec::new(),
+        (None, _) => roots
+            .iter()
+            .flat_map(|root| build(root, "", true, false, false))
+            .collect(),
+    };
+    scope.sort_by_key(|view| region_priority(view.node));
+
+    let mut count = 0;
+    let mut candidate = None;
+    for view in &scope {
+        collect_single_filter_match(view, request, &mut count, &mut candidate);
+        if count > 1 {
+            return None;
+        }
+    }
+    (count == 1).then_some(candidate).flatten()
+}
+
 fn count_unnumbered(node: &ObservedNode) -> usize {
     if node.hazard {
         return 0;

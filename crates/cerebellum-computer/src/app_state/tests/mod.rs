@@ -5,8 +5,8 @@ use super::image::{
     ImageUnavailable, RetainFailure, WindowImageCapture,
 };
 use super::render::{
-    is_session_ending_title, one_line, render_state, ObservedNode, StateHeader, StateRequest,
-    TruncationReason, Zoom, MAX_LABEL_CHARS, MAX_STATE_TEXT_BYTES,
+    is_session_ending_title, one_line, render_state, single_filter_match, ObservedNode,
+    StateHeader, StateRequest, TruncationReason, Zoom, MAX_LABEL_CHARS, MAX_STATE_TEXT_BYTES,
 };
 use super::session::{AppStateSessions, ElementResolution, StateDiff, MAX_SESSION_ELEMENTS};
 use super::source::{ElementValue, FixtureElementToken, RawAppState, RawElement};
@@ -478,6 +478,42 @@ fn session_ending_titles_match_after_normalisation() {
 // ---------------------------------------------------------------------------
 // Filters and caps
 // ---------------------------------------------------------------------------
+
+/// A filter's labelled ancestors provide context but are not extra matches;
+/// exactly one rendered element is the only case a read can target precisely.
+#[test]
+fn a_filter_matching_exactly_one_rendered_element_identifies_that_element() {
+    let sessions = AppStateSessions::new();
+    let observed = read(&sessions, &state(vec![window()]));
+    let request = StateRequest {
+        text: Some("Send"),
+        ..Default::default()
+    };
+    let matched = single_filter_match(&observed.roots, &request).expect("one matching button");
+    assert_eq!(
+        matched.element_id.as_deref(),
+        Some(id_of(&observed, "Send").as_str())
+    );
+}
+
+/// Several rendered matches are ambiguous, so they cannot replace the focused
+/// element as the cursor's target.
+#[test]
+fn a_filter_matching_several_rendered_elements_has_no_single_target() {
+    let root = RawElement::fixture(1, "AXWindow")
+        .titled("Finder")
+        .with_children(vec![
+            RawElement::fixture(2, "AXButton").titled("Date Added"),
+            RawElement::fixture(3, "AXButton").titled("Date Added descending"),
+        ]);
+    let sessions = AppStateSessions::new();
+    let observed = read(&sessions, &state(vec![root]));
+    let request = StateRequest {
+        text: Some("Date Added"),
+        ..Default::default()
+    };
+    assert!(single_filter_match(&observed.roots, &request).is_none());
+}
 
 /// A filter prints each match under the labelled ancestors that place it;
 /// unlabelled wrappers between them carry nothing and are left out.

@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use cerebellum_computer::app_state::image::{
     release_through_custody, ImageFronting, ImageUnavailable, ReleasedImage,
 };
-use cerebellum_computer::app_state::render::{render_state, StateHeader, StateRequest, Zoom};
+use cerebellum_computer::app_state::render::{
+    render_state, single_filter_match, StateHeader, StateRequest, Zoom,
+};
 // The browser plane's reply field, shared so that both planes' state reaches a
 // host under one key.
 use crate::browser::state_text::STATE_TEXT_FIELD;
@@ -26,8 +28,8 @@ use cerebellum_computer::app_state::person::{self, OwnInputLedger, SeenMarks};
 use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
 use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{
-    AppStateReadError, AppStateSource, ElementActionError, ElementReadError, RawAppState,
-    ReadBounds,
+    AppStateReadError, AppStateSource, ElementActionError, ElementHandle, ElementReadError,
+    RawAppState, ReadBounds,
 };
 use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{
@@ -1192,23 +1194,60 @@ where
                 None => raw.unreadable_subtrees = raw.unreadable_subtrees.max(1),
             }
         }
-        // Scheduled after the read so the picture can aim at the element that
-        // has focus; with no focused element it stays where it already is.
-        self.cursor.schedule(
-            cursor::Identity::current(identity.agent_project_id.clone()),
-            cerebellum_computer::cursor::CursorKind::Reading,
-            grant.clone(),
-            self.app_state_source.clone(),
-            raw.focused.clone(),
-            None,
-        );
-
+        // The picture is scheduled after the read. A zoom or one unambiguous
+        // filter match names the element being read; otherwise focus remains
+        // the best available target. Geometry and window-follow work stays off
+        // the read's reply path.
         let unpopulated = raw.mark_unpopulated_content();
         let observed = if let Some((element_id, _)) = &zoom_element {
             sessions.observe_zoomed_subtree(&conversation_key, &grant, element_id, &raw)
         } else {
             sessions.observe(&conversation_key, &grant, &raw)
         };
+        let focused = raw.focused.clone();
+        let zoomed = zoom_element.as_ref().map(|(_, element)| element.clone());
+        let filtered = if zoomed.is_none()
+            && (!parsed.role_filter.is_empty() || parsed.text_filter.is_some())
+        {
+            single_filter_match(
+                &observed.roots,
+                &StateRequest {
+                    zoom,
+                    roles: &parsed.role_filter,
+                    text: parsed.text_filter.as_deref(),
+                },
+            )
+            .and_then(|node| node.element_id.as_deref())
+            .and_then(|element_id| {
+                match sessions.resolve(&conversation_key, element_id) {
+                    ElementResolution::Live {
+                        handle,
+                        bundle_identity,
+                        pid,
+                        process_generation,
+                    } if bundle_identity == grant.bundle_identity
+                        && pid == grant.pid
+                        && process_generation == grant.process_generation_evidence =>
+                    {
+                        Some(handle)
+                    }
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+        self.cursor.schedule_with_fallback(
+            cursor::Identity::current(identity.agent_project_id.clone()),
+            cerebellum_computer::cursor::CursorKind::Reading,
+            grant.clone(),
+            self.app_state_source.clone(),
+            cursor::ReadAim {
+                preferred: read_cursor_target(zoomed, filtered, focused.clone()),
+                focused,
+            },
+            None,
+        );
         let app_name = management.application_name(&grant);
         let mut rendered = render_state(
             &StateHeader {
@@ -2310,6 +2349,49 @@ const READ_STATE_REQUEST_FIELDS: [&str; 6] = [
 ];
 #[cfg(test)]
 const READ_STATE_REQUIRED_FIELDS: [&str; 1] = ["target"];
+
+fn read_cursor_target(
+    zoomed: Option<ElementHandle>,
+    filtered: Option<ElementHandle>,
+    focused: Option<ElementHandle>,
+) -> Option<ElementHandle> {
+    zoomed.or(filtered).or(focused)
+}
+
+#[cfg(test)]
+mod read_cursor_target_tests {
+    use super::*;
+    use cerebellum_computer::app_state::source::RawElement;
+
+    fn element(token: u64) -> ElementHandle {
+        RawElement::fixture(token, "AXButton").handle
+    }
+
+    #[test]
+    fn zoom_read_aims_at_zoomed_element_instead_of_focused_element() {
+        let zoomed = element(1);
+        let focused = element(2);
+        let aimed = read_cursor_target(Some(zoomed.clone()), None, Some(focused)).unwrap();
+        assert!(aimed.same_element(zoomed.as_ref()));
+    }
+
+    #[test]
+    fn a_single_filter_match_aims_at_the_matched_element() {
+        let matched = element(3);
+        let focused = element(4);
+        let aimed = read_cursor_target(None, Some(matched.clone()), Some(focused)).unwrap();
+        assert!(aimed.same_element(matched.as_ref()));
+    }
+
+    #[test]
+    fn several_filter_matches_keep_the_focused_element() {
+        // The rendered-view matcher returns no single candidate for several
+        // matches; focus remains the stable target rather than guessing.
+        let focused = element(5);
+        let aimed = read_cursor_target(None, None, Some(focused.clone())).unwrap();
+        assert!(aimed.same_element(focused.as_ref()));
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedReadState {
