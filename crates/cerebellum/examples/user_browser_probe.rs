@@ -531,6 +531,7 @@ async fn exercise_checks(driver: &mut impl Driver, origin: &str) -> Result<(), S
     let button = reference(&snapshot, "Probe button")?;
     let (clicked, _) = driver.call(json!({"action":"click","tab":tab,"ref":button,"snapshot_id":snapshot["snapshot_id"],"intent":"click fixture button","severity":input_severity})).await?;
     println!("click reply: {clicked}");
+    println!("focus before click readback: {}", driver.observe()?);
     let observation = driver.click_observation().await.map_err(|error| {
         println!("click diagnostics unavailable: {error}");
         error
@@ -998,6 +999,7 @@ mod live {
     struct Focus {
         stop: Arc<AtomicBool>,
         changed: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<Value>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Focus {
@@ -1008,10 +1010,24 @@ mod live {
             let changed = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
             let result = changed.clone();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = events.clone();
             let thread = std::thread::spawn(move || {
+                let mut previous = Some(initial);
                 while !flag.load(Ordering::SeqCst) {
-                    if cerebellum_macos::frontmost_process_id() != Some(initial) {
+                    let current = cerebellum_macos::frontmost_process_id();
+                    if current != Some(initial) {
                         result.store(true, Ordering::SeqCst);
+                    }
+                    if current != previous {
+                        let event =
+                            json!({"at":wall_millis(),"previous_pid":previous,"pid":current});
+                        eprintln!("foreground transition: {event}");
+                        let mut rows = recorded.lock().unwrap();
+                        if rows.len() < 64 {
+                            rows.push(event);
+                        }
+                        previous = current;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1019,6 +1035,7 @@ mod live {
             Ok(Self {
                 stop,
                 changed,
+                events,
                 thread: Some(thread),
             })
         }
@@ -1182,6 +1199,12 @@ mod live {
             params: Value,
             session: Option<&str>,
         ) -> Result<Value, String> {
+            if matches!(method, "Target.attachToTarget" | "Target.detachFromTarget") {
+                println!(
+                    "probe CDP timing: {}",
+                    json!({"at":wall_millis(),"stage":"start","method":method,"params":params})
+                );
+            }
             self.seq += 1;
             let mut request = json!({"id":self.seq,"method":method,"params":params});
             if let Some(s) = session {
@@ -1197,6 +1220,12 @@ mod live {
                 if reply["id"] == self.seq {
                     if reply.get("error").is_some() {
                         return Err(format!("CDP {method}: {}", reply["error"]));
+                    }
+                    if matches!(method, "Target.attachToTarget" | "Target.detachFromTarget") {
+                        println!(
+                            "probe CDP timing: {}",
+                            json!({"at":wall_millis(),"stage":"done","method":method})
+                        );
                     }
                     return Ok(reply["result"].clone());
                 }
@@ -1336,9 +1365,17 @@ mod live {
             session,
             r#"(() => {
           globalThis.__probeFocus = 0;
+          globalThis.__probeFocusEvents = [];
+          globalThis.__probePhase = 'startup';
           globalThis.__probeMembership = [];
-          chrome.tabs.onActivated.addListener(() => { globalThis.__probeFocus++; });
-          chrome.windows.onFocusChanged.addListener(() => { globalThis.__probeFocus++; });
+          const focus = (event, details) => {
+            globalThis.__probeFocus++;
+            const row = {at:Date.now(), event, phase:globalThis.__probePhase, ...details};
+            if (globalThis.__probeFocusEvents.length < 64) globalThis.__probeFocusEvents.push(row);
+            console.info('Agent probe focus: ' + JSON.stringify(row));
+          };
+          chrome.tabs.onActivated.addListener(info => focus('tab_activated', {tabId:info.tabId,windowId:info.windowId}));
+          chrome.windows.onFocusChanged.addListener(windowId => focus('window_focus', {windowId}));
           const note = (event, details) => {
             const rows = globalThis.__probeMembership;
             if (rows.length >= 32) rows.shift();
@@ -1361,6 +1398,13 @@ mod live {
         Ok(())
     }
 
+    fn wall_millis() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
     // Print the extension's own console before shutdown on success as well as
     // failure, so the group-adoption decision can be matched to Chrome's events.
     fn print_worker_events(cdp: &mut Cdp, session: &str) {
@@ -1371,9 +1415,15 @@ mod live {
         if lines.is_empty() {
             println!("worker: no console, exception or log events");
         }
-        // Keep the tail: the events nearest the failure matter most.
-        for line in &lines[lines.len().saturating_sub(50)..] {
-            println!("worker {line}");
+        // Keep all timestamped probe metadata, including initial blank-page
+        // failures; a tail alone can make an old error look post-click.
+        for (index, line) in lines.iter().enumerate() {
+            if index >= lines.len().saturating_sub(50)
+                || line.contains("Agent probe read:")
+                || line.contains("Agent probe focus:")
+            {
+                println!("worker {line}");
+            }
         }
     }
 
@@ -1473,6 +1523,10 @@ mod live {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
+        println!(
+            "Chrome process: {}",
+            json!({"at":wall_millis(),"pid":chrome.id()})
+        );
         // Declared after the listener so it is dropped first (Rust drops
         // locals in reverse order). On an early return the host's exit record
         // is printed before the listener drops and tears down the bridge;
@@ -1638,6 +1692,18 @@ mod live {
     #[async_trait::async_trait(?Send)]
     impl Driver for Live {
         async fn call(&mut self, mut args: Value) -> Result<(Value, usize), String> {
+            let action = args["action"].as_str().unwrap_or("unknown").to_owned();
+            self.cdp.eval(
+                &self.worker_session,
+                &format!(
+                    "globalThis.__probePhase = {}",
+                    json!(format!("tool:{action}"))
+                ),
+            )?;
+            println!(
+                "tool timing: {}",
+                json!({"at":wall_millis(),"stage":"start","action":action})
+            );
             let deferred = std::mem::take(&mut self.defer_answer);
             let decline = std::mem::take(&mut self.decline_answer);
             let calls_before = self.consent.calls().len();
@@ -1722,15 +1788,20 @@ mod live {
                         reply: body.clone(),
                         asks,
                     };
+                    println!(
+                        "tool timing: {}",
+                        json!({"at":wall_millis(),"stage":"done","action":action})
+                    );
                     return Ok((body, asks));
                 }
             }
         }
         fn observe(&mut self) -> Result<Value, String> {
-            let mut observation = self.cdp.eval(&self.worker_session, &format!(r#"Promise.all([chrome.tabs.query({{}}), chrome.debugger.getTargets()]).then(([tabs, targets]) => {{
+            let mut observation = self.cdp.eval(&self.worker_session, &format!(r#"Promise.all([chrome.tabs.query({{}}), chrome.debugger.getTargets(), chrome.windows.getAll()]).then(([tabs, targets, windows]) => {{
               const agent = tabs.filter(t => t.groupId !== -1);
               return {{agent_tabs:agent.length, outside_group:tabs.find(t => t.id === {})?.groupId,
-                agent_attached:targets.some(t => t.attached && agent.some(a => a.id === t.tabId)), focus_events:globalThis.__probeFocus}};
+                agent_attached:targets.some(t => t.attached && agent.some(a => a.id === t.tabId)), focus_events:globalThis.__probeFocus, chrome_focus_events:globalThis.__probeFocusEvents,
+                active_tabs:tabs.filter(t => t.active).map(t => ({{tabId:t.id,windowId:t.windowId,groupId:t.groupId}})), windows:windows.map(w => ({{windowId:w.id,focused:w.focused}}))}};
             }})"#, self.outside_id))?;
             let reports = self.page.reports.lock().unwrap();
             observation["clicks"] = json!(reports.0);
@@ -1739,9 +1810,17 @@ mod live {
             if self.focus.changed.load(Ordering::SeqCst) {
                 observation["focus_events"] = json!(1);
             }
+            observation["foreground_events"] = json!(self.focus.events.lock().unwrap().clone());
+            if observation["focus_events"] != 0 {
+                println!("focus attribution: {observation}");
+            }
             Ok(observation)
         }
         async fn fixture_readiness(&mut self) -> Result<Value, String> {
+            self.cdp.eval(
+                &self.worker_session,
+                "globalThis.__probePhase = 'probe:fixture_readiness'",
+            )?;
             let targets = self.cdp.call("Target.getTargets", json!({}), None)?;
             let target = fixture_page_target(&targets, &self.origin)?;
             let session = self.cdp.attach(&target)?;
@@ -1757,6 +1836,10 @@ mod live {
             result
         }
         async fn click_observation(&mut self) -> Result<Value, String> {
+            self.cdp.eval(
+                &self.worker_session,
+                "globalThis.__probePhase = 'probe:click_readback'",
+            )?;
             // The page counter records handler execution independently of the
             // beacon, which can arrive after the tool has acknowledged input.
             let deadline = Instant::now() + Duration::from_secs(2);
