@@ -34,6 +34,13 @@ name = "cursor_hide"
 path = "tests/cursor_hide.rs"
 harness = false
 
+# No standard harness, for the same reason: it drives the agent cursor's own
+# loop on the main thread and measures the frames it draws.
+[[test]]
+name = "cursor_motion"
+path = "tests/cursor_motion.rs"
+harness = false
+
 # Cargo defaults an example target to test = false, which builds the example's
 # #[cfg(test)] module but never runs it. This probe's pure decision rules carry
 # host-neutral tests, so the target must opt in to running them.

@@ -54,31 +54,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         point,
         target,
         scale,
-        tip_offset: [0.0, 0.0],
-        alpha: 1.0,
+        entry_ms: None,
+        reduce_motion: false,
     };
-    // Stills along a first appearance. The tip offset and opacity mirror
-    // `cerebellum_computer::cursor`: the glide starts 34, 30 points down and
-    // right of the target with an ease-out (1 - (1 - f)^3) of the remaining
-    // way, and the opacity eases up over the first 60% of the arrival.
-    let arrival = |fraction: f64| {
-        let remaining = (1.0 - fraction).powi(3);
-        let fade = (fraction / 0.6).min(1.0);
-        (
-            [34.0 * remaining, 30.0 * remaining],
-            1.0 - (1.0 - fade).powi(2),
-        )
-    };
+    // Stills along a first appearance (520 ms): the avatar alone and large on
+    // the target, then shrinking onto its place as the pointer comes in, and
+    // the Reduce Motion version, a plain fade of the resting badge.
     let pressing = Some("Pressing 07 Prompt surface");
     let mut scenes = Vec::new();
-    for (name, fraction) in [("arrival-15pct", 0.15), ("arrival-40pct", 0.4)] {
-        let (tip_offset, alpha) = arrival(fraction);
+    for (name, ms, reduce_motion) in [
+        ("entry-060ms", 60.0, false),
+        ("entry-200ms", 200.0, false),
+        ("entry-330ms", 330.0, false),
+        ("entry-450ms", 450.0, false),
+        ("entry-reduced-150ms", 150.0, true),
+    ] {
         scenes.push((
             name,
             GalleryShot {
-                tip_offset,
-                alpha,
-                ..shot(OverlayGesture::Read, None, [180.0, 60.0], None, 1.0)
+                entry_ms: Some(ms),
+                reduce_motion,
+                ..shot(OverlayGesture::Press, pressing, [180.0, 75.0], None, 1.0)
             },
         ));
     }

@@ -261,6 +261,10 @@ pub enum HitScope {
     SystemWide,
 }
 
+/// A running watch on one window for a cosmetic picture. It has no methods:
+/// dropping it stops the watch and releases everything it holds.
+pub trait CursorWindowWatch: Send {}
+
 /// Reads an application's state and acts on its elements. One implementation
 /// per platform, and a fixture for tests.
 ///
@@ -287,6 +291,29 @@ pub trait AppStateSource: Send + Sync {
         _point: Option<[f64; 2]>,
         _frame: Option<[f64; 4]>,
     ) -> Option<[f64; 2]> {
+        None
+    }
+
+    /// The window a cosmetic picture's element sits in, or with no element
+    /// the application's focused window. Best-effort: it prepares nothing in
+    /// the application and reads no values.
+    fn cursor_window(
+        &self,
+        _target: &ProcessGrant,
+        _element: Option<&ElementHandle>,
+    ) -> Option<ElementHandle> {
+        None
+    }
+
+    /// Report each move or resize of `window`, and its closing or its
+    /// application quitting, to `changed`, from a thread of the platform's
+    /// choosing, until the returned watch is dropped. Event-driven: nothing
+    /// runs between changes. `None` when the platform cannot watch windows.
+    fn watch_cursor_window(
+        &self,
+        _window: &ElementHandle,
+        _changed: Box<dyn Fn(crate::cursor::WindowChange) + Send + Sync>,
+    ) -> Option<Box<dyn CursorWindowWatch>> {
         None
     }
 

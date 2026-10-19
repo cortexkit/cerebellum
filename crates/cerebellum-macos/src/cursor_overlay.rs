@@ -10,14 +10,17 @@
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cursor_geometry::{
-    appkit_rect_to_global, display_at, layout, panel_origin_for_tip, snap_tip, target_rect,
-    view_point, Display, Layout, Rect, CHIP_CENTER, CHIP_DIAMETER, CHIP_RIM, CHIP_RING,
+    appkit_rect_to_global, chip_at, display_at, layout, panel_origin_for_tip, snap_tip,
+    target_rect, view_point, Display, Layout, Rect, CHIP_DIAMETER, CHIP_RIM, CHIP_RING,
     LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER, POINTER_CORNER,
 };
-use crate::cursor_schedule::{CursorSchedule, PictureStep, Wait};
+use crate::cursor_schedule::{
+    entry_frame, ActivityChange, ActivityGate, Appearance, CursorSchedule, EntryFrame,
+    FollowOffset, FrameClock, PictureStep, Wait,
+};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -30,12 +33,18 @@ use objc2_app_kit::{
     NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSDictionary, NSPoint, NSRect, NSSize, NSString,
+    NSActivityOptions, NSDate, NSDefaultRunLoopMode, NSDictionary, NSObjectProtocol, NSPoint,
+    NSProcessInfo, NSRect, NSSize, NSString,
 };
 
-/// The avatar raster's side in pixels: the 32-point chip at a Retina
-/// display's two pixels per point. The module renders avatars at this size.
+/// The avatar raster's side in pixels. The avatar is drawn 31 points across
+/// inside the chip's ring, 62 pixels on a Retina display, so a raster of 64
+/// is only ever scaled down. The module renders avatars at this size.
 pub const AVATAR_PIXELS: usize = 64;
+
+/// The initial letter's font size in a resting chip; it grows with the chip
+/// during an entry.
+const INITIAL_FONT_SIZE: f64 = 17.0;
 
 /// One 60 Hz frame, in ms: how far ahead a picture looks to decide whether its
 /// landing motion still needs another frame.
@@ -68,11 +77,23 @@ pub struct OverlayEvent {
     pub avatar_update: bool,
 }
 
-/// One message from the module: a picture to show or move, or one agent's
-/// picture to take off the screen now because that agent is done.
+/// One message from the module: a picture to show or move, one agent's
+/// picture to take off the screen now because that agent is done, or the
+/// window under one agent's picture having moved.
 pub enum OverlayMessage {
     Show(OverlayEvent),
-    Hide { agent: String },
+    Hide {
+        agent: String,
+    },
+    /// The element the picture of event `serial` points at has moved by
+    /// `offset` points in total since that event, because its window was
+    /// moved or resized. A report for an older event is ignored: the badge
+    /// has moved on to another target since.
+    Follow {
+        agent: String,
+        serial: u64,
+        offset: [f64; 2],
+    },
 }
 
 /// Motion curves, supplied by the platform-neutral crate where they are
@@ -87,13 +108,6 @@ pub struct CursorMotion {
     pub settle_scale: fn(f64, bool, bool) -> f64,
     /// Opacity factor for a glide fraction (the Reduce Motion fade-move).
     pub fade_alpha: fn(f64, bool) -> f64,
-    /// How long a first appearance takes, in ms.
-    pub arrival_ms: f64,
-    /// Where a first appearance's glide starts, from the destination and
-    /// the Reduce Motion setting.
-    pub arrival_start: fn([f64; 2], bool) -> [f64; 2],
-    /// Opacity during a first appearance, for a fraction of `arrival_ms`.
-    pub arrival_alpha: fn(f64, bool) -> f64,
 }
 
 define_class!(
@@ -115,6 +129,9 @@ struct Scene {
     tip: [f64; 2],
     /// The landing animation's scale, applied about the tip.
     scale: f64,
+    /// Where a first appearance is: the chip's size and place, and how far
+    /// the pointer and label have come in.
+    entry: EntryFrame,
     label: Option<NSRect>,
     accent: [f64; 3],
     /// Only the offscreen gallery draws a backdrop; the live panel is clear.
@@ -129,6 +146,7 @@ impl Default for Scene {
         Self {
             tip: [0.0, 0.0],
             scale: 1.0,
+            entry: EntryFrame::REST,
             label: None,
             accent: [0.427, 0.290, 1.0],
             backdrop: None,
@@ -164,11 +182,12 @@ define_class!(
             }
             with_group_alpha(scene.alpha, || {
                 if let Some(label) = scene.label {
-                    draw_pill(label, scene.accent);
+                    with_group_alpha(scene.entry.pointer, || draw_pill(label, scene.accent));
                 }
                 draw_badge(
                     scene.tip,
                     scene.scale,
+                    scene.entry,
                     scene.accent,
                     self.ivars().image.borrow().as_deref(),
                 );
@@ -199,12 +218,16 @@ fn with_shadow(blur: f64, alpha: f64, body: impl FnOnce()) {
 }
 
 /// Draw `body` as one group at `alpha`, the way a window fade composites the
-/// whole picture, so overlapping parts do not show through each other. Only
-/// the gallery's arrival stills use it; at 1 it draws directly.
+/// whole picture, so overlapping parts do not show through each other. Used
+/// for the gallery's entry stills and, live, for the pointer and label while
+/// an entry fades them in; at 1 it draws directly.
 fn with_group_alpha(alpha: f64, body: impl FnOnce()) {
     use objc2_core_graphics::CGContext;
     if alpha >= 1.0 {
         return body();
+    }
+    if alpha <= 0.0 {
+        return;
     }
     let Some(context) = NSGraphicsContext::currentContext() else {
         return body();
@@ -267,16 +290,26 @@ fn pointer_path(at: impl Fn([f64; 2]) -> NSPoint, scale: f64) -> Retained<NSBezi
 
 /// The pointer and the chip. Geometry is top-down relative to the tip; the
 /// view is bottom-up, so y flips here, and the landing scale is applied about
-/// the tip so the tip itself never moves.
-fn draw_badge(tip: [f64; 2], scale: f64, accent: [f64; 3], avatar: Option<&NSImage>) {
+/// the tip so the tip itself never moves. During an entry the chip is larger
+/// and nearer the tip, and the pointer grows and fades in on top of it.
+fn draw_badge(
+    tip: [f64; 2],
+    scale: f64,
+    entry: EntryFrame,
+    accent: [f64; 3],
+    avatar: Option<&NSImage>,
+) {
     let at = |p: [f64; 2]| NSPoint::new(tip[0] + p[0] * scale, tip[1] - p[1] * scale);
 
-    let centre = at(CHIP_CENTER);
-    let diameter = CHIP_DIAMETER * scale;
+    let (chip_centre, chip_diameter) = chip_at(entry.chip);
+    // The rim and ring keep their proportion to the chip as it grows.
+    let chip_scale = scale * chip_diameter / CHIP_DIAMETER;
+    let centre = at(chip_centre);
+    let diameter = CHIP_DIAMETER * chip_scale;
     let chip = oval(centre, diameter);
     // The white rim, just outside the chip's edge, carries the shadow: it
     // lifts the chip off a light background and outlines it on a dark one.
-    let rim = oval(centre, diameter + 2.0 * CHIP_RIM * scale);
+    let rim = oval(centre, diameter + 2.0 * CHIP_RIM * chip_scale);
     with_shadow(5.0, 0.4, || {
         NSColor::whiteColor().setFill();
         rim.fill();
@@ -289,7 +322,7 @@ fn draw_badge(tip: [f64; 2], scale: f64, accent: [f64; 3], avatar: Option<&NSIma
             chip.addClip();
             // Inset by the ring, so the ring frames the avatar rather than
             // covering its edge.
-            let inset = oval(centre, diameter - 2.0 * CHIP_RING * scale).bounds();
+            let inset = oval(centre, diameter - 2.0 * CHIP_RING * chip_scale).bounds();
             image.drawInRect_fromRect_operation_fraction(
                 inset,
                 NSRect::ZERO,
@@ -304,24 +337,31 @@ fn draw_badge(tip: [f64; 2], scale: f64, accent: [f64; 3], avatar: Option<&NSIma
             chip.fill();
         }
     }
-    let ring = oval(centre, diameter - CHIP_RING * scale);
-    ring.setLineWidth(CHIP_RING * scale);
+    let ring = oval(centre, diameter - CHIP_RING * chip_scale);
+    ring.setLineWidth(CHIP_RING * chip_scale);
     accent_color(accent, 1.0).setStroke();
     ring.stroke();
 
-    let pointer = pointer_path(at, scale);
-    pointer.setLineJoinStyle(NSLineJoinStyle::Round);
-    pointer.setLineWidth(OUTLINE * 2.0 * scale);
-    // The white outline (half of the stroke, outside the fill) and the shadow
-    // are drawn together, then the coloured body on top without a shadow.
-    with_shadow(4.0, 0.45, || {
-        NSColor::whiteColor().setFill();
-        NSColor::whiteColor().setStroke();
+    // The pointer grows about the tip as it comes in, so the tip stays put.
+    let pointer_scale = scale * entry.pointer_scale();
+    let at =
+        |p: [f64; 2]| NSPoint::new(tip[0] + p[0] * pointer_scale, tip[1] - p[1] * pointer_scale);
+    with_group_alpha(entry.pointer, || {
+        let pointer = pointer_path(at, pointer_scale);
+        pointer.setLineJoinStyle(NSLineJoinStyle::Round);
+        pointer.setLineWidth(OUTLINE * 2.0 * pointer_scale);
+        // The white outline (half of the stroke, outside the fill) and the
+        // shadow are drawn together, then the coloured body on top without a
+        // shadow.
+        with_shadow(4.0, 0.45, || {
+            NSColor::whiteColor().setFill();
+            NSColor::whiteColor().setStroke();
+            pointer.fill();
+            pointer.stroke();
+        });
+        accent_color(accent, 1.0).setFill();
         pointer.fill();
-        pointer.stroke();
     });
-    accent_color(accent, 1.0).setFill();
-    pointer.fill();
 }
 
 fn draw_pill(label: NSRect, accent: [f64; 3]) {
@@ -389,6 +429,9 @@ struct Fields {
     badge: Retained<Badge>,
     initial: Retained<NSTextField>,
     label: Retained<NSTextField>,
+    /// The initial's current font size; it changes only while an entry
+    /// grows or shrinks the chip.
+    initial_font: Cell<f64>,
 }
 
 impl Fields {
@@ -397,13 +440,14 @@ impl Fields {
             let this = Badge::alloc(mtm).set_ivars(BadgeIvars::default());
             msg_send![super(this), initWithFrame: frame]
         };
-        let initial = text_field(mtm, &badge, 15.0, true);
+        let initial = text_field(mtm, &badge, INITIAL_FONT_SIZE, true);
         initial.setAlignment(NSTextAlignment::Center);
         let label = text_field(mtm, &badge, 12.0, false);
         Self {
             badge,
             initial,
             label,
+            initial_font: Cell::new(INITIAL_FONT_SIZE),
         }
     }
 
@@ -447,8 +491,8 @@ impl Fields {
                 let data = rep.bitmapData();
                 if data.is_null() { return None; }
                 std::ptr::copy_nonoverlapping(pixels.as_ptr(), data, pixels.len());
-                // The raster is two pixels per point at the chip's size, so a
-                // Retina display draws it pixel for pixel, with no upscaling.
+                // The image is the resting chip's size; AppKit scales the
+                // 64-pixel raster into the avatar's circle when it draws.
                 let size = NSSize::new(CHIP_DIAMETER, CHIP_DIAMETER);
                 rep.setSize(size);
                 let image = NSImage::initWithSize(NSImage::alloc(), size);
@@ -462,19 +506,34 @@ impl Fields {
     }
 
     /// Place the drawing and the text fields for a tip and label given in the
-    /// view's bottom-up coordinates.
-    fn apply(&self, tip: [f64; 2], label: Option<NSRect>, scale: f64) {
+    /// view's bottom-up coordinates, at a landing scale and an entry frame.
+    fn apply(&self, tip: [f64; 2], label: Option<NSRect>, scale: f64, entry: EntryFrame) {
         let mut scene = self.ivars_scene();
         scene.tip = tip;
         scene.label = label;
         scene.scale = scale;
+        scene.entry = entry;
         self.badge.ivars().scene.set(scene);
+        let (centre, diameter) = chip_at(entry.chip);
+        let chip_scale = scale * diameter / CHIP_DIAMETER;
+        // The initial grows and shrinks with the chip, and only an entry
+        // changes the chip's size, so the font is rarely set.
+        let font = (INITIAL_FONT_SIZE * chip_scale * 2.0).round() / 2.0;
+        if font != self.initial_font.get() {
+            // SAFETY: the weight constant is an immutable AppKit static.
+            let weight = unsafe { NSFontWeightSemibold };
+            self.initial
+                .setFont(Some(&NSFont::systemFontOfSize_weight(font, weight)));
+            self.initial.sizeToFit();
+            self.initial_font.set(font);
+        }
         let initial = self.initial.frame().size;
-        // The initial follows the chip's centre as the chip scales.
+        let width = CHIP_DIAMETER * chip_scale;
+        // The initial follows the chip's centre as the chip moves and scales.
         self.initial.setFrame(rect(
-            tip[0] + CHIP_CENTER[0] * scale - CHIP_DIAMETER / 2.0,
-            tip[1] - CHIP_CENTER[1] * scale - initial.height / 2.0,
-            CHIP_DIAMETER,
+            tip[0] + centre[0] * scale - width / 2.0,
+            tip[1] - centre[1] * scale - initial.height / 2.0,
+            width,
             initial.height,
         ));
         if let Some(pill) = label {
@@ -486,6 +545,8 @@ impl Fields {
                 height,
             ));
         }
+        // The label text comes in with its pill and the pointer.
+        self.label.setAlphaValue(entry.pointer);
         self.label.setHidden(label.is_none());
         self.badge.setNeedsDisplay(true);
     }
@@ -540,15 +601,17 @@ struct Picture {
     duration_ms: f64,
     reduce: bool,
     press: bool,
+    /// Whether the landing settle or tap plays after the glide. Not on a
+    /// first appearance: the entry is that picture's landing.
+    settles: bool,
     serial: u64,
-    /// Whether this picture has been placed on screen at least once.
-    shown: bool,
-    /// While the first appearance is still fading up: how far into it the
-    /// picture was when its latest event arrived, in ms. Kept across events,
-    /// so a second action during the arrival does not snap the opacity.
-    arrival_base_ms: Option<f64>,
-    /// The last frame's ms since the latest event.
-    last_elapsed_ms: f64,
+    /// Whether it has appeared yet, and its entry while it is appearing.
+    appearance: Appearance,
+    /// Time into the latest event's glide and settle.
+    glide: FrameClock,
+    /// How far the window under the target has moved the picture since the
+    /// latest event.
+    follow: FollowOffset,
     layout: Layout,
     displays: Vec<Display>,
     primary_height: f64,
@@ -556,6 +619,7 @@ struct Picture {
     /// its ticks cost no window-server or drawing work.
     last_origin: Option<[f64; 2]>,
     last_scale: f64,
+    last_entry: EntryFrame,
     last_alpha: f64,
 }
 
@@ -603,10 +667,11 @@ impl Picture {
             duration_ms: 0.0,
             reduce: false,
             press: false,
+            settles: false,
             serial: 0,
-            shown: false,
-            arrival_base_ms: None,
-            last_elapsed_ms: 0.0,
+            appearance: Appearance::default(),
+            glide: FrameClock::start(Instant::now()),
+            follow: FollowOffset::default(),
             layout: Layout {
                 panel: Rect::new(0.0, 0.0, 48.0, 48.0),
                 label: None,
@@ -615,11 +680,18 @@ impl Picture {
             primary_height: 0.0,
             last_origin: None,
             last_scale: 1.0,
+            last_entry: EntryFrame::REST,
             last_alpha: 1.0,
         }
     }
 
-    fn update(&mut self, mtm: MainThreadMarker, event: OverlayEvent, motion: CursorMotion) {
+    fn update(
+        &mut self,
+        mtm: MainThreadMarker,
+        event: OverlayEvent,
+        motion: CursorMotion,
+        now: Instant,
+    ) {
         self.serial = event.serial;
         self.fields.set_accent(event.accent);
         self.fields.set_avatar(event.avatar_rgba.as_deref());
@@ -627,29 +699,33 @@ impl Picture {
         self.reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         self.press = event.gesture == OverlayGesture::Press;
         (self.displays, self.primary_height) = read_displays(mtm);
+        let first = self.appearance.on_event(now, self.reduce);
         // A read with nothing to aim at leaves a shown cursor where it is.
-        let to = if event.resting && self.shown {
+        let to = if event.resting && !first {
             self.current
         } else {
             event.to
         };
         self.to = to;
-        if self.shown {
+        if first {
+            // A first appearance does not glide in from anywhere: the badge
+            // starts on the target, and the entry animation (not a settle)
+            // is what marks its arrival there.
+            self.from = to;
+            self.current = to;
+            self.duration_ms = 0.0;
+            self.settles = false;
+        } else {
             self.from = self.current;
             self.duration_ms = (motion.duration_ms)(
                 (self.to[0] - self.from[0]).hypot(self.to[1] - self.from[1]),
                 self.reduce,
             );
-            // An arrival still fading up carries on from where it was.
-            self.arrival_base_ms = self.arrival_base_ms.map(|base| base + self.last_elapsed_ms);
-        } else {
-            // A first appearance glides in from a little way off while it
-            // fades up, so the badge reads as the agent arriving here.
-            self.from = (motion.arrival_start)(to, self.reduce);
-            self.duration_ms = motion.arrival_ms;
-            self.arrival_base_ms = Some(0.0);
+            self.settles = true;
         }
-        self.last_elapsed_ms = 0.0;
+        self.glide = FrameClock::start(now);
+        // A window move reported from here on counts from this event.
+        self.follow = FollowOffset::default();
 
         let display = display_at(to, &self.displays);
         let tip = snap_tip(to, display.map_or(1.0, |d| d.scale));
@@ -658,29 +734,54 @@ impl Picture {
             .label
             .filter(|text| event.gesture != OverlayGesture::Read && !text.is_empty());
         let label_size = label.as_deref().map(|text| self.fields.measure_label(text));
-        self.layout = layout(tip, target_rect(tip, event.target), label_size, screen);
+        self.layout = layout(
+            tip,
+            target_rect(tip, event.target),
+            label_size,
+            screen,
+            self.appearance.entering(),
+        );
         self.panel.setContentSize(NSSize::new(
             self.layout.panel.width,
             self.layout.panel.height,
         ));
         self.last_origin = None;
         self.last_scale = 1.0;
+        // An action during an entry keeps the entry where it is.
+        let entry = self.appearance.frame(now);
+        self.last_entry = entry;
         self.fields.apply(
             view_point(self.layout.panel, [0.0, 0.0]),
             self.layout
                 .label
                 .map(|label| view_rect(self.layout.panel, label)),
             1.0,
+            entry,
         );
         self.place(self.from);
-        if !self.shown {
-            // Ordered in fully transparent; the first frame starts the fade.
-            let alpha = (motion.arrival_alpha)(0.0, self.reduce);
-            self.last_alpha = alpha;
-            self.panel.setAlphaValue(alpha);
+        if first {
+            // Ordered in fully transparent; the first frames fade it up.
+            self.last_alpha = entry.alpha;
+            self.panel.setAlphaValue(entry.alpha);
         }
-        self.shown = true;
         self.panel.orderFrontRegardless();
+    }
+
+    /// The window under this picture's target moved: move with it, at once
+    /// and without a glide, so the badge stays on its element. A glide in
+    /// progress carries on, shifted by the same amount.
+    fn follow(&mut self, serial: u64, offset: [f64; 2]) {
+        if serial != self.serial {
+            return;
+        }
+        let Some(by) = self.follow.step(offset) else {
+            return;
+        };
+        for point in [&mut self.from, &mut self.to, &mut self.current] {
+            point[0] += by[0];
+            point[1] += by[1];
+        }
+        self.place(self.current);
     }
 
     /// Move the panel so the tip sits on `point`, snapped to the device-pixel
@@ -699,10 +800,11 @@ impl Picture {
         }
     }
 
-    /// Draw one frame and answer whether the picture is still arriving,
-    /// gliding or settling. A picture at rest needs no further frames.
-    fn tick(&mut self, elapsed: f64, alpha: f64, motion: CursorMotion) -> bool {
-        self.last_elapsed_ms = elapsed;
+    /// Draw the frame for `now` and answer whether the picture is still
+    /// entering, gliding or settling. A picture at rest needs no further
+    /// frames. `alpha` is the schedule's idle-fade opacity.
+    fn tick(&mut self, now: Instant, alpha: f64, motion: CursorMotion) -> bool {
+        let elapsed = self.glide.advance(now);
         let fraction = if self.duration_ms <= 0.0 {
             1.0
         } else {
@@ -710,36 +812,35 @@ impl Picture {
         };
         self.current = (motion.position)(self.from, self.to, fraction, self.reduce);
         self.place(self.current);
-        let scale = (motion.settle_scale)(elapsed - self.duration_ms, self.press, self.reduce);
-        if scale != self.last_scale {
-            let scene = self.fields.ivars_scene();
-            self.fields.apply(scene.tip, scene.label, scale);
-            self.last_scale = scale;
-        }
-        let mut alpha = alpha * (motion.fade_alpha)(fraction, self.reduce);
-        if let Some(base) = self.arrival_base_ms {
-            let arrival = if motion.arrival_ms <= 0.0 {
-                1.0
+        let since_arrival = elapsed - self.duration_ms;
+        let (settles, press, reduce) = (self.settles, self.press, self.reduce);
+        let settle = |at: f64| {
+            if settles {
+                (motion.settle_scale)(at, press, reduce)
             } else {
-                (base + elapsed) / motion.arrival_ms
-            };
-            alpha *= (motion.arrival_alpha)(arrival, self.reduce);
-            if arrival >= 1.0 {
-                self.arrival_base_ms = None;
+                1.0
             }
+        };
+        let scale = settle(since_arrival);
+        let entry = self.appearance.frame(now);
+        if scale != self.last_scale || entry != self.last_entry {
+            let scene = self.fields.ivars_scene();
+            self.fields.apply(scene.tip, scene.label, scale, entry);
+            self.last_scale = scale;
+            self.last_entry = entry;
         }
+        let alpha = alpha * (motion.fade_alpha)(fraction, self.reduce) * entry.alpha;
         if alpha != self.last_alpha {
             self.panel.setAlphaValue(alpha);
             self.last_alpha = alpha;
         }
-        // Still moving while arriving, while the glide runs, while the landing
+        // Still moving while entering, while the glide runs, while the landing
         // scale is off 1, or while it will be off 1 one frame from now: the
-        // settle starts at exactly 1, so the arrival frame alone cannot tell.
-        let since_arrival = elapsed - self.duration_ms;
-        self.arrival_base_ms.is_some()
+        // settle starts at exactly 1, so the landing frame alone cannot tell.
+        self.appearance.entering()
             || fraction < 1.0
             || scale != 1.0
-            || (motion.settle_scale)(since_arrival + ONE_FRAME_MS, self.press, self.reduce) != 1.0
+            || settle(since_arrival + ONE_FRAME_MS) != 1.0
     }
 
     /// Take the picture off the screen for good, now. Hidden means the window
@@ -791,7 +892,7 @@ pub struct HideProbe {
 /// Show one picture through the helper's own `update`, then hide it through
 /// the same `remove` the helper uses on an end or a finished fade, and read
 /// the window server's on-screen list on both sides. Must run on the main
-/// thread. The picture is shown fully transparent (its arrival's first
+/// thread. The picture is shown fully transparent (its entry's first
 /// frame) and never animated, so nothing appears on the desk.
 #[doc(hidden)]
 pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
@@ -821,6 +922,7 @@ pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
             avatar_update: false,
         },
         motion,
+        Instant::now(),
     );
     // The helper's loop sends window changes between frames; do the same
     // once so the window server has really received the shown window.
@@ -867,6 +969,63 @@ fn window_listed_on_screen(number: isize) -> bool {
 /// Run only in the hidden helper mode, before any asynchronous runtime exists.
 /// EOF closes the channel and ends the main-thread run loop without saving state.
 pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) {
+    run_cursor_loop(events, motion, None);
+}
+
+/// While it animates, the helper tells macOS that it is doing latency-critical
+/// work the person asked for, and stops saying so the moment it rests.
+///
+/// The helper is a background process: never frontmost, with no Dock icon,
+/// and between turns it has no window on screen at all. macOS treats such a
+/// process as one it may nap (App Nap) and whose timers it may coalesce, so
+/// its 60 Hz frame wake-ups can arrive late, by hundreds of milliseconds for a
+/// napped process (the `cursor_motion` test measures it). A glide is only a
+/// third of a second long, so a late first wake drew the badge at its start
+/// and then straight at its end. An activity begun with
+/// these options is the documented way to opt out while it is held: "user
+/// initiated" keeps the process out of App Nap, and "latency critical" asks
+/// for precise timers. It does not keep the Mac awake, and it is ended as soon
+/// as no picture needs frames, so a resting badge holds nothing.
+struct AnimationActivity {
+    gate: ActivityGate,
+    token: Option<Retained<objc2::runtime::ProtocolObject<dyn NSObjectProtocol>>>,
+    /// Off only in the motion probe's comparison run, to show the throttling
+    /// the activity prevents.
+    enabled: bool,
+}
+
+impl AnimationActivity {
+    fn before_wait(&mut self, wait: Wait) {
+        match self.gate.before_wait(wait) {
+            Some(ActivityChange::Begin) if self.enabled => {
+                let info = NSProcessInfo::processInfo();
+                self.token = Some(info.beginActivityWithOptions_reason(
+                    NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+                        | NSActivityOptions::LatencyCritical,
+                    &NSString::from_str("Animating the agent cursor"),
+                ));
+            }
+            Some(ActivityChange::End) => {
+                if let Some(token) = self.token.take() {
+                    // SAFETY: the token is the object `beginActivity` returned,
+                    // ended exactly once.
+                    unsafe { NSProcessInfo::processInfo().endActivity(&token) };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn held(&self) -> bool {
+        self.token.is_some()
+    }
+}
+
+fn run_cursor_loop(
+    events: Receiver<OverlayMessage>,
+    motion: CursorMotion,
+    mut probe: Option<&mut LoopRecord>,
+) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -875,6 +1034,11 @@ pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) 
     app.disableRelaunchOnLogin();
     app.finishLaunching();
     let mut pictures = CursorSchedule::<Picture>::new();
+    let mut activity = AnimationActivity {
+        gate: ActivityGate::default(),
+        token: None,
+        enabled: probe.as_ref().is_none_or(|probe| probe.hold_activity),
+    };
     let mut pending = None;
     loop {
         let wait = objc2::rc::autoreleasepool(|_| {
@@ -884,6 +1048,17 @@ pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) 
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
                     Ok(OverlayMessage::Hide { agent }) => {
                         pictures.end(&agent, |picture, _| picture.remove());
+                    }
+                    Ok(OverlayMessage::Follow {
+                        agent,
+                        serial,
+                        offset,
+                    }) => {
+                        // Never creates or revives a picture, and never
+                        // restarts its idle clock: the agent did nothing.
+                        if let Some(picture) = pictures.picture_for_update(&agent) {
+                            picture.follow(serial, offset);
+                        }
                     }
                     Ok(OverlayMessage::Show(event)) => {
                         if !event.to.iter().all(|v| v.is_finite()) {
@@ -897,25 +1072,38 @@ pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) 
                             }
                             continue;
                         }
+                        let now = Instant::now();
                         if let Some(picture) =
-                            pictures.picture_for_event(event.agent.clone(), Instant::now(), || {
-                                Picture::new(mtm)
-                            })
+                            pictures
+                                .picture_for_event(event.agent.clone(), now, || Picture::new(mtm))
                         {
-                            picture.update(mtm, event, motion);
+                            picture.update(mtm, event, motion, now);
                         }
                     }
                     Err(TryRecvError::Disconnected) => return None,
                     Err(TryRecvError::Empty) => break,
                 }
             }
-            let wait = pictures.advance(Instant::now(), |picture, step| match step {
-                PictureStep::Draw { elapsed_ms, alpha } => picture.tick(elapsed_ms, alpha, motion),
+            let now = Instant::now();
+            let wait = pictures.advance(now, |picture, step| match step {
+                PictureStep::Draw { alpha, .. } => picture.tick(now, alpha, motion),
                 PictureStep::Hide => {
                     picture.remove();
                     false
                 }
             });
+            activity.before_wait(wait);
+            if let Some(probe) = probe.as_deref_mut() {
+                let tip = pictures
+                    .picture_for_update(PROBE_AGENT)
+                    .map(|picture| picture.current);
+                probe.passes.push(ProbePass {
+                    at_ms: now.duration_since(probe.start).as_secs_f64() * 1000.0,
+                    frame_wait: matches!(wait, Wait::Frame(_)),
+                    activity_held: activity.held(),
+                    tip,
+                });
+            }
             if let Wait::Frame(interval) = wait {
                 let date = NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64());
                 // Only live pictures need AppKit's timed pump; it never posts input.
@@ -974,6 +1162,145 @@ pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) 
             Some(Wait::Frame(_)) => {}
         }
     }
+    // The helper is exiting; leave no activity behind it.
+    activity.before_wait(Wait::Event);
+}
+
+/// The agent the motion probe drives.
+const PROBE_AGENT: &str = "motion-probe";
+
+/// What the helper's loop did on one pass, for the motion probe.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProbePass {
+    /// When the pass drew, in ms since the probe started.
+    pub at_ms: f64,
+    /// The loop then waited one frame for the next pass, rather than for an
+    /// event or the idle-fade deadline.
+    pub frame_wait: bool,
+    /// The animation activity was held during that wait.
+    pub activity_held: bool,
+    /// Where the probe picture's tip was drawn, if it was live.
+    pub tip: Option<[f64; 2]>,
+}
+
+/// Every pass of the helper's loop during one motion probe.
+struct LoopRecord {
+    start: Instant,
+    hold_activity: bool,
+    passes: Vec<ProbePass>,
+}
+
+/// What the motion probe did, and what the helper's loop recorded meanwhile.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MotionProbe {
+    pub passes: Vec<ProbePass>,
+    /// When the first event (the entry) was sent, ms since the start.
+    pub entry_sent_ms: f64,
+    /// When the second event (a glide from `from` to `to`) was sent.
+    pub glide_sent_ms: f64,
+    pub from: [f64; 2],
+    pub to: [f64; 2],
+    /// When a window-follow report of `follow_offset` was sent.
+    pub follow_sent_ms: f64,
+    pub follow_offset: [f64; 2],
+    /// When the picture was hidden.
+    pub hide_sent_ms: f64,
+}
+
+/// Drive the helper's own loop, exactly as the helper runs it, through one
+/// appearance: `idle` with nothing on screen (long enough for macOS to treat
+/// the process as idle in the background, as the real helper is between
+/// turns), an entry, a 400-point glide, a window-follow report and a hide.
+/// Every pass of the loop is recorded, so the caller can read the real frame
+/// intervals and where the badge was drawn. Must run on the main thread. A
+/// badge is visible on the main display for about three seconds; it never
+/// takes focus and ignores the mouse, like the real one.
+///
+/// `hold_activity: false` runs without the animation activity, to show what
+/// macOS does to the frames without it.
+#[doc(hidden)]
+pub fn probe_cursor_motion(
+    motion: CursorMotion,
+    idle: Duration,
+    hold_activity: bool,
+) -> Result<MotionProbe, String> {
+    let mtm = MainThreadMarker::new().ok_or("the motion probe must run on the main thread")?;
+    let (displays, _) = read_displays(mtm);
+    let screen = displays.first().ok_or("no display is readable")?.visible;
+    let centre = [
+        screen.x + screen.width / 2.0,
+        screen.y + screen.height / 2.0,
+    ];
+    let from = [centre[0] - 200.0, centre[1] - 50.0];
+    let to = [centre[0] + 120.0, centre[1] + 190.0];
+    let follow_offset = [40.0, 30.0];
+    let event = |serial: u64, at: [f64; 2]| {
+        OverlayMessage::Show(OverlayEvent {
+            agent: PROBE_AGENT.into(),
+            initial: 'P',
+            accent: [0.427, 0.290, 1.0],
+            to: at,
+            target: None,
+            resting: false,
+            label: None,
+            gesture: OverlayGesture::Read,
+            serial,
+            avatar_rgba: None,
+            avatar_update: false,
+        })
+    };
+    let start = Instant::now();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    let script = std::thread::spawn(move || {
+        let since = |at: Instant| at.duration_since(start).as_secs_f64() * 1000.0;
+        std::thread::sleep(idle);
+        let entry_sent_ms = since(Instant::now());
+        sender.send(event(1, from)).ok()?;
+        std::thread::sleep(Duration::from_millis(1200));
+        let glide_sent_ms = since(Instant::now());
+        sender.send(event(2, to)).ok()?;
+        std::thread::sleep(Duration::from_millis(1200));
+        let follow_sent_ms = since(Instant::now());
+        sender
+            .send(OverlayMessage::Follow {
+                agent: PROBE_AGENT.into(),
+                serial: 2,
+                offset: follow_offset,
+            })
+            .ok()?;
+        std::thread::sleep(Duration::from_millis(500));
+        let hide_sent_ms = since(Instant::now());
+        sender
+            .send(OverlayMessage::Hide {
+                agent: PROBE_AGENT.into(),
+            })
+            .ok()?;
+        Some([entry_sent_ms, glide_sent_ms, follow_sent_ms, hide_sent_ms])
+    });
+    let mut record = LoopRecord {
+        start,
+        hold_activity,
+        passes: Vec::new(),
+    };
+    // Returns once the script drops its sender.
+    run_cursor_loop(receiver, motion, Some(&mut record));
+    let [entry_sent_ms, glide_sent_ms, follow_sent_ms, hide_sent_ms] = script
+        .join()
+        .ok()
+        .flatten()
+        .ok_or("the helper's loop stopped before the probe's script finished")?;
+    Ok(MotionProbe {
+        passes: record.passes,
+        entry_sent_ms,
+        glide_sent_ms,
+        from,
+        to,
+        follow_sent_ms,
+        follow_offset,
+        hide_sent_ms,
+    })
 }
 
 /// One still of the picture for the offscreen gallery: a stand-in app surface
@@ -993,11 +1320,10 @@ pub struct GalleryShot<'a> {
     pub target: Option<[f64; 4]>,
     /// The landing animation's scale (1 at rest, 0.9 mid-tap, 1.04 mid-settle).
     pub scale: f64,
-    /// Where the tip is relative to `point`: zero at rest, and part of the
-    /// way along the arrival glide for an arrival still.
-    pub tip_offset: [f64; 2],
-    /// The picture's opacity (below 1 only part way into an arrival).
-    pub alpha: f64,
+    /// For a still of a first appearance: how far into its entry, in ms.
+    pub entry_ms: Option<f64>,
+    /// Reduce Motion is on, which turns an entry into a plain fade.
+    pub reduce_motion: bool,
 }
 
 /// Render `shot` at 2x into a PNG at `path`, entirely offscreen: no window is
@@ -1020,19 +1346,17 @@ pub fn render_cursor_gallery_png(
     fields.set_initial(shot.initial);
     fields.set_avatar(shot.avatar_rgba);
     let point = snap_tip(shot.point, SCALE);
-    let tip = snap_tip(
-        [
-            shot.point[0] + shot.tip_offset[0],
-            shot.point[1] + shot.tip_offset[1],
-        ],
-        SCALE,
-    );
+    let tip = point;
+    let entry = shot
+        .entry_ms
+        .and_then(|ms| entry_frame(ms, shot.reduce_motion))
+        .unwrap_or(EntryFrame::REST);
     let label = shot
         .label
         .filter(|text| shot.gesture != OverlayGesture::Read && !text.is_empty())
         .map(|text| fields.measure_label(text));
     let screen = Rect::new(0.0, 0.0, width, height);
-    let placed = layout(tip, target_rect(tip, shot.target), label, screen);
+    let placed = layout(tip, target_rect(tip, shot.target), label, screen, false);
     // The scene itself is the "panel": a rectangle relative to the tip that
     // covers the whole scene.
     let scene = Rect::new(-tip[0], -tip[1], width, height);
@@ -1044,18 +1368,20 @@ pub fn render_cursor_gallery_png(
             point: NSPoint::new(point[0], height - point[1]),
         }),
         accent: shot.accent,
-        alpha: shot.alpha,
+        alpha: entry.alpha,
         ..Scene::default()
     });
-    // The text fields are drawn after the badge view's own drawing, outside
-    // its group opacity, so they take the same opacity themselves.
-    fields.initial.setAlphaValue(shot.alpha);
-    fields.label.setAlphaValue(shot.alpha);
     fields.apply(
         view_point(scene, [0.0, 0.0]),
         placed.label.map(|label| view_rect(scene, label)),
         shot.scale,
+        entry,
     );
+    // The text fields are drawn after the badge view's own drawing, outside
+    // its group opacity, so they take the same opacity themselves: the live
+    // panel fades the whole window instead.
+    fields.initial.setAlphaValue(entry.alpha);
+    fields.label.setAlphaValue(entry.alpha * entry.pointer);
     let pixels = [(width * SCALE) as usize, (height * SCALE) as usize];
     // SAFETY: AppKit allocates and owns the bitmap; it is only read back
     // through AppKit's own PNG encoder.

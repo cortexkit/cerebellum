@@ -80,6 +80,15 @@ fn agent_cursor() {
                     }
                     continue;
                 }
+                // Dropped on a full queue, as a picture is. That loses nothing
+                // lasting: each report carries the element's total offset since
+                // the badge's latest event, not a step, so the next report
+                // puts the badge in the right place anyway.
+                CursorLine::Follow(follow) => cerebellum_macos::OverlayMessage::Follow {
+                    agent: follow.agent,
+                    serial: follow.serial,
+                    offset: follow.offset,
+                },
                 CursorLine::Picture(event) => {
                     cerebellum_macos::OverlayMessage::Show(cerebellum_macos::OverlayEvent {
                         // Derived here from the agent's id rather than sent,
@@ -114,9 +123,6 @@ fn agent_cursor() {
             position: cerebellum_computer::cursor::position,
             settle_scale: cerebellum_computer::cursor::settle_scale,
             fade_alpha: cerebellum_computer::cursor::fade_alpha,
-            arrival_ms: cerebellum_computer::cursor::ARRIVAL_MS,
-            arrival_start: cerebellum_computer::cursor::arrival_start,
-            arrival_alpha: cerebellum_computer::cursor::arrival_alpha,
         },
     );
 }

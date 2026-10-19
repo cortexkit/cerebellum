@@ -78,8 +78,9 @@ mod cursor_schedule;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
-    probe_cursor_hide, render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot,
-    HideProbe, OverlayEvent, OverlayGesture, OverlayMessage, AVATAR_PIXELS,
+    probe_cursor_hide, probe_cursor_motion, render_cursor_gallery_png, run_agent_cursor,
+    CursorMotion, GalleryShot, HideProbe, MotionProbe, OverlayEvent, OverlayGesture,
+    OverlayMessage, ProbePass, AVATAR_PIXELS,
 };
 #[cfg(target_os = "macos")]
 mod peer_attestation;
@@ -91,6 +92,10 @@ pub mod test_support;
 // host; the calls into the private framework are macOS-only.
 #[cfg(any(target_os = "macos", test))]
 mod skylight;
+#[cfg(target_os = "macos")]
+mod window_follow;
+#[cfg(target_os = "macos")]
+pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
 #[cfg(target_os = "macos")]
 mod window_image;
 #[cfg(any(target_os = "macos", test))]
@@ -123,10 +128,10 @@ pub use accessibility::{
 pub use ax_actions::enable_manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_actions::{
-    cursor_element_frame, cursor_element_label, element_at_position, element_facts,
-    element_selected_range, element_text_value, focused_element, focused_window, press_element,
-    request_frontmost, write_element_text, AxElementActionError, AxElementFacts, AxHitScope,
-    AxTextAttribute,
+    cursor_element_frame, cursor_element_label, cursor_element_window, cursor_focused_window,
+    element_at_position, element_facts, element_selected_range, element_text_value,
+    focused_element, focused_window, press_element, request_frontmost, write_element_text,
+    AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use manual_accessibility::prepare_manual_accessibility;

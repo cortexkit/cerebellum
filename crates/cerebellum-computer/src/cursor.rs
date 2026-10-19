@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The avatar raster's side in pixels. The chip is 32 points across and a
-/// Retina display draws each point as two pixels, so 64 pixels keep the avatar
-/// sharp; a smaller raster is upscaled and blurs into an unrecognisable blob.
+/// The avatar raster's side in pixels. The avatar is drawn 31 points across
+/// inside its chip and a Retina display draws each point as two pixels, so 64
+/// pixels keep the avatar sharp; a smaller raster is upscaled and blurs into
+/// an unrecognisable blob.
 pub const AVATAR_SIZE: u32 = 64;
 /// The longest pipe line. The largest is an avatar update: 64 x 64 x 4 bytes,
 /// each written in JSON as at most three digits and a comma (64 KiB), plus
@@ -121,44 +122,122 @@ impl CursorHide {
     }
 }
 
-/// One line of the helper's stdin pipe: a picture to show or move, or one
-/// agent's picture to hide. Untagged, so a picture line keeps exactly the shape
-/// it had before hiding existed. Both shapes refuse unknown fields, and they
-/// share no required field set, so a line decodes as at most one of them.
+/// One line of the helper's stdin pipe: a picture to show or move, one
+/// agent's picture to hide, or the window under one agent's picture having
+/// moved. Untagged, so a picture line keeps exactly the shape it had before
+/// the other two existed. Every shape refuses unknown fields, and no two share
+/// a required field set, so a line decodes as at most one of them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CursorLine {
     Picture(CursorEvent),
     Hide(CursorHide),
+    Follow(CursorFollow),
+}
+
+/// The farthest a followed element may be reported to have moved, in points:
+/// well past any arrangement of displays, so only a malformed report is
+/// refused.
+const MAX_FOLLOW_OFFSET: f64 = 100_000.0;
+
+/// The element under one agent's badge moved because its window was moved or
+/// resized, so the badge moves with it. It names the agent, the picture event
+/// it belongs to, and a distance; nothing about the element or its window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CursorFollow {
+    pub agent: String,
+    /// The picture event the badge was last drawn for. The helper ignores a
+    /// report for any other event: the badge has moved on since.
+    pub serial: u64,
+    /// How far the element has moved in total since that event, in points.
+    /// A total rather than a step, so a report lost on a full pipe is made
+    /// good by the next one.
+    pub offset: [f64; 2],
+}
+
+impl CursorFollow {
+    pub fn valid(&self) -> bool {
+        self.offset
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= MAX_FOLLOW_OFFSET)
+    }
+}
+
+/// What happened to the window an agent's badge rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowChange {
+    Moved,
+    Resized,
+    /// The window closed or its application quit: there is nothing left to
+    /// follow, and the badge stays where it last was.
+    Gone,
+}
+
+fn frame_valid(frame: [f64; 4]) -> bool {
+    frame.iter().all(|v| v.is_finite()) && frame[2] > 0.0 && frame[3] > 0.0
+}
+
+/// How far a badge's element has moved since its event, from the frames read
+/// then (`base_*`) and now, or `None` when there is nothing trustworthy to go
+/// on, which leaves the badge where it is rather than sending it anywhere
+/// odd.
+///
+/// A moved window carries its whole content with it, so the element has
+/// moved exactly as far as the window's origin. A resize can lay the content
+/// out again, so the element's own frame is the better answer when it can
+/// still be read; when it cannot (it scrolled away or was removed), the badge
+/// keeps its offset from the window's top-left corner.
+pub fn follow_offset(
+    change: WindowChange,
+    base_window: [f64; 4],
+    window: [f64; 4],
+    base_element: Option<[f64; 4]>,
+    element: Option<[f64; 4]>,
+) -> Option<[f64; 2]> {
+    let delta = |from: [f64; 4], to: [f64; 4]| [to[0] - from[0], to[1] - from[1]];
+    if change == WindowChange::Gone || !frame_valid(base_window) || !frame_valid(window) {
+        return None;
+    }
+    let offset = match (change, base_element, element) {
+        (WindowChange::Resized, Some(base), Some(now)) if frame_valid(base) && frame_valid(now) => {
+            delta(base, now)
+        }
+        _ => delta(base_window, window),
+    };
+    offset
+        .iter()
+        .all(|v| v.abs() <= MAX_FOLLOW_OFFSET)
+        .then_some(offset)
 }
 
 impl CursorLine {
     pub fn encode_line(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Picture(event) => event.encode_line(),
-            Self::Hide(hide) => {
-                if !self.valid() {
-                    return None;
-                }
-                let mut line = serde_json::to_vec(hide).ok()?;
-                line.push(b'\n');
-                (line.len() <= MAX_CURSOR_LINE).then_some(line)
-            }
+        if !self.valid() {
+            return None;
         }
+        let mut line = match self {
+            Self::Picture(event) => return event.encode_line(),
+            Self::Hide(hide) => serde_json::to_vec(hide).ok()?,
+            Self::Follow(follow) => serde_json::to_vec(follow).ok()?,
+        };
+        line.push(b'\n');
+        (line.len() <= MAX_CURSOR_LINE).then_some(line)
     }
 
     pub fn valid(&self) -> bool {
         match self {
             Self::Picture(event) => event.valid(),
             Self::Hide(hide) => hide.hide,
+            Self::Follow(follow) => follow.valid(),
         }
     }
 
-    /// The picture this line carries, if it is not a hide.
+    /// The picture this line carries, if it is not a hide or a follow.
     pub fn picture(self) -> Option<CursorEvent> {
         match self {
             Self::Picture(event) => Some(event),
-            Self::Hide(_) => None,
+            Self::Hide(_) | Self::Follow(_) => None,
         }
     }
 }
@@ -240,51 +319,6 @@ pub fn fade_alpha(fraction: f64, reduce_motion: bool) -> f64 {
     (2.0 * fraction - 1.0).abs()
 }
 
-/// How long a badge's first appearance takes, in ms. It glides in from a
-/// little way off while it fades up, so it reads as the agent arriving at the
-/// spot rather than popping into place.
-pub const ARRIVAL_MS: f64 = 260.0;
-
-/// Where an arrival glide starts, relative to the tip's destination: down and
-/// to the right, the side the avatar chip trails on, so the pointer leads the
-/// way in. About 45 points: far enough to read as motion, near enough that the
-/// badge is plainly arriving at this spot and not crossing the screen.
-const ARRIVAL_OFFSET: [f64; 2] = [34.0, 30.0];
-
-/// The share of the arrival over which the badge fades up; it is fully opaque
-/// for the rest of the glide and the whole time it rests.
-const ARRIVAL_FADE_SHARE: f64 = 0.6;
-
-/// Where the tip starts on a badge's first appearance. With Reduce Motion it
-/// does not travel: it fades in where it lands.
-pub fn arrival_start(to: [f64; 2], reduce_motion: bool) -> [f64; 2] {
-    if reduce_motion {
-        return to;
-    }
-    [to[0] + ARRIVAL_OFFSET[0], to[1] + ARRIVAL_OFFSET[1]]
-}
-
-/// Opacity on a badge's first appearance, for a fraction of `ARRIVAL_MS`. It
-/// rises from 0 with an ease-out and is exactly 1 from `ARRIVAL_FADE_SHARE`
-/// on; with Reduce Motion the fade takes the whole arrival, since there is no
-/// glide to carry the eye. A malformed fraction answers 1: a badge that is
-/// meant to be visible must never be left dimmed.
-pub fn arrival_alpha(fraction: f64, reduce_motion: bool) -> f64 {
-    if !fraction.is_finite() || fraction >= 1.0 {
-        return 1.0;
-    }
-    if fraction <= 0.0 {
-        return 0.0;
-    }
-    let share = if reduce_motion {
-        1.0
-    } else {
-        ARRIVAL_FADE_SHARE
-    };
-    let t = (fraction / share).min(1.0);
-    1.0 - (1.0 - t).powi(2)
-}
-
 /// The colours a badge can be drawn in, sRGB in [0, 1]. Each is saturated, so
 /// the badge cannot be mistaken for the black-and-white system pointer, and
 /// dark enough for the white outline and white label text drawn on it. None
@@ -353,39 +387,6 @@ mod tests {
                 - colour.iter().cloned().fold(1.0, f64::min);
             assert!(spread >= 0.4, "{colour:?} is too grey");
         }
-    }
-
-    #[test]
-    fn arrival_glides_in_from_nearby_and_is_fully_opaque_once_it_lands() {
-        let to = [400.0, 300.0];
-        let from = arrival_start(to, false);
-        let distance = (from[0] - to[0]).hypot(from[1] - to[1]);
-        assert!(
-            (30.0..=60.0).contains(&distance),
-            "starts {distance} pt off"
-        );
-        assert!((200.0..=300.0).contains(&ARRIVAL_MS));
-        assert_eq!(arrival_start(to, true), to, "Reduce Motion does not travel");
-        assert_eq!(arrival_alpha(0.0, false), 0.0);
-        assert_eq!(arrival_alpha(-1.0, false), 0.0);
-        assert_eq!(arrival_alpha(f64::NAN, false), 1.0);
-        let mut last = 0.0;
-        for step in 1..=100 {
-            let fraction = f64::from(step) / 100.0;
-            let alpha = arrival_alpha(fraction, false);
-            assert!(alpha >= last, "the fade-in never dips at {fraction}");
-            last = alpha;
-            if fraction >= ARRIVAL_FADE_SHARE {
-                assert_eq!(alpha, 1.0, "opaque from {ARRIVAL_FADE_SHARE} on");
-            }
-            assert!((0.0..=1.0).contains(&arrival_alpha(fraction, true)));
-        }
-        assert!(
-            arrival_alpha(0.5, true) < 1.0,
-            "Reduce Motion fades all the way"
-        );
-        assert_eq!(arrival_alpha(1.0, true), 1.0);
-        assert_eq!(arrival_alpha(5.0, false), 1.0);
     }
 
     #[test]
@@ -549,6 +550,87 @@ mod tests {
         let refused: CursorLine = serde_json::from_str(r#"{"hide":false,"agent":"a"}"#).unwrap();
         assert!(!refused.valid());
         assert!(refused.encode_line().is_none());
+    }
+
+    #[test]
+    fn follow_line_names_only_agent_serial_and_offset_and_refuses_extras() {
+        let line = CursorLine::Follow(CursorFollow {
+            agent: "agent-a".into(),
+            serial: 4,
+            offset: [120.0, -30.5],
+        });
+        let encoded = line.encode_line().unwrap();
+        assert_eq!(
+            encoded,
+            b"{\"agent\":\"agent-a\",\"serial\":4,\"offset\":[120.0,-30.5]}\n"
+        );
+        assert_eq!(
+            serde_json::from_slice::<CursorLine>(&encoded).unwrap(),
+            line
+        );
+        for planted in [
+            r#"{"agent":"a","serial":1,"offset":[1.0,2.0],"title":"planted"}"#,
+            r#"{"agent":"a","offset":[1.0,2.0]}"#,
+        ] {
+            assert!(serde_json::from_str::<CursorLine>(planted).is_err());
+        }
+        for offset in [[f64::NAN, 0.0], [0.0, 2.0 * MAX_FOLLOW_OFFSET]] {
+            let line = CursorLine::Follow(CursorFollow {
+                agent: "a".into(),
+                serial: 1,
+                offset,
+            });
+            assert!(!line.valid());
+            assert!(line.encode_line().is_none());
+        }
+        // A hide still decodes as a hide, not a follow, and the reverse.
+        let hide: CursorLine = serde_json::from_str(r#"{"hide":true,"agent":"a"}"#).unwrap();
+        assert!(matches!(hide, CursorLine::Hide(_)));
+    }
+
+    #[test]
+    fn a_moved_window_moves_the_badge_by_its_origin_and_a_resize_follows_the_element() {
+        let window = [100.0, 80.0, 800.0, 600.0];
+        let element = [400.0, 120.0, 90.0, 22.0];
+        let moved = [250.0, 40.0, 800.0, 600.0];
+        assert_eq!(
+            follow_offset(WindowChange::Moved, window, moved, Some(element), None),
+            Some([150.0, -40.0])
+        );
+        // Resized from the left edge: the origin moved 60 left, but the
+        // element is laid out again and moved only 20.
+        let resized = [40.0, 80.0, 860.0, 600.0];
+        assert_eq!(
+            follow_offset(
+                WindowChange::Resized,
+                window,
+                resized,
+                Some(element),
+                Some([380.0, 120.0, 90.0, 22.0])
+            ),
+            Some([-20.0, 0.0])
+        );
+        // The element can no longer be read: keep the offset from the
+        // window's top-left corner.
+        assert_eq!(
+            follow_offset(WindowChange::Resized, window, resized, Some(element), None),
+            Some([-60.0, 0.0])
+        );
+        // Nothing trustworthy: no move at all, never a jump to the origin.
+        assert_eq!(
+            follow_offset(WindowChange::Gone, window, moved, None, None),
+            None
+        );
+        for broken in [[f64::NAN, 0.0, 10.0, 10.0], [0.0, 0.0, 0.0, 0.0]] {
+            assert_eq!(
+                follow_offset(WindowChange::Moved, window, broken, None, None),
+                None
+            );
+            assert_eq!(
+                follow_offset(WindowChange::Moved, broken, window, None, None),
+                None
+            );
+        }
     }
 
     #[test]

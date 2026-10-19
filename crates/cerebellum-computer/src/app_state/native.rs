@@ -9,9 +9,9 @@ use cerebellum_macos::{
 };
 
 use super::source::{
-    AppStateReadError, AppStateSource, ElementActionError, ElementFacts, ElementHandle,
-    ElementReadError, ElementToken, ElementValue, HitScope, RawAppState, RawElement, ReadBounds,
-    RunningApp, TextAttribute, WindowMark,
+    AppStateReadError, AppStateSource, CursorWindowWatch, ElementActionError, ElementFacts,
+    ElementHandle, ElementReadError, ElementToken, ElementValue, HitScope, RawAppState, RawElement,
+    ReadBounds, RunningApp, TextAttribute, WindowMark,
 };
 use crate::platform::native::{verify_grant, GrantVerification};
 use crate::platform::ProcessGrant;
@@ -40,6 +40,11 @@ impl ElementToken for MacElementToken {
 fn handle(element: AxRetainedElement) -> ElementHandle {
     Arc::new(MacElementToken(element))
 }
+
+/// A window watch for the cursor picture; dropping it removes the observer.
+struct MacWindowWatch(#[allow(dead_code)] cerebellum_macos::AxWindowWatch);
+
+impl CursorWindowWatch for MacWindowWatch {}
 
 /// The retained element behind a token, when the token is this reader's.
 fn retained(element: &ElementHandle) -> Result<&AxRetainedElement, ElementActionError> {
@@ -150,6 +155,45 @@ impl AppStateSource for MacAppStateSource {
             return None;
         }
         cerebellum_macos::visible_cursor_point(target.pid, point, frame)
+    }
+
+    /// Only for the granted process, for the same reason a state read is. An
+    /// element with no window of its own (a menu bar item) has nothing to
+    /// follow; only a picture with no element falls back to the focused
+    /// window, the one its badge is drawn over.
+    fn cursor_window(
+        &self,
+        target: &ProcessGrant,
+        element: Option<&ElementHandle>,
+    ) -> Option<ElementHandle> {
+        if verify_grant(target.pid, target) != GrantVerification::Current {
+            return None;
+        }
+        let window = match element {
+            Some(element) => cerebellum_macos::cursor_element_window(retained(element).ok()?),
+            None => cerebellum_macos::cursor_focused_window(target.pid),
+        };
+        window.map(handle)
+    }
+
+    fn watch_cursor_window(
+        &self,
+        window: &ElementHandle,
+        changed: Box<dyn Fn(crate::cursor::WindowChange) + Send + Sync>,
+    ) -> Option<Box<dyn CursorWindowWatch>> {
+        use crate::cursor::WindowChange;
+        use cerebellum_macos::AxWindowChange;
+        let watch = cerebellum_macos::watch_window(
+            retained(window).ok()?,
+            Box::new(move |change| {
+                changed(match change {
+                    AxWindowChange::Moved => WindowChange::Moved,
+                    AxWindowChange::Resized => WindowChange::Resized,
+                    AxWindowChange::Gone => WindowChange::Gone,
+                })
+            }),
+        )?;
+        Some(Box::new(MacWindowWatch(watch)))
     }
     /// Read the granted process, and only while it is still the granted
     /// process: a pid reused by another program after the grant was made is
