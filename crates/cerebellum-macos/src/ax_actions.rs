@@ -180,6 +180,31 @@ pub fn cursor_element_frame(element: &AxRetainedElement) -> Option<[f64; 4]> {
     Some([origin[0], origin[1], extent[0], extent[1]])
 }
 
+/// The window `element` sits in, for following it while the agent cursor
+/// rests there. A window is its own window. Like the other cursor reads it
+/// prepares nothing and changes no messaging timeout.
+pub fn cursor_element_window(element: &AxRetainedElement) -> Option<AxRetainedElement> {
+    require_trust().ok()?;
+    if string(element.as_ptr(), "AXRole").ok()?.as_deref() == Some("AXWindow") {
+        return Some(AxRetainedElement(element.0.clone()));
+    }
+    copy(element.as_ptr(), "AXWindow")
+        .ok()?
+        .filter(|value| is_ax_element(value))
+        .map(AxRetainedElement)
+}
+
+/// The application's focused window, for a cursor picture with no element.
+/// Unlike `focused_window` it prepares nothing in the application.
+pub fn cursor_focused_window(pid: u32) -> Option<AxRetainedElement> {
+    require_trust().ok()?;
+    let application = application(pid).ok()?;
+    copy(application.as_ptr(), "AXFocusedWindow")
+        .ok()?
+        .filter(|value| is_ax_element(value))
+        .map(AxRetainedElement)
+}
+
 /// Cosmetic reads must not enable manual accessibility or reset the messaging
 /// timeout of an element shared with dispatch. Never read AXValue here.
 pub fn cursor_element_label(element: &AxRetainedElement) -> Option<(Option<String>, bool)> {

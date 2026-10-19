@@ -138,3 +138,136 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-avatar-stands-clear-of-the-pointer"
+guards = "the agent cursor's avatar chip sits a clear gap away from the pointer instead of touching it, while the tip stays the requested point"
+file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+old = "pub(crate) const CHIP_CENTER: [f64; 2] = [30.0, 30.0];"
+new = "pub(crate) const CHIP_CENTER: [f64; 2] = [22.5, 22.5]; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_geometry.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_geometry::tests::the_tip_is_the_pointer_s_first_vertex_and_the_chip_stands_clear_of_it",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-entry-plays-once-per-appearance"
+guards = "the agent cursor's entry (large avatar shrinking onto the pointer) plays once when a badge appears, not again on every later action"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "        if self.shown {\n            return false;\n        }"
+new = "        if false && self.shown { // NON-VACUITY BREAK\n            return false;\n        }"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::the_entry_runs_once_per_appearance",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-entry-is-a-plain-fade-under-reduce-motion"
+guards = "with Reduce Motion on, the agent cursor's entry only fades the resting badge in, with no scaling or travel"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "    if reduce_motion {\n        return Some(EntryFrame {"
+new = "    if false && reduce_motion { // NON-VACUITY BREAK\n        return Some(EntryFrame {"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::under_reduce_motion_the_entry_is_a_plain_fade_with_no_scaling",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-glide-never-jumps-on-late-frames"
+guards = "the agent cursor's animation clock advances at most one capped step per frame, so a glide whose frames arrive late still draws its way there instead of jumping to the end"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "        let step = now.saturating_duration_since(self.last).min(MAX_FRAME_STEP);"
+new = "        let step = now.saturating_duration_since(self.last); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::a_glide_draws_intermediate_positions_even_when_frames_are_throttled",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-rest-holds-no-activity"
+guards = "the agent cursor helper holds its animation activity only while it asks for frames, never while every badge rests"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "        let wanted = matches!(wait, Wait::Frame(_));"
+new = "        let wanted = matches!(wait, Wait::Frame(_) | Wait::Timed(_)); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::the_activity_is_held_only_while_frames_are_needed_and_never_at_rest",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-window-move-moves-the-badge"
+guards = "a move of the window an agent cursor badge rests on sends the helper the element's offset, so the badge follows it"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "            .is_some_and(|follow| follow.id == id && follow.serial == serial)"
+new = "            .is_some_and(|follow| follow.id == id && follow.serial == serial && false) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_window_move_moves_the_badge_with_its_element",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-hide-stops-watching-the-window"
+guards = "ending an agent's badge also removes the observer on the window it rested on"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        // The badge is gone, so its window needs no watching.\n        self.follows().remove(agent);"
+new = "        // The badge is gone, so its window needs no watching.\n        let _ = agent; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::the_window_watch_is_removed_on_hide_and_replaced_on_a_new_target",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

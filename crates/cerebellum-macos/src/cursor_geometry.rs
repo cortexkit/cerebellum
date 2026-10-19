@@ -97,11 +97,32 @@ pub(crate) const POINTER_CORNER: [f64; 4] = [0.0, 3.0, 2.0, 3.0];
 /// The white outline drawn around the coloured fill, in points: it keeps the
 /// pointer legible on dark backgrounds, where the accent alone is too dim.
 pub(crate) const OUTLINE: f64 = 1.5;
-/// The avatar chip sits further along the pointer's axis, just touching the
-/// back of the arrowhead, so pointer and avatar read as one marker.
-pub(crate) const CHIP_CENTER: [f64; 2] = [22.5, 22.5];
-/// Large enough for the avatar to be recognisable at a glance.
-pub(crate) const CHIP_DIAMETER: f64 = 32.0;
+/// The avatar chip's diameter. Large enough for the avatar to be recognised
+/// at a glance next to a full-size pointer. The avatar itself is drawn inside
+/// the accent ring, 36 - 2 x 2.5 = 31 points across, which is 62 pixels on a
+/// Retina display: the module's 64-pixel avatar raster is scaled down a
+/// little, never up, so it stays sharp.
+pub(crate) const CHIP_DIAMETER: f64 = 36.0;
+/// Clear space between the pointer's white outline and the chip's white rim.
+/// With no space the two run together into one blob and the pointer's shape
+/// is lost; four points reads as two separate marks (where, and who) that
+/// still plainly belong together. `CHIP_CENTER` is chosen to leave this
+/// gap, and a test holds it to it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const CHIP_GAP: f64 = 4.0;
+/// The avatar chip sits on the pointer's diagonal axis, behind the
+/// arrowhead, as close to it as `CHIP_GAP` allows. The pointer's nearest
+/// points to this centre are the two wing tips, (6.5, 21) and (21, 6.5), each
+/// about 25.2 points away; the chip's rim reaches 18 + 1.5 = 19.5 points out
+/// and the pointer's outline 1.5, leaving just over the 4-point gap. The tip
+/// stays at (0, 0), so moving the chip never moves where the badge points.
+pub(crate) const CHIP_CENTER: [f64; 2] = [30.0, 30.0];
+/// How large the chip is when a badge first appears, as a multiple of its
+/// resting size. The entry shows the avatar alone first, centred on the
+/// target, then shrinks it onto its resting place behind the pointer; at
+/// twice the size it reads as "this agent has started working here" rather
+/// than as an ordinary move.
+pub(crate) const ENTRY_CHIP_SCALE: f64 = 2.0;
 /// The accent ring just inside the chip's edge.
 pub(crate) const CHIP_RING: f64 = 2.5;
 /// The white rim just outside the chip's edge: like the pointer's outline,
@@ -118,16 +139,39 @@ const SHADOW_MARGIN: f64 = 8.0;
 /// pointed-at pixel with no element frame still gets this much clear space.
 const POINT_TARGET: f64 = 12.0;
 
-/// What the pointer and chip cover, relative to the tip, outline and rim
-/// included.
+/// Where the chip's centre is and how large it is, relative to the tip, for
+/// an entry progress in [0, 1]: at 0 it is `ENTRY_CHIP_SCALE` times its
+/// resting size and centred on the tip itself, at 1 it is at rest. Both move
+/// together, linearly in the progress, so every intermediate chip lies inside
+/// the bounding box of the two ends.
+pub(crate) fn chip_at(progress: f64) -> ([f64; 2], f64) {
+    let p = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (
+        [CHIP_CENTER[0] * p, CHIP_CENTER[1] * p],
+        CHIP_DIAMETER * (ENTRY_CHIP_SCALE + (1.0 - ENTRY_CHIP_SCALE) * p),
+    )
+}
+
+/// What the chip covers, rim included, at an entry progress.
+fn chip_bounds(progress: f64) -> Rect {
+    let (centre, diameter) = chip_at(progress);
+    let outer = diameter + 2.0 * CHIP_RIM;
+    Rect::new(
+        centre[0] - outer / 2.0,
+        centre[1] - outer / 2.0,
+        outer,
+        outer,
+    )
+}
+
+/// What the pointer and the resting chip cover, relative to the tip, outline
+/// and rim included.
 pub(crate) fn badge_bounds() -> Rect {
-    let outer = CHIP_DIAMETER + 2.0 * CHIP_RIM;
-    let chip = Rect::new(
-        CHIP_CENTER[0] - outer / 2.0,
-        CHIP_CENTER[1] - outer / 2.0,
-        outer,
-        outer,
-    );
+    let chip = chip_bounds(1.0);
     let (mut right, mut bottom) = (0.0_f64, 0.0_f64);
     for [x, y] in POINTER {
         right = right.max(x);
@@ -252,16 +296,25 @@ pub(crate) struct Layout {
     pub label: Option<Rect>,
 }
 
+/// `entering` makes the panel large enough for the whole entry, whose chip
+/// starts at twice its size around the tip; the label is placed for the
+/// resting badge either way, since it only fades in as the chip settles.
 pub(crate) fn layout(
     tip: [f64; 2],
     target: Rect,
     label_size: Option<[f64; 2]>,
     screen: Rect,
+    entering: bool,
 ) -> Layout {
     let label = label_size
         .and_then(|size| label_rect(tip, size, target, screen))
         .map(|label| label.offset([-tip[0], -tip[1]]));
-    let drawn = label.map_or(badge_bounds(), |label| badge_bounds().union(label));
+    let badge = if entering {
+        badge_bounds().union(chip_bounds(0.0))
+    } else {
+        badge_bounds()
+    };
+    let drawn = label.map_or(badge, |label| badge.union(label));
     let x = (drawn.x - SHADOW_MARGIN).floor();
     let y = (drawn.y - SHADOW_MARGIN).floor();
     Layout {
@@ -328,6 +381,14 @@ mod tests {
     /// window server would: AppKit origin plus the tip's spot in the view,
     /// flipped back to top-down.
     fn landed_tip(requested: [f64; 2], frame: Option<[f64; 4]>) -> ([f64; 2], f64) {
+        landed_tip_with(requested, frame, false)
+    }
+
+    fn landed_tip_with(
+        requested: [f64; 2],
+        frame: Option<[f64; 4]>,
+        entering: bool,
+    ) -> ([f64; 2], f64) {
         let display = display_at(requested, &displays()).unwrap();
         let tip = snap_tip(requested, display.scale);
         let layout = layout(
@@ -335,6 +396,7 @@ mod tests {
             target_rect(tip, frame),
             Some([120.0, LABEL_HEIGHT]),
             display.visible,
+            entering,
         );
         let origin = panel_origin_for_tip(tip, layout.panel, PRIMARY_HEIGHT);
         let in_view = view_point(layout.panel, [0.0, 0.0]);
@@ -362,6 +424,12 @@ mod tests {
     fn tip_lands_on_the_requested_point_on_a_scaled_display() {
         assert_eq!(landed_tip([400.0, 300.0], None).0, [400.0, 300.0]);
         assert_eq!(landed_tip([400.75, 300.25], None).0, [400.5, 300.0]);
+        // The larger panel an entry needs moves the panel's origin, never the
+        // tip.
+        assert_eq!(
+            landed_tip_with([400.75, 300.25], None, true).0,
+            [400.5, 300.0]
+        );
         for requested in [[400.3, 300.7], [1.0, 1.0], [1727.9, 1116.6]] {
             assert_tip_pixel_holds(requested, None);
             assert_tip_pixel_holds(requested, Some([300.0, 280.0, 220.0, 28.0]));
@@ -386,8 +454,24 @@ mod tests {
         assert_eq!(display_at([0.0, 0.0], &[]), None);
     }
 
+    /// The shortest distance from `point` to the pointer's (sharp-cornered)
+    /// outline polygon. Rounding the back corners only pulls the outline
+    /// inward, so the real gap is never smaller than one measured here.
+    fn distance_to_pointer(point: [f64; 2]) -> f64 {
+        (0..POINTER.len())
+            .map(|index| {
+                let a = POINTER[index];
+                let b = POINTER[(index + 1) % POINTER.len()];
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let t = (((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (dx * dx + dy * dy))
+                    .clamp(0.0, 1.0);
+                (point[0] - (a[0] + t * dx)).hypot(point[1] - (a[1] + t * dy))
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
     #[test]
-    fn the_tip_is_the_pointer_s_first_vertex_and_the_chip_touches_its_back() {
+    fn the_tip_is_the_pointer_s_first_vertex_and_the_chip_stands_clear_of_it() {
         // The tip is the first vertex and has no rounding, so the requested
         // point is the pointer's exact corner.
         assert_eq!(POINTER[0], [0.0, 0.0]);
@@ -401,21 +485,48 @@ mod tests {
         let badge = badge_bounds();
         assert_eq!(badge.x, -OUTLINE);
         assert_eq!(badge.y, -OUTLINE);
-        // A chip of about 28-36 points, big enough to recognise the avatar.
-        assert!((28.0..=36.0).contains(&CHIP_DIAMETER));
-        // Both wings touch the chip (within the outline's width), so pointer
-        // and avatar read as one marker rather than two loose shapes.
-        for wing in [POINTER[1], POINTER[3]] {
-            let gap =
-                (wing[0] - CHIP_CENTER[0]).hypot(wing[1] - CHIP_CENTER[1]) - CHIP_DIAMETER / 2.0;
-            assert!((0.0..=OUTLINE).contains(&gap), "wing to chip gap {gap}");
+        // A chip of about 34-40 points, big enough to recognise the avatar,
+        // and the avatar inside its ring needs no more pixels on a Retina
+        // display than the 64-pixel raster has, so it is never upscaled.
+        assert!((34.0..=40.0).contains(&CHIP_DIAMETER));
+        const { assert!((CHIP_DIAMETER - 2.0 * CHIP_RING) * 2.0 <= 64.0) };
+        // The chip's white rim stays at least `CHIP_GAP` clear of the
+        // pointer's white outline, so the two never touch, and not much more,
+        // so the avatar still sits with its pointer.
+        let gap = distance_to_pointer(CHIP_CENTER) - OUTLINE - (CHIP_DIAMETER / 2.0 + CHIP_RIM);
+        assert!(
+            (CHIP_GAP..=CHIP_GAP + 1.0).contains(&gap),
+            "pointer to chip gap {gap}"
+        );
+        // So the drawn shapes do not overlap either: the chip's disc is clear
+        // of every point of the pointer.
+        for vertex in POINTER {
+            let to_centre = (vertex[0] - CHIP_CENTER[0]).hypot(vertex[1] - CHIP_CENTER[1]);
+            assert!(to_centre > CHIP_DIAMETER / 2.0 + CHIP_RIM + OUTLINE);
         }
-        // The back's notch stays clear of the chip, so the arrowhead's shape
-        // is not swallowed by it.
-        let notch = POINTER[2];
-        let notch_gap =
-            (notch[0] - CHIP_CENTER[0]).hypot(notch[1] - CHIP_CENTER[1]) - CHIP_DIAMETER / 2.0;
-        assert!(notch_gap > OUTLINE, "notch to chip gap {notch_gap}");
+        // On the diagonal, so the badge stays symmetric like its pointer.
+        assert_eq!(CHIP_CENTER[0], CHIP_CENTER[1]);
+    }
+
+    #[test]
+    fn the_entry_chip_starts_twice_as_large_on_the_tip_and_the_panel_holds_it() {
+        assert_eq!(chip_at(0.0), ([0.0, 0.0], CHIP_DIAMETER * ENTRY_CHIP_SCALE));
+        assert_eq!(chip_at(1.0), (CHIP_CENTER, CHIP_DIAMETER));
+        assert_eq!(chip_at(f64::NAN), (CHIP_CENTER, CHIP_DIAMETER));
+        let tip = [600.0, 400.0];
+        let entering = layout(tip, target_rect(tip, None), None, screen(), true);
+        let resting = layout(tip, target_rect(tip, None), None, screen(), false);
+        for step in 0..=20 {
+            let chip = chip_bounds(f64::from(step) / 20.0);
+            assert!(
+                entering.panel.contains_rect(chip),
+                "{chip:?} at step {step} leaves {:?}",
+                entering.panel
+            );
+        }
+        // The resting panel stays as tight as before.
+        assert!(!resting.panel.contains_rect(chip_bounds(0.0)));
+        assert!(resting.panel.contains_rect(badge_bounds()));
     }
 
     fn screen() -> Rect {
@@ -478,11 +589,17 @@ mod tests {
     #[test]
     fn panel_encloses_the_drawing_and_its_shadow() {
         let tip = [600.0, 400.0];
-        let with_label = layout(tip, target_rect(tip, None), Some([150.0, 20.0]), screen());
+        let with_label = layout(
+            tip,
+            target_rect(tip, None),
+            Some([150.0, 20.0]),
+            screen(),
+            false,
+        );
         let label = with_label.label.unwrap();
         assert!(with_label.panel.contains_rect(label));
         assert!(with_label.panel.contains_rect(badge_bounds()));
-        let bare = layout(tip, target_rect(tip, None), None, screen());
+        let bare = layout(tip, target_rect(tip, None), None, screen(), false);
         assert_eq!(bare.label, None);
         assert!(bare.panel.contains_rect(badge_bounds()));
         assert!(bare.panel.width < with_label.panel.width);

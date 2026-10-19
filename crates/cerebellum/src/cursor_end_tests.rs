@@ -42,6 +42,7 @@ fn hidden(receiver: &mut mpsc::Receiver<CursorLine>) -> Vec<String> {
         match line {
             CursorLine::Hide(hide) => agents.push(hide.agent),
             CursorLine::Picture(event) => panic!("unexpected picture for {}", event.agent),
+            CursorLine::Follow(follow) => panic!("unexpected follow for {}", follow.agent),
         }
     }
     agents

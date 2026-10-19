@@ -89,7 +89,8 @@ fn main() {
 }
 
 /// Plain stand-ins for the module's motion curves: the probe only needs a
-/// picture that arrives fully transparent and stays put.
+/// picture that stays put. A first appearance's entry starts fully
+/// transparent on its own, and the probe never draws a second frame.
 #[cfg(target_os = "macos")]
 fn motion() -> cerebellum_macos::CursorMotion {
     cerebellum_macos::CursorMotion {
@@ -97,8 +98,5 @@ fn motion() -> cerebellum_macos::CursorMotion {
         position: |_, to, _, _| to,
         settle_scale: |_, _, _| 1.0,
         fade_alpha: |_, _| 1.0,
-        arrival_ms: 250.0,
-        arrival_start: |to, _| to,
-        arrival_alpha: |_, _| 0.0,
     }
 }
