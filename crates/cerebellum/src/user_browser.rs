@@ -2355,7 +2355,7 @@ async fn navigate(
         let read = capture(context, tab, args, &landed, once, None).await?;
         reply["read_page"] = read;
     }
-    return Ok(reply);
+    Ok(reply)
 }
 
 fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
