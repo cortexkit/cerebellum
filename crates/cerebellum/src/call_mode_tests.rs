@@ -279,3 +279,444 @@ async fn run_ignores_bind_session_and_borrows_head_authority() {
         "run_parent_unavailable"
     );
 }
+
+fn attach_consent(mut planes: Planes, consent: &tests::ScriptedConsent) -> Planes {
+    planes.management = Arc::new(
+        ManagementPlane::new(Arc::new(management::PlatformResolver::new())).with_agent_grants(
+            Arc::new(agent_grants::AgentGrants::in_memory(Some(
+                "test-machine".into(),
+            ))),
+        ),
+    );
+    planes.with_cingulate(
+        Arc::new(Arc::clone(&consent.script)),
+        Arc::new(consent.store()),
+    )
+}
+
+fn detach(consent: &tests::ScriptedConsent, id: &str) {
+    consent.raises(id);
+    consent.script.then(
+        cingulate_client::wire::CONSENT_DETACH,
+        cingulate_client::Reply::Result(
+            json!({"elicitation_id":id,"state":"pending","detached":true}),
+        ),
+    );
+}
+
+#[tokio::test]
+async fn codemode_consent_asks_the_head_without_parking() {
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "run-site");
+    let planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    bind_head(&planes).await;
+    assert_eq!(
+        exchange(
+            &planes,
+            0,
+            2,
+            serde_json::to_value(run_bind(run_stamp())).unwrap()
+        )
+        .await
+        .header
+        .ty,
+        FrameType::Response
+    );
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","arguments":{
+        "action":"open_grant","origins":["https://example.com"],"hazards":[]}}),
+    )
+    .await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
+    assert_eq!(reply["isError"], true);
+    assert_eq!(reply["structuredContent"]["detail"]["step"], "consent");
+    assert_eq!(
+        reply["structuredContent"]["detail"]["origin"],
+        "https://example.com"
+    );
+    assert_eq!(consent.cards().len(), 1);
+    assert!(!consent.script.scopes().is_empty());
+    for scope in consent.script.scopes() {
+        assert_eq!(scope.scope_ref, "head");
+        assert_eq!(scope.scope_epoch, Some(7));
+        assert_eq!(scope.owner, session_caller_principal_for_test().unwrap());
+    }
+    assert!(!consent
+        .methods()
+        .iter()
+        .any(|method| method == cingulate_client::wire::CONSENT_AWAIT));
+}
+
+#[tokio::test]
+async fn legacy_run_without_call_mode_keeps_no_ask_policy() {
+    let consent = tests::ScriptedConsent::new();
+    let planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    let mut bind = run_bind(run_stamp());
+    if let ModuleControlRequest::RouteBind {
+        principal,
+        call_mode,
+        ..
+    } = &mut bind
+    {
+        *principal = session_caller_principal_for_test();
+        *call_mode = None;
+    }
+    assert_eq!(
+        exchange(&planes, 0, 2, serde_json::to_value(bind).unwrap())
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","arguments":{
+        "action":"open_grant","origins":["https://example.com"],"hazards":[]}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["errorCode"], "consent_unavailable", "{reply}");
+    assert_eq!(reply["structuredContent"]["detail"]["reason"], "agent_run");
+    assert!(consent.cards().is_empty());
+}
+
+#[tokio::test]
+async fn codemode_user_browser_is_unsupported_but_coordinate_actions_are_not() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    bind_head(&planes).await;
+    exchange(
+        &planes,
+        0,
+        2,
+        serde_json::to_value(run_bind(run_stamp())).unwrap(),
+    )
+    .await;
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","arguments":{
+        "browser":"user","action":"snapshot","tab":"tab-1"}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["code"], "call_mode_unsupported");
+    assert_eq!(
+        reply["detail"],
+        json!({"tool":"browser_use","mode":"codemode","action":"snapshot"})
+    );
+    for (tool, action) in [
+        ("browser_use", "click_point"),
+        ("computer_use", "press_point"),
+    ] {
+        let reply = exchange(
+            &planes,
+            9,
+            4,
+            json!({"name":tool,"arguments":{"action":action}}),
+        )
+        .await;
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_ne!(reply["code"], "call_mode_unsupported", "{reply}");
+        assert_ne!(reply["errorCode"], "call_mode_unsupported", "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn codemode_app_consent_detaches_and_standing_grants_short_circuit() {
+    use computer_grants::{ConsentRefusal, GrantNeed, SignedByFixtureTeam};
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "run-app");
+    let planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    bind_head(&planes).await;
+    exchange(
+        &planes,
+        0,
+        2,
+        serde_json::to_value(run_bind(run_stamp())).unwrap(),
+    )
+    .await;
+    let facts = planes.routes.get(9, 3).unwrap();
+    let (tx, mut rx) = mpsc::channel(2);
+    let frame = request(
+        9,
+        3,
+        json!({"name":"computer_use","arguments":{"action":"read_state","target":"com.example.Test"}}),
+    );
+    let detail = codemode::call_detail(&frame, &facts);
+    let guard = Arc::new(planes.health.enter_request());
+    call_context::ROUTE_GUARD
+        .scope(
+            guard,
+            codemode::CALL_DETAIL.scope(std::cell::RefCell::new(detail), async {
+                let context = consent_context(&planes, &facts, &tx, 9, 3);
+                assert!(!context.agent_run);
+                let need = GrantNeed::App {
+                    bundle_identity: "com.example.Test".into(),
+                    display_name: "Test".into(),
+                    code: Arc::new(SignedByFixtureTeam),
+                };
+                let grants = planes.management.computer_grants();
+                let refusal = grants
+                    .require(&need, &context, &CancelHandle::pending())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(refusal, ConsentRefusal::Pending { .. }));
+                send_tool_response(
+                    &tx,
+                    PROTOCOL_VERSION,
+                    9,
+                    3,
+                    3,
+                    refusal.reply(Some("com.example.Test")),
+                )
+                .await
+                .unwrap();
+                let reply: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
+                assert_eq!(
+                    reply["structuredContent"]["detail"]["app"],
+                    "com.example.Test"
+                );
+                seed_app(&planes, "com.example.Test");
+                assert!(grants
+                    .require(&need, &context, &CancelHandle::pending())
+                    .await
+                    .is_ok());
+            }),
+        )
+        .await;
+    assert_eq!(consent.cards().len(), 1);
+    assert!(!consent
+        .methods()
+        .iter()
+        .any(|method| method == cingulate_client::wire::CONSENT_AWAIT));
+}
+
+fn seed_app(planes: &Planes, bundle: &str) {
+    use agent_grants::{AgentGrant, GrantHolder, GrantSubject};
+    let store = planes.management.agent_grants();
+    let now = store.now_ms();
+    store
+        .upsert(
+            AgentGrant {
+                id: String::new(),
+                holder: GrantHolder::Head {
+                    agent_id: "test-project".into(),
+                },
+                subject: GrantSubject::App(bundle.into()),
+                browser_target: None,
+                machine_uuid: "test-machine".into(),
+                granted_at_ms: now,
+                expires_at_ms: None,
+                card_ref: None,
+                max_level: 4,
+                hazards: vec![],
+                team_id: Some("TESTTEAM".into()),
+                designated_requirement: Some(
+                    "certificate leaf[subject.OU] = \"FIXTURE001\"".into(),
+                ),
+            },
+            now,
+        )
+        .unwrap();
+}
+
+pub(crate) async fn bound_run() -> Planes {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    bind_head(&planes).await;
+    assert_eq!(
+        exchange(
+            &planes,
+            0,
+            2,
+            serde_json::to_value(run_bind(run_stamp())).unwrap()
+        )
+        .await
+        .header
+        .ty,
+        FrameType::Response
+    );
+    planes
+}
+
+#[tokio::test]
+async fn run_resolves_head_computer_images_and_elements_not_run_bind_handles() {
+    use cerebellum_computer::app_state::{
+        image::ImageMapping,
+        session::{ElementResolution, RegisteredImage},
+        source::{RawAppState, RawElement},
+    };
+    let planes = bound_run().await;
+    let sessions = planes.management.app_state_sessions();
+    let grant = cerebellum_computer::platform::ProcessGrant {
+        bundle_identity: "com.example.Test".into(),
+        pid: 42,
+        process_generation_evidence: "generation".into(),
+    };
+    let image = RegisteredImage {
+        bundle_identity: grant.bundle_identity.clone(),
+        pid: 42,
+        process_generation: grant.process_generation_evidence.clone(),
+        width_px: 100,
+        height_px: 100,
+        mapping: ImageMapping::for_window((0.0, 0.0), (100.0, 100.0), (100, 100), (100, 100))
+            .unwrap(),
+    };
+    let image_id = sessions.register_image("head-conversation", image.clone());
+    let foreign_image = sessions.register_image("misleading-session", image.clone());
+    let read = sessions.observe(
+        "head-conversation",
+        &grant,
+        &RawAppState {
+            roots: vec![RawElement::fixture(1, "AXButton").titled("Save")],
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        },
+    );
+    let element = read.roots[0].element_id.as_ref().unwrap();
+    let run = planes.routes.get(9, 3).unwrap();
+    assert_eq!(
+        sessions.resolve_image(&run.identity.conversation_key, &image_id),
+        Some(image)
+    );
+    assert!(sessions
+        .resolve_image(&run.identity.conversation_key, &foreign_image)
+        .is_none());
+    assert!(matches!(
+        sessions.resolve(&run.identity.conversation_key, element),
+        ElementResolution::Live { pid: 42, .. }
+    ));
+    assert!(matches!(
+        sessions.resolve("misleading-session", element),
+        ElementResolution::Stale
+    ));
+}
+
+#[tokio::test]
+async fn codemode_capture_consent_detaches_without_starting_a_handoff() {
+    let fixture = login_capture::test_support::fixture();
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "run-capture");
+    let planes = attach_consent(tests::capture_planes(&fixture), &consent);
+    bind_head(&planes).await;
+    exchange(
+        &planes,
+        0,
+        2,
+        serde_json::to_value(run_bind(run_stamp())).unwrap(),
+    )
+    .await;
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","call_key":"run-capture-key", "arguments":{
+        "action":"capture_login","credential_domain":"ollama.com","account":"work",
+        "fetch_url":"https://ollama.com/settings","login_url":"https://ollama.com/signin"}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
+    assert_eq!(reply["structuredContent"]["detail"]["step"], "consent");
+    assert_eq!(consent.cards().len(), 1);
+    assert!(!consent
+        .methods()
+        .iter()
+        .any(|method| method == cingulate_client::wire::CONSENT_AWAIT));
+}
+
+#[tokio::test]
+async fn codemode_pre_handoff_failures_are_terminal_not_held() {
+    let planes = bound_run().await;
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","call_key":"present-failure","arguments":{
+        "action":"present","origin":"https://example.com"}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["errorCode"], "no_session", "{reply}");
+    let reply = exchange(
+        &planes,
+        9,
+        4,
+        json!({"name":"browser_use","call_key":"capture-failure","arguments":{
+        "action":"capture_login","credential_domain":"example.com","account":"work",
+        "fetch_url":"https://example.com/settings","login_url":"http://example.com/signin"}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["errorCode"], "capture_url_outside_domain", "{reply}");
+}
+
+#[tokio::test]
+async fn codemode_covering_site_grant_never_asks_or_holds() {
+    let consent = tests::ScriptedConsent::new();
+    let planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    bind_head(&planes).await;
+    exchange(
+        &planes,
+        0,
+        2,
+        serde_json::to_value(run_bind(run_stamp())).unwrap(),
+    )
+    .await;
+    let store = planes.management.agent_grants();
+    let now = store.now_ms();
+    store
+        .upsert(
+            agent_grants::AgentGrant {
+                id: String::new(),
+                holder: agent_grants::GrantHolder::Head {
+                    agent_id: "test-project".into(),
+                },
+                subject: agent_grants::GrantSubject::AllSites,
+                browser_target: Some(agent_grants::BrowserTarget::AgentProfile),
+                machine_uuid: "test-machine".into(),
+                granted_at_ms: now,
+                expires_at_ms: None,
+                card_ref: None,
+                max_level: 2,
+                hazards: vec![],
+                team_id: None,
+                designated_requirement: None,
+            },
+            now,
+        )
+        .unwrap();
+    let reply = exchange(
+        &planes,
+        9,
+        3,
+        json!({"name":"browser_use","arguments":{
+        "action":"open_grant","origins":["https://example.com"],"hazards":[]}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["structuredContent"]["outcome"], "granted", "{reply}");
+    assert_ne!(reply["isError"], true);
+    assert!(consent.cards().is_empty());
+}

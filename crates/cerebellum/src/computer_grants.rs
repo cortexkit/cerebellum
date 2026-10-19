@@ -709,7 +709,10 @@ pub struct ConsentContext {
     /// A flow (see `AcceptedBindFacts::flow_id`) has no person to ask: it may use
     /// its owner's persistent app grants, but never raises a consent question.
     pub unattended: bool,
-    /// A program run may use held grants, but cannot put a question to a person.
+    /// True for older runs without a provider-resolved head route: they may
+    /// use existing permissions, but cannot ask a person. False for codemode
+    /// runs admitted through a head route, which can ask that head's person
+    /// without waiting for the answer inside the call.
     pub agent_run: bool,
     /// The admitted live session, or `None` when no agent session can ask.
     pub carrier: Option<Arc<dyn QuestionCarrier>>,
@@ -1405,6 +1408,17 @@ impl ComputerGrants {
                 signature_changed,
             )
             .await?;
+        if crate::codemode::active() {
+            crate::codemode::app(match need {
+                GrantNeed::App {
+                    bundle_identity, ..
+                } => bundle_identity,
+                GrantNeed::Takeover => "whole_computer",
+            });
+            return Err(ConsentRefusal::Pending {
+                ask_id: waiter.ask_id.clone(),
+            });
+        }
         let parked = context
             .park_guard
             .as_ref()
@@ -1601,7 +1615,11 @@ impl ComputerGrants {
                     let decline = Some(card.decline_id.clone());
                     let ask_id = match desk.open_card_for(live.session(), &key) {
                         Some(card) => card.elicitation_id,
-                        None => match session.raise(card, &key).await {
+                        None => match if crate::codemode::active() {
+                            session.raise_detached(card, &key).await
+                        } else {
+                            session.raise(card, &key).await
+                        } {
                             Ok(id) => id,
                             Err(ending) => return failed(ending),
                         },
@@ -1635,6 +1653,11 @@ impl ComputerGrants {
                 ask_id,
                 id,
             };
+            if crate::codemode::active() {
+                return LoginConsent::Pending {
+                    ask_id: waiter.ask_id.clone(),
+                };
+            }
             let parked = request
                 .park_guard
                 .as_ref()
@@ -1835,10 +1858,12 @@ impl ComputerGrants {
                 None,
             )
             .map_err(|_| card_refusal(&CardEnding::DeliveryFailed))?;
-            session
-                .raise(card, &key)
-                .await
-                .map_err(|ending| card_refusal(&ending))?
+            (if crate::codemode::active() {
+                session.raise_detached(card, &key).await
+            } else {
+                session.raise(card, &key).await
+            })
+            .map_err(|ending| card_refusal(&ending))?
         };
         let (settled_tx, settled) = watch::channel(None);
         let (completion_tx, completion) = watch::channel(false);

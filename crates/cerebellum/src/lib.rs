@@ -1729,7 +1729,7 @@ fn consent_context(
         context.park_limit = limit;
     }
     context.unattended = facts.flow_id.is_some();
-    context.agent_run = facts.call_mode == subc_protocol::call_mode::CallMode::Codemode;
+    context.agent_run = codemode::legacy_run(facts);
     if context.unattended {
         context.caller.conversation_key.clear();
     }
@@ -3653,6 +3653,16 @@ async fn handle_route_request(
     if facts.surface == RouteSurface::Tools {
         if let Ok(request) = serde_json::from_slice::<Value>(&frame.body) {
             if let Some(name) = request.get("name").and_then(Value::as_str) {
+                if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+                    && name == flat_tools::BROWSER_USE
+                    && request["arguments"]["browser"] == "user"
+                {
+                    return tool_provider::send_error(ErrorBody {
+                        code: "call_mode_unsupported".into(),
+                        message: "codemode does not support the user-browser plane".into(),
+                        detail: Some(json!({"tool":name,"mode":"codemode","action":request["arguments"]["action"]})),
+                    }, (ver, channel, epoch, corr), writer).await;
+                }
                 if let Err(error) = tool_provider::check_call_mode(name, &facts.call_mode, planes) {
                     return tool_provider::send_error(error, (ver, channel, epoch, corr), writer)
                         .await;
@@ -3686,6 +3696,7 @@ async fn handle_route_request(
     };
     let cursor_agent = permission_scope::cursor_agent(&facts, worker.as_ref());
     let cursor_session = permission_scope::cursor_session(&facts);
+    let detail = codemode::call_detail(&frame, &facts);
     permission_scope::WORKER_HOLDER
         .scope(
             worker,
@@ -3693,7 +3704,10 @@ async fn handle_route_request(
                 cursor_agent,
                 computer_capability::cursor::ACTING_SESSION.scope(
                     cursor_session,
-                    dispatch_resolved_route(frame, writer, planes, &facts),
+                    codemode::CALL_DETAIL.scope(
+                        std::cell::RefCell::new(detail),
+                        dispatch_resolved_route(frame, writer, planes, &facts),
+                    ),
                 ),
             ),
         )
@@ -3877,7 +3891,7 @@ async fn handle_management_request_observed(
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.
     // A flow route never gets them, even when acting for its owner.
-    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+    if codemode::legacy_run(facts)
         && matches!(
             method,
             management::OPEN_GRANT
@@ -6963,7 +6977,7 @@ async fn handle_tool_request_inner(
         )
         .await;
     }
-    if accepted_facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+    if codemode::legacy_run(&accepted_facts)
         && matches!(
             name,
             "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
@@ -7281,7 +7295,7 @@ async fn serve_browser_with_consent(
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
-    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode {
+    if codemode::legacy_run(facts) {
         reply["outcome"] = json!("consent_unavailable");
         reply["detail"]["reason"] = json!("agent_run");
         reply["remedy"] = agent_run_consent_refusal()["remedy"].clone();
@@ -7375,7 +7389,7 @@ async fn serve_browser_with_consent(
         &mut session,
         cingulate_client::card::CardKind::WebsiteAccessInCall,
         &question,
-        false,
+        codemode::active(),
     )
     .await
     {
@@ -7392,6 +7406,10 @@ async fn serve_browser_with_consent(
         }
     };
     pending["ask_id"] = json!(id);
+    if codemode::active() {
+        pending["context"] = reply["context"].clone();
+        return planes.browser.finish_reply(capability.name(), pending);
+    }
     let mut drain = planes.drain_signal.subscribe();
     let mut draining = false;
     let cancelled = async {
@@ -7821,6 +7839,8 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
+    let body = codemode::unsupported(body);
+    let force_content = body["outcome"] == "held_unsupported";
     let content_v1 = tool_result::RESULT_BIND
         .try_with(|binding| {
             binding.as_ref().is_some_and(|(tool, bind)| {
@@ -7833,7 +7853,7 @@ async fn send_tool_response(
             })
         })
         .unwrap_or(false);
-    let body = if content_v1 {
+    let body = if content_v1 || force_content {
         tool_result::encode(body)?
     } else {
         serde_json::to_vec(&body).map_err(ModuleError::Json)?
