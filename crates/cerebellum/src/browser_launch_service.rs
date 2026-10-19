@@ -3103,6 +3103,7 @@ mod executable_identity_launch_tests {
             surface: RouteSurface::Tools,
             scope: None,
             call_mode: subc_protocol::call_mode::CallMode::Classic,
+            codemode_head: None,
             flow_id: None,
         }
     }
@@ -4585,6 +4586,7 @@ mod orphan_recovery_tests {
                 surface: RouteSurface::Tools,
                 scope: None,
                 call_mode: subc_protocol::call_mode::CallMode::Classic,
+                codemode_head: None,
                 flow_id: None,
             }
         }

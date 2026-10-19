@@ -32,6 +32,7 @@ pub(crate) fn cursor_agent(
     facts: &AcceptedBindFacts,
     worker: Option<&ResolvedWorker>,
 ) -> Option<String> {
+    let facts = facts.head_context();
     if is_worker(facts) {
         return worker.map(|worker| match &worker.holder {
             GrantHolder::Head { agent_id } | GrantHolder::Worker { agent_id, .. } => {
@@ -55,6 +56,7 @@ pub(crate) fn cursor_agent(
 pub(crate) fn cursor_session(
     facts: &AcceptedBindFacts,
 ) -> Option<crate::computer_capability::cursor::SessionScope> {
+    let facts = facts.head_context();
     use crate::computer_capability::cursor::SessionScope;
     let stamp = facts.scope.as_ref()?;
     match stamp.kind {
@@ -164,6 +166,7 @@ pub(crate) async fn resolve_worker(
 /// A flow attribute alone is not delegation, and a caller-controlled project
 /// directory cannot establish the agent identity used to hold permissions.
 pub(crate) fn authorizing_holder(facts: &AcceptedBindFacts) -> Option<GrantHolder> {
+    let facts = facts.head_context();
     if facts.flow_id.is_none()
         && facts
             .scope
@@ -226,6 +229,7 @@ pub(crate) fn is_worker(facts: &AcceptedBindFacts) -> bool {
 /// and Cingulate resolves it to a live head. A worker must still pass the same
 /// admitted-caller check as a head session.
 pub(crate) fn card_stamp(facts: &AcceptedBindFacts) -> Option<&ScopeStamp> {
+    let facts = facts.head_context();
     (facts.admits_session_calls()
         && facts.flow_id.is_none()
         && (facts.agent_project_id_attested

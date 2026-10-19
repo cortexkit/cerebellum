@@ -2,6 +2,7 @@
 //! drain, the route's unbind and a Cancel frame each release it at once, and
 //! the request is counted exactly once as in flight or as awaiting consent.
 
+mod codemode;
 pub(crate) mod stack_tests;
 use super::*;
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};

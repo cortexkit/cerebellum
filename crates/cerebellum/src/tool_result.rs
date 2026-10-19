@@ -191,6 +191,14 @@ fn strip_inline_image(result: &mut ToolResult, reason: &str) -> Option<String> {
 
 pub(crate) fn encode(reply: Value) -> Result<Vec<u8>, ModuleError> {
     let mut result = project(reply);
+    // Programs use screenshot handles and dimensions; image bytes are for the
+    // model's direct view, not a JavaScript round trip through the carrier.
+    if crate::codemode::active() {
+        result
+            .content
+            .retain(|part| !matches!(part, ContentPart::Image(_)));
+        strip_inline_image(&mut result, "codemode");
+    }
     loop {
         let bytes = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
         if bytes.len() < result::MAX_RESULT_BYTES {

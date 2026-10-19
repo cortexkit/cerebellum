@@ -34,6 +34,7 @@ pub mod capability;
 pub mod cdp;
 pub mod cingulate_client;
 pub mod classification;
+mod codemode;
 pub mod computer_capability;
 pub mod computer_grants;
 pub mod connector_evidence;
@@ -1461,9 +1462,27 @@ async fn scope_epoch_admits_bind(
     else {
         return Ok(true);
     };
-    // Run scopes borrow their bind's head conversation. Their epochs must not
-    // revoke that conversation's grants or browser when a run is replaced.
+    // Runs borrow the resolved head route's conversation. A run being replaced
+    // must not revoke the head conversation's grants or browser.
     if stamp.attributes.run_id.is_some() {
+        if planes.routes.run_head(&stamp).ok().is_some_and(|head| {
+            head.scope
+                .as_ref()
+                .is_some_and(|head| planes.scopes.is_superseded(head))
+        }) {
+            let refusal = codemode::ParentRefusal::NoLiveHead;
+            send_route_error(
+                writer,
+                frame.header.ver,
+                0,
+                0,
+                frame.header.corr,
+                refusal.code(),
+                refusal.message(),
+            )
+            .await?;
+            return Ok(false);
+        }
         return Ok(true);
     }
     match planes.scopes.note_bind(&stamp, &identity.session) {
@@ -1728,7 +1747,7 @@ fn consent_context(
         context.park_limit = limit;
     }
     context.unattended = facts.flow_id.is_some();
-    context.agent_run = facts.call_mode == subc_protocol::call_mode::CallMode::Codemode;
+    context.agent_run = codemode::legacy_run(facts);
     if context.unattended {
         context.caller.conversation_key.clear();
     }
@@ -2738,6 +2757,7 @@ pub struct Planes {
     computer_for_test: Option<Arc<computer_capability::ScriptedComputerPlane>>,
     pub health: Arc<HealthState>,
     cancellations: RequestCancellations,
+    run_calls: codemode::RunCalls,
     browser_queue: Arc<call_queue::ConversationQueue>,
     draining: Arc<std::sync::atomic::AtomicBool>,
     /// The same drain, as a signal a waiting task can await: a call parked on
@@ -3209,6 +3229,7 @@ impl Planes {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
+            run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             capture,
             calls,
@@ -3246,6 +3267,7 @@ impl Clone for Planes {
             computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
             cancellations: self.cancellations.clone(),
+            run_calls: self.run_calls.clone(),
             browser_queue: self.browser_queue.clone(),
             draining: self.draining.clone(),
             drain_signal: Arc::clone(&self.drain_signal),
@@ -3591,6 +3613,36 @@ async fn handle_route_request(
         )
         .await;
     };
+    if facts.codemode_head.is_some() {
+        let resolved = planes
+            .routes
+            .run_head(facts.scope.as_ref().expect("admitted run stamp"));
+        let refusal = match resolved {
+            Err(refusal) => Some(refusal),
+            Ok(head)
+                if head.identity.conversation_key != facts.identity.conversation_key
+                    || head
+                        .scope
+                        .as_ref()
+                        .is_some_and(|stamp| planes.scopes.is_superseded(stamp)) =>
+            {
+                Some(codemode::ParentRefusal::NoLiveHead)
+            }
+            Ok(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code(),
+                refusal.message(),
+            )
+            .await;
+        }
+    }
     if let Some(method) = permissions::refused_method(&frame, &facts) {
         return send_route_error(writer, ver, channel, epoch, corr, "principal_denied",
             &format!("reserved:cingulate may call only permissions.list or permissions.revoke, not '{method}'"))
@@ -3622,6 +3674,16 @@ async fn handle_route_request(
     if facts.surface == RouteSurface::Tools {
         if let Ok(request) = serde_json::from_slice::<Value>(&frame.body) {
             if let Some(name) = request.get("name").and_then(Value::as_str) {
+                if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+                    && name == flat_tools::BROWSER_USE
+                    && request["arguments"]["browser"] == "user"
+                {
+                    return tool_provider::send_error(ErrorBody {
+                        code: "call_mode_unsupported".into(),
+                        message: "codemode does not support the user-browser plane".into(),
+                        detail: Some(json!({"tool":name,"mode":"codemode","action":request["arguments"]["action"]})),
+                    }, (ver, channel, epoch, corr), writer).await;
+                }
                 if let Err(error) = tool_provider::check_call_mode(name, &facts.call_mode, planes) {
                     return tool_provider::send_error(error, (ver, channel, epoch, corr), writer)
                         .await;
@@ -3655,6 +3717,7 @@ async fn handle_route_request(
     };
     let cursor_agent = permission_scope::cursor_agent(&facts, worker.as_ref());
     let cursor_session = permission_scope::cursor_session(&facts);
+    let detail = codemode::call_detail(&frame, &facts);
     permission_scope::WORKER_HOLDER
         .scope(
             worker,
@@ -3662,7 +3725,10 @@ async fn handle_route_request(
                 cursor_agent,
                 computer_capability::cursor::ACTING_SESSION.scope(
                     cursor_session,
-                    dispatch_resolved_route(frame, writer, planes, &facts),
+                    codemode::CALL_DETAIL.scope(
+                        std::cell::RefCell::new(detail),
+                        dispatch_resolved_route(frame, writer, planes, &facts),
+                    ),
                 ),
             ),
         )
@@ -3846,7 +3912,12 @@ async fn handle_management_request_observed(
     // Operator operations (list or revoke grants, profile-root rebind, and
     // launch-recovery clear) administer machine-wide grants and browser state.
     // A flow route never gets them, even when acting for its owner.
-    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+    if (codemode::legacy_run(facts)
+        || (facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+            && matches!(
+                method,
+                management::CLEAR_LAUNCH_RECOVERY | management::REBIND_PROFILE_ROOT
+            )))
         && matches!(
             method,
             management::OPEN_GRANT
@@ -5522,12 +5593,20 @@ async fn handle_control_request(
             role_versions: _,
             call_mode,
         } => {
-            // Basal needs verified flow delegation. Cingulate may bind only to
+            // Basal needs verified flow delegation or a resolved codemode head.
+            // Cingulate may bind only to
             // this module's management surface, where its calls are limited to
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
+            let mode = call_mode
+                .clone()
+                .unwrap_or(subc_protocol::call_mode::CallMode::Classic);
+            let run_candidate = scope.as_ref().is_some_and(|stamp| {
+                cerebellum_core::identity::codemode_carrier_candidate(stamp, &principal, &mode)
+            });
             if !trust.is_first_party()
+                && !run_candidate
                 && !scope.as_ref().is_some_and(|stamp| {
                     cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
                 })
@@ -5573,10 +5652,38 @@ async fn handle_control_request(
                 return send(writer, frame).await;
             }
 
+            let head = if run_candidate {
+                match route_bindings.run_head(scope.as_ref().expect("run candidate has a scope")) {
+                    Ok(head) => Some(head),
+                    Err(refusal) => {
+                        return send_route_error(
+                            writer,
+                            frame.header.ver,
+                            0,
+                            0,
+                            frame.header.corr,
+                            refusal.code(),
+                            refusal.message(),
+                        )
+                        .await
+                    }
+                }
+            } else {
+                None
+            };
+            // A carrier may put any session id on a run bind. Construct its
+            // identity from the admitted head instead, without consulting that id.
+            let head_identity = head.as_ref().map(|head| {
+                subc_protocol::BindIdentity::new(
+                    head.identity.project_root.to_string_lossy().into_owned(),
+                    "codemode-head",
+                    head.identity.conversation_key.clone(),
+                )
+            });
             // Retain only facts from the accepted bind. Data-plane frames inherit
             // these facts by (channel, epoch); request bodies cannot replace them.
             let mut accepted_facts = AcceptedBindFacts::from_bind(
-                &identity,
+                head_identity.as_ref().unwrap_or(&identity),
                 principal.clone(),
                 admission_facts.as_ref(),
                 consumer_capabilities.as_deref(),
@@ -5588,6 +5695,9 @@ async fn handle_control_request(
             .with_scope(scope);
             accepted_facts.call_mode =
                 call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic);
+            if let Some(head) = head {
+                accepted_facts = accepted_facts.with_codemode_head(&head);
+            }
             route_bindings.insert(route_channel, epoch, accepted_facts);
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
@@ -5868,6 +5978,14 @@ async fn handle_keyed_tool_request_inner(
         .await;
     };
     let principal = call_records::principal_label(facts.principal.as_ref());
+    // Install before durable admission finishes: a withdrawal can observe the
+    // new record as soon as its write completes, before this task resumes.
+    // Duplicate/replayed keys must not replace an executing call's handle.
+    let _run_call = planes.run_calls.register(
+        &facts,
+        &call_key,
+        planes.cancellations.get((channel, epoch, corr)),
+    );
     // Only an admission completed within its budget can authorize execution.
     // The worker keeps its permit through any late refusal write.
     let begun = {
@@ -6249,8 +6367,9 @@ async fn forward_recording_reply(
 }
 
 /// `tool.withdraw {call_key, scope?, carrier?}`: what became of a recorded
-/// call, and, for one that only asked a person, a guarantee that its action
-/// will never run. The question may still record a grant for a future call.
+/// call, interrupting a live codemode call after authorization. Only a record
+/// that merely asked a person guarantees its action will never run. The
+/// question may still record a grant for a future call.
 ///
 /// The answer is read from the record, so every permitted repeat gets the
 /// same bytes. A carrier looks up only its own key; an authorized scope owner
@@ -6411,10 +6530,21 @@ async fn handle_tool_withdraw(
     }
     match lookup {
         Lookup::Own(snapshot) => {
+            if let Some(cancel) =
+                planes
+                    .run_calls
+                    .cancellation(&carrier, &call_key, stamped.as_ref())
+            {
+                cancel.cancel();
+                if let (Some(agent), Some(cursor)) = (cancel.cursor_agent(), planes_cursor(planes))
+                {
+                    cursor.end(&agent);
+                }
+            }
             let answer = call_records::withdraw_answer(&snapshot);
-            // The held action has already returned without executing. Stopping
-            // the turn is not a refusal: its card may still record a late grant,
-            // but acting on that grant requires a new call.
+            // Interruption does not undo dispatched input. Only a record that
+            // merely asked a person proves the action will never run; a started
+            // call keeps its honest outcome even after cancellation is fired.
             send_tool_response(writer, ver, channel, epoch, corr, answer).await
         }
         Lookup::Unknown => {
@@ -6903,7 +7033,7 @@ async fn handle_tool_request_inner(
         )
         .await;
     }
-    if accepted_facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+    if codemode::legacy_run(&accepted_facts)
         && matches!(
             name,
             "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
@@ -7221,7 +7351,7 @@ async fn serve_browser_with_consent(
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
-    if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode {
+    if codemode::legacy_run(facts) {
         reply["outcome"] = json!("consent_unavailable");
         reply["detail"]["reason"] = json!("agent_run");
         reply["remedy"] = agent_run_consent_refusal()["remedy"].clone();
@@ -7315,7 +7445,7 @@ async fn serve_browser_with_consent(
         &mut session,
         cingulate_client::card::CardKind::WebsiteAccessInCall,
         &question,
-        false,
+        codemode::active(),
     )
     .await
     {
@@ -7332,6 +7462,10 @@ async fn serve_browser_with_consent(
         }
     };
     pending["ask_id"] = json!(id);
+    if codemode::active() {
+        pending["context"] = reply["context"].clone();
+        return planes.browser.finish_reply(capability.name(), pending);
+    }
     let mut drain = planes.drain_signal.subscribe();
     let mut draining = false;
     let cancelled = async {
@@ -7761,6 +7895,8 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
+    let mut body = codemode::unsupported(body);
+    let force_content = body["outcome"] == "held_unsupported";
     let content_v1 = tool_result::RESULT_BIND
         .try_with(|binding| {
             binding.as_ref().is_some_and(|(tool, bind)| {
@@ -7773,9 +7909,14 @@ async fn send_tool_response(
             })
         })
         .unwrap_or(false);
-    let body = if content_v1 {
+    let body = if content_v1 || force_content {
         tool_result::encode(body)?
     } else {
+        if codemode::active() {
+            if let Some(image) = body.get_mut("image").and_then(Value::as_object_mut) {
+                image.remove("data_b64");
+            }
+        }
         serde_json::to_vec(&body).map_err(ModuleError::Json)?
     };
     let response = Frame::build_with_version(
@@ -9929,6 +10070,7 @@ mod tests {
 
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
@@ -11775,6 +11917,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),
@@ -11858,6 +12001,7 @@ mod tests {
     pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
             cancellations: RequestCancellations::default(),
+            run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
             computer_admitted: test_admitted_computer_capabilities(),

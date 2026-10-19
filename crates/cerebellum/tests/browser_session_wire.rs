@@ -2784,6 +2784,7 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
         consumer_capabilities: Vec::new(),
         surface: RouteSurface::Tools,
         call_mode: subc_protocol::call_mode::CallMode::Classic,
+        codemode_head: None,
         scope: None,
     };
     // It must succeed: a refusal before the registry opened would also leave
@@ -9934,6 +9935,7 @@ fn only_profile_creation_marks_signed_in_coverage_complete() {
         consumer_capabilities: vec![],
         surface: RouteSurface::Tools,
         call_mode: subc_protocol::call_mode::CallMode::Classic,
+        codemode_head: None,
         scope: None,
     };
     let legacy = service

@@ -7406,3 +7406,5 @@ mod resource_busy_schema_tests {
 
 #[cfg(test)]
 mod agent_enforcement_tests;
+#[cfg(test)]
+mod codemode_tests;
