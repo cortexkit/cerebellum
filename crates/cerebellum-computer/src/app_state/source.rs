@@ -232,6 +232,15 @@ pub enum ElementActionError {
     UnsupportedOnPlatform,
 }
 
+/// Why a retained element's subtree could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementReadError {
+    /// The element no longer exists in the granted process.
+    Gone,
+    /// The element could not be resolved or answered within the read budget.
+    Unreadable,
+}
+
 /// Which text attribute a write sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAttribute {
@@ -294,6 +303,18 @@ pub trait AppStateSource: Send + Sync {
         bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         self.read_app_state(target, bounds)
+    }
+
+    /// Read only the subtree rooted at the retained element, without walking
+    /// from the application's root first.
+    fn read_element_state(
+        &self,
+        _target: &ProcessGrant,
+        _element: &ElementHandle,
+        _bounds: ReadBounds,
+        _expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        Err(ElementReadError::Unreadable)
     }
 
     /// What the element is now: owner, role, title, actions, settability.

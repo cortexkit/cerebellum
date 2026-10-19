@@ -134,8 +134,8 @@ pub use manual_accessibility::prepare_manual_accessibility;
 mod manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_state::{
-    read_app_state, read_app_state_with_menus, AxAppState, AxAppStateBounds, AxAppStateError,
-    AxRetainedElement, AxStateElement, AxStateValue,
+    read_app_state, read_app_state_with_menus, read_element_state, AxAppState, AxAppStateBounds,
+    AxAppStateError, AxRetainedElement, AxStateElement, AxStateValue,
 };
 #[cfg(target_os = "macos")]
 pub use code_signing::{

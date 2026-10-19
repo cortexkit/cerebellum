@@ -99,6 +99,11 @@ struct Entry {
     /// Menu ancestors let a deliberately collapsed menu preserve the identities
     /// of its unread descendants without claiming they disappeared.
     menu_ancestors: Vec<u64>,
+    /// Keep the parent menu context so a scoped read still hides Apple-menu
+    /// commands and knows when a selected menu is open.
+    in_apple_menu: bool,
+    is_apple_menu: bool,
+    selected_menu: bool,
 }
 
 #[derive(Debug)]
@@ -156,6 +161,9 @@ impl Session {
                 absent_reads: 0,
                 refusing,
                 menu_ancestors: Vec::new(),
+                in_apple_menu: false,
+                is_apple_menu: false,
+                selected_menu: false,
             },
         );
         Some(number)
@@ -464,6 +472,16 @@ impl AppStateSessions {
         target: &ProcessGrant,
         read: &RawAppState,
     ) -> SessionRead {
+        self.observe_with_context(conversation_key, target, read, None)
+    }
+
+    fn observe_with_context(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        read: &RawAppState,
+        root_context: Option<&ZoomRootContext>,
+    ) -> SessionRead {
         let key = SessionKey::new(conversation_key, target);
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -505,7 +523,20 @@ impl AppStateSessions {
             .roots
             .iter()
             .enumerate()
-            .map(|(index, root)| walk.node(root, None, index, false, false, (false, &[])))
+            .map(|(index, root)| {
+                if let Some(context) = root_context.filter(|_| read.roots.len() == 1) {
+                    walk.node(
+                        root,
+                        context.is_apple_menu.then_some("AXMenuBar"),
+                        0,
+                        false,
+                        context.in_apple_menu,
+                        (context.selected_menu, &context.menu_ancestors),
+                    )
+                } else {
+                    walk.node(root, None, index, false, false, (false, &[]))
+                }
+            })
             .collect();
         let Walk {
             tag: _,
@@ -588,6 +619,79 @@ impl AppStateSessions {
             observed.replacement = mostly_replaced(&before.roots, &observed.roots, &observed.diff);
         }
         session.latest = Some(observed.clone());
+        observed
+    }
+
+    /// Observe only a zoom target's subtree without aging elements outside it.
+    pub fn observe_zoomed_subtree(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        element_id: &str,
+        read: &RawAppState,
+    ) -> SessionRead {
+        let key = SessionKey::new(conversation_key, target);
+        let context = {
+            let state = self.lock();
+            let entry = parse_element_id(element_id)
+                .and_then(|(_, number)| state.sessions.get(&key)?.entries.get(&number));
+            entry.map_or_else(ZoomRootContext::default, |entry| ZoomRootContext {
+                in_apple_menu: entry.in_apple_menu,
+                is_apple_menu: entry.is_apple_menu,
+                selected_menu: entry.selected_menu,
+                menu_ancestors: entry.menu_ancestors.clone(),
+            })
+        };
+        let before = self.latest(conversation_key, target);
+        if read.roots.is_empty() {
+            return SessionRead {
+                roots: Vec::new(),
+                focused_element_id: None,
+                unreadable_subtrees: read.unreadable_subtrees,
+                diff: StateDiff::default(),
+                replacement: false,
+                complete: read.is_complete(),
+            };
+        };
+
+        // A scoped read has not inspected the elements outside its target. Keep
+        // their IDs live while the ordinary numbering walk observes this subtree.
+        let mut partial = read.clone();
+        partial.read_bound_reached = true;
+        let mut observed =
+            self.observe_with_context(conversation_key, target, &partial, Some(&context));
+        let target_node = observed
+            .roots
+            .first()
+            .cloned()
+            .expect("a scoped read has one root");
+        let mut roots = before
+            .as_ref()
+            .map(|previous| previous.roots.clone())
+            .unwrap_or_default();
+        if !replace_observed_node(&mut roots, element_id, &target_node) {
+            roots.push(target_node);
+        }
+        observed.roots = roots.clone();
+        observed.focused_element_id = None;
+        observed.complete = read.is_complete();
+        observed.replacement = before.as_ref().is_some_and(|previous| {
+            mostly_replaced(&previous.roots, &observed.roots, &observed.diff)
+        });
+
+        let mut latest = observed.clone();
+        latest.focused_element_id = before
+            .as_ref()
+            .and_then(|previous| previous.focused_element_id.clone());
+        latest.unreadable_subtrees = before
+            .as_ref()
+            .map_or(read.unreadable_subtrees, |previous| {
+                previous.unreadable_subtrees
+            });
+        latest.complete = false;
+        if let Some(session) = self.lock().sessions.get_mut(&key) {
+            session.latest = Some(latest);
+        }
         observed
     }
 
@@ -854,6 +958,31 @@ struct Walk<'a> {
     closed_menus: HashSet<u64>,
 }
 
+#[derive(Default)]
+struct ZoomRootContext {
+    in_apple_menu: bool,
+    is_apple_menu: bool,
+    selected_menu: bool,
+    menu_ancestors: Vec<u64>,
+}
+
+fn replace_observed_node(
+    nodes: &mut [ObservedNode],
+    element_id: &str,
+    replacement: &ObservedNode,
+) -> bool {
+    for node in nodes {
+        if node.element_id.as_deref() == Some(element_id) {
+            *node = replacement.clone();
+            return true;
+        }
+        if replace_observed_node(&mut node.children, element_id, replacement) {
+            return true;
+        }
+    }
+    false
+}
+
 impl Walk<'_> {
     /// Number one element and its descendants.
     ///
@@ -921,11 +1050,15 @@ impl Walk<'_> {
         };
         if let Some(number) = number {
             self.seen.insert(number);
-            self.session
+            let entry = self
+                .session
                 .entries
                 .get_mut(&number)
-                .expect("numbered entry")
-                .menu_ancestors = menu_ancestors.to_vec();
+                .expect("numbered entry");
+            entry.menu_ancestors = menu_ancestors.to_vec();
+            entry.in_apple_menu = in_apple_menu;
+            entry.is_apple_menu = is_apple_menu;
+            entry.selected_menu = selected_menu;
             if element.closed_menu_children > 0 {
                 self.closed_menus.insert(number);
             }

@@ -25,7 +25,10 @@ use crate::browser::state_text::STATE_TEXT_FIELD;
 use cerebellum_computer::app_state::person::{self, OwnInputLedger, SeenMarks};
 use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage};
 use cerebellum_computer::app_state::source::RunningApp;
-use cerebellum_computer::app_state::source::{AppStateReadError, AppStateSource, ReadBounds};
+use cerebellum_computer::app_state::source::{
+    AppStateReadError, AppStateSource, ElementActionError, ElementReadError, RawAppState,
+    ReadBounds,
+};
 use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{
     lock_audit, AuditToken, ComputerAudit, ComputerCapability, SharedAudit,
@@ -1035,16 +1038,19 @@ where
         // another conversation names nothing here; refused before reading so
         // the caller learns it at once.
         let zoom = parsed.zoom.as_deref().map(Zoom::parse);
-        if let Some(Zoom::Element(zoomed)) = zoom {
+        let zoom_element = if let Some(Zoom::Element(zoomed)) = zoom {
             match sessions.resolve(&conversation_key, zoomed) {
                 ElementResolution::Live {
+                    handle,
                     bundle_identity,
                     pid,
                     process_generation,
-                    ..
                 } if bundle_identity == grant.bundle_identity
                     && pid == grant.pid
-                    && process_generation == grant.process_generation_evidence => {}
+                    && process_generation == grant.process_generation_evidence =>
+                {
+                    Some((zoomed.to_owned(), handle))
+                }
                 ElementResolution::PreviousRun => {
                     let mut reply = element_actions::previous_run_reply();
                     admission.decorate(&mut reply);
@@ -1056,12 +1062,15 @@ where
                     return reply;
                 }
             }
-        }
+        } else {
+            None
+        };
 
         let source = self.app_state_source.clone();
         let read_grant = grant.clone();
         let expand_menus =
             sessions.zoom_expands_menus(&conversation_key, &grant, parsed.zoom.as_deref());
+        let read_zoom_element = zoom_element.clone();
         let read_work = work.clone();
         let read = tokio::task::spawn_blocking(move || {
             let _ax = read_work.bound_ax();
@@ -1076,10 +1085,29 @@ where
             // tree is read shows up at the next action rather than passing
             // as something this read showed.
             let seen = SeenMarks::read(source.as_ref(), &read_grant);
-            let raw = if expand_menus {
-                source.read_app_state_expanding_menus(&read_grant, ReadBounds::default())
+            let raw = if let Some((_, element)) = read_zoom_element {
+                match source.element_facts(&element) {
+                    Ok(facts) if facts.pid.is_none_or(|pid| pid == read_grant.pid) => source
+                        .read_element_state(
+                            &read_grant,
+                            &element,
+                            ReadBounds::default(),
+                            expand_menus,
+                        )
+                        .map_err(|error| match error {
+                            ElementReadError::Gone => StateReadFailure::ZoomGone,
+                            ElementReadError::Unreadable => StateReadFailure::ZoomUnreadable,
+                        }),
+                    Ok(_) | Err(ElementActionError::Gone) => Err(StateReadFailure::ZoomGone),
+                    Err(_) => Err(StateReadFailure::ZoomUnreadable),
+                }
             } else {
-                source.read_app_state(&read_grant, ReadBounds::default())
+                let raw = if expand_menus {
+                    source.read_app_state_expanding_menus(&read_grant, ReadBounds::default())
+                } else {
+                    source.read_app_state(&read_grant, ReadBounds::default())
+                };
+                raw.map_err(StateReadFailure::Application)
             };
             Some((
                 raw,
@@ -1088,13 +1116,17 @@ where
             ))
         })
         .await
-        .unwrap_or(Some((Err(AppStateReadError::Unreadable), None, None)));
+        .unwrap_or(Some((
+            Err(StateReadFailure::Application(AppStateReadError::Unreadable)),
+            None,
+            None,
+        )));
         let Some((raw, manual_accessibility, seen)) = read else {
             return quarantine::stopped_before_dispatch_reply();
         };
         let mut raw = match raw {
             Ok(raw) => raw,
-            Err(AppStateReadError::TargetGone) => {
+            Err(StateReadFailure::Application(AppStateReadError::TargetGone)) => {
                 let mut reply = json!({
                     "outcome": "not_running",
                     "bundle_identity": parsed.target,
@@ -1103,7 +1135,7 @@ where
                 admission.decorate(&mut reply);
                 return reply;
             }
-            Err(error) => {
+            Err(StateReadFailure::Application(error)) => {
                 let summary = cerebellum_computer::app_state::ReadStateSummary {
                     grant_identity: grant.clone(),
                     element_count: 0,
@@ -1131,7 +1163,35 @@ where
                 admission.decorate(&mut reply);
                 return reply;
             }
+            Err(StateReadFailure::ZoomGone) => {
+                let mut reply = stale_zoom_reply();
+                admission.decorate(&mut reply);
+                return reply;
+            }
+            Err(StateReadFailure::ZoomUnreadable) => RawAppState {
+                roots: Vec::new(),
+                focused: None,
+                unreadable_subtrees: 1,
+                read_bound_reached: true,
+            },
         };
+        if let Some((_, element)) = &zoom_element {
+            match raw.roots.first() {
+                Some(root)
+                    if raw.roots.len() == 1 && root.handle.same_element(element.as_ref()) => {}
+                Some(_) => {
+                    let mut reply = stale_zoom_reply();
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+                None if raw.is_complete() => {
+                    let mut reply = stale_zoom_reply();
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+                None => raw.unreadable_subtrees = raw.unreadable_subtrees.max(1),
+            }
+        }
         // Scheduled after the read so the picture can aim at the element that
         // has focus; with no focused element it stays where it already is.
         self.cursor.schedule(
@@ -1144,7 +1204,11 @@ where
         );
 
         let unpopulated = raw.mark_unpopulated_content();
-        let observed = sessions.observe(&conversation_key, &grant, &raw);
+        let observed = if let Some((element_id, _)) = &zoom_element {
+            sessions.observe_zoomed_subtree(&conversation_key, &grant, element_id, &raw)
+        } else {
+            sessions.observe(&conversation_key, &grant, &raw)
+        };
         let app_name = management.application_name(&grant);
         let mut rendered = render_state(
             &StateHeader {
@@ -1162,9 +1226,16 @@ where
             rendered.text.push_str("Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n");
         }
         if !rendered.zoom_found {
-            let mut reply = stale_zoom_reply();
-            admission.decorate(&mut reply);
-            return reply;
+            if !observed.complete && matches!(zoom, Some(Zoom::Element(_))) {
+                // An incomplete read cannot prove that a previously live element is gone.
+                rendered.text.push_str(
+                    "That part couldn't be read this time; read the state again without zoom, then try again.\n",
+                );
+            } else {
+                let mut reply = stale_zoom_reply();
+                admission.decorate(&mut reply);
+                return reply;
+            }
         }
 
         let mut reply = json!({
@@ -2249,6 +2320,12 @@ struct ParsedReadState {
     text_filter: Option<String>,
     include_image: bool,
     bring_to_front: bool,
+}
+
+enum StateReadFailure {
+    Application(AppStateReadError),
+    ZoomGone,
+    ZoomUnreadable,
 }
 
 fn invalid_read_state_request(field: &str, reason: &str) -> Value {
