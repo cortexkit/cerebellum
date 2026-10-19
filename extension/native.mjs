@@ -1,4 +1,5 @@
 import { bounded, DEADLINES, Refusal } from "./errors.mjs";
+import { EXTENSION_REVISION } from "./revision.mjs";
 
 export const NATIVE_HOST = "com.cortexkit.cerebellum";
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
@@ -144,7 +145,9 @@ export class NativeBridge {
     if (entry.state) entry.state.cancelled = true;
     try {
       await this.cleanup(entry);
-      this.post(entry, { type: "refused", reason: JSON.stringify({ reason: error.reason ?? "extension_error", ...(error.detail ?? { remedy: "read again" }) }), input_dispatched: entry.state?.input ?? false, detached: error.detached !== false });
+      // Every refusal carries the contract revision, so cerebellum can tell a
+      // refusal from a mismatched extension apart from an ordinary one.
+      this.post(entry, { type: "refused", reason: JSON.stringify({ reason: error.reason ?? "extension_error", ...(error.detail ?? { remedy: "read again" }), extension_revision: EXTENSION_REVISION }), input_dispatched: entry.state?.input ?? false, detached: error.detached !== false });
       this.end(entry);
       if (error.detached === false && this.epoch === entry.epoch) this.drop();
     } catch { if (this.epoch === entry.epoch) this.drop(); }
@@ -170,6 +173,9 @@ export class NativeBridge {
   async complete(entry, result) {
     if (entry.cancelled || entry.ended || this.epoch !== entry.epoch) return;
     await this.cleanup(entry);
+    // Every completed result carries the contract revision; cerebellum checks
+    // it before decoding anything else in the reply.
+    result = { ...result, extension_revision: EXTENSION_REVISION };
     const metadata = { input_dispatched: entry.state?.input ?? false, detached: true };
     const body = { type: "completed", result, ...metadata };
     // Check the whole escaped JSON envelope, not just the unescaped payload.

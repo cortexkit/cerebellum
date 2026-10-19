@@ -445,8 +445,12 @@ impl UserBrowser {
         route: Route,
         action: &str,
         args: &Value,
-        work_ms: u64,
+        budget: &crate::budgets::ActionBudget,
     ) -> Arc<UserExecution> {
+        let work_ms = budget.work_ms;
+        // The consent allowance follows the budget, not the action name: an
+        // `open_tab` that also navigates asks about its site like navigate.
+        let consents = crate::budgets::user_consent_count(budget.action);
         let tab = args["tab"].as_str().map(str::to_owned);
         let key = tab
             .clone()
@@ -464,15 +468,11 @@ impl UserBrowser {
                     .unwrap_or_else(|_| {
                         tokio::time::Instant::now()
                             + Duration::from_millis(
-                                work_ms
-                                    + crate::budgets::user_consent_count(action)
-                                        * crate::budgets::USER_CONSENT_MS,
+                                work_ms + consents * crate::budgets::USER_CONSENT_MS,
                             )
                     }),
                 parked: Duration::ZERO,
-                park_left: Duration::from_millis(
-                    crate::budgets::user_consent_count(action) * crate::budgets::USER_CONSENT_MS,
-                ),
+                park_left: Duration::from_millis(consents * crate::budgets::USER_CONSENT_MS),
                 parking: None,
             }),
             clock_changed: tokio::sync::Notify::new(),
@@ -617,6 +617,88 @@ fn opaque(prefix: &str) -> String {
 
 fn refusal(reason: &str) -> Value {
     json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false})
+}
+
+/// The revision of the cerebellum-to-extension contract this build speaks.
+/// The extension stamps its own revision (`EXTENSION_REVISION` in
+/// `extension/revision.mjs`) on every completed reply and every refusal, and
+/// both numbers must change together whenever a plan, reply or refusal shape
+/// changes. The manifest `version` is not used for this: the person's Chrome
+/// can keep running an old unpacked copy that reports the same `version`, and
+/// replies from such a copy must refuse with a reload remedy instead of
+/// failing to decode.
+pub(crate) const EXTENSION_REVISION: u64 = 1;
+
+const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
+const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
+
+/// The refusal for a reply whose extension revision differs from
+/// [`EXTENSION_REVISION`]. A missing revision means an extension older than
+/// the handshake itself, so it counts as outdated. Every reply from such an
+/// extension is untrusted for decoding, so nothing of it is relayed except
+/// whether input was dispatched.
+fn extension_revision_mismatch(found: Option<u64>, input_dispatched: Option<bool>) -> Value {
+    let newer = found.is_some_and(|revision| revision > EXTENSION_REVISION);
+    let mut reply = refusal(if newer {
+        "extension_newer"
+    } else {
+        "extension_outdated"
+    });
+    reply["remedy"] = json!(if newer {
+        EXTENSION_NEWER_REMEDY
+    } else {
+        EXTENSION_OUTDATED_REMEDY
+    });
+    reply["detail"] = json!({"extension_revision":found, "required_revision":EXTENSION_REVISION});
+    reply["input_dispatched"] = json!(input_dispatched);
+    reply
+}
+
+/// A reply from a current extension that still could not be decoded. It stays
+/// fail-closed, but names the decoding `step` and, when serde reports one, the
+/// field, so the next contract drift is diagnosable from the refusal alone.
+/// serde's full message is never relayed: an "invalid type" message quotes the
+/// offending value, which can be page content. Field names come from the
+/// extension's own reply keys, and anything that does not look like one is
+/// dropped.
+fn protocol_error(step: &str, error: Option<&serde_json::Error>) -> Value {
+    let mut reply = refusal("protocol_error");
+    let mut detail = json!({"step":step});
+    if let Some(error) = error {
+        let message = error.to_string();
+        let (problem, field) = if let Some(rest) = message.strip_prefix("missing field `") {
+            ("missing_field", rest.split('`').next())
+        } else if let Some(rest) = message.strip_prefix("unknown field `") {
+            ("unknown_field", rest.split('`').next())
+        } else {
+            ("wrong_type", None)
+        };
+        detail["problem"] = json!(problem);
+        if let Some(field) = field.filter(|field| {
+            !field.is_empty()
+                && field.len() <= 64
+                && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }) {
+            detail["field"] = json!(field);
+        }
+    }
+    reply["detail"] = detail;
+    reply
+}
+
+/// [`protocol_error`] for a reply value that is present but not the expected
+/// type, at a named field of a named step.
+fn protocol_field_error(step: &str, field: &str) -> Value {
+    let mut reply = protocol_error(step, None);
+    reply["detail"]["field"] = json!(field);
+    reply["detail"]["problem"] = json!("wrong_type");
+    reply
+}
+
+/// Decode an extension reply as `T`, refusing with [`protocol_error`] for
+/// `step` when it does not match.
+fn decode<T: serde::de::DeserializeOwned>(step: &str, raw: Value) -> Result<T, Value> {
+    serde_json::from_value(raw).map_err(|error| protocol_error(step, Some(&error)))
 }
 
 fn observer_unavailable() -> Value {
@@ -895,7 +977,37 @@ async fn invoke(
     command["action"] = json!(action);
     let outcome = bridge.invoke(route, command, cancel.clone()).await;
     if outcome.terminal == Terminal::Completed {
-        return outcome.result.ok_or_else(|| refusal("protocol_error"));
+        let mut result = outcome
+            .result
+            .ok_or_else(|| protocol_error("reply", None))?;
+        // Check the revision before any decoding, so an extension speaking
+        // another contract is named as such rather than surfacing as
+        // whichever field it happens to lack. Remove it here so the per-action
+        // reply types, which deny unknown fields, never see it.
+        let revision = result
+            .as_object_mut()
+            .and_then(|fields| fields.remove("extension_revision"))
+            .and_then(|revision| revision.as_u64());
+        if revision != Some(EXTENSION_REVISION) {
+            return Err(extension_revision_mismatch(
+                revision,
+                outcome.input_dispatched,
+            ));
+        }
+        return Ok(result);
+    }
+    // A current extension encodes every refusal as JSON carrying its
+    // revision, so a refusal without one (or with another) comes from an
+    // extension speaking another contract, whose reason cannot be trusted.
+    if let Some(reason) = &outcome.extension_reason {
+        let revision = serde_json::from_str::<Value>(reason)
+            .ok()
+            .and_then(|detail| detail.get("extension_revision").and_then(Value::as_u64));
+        if revision != Some(EXTENSION_REVISION) {
+            let mut reply = extension_revision_mismatch(revision, outcome.input_dispatched);
+            reply["outcome"] = serde_json::to_value(outcome.terminal).expect("terminal serializes");
+            return Err(reply);
+        }
     }
     let mut reply = refusal(
         outcome
@@ -986,14 +1098,14 @@ async fn plan(
         command["interaction_epoch"] = json!(epoch);
     }
     let raw = invoke(bridge, route, cancel, "cdp", command).await?;
-    let reply: PlanReply = serde_json::from_value(raw).map_err(|_| refusal("protocol_error"))?;
+    let reply: PlanReply = decode("cdp_reply", raw)?;
     if reply.popup_activated_briefly {
         let _ = POPUP_SEEN.try_with(|seen| seen.set(true));
     }
     let mut results = Vec::new();
     let mut dispatched = false;
     if reply.results.len() > count {
-        return Err(refusal("protocol_error"));
+        return Err(protocol_field_error("cdp_reply", "results"));
     }
     for (index, result) in reply.results.into_iter().enumerate() {
         match result {
@@ -1029,7 +1141,10 @@ async fn plan(
         return Err(read_again(dispatched));
     }
     if results.len() != count {
-        return Err(prior_input(refusal("protocol_error"), dispatched));
+        return Err(prior_input(
+            protocol_field_error("cdp_reply", "results"),
+            dispatched,
+        ));
     }
     Ok(Plan {
         results,
@@ -1113,10 +1228,10 @@ async fn document(
     .await?;
     let history = plan.results[0]
         .as_object()
-        .ok_or_else(|| refusal("protocol_error"))?;
+        .ok_or_else(|| protocol_error("navigation_history", None))?;
     let tree = plan.results[1]
         .as_object()
-        .ok_or_else(|| refusal("protocol_error"))?;
+        .ok_or_else(|| protocol_error("frame_tree", None))?;
     let committed = crate::browser::navigation::committed_document_from(history, tree)
         .ok_or_else(|| refusal("document_not_ready"))?;
     let mut frames = Vec::new();
@@ -1157,7 +1272,7 @@ fn collect_frames(
         frame[field]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| refusal("protocol_error"))
+            .ok_or_else(|| protocol_field_error("frame_tree", field))
     };
     let url = text("url")?;
     let id = text("id")?;
@@ -1228,7 +1343,7 @@ pub(crate) async fn serve(
     action: &str,
     args: &Value,
 ) -> Value {
-    let Some(budget) = crate::budgets::user_browser(action) else {
+    let Some(budget) = crate::budgets::user_browser_call(action, args) else {
         return invalid("action", "unsupported_value");
     };
     let Some(permits) = planes.user_browser.target().workers.try_call() else {
@@ -1245,7 +1360,7 @@ pub(crate) async fn serve(
         },
         action,
         args,
-        budget.work_ms,
+        budget,
     );
     let result = EXECUTION_PERMITS.scope(Arc::new(permits),
         EXECUTION.scope(Arc::clone(&execution), POPUP_SEEN.scope(Cell::new(false), async {
@@ -1349,6 +1464,27 @@ fn validate(action: &str, args: &Value) -> Result<(), Value> {
     }
     if action == "revoke_access" {
         fields.insert("origin".into(), json!({"type":"string"}));
+    }
+    // The extension can open a tab directly at a URL, but cerebellum opens it
+    // blank and then runs the same per-site grant, navigation and landing
+    // checks as `navigate` (see `serve_inner`), so one call can open and load
+    // a page without bypassing site consent.
+    if action == "open_tab" {
+        fields.insert("url".into(), json!({"type":"string","minLength":1}));
+    }
+    // The shared `wait` field asks for page settlement before reading, but the
+    // person's browser reports command results only, never the network quiet
+    // that settlement is judged by. `none` is exactly what a read here does,
+    // so it is accepted; `settle` is refused by name rather than treated as an
+    // unknown field or silently ignored.
+    if matches!(action, "snapshot" | "screenshot") {
+        if object.get("wait").is_some_and(|wait| wait == "settle") {
+            let mut reply = refusal("unsupported_on_user_browser");
+            reply["detail"] = json!({"field":"wait","reason_code":"unsupported_value"});
+            reply["remedy"] = json!(format!("wait: settle doesn't apply to {action} on the user browser: page settlement isn't observed there, so a read returns the page as it is now. Omit wait or pass none, and read again if the page is still loading."));
+            return Err(reply);
+        }
+        fields.insert("wait".into(), json!({"type":"string","enum":["none"]}));
     }
     if action == "open_grant" {
         fields.insert(
@@ -1920,8 +2056,7 @@ async fn serve_inner(
     };
     if action == "status" {
         let raw = invoke(bridge, route, &context.cancel, "status", json!({})).await?;
-        let inventory: Inventory =
-            serde_json::from_value(raw).map_err(|_| refusal("protocol_error"))?;
+        let inventory: Inventory = decode("status_reply", raw)?;
         if inventory.connection_epoch != connection {
             return Err(read_again(false));
         }
@@ -1932,7 +2067,7 @@ async fn serve_inner(
         }
         for tab in inventory.tabs {
             if tab.tab.is_empty() {
-                return Err(refusal("protocol_error"));
+                return Err(protocol_field_error("status_reply", "tab"));
             }
             if state
                 .claims
@@ -1970,44 +2105,86 @@ async fn serve_inner(
                 return Err(refusal("tab_already_claimed"));
             }
         }
+        // `open_tab` with a page URL opens the tab blank and then navigates it
+        // exactly as `navigate` would. The site is asked about first, so a
+        // refused site opens no tab at all.
+        let open_url = (action == "open_tab")
+            .then(|| args.get("url").and_then(Value::as_str))
+            .flatten()
+            .filter(|url| *url != "about:blank");
+        let once = match open_url {
+            Some(url) => {
+                let site = origin(url)?;
+                let severity = authorization::effective_severity(
+                    Action::Navigate,
+                    Action::Navigate.floor(),
+                    None,
+                )
+                .map_err(|_| refusal("severity_below_floor"))?;
+                Some(context.authorize(&site, severity, BTreeSet::new()).await?)
+            }
+            None => None,
+        };
+        let mut command = args.clone();
+        if open_url.is_some() {
+            if let Some(fields) = command.as_object_mut() {
+                fields.remove("url");
+            }
+        }
         planes
             .browser
             .journal_user_browser(&facts.identity, action, None, "dispatch_committed", None)
             .await
             .map_err(|_| refusal("journal_unavailable"))?;
-        let raw = invoke(bridge, route, &context.cancel, action, args.clone()).await?;
-        let claimed: Claimed =
-            serde_json::from_value(raw).map_err(|_| refusal("protocol_error"))?;
+        let raw = invoke(bridge, route, &context.cancel, action, command.clone()).await?;
+        let claimed: Claimed = decode("tab_reply", raw)?;
         if claimed.connection_epoch != connection || bridge.connected_epoch() != Some(connection) {
             return Err(read_again(false));
         }
         if action == "claim_tab" && args["tab"] != claimed.tab {
-            return Err(refusal("protocol_error"));
+            return Err(protocol_field_error("tab_reply", "tab"));
         }
-        let mut state = target.state();
-        if state.ended_routes.contains(&route) || state.connection != Some(connection) {
-            return Err(refusal("route_closed"));
-        }
-        if state
-            .claims
-            .get(&claimed.tab)
-            .is_some_and(|owner| *owner != route)
         {
-            return Err(refusal("tab_already_claimed"));
+            let mut state = target.state();
+            if state.ended_routes.contains(&route) || state.connection != Some(connection) {
+                return Err(refusal("route_closed"));
+            }
+            if state
+                .claims
+                .get(&claimed.tab)
+                .is_some_and(|owner| *owner != route)
+            {
+                return Err(refusal("tab_already_claimed"));
+            }
+            state.claims.insert(claimed.tab.clone(), route);
+            if action == "open_tab"
+                && command.get("opener_tab").is_none()
+                && command
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_none_or(|url| url == "about:blank")
+            {
+                state.unobserved_blank.insert(claimed.tab.clone());
+            }
         }
-        state.claims.insert(claimed.tab.clone(), route);
-        if action == "open_tab"
-            && args.get("opener_tab").is_none()
-            && args
-                .get("url")
-                .and_then(Value::as_str)
-                .is_none_or(|url| url == "about:blank")
-        {
-            state.unobserved_blank.insert(claimed.tab.clone());
+        let (Some(url), Some(once)) = (open_url, once) else {
+            return Ok(
+                json!({"browser":"user","outcome":"ok","tab":claimed.tab,"interaction_epoch":claimed.interaction_epoch,"connection_epoch":connection,"input_dispatched":false}),
+            );
+        };
+        let tab = claimed.tab;
+        let navigation = json!({"tab":tab,"url":url});
+        let navigated = async {
+            let current = context.document(&tab).await?;
+            navigate(&context, &tab, &navigation, &current, &once).await
         }
-        return Ok(
-            json!({"browser":"user","outcome":"ok","tab":claimed.tab,"interaction_epoch":claimed.interaction_epoch,"connection_epoch":connection,"input_dispatched":false}),
-        );
+        .await;
+        // The tab now exists and is claimed even when loading the page was
+        // refused, so the refusal names it for a retry with `navigate`.
+        return navigated.map_err(|mut reply| {
+            reply["tab"] = json!(tab);
+            reply
+        });
     }
     if action == "open_grant" {
         let value = args["origins"][0].as_str().expect("validated origin");
@@ -2059,92 +2236,7 @@ async fn serve_inner(
         };
         let once = context.authorize(&site, severity, BTreeSet::new()).await?;
         if action == "navigate" {
-            let observed = context.document(tab).await?;
-            let created_blank = current.committed.url == "about:blank"
-                && observed.committed.url == "about:blank"
-                && target.state().unobserved_blank.contains(tab)
-                && (!current.observer_available || !observed.observer_available);
-            // An openerless agent-created blank document may not have an observer
-            // before an HTTP document commits. Only explicit initial navigation may lack
-            // observation; reference input and handed tabs never receive this exception.
-            if !created_blank
-                && (!current.observer_available
-                    || !observed.observer_available
-                    || current.observer_continuity != observed.observer_continuity)
-            {
-                return Err(observer_unavailable());
-            }
-            if !created_blank
-                && (current.committed != observed.committed
-                    || current.interaction != observed.interaction)
-            {
-                return Err(read_again(false));
-            }
-            if !created_blank {
-                bind_observer_continuity(observed.observer_continuity);
-            }
-            let navigation = context
-                .cdp(
-                    tab,
-                    (!created_blank).then_some(observed.interaction),
-                    vec![command("Page.navigate", json!({"url":args["url"]}))],
-                )
-                .await?;
-            if navigation.results[0].get("errorText").is_some() {
-                return Err(refusal("navigation_failed"));
-            }
-            target.state().unobserved_blank.remove(tab);
-            let loader = navigation.results[0]["loaderId"].as_str();
-            let deadline = tokio::time::Instant::now() + NAVIGATION_READ_DEADLINE;
-            let mut ticks = tokio::time::interval(Duration::from_millis(25));
-            let mut observer_deadline = None;
-            let landed = loop {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(refusal("navigation_read_deadline"));
-                }
-                ticks.tick().await;
-                let landed = context.document(tab).await?;
-                if loader.is_some_and(|loader| landed.committed.loader_id == loader)
-                    || (loader.is_none()
-                        && (landed.committed.url == args["url"].as_str().unwrap()
-                            || landed.committed.url != current.committed.url))
-                {
-                    if landed.observer_available {
-                        break landed;
-                    }
-                    let limit = observer_deadline.get_or_insert_with(|| {
-                        tokio::time::Instant::now() + Duration::from_secs(5)
-                    });
-                    if tokio::time::Instant::now() >= *limit {
-                        return Err(observer_unavailable());
-                    }
-                }
-            };
-            let landing = origin(&landed.committed.url)?;
-            if !context.granted(
-                &landing,
-                Severity::new(1, false, false),
-                &BTreeSet::new(),
-                Some(&once),
-            ) {
-                return Err(refusal("landing_site_not_authorized"));
-            }
-            let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"connection_epoch":connection,"interaction_epoch":landed.interaction,"input_dispatched":false});
-            // Plans carry command results, not the Page/Network event stream
-            // the own-browser Tracker uses to establish network quiet.
-            reply["settled"] = json!(false);
-            reply["settlement_reason"] = json!("settlement isn't observed on the person's browser");
-            reply["remedy"] =
-                json!("Read the page before acting; only its committed document was confirmed.");
-            if navigation.popup {
-                reply["popup_activated_briefly"] = json!(true);
-            }
-            if args["read_page"] == true {
-                bind_observer_continuity(landed.observer_continuity);
-                let read = capture(&context, tab, args, &landed, &once, None).await?;
-                reply["read_page"] = read;
-            }
-            return Ok(reply);
+            return navigate(&context, tab, args, &current, &once).await;
         }
         let observed = context.document(tab).await?;
         if !observed.observer_available
@@ -2167,6 +2259,103 @@ async fn serve_inner(
         return capture(&context, tab, args, &observed, &once, zoom.as_ref()).await;
     }
     input(&context, tab, action, args, &current).await
+}
+
+/// Navigate a claimed tab to `args["url"]` after `once` authorized that site,
+/// then confirm the landing document is observed and its site authorized.
+/// `current` is the document read before authorization. `navigate` and
+/// `open_tab` with a URL share this, so both apply the same checks.
+async fn navigate(
+    context: &Context<'_>,
+    tab: &str,
+    args: &Value,
+    current: &Document,
+    once: &InvocationGrant,
+) -> Result<Value, Value> {
+    let observed = context.document(tab).await?;
+    let created_blank = current.committed.url == "about:blank"
+        && observed.committed.url == "about:blank"
+        && context.target().state().unobserved_blank.contains(tab)
+        && (!current.observer_available || !observed.observer_available);
+    // An openerless agent-created blank document may not have an observer
+    // before an HTTP document commits. Only explicit initial navigation may lack
+    // observation; reference input and handed tabs never receive this exception.
+    if !created_blank
+        && (!current.observer_available
+            || !observed.observer_available
+            || current.observer_continuity != observed.observer_continuity)
+    {
+        return Err(observer_unavailable());
+    }
+    if !created_blank
+        && (current.committed != observed.committed || current.interaction != observed.interaction)
+    {
+        return Err(read_again(false));
+    }
+    if !created_blank {
+        bind_observer_continuity(observed.observer_continuity);
+    }
+    let navigation = context
+        .cdp(
+            tab,
+            (!created_blank).then_some(observed.interaction),
+            vec![command("Page.navigate", json!({"url":args["url"]}))],
+        )
+        .await?;
+    if navigation.results[0].get("errorText").is_some() {
+        return Err(refusal("navigation_failed"));
+    }
+    context.target().state().unobserved_blank.remove(tab);
+    let loader = navigation.results[0]["loaderId"].as_str();
+    let deadline = tokio::time::Instant::now() + NAVIGATION_READ_DEADLINE;
+    let mut ticks = tokio::time::interval(Duration::from_millis(25));
+    let mut observer_deadline = None;
+    let landed = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(refusal("navigation_read_deadline"));
+        }
+        ticks.tick().await;
+        let landed = context.document(tab).await?;
+        if loader.is_some_and(|loader| landed.committed.loader_id == loader)
+            || (loader.is_none()
+                && (landed.committed.url == args["url"].as_str().unwrap()
+                    || landed.committed.url != current.committed.url))
+        {
+            if landed.observer_available {
+                break landed;
+            }
+            let limit = observer_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
+            if tokio::time::Instant::now() >= *limit {
+                return Err(observer_unavailable());
+            }
+        }
+    };
+    let landing = origin(&landed.committed.url)?;
+    if !context.granted(
+        &landing,
+        Severity::new(1, false, false),
+        &BTreeSet::new(),
+        Some(once),
+    ) {
+        return Err(refusal("landing_site_not_authorized"));
+    }
+    let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"connection_epoch":context.connection,"interaction_epoch":landed.interaction,"input_dispatched":false});
+    // Plans carry command results, not the Page/Network event stream
+    // the own-browser Tracker uses to establish network quiet.
+    reply["settled"] = json!(false);
+    reply["settlement_reason"] = json!("settlement isn't observed on the person's browser");
+    reply["remedy"] =
+        json!("Read the page before acting; only its committed document was confirmed.");
+    if navigation.popup {
+        reply["popup_activated_briefly"] = json!(true);
+    }
+    if args["read_page"] == true {
+        bind_observer_continuity(landed.observer_continuity);
+        let read = capture(context, tab, args, &landed, once, None).await?;
+        reply["read_page"] = read;
+    }
+    return Ok(reply);
 }
 
 fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
@@ -2373,7 +2562,7 @@ async fn capture_attempt(
                 };
                 let backend = owner.results[0]["backendNodeId"]
                     .as_u64()
-                    .ok_or_else(|| refusal("protocol_error"))?;
+                    .ok_or_else(|| protocol_field_error("DOM.getFrameOwner", "backendNodeId"))?;
                 let owner_ref = snapshot
                     .refs
                     .iter()
@@ -2463,10 +2652,10 @@ async fn capture_attempt(
         popup |= plan.popup;
         let nodes = plan.results[1]["nodes"]
             .as_array()
-            .ok_or_else(|| refusal("protocol_error"))?;
+            .ok_or_else(|| protocol_field_error("Accessibility.getFullAXTree", "nodes"))?;
         let dom = plan.results[3]
             .as_object()
-            .ok_or_else(|| refusal("protocol_error"))?;
+            .ok_or_else(|| protocol_error("DOM.getFlattenedDocument", None))?;
         let observation = snapshot_from_capture(
             nodes,
             dom,
@@ -2634,7 +2823,7 @@ async fn capture_attempt(
                 frame.frame_id.clone(),
                 outer.results[0]["outerHTML"]
                     .as_str()
-                    .ok_or_else(|| refusal("protocol_error"))?
+                    .ok_or_else(|| protocol_field_error("DOM.getOuterHTML", "outerHTML"))?
                     .to_owned(),
             ));
         }
@@ -2927,7 +3116,7 @@ async fn screenshot(
     }
     let image = capture.results[1]["data"]
         .as_str()
-        .ok_or_else(|| refusal("protocol_error"))?;
+        .ok_or_else(|| protocol_field_error("Page.captureScreenshot", "data"))?;
     let decoded = crate::coordinate::validate_png_base64_dimensions(image)
         .map_err(|_| refusal("screenshot_not_ready"))?;
     if decoded.as_bytes().len() > args["max_bytes"].as_u64().unwrap_or(262144) as usize {
@@ -3019,10 +3208,10 @@ async fn input(
             (
                 local["x"]
                     .as_f64()
-                    .ok_or_else(|| refusal("protocol_error"))?,
+                    .ok_or_else(|| protocol_field_error("DOM.getNodeForLocation", "frame_point"))?,
                 local["y"]
                     .as_f64()
-                    .ok_or_else(|| refusal("protocol_error"))?,
+                    .ok_or_else(|| protocol_field_error("DOM.getNodeForLocation", "frame_point"))?,
             )
         };
         (
@@ -3165,8 +3354,7 @@ async fn input(
                 json!({"url":url,"opener_tab":tab}),
             )
             .await?;
-            let opened: Claimed =
-                serde_json::from_value(raw).map_err(|_| refusal("protocol_error"))?;
+            let opened: Claimed = decode("tab_reply", raw)?;
             if opened.connection_epoch != context.connection {
                 return Err(read_again(false));
             }

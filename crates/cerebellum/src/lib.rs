@@ -188,9 +188,10 @@ fn route_limits(frame: &Frame, planes: &Planes) -> (u64, u64) {
         }
     }
     if body["name"] == flat_tools::BROWSER_USE && body["arguments"]["browser"] == "user" {
-        if let Some(budget) =
-            budgets::user_browser(body["arguments"]["action"].as_str().unwrap_or_default())
-        {
+        if let Some(budget) = budgets::user_browser_call(
+            body["arguments"]["action"].as_str().unwrap_or_default(),
+            &body["arguments"],
+        ) {
             let envelope = budgets::CALL_RECORD_BEGIN_MS
                 + budgets::BROWSER_QUEUE_WAIT_LIMIT_MS
                 + budgets::user_consent_count(budget.action) * budgets::USER_CONSENT_MS

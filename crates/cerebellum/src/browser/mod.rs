@@ -5619,7 +5619,14 @@ pub(crate) fn validate_user_browser_result(
                     closed_object(json!({"reason":string_schema()}), &["reason"]),
                     // A cdp_error refusal names the rejected plan command and
                     // Chrome's fixed error code and message, never page text.
-                    closed_object(json!({"method":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"])]}
+                    closed_object(json!({"method":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"]),
+                    // An extension_outdated or extension_newer refusal names
+                    // the extension's contract revision (null when it sent
+                    // none) and the one this build requires.
+                    closed_object(json!({"extension_revision":{"anyOf":[integer_schema(),{"type":"null"}]},"required_revision":integer_schema()}), &["extension_revision","required_revision"]),
+                    // A protocol_error refusal names the decoding step and,
+                    // when known, the reply field and what was wrong with it.
+                    closed_object(json!({"step":string_schema(),"field":string_schema(),"problem":string_schema()}), &["step"])]}
             }),
             &["browser", "outcome"],
         )

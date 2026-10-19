@@ -601,6 +601,25 @@ pub fn user_browser(action: &str) -> Option<&'static ActionBudget> {
     })
 }
 
+/// The budget for one user-browser call with its `arguments`. An `open_tab`
+/// with a page URL also navigates the new tab, with its own site card, so it
+/// runs on navigate's budget: the opening plan takes the place of navigate's
+/// optional page read, which this call never makes.
+pub fn user_browser_call(
+    action: &str,
+    arguments: &serde_json::Value,
+) -> Option<&'static ActionBudget> {
+    if action == "open_tab"
+        && arguments
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|url| url != "about:blank")
+    {
+        return Some(&USER_NAVIGATE);
+    }
+    user_browser(action)
+}
+
 pub const fn user_consent_count(action: &str) -> u64 {
     // A click can ask once to inspect its page, again for a sensitive control
     // (for example a submit button), and once for a link to a different site.

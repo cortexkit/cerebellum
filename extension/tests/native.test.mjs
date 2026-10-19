@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { NativeBridge, byteLength, chunks, CHUNK_BYTES, MAX_MESSAGE_BYTES } from "../native.mjs";
+import { EXTENSION_REVISION } from "../revision.mjs";
 import { setup, route, read, release, turn } from "./harness.mjs";
 import { deferred } from "./fake-chrome.mjs";
 import { readFileSync } from "node:fs";
@@ -275,4 +276,34 @@ test("native bridge answers the native host's own frames for a first open_tab wi
   assert.equal(completed.detached, true);
   assert.equal(typeof completed.result.tab, "string");
   assert.equal(completed.result.connection_epoch, hostWire.epoch);
+});
+
+// Cerebellum refuses any reply whose contract revision is missing or differs
+// from its own, so every terminal reply shape must carry it.
+test("completed, chunked and refused replies all carry the contract revision", async t => {
+  const f = await native(t);
+  assert.ok(Number.isSafeInteger(EXTENSION_REVISION) && EXTENSION_REVISION > 0);
+  const completed = await f.invoke(1, f.cdp([read]));
+  assert.equal(completed.result.extension_revision, EXTENSION_REVISION);
+  assert.deepEqual(completed.result.results, [{ result: { method: read.method } }]);
+
+  f.attach(2, f.cdp([{ method: "Target.createTarget", params: {} }]));
+  const refusal = JSON.parse((await waitBody(f.port, "refused", 2)).reason);
+  assert.equal(refusal.reason, "unsupported_cdp_method");
+  assert.equal(refusal.extension_revision, EXTENSION_REVISION);
+
+  f.chrome.debugger.sendCommand = async () => ({ data: "x".repeat(1100000) });
+  f.attach(3, f.cdp([read]));
+  await waitBody(f.port, "attached", 3);
+  f.send(3, { type: "dispatch" });
+  await waitBody(f.port, "reply_end", 3);
+  const text = f.port.sent.filter(frame => frame.message.id === 3 && frame.message.body.type === "reply_chunk").map(frame => frame.message.body.data).join("");
+  assert.equal(JSON.parse(text).extension_revision, EXTENSION_REVISION);
+});
+
+test("the extension's contract revision matches the one cerebellum requires", async () => {
+  const rust = readFileSync(new URL("../../crates/cerebellum/src/user_browser.rs", import.meta.url), "utf8");
+  const required = rust.match(/^pub\(crate\) const EXTENSION_REVISION: u64 = (\d+);$/m);
+  assert.ok(required, "cerebellum must declare EXTENSION_REVISION");
+  assert.equal(Number(required[1]), EXTENSION_REVISION);
 });
