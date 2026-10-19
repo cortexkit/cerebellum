@@ -388,11 +388,7 @@ impl Fixture {
                 }),
                 consumer_capabilities: Some(vec!["elicitation".into()]),
                 admission_facts: None,
-                scope: scoped.then(|| ScopeSelector {
-                    owner: reserved(OWNER),
-                    scope_ref: "flow-live".into(),
-                    scope_epoch: Some(1),
-                }),
+                scope: scoped.then(|| ScopeSelector::new(reserved(OWNER), "flow-live", Some(1))),
             },
         )
         .await;
