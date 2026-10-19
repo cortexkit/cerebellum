@@ -165,28 +165,60 @@ export class InteractionEpochs {
       record.installAttempts.set(slot, attempts);
     }
     if (attempts.installed && !retry) return true;
-    // One commit-time attempt and one read-time retry per document. A missing
-    // receiver must never turn repeated reads into an unbounded injection loop.
+    // Share a two-injection budget between permission-binding recovery and a
+    // fresh read's missing-receiver repair; neither can create an endless loop.
     if (attempts.count >= 2) return false;
-    attempts.count += 1;
     const task = (async () => {
-      try {
-        const target = documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId] };
-        await bounded(this.chrome.scripting.executeScript({ target, files: ["sentinel.js"], world: "ISOLATED", injectImmediately: true }), "dispatch");
+      while (attempts.count < 2) {
+        // The site's agent grant and Chrome's extension host access are separate
+        // permissions. An initial blank tab has no HTTP host to confirm; a blank
+        // child may inherit its live parent's access. Never prompt here.
+        let frame;
+        let allowed = false;
+        let documentKind = "other";
+        try {
+          const frames = await bounded(this.chrome.webNavigation.getAllFrames({ tabId }), "dispatch");
+          frame = frames?.find(frame => frame.frameId === frameId);
+          if (!frame || documentId && frame.documentId !== documentId) return false;
+          let url = new URL(frame.url);
+          documentKind = ["http:", "https:"].includes(url.protocol) ? "http" : url.href === "about:blank" ? "blank" : "other";
+          let authority = frame;
+          const seen = new Set();
+          while (["about:blank", "about:srcdoc"].includes(url.href) && authority.parentFrameId >= 0 && !seen.has(authority.frameId)) {
+            seen.add(authority.frameId);
+            authority = frames.find(parent => parent.frameId === authority.parentFrameId);
+            if (!authority) break;
+            url = new URL(authority.url);
+          }
+          if (["http:", "https:"].includes(url.protocol)) allowed = await bounded(this.chrome.permissions.contains({ origins: [`${url.protocol}//${url.hostname}/*`] }), "dispatch");
+        } catch { /* Unknown host access cannot authorize injection. */ }
+        probeReadDiagnostic("observer_access", { tabId, frameId, documentKind, allowed, attempt: attempts.count });
+        if (!allowed) { markUnavailable(record); return false; }
         await this.tabs.eligible(tabId);
         if (this.records.get(tabId) !== record || record.installAttempts.get(slot) !== attempts) return false;
-        attempts.installed = true;
-        return true;
-      } catch (error) {
-        if (record.installAttempts.get(slot) === attempts) markUnavailable(record);
-        // A late injection may finish after withdrawal's first disable. This
-        // release-only cleanup targets that document and reads no page state.
-        if (!this.tabs.tabs.has(tabId)) {
-          await bounded(this.chrome.tabs.sendMessage(tabId, { kind: "agent-sentinel", operation: "disable" }, documentId ? { documentId } : { frameId }), "cancel").catch(() => {});
+        attempts.count += 1;
+        try {
+          const target = documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [frameId] };
+          await bounded(this.chrome.scripting.executeScript({ target, files: ["sentinel.js"], world: "ISOLATED", injectImmediately: true }), "dispatch");
+          await this.tabs.eligible(tabId);
+          if (this.records.get(tabId) !== record || record.installAttempts.get(slot) !== attempts) return false;
+          attempts.installed = true;
+          return true;
+        } catch (error) {
+          if (record.installAttempts.get(slot) === attempts) markUnavailable(record);
+          // A late injection may finish after withdrawal's first disable. This
+          // release-only cleanup targets that document and reads no page state.
+          if (!this.tabs.tabs.has(tabId)) {
+            await bounded(this.chrome.tabs.sendMessage(tabId, { kind: "agent-sentinel", operation: "disable" }, documentId ? { documentId } : { frameId }), "cancel").catch(() => {});
+          }
+          probeReadDiagnostic("observer_install_failed", { tabId, frameId, step: "observer_install", reason: diagnosticReason(error), errorMessage: diagnosticErrorMessage(error), continuity: record.continuity });
+          if (diagnosticReason(error) !== "host_permission_missing" || attempts.count >= 2 || !this.tabs.tabs.has(tabId)) return false;
+          // Chrome may acknowledge host access before its document binding is
+          // ready. Reconfirm the same document/access before one bounded retry.
+          await new Promise(resolve => setTimeout(resolve, 25));
         }
-        probeReadDiagnostic("observer_install_failed", { tabId, frameId, step: "observer_install", reason: diagnosticReason(error), errorMessage: diagnosticErrorMessage(error), continuity: record.continuity });
-        return false;
       }
+      return false;
     })();
     this.installing.set(key, task);
     try { return await task; }

@@ -149,7 +149,9 @@ export class Agent {
         state.attachSettled = false;
         // Attach is not dispatch: no Page, Runtime or Input commands run here.
         // A late attach completion still detaches even after timeout/cancellation.
+        probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "attach_start" });
         const pending = this.chrome.debugger.attach({ tabId: state.tabId }, "1.3").then(async () => {
+          probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "attach_done" });
           state.attached = true;
           state.actionWindow = this.epochs.beginAction(state.tabId);
           if (state.cancelled || this.connectionEpoch !== state.epoch) await this.detach(state);
@@ -182,7 +184,9 @@ export class Agent {
       try { await this.releaseMouse(state); } finally {
         // Keep the window open until Chrome actually detaches, even if the
         // caller's deadline expires before the detach promise settles.
+        probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "detach_start" });
         const pending = this.chrome.debugger.detach({ tabId: state.tabId }).then(() => {
+          probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "detach_done" });
           state.attached = false;
           state.frames?.close();
           this.epochs.endAction(state.actionWindow);

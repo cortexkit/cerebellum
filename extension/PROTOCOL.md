@@ -86,8 +86,13 @@ Modifying plans carry the saved snapshot's continuity, not a newer baseline from
 an internal classification read; a repaired observer cannot silently rebase old refs.
 
 Observer injection is immediate and document-id scoped after `onCommitted`.
-A read may retry a missing receiver once, with at most two injection attempts per
-frame/document; input checks never reinstall or rebase a snapshot. Only an
+Before injection, the extension confirms Chrome's HTTP/S host access for that
+document. Agent site consent is a separate permission and cannot grant Chrome
+extension access. An initial blank tab without a live HTTP parent is deferred;
+an embedded blank document may inherit its live parent's host access. A host-permission
+binding error may retry once after reconfirming access and the same document;
+this shares a two-injection budget with a fresh read's missing-receiver repair.
+Input checks never reinstall or rebase a snapshot. Only an
 agent-created `about:blank` tab without an opener may make its explicit first navigation without
 observation: HTTP host permissions alone do not guarantee injection there. Both sides verify that
 exception, and navigation success waits for confirmed observation on the landing

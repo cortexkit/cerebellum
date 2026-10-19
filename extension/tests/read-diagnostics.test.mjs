@@ -27,14 +27,15 @@ test("read diagnostics are disabled without the probe opt-in", t => {
 
 test("probe read diagnostics allow only fixed metadata and normalize exceptions", t => {
   const { lines, rows } = capture(t, true);
+  t.mock.method(Date, "now", () => 123456);
   const error = new Error('Cannot access contents of url "https://private.invalid/SECRET"');
   probeReadDiagnostic("sample_failed", {
     tabId: 2, stage: "pre_read", step: "frame_message", frameId: 7,
     reason: diagnosticReason(error), enabled: false, sequence: "SECRET",
-    url: "https://private.invalid/SECRET", title: "SECRET", documentId: "SECRET", error,
+    url: "https://private.invalid/SECRET", title: "SECRET", documentId: "SECRET", at: 999, error,
   });
   probeReadDiagnostic("SECRET", { tabId: 2 });
-  assert.deepEqual(rows(), [{ event: "sample_failed", tabId: 2, stage: "pre_read", step: "frame_message", frameId: 7, reason: "access_denied", enabled: false }]);
+  assert.deepEqual(rows(), [{ event: "sample_failed", at: 123456, tabId: 2, stage: "pre_read", step: "frame_message", frameId: 7, reason: "access_denied", enabled: false }]);
   assert.ok(lines.every(line => !line.includes("SECRET") && !line.includes("private.invalid")));
   assert.equal(diagnosticReason(new Error("arbitrary SECRET")), "other_error");
 });
@@ -79,6 +80,7 @@ test("probe observer-install diagnostics redact Chrome exception text and preser
   const { lines, rows } = capture(t, true);
   const f = await setup();
   const previous = f.epochs.record(2).continuity;
+  f.chrome.tabData.get(2).documentId = "blocked-document";
   f.chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of url "https://private.invalid/SECRET"'); };
   await f.epochs.install(2, 0, "blocked-document");
   assert.equal(f.epochs.record(2).continuity, previous + 1);

@@ -6,6 +6,64 @@ import { setup, turn, read } from "./harness.mjs";
 
 const inputCalls = f => f.chrome.calls.filter(call => call[0] === "cdp" && call[2].startsWith("Input."));
 
+test("host access is confirmed before injection and a permission binding race retries once", async () => {
+  const f = await setup();
+  Object.assign(f.chrome.tabData.get(2), { url: "http://127.0.0.1:54321/", documentId: "http-document" });
+  f.chrome.observations.delete("2:0");
+  f.chrome.sentinels.delete("2:0");
+  f.chrome.calls.length = 0;
+  let allowed = false;
+  f.chrome.permissions.contains = async options => {
+    f.chrome.calls.push(["hostPermission", options]);
+    assert.deepEqual(options, { origins: ["http://127.0.0.1/*"] });
+    return allowed;
+  };
+  assert.equal(await f.epochs.install(2, 0, "http-document"), false);
+  assert.equal(f.chrome.calls.filter(call => call[0] === "inject").length, 0);
+  allowed = true;
+  const inject = f.chrome.scripting.executeScript;
+  let attempts = 0;
+  f.chrome.scripting.executeScript = async options => {
+    assert.equal(f.chrome.calls.at(-1)[0], "get");
+    if (++attempts === 1) throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+    return inject(options);
+  };
+  const fresh = await f.fresh();
+  assert.equal(fresh.observer_available, true);
+  assert.equal(attempts, 2);
+  assert.equal(f.chrome.calls.filter(call => call[0] === "hostPermission").length, 3);
+  await f.run(f.input(fresh.interaction_epoch));
+  assert.equal(inputCalls(f).length, 2);
+  assert.equal(f.chrome.tabData.get(2).active, false);
+});
+
+test("persistent host permission failure never exceeds two injections per document", async () => {
+  const f = await setup();
+  f.chrome.tabData.get(2).documentId = "blocked-http";
+  f.chrome.observations.delete("2:0");
+  f.chrome.sentinels.delete("2:0");
+  let attempts = 0;
+  f.chrome.scripting.executeScript = async () => { attempts++; throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host."); };
+  for (let i = 0; i < 3; i++) assert.equal((await f.fresh()).observer_available, false);
+  assert.equal(attempts, 2);
+  await assert.rejects(f.run(f.input(f.epochs.record(2).epoch)), { reason: "observer_unavailable" });
+  assert.equal(inputCalls(f).length, 0);
+});
+
+test("an inherited blank child confirms its live HTTP parent host access", async () => {
+  const f = await setup();
+  f.chrome.webNavigation.getAllFrames = async () => [
+    { frameId: 0, parentFrameId: -1, url: "https://parent.example/page", documentId: "document-2" },
+    { frameId: 7, parentFrameId: 0, url: "about:blank" },
+  ];
+  const root = f.chrome.sentinels.get("2:0");
+  f.chrome.calls.length = 0;
+  assert.equal(await f.epochs.install(2, 7), true);
+  assert.deepEqual(f.chrome.calls.find(call => call[0] === "hostPermission")[1], { origins: ["https://parent.example/*"] });
+  assert.deepEqual(f.chrome.calls.find(call => call[0] === "inject")[1].target, { tabId: 2, frameIds: [7] });
+  assert.equal(f.chrome.sentinels.get("2:0"), root);
+});
+
 test("child commit after mouse release invalidates tab coverage without disabling the root receiver", async t => {
   const lines = [];
   t.mock.method(console, "info", line => lines.push(line));
@@ -38,7 +96,7 @@ test("child commit after mouse release invalidates tab coverage without disablin
   assert.equal(inputCalls(f).length, 4);
 });
 
-test("blank-tab install failure recovers on HTTP commit before fresh read and click", async () => {
+test("blank-tab observer waits for HTTP host access before fresh read and click", async () => {
   const f = await setup();
   new BrowserEvents(f.chrome, f.tabs, f.epochs, f.agent).listen();
   const inject = f.chrome.scripting.executeScript;
@@ -50,6 +108,7 @@ test("blank-tab install failure recovers on HTTP commit before fresh read and cl
   const opened = await f.run({ version: 2, action: "open_tab" });
   const record = await f.tabs.resolve(opened.tab);
   assert.equal(f.epochs.record(record.tabId).available, false);
+  assert.equal(f.chrome.calls.some(call => call[0] === "inject" && call[1].target.tabId === record.tabId), false);
   const send = f.chrome.debugger.sendCommand;
   f.chrome.debugger.sendCommand = async (target, method, params) => {
     if (method === "Page.navigate") {
@@ -123,12 +182,14 @@ test("probe logs real injection errors with URL and document-value redaction", a
   t.after(() => { delete globalThis.__ckProbeReadDiagnostics; });
   const f = await setup();
   const message = "Cannot access contents of the page. Extension manifest must request permission to access this host.";
+  f.chrome.tabData.get(2).documentId = "new-document";
   f.chrome.scripting.executeScript = async () => { throw new Error(message); };
   await f.epochs.install(2, 0, "new-document");
   const row = lines.filter(line => line.startsWith("Agent probe read: ")).map(line => JSON.parse(line.slice("Agent probe read: ".length))).find(row => row.event === "observer_install_failed");
   assert.equal(row.reason, "host_permission_missing");
   assert.equal(row.errorMessage, message);
   f.chrome.scripting.executeScript = async () => { throw "Injection failed on https://private.invalid/SECRET for 12345678-1234-1234-1234-123456789abc value 'SECRET'"; };
+  f.chrome.tabData.get(2).documentId = "another-document";
   await f.epochs.install(2, 0, "another-document");
   const other = lines.filter(line => line.startsWith("Agent probe read: ")).map(line => JSON.parse(line.slice("Agent probe read: ".length))).find(row => row.errorMessage?.startsWith("Injection failed"));
   assert.equal(other.reason, "other_error");

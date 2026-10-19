@@ -1,13 +1,15 @@
 // Only the signed, feature-enabled CfT probe enables this flag in its own
 // extension worker. Normal browser_use plans cannot turn diagnostics on.
-const events = new Set(["plan_baseline", "sample_failed", "baseline_set", "baseline_deleted", "baseline_cleared", "observer_install_failed", "observer_commit", "input_baseline_refused"]);
+const events = new Set(["plan_baseline", "sample_failed", "baseline_set", "baseline_deleted", "baseline_cleared", "observer_install_failed", "observer_commit", "observer_access", "debugger_timing", "input_baseline_refused"]);
 const values = {
   stage: new Set(["pre_read", "post_plan", "input_check", "sample"]),
   step: new Set(["membership", "frame_list", "frame_message", "observation", "observer_install"]),
+  documentKind: new Set(["http", "blank", "other"]),
+  phase: new Set(["attach_start", "attach_done", "detach_start", "detach_done"]),
   reason: new Set(["baseline_missing", "plan_epoch_missing", "epoch_mismatch", "interaction_continuity_lost", "interaction_epoch_changed", "observer_unavailable", "host_permission_missing", "frame_removed", "tab_not_in_agent_group", "tab_not_claimed", "dispatch_deadline", "cancelled", "no_receiver", "port_closed", "access_denied", "no_frames", "other_error", "connected", "disconnected", "withdrawn", "released"]),
 };
-const numbers = new Set(["tabId", "frameId", "baselineEpoch", "planEpoch", "planContinuity", "baselineContinuity", "epoch", "continuity", "sequence", "previousSequence", "historyLength", "frameCount", "commandCount", "baselineCount"]);
-const booleans = new Set(["baselinePresent", "hasInput", "hasRead", "covered", "readObserved", "enabled", "sameDocument", "invalidated"]);
+const numbers = new Set(["tabId", "frameId", "baselineEpoch", "planEpoch", "planContinuity", "baselineContinuity", "epoch", "continuity", "sequence", "previousSequence", "historyLength", "frameCount", "commandCount", "baselineCount", "attempt"]);
+const booleans = new Set(["baselinePresent", "hasInput", "hasRead", "covered", "readObserved", "enabled", "sameDocument", "invalidated", "allowed"]);
 export function diagnosticErrorMessage(error) {
   const message = typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "Unrecognized observer error";
   // This message comes only from Chrome's injection API or the fixed isolated
@@ -34,7 +36,7 @@ export function diagnosticReason(error) {
 
 export function probeReadDiagnostic(event, fields = {}) {
   if (globalThis.__ckProbeReadDiagnostics !== true || !events.has(event)) return;
-  const row = { event };
+  const row = { event, at: Date.now() };
   for (const [key, value] of Object.entries(fields)) {
     if (values[key] instanceof Set && values[key].has(value) || numbers.has(key) && Number.isSafeInteger(value) || booleans.has(key) && typeof value === "boolean" || key === "errorMessage" && event === "observer_install_failed" && typeof value === "string" && diagnosticErrorMessage({ message: value }) === value) row[key] = value;
   }

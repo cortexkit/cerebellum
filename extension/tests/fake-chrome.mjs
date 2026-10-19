@@ -37,6 +37,7 @@ export function fakeChrome() {
       },
     },
     storage: { session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } } },
+    permissions: { async contains(options) { calls.push(["hostPermission", options]); return true; } },
     tabs: {
       onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onActivated: new Event(), onCreated: new Event(),
       async get(id) { calls.push(["get", id]); if (!tabData.has(id)) throw new Error("closed"); return { ...tabData.get(id) }; },
@@ -99,7 +100,7 @@ export function fakeChrome() {
       observations.set(key, observer.send("sample"));
       return [];
     } },
-    webNavigation: { onCreatedNavigationTarget: new Event(), onCommitted: new Event(), onBeforeNavigate: new Event(), onErrorOccurred: new Event(), async getAllFrames({ tabId }) { return [{ tabId, frameId: 0, documentId: tabData.get(tabId)?.documentId ?? `document-${tabId}` }]; } },
+    webNavigation: { onCreatedNavigationTarget: new Event(), onCommitted: new Event(), onBeforeNavigate: new Event(), onErrorOccurred: new Event(), async getAllFrames({ tabId }) { return [{ tabId, frameId: 0, url: tabData.get(tabId)?.url ?? "https://example.com/", documentId: tabData.get(tabId)?.documentId ?? `document-${tabId}` }]; } },
     debugger: {
       onEvent: new Event(), onDetach: new Event(),
       async attach(target, version) { calls.push(["attach", target, version]); },
