@@ -48,12 +48,50 @@ impl HandoffEnding {
     }
 }
 
+/// A consent answer never dispatches the original action: its context may have
+/// changed while the person decided. Only the grant survives for a fresh call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentEnding {
+    Approved,
+    Denied,
+    Withdrawn,
+    Expired,
+}
+
+impl ConsentEnding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Withdrawn => "withdrawn",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum LateOutcome {
+    Handoff(HandoffEnding),
+    Consent(ConsentEnding),
+}
+
+impl LateOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Handoff(ending) => ending.as_str(),
+            Self::Consent(ending) => ending.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum Phase {
     Pending,
     Result {
-        outcome: HandoffEnding,
+        outcome: LateOutcome,
         settled_at: u64,
     },
     Expired {
@@ -63,17 +101,20 @@ enum Phase {
     Acked,
 }
 
-/// Only a canonical origin and closed outcome codes are persisted. In
-/// particular, the CDP observations used to detect login never enter this type.
+/// Login and consent share retention, acknowledgements and recovery. Only
+/// identifiers and closed outcomes are persisted, never captured page content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeldHandoff {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     origin: String,
     scope: ScopeIdentity,
     phase: Phase,
     // Omitted for present so its existing version-3 representation is unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     capture: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consent: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -81,6 +122,9 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl HeldHandoff {
+    pub(super) fn is_consent(&self) -> bool {
+        self.consent.is_some()
+    }
     pub(super) fn is_capture(&self) -> bool {
         self.capture
     }
@@ -102,7 +146,7 @@ pub(super) fn unacked(record: &CallRecord) -> bool {
 fn event_id(
     record: &CallRecord,
     handoff: &HeldHandoff,
-    outcome: HandoffEnding,
+    outcome: LateOutcome,
     settled_at: u64,
 ) -> String {
     // Hash a tuple, not concatenated strings: opaque identifiers can contain
@@ -117,7 +161,12 @@ fn event_id(
         settled_at,
     ))
     .expect("text-free settlement identity serializes");
-    format!("{:x}", Sha256::digest(bytes))
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    if let Some(ask_id) = &handoff.consent {
+        hash.update(serde_json::to_vec(&("consent/v1", ask_id)).unwrap());
+    }
+    format!("{:x}", hash.finalize())
 }
 
 fn next_seq(inner: &mut Inner, key: &Key) {
@@ -139,11 +188,26 @@ pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> bool {
         };
         if matches!(handoff.phase, Phase::Pending) {
             handoff.phase = Phase::Result {
-                outcome: HandoffEnding::HandoffInterrupted,
+                outcome: if handoff.is_consent() {
+                    LateOutcome::Consent(ConsentEnding::Withdrawn)
+                } else {
+                    LateOutcome::Handoff(HandoffEnding::HandoffInterrupted)
+                },
                 settled_at: now_ms,
             };
-            entry.record.outcome = Some(HandoffEnding::HandoffInterrupted.as_str().into());
-            entry.record.state = CallState::Replied;
+            entry.record.outcome = Some(
+                if handoff.is_consent() {
+                    "withdrawn"
+                } else {
+                    "handoff_interrupted"
+                }
+                .into(),
+            );
+            entry.record.state = if handoff.is_consent() {
+                CallState::Asked
+            } else {
+                CallState::Replied
+            };
             entry.record.settled_at_ms = Some(now_ms);
             changed = true;
         }
@@ -166,10 +230,14 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
             outcome,
             settled_at,
         } => (
-            late_results::kinds::RESULT,
+            if handoff.is_consent() {
+                late_results::kinds::NOT_STARTED
+            } else {
+                late_results::kinds::RESULT
+            },
             event_id(record, handoff, *outcome, *settled_at),
             *settled_at,
-            Some(json!({"outcome": outcome.as_str(), "origin": handoff.origin})),
+            Some(result_body(handoff, outcome.as_str())),
         ),
         Phase::Expired {
             event_id,
@@ -195,6 +263,14 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
     if let Some(result) = result {
         entry = entry.with_result(result);
     }
+    if let (Some(ask_id), Phase::Result { outcome, .. }) = (&handoff.consent, &handoff.phase) {
+        entry.reason = Some("consent".into());
+        entry.outcome = Some(outcome.as_str().into());
+        entry.extra.insert(
+            "detail".into(),
+            json!({"consent":outcome.as_str(), "ask_id":ask_id}),
+        );
+    }
     Some(entry)
 }
 
@@ -204,10 +280,127 @@ pub(super) fn settled_result(record: &CallRecord) -> Option<Value> {
         return None;
     }
     let outcome = record.outcome.as_deref()?;
-    Some(json!({"outcome":outcome,"origin":handoff.origin}))
+    Some(result_body(handoff, outcome))
+}
+
+fn result_body(held: &HeldHandoff, outcome: &str) -> Value {
+    if let Some(ask_id) = &held.consent {
+        json!({"outcome": if outcome == "approved" { "not_started" } else { outcome },
+            "detail":{"consent":outcome,"ask_id":ask_id},
+            "remedy":if outcome == "approved" { "Approved; call again to run it." } else { "The original action was not run." }})
+    } else {
+        json!({"outcome":outcome,"origin":held.origin})
+    }
 }
 
 impl CallRecords {
+    /// Save the obligation before forwarding the held first reply. Consent is
+    /// not an execution queue: an answer only settles this call as not started.
+    pub fn hold_consent(
+        &self,
+        principal: &str,
+        call_key: &str,
+        ask_id: &str,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        let mut inner = self.lock();
+        if let Some(error) = &inner.broken {
+            return Err(error.clone());
+        }
+        let key = (principal.to_owned(), call_key.to_owned());
+        let entry = inner
+            .entries
+            .get(&key)
+            .ok_or_else(|| CallRecordError::Corrupt("held consent has no call record".into()))?;
+        if entry.consent_ended {
+            return Err(CallRecordError::Corrupt(
+                "the consent context has ended".into(),
+            ));
+        }
+        let mut record = entry.record.clone();
+        let scope = record
+            .scope
+            .clone()
+            .ok_or_else(|| CallRecordError::Corrupt("held consent has no scope".into()))?;
+        record.handoff = Some(HeldHandoff {
+            origin: String::new(),
+            scope,
+            phase: Phase::Pending,
+            capture: false,
+            consent: Some(ask_id.into()),
+        });
+        self.write(&mut inner, &record, now_ms)?;
+        inner.entries.get_mut(&key).unwrap().record = record;
+        Ok(())
+    }
+
+    pub fn has_pending_consents(&self) -> bool {
+        self.lock().entries.values().any(|entry| {
+            entry
+                .record
+                .handoff
+                .as_ref()
+                .is_some_and(|held| held.is_consent() && matches!(held.phase, Phase::Pending))
+        })
+    }
+
+    /// A definitive session end removes the cards locally, so no future live
+    /// drain can answer these holds. Settle them without contacting Cingulate,
+    /// and reject an older request whose custody write arrives after teardown.
+    pub(crate) fn end_consent_conversation(
+        &self,
+        conversation: &str,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        let mut inner = self.lock();
+        let mut keys = Vec::new();
+        for (key, entry) in &mut inner.entries {
+            if entry.conversation_key == conversation {
+                entry.consent_ended = true;
+                if entry
+                    .record
+                    .handoff
+                    .as_ref()
+                    .is_some_and(|held| held.is_consent() && matches!(held.phase, Phase::Pending))
+                {
+                    keys.push(key.clone());
+                }
+            }
+        }
+        for key in keys {
+            self.finish_held_locked(
+                &mut inner,
+                &key,
+                LateOutcome::Consent(ConsentEnding::Withdrawn),
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn finish_consent(
+        &self,
+        ask_id: &str,
+        ending: ConsentEnding,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        let mut inner = self.lock();
+        let keys: Vec<_> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.record.handoff.as_ref().is_some_and(|held| {
+                    held.consent.as_deref() == Some(ask_id) && matches!(held.phase, Phase::Pending)
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.finish_held_locked(&mut inner, &key, LateOutcome::Consent(ending), now_ms)?;
+        }
+        Ok(())
+    }
+
     /// Sync the recovery obligation before returning a pending handoff. Without
     /// this write, a crash could leave the custodian waiting for a result forever.
     pub fn hold_handoff(
@@ -273,6 +466,7 @@ impl CallRecords {
             scope,
             phase: Phase::Pending,
             capture: conversation.is_none(),
+            consent: None,
         });
         self.write(&mut inner, &record, now_ms)?;
         inner
@@ -307,6 +501,16 @@ impl CallRecords {
         outcome: HandoffEnding,
         now_ms: u64,
     ) -> Result<(), CallRecordError> {
+        self.finish_held_locked(inner, key, LateOutcome::Handoff(outcome), now_ms)
+    }
+
+    fn finish_held_locked(
+        &self,
+        inner: &mut Inner,
+        key: &Key,
+        outcome: LateOutcome,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
         let Some(entry) = inner.entries.get(key) else {
             return Ok(());
         };
@@ -322,7 +526,11 @@ impl CallRecords {
             settled_at: now_ms,
         };
         record.outcome = Some(outcome.as_str().into());
-        record.state = CallState::Replied;
+        record.state = if handoff.is_consent() {
+            CallState::Asked
+        } else {
+            CallState::Replied
+        };
         record.settled_at_ms = Some(now_ms);
         self.write(inner, &record, now_ms)?;
         let result = settled_result(&record).expect("settled handoff has a result");

@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -589,6 +589,7 @@ pub struct ConsentDesk {
     single_use: Mutex<SingleUse>,
     reporting: tokio::sync::Mutex<()>,
     saving: Mutex<()>,
+    settlements: Mutex<HashMap<SessionKey, Weak<tokio::sync::Mutex<()>>>>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -609,6 +610,7 @@ impl ConsentDesk {
             single_use: Mutex::new(SingleUse::default()),
             reporting: tokio::sync::Mutex::new(()),
             saving: Mutex::new(()),
+            settlements: Mutex::new(HashMap::new()),
             clock: Arc::new(crate::wall_clock_ms),
         }
     }
@@ -635,6 +637,7 @@ impl ConsentDesk {
             single_use: Mutex::new(SingleUse::default()),
             reporting: tokio::sync::Mutex::new(()),
             saving: Mutex::new(()),
+            settlements: Mutex::new(HashMap::new()),
             clock: Arc::new(crate::wall_clock_ms),
         };
         // Never reuse a claimed approval after a restart. A dispatch with no
@@ -658,6 +661,19 @@ impl ConsentDesk {
             }
         }
         desk
+    }
+
+    /// Serialize card creation and custody preparation with inbound answer
+    /// drains. Release this lock before any in-call wait for a person's answer.
+    pub(crate) fn settlement_lock(&self, session: &SessionKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = lock(&self.settlements);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Open a route to Cingulate for `live`'s call.
@@ -1428,6 +1444,18 @@ impl DeskSession<'_> {
         &mut self,
         apply: &mut (dyn FnMut(&RaisedCard, &Record, &Ending) -> Result<Apply, ApplyFailed> + Send),
     ) -> Result<DrainReport, Ending> {
+        self.drain_answers_recording(apply, &mut |_, _| Ok(()))
+            .await
+    }
+
+    /// Store a held call's late answer after its grant is durable and before
+    /// acknowledging Cingulate. A failed custody write leaves the feed readable
+    /// on the next live inbound call, including cards already marked applied.
+    pub(crate) async fn drain_answers_recording(
+        &mut self,
+        apply: &mut (dyn FnMut(&RaisedCard, &Record, &Ending) -> Result<Apply, ApplyFailed> + Send),
+        stored: &mut (dyn FnMut(&RaisedCard, &Ending) -> Result<(), ApplyFailed> + Send),
+    ) -> Result<DrainReport, Ending> {
         let mut report = DrainReport::default();
         let mut seen = Vec::new();
         let mut since = 0;
@@ -1472,6 +1500,11 @@ impl DeskSession<'_> {
                     }
                 }
                 if card.applied {
+                    if let Some(ending) = Ending::of_record(record, &card) {
+                        if stored(&card, &ending).is_err() {
+                            return Ok(report);
+                        }
+                    }
                     continue;
                 }
                 let Some(ending) = Ending::of_record(record, &card) else {
@@ -1498,6 +1531,9 @@ impl DeskSession<'_> {
                     }
                 }
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {
+                    return Ok(report);
+                }
+                if stored(&card, &ending).is_err() {
                     return Ok(report);
                 }
                 if record.state == CardState::Answered && matches!(ending, Ending::Declined { .. })

@@ -1565,6 +1565,9 @@ fn forget_conversation_cards(planes: &Planes, conversation_key: &str) {
     for session in sessions {
         let _ = planes.consent.forget_session(&session);
     }
+    let _ = planes
+        .calls
+        .end_consent_conversation(conversation_key, wall_clock_ms());
 }
 
 /// End what a session scope that definitively ended was allowed, for each
@@ -3750,7 +3753,10 @@ async fn dispatch_resolved_route(
     if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
         // A failed drain is retried on a later call; it must not replace this
         // call's ordinary reply with a consent refusal.
-        let _ = planes.consent_drain.run(&planes.consent, &live).await;
+        let _ = planes
+            .consent_drain
+            .run_recording(&planes.consent, &live, Some(&planes.calls))
+            .await;
     }
 
     let dispatch = dispatch_bound_route(frame, writer, planes, facts);
@@ -5864,7 +5870,10 @@ async fn handle_keyed_tool_request(
     tool_result::RESULT_BIND
         .scope(
             result_bind,
-            handle_keyed_tool_request_inner(frame, writer, planes),
+            codemode::CALL_RECORDS.scope(
+                Arc::clone(&planes.calls),
+                handle_keyed_tool_request_inner(frame, writer, planes),
+            ),
         )
         .await
 }
@@ -6026,6 +6035,15 @@ async fn handle_keyed_tool_request_inner(
             // the recorded action. Adapt only the encoding, never execute again.
             if flat_tool {
                 if let Some(result) = reply.result() {
+                    if result.get("held").is_some() {
+                        let legacy = result.get("structuredContent").cloned().unwrap_or(result);
+                        return call_context::CALL_KEY
+                            .scope(
+                                call_key.clone(),
+                                send_tool_response(writer, ver, channel, epoch, corr, legacy),
+                            )
+                            .await;
+                    }
                     let is_content = result.get("content").is_some()
                         && result.get("structuredContent").is_some();
                     let wants_content = tool_result::RESULT_BIND
@@ -7895,7 +7913,12 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
-    let mut body = codemode::unsupported(body);
+    let held = codemode::held(&body);
+    let mut body = if held.is_some() {
+        body
+    } else {
+        codemode::unsupported(body)
+    };
     let force_content = body["outcome"] == "held_unsupported";
     let content_v1 = tool_result::RESULT_BIND
         .try_with(|binding| {
@@ -7910,7 +7933,7 @@ async fn send_tool_response(
         })
         .unwrap_or(false);
     let body = if content_v1 || force_content {
-        tool_result::encode(body)?
+        tool_result::encode_with_held(body, held)?
     } else {
         if codemode::active() {
             if let Some(image) = body.get_mut("image").and_then(Value::as_object_mut) {

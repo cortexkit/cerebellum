@@ -68,7 +68,7 @@ use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType, Principal};
 
 mod late;
-pub use late::{HandoffEnding, HeldHandoff};
+pub use late::{ConsentEnding, HandoffEnding, HeldHandoff};
 
 /// The file name under the journal data home.
 pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
@@ -79,8 +79,10 @@ pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 /// files advance to version 3 only when a handoff is recorded; ordinary calls
 /// still use the version 2 format so placing a build does not close rollback.
 /// Version 4 adds capture handoffs and their closed settlement vocabulary.
-/// Only the first capture handoff requires reader 4; present remains reader 3.
-pub const CALL_RECORD_VERSION: u64 = 4;
+/// Only the first capture handoff requires reader 4; `browser.present` handoffs
+/// remain readable by reader 3.
+/// Version 5 adds consent custody. Only a held consent reply requires reader 5.
+pub const CALL_RECORD_VERSION: u64 = 5;
 
 const ORDINARY_CALL_RECORD_VERSION: u64 = 2;
 const HANDOFF_CALL_RECORD_VERSION: u64 = 3;
@@ -218,7 +220,8 @@ pub struct CallRecord {
 impl CallRecord {
     fn required_version(&self) -> u64 {
         match &self.handoff {
-            Some(handoff) if handoff.is_capture() => CALL_RECORD_VERSION,
+            Some(handoff) if handoff.is_consent() => CALL_RECORD_VERSION,
+            Some(handoff) if handoff.is_capture() => 4,
             Some(_) => HANDOFF_CALL_RECORD_VERSION,
             None => ORDINARY_CALL_RECORD_VERSION,
         }
@@ -677,6 +680,7 @@ type Key = (String, String);
 
 #[derive(Debug)]
 struct Entry {
+    consent_ended: bool,
     record: CallRecord,
     conversation_key: String,
     ask_id: Option<String>,
@@ -881,6 +885,7 @@ impl CallRecords {
             inner.entries.insert(
                 key,
                 Entry {
+                    consent_ended: false,
                     record,
                     conversation_key: String::new(),
                     ask_id: None,
@@ -1111,6 +1116,7 @@ impl CallRecords {
         inner.entries.insert(
             key.clone(),
             Entry {
+                consent_ended: false,
                 record,
                 conversation_key: conversation_key.to_string(),
                 ask_id: None,
@@ -1138,7 +1144,7 @@ impl CallRecords {
         if let Some(result) = late::settled_result(&entry.record) {
             // A fast resume may settle before the initial held reply is cached.
             // Preserve that ending instead of caching an already-obsolete hold.
-            settlement.state = CallState::Replied;
+            settlement.state = entry.record.state;
             settlement.outcome = entry.record.outcome.clone();
             settlement.reply.frame.body =
                 serde_json::to_vec(&result).expect("handoff result serializes");
@@ -1382,17 +1388,17 @@ mod tests {
         assert!(matches!(records.lookup("direct", "k"), Lookup::Unknown));
 
         let newer = InMemoryCallRecordStorage::new();
-        newer
-            .replace(b"{\"format\":\"call-records\",\"version\":5}\n", 5)
-            .unwrap();
+        let future_version = CALL_RECORD_VERSION + 1;
+        let future_bytes = header(future_version);
+        newer.replace(&future_bytes, future_version).unwrap();
         let records = CallRecords::open(Box::new(newer.clone()), 0);
         assert!(matches!(
             records.begin("direct", "k", "c", 0),
-            Begin::Unavailable(CallRecordError::UnknownVersion(5))
+            Begin::Unavailable(CallRecordError::UnknownVersion(version)) if version == future_version
         ));
         assert_eq!(
             newer.contents().unwrap(),
-            b"{\"format\":\"call-records\",\"version\":5}\n",
+            future_bytes,
             "a newer build's file was overwritten"
         );
     }
@@ -1585,6 +1591,51 @@ mod tests {
                 .get("call-records"),
             Some(&2)
         );
+    }
+
+    #[test]
+    fn first_consent_hold_upgrades_the_file_and_floor_without_losing_old_calls() {
+        let (_scratch, path, floor) = v1_on_disk("consent-reader");
+        let records = open_on_disk(&path, &floor, 30);
+        let scope = ScopeIdentity {
+            owner: "reserved:prefrontal-core".into(),
+            reference: "run".into(),
+            scope_epoch: 1,
+        };
+        let _ticket =
+            executed(records.begin_scoped("reserved:basal", "consent-key", "c", Some(scope), 40));
+        assert_eq!(
+            cerebellum_core::format_floor::read_floors(&floor)
+                .unwrap()
+                .get("call-records"),
+            Some(&2)
+        );
+        records
+            .hold_consent("reserved:basal", "consent-key", "ask", 50)
+            .unwrap();
+        assert_eq!(
+            cerebellum_core::format_floor::read_floors(&floor)
+                .unwrap()
+                .get("call-records"),
+            Some(&5)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().next(),
+            Some("{\"format\":\"call-records\",\"version\":5}")
+        );
+        drop(records);
+        let reopened = open_on_disk(&path, &floor, 60);
+        assert!(
+            matches!(reopened.begin("reserved:prefrontal-core", "pf:v1", "c", 70), Begin::NotRetained { outcome } if outcome.as_deref() == Some("ok"))
+        );
+        let late = reopened
+            .late_results(
+                "reserved:basal",
+                &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+                70,
+            )
+            .unwrap();
+        assert_eq!(late.entries[0].extra["detail"]["consent"], "withdrawn");
     }
 
     #[test]

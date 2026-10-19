@@ -80,6 +80,7 @@ impl Drop for RunCall {
 
 tokio::task_local! {
     pub(crate) static CALL_DETAIL: RefCell<Option<Value>>;
+    pub(crate) static CALL_RECORDS: Arc<crate::journal::call_records::CallRecords>;
 }
 
 pub(crate) fn active() -> bool {
@@ -145,9 +146,77 @@ pub(crate) fn call_detail(
     Some(detail)
 }
 
-/// Domain handlers still validate their existing pending vocabulary. Translate
-/// only at the provider boundary: Basal cannot suspend on a domain pending reply
-/// until the held-reply protocol is published.
+/// The route bind's consumer capabilities choose the held reader, not call_mode.
+/// The validated envelope call_key addresses the promised durable late answer.
+pub(crate) fn held(reply: &Value) -> Option<cortexkit_role_tool_provider::result::HeldReply> {
+    use cortexkit_role_tool_provider::result::HeldReply;
+    if !accepts_held() {
+        return None;
+    }
+    let reason = match reply["outcome"].as_str()? {
+        "consent_pending" => "consent",
+        "login_pending" | "presented" => "login_handoff",
+        "capture_pending" => "login_capture",
+        _ => return None,
+    };
+    let mut detail = CALL_DETAIL.with(|detail| detail.borrow().clone().unwrap());
+    for key in ["ask_id", "kind", "origin", "app", "expires_in_ms"] {
+        if let Some(value) = reply.get(key) {
+            detail[key] = value.clone();
+        }
+    }
+    Some(HeldReply::new(reason).with_detail(detail.as_object().unwrap().clone()))
+}
+
+pub(crate) fn accepts_held() -> bool {
+    active()
+        && crate::call_context::current_call_key().is_some()
+        && crate::tool_result::RESULT_BIND
+            .try_with(|binding| {
+                binding.as_ref().is_some_and(|(tool, bind)| {
+                    matches!(
+                        tool.as_str(),
+                        crate::flat_tools::BROWSER_USE | crate::flat_tools::COMPUTER_USE
+                    ) && cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                        bind.consumer_capabilities(),
+                    )
+                })
+            })
+            .unwrap_or(false)
+}
+
+/// Called while the consent desk's session lock is held, including when joining
+/// an existing card. A competing inbound drain cannot acknowledge the answer
+/// before this call's durable obligation exists.
+pub(crate) async fn prepare_consent(
+    ask_id: &str,
+    kind: crate::cingulate_client::card::CardKind,
+) -> Result<(), crate::cingulate_client::desk::Ending> {
+    use crate::cingulate_client::desk::Ending;
+    if !accepts_held() {
+        return Ok(());
+    }
+    CALL_DETAIL.with(|detail| detail.borrow_mut().as_mut().unwrap()["kind"] = json!(kind));
+    let calls = CALL_RECORDS
+        .try_with(Arc::clone)
+        .map_err(|_| Ending::DeliveryFailed)?;
+    let principal = crate::tool_result::RESULT_BIND.with(|binding| {
+        crate::journal::call_records::principal_label(
+            binding.as_ref().unwrap().1.principal.as_ref(),
+        )
+    });
+    let key = crate::call_context::current_call_key().unwrap();
+    let ask_id = ask_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        calls.hold_consent(&principal, &key, &ask_id, crate::wall_clock_ms())
+    })
+    .await
+    .map_err(|_| Ending::DeliveryFailed)?
+    .map_err(|_| Ending::DeliveryFailed)
+}
+
+/// Older carriers cannot suspend on a domain pending reply. Preserve their
+/// terminal refusal until the route declares the held-reply reader.
 pub(crate) fn unsupported(reply: Value) -> Value {
     let pending = reply["outcome"]
         .as_str()

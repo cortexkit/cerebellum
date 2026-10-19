@@ -5,13 +5,13 @@
 //! than keeping a second pending map that could let two callers act.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use crate::cingulate_client::card::CardKind;
 use crate::cingulate_client::desk::{
     Apply, ApplyFailed, ConsentDesk, DrainReport, Ending, RaisedCard, RegistryStore,
 };
-use crate::cingulate_client::live_call::{LiveCall, NotLive, SessionKey};
+use crate::cingulate_client::live_call::{LiveCall, NotLive};
 use crate::cingulate_client::route::{BoxFuture, CallError, CingulateOpener, CingulateRoute};
 use crate::cingulate_client::wire::Record;
 use crate::{AcceptedBindFacts, BoundRoute, Frame, Planes};
@@ -63,10 +63,9 @@ impl ConsentEffects for SingleUseEffects {
     }
 }
 
-/// Shared by every route and clone of a plane. A weak lock entry can disappear
-/// after the last pass, without retaining every session the module ever served.
+/// Shared by every route and clone of a plane. The desk serializes drains with
+/// consent creation so an answer cannot overtake a held call's custody write.
 pub struct ConsentDrain {
-    sessions: Mutex<HashMap<SessionKey, Weak<tokio::sync::Mutex<()>>>>,
     effects: Mutex<HashMap<CardKind, Arc<dyn ConsentEffects>>>,
 }
 
@@ -74,7 +73,6 @@ impl Default for ConsentDrain {
     fn default() -> Self {
         let login: Arc<dyn ConsentEffects> = Arc::new(SingleUseEffects);
         Self {
-            sessions: Mutex::new(HashMap::new()),
             effects: Mutex::new(HashMap::from([
                 (CardKind::LoginImport, Arc::clone(&login)),
                 (CardKind::LoginCapture, login),
@@ -91,25 +89,24 @@ impl ConsentDrain {
         self.effects.lock().unwrap().insert(kind, effects);
     }
 
-    fn session_lock(&self, session: &SessionKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = sessions.get(session).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        sessions.insert(session.clone(), Arc::downgrade(&lock));
-        lock
-    }
-
     /// Sweep lost memory-only records before reading the feed, then apply and
     /// acknowledge answers. The session lock covers the entire pass, including
     /// the registry check, so a waiting call opens no second route after a winner.
     pub async fn run(&self, desk: &ConsentDesk, live: &LiveCall) -> Result<DrainReport, Ending> {
-        let lock = self.session_lock(live.session());
+        self.run_recording(desk, live, None).await
+    }
+
+    pub(crate) async fn run_recording(
+        &self,
+        desk: &ConsentDesk,
+        live: &LiveCall,
+        calls: Option<&crate::journal::call_records::CallRecords>,
+    ) -> Result<DrainReport, Ending> {
+        let lock = desk.settlement_lock(live.session());
         let _pass = lock.lock().await;
         let cards = desk.unapplied_for(live);
-        if cards.is_empty() && !desk.has_pending_reports() {
+        let owed = cards.is_empty() && calls.is_some_and(|calls| calls.has_pending_consents());
+        if cards.is_empty() && !desk.has_pending_reports() && !owed {
             return Ok(DrainReport::default());
         }
         let effects = self.effects.lock().unwrap().clone();
@@ -117,7 +114,7 @@ impl ConsentDrain {
             .session(live)
             .await
             .map_err(|error| Ending::of_refusal(&error))?;
-        if cards.is_empty() {
+        if cards.is_empty() && !owed {
             return Ok(DrainReport::default());
         }
         for card in &cards {
@@ -142,19 +139,41 @@ impl ConsentDrain {
         }
         let mut completions = Vec::new();
         let result = session
-            .drain_answers(&mut |card, record, ending| {
-                let adapter = effects.get(&card.kind).ok_or_else(|| {
-                    ApplyFailed("the card's flow has not registered a consent adapter".into())
-                })?;
-                if !card.kind.single_use() && !adapter.has_pending(card) {
-                    return Ok(Apply::NoRecord);
-                }
-                let applied = adapter.apply(card, record, ending)?;
-                if let Some(completion) = applied.completion {
-                    completions.push(completion);
-                }
-                Ok(applied.effect)
-            })
+            .drain_answers_recording(
+                &mut |card, record, ending| {
+                    let adapter = effects.get(&card.kind).ok_or_else(|| {
+                        ApplyFailed("the card's flow has not registered a consent adapter".into())
+                    })?;
+                    if !card.kind.single_use() && !adapter.has_pending(card) {
+                        return Ok(Apply::NoRecord);
+                    }
+                    let applied = adapter.apply(card, record, ending)?;
+                    if let Some(completion) = applied.completion {
+                        completions.push(completion);
+                    }
+                    Ok(applied.effect)
+                },
+                &mut |card, ending| {
+                    use crate::journal::call_records::ConsentEnding;
+                    let ending = match ending {
+                        Ending::Granted { .. } => ConsentEnding::Approved,
+                        Ending::Declined { .. } => ConsentEnding::Denied,
+                        Ending::Withdrawn => ConsentEnding::Withdrawn,
+                        Ending::NoAnswer => ConsentEnding::Expired,
+                        _ => {
+                            return Err(ApplyFailed(
+                                "the consent card has no terminal answer".into(),
+                            ))
+                        }
+                    };
+                    if let Some(calls) = calls {
+                        calls
+                            .finish_consent(&card.elicitation_id, ending, crate::wall_clock_ms())
+                            .map_err(|error| ApplyFailed(error.to_string()))?;
+                    }
+                    Ok(())
+                },
+            )
             .await;
         // A caller that lost the settlement election may now use the stored
         // permission or single-use approval. Release its completion watch even
@@ -228,6 +247,7 @@ impl RegistryStore for UnavailableRegistry {
 mod tests {
     use super::*;
     use crate::cingulate_client::desk::FileRegistryStore;
+    use crate::cingulate_client::live_call::SessionKey;
     use crate::cingulate_client::wire;
     use crate::cingulate_client::{Reply, ScriptedCingulate};
     use crate::terminal_arbiter::{TerminalArbiter, TerminalCause, CALL_TERMINAL};
