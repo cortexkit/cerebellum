@@ -122,6 +122,8 @@ struct DoubleState {
     observer_continuity: u64,
     metadata_unready: usize,
     observer_loss_during_classification: bool,
+    observer_loss_after_click: bool,
+    observer_refusal_after_click: bool,
     human_during_card: bool,
     plan_count: usize,
     attaches: usize,
@@ -362,6 +364,11 @@ impl Fixture {
                             },
                         });
                         let body = match result {
+                            Ok(_) if input && state.observer_unavailable && state.observer_refusal_after_click => MessageBody::Refused {
+                                reason: json!({"reason":"observer_unavailable","remedy":"read again"}).to_string(),
+                                input_dispatched: true,
+                                detached: true,
+                            },
                             Ok((result, _)) => MessageBody::Completed {
                                 result,
                                 input_dispatched: input,
@@ -952,6 +959,14 @@ fn execute(
             .unwrap()
             .remove("web_navigation_frame_id");
     }
+    if state.observer_loss_after_click
+        && commands.iter().any(|step| {
+            step["method"] == "Input.dispatchMouseEvent"
+                && step["params"]["type"] == "mouseReleased"
+        })
+    {
+        state.observer_unavailable = true;
+    }
     Ok((
         json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"observer_available":!state.observer_unavailable && !(state.observer_missing_on_blank && tab.url == "about:blank"),"observer_continuity":state.observer_continuity,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
         input,
@@ -1501,6 +1516,62 @@ async fn observer_loss_during_classification_cannot_scroll_or_click_saved_ref() 
 }
 
 #[tokio::test]
+async fn observer_loss_after_a_delivered_click_reports_unknown_and_requires_a_fresh_read() {
+    for refused in [false, true] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.observer_loss_after_click = true;
+            state.observer_refusal_after_click = refused;
+        }
+        let (clicked, cards) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Go")),
+                "deny",
+            )
+            .await;
+        assert_eq!(clicked["outcome"], "outcome_unknown", "{clicked}");
+        assert_eq!(clicked["reason"], "observer_unavailable", "{clicked}");
+        assert_eq!(clicked["input_dispatched"], true, "{clicked}");
+        assert!(clicked["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("Do not repeat"));
+        assert!(cards.is_empty());
+        let sent = fixture.state.lock().unwrap().inputs.clone();
+        assert_eq!(
+            sent,
+            ["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]
+        );
+        let (retry, _) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Go")),
+                "deny",
+            )
+            .await;
+        assert_eq!(retry["outcome"], "refused", "{retry}");
+        assert_eq!(retry["input_dispatched"], false, "{retry}");
+        assert_eq!(fixture.state.lock().unwrap().inputs, sent);
+    }
+}
+
+#[test]
+fn a_post_dispatch_refusal_is_unknown_without_discarding_the_reason() {
+    let reply = dispatched_outcome(prior_input(observer_unavailable(), true));
+    assert_eq!(reply["outcome"], "outcome_unknown");
+    assert_eq!(reply["reason"], "observer_unavailable");
+    assert_eq!(reply["input_dispatched"], true);
+    assert_eq!(
+        dispatched_outcome(observer_unavailable())["outcome"],
+        "refused"
+    );
+}
+
+#[tokio::test]
 async fn observer_continuity_loss_requires_a_new_read_not_a_person_change() {
     let fixture = Fixture::new();
     fixture.state.lock().unwrap().top_level_only = true;
@@ -1710,7 +1781,13 @@ async fn human_input_before_click_and_between_typing_steps_stops_all_further_inp
         }
         let (reply, _) = fixture.call(1, args, "allow_30m").await;
         assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
-        assert_eq!(reply["remedy"], "read again");
+        if before {
+            assert_eq!(reply["outcome"], "refused");
+            assert_eq!(reply["remedy"], "read again");
+        } else {
+            assert_eq!(reply["outcome"], "outcome_unknown");
+            assert!(reply["remedy"].as_str().unwrap().contains("Do not repeat"));
+        }
         assert_eq!(reply["input_dispatched"], !before);
         assert_eq!(
             fixture.state.lock().unwrap().inputs.len(),

@@ -205,9 +205,15 @@ export class InteractionEpochs {
     }
     // A delayed commit event for the exact document already sampled must not
     // invalidate the successful read that confirmed its observer.
-    if (documentId && record.available && !record.coverageLost && record.confirmedDocuments.get(frameId) === documentId) return this.install(tabId, frameId, documentId);
+    if (documentId && record.available && !record.coverageLost && record.confirmedDocuments.get(frameId) === documentId) {
+      probeReadDiagnostic("observer_commit", { tabId, frameId, invalidated: false, continuity: record.continuity });
+      return this.install(tabId, frameId, documentId);
+    }
     record.navigationGeneration += 1;
     markUnavailable(record);
+    // Coverage is tab-wide: a new child document invalidates the saved read,
+    // but only that child's receiver is installed. The parent is not disabled.
+    probeReadDiagnostic("observer_commit", { tabId, frameId, invalidated: true, continuity: record.continuity });
     if (!documentId) record.installAttempts.delete(frameId);
     return this.install(tabId, frameId, documentId);
   }

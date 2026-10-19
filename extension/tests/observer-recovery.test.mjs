@@ -6,6 +6,38 @@ import { setup, turn, read } from "./harness.mjs";
 
 const inputCalls = f => f.chrome.calls.filter(call => call[0] === "cdp" && call[2].startsWith("Input."));
 
+test("child commit after mouse release invalidates tab coverage without disabling the root receiver", async t => {
+  const lines = [];
+  t.mock.method(console, "info", line => lines.push(line));
+  globalThis.__ckProbeReadDiagnostics = true;
+  t.after(() => { delete globalThis.__ckProbeReadDiagnostics; });
+  const f = await setup();
+  const fresh = await f.fresh();
+  const root = f.chrome.sentinels.get("2:0");
+  const send = f.chrome.debugger.sendCommand;
+  let committed = false;
+  f.chrome.debugger.sendCommand = async (target, method, params) => {
+    const result = await send(target, method, params);
+    if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased" && !committed) {
+      committed = true;
+      await f.epochs.committed(2, 7);
+    }
+    return result;
+  };
+  await assert.rejects(f.run(f.input(fresh.interaction_epoch)), error => error.reason === "observer_unavailable" && error.detail.input_dispatched === true);
+  assert.equal(inputCalls(f).length, 2);
+  assert.equal(f.chrome.sentinels.get("2:0"), root);
+  assert.equal(root.send("sample").enabled, true);
+  assert.equal(f.epochs.record(2).coverageLost, true);
+  assert.ok(lines.some(line => line.includes('"event":"observer_commit"') && line.includes('"frameId":7') && line.includes('"invalidated":true')));
+  await assert.rejects(f.run(f.input(fresh.interaction_epoch)), { reason: "observer_unavailable" });
+  assert.equal(inputCalls(f).length, 2);
+  const recovered = await f.fresh();
+  assert.equal(recovered.observer_available, true);
+  await f.run(f.input(recovered.interaction_epoch));
+  assert.equal(inputCalls(f).length, 4);
+});
+
 test("blank-tab install failure recovers on HTTP commit before fresh read and click", async () => {
   const f = await setup();
   new BrowserEvents(f.chrome, f.tabs, f.epochs, f.agent).listen();

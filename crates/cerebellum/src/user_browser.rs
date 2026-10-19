@@ -1017,19 +1017,19 @@ async fn plan(
     }
     let navigates = methods.iter().any(|method| method == "Page.navigate");
     if interaction.is_some() && !reply.observer_available && !navigates {
-        return Err(observer_unavailable());
+        return Err(prior_input(observer_unavailable(), dispatched));
     }
     if !navigates
         && interaction.is_some()
         && observer_continuity.is_some_and(|expected| expected != reply.observer_continuity)
     {
-        return Err(observer_unavailable());
+        return Err(prior_input(observer_unavailable(), dispatched));
     }
     if !navigates && interaction.is_some_and(|expected| expected != reply.interaction_epoch) {
         return Err(read_again(dispatched));
     }
     if results.len() != count {
-        return Err(refusal("protocol_error"));
+        return Err(prior_input(refusal("protocol_error"), dispatched));
     }
     Ok(Plan {
         results,
@@ -1283,6 +1283,7 @@ async fn serve_scoped(
     if POPUP_SEEN.with(Cell::get) {
         reply["popup_activated_briefly"] = json!(true);
     }
+    reply = dispatched_outcome(reply);
     if crate::browser::validate_user_browser_result(action, &reply).is_err() {
         let input = reply
             .get("input_dispatched")
@@ -1291,6 +1292,7 @@ async fn serve_scoped(
         reply = refusal("result_schema_violation");
         reply["input_dispatched"] = input;
     }
+    reply = dispatched_outcome(reply);
     let record_origin = args
         .get("url")
         .and_then(Value::as_str)
@@ -1315,7 +1317,7 @@ async fn serve_scoped(
         if POPUP_SEEN.with(Cell::get) {
             failure["popup_activated_briefly"] = json!(true);
         }
-        return failure;
+        return dispatched_outcome(failure);
     }
     reply
 }
@@ -3677,6 +3679,16 @@ async fn verify_click_position(
 fn prior_input(mut reply: Value, dispatched: bool) -> Value {
     if dispatched {
         reply["input_dispatched"] = json!(true);
+    }
+    reply
+}
+
+fn dispatched_outcome(mut reply: Value) -> Value {
+    if reply["outcome"] == "refused" && reply["input_dispatched"] == true {
+        // A refusal promises that nothing ran. Once input was sent, failed
+        // observation cannot make that promise or safely invite a retry.
+        reply["outcome"] = json!("outcome_unknown");
+        reply["remedy"] = json!("Input was dispatched and may have taken effect. Do not repeat this action; take a fresh read before deciding what to do next.");
     }
     reply
 }
