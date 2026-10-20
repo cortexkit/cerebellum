@@ -733,7 +733,7 @@ mod live {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use subc_protocol::session::ModuleControlRequest;
@@ -998,25 +998,35 @@ mod live {
 
     struct Focus {
         stop: Arc<AtomicBool>,
+        /// Set once the probe's own Chrome has been the frontmost app.
         changed: Arc<AtomicBool>,
+        /// The probe's Chrome pid, or 0 before it is spawned.
+        watched: Arc<AtomicI32>,
         events: Arc<Mutex<Vec<Value>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Focus {
+        /// Samples the foreground app every 10 ms. Every transition is
+        /// recorded for diagnosis, but only the probe's own Chrome coming to
+        /// the front counts as a failure: the operator switching between their
+        /// own apps while the probe runs is not something the probe caused.
         fn start() -> Result<Self, String> {
             let initial =
                 cerebellum_macos::frontmost_process_id().ok_or("cannot observe foreground app")?;
             let stop = Arc::new(AtomicBool::new(false));
             let changed = Arc::new(AtomicBool::new(false));
+            let watched = Arc::new(AtomicI32::new(0));
             let flag = stop.clone();
             let result = changed.clone();
+            let chrome = watched.clone();
             let events = Arc::new(Mutex::new(Vec::new()));
             let recorded = events.clone();
             let thread = std::thread::spawn(move || {
                 let mut previous = Some(initial);
                 while !flag.load(Ordering::SeqCst) {
                     let current = cerebellum_macos::frontmost_process_id();
-                    if current != Some(initial) {
+                    let chrome_pid = chrome.load(Ordering::SeqCst);
+                    if chrome_pid != 0 && current == Some(chrome_pid) {
                         result.store(true, Ordering::SeqCst);
                     }
                     if current != previous {
@@ -1035,9 +1045,17 @@ mod live {
             Ok(Self {
                 stop,
                 changed,
+                watched,
                 events,
                 thread: Some(thread),
             })
+        }
+
+        /// Give the sampler the pid of the Chrome this probe launched. From now
+        /// on, that Chrome becoming the frontmost app fails the probe: driving
+        /// the person's browser must never pull it in front of their work.
+        fn watch(&self, chrome_pid: u32) {
+            self.watched.store(chrome_pid as i32, Ordering::SeqCst);
         }
     }
     impl Drop for Focus {
@@ -1523,6 +1541,7 @@ mod live {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
+        focus.watch(chrome.id());
         println!(
             "Chrome process: {}",
             json!({"at":wall_millis(),"pid":chrome.id()})
@@ -1685,7 +1704,10 @@ mod live {
         });
         driver.planes.user_browser.shutdown();
         drop(listener);
-        check("foreground pid never changed (10ms sampling)", focus_ok)?;
+        check(
+            "the probe's Chrome never came to the front (10ms sampling)",
+            focus_ok,
+        )?;
         result
     }
 
