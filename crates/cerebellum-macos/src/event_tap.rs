@@ -6,17 +6,41 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use crate::input::InputMonitoringAccess;
 
 /// A deliberate act by a person at the hardware: a key press (10), a left,
-/// right or other mouse-button press (1, 3, 25) or a scroll (22). Pointer
-/// motion is excluded because it isn't an act on an app. A nonzero source PID
-/// means another process synthesised the event. The private source state
-/// (`kCGEventSourceStatePrivate`, -1) is excluded because synthetic events
-/// posted from a private source can still carry a zero source PID.
-fn is_hardware_deliberate(pid: i64, source_state: i64, event_type: u32) -> bool {
-    pid == 0 && source_state != -1 && matches!(event_type, 1 | 3 | 10 | 22 | 25)
+/// right or other mouse-button press (1, 3, 25), or an active scroll (22).
+/// Pointer motion is excluded because it isn't an act on an app. A nonzero
+/// source PID means another process synthesised the event. The private source
+/// state (`kCGEventSourceStatePrivate`, -1) is excluded because synthetic
+/// events posted from a private source can still carry a zero source PID.
+fn is_hardware_deliberate(
+    pid: i64,
+    source_state: i64,
+    event_type: u32,
+    scroll: Option<(i64, [i64; 3], [i64; 3])>,
+) -> bool {
+    if pid != 0 || source_state == -1 {
+        return false;
+    }
+    match event_type {
+        1 | 3 | 10 | 25 => true,
+        22 => match scroll {
+            // Momentum continues a completed gesture; zero deltas describe a
+            // phase transition or contact, not movement by the person's fingers.
+            Some((momentum_phase, line_deltas, point_deltas)) => {
+                momentum_phase == 0
+                    && line_deltas
+                        .into_iter()
+                        .chain(point_deltas)
+                        .any(|delta| delta != 0)
+            }
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// The entire recorded payload of the process-lifetime hardware observer.
-/// It intentionally has no key code, character, flags, coordinates or PID.
+/// Scroll phase and deltas are read only to classify a scroll; they are not
+/// retained. This payload has no key code, character, flags, coordinates or PID.
 #[derive(Debug, Clone, Copy)]
 struct HardwareObservation {
     event_type: u32,
@@ -36,9 +60,15 @@ struct HardwareHistory {
 }
 
 impl HardwareHistory {
-    fn record(&mut self, pid: i64, source_state: i64, observation: HardwareObservation) {
+    fn record(
+        &mut self,
+        pid: i64,
+        source_state: i64,
+        observation: HardwareObservation,
+        scroll: Option<(i64, [i64; 3], [i64; 3])>,
+    ) {
         if self.since.is_none()
-            || !is_hardware_deliberate(pid, source_state, observation.event_type)
+            || !is_hardware_deliberate(pid, source_state, observation.event_type, scroll)
         {
             return;
         }
@@ -536,7 +566,51 @@ mod framework {
             if note_hardware_disable(event_type.0, &HARDWARE, &HARDWARE_HEALTH) {
                 return event.as_ptr();
             }
-            if super::is_hardware_deliberate(source_unix_process_id, source_state, event_type.0) {
+            let scroll = if event_type.0 == 22 {
+                let cg_event = Some(unsafe { event.as_ref() });
+                Some((
+                    CGEvent::integer_value_field(
+                        cg_event,
+                        CGEventField::ScrollWheelEventMomentumPhase,
+                    ),
+                    [
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventDeltaAxis1,
+                        ),
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventDeltaAxis2,
+                        ),
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventDeltaAxis3,
+                        ),
+                    ],
+                    [
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventPointDeltaAxis1,
+                        ),
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventPointDeltaAxis2,
+                        ),
+                        CGEvent::integer_value_field(
+                            cg_event,
+                            CGEventField::ScrollWheelEventPointDeltaAxis3,
+                        ),
+                    ],
+                ))
+            } else {
+                None
+            };
+            if super::is_hardware_deliberate(
+                source_unix_process_id,
+                source_state,
+                event_type.0,
+                scroll,
+            ) {
                 let timestamp_ns = CGEvent::timestamp(Some(unsafe { event.as_ref() }));
                 let observed_at_ns = super::uptime_now_ns();
                 let at = Instant::now().checked_sub(Duration::from_nanos(
@@ -547,7 +621,7 @@ mod framework {
                     HARDWARE
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record(source_unix_process_id, source_state, observation);
+                        .record(source_unix_process_id, source_state, observation, scroll);
                 } else {
                     HARDWARE
                         .lock()
@@ -659,19 +733,75 @@ mod hardware_tests {
             ..HardwareHistory::default()
         };
         for (pid, state, kind) in [(42, 1, 10), (0, -1, 10), (0, 1, 5)] {
-            history.record(pid, state, HardwareObservation::new(kind, at));
+            history.record(pid, state, HardwareObservation::new(kind, at), None);
         }
         assert_eq!(history.latest, [None; 5]);
         for (slot, kind) in [1, 3, 25, 10, 22].into_iter().enumerate() {
             history.latest = [None; 5];
-            history.record(0, 1, HardwareObservation::new(kind, at));
+            let scroll = (kind == 22).then_some((0, [1, 0, 0], [0; 3]));
+            history.record(0, 1, HardwareObservation::new(kind, at), scroll);
             let mut expected = [None; 5];
             expected[slot] = Some(at);
             assert_eq!(history.latest, expected);
         }
         history.invalidate();
-        history.record(0, 1, HardwareObservation::new(10, at));
+        history.record(0, 1, HardwareObservation::new(10, at), None);
         assert_eq!(history.latest, [None; 5]);
+    }
+
+    #[test]
+    fn momentum_phase_scroll_is_not_deliberate() {
+        assert!(!is_hardware_deliberate(
+            0,
+            1,
+            22,
+            Some((1, [1, 0, 0], [0; 3]))
+        ));
+    }
+
+    #[test]
+    fn zero_delta_scroll_phase_is_not_deliberate() {
+        assert!(!is_hardware_deliberate(0, 1, 22, Some((0, [0; 3], [0; 3]))));
+    }
+
+    #[test]
+    fn real_finger_scroll_with_line_delta_counts() {
+        assert!(is_hardware_deliberate(
+            0,
+            1,
+            22,
+            Some((0, [0, -1, 0], [0; 3]))
+        ));
+    }
+
+    #[test]
+    fn real_finger_scroll_with_point_delta_only_counts() {
+        assert!(is_hardware_deliberate(
+            0,
+            1,
+            22,
+            Some((0, [0; 3], [1, 0, 0]))
+        ));
+    }
+
+    #[test]
+    fn discrete_wheel_click_counts() {
+        assert!(is_hardware_deliberate(
+            0,
+            1,
+            22,
+            Some((0, [1, 0, 0], [0; 3]))
+        ));
+    }
+
+    #[test]
+    fn key_and_button_classification_is_unchanged() {
+        for kind in [1, 3, 10, 25] {
+            assert!(is_hardware_deliberate(0, 1, kind, None));
+        }
+        assert!(!is_hardware_deliberate(42, 1, 10, None));
+        assert!(!is_hardware_deliberate(0, -1, 10, None));
+        assert!(!is_hardware_deliberate(0, 1, 5, None));
     }
 
     #[test]
@@ -745,7 +875,7 @@ mod hardware_tests {
             history
                 .lock()
                 .unwrap()
-                .record(0, 1, HardwareObservation::new(10, after));
+                .record(0, 1, HardwareObservation::new(10, after), None);
             assert_eq!(history.lock().unwrap().latest[3], Some(after));
         }
     }
