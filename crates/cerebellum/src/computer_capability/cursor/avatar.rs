@@ -380,7 +380,7 @@ mod tests {
 
     /// How close our reading must come to the phone's. The phone rasterizes
     /// with CoreGraphics and we with resvg, so a pixel here and there
-    /// differs; these are the margins its authors expect from that alone.
+    /// differs; CKIOS, who produced the vectors, gave these margins for that.
     const HUE_TOLERANCE: f64 = 0.003;
     const SATURATION_TOLERANCE: f64 = 0.015;
 

@@ -538,9 +538,10 @@ pub const PILL_CONTRAST: f64 = 4.5;
 
 /// The label pill's fill for an accent: the accent's own hue and saturation,
 /// darkened only as far as white text needs to reach `PILL_CONTRAST`. The
-/// pointer and ring take the accent itself; the pill carries words, and the
-/// phone's accents (above all the brighter Dark mode one) are too light for
-/// white text on them to be read easily.
+/// pointer and ring take the accent itself; the pill carries words, and some
+/// of the phone's accents (above all the brighter Dark mode ones) are too
+/// light for white text on them to be read easily. An accent that already
+/// gives enough contrast is left as it is.
 pub fn pill_colour(accent: [f64; 3]) -> [f64; 3] {
     if white_contrast(accent) >= PILL_CONTRAST {
         return accent;
