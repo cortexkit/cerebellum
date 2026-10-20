@@ -59,6 +59,10 @@ type ProductionLaunchJournal = DurableLaunchJournal<crate::PlaneJournalStorage>;
 
 type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
 
+#[cfg(test)]
+#[path = "browser_launch_service_reap_tests.rs"]
+mod failed_reap_tests;
+
 fn map_poisoned_mutex<T>(
     result: Result<T, std::sync::PoisonError<T>>,
     stage: &'static str,
@@ -294,10 +298,17 @@ impl ProductionLaunchService {
         ),
     {
         let (journal, startup_failure, retained) = recover(&config, &profile_root);
+        let root = profile_root.resolve().ok();
+        if let Some(root) = root.clone() {
+            // Opening the registry runs attachment recovery even before the
+            // first launch. An unreadable registry stays unchanged; launch
+            // retries the open and returns its typed storage refusal.
+            let _ = profile_lifecycle_at(root);
+        }
         let journal = Arc::new(Mutex::new(journal));
         let recovery = Arc::new(RecoveryClearState {
             journal: Arc::clone(&journal),
-            root: profile_root.resolve().ok(),
+            root,
             configured_executable: config.executable_path.clone(),
             retained: Mutex::new(
                 retained
@@ -461,6 +472,14 @@ impl ProductionLaunchService {
             transport: Some(ready.transport),
             decoder: Some(ready.decoder),
             cleanup: Some(ProductionSessionCleanup {
+                reap_recovery: Some(SessionRecovery {
+                    evidence: Arc::clone(&self.recovery),
+                    durable_project: (accepted.identity.profile_disposition
+                        == ProfileDisposition::Durable)
+                        .then(|| accepted.identity.agent_project_id.clone()),
+                    journal_settled: false,
+                    cleanup_result: None,
+                }),
                 journal: Arc::clone(&self.journal),
                 launch_attempt_id: browser_session_id.to_string(),
                 terminal_outcome: None,
@@ -2569,6 +2588,7 @@ fn delete_crash_reports(
 }
 
 struct ProductionSessionCleanup {
+    reap_recovery: Option<SessionRecovery>,
     journal: SharedLaunchJournal,
     launch_attempt_id: String,
     terminal_outcome: Option<BrowserSessionTerminalOutcome>,
@@ -2576,6 +2596,13 @@ struct ProductionSessionCleanup {
     profile: SharedRollback,
     /// Deleted after the browser is reaped, whichever way the session ended.
     crash_reports: Option<CrashReportDirectory>,
+}
+
+struct SessionRecovery {
+    evidence: Arc<RecoveryClearState>,
+    durable_project: Option<String>,
+    journal_settled: bool,
+    cleanup_result: Option<Result<SessionCleanupOutcome, CleanupStage>>,
 }
 
 impl ProductionSessionCleanup {
@@ -2605,6 +2632,50 @@ impl ProductionSessionCleanup {
 }
 
 impl SessionCleanup for ProductionSessionCleanup {
+    fn durable_profile_project(&self) -> Option<&str> {
+        self.reap_recovery
+            .as_ref()
+            .and_then(|recovery| recovery.durable_project.as_deref())
+    }
+
+    fn prove_profile_unused(&self) -> Result<(), String> {
+        let recovery = &self.reap_recovery.as_ref().ok_or_else(||
+            "profile recovery evidence is unavailable; restart the module to run startup recovery".to_string())?.evidence;
+        crate::launch_recovery::read_profile_evidence(
+            &self.persistence.profile_directory,
+            recovery.configured_executable.as_deref(),
+            recovery.process_table.as_ref(),
+        )
+        .permits_clear()
+        .map_err(|refusal| refusal.remedy().to_string())
+    }
+
+    fn after_proven_exit(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+        // A retry must settle the old launch before making its profile
+        // available to a new one. Remember settlement if later cleanup fails.
+        let recovery = self.reap_recovery.as_mut().ok_or(CleanupStage::Reap)?;
+        if let Some(result) = recovery.cleanup_result {
+            return result;
+        }
+        if !recovery.journal_settled {
+            Self::finalize_journal(
+                &self.journal,
+                &self.launch_attempt_id,
+                &mut self.terminal_outcome,
+            )?;
+            recovery.journal_settled = true;
+        }
+        let outcome = self.persistence.observe();
+        // The profile rollback consumes its attachment handle even on error;
+        // retrying it would mistake the missing handle for successful release.
+        let result = self
+            .profile
+            .after_reap()
+            .and_then(|()| delete_crash_reports(&mut self.crash_reports))
+            .map(|()| outcome);
+        recovery.cleanup_result = Some(result);
+        result
+    }
     fn custody_holder_id(&self) -> Option<&str> {
         self.profile.holder_id.as_deref()
     }
@@ -2625,6 +2696,7 @@ impl SessionCleanup for ProductionSessionCleanup {
             persistence,
             profile,
             crash_reports,
+            ..
         } = self;
         run_cleanup_obligations(
             || persistence.observe(),
@@ -3266,6 +3338,7 @@ mod cleanup_ordering_tests {
         };
 
         let mut cleanup = ProductionSessionCleanup {
+            reap_recovery: None,
             // No journal bound, so the finalize step cannot succeed.
             journal: Arc::new(Mutex::new(None)),
             launch_attempt_id: "attempt-under-test".to_string(),
@@ -3418,6 +3491,7 @@ mod crash_reports_teardown_tests {
 
     fn cleanup_owning(crash_reports: CrashReportDirectory) -> ProductionSessionCleanup {
         ProductionSessionCleanup {
+            reap_recovery: None,
             journal: Arc::new(Mutex::new(None)),
             launch_attempt_id: "crash-reports-teardown".to_string(),
             terminal_outcome: None,

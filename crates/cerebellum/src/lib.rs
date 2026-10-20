@@ -7639,10 +7639,11 @@ async fn handle_browser_control(
             if accepted.identity.profile_disposition == ProfileDisposition::None {
                 return json!({"outcome": "no_profile", "profile_disposition": "none"});
             }
-            let browser_session_id = match planes
-                .sessions
-                .acquire_launch_slot(&accepted.identity.conversation_key)
-            {
+            let browser_session_id = match planes.sessions.acquire_launch_slot_for_profile(
+                &accepted.identity.conversation_key,
+                (accepted.identity.profile_disposition == ProfileDisposition::Durable)
+                    .then_some(accepted.identity.agent_project_id.as_str()),
+            ) {
                 browser_session::LaunchSlot::Occupied { browser_session_id } => {
                     return json!({
                         "outcome": "browser_session_exists",

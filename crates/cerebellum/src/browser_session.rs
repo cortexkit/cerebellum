@@ -1176,6 +1176,20 @@ pub trait SessionCleanup: Send {
         let _ = outcome;
     }
 
+    fn durable_profile_project(&self) -> Option<&str> {
+        None
+    }
+
+    /// Reuse the recovery evidence reader before releasing custody when reap
+    /// did not establish that the browser stopped. Unread evidence is not proof.
+    fn prove_profile_unused(&self) -> Result<(), String> {
+        Err("this cleanup cannot prove the profile unused; restart the module to run startup recovery".into())
+    }
+
+    fn after_proven_exit(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+        self.after_reap()
+    }
+
     fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage>;
 }
 
@@ -1449,12 +1463,13 @@ impl SessionMeta {
             terminal: self.terminal,
             cleanup_failure: self.cleanup_failure,
             cleanup_outcome: self.cleanup_outcome,
+            reap_recovery: None,
         }
     }
 }
 
 /// The part of a session that status and close report. An ended session is
-/// kept on its route as one of these plain records.
+/// kept on its route, including cleanup that must wait for proof of exit.
 #[derive(Clone)]
 struct SessionRecord {
     browser_session_id: String,
@@ -1463,6 +1478,17 @@ struct SessionRecord {
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
     cleanup_outcome: Option<SessionCleanupOutcome>,
+    reap_recovery: Option<Arc<ReapRecovery>>,
+}
+
+struct ReapRecovery {
+    durable_project: Option<String>,
+    state: Mutex<ReapRecoveryState>,
+}
+
+struct ReapRecoveryState {
+    cleanup: Box<dyn SessionCleanup>,
+    outcome: Option<SessionCleanupOutcome>,
 }
 
 impl SessionRecord {
@@ -2099,6 +2125,17 @@ impl BrowserSessions {
     }
 
     pub fn acquire_launch_slot(&self, route_key: &str) -> LaunchSlot {
+        self.acquire_launch_slot_for_profile(route_key, None)
+    }
+
+    pub fn acquire_launch_slot_for_profile(
+        &self,
+        route_key: &str,
+        durable_project: Option<&str>,
+    ) -> LaunchSlot {
+        if let Err(refusal) = self.retry_failed_reaps(route_key, None, durable_project) {
+            return LaunchSlot::Refused(refusal);
+        }
         let mut registry = match self.registry() {
             Ok(registry) => registry,
             Err(_) => {
@@ -2122,6 +2159,84 @@ impl BrowserSessions {
             browser_session_id.clone(),
         )));
         LaunchSlot::Acquired { browser_session_id }
+    }
+
+    /// Snapshot the recovery handles before doing process-table or filesystem
+    /// reads. Other routes and status must not wait behind that I/O.
+    fn retry_failed_reaps(
+        &self,
+        route_key: &str,
+        session_id: Option<&str>,
+        durable_project: Option<&str>,
+    ) -> Result<(), Value> {
+        let candidates: Vec<_> = {
+            let registry = self
+                .registry()
+                .map_err(|_| internal_failure_reply(BROWSER_SESSION_LOCK_STAGE))?;
+            registry
+                .routes
+                .iter()
+                .flat_map(|(route, slot)| {
+                    slot.retained.iter().filter_map(|record| {
+                        let recovery = record.reap_recovery.clone()?;
+                        Some((route.clone(), record.browser_session_id.clone(), recovery))
+                    })
+                })
+                .collect()
+        };
+        for (route, id, recovery) in candidates {
+            let same_session = route == route_key && session_id.is_none_or(|wanted| wanted == id);
+            let same_profile = session_id.is_none()
+                && durable_project.is_some()
+                && recovery.durable_project.as_deref() == durable_project;
+            if !same_session && !same_profile {
+                continue;
+            }
+            let mut pending = recovery
+                .state
+                .lock()
+                .map_err(|_| internal_failure_reply(BROWSER_SESSION_LOCK_STAGE))?;
+            let refusal = |stage: CleanupStage, remedy: String| {
+                json!({
+                    "outcome": "cleanup_failure", "browser_session_id": id,
+                    "stage": stage.as_str(), "remedy": remedy,
+                })
+            };
+            let outcome = match pending.outcome {
+                Some(outcome) => outcome,
+                None => {
+                    pending.cleanup.prove_profile_unused().map_err(|remedy| refusal(
+                        CleanupStage::Reap, format!("{remedy}; then retry browser.close for this session or browser.launch")
+                    ))?;
+                    pending
+                        .cleanup
+                        .set_terminal_outcome(BrowserSessionTerminalOutcome::Closed);
+                    let outcome = pending.cleanup.after_proven_exit().map_err(|stage| refusal(
+                        stage, if stage == CleanupStage::RecordTerminalization {
+                            "the launch journal could not be settled; check its storage, then retry browser.close or browser.launch".into()
+                        } else {
+                            "profile cleanup failed after launch settlement; restart the module to finish registry and custody recovery before relaunching".into()
+                        }
+                    ))?;
+                    pending.outcome = Some(outcome);
+                    outcome
+                }
+            };
+            let mut registry = self
+                .registry()
+                .map_err(|_| internal_failure_reply(BROWSER_SESSION_LOCK_STAGE))?;
+            if let Some(record) = registry.routes.get_mut(&route).and_then(|slot| {
+                slot.retained
+                    .iter_mut()
+                    .find(|record| record.browser_session_id == id)
+            }) {
+                record.terminal = Some(BrowserSessionTerminalOutcome::Closed);
+                record.cleanup_failure = None;
+                record.cleanup_outcome = Some(outcome);
+                record.reap_recovery = None;
+            }
+        }
+        Ok(())
     }
 
     /// Give back a launch slot whose launch failed before readiness.
@@ -2988,6 +3103,9 @@ impl BrowserSessions {
         browser_session_id: &str,
         config: &BrowserConfig,
     ) -> Value {
+        if let Err(refusal) = self.retry_failed_reaps(route_key, Some(browser_session_id), None) {
+            return refusal;
+        }
         let cell = {
             let registry = match self.registry() {
                 Ok(registry) => registry,
@@ -3549,7 +3667,7 @@ impl BrowserSessions {
         &self,
         cell: &Arc<SessionCell>,
         process: Box<dyn OwnedBrowserProcess>,
-        cleanup: Option<Box<dyn SessionCleanup>>,
+        mut cleanup: Option<Box<dyn SessionCleanup>>,
         outcome: Result<SessionCleanupOutcome, CleanupStage>,
     ) {
         // The retained record is built before the registry lock is taken.
@@ -3564,6 +3682,18 @@ impl BrowserSessions {
             Err(stage) => {
                 record.cleanup_failure = Some(stage);
                 record.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
+                if stage == CleanupStage::Reap {
+                    record.reap_recovery = cleanup.take().map(|cleanup| {
+                        let durable_project = cleanup.durable_profile_project().map(str::to_owned);
+                        Arc::new(ReapRecovery {
+                            durable_project,
+                            state: Mutex::new(ReapRecoveryState {
+                                cleanup,
+                                outcome: None,
+                            }),
+                        })
+                    });
+                }
             }
         }
         let removed = {
