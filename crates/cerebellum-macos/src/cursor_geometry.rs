@@ -328,6 +328,91 @@ pub(crate) fn layout(
     }
 }
 
+/// How far the pointer's tip is from the chip's centre in the resting badge.
+/// While the window under a badge is being dragged, the chip holds still and
+/// the pointer swings around it like a clock's hand, its tip on a circle of
+/// this radius, so the badge keeps its shape and size the whole time.
+pub(crate) fn hand_radius() -> f64 {
+    CHIP_CENTER[0].hypot(CHIP_CENTER[1])
+}
+
+/// The direction, in radians, from the chip's centre to the pointer's tip in
+/// the resting badge, measured like `atan2` in top-down points (0 is to the
+/// right, a quarter turn is straight down). The chip sits below and to the
+/// right of the tip, so this points up and to the left.
+pub(crate) fn rest_angle() -> f64 {
+    (-CHIP_CENTER[1]).atan2(-CHIP_CENTER[0])
+}
+
+/// An angle brought into (-pi, pi], so a pointer turning back to rest from
+/// it takes the short way round.
+pub(crate) fn wrap_angle(angle: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let wrapped = (angle + PI).rem_euclid(TAU) - PI;
+    // rem_euclid maps an angle of exactly pi to -pi; keep it at +pi so the
+    // range is half-open on the negative side.
+    if wrapped == -PI {
+        PI
+    } else {
+        wrapped
+    }
+}
+
+/// The turn from `from` to `to` that goes the short way round: at most half
+/// a turn either way. A pointer pointing just past straight left that must
+/// point just short of it turns a few degrees, not almost a whole circle.
+pub(crate) fn shortest_turn(from: f64, to: f64) -> f64 {
+    wrap_angle(to - from)
+}
+
+/// How far to turn the pointer about the chip's centre, from its resting
+/// direction, so that it points from a chip centred on `chip` toward
+/// `target` (both global top-down points). `None` when the direction is
+/// undefined: the target is on the chip's centre or a value is not finite.
+pub(crate) fn aim_rotation(chip: [f64; 2], target: [f64; 2]) -> Option<f64> {
+    let (dx, dy) = (target[0] - chip[0], target[1] - chip[1]);
+    if !(dx.is_finite() && dy.is_finite()) || dx.hypot(dy) < f64::EPSILON {
+        return None;
+    }
+    Some(wrap_angle(dy.atan2(dx) - rest_angle()))
+}
+
+/// Where a point drawn relative to the resting tip goes once the pointer has
+/// turned by `rotation` about the chip's centre. A rotation of exactly 0 is
+/// the resting badge and leaves every point exactly where it was.
+pub(crate) fn turn_point(point: [f64; 2], rotation: f64) -> [f64; 2] {
+    if rotation == 0.0 || !rotation.is_finite() {
+        return point;
+    }
+    let (sin, cos) = rotation.sin_cos();
+    let (dx, dy) = (point[0] - CHIP_CENTER[0], point[1] - CHIP_CENTER[1]);
+    [
+        CHIP_CENTER[0] + dx * cos - dy * sin,
+        CHIP_CENTER[1] + dx * sin + dy * cos,
+    ]
+}
+
+/// The panel a swinging pointer needs: `panel` (a resting layout's) grown to
+/// hold the pointer at every angle around the chip, outline and shadow
+/// included. Every pointer point lies within `hand_radius` of the chip's
+/// centre (the tip is the farthest), so a square of that half-size around
+/// the centre holds them all.
+pub(crate) fn swing_panel(panel: Rect) -> Rect {
+    let reach = hand_radius() + OUTLINE + SHADOW_MARGIN;
+    let orbit = Rect::new(
+        CHIP_CENTER[0] - reach,
+        CHIP_CENTER[1] - reach,
+        2.0 * reach,
+        2.0 * reach,
+    )
+    .union(panel);
+    // Whole points, like every layout panel, so a tip on the device-pixel
+    // grid still gives a panel origin on it.
+    let x = orbit.x.floor();
+    let y = orbit.y.floor();
+    Rect::new(x, y, orbit.right().ceil() - x, orbit.bottom().ceil() - y)
+}
+
 /// The AppKit (bottom-up) window origin that puts the pointer's tip on `tip`.
 /// `primary_height` is the primary display's height: AppKit's y axis starts at
 /// that display's bottom edge, the top-down one at its top edge, on every
@@ -626,5 +711,74 @@ mod tests {
         assert_eq!(target_rect(tip, Some([f64::NAN, 0.0, 5.0, 10.0])), point);
         assert_eq!(label_rect(tip, [f64::NAN, 20.0], point, screen()), None);
         assert_eq!(snap_tip([10.3, 10.6], f64::NAN), [10.0, 10.0]);
+    }
+
+    #[test]
+    fn the_hand_turns_about_the_chip_on_a_circle_through_the_resting_tip() {
+        use std::f64::consts::PI;
+        // The resting badge is the hand at rotation 0: every point stays put
+        // exactly, so a badge that has turned back lands pixel for pixel.
+        for point in POINTER {
+            assert_eq!(turn_point(point, 0.0), point);
+        }
+        // The resting tip is on the circle, up and to the left of the chip.
+        assert!((rest_angle() + 3.0 * PI / 4.0).abs() < 1e-12);
+        assert!((hand_radius() - 30.0 * 2f64.sqrt()).abs() < 1e-12);
+        for step in 0..72 {
+            let rotation = f64::from(step) * PI / 36.0 - PI;
+            let tip = turn_point([0.0, 0.0], rotation);
+            let from_chip = [tip[0] - CHIP_CENTER[0], tip[1] - CHIP_CENTER[1]];
+            assert!((from_chip[0].hypot(from_chip[1]) - hand_radius()).abs() < 1e-9);
+            // The pointer's notch stays on the line from the chip to the tip,
+            // between them: the arrow points away from the avatar.
+            let notch = turn_point(POINTER[2], rotation);
+            let to_notch = [notch[0] - CHIP_CENTER[0], notch[1] - CHIP_CENTER[1]];
+            let cross = from_chip[0] * to_notch[1] - from_chip[1] * to_notch[0];
+            let along = from_chip[0] * to_notch[0] + from_chip[1] * to_notch[1];
+            assert!(cross.abs() < 1e-9 && along > 0.0, "at {rotation}");
+            // Aiming at the turned tip asks for exactly this rotation.
+            let aimed = aim_rotation(CHIP_CENTER, tip).unwrap();
+            assert!(shortest_turn(aimed, rotation).abs() < 1e-9, "at {rotation}");
+        }
+        assert_eq!(aim_rotation(CHIP_CENTER, CHIP_CENTER), None);
+        assert_eq!(aim_rotation(CHIP_CENTER, [f64::NAN, 0.0]), None);
+    }
+
+    #[test]
+    fn turns_wrap_the_short_way_round() {
+        use std::f64::consts::PI;
+        let degrees = |d: f64| d * PI / 180.0;
+        // From just short of half a turn one way to just short of it the
+        // other way is a small turn across the back, not almost a circle.
+        assert!((shortest_turn(degrees(170.0), degrees(-170.0)) - degrees(20.0)).abs() < 1e-12);
+        assert!((shortest_turn(degrees(-170.0), degrees(170.0)) + degrees(20.0)).abs() < 1e-12);
+        assert!((shortest_turn(degrees(10.0), degrees(50.0)) - degrees(40.0)).abs() < 1e-12);
+        for angle in [-7.0, -PI, -1.0, 0.0, 1.0, PI, 7.0, 100.0] {
+            let wrapped = wrap_angle(angle);
+            assert!(
+                wrapped > -PI && wrapped <= PI,
+                "{angle} wrapped to {wrapped}"
+            );
+            assert!(((angle - wrapped) / (2.0 * PI)).fract().abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_swing_panel_holds_the_pointer_at_every_angle() {
+        let tip = [600.0, 400.0];
+        let resting = layout(tip, target_rect(tip, None), None, screen(), false).panel;
+        let panel = swing_panel(resting);
+        assert!(panel.contains_rect(resting));
+        for v in [panel.x, panel.y, panel.width, panel.height] {
+            assert_eq!(v.fract(), 0.0, "panel {panel:?} is not point-aligned");
+        }
+        for step in 0..360 {
+            let rotation = f64::from(step).to_radians();
+            for point in POINTER {
+                let [x, y] = turn_point(point, rotation);
+                let outlined = Rect::new(x - OUTLINE, y - OUTLINE, 2.0 * OUTLINE, 2.0 * OUTLINE);
+                assert!(panel.contains_rect(outlined), "{point:?} at {step} degrees");
+            }
+        }
     }
 }
