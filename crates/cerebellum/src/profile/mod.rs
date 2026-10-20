@@ -1430,6 +1430,18 @@ pub struct RegistryRecord {
     pub integrity: String,
 }
 
+fn release_attachment(record: &mut RegistryRecord) {
+    record.state = ProfileState::Released;
+    record.session_id = None;
+    record.attachment_id = None;
+    record.process = None;
+    record.seal_state = if record.kind == ProfileKind::Durable {
+        SealState::Sealed
+    } else {
+        SealState::Available
+    };
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuarantineReason {
@@ -2694,11 +2706,30 @@ pub enum ReleaseResult {
     Closed(ProfileOutcome),
 }
 
+struct AttachmentLiveness(
+    std::sync::Arc<dyn crate::profile_custody::SupervisorLivenessProbe + Send + Sync>,
+);
+
+impl fmt::Debug for AttachmentLiveness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AttachmentLiveness")
+    }
+}
+
+impl Default for AttachmentLiveness {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(
+            crate::profile_custody::KernelSupervisorLiveness,
+        ))
+    }
+}
+
 /// The profile lifecycle coordinator. It is deliberately synchronous: browser
 /// and journal adapters call it around their own asynchronous work and retain
 /// only opaque handles across that boundary.
 #[derive(Debug)]
 pub struct ProfileLifecycle {
+    attachment_liveness: AttachmentLiveness,
     registry: ProfileRegistry,
     namespace: u64,
     prepared: HashMap<u64, PreparedState>,
@@ -2721,7 +2752,8 @@ impl ProfileLifecycle {
     ) -> Result<Self, RegistryError> {
         let registry = ProfileRegistry::open_with_config(root, config)?;
         let namespace = handle_namespace(registry.root());
-        Ok(Self {
+        let mut lifecycle = Self {
+            attachment_liveness: AttachmentLiveness::default(),
             registry,
             namespace,
             prepared: HashMap::new(),
@@ -2732,7 +2764,15 @@ impl ProfileLifecycle {
             final_contexts: HashMap::new(),
             abort_signals: Vec::new(),
             deletion_excluded: BTreeSet::new(),
-        })
+        };
+        // Resolution reports untrusted or newer registry data as a typed
+        // refusal. Recovery must not turn that read-only refusal into an open
+        // failure or attempt to rewrite data it does not understand.
+        match lifecycle.recover_startup() {
+            Ok(_) | Err(RegistryError::Untrustworthy(_)) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(lifecycle)
     }
     /// Raise `floor` for registry writes instead of the one chosen from the
     /// root's location.
@@ -2744,6 +2784,7 @@ impl ProfileLifecycle {
         let registry = ProfileRegistry::disabled(root, RegistryConfig::default())?;
         let namespace = handle_namespace(registry.root());
         Ok(Self {
+            attachment_liveness: AttachmentLiveness::default(),
             registry,
             namespace,
             prepared: HashMap::new(),
@@ -3005,7 +3046,7 @@ impl ProfileLifecycle {
             }
         };
         let mut freshly_created = false;
-        let record = match resolution {
+        let mut record = match resolution {
             DurableResolution::Untrustworthy(reason) => return self.closed_untrusted_root(reason),
             DurableResolution::Unavailable => {
                 return self.closed_storage(
@@ -3061,6 +3102,18 @@ impl ProfileLifecycle {
             return PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
                 reason_code: "durable_profile_grant_unavailable",
             });
+        }
+        if record.state == ProfileState::Attached {
+            match self.recover_attachment(&record) {
+                Ok(Some(released)) => record = released,
+                Ok(None) => {}
+                Err(_) => {
+                    return self.closed_storage(
+                        FailureOrigin::RegistryOrStorage,
+                        "profile_attachment_recovery_failed",
+                    )
+                }
+            }
         }
         if record.state == ProfileState::Attached || record.state == ProfileState::Locked {
             return PrepareResult::Closed(ProfileOutcome::ProfileBusy {
@@ -3462,15 +3515,7 @@ impl ProfileLifecycle {
                 if record.profile_uuid != uuid || record.kind != kind {
                     return Err(RegistryError::Conflict);
                 }
-                record.state = ProfileState::Released;
-                record.session_id = None;
-                record.attachment_id = None;
-                record.process = None;
-                record.seal_state = if kind == ProfileKind::Durable {
-                    SealState::Sealed
-                } else {
-                    SealState::Available
-                };
+                release_attachment(record);
                 record.deletion_pending = kind == ProfileKind::Disposable;
                 Ok(())
             })
@@ -3909,11 +3954,7 @@ impl ProfileLifecycle {
                 if record.profile_uuid != state.profile_uuid {
                     return Err(RegistryError::Conflict);
                 }
-                record.state = ProfileState::Released;
-                record.session_id = None;
-                record.attachment_id = None;
-                record.process = None;
-                record.seal_state = SealState::Sealed;
+                release_attachment(record);
                 Ok(())
             })
             .map(|_| ())
@@ -4006,12 +4047,73 @@ impl ProfileLifecycle {
                 self.deletion_excluded.insert(record.profile_uuid.clone());
             }
             if record.state == ProfileState::Attached && record.process.is_none() {
-                let _ = self.registry.mark_unavailable(record);
+                self.registry.mark_unavailable(record)?;
                 self.deletion_excluded.insert(record.profile_uuid.clone());
+                recovered += 1;
+            } else if record.state == ProfileState::Attached
+                && self.recover_attachment(record)?.is_some()
+            {
                 recovered += 1;
             }
         }
         Ok(recovered)
+    }
+
+    /// Re-read the attachment and its kernel-generation evidence while holding
+    /// the registry slot. The registry's `s8-<handle>` start token names a local
+    /// attachment, not a kernel process start time, so it cannot rule out pid
+    /// reuse. A missing or unreadable custody journal leaves the attachment busy.
+    fn recover_attachment(
+        &self,
+        original: &RegistryRecord,
+    ) -> Result<Option<RegistryRecord>, RegistryError> {
+        use crate::profile_custody::{
+            current_supervisor_generation, recorded_profile_supervisor, SupervisorLiveness,
+        };
+        let _slot = self.registry.acquire_slot_lock()?;
+        let Some(document) = self.registry.read_document()? else {
+            return Ok(None);
+        };
+        let Some((key, record)) = document
+            .records
+            .iter()
+            .find(|(_, record)| record.profile_uuid == original.profile_uuid)
+        else {
+            return Ok(None);
+        };
+        if record.state != ProfileState::Attached
+            || record.process != original.process
+            || record.attachment_id != original.attachment_id
+            || record.generation != original.generation
+        {
+            return Ok(None);
+        }
+        let Some(process) = &record.process else {
+            return Ok(None);
+        };
+        let directory = self.registry.profile_target(&record.target, false)?;
+        let Ok(Some(owner)) = recorded_profile_supervisor(
+            self.registry.root().canonical_path(),
+            &directory,
+            process.pid,
+        ) else {
+            return Ok(None);
+        };
+        let Ok(current) = current_supervisor_generation() else {
+            return Ok(None);
+        };
+        if owner == current
+            || self.attachment_liveness.0.observe(owner) != SupervisorLiveness::NotLive
+        {
+            return Ok(None);
+        }
+        self.registry
+            .update_record_by_key_locked(key, |record| {
+                release_attachment(record);
+                record.deletion_pending = record.kind == ProfileKind::Disposable;
+                Ok(())
+            })
+            .map(Some)
     }
 }
 
@@ -4219,6 +4321,196 @@ mod tests {
             format!("commitment-{id}"),
         );
         (invocation, reservation, token)
+    }
+
+    struct AttachmentFixture {
+        path: PathBuf,
+        lifecycle: ProfileLifecycle,
+        config: RegistryConfig,
+    }
+
+    impl AttachmentFixture {
+        fn new(owner: crate::profile_custody::SupervisorGeneration) -> Self {
+            use crate::profile_custody::{
+                FilesystemProfileCustodyJournal, HolderId, ProfileCustodyEvent,
+                ProfileCustodyEventKind, ProfileCustodyJournal,
+            };
+            let path = root();
+            let config = RegistryConfig {
+                grant_verifier_available: true,
+                sealing_available: true,
+                uuid_protocol_compatible: true,
+                ..RegistryConfig::default()
+            };
+            let mut lifecycle = ProfileLifecycle::open_with_config(&path, config.clone()).unwrap();
+            let (invocation, reservation, commitment) = tokens("old-attachment");
+            let PrepareResult::Prepared(prepared) = lifecycle.prepare_context_open(
+                &invocation,
+                &reservation,
+                &context("primary", "durable", "old-conversation"),
+            ) else {
+                panic!("prepare attachment");
+            };
+            let directory = lifecycle
+                .prepared_profile_attempt(&prepared)
+                .unwrap()
+                .directory()
+                .to_path_buf();
+            assert!(matches!(
+                lifecycle.launch_prepared_context(prepared, &commitment),
+                LaunchResult::Opened(_)
+            ));
+            lifecycle
+                .registry
+                .update_record("project-1", |record| {
+                    record.process.as_mut().unwrap().pid = owner.pid;
+                    Ok(())
+                })
+                .unwrap();
+            let mut journal =
+                FilesystemProfileCustodyJournal::open(path.join(".ck-browser-profile-custody"))
+                    .unwrap();
+            journal
+                .record(&ProfileCustodyEvent {
+                    format_version: "ck-browser-profile-custody-event/v1".into(),
+                    kind: ProfileCustodyEventKind::ProfileDirectoryBind,
+                    holder_id: HolderId::from_recorded("old-holder"),
+                    supervisor: owner,
+                    profile_directory: Some(directory),
+                    evidence: None,
+                })
+                .unwrap();
+            Self {
+                path,
+                lifecycle,
+                config,
+            }
+        }
+
+        fn record(&self) -> RegistryRecord {
+            match self
+                .lifecycle
+                .registry
+                .resolve_durable("project-1")
+                .unwrap()
+            {
+                DurableResolution::TrustworthyExisting(record) => record,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn prepare(&mut self) -> PrepareResult {
+            let (invocation, reservation, _) = tokens("new-attachment");
+            self.lifecycle.prepare_context_open(
+                &invocation,
+                &reservation,
+                &context("primary", "durable", "new-conversation"),
+            )
+        }
+    }
+
+    impl Drop for AttachmentFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
+        crate::profile_custody::SupervisorGeneration {
+            pid: u32::MAX,
+            start_time: 1,
+            boot_id: None,
+        }
+    }
+
+    #[test]
+    fn attached_dead_supervisor_is_released_at_startup() {
+        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+        fixture.lifecycle =
+            ProfileLifecycle::open_with_config(&fixture.path, fixture.config.clone()).unwrap();
+        let record = fixture.record();
+        assert_eq!(record.state, ProfileState::Released);
+        assert_eq!(record.seal_state, SealState::Sealed);
+        assert!(
+            record.process.is_none()
+                && record.session_id.is_none()
+                && record.attachment_id.is_none()
+        );
+    }
+
+    #[test]
+    fn attached_dead_supervisor_allows_a_later_launch() {
+        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+        use crate::profile_custody::{ProfileCustodyKey, ProfileCustodyLocks};
+        let mut locks = ProfileCustodyLocks::open_filesystem(&fixture.path).unwrap();
+        let (invocation, reservation, commitment) = tokens("retry-launch");
+        let mut launch =
+            crate::browser_launch::ProfileBoundLaunch::new(&mut fixture.lifecycle, &mut locks);
+        let held = launch
+            .acquire_and_prepare(
+                ProfileCustodyKey::durable("project-1"),
+                &invocation,
+                &reservation,
+                &context("primary", "durable", "new-conversation"),
+            )
+            .expect("launch recovers the dead attachment");
+        let opened = launch
+            .launch_prepared(held, &commitment)
+            .expect("launch opens the recovered profile");
+        launch.rollback_opened(opened).unwrap();
+    }
+
+    #[test]
+    fn attached_live_supervisor_stays_busy() {
+        let mut fixture = AttachmentFixture::new(
+            crate::profile_custody::current_supervisor_generation().unwrap(),
+        );
+        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
+        assert!(matches!(
+            fixture.prepare(),
+            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
+        ));
+        assert_eq!(fixture.record().state, ProfileState::Attached);
+        assert_eq!(fixture.record().seal_state, SealState::Available);
+    }
+
+    struct UnreadableAttachmentOwner;
+    impl crate::profile_custody::SupervisorLivenessProbe for UnreadableAttachmentOwner {
+        fn observe(
+            &self,
+            _: crate::profile_custody::SupervisorGeneration,
+        ) -> crate::profile_custody::SupervisorLiveness {
+            crate::profile_custody::SupervisorLiveness::Unavailable
+        }
+    }
+
+    #[test]
+    fn attached_unreadable_supervisor_stays_busy() {
+        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+        fixture.lifecycle.attachment_liveness =
+            AttachmentLiveness(std::sync::Arc::new(UnreadableAttachmentOwner));
+        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
+        assert!(matches!(
+            fixture.prepare(),
+            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
+        ));
+        assert_eq!(fixture.record().state, ProfileState::Attached);
+    }
+
+    #[test]
+    fn attached_missing_generation_evidence_stays_busy() {
+        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+        fs::remove_file(
+            fixture
+                .path
+                .join(".ck-browser-profile-custody/custody-events.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
+        assert!(matches!(
+            fixture.prepare(),
+            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
+        ));
     }
 
     #[test]

@@ -292,7 +292,7 @@ fn a_second_attempt_names_the_winning_holder_and_prepares_no_second_profile() {
 }
 
 #[test]
-fn a_held_lock_and_registry_profile_busy_is_internal_failure() {
+fn registry_profile_busy_is_typed_with_a_recovery_remedy() {
     let root = TestRoot::new("artifact-disagreement");
     let mut owner = ProfileLifecycle::open_with_config(root.path(), durable_config()).unwrap();
     let (invocation, reservation, commitment) = tokens("existing-owner");
@@ -328,19 +328,15 @@ fn a_held_lock_and_registry_profile_busy_is_internal_failure() {
         )
         .unwrap_err();
 
-    assert_eq!(
-        outcome,
-        BrowserLaunchOutcome::InternalFailure {
-            reason_code: "registry_profile_busy",
-        }
-    );
-    assert_eq!(
-        outcome.as_json(),
-        json!({
-            "outcome": "internal_failure",
-            "reason_code": "registry_profile_busy",
-        })
-    );
+    assert_eq!(outcome, BrowserLaunchOutcome::RegistryProfileBusy);
+    let reply = outcome.as_json();
+    assert_eq!(reply["outcome"], "profile_busy");
+    assert_eq!(reply["reason_code"], "registry_profile_busy");
+    assert!(reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("supervisor liveness"));
+    assert!(reply["remedy"].as_str().unwrap().contains("browser.launch"));
     assert!(profile_lock_paths(root.path()).is_empty());
     assert_eq!(profile_directory_count(root.path()), 1);
 }

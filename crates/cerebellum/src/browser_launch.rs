@@ -4867,6 +4867,7 @@ impl LaunchCleanupStage {
 /// profile contention identity this type can carry is a custody holder id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserLaunchOutcome {
+    RegistryProfileBusy,
     ProfileBusy {
         holder_id: HolderId,
     },
@@ -4896,6 +4897,11 @@ pub enum BrowserLaunchOutcome {
 impl BrowserLaunchOutcome {
     pub fn as_json(&self) -> Value {
         match self {
+            Self::RegistryProfileBusy => json!({
+                "outcome": "profile_busy",
+                "reason_code": "registry_profile_busy",
+                "remedy": "the profile registry still has an attachment whose owner is live or cannot be proven gone; close its browser session, or have an operator check supervisor liveness and custody journal access, then retry browser.launch",
+            }),
             Self::ResourceBusy { detail } => {
                 detail
                     .validate()
@@ -5016,14 +5022,13 @@ mod profile_registry_outcome_tests {
     }
 }
 
-/// Exhaustive mapping for the profile API's closed outcome. In particular,
-/// registry `ProfileBusy` is disagreement with an already-held custody claim and
-/// cannot be reported as contention.
+/// Keep registry attachment contention distinct from internal failures, even
+/// when the new launch already holds the profile's exclusive custody lock.
 pub fn map_profile_outcome(outcome: ProfileOutcome) -> BrowserLaunchOutcome {
     match outcome {
-        ProfileOutcome::ProfileBusy { profile_uuid: _ } => BrowserLaunchOutcome::InternalFailure {
-            reason_code: "registry_profile_busy",
-        },
+        ProfileOutcome::ProfileBusy { profile_uuid: _ } => {
+            BrowserLaunchOutcome::RegistryProfileBusy
+        }
         ProfileOutcome::ProfileGrantRequired { reason_code: _ } => {
             BrowserLaunchOutcome::ProfileGrantRequired
         }
@@ -5429,6 +5434,7 @@ fn cleanup_stage_after_profile_completion(attempt: &PreparedProfileAttempt) -> L
 /// This compile-time shape assertion fails if a future wire-facing outcome can
 /// carry a profile UUID or profile path without updating the structural fence.
 const _: fn(BrowserLaunchOutcome) = |outcome| match outcome {
+    BrowserLaunchOutcome::RegistryProfileBusy => {}
     BrowserLaunchOutcome::ProfileBusy { holder_id: _ }
     | BrowserLaunchOutcome::ResourceBusy { detail: _ }
     | BrowserLaunchOutcome::ProfileRecoveryPending { reason: _ }
@@ -5450,6 +5456,9 @@ mod launch_outcome_schema_tests {
     /// changes the rendered words (a remedy appears for some reasons only).
     fn renderings_of(variant: &BrowserLaunchOutcome) -> Vec<BrowserLaunchOutcome> {
         match variant {
+            BrowserLaunchOutcome::RegistryProfileBusy => {
+                vec![BrowserLaunchOutcome::RegistryProfileBusy]
+            }
             BrowserLaunchOutcome::ResourceBusy { detail } => {
                 vec![BrowserLaunchOutcome::ResourceBusy {
                     detail: detail.clone(),
@@ -5545,6 +5554,7 @@ mod launch_outcome_schema_tests {
         // One seed per variant; `renderings_of` refuses to compile if a
         // variant is missing from its match.
         let seeds = [
+            BrowserLaunchOutcome::RegistryProfileBusy,
             BrowserLaunchOutcome::ResourceBusy {
                 detail: cortexkit_resource_busy::ResourceBusy::new(
                     "browser_profile",
@@ -5590,9 +5600,9 @@ mod launch_outcome_schema_tests {
         }
         // One rendering each for busy, grant, storage and internal failure,
         // three recovery-pending reasons, eighteen untrusted-root reasons, and
-        // three cleanup stages, plus the fleet resource refusal: 29. A lower count means a rendering was
-        // dropped from the check.
-        assert_eq!(checked, 29);
+        // three cleanup stages, plus the fleet resource refusal and the registry
+        // attachment refusal: 30. A lower count means a rendering was dropped.
+        assert_eq!(checked, 30);
     }
 
     /// Platform launch refusals reach the caller through the launch service's
