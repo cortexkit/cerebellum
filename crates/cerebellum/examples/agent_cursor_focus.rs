@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serial: 0,
             avatar_rgba: None,
             avatar_update: false,
+            avatar_tint: None,
             agent: "Focus probe".into(),
             initial: 'F',
             to: point,

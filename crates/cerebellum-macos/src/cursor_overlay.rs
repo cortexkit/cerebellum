@@ -20,8 +20,8 @@ use crate::cursor_geometry::{
 };
 pub use crate::cursor_schedule::CursorMotion;
 use crate::cursor_schedule::{
-    entry_frame, ActivityChange, ActivityGate, Appearance, BadgeMotion, CursorSchedule, EntryFrame,
-    MotionEvent, PictureNeed, PictureStep, Wait,
+    entry_frame, ActivityChange, ActivityGate, Appearance, BadgeMotion, ColourFade, Colours,
+    CursorSchedule, EntryFrame, MotionEvent, PictureNeed, PictureStep, Wait,
 };
 
 use objc2::rc::Retained;
@@ -59,9 +59,14 @@ pub enum OverlayGesture {
 pub struct OverlayEvent {
     pub agent: String,
     pub initial: char,
-    /// The agent's accent colour, sRGB in [0, 1]: the pointer, the chip's
-    /// ring and the label pill are drawn in it.
-    pub accent: [f64; 3],
+    /// The agent's colours for Light and Dark mode; the helper draws the set
+    /// for the appearance it sees.
+    pub accent: OverlayAccent,
+    /// `accent` is the agent's own colour, read from its avatar. When false
+    /// it is the neutral colour, which a badge already showing the agent's
+    /// colour keeps rather than going back to grey. An avatar update always
+    /// sets the colour it carries.
+    pub accent_known: bool,
     /// The tip's destination, global top-down points.
     pub to: [f64; 2],
     /// The acted-on element's frame; the label never covers it.
@@ -73,6 +78,22 @@ pub struct OverlayEvent {
     pub serial: u64,
     pub avatar_rgba: Option<Vec<u8>>,
     pub avatar_update: bool,
+}
+
+/// The colours a badge is drawn in for one system appearance, sRGB in [0, 1].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayColours {
+    /// The pointer's fill and the chip's ring.
+    pub accent: [f64; 3],
+    /// The label pill, under white text.
+    pub pill: [f64; 3],
+}
+
+/// An agent's colours for Light and for Dark mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayAccent {
+    pub light: OverlayColours,
+    pub dark: OverlayColours,
 }
 
 /// One message from the module: a picture to show or move, one agent's
@@ -123,6 +144,8 @@ struct Scene {
     pointer_alpha: f64,
     label: Option<NSRect>,
     accent: [f64; 3],
+    /// The label pill's fill.
+    pill: [f64; 3],
     /// Only the offscreen gallery draws a backdrop; the live panel is clear.
     backdrop: Option<Backdrop>,
     /// Opacity the gallery draws the badge at. The live panel always draws
@@ -140,9 +163,16 @@ impl Default for Scene {
             pointer_alpha: 1.0,
             label: None,
             accent: [0.427, 0.290, 1.0],
+            pill: [0.427, 0.290, 1.0],
             backdrop: None,
             alpha: 1.0,
         }
+    }
+}
+
+impl Scene {
+    fn colours(&self) -> Colours {
+        [self.accent, self.pill]
     }
 }
 
@@ -173,7 +203,7 @@ define_class!(
             }
             with_group_alpha(scene.alpha, || {
                 if let Some(label) = scene.label {
-                    with_group_alpha(scene.entry.pointer, || draw_pill(label, scene.accent));
+                    with_group_alpha(scene.entry.pointer, || draw_pill(label, scene.pill));
                 }
                 draw_badge(&scene, self.ivars().image.borrow().as_deref());
             });
@@ -349,11 +379,11 @@ fn draw_badge(scene: &Scene, avatar: Option<&NSImage>) {
     });
 }
 
-fn draw_pill(label: NSRect, accent: [f64; 3]) {
+fn draw_pill(label: NSRect, fill: [f64; 3]) {
     let radius = label.size.height / 2.0;
     let pill = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(label, radius, radius);
     with_shadow(3.0, 0.3, || {
-        accent_color(accent, 1.0).setFill();
+        accent_color(fill, 1.0).setFill();
         pill.fill();
     });
     // A thin white edge, like the pointer's outline, keeps the pill's shape
@@ -454,9 +484,9 @@ impl Fields {
         self.initial.sizeToFit();
     }
 
-    fn set_accent(&self, accent: [f64; 3]) {
+    fn set_colours(&self, colours: Colours) {
         let mut scene = self.ivars_scene();
-        scene.accent = accent;
+        [scene.accent, scene.pill] = colours;
         self.badge.ivars().scene.set(scene);
         self.badge.setNeedsDisplay(true);
     }
@@ -556,6 +586,20 @@ fn view_rect(panel: Rect, relative: Rect) -> NSRect {
     rect(x, y, relative.width, relative.height)
 }
 
+/// Whether the system is in Dark mode, as this process sees it. The helper
+/// never sets an appearance of its own, so its application's appearance is
+/// the system's.
+fn system_is_dark(mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::{NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    use objc2_foundation::NSArray;
+    let appearance = NSApplication::sharedApplication(mtm).effectiveAppearance();
+    // SAFETY: the appearance names are immutable AppKit string constants.
+    let (light, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+    appearance
+        .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[light, dark]))
+        .is_some_and(|best| &*best == dark)
+}
+
 /// Every display in global top-down points, and the primary display's height
 /// that AppKit's flipped y axis is measured from.
 fn read_displays(mtm: MainThreadMarker) -> (Vec<Display>, f64) {
@@ -594,6 +638,10 @@ struct Picture {
     appearance: Appearance,
     /// Where it is, where it is going, and what its pointer is doing.
     motion: BadgeMotion,
+    /// The agent's colours this picture is drawn in, once set by an event.
+    accent: Option<OverlayAccent>,
+    /// The colours shown, cross-fading to new ones when they change.
+    colours: ColourFade,
     /// The resting badge's layout for the latest event.
     layout: Layout,
     /// The panel in use: the resting layout's, or a larger one that holds a
@@ -610,6 +658,7 @@ struct Picture {
     last_entry: EntryFrame,
     last_alpha: f64,
     last_hand: (f64, f64),
+    last_colours: Colours,
 }
 
 impl Picture {
@@ -653,6 +702,8 @@ impl Picture {
             serial: 0,
             appearance: Appearance::default(),
             motion: BadgeMotion::new(Instant::now()),
+            accent: None,
+            colours: ColourFade::new(Scene::default().colours()),
             layout: Layout {
                 panel: Rect::new(0.0, 0.0, 48.0, 48.0),
                 label: None,
@@ -666,6 +717,26 @@ impl Picture {
             last_entry: EntryFrame::REST,
             last_alpha: 1.0,
             last_hand: (0.0, 1.0),
+            last_colours: Scene::default().colours(),
+        }
+    }
+
+    /// Draw this picture in `accent`, the set for the system's current
+    /// appearance: at once for a badge only now appearing, otherwise by a
+    /// short cross-fade, so a colour that arrives after the badge appeared
+    /// eases in rather than snapping.
+    fn recolour(&mut self, mtm: MainThreadMarker, accent: OverlayAccent, now: Instant, fade: bool) {
+        self.accent = Some(accent);
+        let colours = if system_is_dark(mtm) {
+            accent.dark
+        } else {
+            accent.light
+        };
+        self.colours.set([colours.accent, colours.pill], now, fade);
+        if !fade {
+            let (shown, _) = self.colours.frame(now);
+            self.fields.set_colours(shown);
+            self.last_colours = shown;
         }
     }
 
@@ -677,12 +748,20 @@ impl Picture {
         now: Instant,
     ) {
         self.serial = event.serial;
-        self.fields.set_accent(event.accent);
         self.fields.set_avatar(event.avatar_rgba.as_deref());
         self.fields.set_initial(event.initial);
         let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         (self.displays, self.primary_height) = read_displays(mtm);
         let first = self.appearance.on_event(now, reduce);
+        // The agent's own colour replaces whatever is shown; the neutral one
+        // only stands in until that is known, so it never replaces it. The
+        // appearance is read again either way, so a switch between Light and
+        // Dark mode shows on the next event.
+        let accent = match self.accent {
+            Some(known) if !event.accent_known => known,
+            _ => event.accent,
+        };
+        self.recolour(mtm, accent, now, !first);
         let to = self.motion.on_event(
             MotionEvent {
                 to: event.to,
@@ -807,7 +886,12 @@ impl Picture {
             self.panel.setAlphaValue(alpha);
             self.last_alpha = alpha;
         }
-        if self.appearance.entering() {
+        let (colours, recolouring) = self.colours.frame(now);
+        if colours != self.last_colours {
+            self.fields.set_colours(colours);
+            self.last_colours = colours;
+        }
+        if self.appearance.entering() || recolouring {
             PictureNeed::Frames
         } else {
             frame.need
@@ -879,7 +963,8 @@ pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
         OverlayEvent {
             agent: "hide-probe".into(),
             initial: 'P',
-            accent: [0.4, 0.3, 1.0],
+            accent: PROBE_ACCENT,
+            accent_known: true,
             to: [
                 screen.x + screen.width / 2.0,
                 screen.y + screen.height / 2.0,
@@ -1039,6 +1124,9 @@ fn run_cursor_loop(
                             if let Some(picture) = pictures.picture_for_update(&event.agent) {
                                 if picture.serial == event.serial {
                                     picture.fields.set_avatar(event.avatar_rgba.as_deref());
+                                    // The colour read from that avatar; the
+                                    // next frame starts fading to it.
+                                    picture.recolour(mtm, event.accent, Instant::now(), true);
                                 }
                             }
                             continue;
@@ -1142,6 +1230,18 @@ fn run_cursor_loop(
 /// The agent the motion probe drives.
 const PROBE_AGENT: &str = "motion-probe";
 
+/// The colours the probes draw their badge in: a violet with a darker pill.
+const PROBE_ACCENT: OverlayAccent = OverlayAccent {
+    light: OverlayColours {
+        accent: [0.427, 0.290, 1.0],
+        pill: [0.33, 0.22, 0.78],
+    },
+    dark: OverlayColours {
+        accent: [0.427, 0.290, 1.0],
+        pill: [0.33, 0.22, 0.78],
+    },
+};
+
 /// What the helper's loop did on one pass, for the motion probe.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -1213,7 +1313,8 @@ pub fn probe_cursor_motion(
         OverlayMessage::Show(OverlayEvent {
             agent: PROBE_AGENT.into(),
             initial: 'P',
-            accent: [0.427, 0.290, 1.0],
+            accent: PROBE_ACCENT,
+            accent_known: true,
             to: at,
             target: None,
             resting: false,
@@ -1341,6 +1442,8 @@ pub fn render_cursor_gallery_png(
             point: NSPoint::new(point[0], height - point[1]),
         }),
         accent: shot.accent,
+        // The stills show the pill in the accent itself.
+        pill: shot.accent,
         alpha: entry.alpha,
         ..Scene::default()
     });

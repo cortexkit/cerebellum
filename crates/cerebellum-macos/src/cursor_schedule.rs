@@ -177,6 +177,75 @@ impl Appearance {
     }
 }
 
+/// How long a badge takes to change colour, in ms: when its agent's avatar
+/// colour arrives after the badge appeared in the neutral one, or the system
+/// switches between Light and Dark mode. Long enough to read as a change of
+/// tint rather than a flicker, short enough to be done before the next
+/// action.
+pub(crate) const COLOUR_FADE_MS: f64 = 200.0;
+
+/// The colours a badge is drawn in, sRGB in [0, 1]: the pointer and the
+/// chip's ring, then the label pill.
+pub(crate) type Colours = [[f64; 3]; 2];
+
+/// A badge's colours, cross-faded from one set to the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ColourFade {
+    from: Colours,
+    to: Colours,
+    shown: Colours,
+    clock: Option<FrameClock>,
+}
+
+impl ColourFade {
+    pub(crate) fn new(colours: Colours) -> Self {
+        Self {
+            from: colours,
+            to: colours,
+            shown: colours,
+            clock: None,
+        }
+    }
+
+    /// Change to `colours`: at once when `fade` is false (a badge that is
+    /// only now appearing), otherwise by a cross-fade from the colours shown
+    /// now, so a change mid-fade carries on from where it is.
+    pub(crate) fn set(&mut self, colours: Colours, now: Instant, fade: bool) {
+        if colours == self.to && (fade || self.clock.is_none()) {
+            return;
+        }
+        self.to = colours;
+        if fade {
+            self.from = self.shown;
+            self.clock = Some(FrameClock::start(now));
+        } else {
+            self.from = colours;
+            self.shown = colours;
+            self.clock = None;
+        }
+    }
+
+    /// The colours to draw at `now`, and whether they are still changing.
+    pub(crate) fn frame(&mut self, now: Instant) -> (Colours, bool) {
+        let Some(clock) = self.clock.as_mut() else {
+            return (self.shown, false);
+        };
+        let progress = (clock.advance(now) / COLOUR_FADE_MS).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.clock = None;
+            self.shown = self.to;
+            return (self.shown, false);
+        }
+        let eased = ease_in_out(progress);
+        for (part, (from, to)) in self.shown.iter_mut().zip(self.from.iter().zip(self.to)) {
+            for (channel, (a, b)) in part.iter_mut().zip(from.iter().zip(to)) {
+                *channel = a + (b - a) * eased;
+            }
+        }
+        (self.shown, true)
+    }
+}
+
 /// Motion curves, supplied by the platform-neutral crate where they are
 /// tested on every host.
 #[derive(Clone, Copy)]
@@ -1230,6 +1299,47 @@ mod tests {
         entries += usize::from(event(&mut schedule, start + SECOND * 40));
         assert_eq!(entries, 2);
         assert!(schedule.picture_for_update("agent").unwrap().entering());
+    }
+
+    #[test]
+    fn a_new_colour_cross_fades_in_over_about_200_ms_instead_of_snapping() {
+        const GREY: Colours = [[0.52, 0.49, 0.45], [0.40, 0.38, 0.35]];
+        const ROSE: Colours = [[0.60, 0.30, 0.40], [0.50, 0.25, 0.33]];
+        let start = Instant::now();
+        let mut colours = ColourFade::new(GREY);
+        assert_eq!(colours.frame(start), (GREY, false), "at rest, no frames");
+        colours.set(ROSE, start, true);
+        let mut shown = Vec::new();
+        let mut now = start;
+        loop {
+            let (frame, changing) = colours.frame(now);
+            shown.push(frame);
+            if !changing {
+                break;
+            }
+            now += FRAME;
+        }
+        assert_eq!(shown[0], GREY, "starts from the colour on screen");
+        assert_eq!(*shown.last().unwrap(), ROSE);
+        let took = now - start;
+        assert!(
+            (Duration::from_millis(190)..=Duration::from_millis(220)).contains(&took),
+            "{took:?}"
+        );
+        // Every frame between is a step of the way, never a jump to the end.
+        assert!(shown.len() >= 11, "{} frames", shown.len());
+        for pair in shown.windows(2) {
+            let step = (pair[1][0][0] - pair[0][0][0]).abs();
+            assert!(step < 0.25 * (ROSE[0][0] - GREY[0][0]), "{pair:?}");
+        }
+        // A change in the middle of a fade carries on from where it is.
+        colours.set(GREY, now, true);
+        let (half_way, _) = colours.frame(now + Duration::from_millis(100));
+        colours.set(ROSE, now + Duration::from_millis(100), true);
+        assert_eq!(colours.frame(now + Duration::from_millis(100)).0, half_way);
+        // A badge only now appearing takes its colour at once.
+        colours.set(GREY, now, false);
+        assert_eq!(colours.frame(now), (GREY, false));
     }
 
     #[test]

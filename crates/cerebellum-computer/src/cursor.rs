@@ -77,6 +77,11 @@ pub struct CursorEvent {
     pub serial: u64,
     pub avatar_rgba: Option<Vec<u8>>,
     pub avatar_update: bool,
+    /// The colour read from the agent's avatar, when it is known; the badge
+    /// is drawn in the accent it gives. Left out of the line when unknown, so
+    /// a picture without it keeps the shape it had before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_tint: Option<AvatarTint>,
 }
 
 impl CursorEvent {
@@ -99,6 +104,7 @@ impl CursorEvent {
                 .as_ref()
                 .is_none_or(|rgba| rgba.len() == (AVATAR_SIZE * AVATAR_SIZE * 4) as usize)
             && (!self.avatar_update || self.avatar_rgba.is_some())
+            && self.avatar_tint.is_none_or(AvatarTint::valid)
     }
 }
 
@@ -319,74 +325,445 @@ pub fn fade_alpha(fraction: f64, reduce_motion: bool) -> f64 {
     (2.0 * fraction - 1.0).abs()
 }
 
-/// The colours a badge can be drawn in, sRGB in [0, 1]. Each is saturated, so
-/// the badge cannot be mistaken for the black-and-white system pointer, and
-/// dark enough for the white outline and white label text drawn on it. None
-/// is red, which would read as an error, and none is grey, which reads as
-/// disabled.
-const ACCENTS: [[f64; 3]; 6] = [
-    // Violet.
-    [0.427, 0.290, 1.000],
-    // Blue.
-    [0.122, 0.435, 0.922],
-    // Teal.
-    [0.000, 0.537, 0.482],
-    // Magenta.
-    [0.761, 0.094, 0.545],
-    // Orange.
-    [0.851, 0.282, 0.059],
-    // Green.
-    [0.118, 0.557, 0.243],
-];
+/// The side of the square, in pixels, that an avatar is averaged down to
+/// before its colour is read. The Alfonso phone app reads its agents' colours
+/// from exactly this many pixels (24 x 24), so a badge here takes the same
+/// colour as the agent's page there.
+pub const TINT_SAMPLE_SIDE: usize = 24;
+/// The side, in pixels, the avatar is rendered at before it is averaged
+/// down: the phone draws the creature 44 points across on a 3x screen.
+pub const TINT_RENDER_SIDE: u32 = 132;
 
-/// The agent's accent colour: the same agent always gets the same colour, so
-/// two agents working at once are told apart at a glance. Picked by a stable
-/// hash of the agent's id (64-bit FNV-1a), never by process state, so the
-/// colour survives a helper restart.
-pub fn accent(agent: &str) -> [f64; 3] {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in agent.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// An agent's colour as read from its avatar: HSV hue and saturation, each in
+/// [0, 1].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarTint {
+    pub hue: f64,
+    pub saturation: f64,
+}
+
+impl AvatarTint {
+    pub fn valid(self) -> bool {
+        [self.hue, self.saturation]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
     }
-    ACCENTS[(hash % ACCENTS.len() as u64) as usize]
+}
+
+/// The phone's colour reading, ported from the Alfonso app's
+/// `CreatureTint.dominantHue(of:)`: the hue of the creature's colourful
+/// pixels, weighted toward the most saturated ones. `pixels` is premultiplied
+/// RGBA, 8 bits per channel, in any order (the phone reads a 24 x 24 bitmap).
+/// `None` when no pixel counts, which draws the neutral colour.
+///
+/// A pixel counts only when it is mostly opaque (edges blend into whatever is
+/// behind), not near-black (outlines and the ground shadow) and not grey or
+/// near-white (eyes, highlights). Its colour is un-premultiplied first, so a
+/// half-transparent pixel is judged by its own colour, not by how dark the
+/// premultiplication made it. Each counting pixel weighs its opacity times
+/// its saturation squared, so a few vivid patches outweigh a large dull body.
+/// Hue is a circle, so it is averaged as one: 0.97 and 0.03 are both red, and
+/// their mean is 0.0, not the 0.5 (cyan) a plain mean would give.
+pub fn avatar_tint(pixels: &[u8]) -> Option<AvatarTint> {
+    let (mut cos, mut sin, mut saturation, mut weights) = (0.0, 0.0, 0.0, 0.0);
+    for pixel in pixels.as_chunks::<4>().0 {
+        let alpha = f64::from(pixel[3]) / 255.0;
+        if alpha <= 0.6 {
+            continue;
+        }
+        let [r, g, b] = [0, 1, 2].map(|channel| f64::from(pixel[channel]) / 255.0 / alpha);
+        let top = r.max(g).max(b);
+        let bottom = r.min(g).min(b);
+        let delta = top - bottom;
+        if top <= 0.2 || delta <= 0.12 {
+            continue;
+        }
+        let sixths = if top == r {
+            ((g - b) / delta).rem_euclid(6.0)
+        } else if top == g {
+            (b - r) / delta + 2.0
+        } else {
+            (r - g) / delta + 4.0
+        };
+        let hue = sixths / 6.0;
+        let pixel_saturation = delta / top;
+        let weight = alpha * pixel_saturation * pixel_saturation;
+        let angle = std::f64::consts::TAU * hue;
+        cos += weight * angle.cos();
+        sin += weight * angle.sin();
+        saturation += weight * pixel_saturation;
+        weights += weight;
+    }
+    if weights <= 0.0 {
+        return None;
+    }
+    // A tiny negative angle wraps to exactly 1.0 in floating point, which
+    // is the same hue as 0.0; keep the result in [0, 1).
+    let hue = (sin.atan2(cos) / std::f64::consts::TAU).rem_euclid(1.0);
+    Some(AvatarTint {
+        hue: if hue >= 1.0 { 0.0 } else { hue },
+        saturation: saturation / weights,
+    })
+}
+
+/// Average a square premultiplied RGBA image of `side` pixels down to `out`
+/// pixels a side, each output pixel the area-weighted mean of the source
+/// pixels it covers (partly covered ones count by the part covered).
+/// Averaging premultiplied values keeps a transparent pixel's colour from
+/// bleeding into its neighbours. Empty when `pixels` is not `side` square.
+pub fn area_average(pixels: &[u8], side: usize, out: usize) -> Vec<u8> {
+    if side == 0 || out == 0 || pixels.len() != side * side * 4 {
+        return Vec::new();
+    }
+    let scale = side as f64 / out as f64;
+    // For one output row or column: each source index it covers, and how
+    // much of that source pixel lies inside it.
+    let spans: Vec<Vec<(usize, f64)>> = (0..out)
+        .map(|index| {
+            let (start, end) = (index as f64 * scale, (index + 1) as f64 * scale);
+            (start.floor() as usize..(end.ceil() as usize).min(side))
+                .map(|source| {
+                    let covered = end.min(source as f64 + 1.0) - start.max(source as f64);
+                    (source, covered)
+                })
+                .filter(|(_, covered)| *covered > 0.0)
+                .collect()
+        })
+        .collect();
+    let area = scale * scale;
+    let mut result = Vec::with_capacity(out * out * 4);
+    for rows in &spans {
+        for columns in &spans {
+            let mut sum = [0.0; 4];
+            for &(y, height) in rows {
+                for &(x, width) in columns {
+                    let at = (y * side + x) * 4;
+                    for (channel, total) in sum.iter_mut().enumerate() {
+                        *total += f64::from(pixels[at + channel]) * height * width;
+                    }
+                }
+            }
+            result.extend(sum.map(|total| (total / area).round().clamp(0.0, 255.0) as u8));
+        }
+    }
+    result
+}
+
+/// The neutral colours drawn when an agent's avatar colour is unknown or its
+/// avatar has no colourful pixels: a warm grey, as on the phone.
+pub const NEUTRAL_LIGHT: [f64; 3] = [0.52, 0.49, 0.45];
+pub const NEUTRAL_DARK: [f64; 3] = [0.66, 0.63, 0.59];
+
+/// An agent's accent for Light and for Dark mode, sRGB in [0, 1].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Accents {
+    pub light: [f64; 3],
+    pub dark: [f64; 3],
+}
+
+/// The phone's accents for a tint, from `CreatureTint.init(creature:)`. The
+/// saturation is held between 0.38 and 0.62, so a dull creature still gets a
+/// visible colour and a vivid one does not glare; Dark mode takes a brighter,
+/// slightly less saturated version so it stands out on dark windows.
+pub fn accents(tint: Option<AvatarTint>) -> Accents {
+    let Some(tint) = tint.filter(|tint| tint.valid()) else {
+        return Accents {
+            light: NEUTRAL_LIGHT,
+            dark: NEUTRAL_DARK,
+        };
+    };
+    let saturation = tint.saturation.clamp(0.38, 0.62);
+    Accents {
+        light: hsb_to_rgb(tint.hue, saturation, 0.60),
+        dark: hsb_to_rgb(tint.hue, saturation * 0.85, 0.82),
+    }
+}
+
+/// HSB (HSV), each in [0, 1], to sRGB in [0, 1].
+pub fn hsb_to_rgb(hue: f64, saturation: f64, brightness: f64) -> [f64; 3] {
+    let sixths = hue.rem_euclid(1.0) * 6.0;
+    let sector = sixths.floor();
+    let f = sixths - sector;
+    let (v, s) = (brightness, saturation);
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match sector as u8 {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+/// sRGB in [0, 1] to HSB (HSV), each in [0, 1].
+pub fn rgb_to_hsb(colour: [f64; 3]) -> [f64; 3] {
+    let [r, g, b] = colour;
+    let top = r.max(g).max(b);
+    let delta = top - r.min(g).min(b);
+    let hue = if delta <= 0.0 {
+        0.0
+    } else if top == r {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if top == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    let saturation = if top <= 0.0 { 0.0 } else { delta / top };
+    [hue, saturation, top]
+}
+
+/// WCAG relative luminance of an sRGB colour.
+pub fn luminance(colour: [f64; 3]) -> f64 {
+    let linear = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(colour[0]) + 0.7152 * linear(colour[1]) + 0.0722 * linear(colour[2])
+}
+
+/// The WCAG contrast of white text on `colour`.
+pub fn white_contrast(colour: [f64; 3]) -> f64 {
+    1.05 / (luminance(colour) + 0.05)
+}
+
+/// The contrast white label text needs on its pill: WCAG's level for body
+/// text, which a 12-point label is.
+pub const PILL_CONTRAST: f64 = 4.5;
+
+/// The label pill's fill for an accent: the accent's own hue and saturation,
+/// darkened only as far as white text needs to reach `PILL_CONTRAST`. The
+/// pointer and ring take the accent itself; the pill carries words, and the
+/// phone's accents (above all the brighter Dark mode one) are too light for
+/// white text on them to be read easily.
+pub fn pill_colour(accent: [f64; 3]) -> [f64; 3] {
+    if white_contrast(accent) >= PILL_CONTRAST {
+        return accent;
+    }
+    let [hue, saturation, brightness] = rgb_to_hsb(accent);
+    // Luminance only grows with brightness, so the brightest acceptable
+    // value is found by halving the interval; `low` always passes.
+    let (mut low, mut high) = (0.0, brightness);
+    for _ in 0..48 {
+        let middle = (low + high) / 2.0;
+        if white_contrast(hsb_to_rgb(hue, saturation, middle)) >= PILL_CONTRAST {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    hsb_to_rgb(hue, saturation, low)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// WCAG relative luminance of an sRGB colour.
-    fn luminance(colour: [f64; 3]) -> f64 {
-        let linear = |c: f64| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(colour[0]) + 0.7152 * linear(colour[1]) + 0.0722 * linear(colour[2])
+    /// One opaque pixel of the given HSB colour, 8-bit premultiplied RGBA.
+    fn opaque(hue: f64, saturation: f64, brightness: f64) -> [u8; 4] {
+        let [r, g, b] = hsb_to_rgb(hue, saturation, brightness).map(|c| (c * 255.0).round() as u8);
+        [r, g, b, 255]
+    }
+
+    fn tint_of(pixels: &[[u8; 4]]) -> Option<AvatarTint> {
+        avatar_tint(pixels.as_flattened())
+    }
+
+    /// The distance between two hues around the colour circle.
+    fn hue_gap(a: f64, b: f64) -> f64 {
+        let gap = (a - b).rem_euclid(1.0);
+        gap.min(1.0 - gap)
     }
 
     #[test]
-    fn accent_is_stable_per_agent_and_legible_under_white_text() {
-        assert_eq!(accent("agent-a"), accent("agent-a"));
-        let used: std::collections::BTreeSet<usize> = (0..60)
-            .map(|n| {
-                let colour = accent(&format!("agent-{n}"));
-                ACCENTS.iter().position(|c| *c == colour).unwrap()
-            })
-            .collect();
-        assert_eq!(used.len(), ACCENTS.len(), "agents spread over every colour");
-        for colour in ACCENTS {
-            // White label text and the white outline need at least 4:1.
-            let contrast = 1.05 / (luminance(colour) + 0.05);
-            assert!(contrast >= 4.0, "{colour:?} gives white {contrast:.2}:1");
-            // Saturated: far from any grey, so never the system pointer's look.
-            let spread = colour.iter().cloned().fold(0.0, f64::max)
-                - colour.iter().cloned().fold(1.0, f64::min);
-            assert!(spread >= 0.4, "{colour:?} is too grey");
+    fn tint_skips_transparent_dark_and_grey_pixels() {
+        // Opacity: at most 0.6 is skipped (153 / 255 is exactly 0.6).
+        assert_eq!(tint_of(&[[153, 0, 0, 153]]), None);
+        assert!(tint_of(&[[154, 0, 0, 154]]).is_some());
+        // Brightness: a brightest channel of at most 0.2 is an outline or
+        // shadow (51 / 255 is exactly 0.2).
+        assert_eq!(tint_of(&[[51, 0, 0, 255]]), None);
+        assert!(tint_of(&[[52, 0, 0, 255]]).is_some());
+        // Spread: channels within 0.12 of each other are grey (30 / 255 is
+        // just under it, 31 / 255 just over).
+        assert_eq!(tint_of(&[[200, 170, 170, 255]]), None);
+        assert!(tint_of(&[[200, 169, 169, 255]]).is_some());
+        // A skipped pixel does not pull the hue either: vivid blue pixels that
+        // fail each rule leave a single red pixel's hue alone.
+        let tint = tint_of(&[
+            [255, 0, 0, 255],
+            [0, 0, 153, 153],
+            [0, 0, 51, 255],
+            [170, 170, 200, 255],
+        ])
+        .unwrap();
+        assert_eq!((tint.hue, tint.saturation), (0.0, 1.0));
+    }
+
+    #[test]
+    fn tint_weighs_each_pixel_by_opacity_times_saturation_squared() {
+        // Pure red (saturation 1) and a pale green (saturation s = 1 - 128/255,
+        // about 0.498), both opaque: weights 1 and s^2. The saturation is
+        // their weighted mean, (1 + s^2 x s) / (1 + s^2), about 0.90; a weight
+        // of plain saturation would give (1 + s x s) / (1 + s), about 0.83.
+        let s = 1.0 - 128.0 / 255.0;
+        let tint = tint_of(&[[255, 0, 0, 255], [128, 255, 128, 255]]).unwrap();
+        let mean = (1.0 + s * s * s) / (1.0 + s * s);
+        assert!((tint.saturation - mean).abs() < 1e-9, "{}", tint.saturation);
+        // The heavier red pulls the hue toward itself, short of the midpoint.
+        assert!(tint.hue > 0.0 && tint.hue < 1.0 / 6.0, "{}", tint.hue);
+        // Opacity counts linearly: the same red at 0.8 opacity weighs 0.8.
+        let tint = tint_of(&[[204, 0, 0, 204], [128, 255, 128, 255]]).unwrap();
+        let mean = (0.8 + s * s * s) / (0.8 + s * s);
+        assert!((tint.saturation - mean).abs() < 1e-9, "{}", tint.saturation);
+    }
+
+    #[test]
+    fn tint_hue_is_a_circular_mean() {
+        // Two reds either side of 0: their mean is red, not cyan.
+        let tint = tint_of(&[opaque(0.97, 1.0, 1.0), opaque(0.03, 1.0, 1.0)]).unwrap();
+        assert!(hue_gap(tint.hue, 0.0) < 0.005, "{}", tint.hue);
+        assert!((0.0..1.0).contains(&tint.hue));
+        // Weighted toward the heavier side, still across the wrap.
+        let tint = tint_of(&[
+            opaque(0.95, 1.0, 1.0),
+            opaque(0.95, 1.0, 1.0),
+            opaque(0.03, 1.0, 1.0),
+        ])
+        .unwrap();
+        assert!(tint.hue > 0.95 && tint.hue < 1.0, "{}", tint.hue);
+    }
+
+    #[test]
+    fn tint_un_premultiplies_before_judging_a_pixel() {
+        // A dark red at 0.7 opacity: its own brightest channel is 0.25, over
+        // the 0.2 cut, but premultiplied it is stored as 45 / 255 = 0.176.
+        let tint = tint_of(&[[45, 0, 0, 179]]).expect("judged by its own colour");
+        assert_eq!(tint.hue, 0.0);
+        // A pink at 0.7 opacity: premultiplied its channels are 29 / 255 =
+        // 0.11 apart (too grey to count), un-premultiplied 0.16 apart.
+        assert!(tint_of(&[[179, 150, 150, 179]]).is_some());
+    }
+
+    #[test]
+    fn no_colourful_pixel_gives_the_neutral_accent() {
+        assert_eq!(tint_of(&[]), None);
+        assert_eq!(
+            tint_of(&[[0, 0, 0, 0], [20, 20, 20, 255], [240, 240, 235, 255]]),
+            None
+        );
+        let neutral = accents(None);
+        assert_eq!(neutral.light, [0.52, 0.49, 0.45]);
+        assert_eq!(neutral.dark, [0.66, 0.63, 0.59]);
+        // A malformed tint is treated the same way.
+        let malformed = AvatarTint {
+            hue: f64::NAN,
+            saturation: 0.5,
+        };
+        assert_eq!(accents(Some(malformed)), neutral);
+    }
+
+    fn close(a: [f64; 3], b: [f64; 3]) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-9)
+    }
+
+    #[test]
+    fn light_and_dark_accents_follow_the_phone_formulas() {
+        let tint = AvatarTint {
+            hue: 0.0,
+            saturation: 0.5,
+        };
+        let both = accents(Some(tint));
+        // Light: HSB(0, 0.5, 0.60).
+        assert!(close(both.light, [0.60, 0.30, 0.30]), "{:?}", both.light);
+        // Dark: HSB(0, 0.5 x 0.85, 0.82).
+        assert!(close(
+            both.dark,
+            [0.82, 0.82 * (1.0 - 0.425), 0.82 * (1.0 - 0.425)]
+        ));
+        // A blue hue lands in the blue sector.
+        let blue = accents(Some(AvatarTint {
+            hue: 2.0 / 3.0,
+            saturation: 0.5,
+        }));
+        assert!(close(blue.light, [0.30, 0.30, 0.60]), "{:?}", blue.light);
+    }
+
+    #[test]
+    fn accent_saturation_is_held_between_0_38_and_0_62() {
+        let at = |saturation: f64| {
+            accents(Some(AvatarTint {
+                hue: 0.0,
+                saturation,
+            }))
+        };
+        let saturation_of = |colour: [f64; 3]| rgb_to_hsb(colour)[1];
+        assert!((saturation_of(at(0.1).light) - 0.38).abs() < 1e-9);
+        assert!((saturation_of(at(0.1).dark) - 0.38 * 0.85).abs() < 1e-9);
+        assert!((saturation_of(at(0.9).light) - 0.62).abs() < 1e-9);
+        assert!((saturation_of(at(0.9).dark) - 0.62 * 0.85).abs() < 1e-9);
+        assert!((saturation_of(at(0.5).light) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_pill_darkens_the_accent_just_enough_for_white_text() {
+        let mut darkened = 0;
+        for step in 0..=100 {
+            let hue = f64::from(step) / 100.0;
+            for saturation in [0.0, 0.3, 0.5, 0.9] {
+                let both = accents(Some(AvatarTint { hue, saturation }));
+                for accent in [both.light, both.dark, NEUTRAL_LIGHT, NEUTRAL_DARK] {
+                    let pill = pill_colour(accent);
+                    let contrast = white_contrast(pill);
+                    assert!(
+                        contrast >= PILL_CONTRAST,
+                        "{accent:?} gives {contrast:.2}:1"
+                    );
+                    let [accent_hue, accent_saturation, accent_brightness] = rgb_to_hsb(accent);
+                    let [pill_hue, pill_saturation, pill_brightness] = rgb_to_hsb(pill);
+                    assert!(
+                        hue_gap(pill_hue, accent_hue) < 1e-9,
+                        "{accent:?} -> {pill:?}"
+                    );
+                    assert!((pill_saturation - accent_saturation).abs() < 1e-9);
+                    if pill != accent {
+                        darkened += 1;
+                        // No darker than needed: a little brighter fails.
+                        let brighter =
+                            hsb_to_rgb(pill_hue, pill_saturation, pill_brightness + 0.002);
+                        assert!(white_contrast(brighter) < PILL_CONTRAST);
+                        assert!(pill_brightness < accent_brightness);
+                    }
+                }
+            }
         }
+        assert!(
+            darkened > 0,
+            "the phone's accents are too light for white text"
+        );
+    }
+
+    #[test]
+    fn area_average_weighs_partly_covered_pixels_by_the_part_covered() {
+        // 3 pixels down to 2: each output pixel covers one whole source pixel
+        // and half of the middle one.
+        let row = |values: [u8; 3]| values.map(|v| [v, v, v, 255]);
+        let image: Vec<[u8; 4]> = (0..3).flat_map(|_| row([0, 90, 180])).collect();
+        let out = area_average(image.as_flattened(), 3, 2);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        // (0 x 1 + 90 x 0.5) / 1.5 = 30, (90 x 0.5 + 180 x 1) / 1.5 = 150.
+        assert_eq!(&out[0..4], &[30, 30, 30, 255]);
+        assert_eq!(&out[4..8], &[150, 150, 150, 255]);
+        // The phone's sizes: a uniform 132-pixel image stays that colour.
+        let uniform = [10u8, 120, 200, 255].repeat(132 * 132);
+        let out = area_average(&uniform, 132, TINT_SAMPLE_SIDE);
+        assert_eq!(out, [10u8, 120, 200, 255].repeat(24 * 24));
+        assert!(area_average(&uniform, 131, 24).is_empty());
     }
 
     #[test]
@@ -506,6 +883,7 @@ mod tests {
             serial: 0,
             avatar_rgba: None,
             avatar_update: false,
+            avatar_tint: None,
         };
         let encoded = event.encode_line().unwrap();
         assert_eq!(encoded.iter().filter(|c| **c == b'\n').count(), 1);
@@ -646,10 +1024,26 @@ mod tests {
             serial: 7,
             avatar_rgba: Some(vec![255; (AVATAR_SIZE * AVATAR_SIZE * 4) as usize]),
             avatar_update: true,
+            avatar_tint: None,
         };
         let line = event.encode_line().unwrap();
         assert!(line.len() <= MAX_CURSOR_LINE);
         assert_eq!(serde_json::from_slice::<CursorEvent>(&line).unwrap(), event);
+        // The avatar's colour rides with its pixels, and a malformed one is
+        // refused like malformed pixels.
+        event.avatar_tint = Some(AvatarTint {
+            hue: 0.95,
+            saturation: 0.6,
+        });
+        let line = event.encode_line().unwrap();
+        assert!(line.len() <= MAX_CURSOR_LINE);
+        assert_eq!(serde_json::from_slice::<CursorEvent>(&line).unwrap(), event);
+        event.avatar_tint = Some(AvatarTint {
+            hue: 1.5,
+            saturation: 0.6,
+        });
+        assert!(event.encode_line().is_none());
+        event.avatar_tint = None;
         event.avatar_rgba.as_mut().unwrap().pop();
         assert!(event.encode_line().is_none());
         event.avatar_rgba = None;
