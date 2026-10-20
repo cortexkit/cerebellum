@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::cursor_geometry::{aim_rotation, shortest_turn, wrap_angle, CHIP_CENTER};
+
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const MAX_PICTURES: usize = 64;
 
@@ -175,6 +177,416 @@ impl Appearance {
     }
 }
 
+/// How long a badge takes to change colour, in ms: when its agent's avatar
+/// colour arrives after the badge appeared in the neutral one, or the system
+/// switches between Light and Dark mode. Long enough to read as a change of
+/// tint rather than a flicker, short enough to be done before the next
+/// action.
+pub(crate) const COLOUR_FADE_MS: f64 = 200.0;
+
+/// The colours a badge is drawn in, sRGB in [0, 1]: the pointer and the
+/// chip's ring, then the label pill.
+pub(crate) type Colours = [[f64; 3]; 2];
+
+/// A badge's colours, cross-faded from one set to the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ColourFade {
+    from: Colours,
+    to: Colours,
+    shown: Colours,
+    clock: Option<FrameClock>,
+}
+
+impl ColourFade {
+    pub(crate) fn new(colours: Colours) -> Self {
+        Self {
+            from: colours,
+            to: colours,
+            shown: colours,
+            clock: None,
+        }
+    }
+
+    /// Change to `colours`: at once when `fade` is false (a badge that is
+    /// only now appearing), otherwise by a cross-fade from the colours shown
+    /// now, so a change mid-fade carries on from where it is.
+    pub(crate) fn set(&mut self, colours: Colours, now: Instant, fade: bool) {
+        if colours == self.to && (fade || self.clock.is_none()) {
+            return;
+        }
+        self.to = colours;
+        if fade {
+            self.from = self.shown;
+            self.clock = Some(FrameClock::start(now));
+        } else {
+            self.from = colours;
+            self.shown = colours;
+            self.clock = None;
+        }
+    }
+
+    /// The colours to draw at `now`, and whether they are still changing.
+    pub(crate) fn frame(&mut self, now: Instant) -> (Colours, bool) {
+        let Some(clock) = self.clock.as_mut() else {
+            return (self.shown, false);
+        };
+        let progress = (clock.advance(now) / COLOUR_FADE_MS).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.clock = None;
+            self.shown = self.to;
+            return (self.shown, false);
+        }
+        let eased = ease_in_out(progress);
+        for (part, (from, to)) in self.shown.iter_mut().zip(self.from.iter().zip(self.to)) {
+            for (channel, (a, b)) in part.iter_mut().zip(from.iter().zip(to)) {
+                *channel = a + (b - a) * eased;
+            }
+        }
+        (self.shown, true)
+    }
+}
+
+/// Motion curves, supplied by the platform-neutral crate where they are
+/// tested on every host.
+#[derive(Clone, Copy)]
+pub struct CursorMotion {
+    /// Glide length in ms from the distance and the Reduce Motion setting.
+    pub duration_ms: fn(f64, bool) -> f64,
+    /// The tip's position for a glide fraction in [0, 1].
+    pub position: fn([f64; 2], [f64; 2], f64, bool) -> [f64; 2],
+    /// Scale about the tip, from ms since arrival, press or not, Reduce Motion.
+    pub settle_scale: fn(f64, bool, bool) -> f64,
+    /// Opacity factor for a glide fraction (the Reduce Motion fade-move).
+    pub fade_alpha: fn(f64, bool) -> f64,
+}
+
+/// One 60 Hz frame, in ms: how far ahead a picture looks to decide whether its
+/// landing motion still needs another frame.
+const ONE_FRAME_MS: f64 = 1000.0 / 60.0;
+
+/// How long a dragged window must stay still before the badge flies back
+/// onto its element. While a person drags a window, the accessibility move
+/// reports come in bursts with short gaps between them, and the hand often
+/// pauses for a moment without letting go. 700 ms outlasts those gaps and
+/// pauses, so the badge flies once, after the drag, instead of setting off in
+/// every pause and being pulled away again by the next burst.
+pub(crate) const WINDOW_QUIET: Duration = Duration::from_millis(700);
+
+/// How long the swinging pointer takes to turn to a newly reported
+/// direction, in ms. Move reports arrive in bursts; easing each turn over a
+/// few frames joins them into one smooth sweep instead of a series of jumps.
+pub(crate) const HAND_EASE_MS: f64 = 120.0;
+
+/// What the pointer is doing relative to the chip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hand {
+    /// In its resting place, pointing at the target with its tip on it.
+    Off,
+    /// The window under the target is moving. The chip holds still and the
+    /// pointer turns about it, from `from` toward `to` (rotations from the
+    /// resting direction, in radians, not wrapped, so the turn between them
+    /// is the short one picked when the report came in).
+    Swinging {
+        from: f64,
+        to: f64,
+        ease: FrameClock,
+        /// The latest move report; the badge flies back once the window has
+        /// been still for `WINDOW_QUIET` after it.
+        last_move: Instant,
+    },
+    /// The badge is gliding to its target (the window came to rest, or a new
+    /// action aims elsewhere) and the pointer turns from `from` back to its
+    /// resting direction along the way, arriving exactly with the glide.
+    Returning { from: f64 },
+}
+
+/// One event's aim, as the helper received it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MotionEvent {
+    /// The tip's destination, global top-down points.
+    pub to: [f64; 2],
+    /// `to` is only somewhere to appear: a shown badge stays where it is.
+    pub resting: bool,
+    /// The picture's first appearance, which enters rather than glides.
+    pub first: bool,
+    /// A press lands with a tap rather than a settle.
+    pub press: bool,
+    pub reduce_motion: bool,
+}
+
+/// Where a picture is and what its pointer does on one frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MotionFrame {
+    /// Where the tip of the standard resting badge would be: the panel is
+    /// placed for it, and the chip's centre is this plus `CHIP_CENTER`
+    /// whatever the pointer does.
+    pub tip: [f64; 2],
+    /// How far the pointer is turned about the chip's centre from its
+    /// resting direction, radians; exactly 0 in the resting badge.
+    pub rotation: f64,
+    /// The pointer's own opacity: 0 while Reduce Motion hides it during a
+    /// window drag instead of swinging it.
+    pub pointer_alpha: f64,
+    /// The pointer is off its resting place (swinging, or turning back on a
+    /// glide): the label stays hidden and the panel must hold every angle.
+    pub hand: bool,
+    /// The landing scale about the tip.
+    pub scale: f64,
+    /// The Reduce Motion fade-move's opacity factor.
+    pub alpha: f64,
+    pub need: PictureNeed,
+}
+
+/// A picture's movement: its glides between targets, the landing settle,
+/// following a moved window, and the clock-hand swing while that window is
+/// dragged. It knows nothing of windows or drawing, so every state change
+/// is tested on any host; the helper draws what `frame` answers.
+///
+/// A dragged window reports its moves in bursts. Gliding the whole badge to
+/// each report made it stutter after the window, so instead the chip holds
+/// still and only the pointer turns toward where the element now is; once
+/// the window has been still for `WINDOW_QUIET`, the badge flies there in one
+/// glide while the pointer turns back into its resting place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BadgeMotion {
+    from: [f64; 2],
+    to: [f64; 2],
+    current: [f64; 2],
+    duration_ms: f64,
+    reduce: bool,
+    press: bool,
+    /// Whether the landing settle or tap plays after the glide. Not on a
+    /// first appearance (the entry is that picture's landing) and not after
+    /// following a window (the agent did nothing).
+    settles: bool,
+    /// Time into the current glide and settle.
+    glide: FrameClock,
+    /// How far the window under the target has moved since the latest event.
+    follow: FollowOffset,
+    hand: Hand,
+    /// The pointer's rotation on the latest frame drawn: where a new turn
+    /// starts from, so the pointer never jumps.
+    rotation: f64,
+}
+
+impl BadgeMotion {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            from: [0.0, 0.0],
+            to: [0.0, 0.0],
+            current: [0.0, 0.0],
+            duration_ms: 0.0,
+            reduce: false,
+            press: false,
+            settles: false,
+            glide: FrameClock::start(now),
+            follow: FollowOffset::default(),
+            hand: Hand::Off,
+            rotation: 0.0,
+        }
+    }
+
+    /// Where the badge was last drawn (the resting tip's place).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn current(&self) -> [f64; 2] {
+        self.current
+    }
+
+    /// The pointer is off its resting place.
+    pub(crate) fn hand(&self) -> bool {
+        !matches!(self.hand, Hand::Off)
+    }
+
+    /// An agent event arrived. Answers the tip's destination, which the
+    /// badge's layout is computed for.
+    pub(crate) fn on_event(
+        &mut self,
+        event: MotionEvent,
+        now: Instant,
+        curves: &CursorMotion,
+    ) -> [f64; 2] {
+        self.reduce = event.reduce_motion;
+        self.press = event.press;
+        // A window move reported from here on counts from this event.
+        self.follow = FollowOffset::default();
+        let stays = event.resting && !event.first;
+        if stays && self.hand() {
+            // A read with nothing to aim at aims nowhere new: the badge keeps
+            // following the window it is already following.
+            return self.to;
+        }
+        let to = if stays { self.current } else { event.to };
+        self.to = to;
+        self.from = self.current;
+        self.glide = FrameClock::start(now);
+        if event.first {
+            // A first appearance does not glide in from anywhere: the badge
+            // starts on the target, and the entry animation (not a settle)
+            // is what marks its arrival there.
+            self.from = to;
+            self.current = to;
+            self.duration_ms = 0.0;
+            self.settles = false;
+        } else {
+            self.duration_ms = (curves.duration_ms)(distance(self.from, to), self.reduce);
+            self.settles = true;
+        }
+        // A new aim ends a swing; the pointer turns back to rest on the way
+        // to the new target rather than snapping there.
+        self.hand = if self.hand() || self.rotation != 0.0 {
+            Hand::Returning {
+                from: wrap_angle(self.rotation),
+            }
+        } else {
+            Hand::Off
+        };
+        to
+    }
+
+    /// The window under the target moved, by `offset` in total since the
+    /// latest event. Answers whether anything changed. During a first
+    /// appearance the badge simply moves with the window, as its chip is not
+    /// yet in the resting place a swing turns about.
+    pub(crate) fn on_follow(&mut self, offset: [f64; 2], now: Instant, entering: bool) -> bool {
+        let Some(by) = self.follow.step(offset) else {
+            return false;
+        };
+        let shift = |point: &mut [f64; 2]| {
+            point[0] += by[0];
+            point[1] += by[1];
+        };
+        if entering {
+            for point in [&mut self.from, &mut self.to, &mut self.current] {
+                shift(point);
+            }
+            return true;
+        }
+        // Only the target moves; the chip stays where it was last drawn.
+        shift(&mut self.to);
+        self.settles = false;
+        let chip = [
+            self.current[0] + CHIP_CENTER[0],
+            self.current[1] + CHIP_CENTER[1],
+        ];
+        let to = if self.reduce {
+            // Reduce Motion: no swing; the pointer is hidden instead.
+            0.0
+        } else {
+            // The aimed direction, reached by the short way round from where
+            // the pointer is drawn now. A target on the chip's very centre
+            // has no direction; the pointer then holds its course.
+            let previous = match self.hand {
+                Hand::Swinging { to, .. } => to,
+                _ => self.rotation,
+            };
+            aim_rotation(chip, self.to).map_or(previous, |aim| {
+                self.rotation + shortest_turn(self.rotation, aim)
+            })
+        };
+        self.hand = Hand::Swinging {
+            from: self.rotation,
+            to,
+            ease: FrameClock::start(now),
+            last_move: now,
+        };
+        true
+    }
+
+    /// The window has been still long enough: glide to the target, turning
+    /// the pointer back to rest on the way.
+    fn fly_back(&mut self, now: Instant, curves: &CursorMotion) {
+        self.from = self.current;
+        self.duration_ms = (curves.duration_ms)(distance(self.from, self.to), self.reduce);
+        self.glide = FrameClock::start(now);
+        self.settles = false;
+        self.hand = Hand::Returning {
+            from: wrap_angle(self.rotation),
+        };
+    }
+
+    /// The frame to draw at `now`, which is also when it is drawn.
+    pub(crate) fn frame(&mut self, now: Instant, curves: &CursorMotion) -> MotionFrame {
+        if let Hand::Swinging {
+            from,
+            to,
+            ref mut ease,
+            last_move,
+        } = self.hand
+        {
+            let still_for = now.saturating_duration_since(last_move);
+            if still_for < WINDOW_QUIET {
+                let progress = (ease.advance(now) / HAND_EASE_MS).clamp(0.0, 1.0);
+                self.rotation = from + (to - from) * ease_out(progress);
+                let turning = progress < 1.0 && self.rotation != to;
+                return MotionFrame {
+                    tip: self.current,
+                    rotation: self.rotation,
+                    pointer_alpha: if self.reduce { 0.0 } else { 1.0 },
+                    hand: true,
+                    scale: 1.0,
+                    alpha: 1.0,
+                    // Once the pointer has turned, nothing moves until the
+                    // next report or the end of the quiet period: sleep.
+                    need: if turning {
+                        PictureNeed::Frames
+                    } else {
+                        PictureNeed::WakeAfter(WINDOW_QUIET - still_for)
+                    },
+                };
+            }
+            self.fly_back(now, curves);
+        }
+        let elapsed = self.glide.advance(now);
+        let fraction = if self.duration_ms <= 0.0 {
+            1.0
+        } else {
+            elapsed / self.duration_ms
+        };
+        self.current = (curves.position)(self.from, self.to, fraction, self.reduce);
+        let (settles, press, reduce) = (self.settles, self.press, self.reduce);
+        let settle = |at: f64| {
+            if settles {
+                (curves.settle_scale)(at, press, reduce)
+            } else {
+                1.0
+            }
+        };
+        let since_arrival = elapsed - self.duration_ms;
+        let scale = settle(since_arrival);
+        let (rotation, pointer_alpha) = match self.hand {
+            Hand::Returning { .. } if fraction >= 1.0 => {
+                self.hand = Hand::Off;
+                (0.0, 1.0)
+            }
+            // Reduce Motion: the pointer, hidden during the drag, comes back
+            // with the badge as it fades in at the target.
+            Hand::Returning { .. } if self.reduce => (0.0, if fraction < 0.5 { 0.0 } else { 1.0 }),
+            // Eased like the glide itself, so the turn and the flight end
+            // together.
+            Hand::Returning { from } => (from * (1.0 - ease_out(fraction.max(0.0))), 1.0),
+            _ => (0.0, 1.0),
+        };
+        self.rotation = rotation;
+        // Still moving while the glide runs, while the landing scale is off
+        // 1, or while it will be off 1 one frame from now: the settle starts
+        // at exactly 1, so the landing frame alone cannot tell.
+        let moving = fraction < 1.0 || scale != 1.0 || settle(since_arrival + ONE_FRAME_MS) != 1.0;
+        MotionFrame {
+            tip: self.current,
+            rotation,
+            pointer_alpha,
+            hand: self.hand(),
+            scale,
+            alpha: (curves.fade_alpha)(fraction, self.reduce),
+            need: moving.into(),
+        }
+    }
+}
+
+fn distance(from: [f64; 2], to: [f64; 2]) -> f64 {
+    (to[0] - from[0]).hypot(to[1] - from[1])
+}
+
 /// The window a badge rests on was moved: the main process reports the
 /// element's total offset since the badge's latest event, and this keeps how
 /// much of it the picture has already been moved by. Reporting the total
@@ -252,6 +664,29 @@ pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(2 * 60);
 /// The fade itself stays short: once the agent is idle, the badge should go.
 const FADE: Duration = Duration::from_millis(250);
 
+/// What a drawn picture still needs from the helper's loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PictureNeed {
+    /// It is at rest: nothing changes until the next event.
+    Rest,
+    /// It is moving: draw it again next frame.
+    Frames,
+    /// Nothing moves now, but it must be looked at again after this long
+    /// (when a dragged window has been still long enough for the badge to
+    /// fly back). The loop sleeps until then, drawing nothing in between.
+    WakeAfter(Duration),
+}
+
+impl From<bool> for PictureNeed {
+    fn from(moving: bool) -> Self {
+        if moving {
+            Self::Frames
+        } else {
+            Self::Rest
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PictureStep {
     Draw { elapsed_ms: f64, alpha: f64 },
@@ -266,7 +701,8 @@ pub(crate) enum Wait {
     Frame(Duration),
     /// Everything on screen is resting: nothing changes until the next event
     /// or until this much time has passed, when the oldest picture starts to
-    /// fade. No frames are drawn in between.
+    /// fade or a picture asked to be looked at again (a dragged window has
+    /// been still long enough). No frames are drawn in between.
     Timed(Duration),
 }
 
@@ -321,18 +757,24 @@ impl<P> CursorSchedule<P> {
     }
 
     /// Draw every live picture once, and hide a fully faded one exactly once,
-    /// then release it. `apply` answers whether a drawn picture is still
-    /// moving (gliding or pulsing); its answer for `Hide` is ignored.
+    /// then release it. `apply` answers what a drawn picture still needs: a
+    /// plain `bool` says whether it is still moving (gliding or pulsing), and
+    /// a `PictureNeed` can also ask to be woken later; its answer for `Hide`
+    /// is ignored.
     ///
     /// Only moving or fading pictures need frames. Resting ones ask for a wait
-    /// until the first fade starts, and an empty schedule has no timer at all.
-    pub(crate) fn advance(
+    /// until the first fade starts or the earliest wake-up a picture asked
+    /// for, and an empty schedule has no timer at all.
+    pub(crate) fn advance<N: Into<PictureNeed>>(
         &mut self,
         now: Instant,
-        mut apply: impl FnMut(&mut P, PictureStep) -> bool,
+        mut apply: impl FnMut(&mut P, PictureStep) -> N,
     ) -> Wait {
         let mut needs_frames = false;
         let mut next_fade: Option<Duration> = None;
+        let sooner = |next: &mut Option<Duration>, at: Duration| {
+            *next = Some(next.map_or(at, |next| next.min(at)));
+        };
         self.pictures.retain(|_, live| {
             let idle = now.saturating_duration_since(live.started);
             let elapsed_ms = idle.as_secs_f64() * 1000.0;
@@ -342,12 +784,14 @@ impl<P> CursorSchedule<P> {
                 apply(&mut live.picture, PictureStep::Hide);
                 return false;
             }
-            let moving = apply(&mut live.picture, PictureStep::Draw { elapsed_ms, alpha });
-            if moving || idle >= IDLE_FADE_AFTER {
+            let need = apply(&mut live.picture, PictureStep::Draw { elapsed_ms, alpha }).into();
+            if need == PictureNeed::Frames || idle >= IDLE_FADE_AFTER {
                 needs_frames = true;
             } else {
-                let until_fade = IDLE_FADE_AFTER - idle;
-                next_fade = Some(next_fade.map_or(until_fade, |next| next.min(until_fade)));
+                sooner(&mut next_fade, IDLE_FADE_AFTER - idle);
+                if let PictureNeed::WakeAfter(after) = need {
+                    sooner(&mut next_fade, after);
+                }
             }
             true
         });
@@ -444,7 +888,7 @@ mod tests {
         assert_eq!(wait, Wait::Event);
         // Dropped: never drawn again, no frame and no timer requested, and a
         // late avatar has nothing to decorate.
-        let wait = schedule.advance(start + IDLE_FADE_AFTER * 2, |_, step| {
+        let wait = schedule.advance::<bool>(start + IDLE_FADE_AFTER * 2, |_, step| {
             panic!("a faded picture was given {step:?}")
         });
         assert_eq!(wait, Wait::Event);
@@ -488,7 +932,7 @@ mod tests {
         // for, and a late raster has no target.
         schedule.end("ending", |_, _| panic!("already hidden"));
         assert_eq!(
-            schedule.advance(start + SECOND, |_, step| panic!(
+            schedule.advance::<bool>(start + SECOND, |_, step| panic!(
                 "ended picture got {step:?}"
             )),
             Wait::Event
@@ -618,7 +1062,7 @@ mod tests {
     fn no_live_pictures_blocks_until_an_event() {
         let mut schedule = CursorSchedule::<()>::new();
         assert_eq!(
-            schedule.advance(Instant::now(), |_, _| panic!("no picture to tick")),
+            schedule.advance::<bool>(Instant::now(), |_, _| panic!("no picture to tick")),
             Wait::Event
         );
     }
@@ -858,6 +1302,47 @@ mod tests {
     }
 
     #[test]
+    fn a_new_colour_cross_fades_in_over_about_200_ms_instead_of_snapping() {
+        const GREY: Colours = [[0.52, 0.49, 0.45], [0.40, 0.38, 0.35]];
+        const ROSE: Colours = [[0.60, 0.30, 0.40], [0.50, 0.25, 0.33]];
+        let start = Instant::now();
+        let mut colours = ColourFade::new(GREY);
+        assert_eq!(colours.frame(start), (GREY, false), "at rest, no frames");
+        colours.set(ROSE, start, true);
+        let mut shown = Vec::new();
+        let mut now = start;
+        loop {
+            let (frame, changing) = colours.frame(now);
+            shown.push(frame);
+            if !changing {
+                break;
+            }
+            now += FRAME;
+        }
+        assert_eq!(shown[0], GREY, "starts from the colour on screen");
+        assert_eq!(*shown.last().unwrap(), ROSE);
+        let took = now - start;
+        assert!(
+            (Duration::from_millis(190)..=Duration::from_millis(220)).contains(&took),
+            "{took:?}"
+        );
+        // Every frame between is a step of the way, never a jump to the end.
+        assert!(shown.len() >= 11, "{} frames", shown.len());
+        for pair in shown.windows(2) {
+            let step = (pair[1][0][0] - pair[0][0][0]).abs();
+            assert!(step < 0.25 * (ROSE[0][0] - GREY[0][0]), "{pair:?}");
+        }
+        // A change in the middle of a fade carries on from where it is.
+        colours.set(GREY, now, true);
+        let (half_way, _) = colours.frame(now + Duration::from_millis(100));
+        colours.set(ROSE, now + Duration::from_millis(100), true);
+        assert_eq!(colours.frame(now + Duration::from_millis(100)).0, half_way);
+        // A badge only now appearing takes its colour at once.
+        colours.set(GREY, now, false);
+        assert_eq!(colours.frame(now), (GREY, false));
+    }
+
+    #[test]
     fn follow_offsets_move_a_picture_by_the_change_only_and_survive_a_lost_report() {
         let mut follow = FollowOffset::default();
         assert_eq!(follow.step([0.0, 0.0]), None, "no change, no move");
@@ -868,5 +1353,370 @@ mod tests {
         assert_eq!(follow.step([180.0, 60.0]), None);
         assert_eq!(follow.step([f64::NAN, 0.0]), None);
         assert_eq!(follow.step([180.0, 60.0]), None);
+    }
+
+    // The clock-hand swing while a followed window is dragged.
+
+    use crate::cursor_geometry::{hand_radius, turn_point};
+
+    fn test_duration(distance: f64, reduce: bool) -> f64 {
+        if distance < 0.5 {
+            0.0
+        } else if reduce {
+            140.0
+        } else {
+            300.0
+        }
+    }
+
+    fn test_position(from: [f64; 2], to: [f64; 2], fraction: f64, reduce: bool) -> [f64; 2] {
+        if fraction >= 1.0 {
+            return to;
+        }
+        if fraction <= 0.0 {
+            return from;
+        }
+        if reduce {
+            return if fraction < 0.5 { from } else { to };
+        }
+        let s = ease_out(fraction);
+        [
+            from[0] + (to[0] - from[0]) * s,
+            from[1] + (to[1] - from[1]) * s,
+        ]
+    }
+
+    fn test_fade(fraction: f64, reduce: bool) -> f64 {
+        if !reduce || !(0.0..1.0).contains(&fraction) {
+            return 1.0;
+        }
+        (2.0 * fraction - 1.0).abs()
+    }
+
+    /// Curves shaped like the module's: a 300 ms glide (140 ms under Reduce
+    /// Motion, as a fade that jumps at its midpoint) and no settle, so a
+    /// glide that is over is plainly at rest.
+    const CURVES: CursorMotion = CursorMotion {
+        duration_ms: test_duration,
+        position: test_position,
+        settle_scale: |_, _, _| 1.0,
+        fade_alpha: test_fade,
+    };
+
+    const START: [f64; 2] = [500.0, 400.0];
+    const DRAG: [f64; 2] = [140.0, -60.0];
+
+    fn aim(to: [f64; 2], reduce_motion: bool) -> MotionEvent {
+        MotionEvent {
+            to,
+            resting: false,
+            first: false,
+            press: true,
+            reduce_motion,
+        }
+    }
+
+    /// A badge that appeared on `START` and has finished drawing its arrival.
+    fn resting_badge(start: Instant, reduce_motion: bool) -> BadgeMotion {
+        let mut motion = BadgeMotion::new(start);
+        motion.on_event(
+            MotionEvent {
+                first: true,
+                ..aim(START, reduce_motion)
+            },
+            start,
+            &CURVES,
+        );
+        let frame = motion.frame(start, &CURVES);
+        assert_eq!(frame.need, PictureNeed::Rest);
+        motion
+    }
+
+    /// Frames at 60 Hz from `from` until the picture stops asking for them.
+    /// Returns every frame drawn and when the last one was.
+    fn frames_until_still(motion: &mut BadgeMotion, from: Instant) -> (Vec<MotionFrame>, Instant) {
+        let mut frames = Vec::new();
+        let mut now = from;
+        loop {
+            let frame = motion.frame(now, &CURVES);
+            frames.push(frame);
+            if frame.need != PictureNeed::Frames {
+                return (frames, now);
+            }
+            assert!(frames.len() < 1000, "never came to rest");
+            now += FRAME;
+        }
+    }
+
+    fn add(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+        [a[0] + b[0], a[1] + b[1]]
+    }
+
+    /// Where the pointer's tip is drawn on screen for a frame.
+    fn drawn_tip(frame: &MotionFrame) -> [f64; 2] {
+        add(frame.tip, turn_point([0.0, 0.0], frame.rotation))
+    }
+
+    fn chip(frame: &MotionFrame) -> [f64; 2] {
+        add(frame.tip, CHIP_CENTER)
+    }
+
+    /// The resting badge with its tip on `target`: what every landing must
+    /// end in.
+    fn resting_on(target: [f64; 2]) -> MotionFrame {
+        MotionFrame {
+            tip: target,
+            rotation: 0.0,
+            pointer_alpha: 1.0,
+            hand: false,
+            scale: 1.0,
+            alpha: 1.0,
+            need: PictureNeed::Rest,
+        }
+    }
+
+    #[test]
+    fn a_window_move_while_resting_swings_the_pointer_and_leaves_the_avatar_still() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let before = motion.frame(start, &CURVES);
+        let moved = start + SECOND;
+        assert!(motion.on_follow(DRAG, moved, false));
+        let (frames, _) = frames_until_still(&mut motion, moved);
+        for frame in &frames {
+            assert!(frame.hand, "{frame:?}");
+            assert_eq!(chip(frame), chip(&before), "the avatar chased the window");
+        }
+        // The pointer has left the element; it did not move with it.
+        assert_ne!(frames.last().unwrap().rotation, 0.0);
+    }
+
+    #[test]
+    fn the_swinging_pointer_orbits_the_avatar_aims_at_the_target_and_turns_the_short_way() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let moved = start + SECOND;
+        motion.on_follow(DRAG, moved, false);
+        let (frames, settled_at) = frames_until_still(&mut motion, moved);
+        // A few frames of easing (about 120 ms), never a jump to the end.
+        assert!(frames.len() >= 6, "{} frames", frames.len());
+        assert!(settled_at - moved <= Duration::from_millis(150));
+        let target = add(START, DRAG);
+        for frame in &frames {
+            let tip = drawn_tip(frame);
+            let from_chip = [tip[0] - chip(frame)[0], tip[1] - chip(frame)[1]];
+            assert!((from_chip[0].hypot(from_chip[1]) - hand_radius()).abs() < 1e-9);
+        }
+        let last = frames.last().unwrap();
+        let tip = drawn_tip(last);
+        let to_tip = [tip[0] - chip(last)[0], tip[1] - chip(last)[1]];
+        let to_target = [target[0] - chip(last)[0], target[1] - chip(last)[1]];
+        let cross = to_tip[0] * to_target[1] - to_tip[1] * to_target[0];
+        let along = to_tip[0] * to_target[0] + to_tip[1] * to_target[1];
+        assert!(
+            cross.abs() < 1e-6 && along > 0.0,
+            "points along {to_tip:?}, target is along {to_target:?}"
+        );
+        // Then nothing moves until the quiet period is over: no frames.
+        assert_eq!(
+            last.need,
+            PictureNeed::WakeAfter(WINDOW_QUIET - (settled_at - moved))
+        );
+
+        // Further reports turn it the short way round, even across the back
+        // where the angle wraps.
+        let mut motion = resting_badge(start, false);
+        let centre = add(START, CHIP_CENTER);
+        let rest = crate::cursor_geometry::rest_angle();
+        // A target in the direction that is `rotation` past the resting one,
+        // given as the total offset from the element's first place.
+        let toward = |rotation: f64| {
+            let angle = rest + rotation.to_radians();
+            let target = [
+                centre[0] + 300.0 * angle.cos(),
+                centre[1] + 300.0 * angle.sin(),
+            ];
+            [target[0] - START[0], target[1] - START[1]]
+        };
+        let mut now = start + SECOND;
+        motion.on_follow(toward(170.0), now, false);
+        let (frames, at) = frames_until_still(&mut motion, now);
+        let before = frames.last().unwrap().rotation;
+        assert!((before.to_degrees() - 170.0).abs() < 1e-6, "{before}");
+        now = at + FRAME;
+        motion.on_follow(toward(-170.0), now, false);
+        let (frames, _) = frames_until_still(&mut motion, now);
+        // 20 degrees on through the back, not 340 back the long way.
+        for frame in &frames {
+            let degrees = frame.rotation.to_degrees();
+            assert!(
+                (170.0 - 1e-6..=190.0 + 1e-6).contains(&degrees),
+                "{degrees}"
+            );
+        }
+        let after = frames.last().unwrap().rotation.to_degrees();
+        assert!((after - 190.0).abs() < 1e-6, "{after}");
+    }
+
+    #[test]
+    fn after_the_window_keeps_still_the_badge_flies_back_into_its_resting_layout() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let moved = start + SECOND;
+        motion.on_follow(DRAG, moved, false);
+        let (frames, _) = frames_until_still(&mut motion, moved);
+        let swung = *frames.last().unwrap();
+        // Just short of the quiet period: still swinging, still waiting.
+        let waiting = motion.frame(moved + WINDOW_QUIET - FRAME, &CURVES);
+        assert!(waiting.hand && waiting.tip == START);
+        assert_eq!(waiting.need, PictureNeed::WakeAfter(FRAME));
+        // At the end of it the flight starts from where the chip was.
+        let quiet = moved + WINDOW_QUIET;
+        let (frames, _) = frames_until_still(&mut motion, quiet);
+        assert_eq!(frames[0].tip, START);
+        assert_eq!(frames[0].need, PictureNeed::Frames);
+        assert!(frames.len() >= 15, "a glide, not a jump: {}", frames.len());
+        // The pointer turns back steadily as the badge flies.
+        let mut turned = swung.rotation.abs();
+        for frame in &frames {
+            assert!(frame.rotation.abs() <= turned + 1e-12, "{frame:?}");
+            turned = frame.rotation.abs();
+        }
+        // And lands exactly in the standard resting layout on the target.
+        assert_eq!(*frames.last().unwrap(), resting_on(add(START, DRAG)));
+        assert_eq!(drawn_tip(frames.last().unwrap()), add(START, DRAG));
+    }
+
+    #[test]
+    fn a_window_move_within_the_quiet_period_restarts_it() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let first = start + SECOND;
+        motion.on_follow(DRAG, first, false);
+        frames_until_still(&mut motion, first);
+        let second = first + Duration::from_millis(500);
+        motion.on_follow(add(DRAG, [30.0, 10.0]), second, false);
+        frames_until_still(&mut motion, second);
+        // A frame past 700 ms since the first report, but only about 200 ms
+        // since the second.
+        let frame = motion.frame(first + WINDOW_QUIET + FRAME, &CURVES);
+        assert!(frame.hand && frame.tip == START, "{frame:?}");
+        assert_eq!(
+            frame.need,
+            PictureNeed::WakeAfter(second + WINDOW_QUIET - (first + WINDOW_QUIET + FRAME))
+        );
+        let (frames, _) = frames_until_still(&mut motion, second + WINDOW_QUIET);
+        assert_eq!(frames[0].need, PictureNeed::Frames, "the flight starts");
+        assert_eq!(
+            *frames.last().unwrap(),
+            resting_on(add(START, add(DRAG, [30.0, 10.0])))
+        );
+    }
+
+    #[test]
+    fn a_new_action_during_the_swing_cancels_it_and_glides_to_the_new_target() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let moved = start + SECOND;
+        motion.on_follow(DRAG, moved, false);
+        frames_until_still(&mut motion, moved);
+        let elsewhere = [900.0, 700.0];
+        let acted = moved + Duration::from_millis(300);
+        assert_eq!(
+            motion.on_event(aim(elsewhere, false), acted, &CURVES),
+            elsewhere
+        );
+        let (frames, landed) = frames_until_still(&mut motion, acted);
+        // It glides from where the chip held still, turning the pointer back.
+        assert_eq!(frames[0].tip, START);
+        assert!(frames.len() >= 15, "a glide, not a jump: {}", frames.len());
+        assert_eq!(*frames.last().unwrap(), resting_on(elsewhere));
+        // The quiet period of the old drag no longer sends it anywhere.
+        let later = motion.frame(landed.max(moved + WINDOW_QUIET) + SECOND, &CURVES);
+        assert_eq!(later, resting_on(elsewhere));
+    }
+
+    #[test]
+    fn under_reduce_motion_a_drag_hides_the_pointer_then_the_badge_fades_in_on_the_target() {
+        let start = Instant::now();
+        let mut motion = resting_badge(start, true);
+        let moved = start + SECOND;
+        motion.on_follow(DRAG, moved, false);
+        let hidden = motion.frame(moved, &CURVES);
+        assert_eq!(hidden.rotation, 0.0, "no swing under Reduce Motion");
+        assert_eq!(hidden.pointer_alpha, 0.0, "the pointer hides instead");
+        assert_eq!(hidden.tip, START);
+        // Nothing to animate while the window moves: sleep out the quiet.
+        assert_eq!(hidden.need, PictureNeed::WakeAfter(WINDOW_QUIET));
+        let (frames, _) = frames_until_still(&mut motion, moved + WINDOW_QUIET);
+        let mut faded_out = false;
+        for frame in &frames {
+            assert_eq!(frame.rotation, 0.0, "swung during the fade: {frame:?}");
+            // The badge never travels: it is at the old place or the new.
+            assert!(
+                frame.tip == START || frame.tip == add(START, DRAG),
+                "{frame:?}"
+            );
+            if frame.tip == START {
+                assert_eq!(frame.pointer_alpha, 0.0);
+            }
+            faded_out |= frame.alpha < 0.2;
+        }
+        assert!(faded_out, "a fade, not a jump");
+        assert_eq!(*frames.last().unwrap(), resting_on(add(START, DRAG)));
+    }
+
+    #[test]
+    fn waiting_out_the_quiet_period_draws_no_frames_and_holds_no_activity() {
+        let start = Instant::now();
+        let mut schedule = CursorSchedule::<BadgeMotion>::new();
+        let mut gate = ActivityGate::default();
+        schedule
+            .picture_for_event("agent".into(), start, || resting_badge(start, false))
+            .unwrap();
+        let moved = start + SECOND;
+        let mut now = moved;
+        let mut followed = false;
+        let mut frames_while_waiting = 0;
+        let mut timed_waits = 0;
+        let mut flew = false;
+        while now < moved + SECOND * 3 {
+            if !followed && now >= moved {
+                let badge = schedule.picture_for_update("agent").unwrap();
+                badge.on_follow(DRAG, now, false);
+                followed = true;
+            }
+            let wait = schedule.advance(now, |badge, step| match step {
+                PictureStep::Draw { .. } => badge.frame(now, &CURVES).need,
+                PictureStep::Hide => PictureNeed::Rest,
+            });
+            gate.before_wait(wait);
+            let easing = now < moved + Duration::from_millis(150);
+            let flying = now >= moved + WINDOW_QUIET;
+            match wait {
+                Wait::Frame(interval) => {
+                    assert!(gate.held());
+                    if !easing && !flying {
+                        frames_while_waiting += 1;
+                    }
+                    flew |= flying;
+                    now += interval;
+                }
+                Wait::Timed(until) => {
+                    assert!(!gate.held(), "a waiting badge kept the activity");
+                    if !flying {
+                        timed_waits += 1;
+                        // Woken exactly when the quiet period ends.
+                        assert_eq!(now + until, moved + WINDOW_QUIET);
+                    }
+                    now += until;
+                }
+                Wait::Event => panic!("the picture is still live"),
+            }
+        }
+        assert_eq!(frames_while_waiting, 0);
+        assert_eq!(timed_waits, 1, "one sleep across the quiet period");
+        assert!(flew, "the flight back drew frames");
+        assert!(!gate.held(), "released once the badge landed");
     }
 }

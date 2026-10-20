@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cerebellum_computer::cursor::AVATAR_SIZE;
+use cerebellum_computer::cursor::{
+    area_average, avatar_tint, AvatarTint, AVATAR_SIZE, TINT_RENDER_SIDE, TINT_SAMPLE_SIDE,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -14,6 +16,9 @@ use crate::login_capture::vault::{ClaustrumVault, CookieVault};
 
 const FETCH_BUDGET: Duration = Duration::from_secs(1);
 const CACHE_CAPACITY: usize = 32;
+/// Agents whose avatar colour is remembered: one per badge the helper can
+/// draw at once, which is far more agents than one person runs together.
+const TINT_CAPACITY: usize = 64;
 static MALFORMED_ROWS: AtomicU64 = AtomicU64::new(0);
 static READ_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
@@ -83,13 +88,61 @@ struct Key {
 
 #[derive(Default)]
 struct Cache {
-    entries: VecDeque<(Key, Vec<u8>)>,
+    entries: VecDeque<(Key, Rendered)>,
     renders: usize,
     malformed: u64,
 }
 
+/// One genome's renders: the badge's avatar pixels, and the agent colour
+/// read from the creature (`None` when it has no colourful pixels, which
+/// draws the neutral colour).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Rendered {
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) tint: Option<AvatarTint>,
+}
+
+/// The creature drawn `side` pixels square, premultiplied RGBA, with its
+/// ground shadow or without it. The badge and the colour reading both come
+/// through here, so they always show the same creature.
+fn rasterize(
+    bytes: &[u8],
+    avatar_type: &str,
+    version: u32,
+    side: u32,
+    ground_shadow: bool,
+) -> Option<Vec<u8>> {
+    let mut tree =
+        avatar_svg::render_tree_for_bytes(bytes, avatar_type, version, avatar_svg::Mood::Neutral)
+            .ok()?;
+    if !ground_shadow {
+        tree.primitives
+            .retain(|primitive| primitive.role != Some(avatar_svg::Role::GroundShadow));
+    }
+    let svg = avatar_svg::serialize_tree(&tree);
+    let svg_tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side)?;
+    let scale = side as f32 / svg_tree.size().width();
+    resvg::render(
+        &svg_tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Some(pixmap.take())
+}
+
+/// The agent's colour the way the Alfonso phone app reads it, so a badge
+/// here matches the agent's page there: the creature in its neutral mood,
+/// with its ground shadow as the phone draws it, at the phone's size, then
+/// averaged down to the phone's 24 x 24 sample. Memory only.
+fn read_tint(bytes: &[u8], avatar_type: &str, version: u32) -> Option<AvatarTint> {
+    let side = TINT_RENDER_SIDE;
+    let pixels = rasterize(bytes, avatar_type, version, side, true)?;
+    avatar_tint(&area_average(&pixels, side as usize, TINT_SAMPLE_SIDE))
+}
+
 impl Cache {
-    fn render(&mut self, row: &AvatarRow) -> Option<Vec<u8>> {
+    fn render(&mut self, row: &AvatarRow) -> Option<Rendered> {
         let (length, default_version) = match row.avatar_type.as_str() {
             "creature.wild" => (16_384, 1),
             "creature.classic" => (1_024, 2),
@@ -124,42 +177,32 @@ impl Cache {
         };
         if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == key) {
             let hit = self.entries.remove(index)?;
-            let pixels = hit.1.clone();
+            let rendered = hit.1.clone();
             self.entries.push_back(hit);
-            return Some(pixels);
+            return Some(rendered);
         }
         self.renders += 1;
-        let mut tree = avatar_svg::render_tree_for_bytes(
-            &bytes,
-            &row.avatar_type,
-            version,
-            avatar_svg::Mood::Neutral,
-        )
-        .ok()?;
         // Ground shadows belong on a scene's floor, not inside a floating badge.
-        tree.primitives
-            .retain(|primitive| primitive.role != Some(avatar_svg::Role::GroundShadow));
-        let svg = avatar_svg::serialize_tree(&tree);
-        let svg_tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default()).ok()?;
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(AVATAR_SIZE, AVATAR_SIZE)?;
-        let scale = AVATAR_SIZE as f32 / svg_tree.size().width();
-        resvg::render(
-            &svg_tree,
-            resvg::tiny_skia::Transform::from_scale(scale, scale),
-            &mut pixmap.as_mut(),
-        );
-        let pixels = pixmap.take();
+        let pixels = rasterize(&bytes, &row.avatar_type, version, AVATAR_SIZE, false)?;
+        let rendered = Rendered {
+            pixels,
+            tint: read_tint(&bytes, &row.avatar_type, version),
+        };
         if self.entries.len() == CACHE_CAPACITY {
             self.entries.pop_front();
         }
-        self.entries.push_back((key, pixels.clone()));
-        Some(pixels)
+        self.entries.push_back((key, rendered.clone()));
+        Some(rendered)
     }
 }
 
 pub(crate) struct Avatars {
     route: Arc<dyn CookieVault>,
     cache: Mutex<Cache>,
+    /// Each agent's latest avatar colour, so its next badge, even after a
+    /// hide, is drawn in that colour from the start instead of waiting for
+    /// the avatar to be fetched again.
+    tints: Mutex<VecDeque<(String, Option<AvatarTint>)>>,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -176,11 +219,35 @@ impl Avatars {
         Self {
             route,
             cache: Mutex::new(Cache::default()),
+            tints: Mutex::new(VecDeque::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
-    pub(super) async fn fetch_and_render(self: &Arc<Self>, agent: &str) -> Option<Vec<u8>> {
+    /// The colour `agent`'s avatar was last read as: `None` until it has
+    /// been, and `Some(None)` for an avatar with no colourful pixels.
+    pub(super) fn known_tint(&self, agent: &str) -> Option<Option<AvatarTint>> {
+        self.tints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(known, _)| known == agent)
+            .map(|(_, tint)| *tint)
+    }
+
+    fn remember_tint(&self, agent: &str, tint: Option<AvatarTint>) {
+        let mut tints = self
+            .tints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tints.retain(|(known, _)| known != agent);
+        if tints.len() == TINT_CAPACITY {
+            tints.pop_front();
+        }
+        tints.push_back((agent.to_owned(), tint));
+    }
+
+    pub(super) async fn fetch_and_render(self: &Arc<Self>, agent: &str) -> Option<Rendered> {
         // Saturation drops cosmetics rather than queuing unbounded recipe reads.
         let permit = self.slots.clone().try_acquire_owned().ok()?;
         let row = tokio::time::timeout(FETCH_BUDGET, async {
@@ -192,7 +259,7 @@ impl Avatars {
         .ok()
         .flatten()?;
         let avatars = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let rendered = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             avatars
                 .cache
@@ -202,7 +269,9 @@ impl Avatars {
         })
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        self.remember_tint(agent, rendered.tint);
+        Some(rendered)
     }
 }
 
@@ -276,7 +345,7 @@ mod tests {
     #[test]
     fn real_fixture_raster_has_badge_dimensions_and_visible_pixels() {
         let mut cache = Cache::default();
-        let pixels = cache.render(&fixture("agent-a")).unwrap();
+        let pixels = cache.render(&fixture("agent-a")).unwrap().pixels;
         assert_eq!(pixels.len(), (AVATAR_SIZE * AVATAR_SIZE * 4) as usize);
         assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         assert_eq!(cache.renders, 1);
@@ -293,6 +362,63 @@ mod tests {
             .primitives
             .iter()
             .any(|primitive| primitive.role == Some(avatar_svg::Role::GroundShadow)));
+    }
+
+    /// Agent colours the Alfonso phone app computed for three creatures; see
+    /// the README beside the file.
+    const COLOUR_VECTORS: &str = include_str!("../../../tests/fixtures/avatar-colour/vectors.json");
+
+    #[derive(Deserialize)]
+    struct ColourVector {
+        fingerprint: String,
+        avatar_type: String,
+        avatar_version: u32,
+        genome_hex: String,
+        dock_hue: f64,
+        dock_sat: f64,
+    }
+
+    /// How close our reading must come to the phone's. The phone rasterizes
+    /// with CoreGraphics and we with resvg, so a pixel here and there
+    /// differs; CKIOS, who produced the vectors, gave these margins for that.
+    const HUE_TOLERANCE: f64 = 0.003;
+    const SATURATION_TOLERANCE: f64 = 0.015;
+
+    #[test]
+    fn avatar_colour_matches_the_phone_for_its_reference_creatures() {
+        let vectors: Vec<ColourVector> = serde_json::from_str(COLOUR_VECTORS).unwrap();
+        assert_eq!(vectors.len(), 3);
+        let mut cache = Cache::default();
+        let mut misses = Vec::new();
+        for vector in &vectors {
+            // Through the same decoding the live badge uses for a genome
+            // from Entorhinal: its length and type are checked there.
+            let row = AvatarRow {
+                agent_id: vector.fingerprint.clone(),
+                genome: vector.genome_hex.clone(),
+                avatar_type: vector.avatar_type.clone(),
+                version: Some(vector.avatar_version),
+            };
+            let tint = cache
+                .render(&row)
+                .unwrap_or_else(|| panic!("{} did not decode", vector.fingerprint))
+                .tint
+                .unwrap_or_else(|| panic!("{} has no colour", vector.fingerprint));
+            let hue_gap = {
+                let gap = (tint.hue - vector.dock_hue).rem_euclid(1.0);
+                gap.min(1.0 - gap)
+            };
+            let saturation_gap = (tint.saturation - vector.dock_sat).abs();
+            eprintln!(
+                "{}: hue {:.6} (phone {:.6}, gap {hue_gap:.6}), saturation {:.6} \
+                 (phone {:.6}, gap {saturation_gap:.6})",
+                vector.fingerprint, tint.hue, vector.dock_hue, tint.saturation, vector.dock_sat
+            );
+            if hue_gap > HUE_TOLERANCE || saturation_gap > SATURATION_TOLERANCE {
+                misses.push(vector.fingerprint.clone());
+            }
+        }
+        assert!(misses.is_empty(), "off the phone's colour: {misses:?}");
     }
 
     #[test]
@@ -527,6 +653,31 @@ mod tests {
             .0
             .iter()
             .any(|pixel| pixel[3] != 0));
+    }
+
+    #[tokio::test]
+    async fn the_avatar_colour_rides_with_the_avatar_and_starts_the_next_badge() {
+        let row = fixture("agent-a");
+        let avatars = source(
+            Some(
+                serde_json::json!({"result":{"avatars":[{"agentId":row.agent_id,"genome":row.genome,"type":row.avatar_type,"version":1}],"generation":1,"incarnation":"0123456789abcdef"}}),
+            ),
+            false,
+        );
+        let mut events = scheduled(avatars.clone()).await;
+        let plain = events.recv().await.unwrap();
+        let update = events.recv().await.unwrap();
+        // Unknown at first: the helper draws the neutral colour.
+        assert_eq!(plain.avatar_tint, None);
+        let tint = update
+            .avatar_tint
+            .expect("the colour comes with the avatar");
+        assert!(tint.valid());
+        // A later badge, even a fresh one after a hide, starts in that colour.
+        let mut events = scheduled(avatars).await;
+        let next = events.recv().await.unwrap();
+        assert!(!next.avatar_update);
+        assert_eq!(next.avatar_tint, Some(tint));
     }
 
     #[tokio::test]

@@ -630,6 +630,7 @@ impl Coordinator {
                         serial,
                         avatar_rgba: None,
                         avatar_update: false,
+                        avatar_tint: None,
                     },
                     aimed_handle,
                 ))
@@ -637,6 +638,18 @@ impl Coordinator {
             if let Ok(Ok(Some((event, followed_element)))) =
                 tokio::time::timeout(READ_BUDGET, read).await
             {
+                // A badge for an agent whose avatar colour is already known
+                // starts in that colour rather than the neutral one.
+                #[cfg(target_os = "macos")]
+                let event = {
+                    let mut event = event;
+                    if let (Some(agent), Some(avatars)) =
+                        (identity.avatar_agent.as_deref(), cursor.0.avatars.get())
+                    {
+                        event.avatar_tint = avatars.known_tint(agent).flatten();
+                    }
+                    event
+                };
                 cursor.send_unless_ended(event.clone());
                 // Off the read's deadline: following the window is a nicety
                 // that must never hold up or drop the picture itself.
@@ -651,9 +664,10 @@ impl Coordinator {
                 if let (Some(agent), Some(avatars)) =
                     (identity.avatar_agent, cursor.0.avatars.get())
                 {
-                    if let Some(pixels) = avatars.fetch_and_render(&agent).await {
+                    if let Some(rendered) = avatars.fetch_and_render(&agent).await {
                         let mut update = event;
-                        update.avatar_rgba = Some(pixels);
+                        update.avatar_rgba = Some(rendered.pixels);
+                        update.avatar_tint = rendered.tint;
                         update.avatar_update = true;
                         cursor.send(update);
                     }
@@ -692,6 +706,7 @@ impl Coordinator {
                 serial: 0,
                 avatar_rgba: None,
                 avatar_update: false,
+                avatar_tint: None,
             }));
         }
     }
@@ -1376,6 +1391,7 @@ mod tests {
             serial: 0,
             avatar_rgba: None,
             avatar_update: false,
+            avatar_tint: None,
         };
         for _ in 0..CAPACITY {
             cursor.send(event.clone());

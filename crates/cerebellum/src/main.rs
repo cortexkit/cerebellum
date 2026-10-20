@@ -37,7 +37,9 @@ fn agent_cursor() {}
 
 #[cfg(target_os = "macos")]
 fn agent_cursor() {
-    use cerebellum_computer::cursor::{accent, CursorKind, CursorLine, MAX_CURSOR_LINE};
+    use cerebellum_computer::cursor::{
+        accents, pill_colour, CursorKind, CursorLine, MAX_CURSOR_LINE,
+    };
     use std::io::{BufRead, Read};
     // The module renders avatars at one size and the helper draws exactly that
     // size; a mismatch would silently drop every avatar.
@@ -90,10 +92,21 @@ fn agent_cursor() {
                     offset: follow.offset,
                 },
                 CursorLine::Picture(event) => {
+                    // The agent's colours come from its avatar; until that
+                    // colour is known they are the neutral ones. The pill
+                    // under the white label text is darkened as far as the
+                    // text needs to stay readable.
+                    let colours = accents(event.avatar_tint);
+                    let pair = |accent: [f64; 3]| cerebellum_macos::OverlayColours {
+                        accent,
+                        pill: pill_colour(accent),
+                    };
                     cerebellum_macos::OverlayMessage::Show(cerebellum_macos::OverlayEvent {
-                        // Derived here from the agent's id rather than sent,
-                        // so the pipe vocabulary stays as it is.
-                        accent: accent(&event.agent),
+                        accent: cerebellum_macos::OverlayAccent {
+                            light: pair(colours.light),
+                            dark: pair(colours.dark),
+                        },
+                        accent_known: event.avatar_tint.is_some(),
                         agent: event.agent,
                         initial: event.initial,
                         to: event.to,
