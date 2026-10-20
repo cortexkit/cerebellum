@@ -689,6 +689,30 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
 /// What a refusal adds beyond its sentence and remedy: the request field or
 /// application it is about, and the detail that tells the model how to fix it.
 fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String>) {
+    if code == "internal_failure" {
+        // The flat reply is often all the caller sees. Keep the diagnostic
+        // identity even when the structured failure uses a top-level code.
+        let detail = object.get("detail").and_then(Value::as_object);
+        let identifier = [
+            ("Stage", text(object, "stage")),
+            ("Reason code", text(object, "reason_code")),
+            ("Stage", detail.and_then(|detail| text(detail, "stage"))),
+            (
+                "Reason code",
+                detail.and_then(|detail| text(detail, "reason_code")),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(label, value)| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (label, value))
+        });
+        lines.push(match identifier {
+            Some((label, value)) => format!("{label}: {value}."),
+            None => "Stage: unavailable (no stage or reason_code supplied).".into(),
+        });
+    }
     if code != "invalid_request" {
         if let Some(field) = text(object, "field") {
             lines.push(format!("Field: {field}."));
@@ -744,7 +768,7 @@ fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String
     {
         lines.push(format!("Why: {}.", words(reason)));
     }
-    if let Some(stage) = text(object, "stage") {
+    if let Some(stage) = text(object, "stage").filter(|_| code != "internal_failure") {
         lines.push(format!("Stage: {}.", words(stage)));
     }
     if let Some(detail) = object.get("detail").and_then(Value::as_object) {

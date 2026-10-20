@@ -318,6 +318,47 @@ pub(crate) fn model_view_problems_for_action(result: &Value, action: &str) -> Ve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn internal_failure_text_names_stage_or_reason_code() {
+        for (reply, expected) in [
+            (
+                serde_json::json!({"outcome":"internal_failure", "stage":"launch_journal"}),
+                "Stage: launch_journal.",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure", "reason_code":"registry_profile_busy"}),
+                "Reason code: registry_profile_busy.",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure", "detail":{"reason_code":"cdp_failure"}}),
+                "Reason code: cdp_failure.",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure", "detail":{"reason_code":"cdp_failure", "reason":"transport"}}),
+                "Reason code: cdp_failure.",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure", "stage":"spawn", "reason_code":"missing_pipe"}),
+                "Stage: spawn.",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure", "stage":" ", "reason_code":42}),
+                "Stage: unavailable (no stage or reason_code supplied).",
+            ),
+            (
+                serde_json::json!({"outcome":"internal_failure"}),
+                "Stage: unavailable (no stage or reason_code supplied).",
+            ),
+        ] {
+            let encoded = decoded(reply.clone());
+            assert_eq!(encoded["structuredContent"], reply);
+            assert_eq!(encoded["isError"], true);
+            assert!(
+                texts(&encoded).iter().any(|text| text.contains(expected)),
+                "{encoded}"
+            );
+        }
+    }
     use super::*;
 
     fn decoded(reply: Value) -> Value {

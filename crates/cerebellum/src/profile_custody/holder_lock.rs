@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -569,6 +569,31 @@ pub trait ProfileCustodyJournal {
 /// the guarded filesystem mutation begins.
 pub struct FilesystemProfileCustodyJournal {
     file: File,
+}
+
+/// Find the last owner bound to this directory, even after its lock was
+/// released or stale-broken. The custody journal records the supervisor's pid
+/// and kernel start time; the registry's attachment counter cannot distinguish
+/// two processes that reuse the same pid.
+pub(crate) fn recorded_profile_supervisor(
+    root: &Path,
+    directory: &Path,
+    pid: u32,
+) -> io::Result<Option<SupervisorGeneration>> {
+    let file = File::open(root.join(LOCK_DIRECTORY).join(JOURNAL_FILE))?;
+    let mut last = None;
+    for line in io::BufReader::new(file).lines() {
+        let event: ProfileCustodyEvent = serde_json::from_str(&line?).map_err(io::Error::other)?;
+        if event.format_version != JOURNAL_FORMAT_VERSION {
+            return Err(io::Error::other("unsupported custody event"));
+        }
+        if event.kind == ProfileCustodyEventKind::ProfileDirectoryBind
+            && event.profile_directory.as_deref() == Some(directory)
+        {
+            last = Some(event.supervisor);
+        }
+    }
+    Ok(last.filter(|owner| owner.pid == pid))
 }
 
 impl FilesystemProfileCustodyJournal {

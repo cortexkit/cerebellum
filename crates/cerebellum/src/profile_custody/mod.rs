@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 mod holder_lock;
 mod lease_timing;
+pub(crate) use holder_lock::recorded_profile_supervisor;
 pub(crate) use lease_timing::{
     acquired as lease_acquired, deadline as lease_deadline, refusal as lease_refusal,
     released as lease_released, with_holder as with_lease_holder,
