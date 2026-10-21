@@ -275,6 +275,14 @@ pub(crate) fn normal_frontmost_process_id() -> Option<i32> {
     crate::window_visibility::frontmost_from_windows(&cursor_window_list()?)
 }
 
+/// The number of the on-screen window a pointer event at the desktop point
+/// `(x, y)` would reach, read from the same front-to-back list as the image
+/// visibility reading. `None` when the list cannot be read or does not settle
+/// which window is there.
+pub fn topmost_window_at(x: f64, y: f64) -> Option<u32> {
+    crate::window_visibility::topmost_window_at([x, y], &cursor_window_list()?)
+}
+
 fn window_visibility_with_entries(
     pid: u32,
     id: u32,

@@ -463,7 +463,9 @@ async fn a_lock_during_the_wait_of_an_element_or_point_action_refuses_before_act
             .element_id
             .clone()
             .expect("the text field is numbered");
-        let image_id = sessions.register_image(
+        // Registered with its window, and the hit element placed in that
+        // window, so only the lock stands between the point and a press.
+        let image_id = sessions.register_window_image(
             &conversation,
             RegisteredImage {
                 bundle_identity: TARGET_BUNDLE_ID.to_string(),
@@ -479,8 +481,10 @@ async fn a_lock_during_the_wait_of_an_element_or_point_action_refuses_before_act
                 )
                 .expect("a whole-window mapping"),
             },
+            77,
         );
         rig.desk.state().application_hit = Some((2, Some(grant().pid)));
+        rig.desk.state().element_windows.insert(2, 77);
         let arguments = match name {
             "computer.press_element" => json!({"element_id": field}),
             "computer.write_text" => {

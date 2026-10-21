@@ -141,6 +141,45 @@ pub(crate) fn cursor_point_from_windows(
     None
 }
 
+/// The number of the window a pointer event at `point` would reach: the first
+/// window, front to back, whose bounds contain the point.
+///
+/// Passed over, as the visibility reading passes over them: this module's own
+/// cursor picture and fully transparent windows, which a person cannot see,
+/// and windows with an empty frame, which contain no point. `None` whenever
+/// the answer is not established: a window in front whose bounds are missing
+/// or not finite might cover the point, so nothing behind it can be named,
+/// and the window that contains the point may carry no number. A window of
+/// unknown transparency is counted as one that covers.
+pub(crate) fn topmost_window_at(point: [f64; 2], windows: &[Window]) -> Option<u32> {
+    if !point.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    for window in windows {
+        if window.cursor_picture || window.alpha == Some(0.0) {
+            continue;
+        }
+        let bounds = window.bounds?;
+        if ![bounds.x, bounds.y, bounds.width, bounds.height]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return None;
+        }
+        if !bounds.valid() {
+            continue;
+        }
+        if point[0] >= bounds.x
+            && point[0] < bounds.x + bounds.width
+            && point[1] >= bounds.y
+            && point[1] < bounds.y + bounds.height
+        {
+            return window.id.filter(|id| *id != 0);
+        }
+    }
+    None
+}
+
 /// The deciding rule, suitable for a text-free image journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibilityRule {
@@ -415,6 +454,95 @@ mod tests {
             width,
             height: 100.0,
         }
+    }
+
+    #[test]
+    fn the_topmost_window_at_a_point_is_the_first_one_containing_it() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        let cover = |id, pid, layer| Window {
+            pid: Some(pid),
+            ..layered(id, layer, rect(20.0, 120.0))
+        };
+        // Nothing in front: the target.
+        assert_eq!(topmost_window_at([40.0, 40.0], &[target()]), Some(1));
+        // Another application's window, and another window of the same
+        // application, both take the point; a menu or panel on a higher layer
+        // does too, because it would receive the click.
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[cover(2, 99, 0), target()]),
+            Some(2)
+        );
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[cover(3, 7, 0), target()]),
+            Some(3)
+        );
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[cover(4, 99, 101), target()]),
+            Some(4)
+        );
+        // A window in front that does not contain the point does not matter.
+        assert_eq!(
+            topmost_window_at([500.0, 40.0], &[cover(2, 99, 0), target()]),
+            Some(1)
+        );
+        // Outside every window.
+        assert_eq!(topmost_window_at([1500.0, 40.0], &[target()]), None);
+    }
+
+    #[test]
+    fn the_topmost_window_skips_the_cursor_picture_and_invisible_windows() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        let picture = Window {
+            cursor_picture: true,
+            pid: Some(99),
+            ..layered(2, 3, rect(20.0, 120.0))
+        };
+        let transparent = Window {
+            alpha: Some(0.0),
+            ..window(3, Some(rect(20.0, 120.0)))
+        };
+        let empty = window(4, Some(rect(20.0, 0.0)));
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[picture, transparent, empty, target()]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_topmost_window_is_unknown_when_the_list_cannot_settle_it() {
+        let target = || window(1, Some(rect(0.0, 1000.0)));
+        // A window in front with no bounds might cover the point.
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[window(2, None), target()]),
+            None
+        );
+        assert_eq!(
+            topmost_window_at(
+                [40.0, 40.0],
+                &[window(2, Some(rect(f64::NAN, 10.0))), target()]
+            ),
+            None
+        );
+        // The containing window carries no number, or the null window id.
+        let unnumbered = Window {
+            id: None,
+            ..target()
+        };
+        assert_eq!(topmost_window_at([40.0, 40.0], &[unnumbered]), None);
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[window(0, Some(rect(0.0, 1000.0)))]),
+            None
+        );
+        // Unknown transparency counts as covering.
+        let unknown_alpha = Window {
+            alpha: None,
+            ..window(5, Some(rect(20.0, 120.0)))
+        };
+        assert_eq!(
+            topmost_window_at([40.0, 40.0], &[unknown_alpha, target()]),
+            Some(5)
+        );
+        assert_eq!(topmost_window_at([f64::NAN, 40.0], &[target()]), None);
     }
     fn window(id: u32, bounds: Option<Rect>) -> Window {
         Window {

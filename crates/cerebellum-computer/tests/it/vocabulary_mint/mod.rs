@@ -2116,3 +2116,46 @@ pub fn v25_from_v24(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The rows that act at a pixel of a window image.
+pub const IMAGE_COORDINATE_ROW_IDS: [&str; 3] = [
+    "computer.press_point",
+    "computer.takeover_move",
+    "computer.takeover_drag",
+];
+
+/// What v26 appends to each image-coordinate row's outcome description,
+/// separated from the existing text by one space.
+pub const POINT_IN_ANOTHER_WINDOW_DESCRIPTION: &str = "point_in_another_window means the point lands on a different window of the application than the image shows, or that window could not be confirmed, so nothing was pressed or posted; read the application again and act by element id, or bring that window forward.";
+
+/// An image-coordinate action lands only in the window the image shows.
+///
+/// The image's pixels map onto the desktop, and at that desktop point there
+/// may be another window. `press_point` hit-tests the image's application, so
+/// it can find an element in a second window of that application; it now
+/// refuses with `point_in_another_window` unless the element it found is
+/// positively in the captured window. `takeover_move` and `takeover_drag`
+/// move the real pointer, which reaches whatever window is on top; they now
+/// refuse with the same outcome unless the topmost window at every point is
+/// confirmed to be the captured one. Each row says so in its outcome
+/// description. No request field changes, so the advertised tool does not.
+pub fn v26_from_v25(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if !IMAGE_COORDINATE_ROW_IDS.contains(&capability.as_str()) {
+            continue;
+        }
+        let outcome = &mut row["result_schema"]["properties"]["outcome"];
+        outcome["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("point_in_another_window"));
+        let description = outcome["description"].as_str().unwrap();
+        outcome["description"] = json!(format!(
+            "{description} {POINT_IN_ANOTHER_WINDOW_DESCRIPTION}"
+        ));
+    }
+    next
+}

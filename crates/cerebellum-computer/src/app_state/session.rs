@@ -344,6 +344,17 @@ pub struct RegisteredImage {
     pub mapping: ImageMapping,
 }
 
+/// An image held for a conversation, with the window it was captured from.
+#[derive(Debug)]
+struct HeldImage {
+    conversation_key: String,
+    image: RegisteredImage,
+    /// The window-server number of the captured window. `None` for an image
+    /// registered without one, which no coordinate action may act on: its
+    /// pixels cannot be tied to the window they show.
+    window_number: Option<u32>,
+}
+
 #[derive(Debug, Default)]
 struct StoreState {
     next_image: u64,
@@ -352,7 +363,7 @@ struct StoreState {
     last_number: u64,
     /// Which session issued each live number.
     owners: HashMap<u64, SessionKey>,
-    images: HashMap<String, (String, RegisteredImage)>,
+    images: HashMap<String, HeldImage>,
 }
 
 impl StoreState {
@@ -869,18 +880,45 @@ impl AppStateSessions {
         }
     }
 
-    /// Remember an image handed to a conversation, and name it.
+    /// Remember an image handed to a conversation, and name it, without the
+    /// window it shows. Such an image can still be resolved, but a coordinate
+    /// action refuses it, because nothing ties its pixels to a window.
     pub fn register_image(&self, conversation_key: &str, image: RegisteredImage) -> String {
+        self.register(conversation_key, image, None)
+    }
+
+    /// Remember an image handed to a conversation together with the
+    /// window-server number of the window it was captured from, and name it.
+    pub fn register_window_image(
+        &self,
+        conversation_key: &str,
+        image: RegisteredImage,
+        window_number: u32,
+    ) -> String {
+        self.register(conversation_key, image, Some(window_number))
+    }
+
+    fn register(
+        &self,
+        conversation_key: &str,
+        image: RegisteredImage,
+        window_number: Option<u32>,
+    ) -> String {
         let mut state = self.lock();
         state.next_image += 1;
         let image_id = format!("i{}{}", self.salt, state.next_image);
-        state
-            .images
-            .insert(image_id.clone(), (conversation_key.to_string(), image));
+        state.images.insert(
+            image_id.clone(),
+            HeldImage {
+                conversation_key: conversation_key.to_string(),
+                image,
+                window_number,
+            },
+        );
         let mut held: Vec<(u64, String)> = state
             .images
             .iter()
-            .filter(|(_, (conversation, _))| conversation == conversation_key)
+            .filter(|(_, held)| held.conversation_key == conversation_key)
             .filter_map(|(id, _)| {
                 id.strip_prefix('i')
                     .and_then(|rest| rest.strip_prefix(self.salt.as_str()))
@@ -901,8 +939,20 @@ impl AppStateSessions {
     /// An image this conversation was given, if it is still remembered.
     pub fn resolve_image(&self, conversation_key: &str, image_id: &str) -> Option<RegisteredImage> {
         let state = self.lock();
-        let (conversation, image) = state.images.get(image_id)?;
-        (conversation == conversation_key).then(|| image.clone())
+        let held = state.images.get(image_id)?;
+        (held.conversation_key == conversation_key).then(|| held.image.clone())
+    }
+
+    /// The window-server number of the window an image this conversation
+    /// holds was captured from; `None` when the image is unknown to this
+    /// conversation or was registered without its window.
+    pub fn image_window(&self, conversation_key: &str, image_id: &str) -> Option<u32> {
+        let state = self.lock();
+        let held = state.images.get(image_id)?;
+        if held.conversation_key != conversation_key {
+            return None;
+        }
+        held.window_number
     }
 
     /// Forget everything held for a conversation that has ended.
@@ -923,7 +973,7 @@ impl AppStateSessions {
         // id issued before.
         state
             .images
-            .retain(|_, (conversation, _)| conversation != conversation_key);
+            .retain(|_, held| held.conversation_key != conversation_key);
     }
 
     /// How many sessions are held, for tests of their lifetime.

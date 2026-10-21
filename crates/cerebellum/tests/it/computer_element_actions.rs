@@ -596,14 +596,16 @@ async fn read_with_image(plane: &Plane, management: &Arc<ManagementPlane>) -> St
 
 /// The point is hit-tested inside the image's own application, never
 /// system-wide: here another application's window covers the point, and a
-/// system-wide hit would land in it. The element found is pressed, the pointer
-/// is not used, and the element is given an id the diff can name.
+/// system-wide hit would land in it. The element found sits in the window the
+/// image shows (window 77, the one `capturing` captures), so it is pressed,
+/// the pointer is not used, and the element is given an id the diff can name.
 #[tokio::test]
 async fn a_point_is_hit_tested_in_its_own_application_and_pressed() {
     let desk = desk();
     {
         let mut state = desk.state();
         state.application_hit = Some((60, Some(grant().pid)));
+        state.element_windows.insert(60, 77);
         state.system_wide_hit = Some((99, Some(777)));
         state.elements.insert(
             60,
@@ -705,6 +707,7 @@ async fn a_hit_on_a_session_ending_item_is_refused_at_press_time() {
     {
         let mut state = desk.state();
         state.application_hit = Some((70, Some(grant().pid)));
+        state.element_windows.insert(70, 77);
         let mut item = facts("AXMenuItem", &["AXPress"]);
         item.title = Some("Shut Down…".into());
         state.elements.insert(
@@ -727,6 +730,79 @@ async fn a_hit_on_a_session_ending_item_is_refused_at_press_time() {
     .await;
     assert_eq!(reply["outcome"], "blocked_menu_item", "{reply}");
     assert!(desk.state().presses.is_empty());
+}
+
+/// The application-scoped hit test finds the topmost element of the
+/// application at the point in any of its windows. With a second window of
+/// the same application over the imaged one there, the element found is in
+/// that window, which the image does not show: nothing is pressed, the element
+/// is not given an id, and the refusal names the application.
+#[tokio::test]
+async fn a_hit_in_another_window_of_the_same_application_presses_nothing() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((60, Some(grant().pid)));
+        state.element_windows.insert(60, 78);
+        state.elements.insert(
+            60,
+            DeskElement {
+                facts: facts("AXButton", &["AXPress"]),
+                ..DeskElement::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("element id")),
+        "{reply}"
+    );
+    assert!(reply.get("state_text").is_none(), "{reply}");
+    assert!(desk.state().presses.is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A hit element whose window cannot be established is not taken to be in
+/// the imaged window: nothing is pressed.
+#[tokio::test]
+async fn a_hit_whose_window_cannot_be_established_presses_nothing() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((60, Some(grant().pid)));
+        state.elements.insert(
+            60,
+            DeskElement {
+                facts: facts("AXButton", &["AXPress"]),
+                ..DeskElement::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(desk.state().presses.is_empty());
+    assert!(plane.result_schema_findings().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1516,7 @@ async fn cursor_every_action_reply_is_byte_identical_on_off_and_dead_transport()
             desk.state().cursor_visible = true;
             desk.state().focus = support::computer::DeskFocus::Element(12);
             desk.state().application_hit = Some((10, Some(grant().pid)));
+            desk.state().element_windows.insert(10, 77);
             let base = plane(&desk);
             let state = serve(
                 &base,

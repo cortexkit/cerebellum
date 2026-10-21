@@ -1063,7 +1063,46 @@ enum PressTarget {
         element_id: String,
         handle: ElementHandle,
     },
-    Point((f64, f64)),
+    Point {
+        point: (f64, f64),
+        /// The window-server number of the window the image shows; `None`
+        /// when the image was registered without one.
+        window_number: Option<u32>,
+        /// The application's name, for the refusal's remedy.
+        application_name: String,
+    },
+}
+
+/// Whether the element a point hit sits in the window the image shows.
+///
+/// The hit test is scoped to the application, not to a window, so it finds
+/// the topmost element of that application at the point in any of its
+/// windows: with a second window of the same application in front, that is
+/// an element the image does not show. Only a positive identification of the
+/// hit element's window as the imaged one counts; a window that cannot be
+/// read, or an image with no remembered window, is not a match.
+pub(crate) fn hit_is_in_imaged_window(
+    source: &dyn AppStateSource,
+    handle: &ElementHandle,
+    window_number: Option<u32>,
+) -> bool {
+    match window_number {
+        Some(expected) => source.element_window_number(handle) == Some(expected),
+        None => false,
+    }
+}
+
+/// The refusal for a point that does not land in the window the image shows,
+/// or whose window could not be confirmed. Nothing was pressed or posted.
+pub(crate) fn point_in_another_window_reply(application_name: &str, posted: &str) -> Value {
+    json!({
+        "outcome": "point_in_another_window",
+        "remedy": format!(
+            "the point lands on a different window of {application_name} than the image shows, \
+             or that window could not be confirmed, so {posted}; read the app again and act by \
+             element id, or bring that window forward"
+        ),
+    })
 }
 
 impl<B, R, T, S, D> super::ComputerPlane<B, R, T, S, D>
@@ -1332,13 +1371,19 @@ where
         let point = image
             .mapping
             .pixel_to_desktop(parsed.x as f64, parsed.y as f64);
+        let window_number = sessions.image_window(&conversation_key, &parsed.image_id);
+        let application_name = management.application_name(&grant);
         let mut reply = self
             .press_and_diff(
                 identity,
                 sessions,
                 ComputerCapability::PressPoint,
                 grant,
-                PressTarget::Point(point),
+                PressTarget::Point {
+                    point,
+                    window_number,
+                    application_name,
+                },
                 view,
             )
             .await;
@@ -1558,12 +1603,23 @@ where
         tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            let point = match &target { PressTarget::Point(point) => Some([point.0, point.1]), _ => None };
+            let point = match &target { PressTarget::Point { point, .. } => Some([point.0, point.1]), _ => None };
             let (element_id, handle) = match target {
                 PressTarget::Element { element_id, handle } => (element_id, handle),
-                PressTarget::Point(point) => {
+                PressTarget::Point { point, window_number, application_name } => {
                     let hit = hit_test(source.as_ref(), &grant, point);
                     let found = match hit {
+                        // Checked before the element is given an id, so an
+                        // element of a window the image does not show is
+                        // neither numbered nor pressed.
+                        PointHit::Element(handle)
+                            if !hit_is_in_imaged_window(source.as_ref(), &handle, window_number) =>
+                        {
+                            Err(point_in_another_window_reply(
+                                &application_name,
+                                "nothing was pressed and the pointer was not used",
+                            ))
+                        }
                         PointHit::Element(handle) => adopt(&sessions, &identity.conversation_key, &grant, &handle)
                             .map(|id| (id, handle)),
                         PointHit::Nothing => Err(json!({

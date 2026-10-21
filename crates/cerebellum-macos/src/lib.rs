@@ -96,6 +96,11 @@ mod skylight;
 mod window_follow;
 #[cfg(target_os = "macos")]
 pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
+// The fail-closed rule is pure Rust, so its tests run on every host; off
+// macOS only those tests use it.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod window_identity;
 #[cfg(target_os = "macos")]
 mod window_image;
 #[cfg(any(target_os = "macos", test))]
@@ -130,8 +135,8 @@ pub use ax_actions::enable_manual_accessibility;
 pub use ax_actions::{
     cursor_element_frame, cursor_element_label, cursor_element_window, cursor_focused_window,
     element_at_position, element_facts, element_selected_range, element_text_value,
-    focused_element, focused_window, press_element, request_frontmost, write_element_text,
-    AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,
+    element_window_number, focused_element, focused_window, press_element, request_frontmost,
+    write_element_text, AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use manual_accessibility::prepare_manual_accessibility;
@@ -201,6 +206,6 @@ pub use skylight::{
 };
 #[cfg(target_os = "macos")]
 pub use window_image::{
-    encode_scaled_jpeg, frontmost_window_id, register_cursor_generation, visible_cursor_point,
-    window_visibility, window_visibility_decision,
+    encode_scaled_jpeg, frontmost_window_id, register_cursor_generation, topmost_window_at,
+    visible_cursor_point, window_visibility, window_visibility_decision,
 };
