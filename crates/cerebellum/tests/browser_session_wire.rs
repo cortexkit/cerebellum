@@ -455,6 +455,7 @@ struct RecordingLauncher {
     hazardous_target: bool,
     cross_site_link_target: bool,
     present_error: Option<&'static str>,
+    reap_failure: bool,
     cookie_value: Option<&'static str>,
     cookie_grows_on_poll: bool,
     credential_field_then_clears: bool,
@@ -527,6 +528,7 @@ impl BrowserSessionLauncher for RecordingLauncher {
                 hazardous_target: self.hazardous_target,
                 cross_site_link_target: self.cross_site_link_target,
                 present_error: self.present_error,
+                reap_failure: self.reap_failure,
                 cookie_value: self.cookie_value,
                 cookie_grows_on_poll: self.cookie_grows_on_poll,
                 credential_field_then_clears: self.credential_field_then_clears,
@@ -582,6 +584,7 @@ struct FrameFixture {
 }
 
 struct RecordingProcess {
+    reap_failure: bool,
     effects: Arc<Mutex<Vec<&'static str>>>,
     page: CommittedPage,
     moves_during_capture: Arc<Mutex<Vec<PageMove>>>,
@@ -1007,7 +1010,14 @@ impl OwnedBrowserProcess for RecordingProcess {
 
     fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
         self.effects.lock().unwrap().push("reap");
-        Ok(())
+        if self.reap_failure {
+            Err(ProcessControlFailure::from_io(
+                cerebellum::browser_session::ProcessControlStep::ReapWait,
+                &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "/private/secret"),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1250,6 +1260,48 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     );
     // Five, not six: the refused navigation contributed no effect.
     assert_eq!(launcher.effects.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn cleanup_failure_step_reaches_the_caller_not_a_schema_violation() {
+    let launcher = Arc::new(RecordingLauncher {
+        reap_failure: true,
+        ..Default::default()
+    });
+    let planes = recording_planes(&launcher);
+    let launched = response_body(&planes, 1, "browser.launch", json!({})).await;
+    let reply = response_body(
+        &planes,
+        2,
+        "browser.close",
+        json!({
+            "browser_session_id": launched["browser_session_id"],
+        }),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "cleanup_failure", "{reply}");
+    assert_eq!(reply["stage"], "reap");
+    assert_eq!(
+        reply["detail"],
+        json!({"step": "reap_wait", "error_kind": "PermissionDenied"})
+    );
+    let status = response_body(&planes, 3, "browser.status", json!({})).await;
+    assert_eq!(status["detail"], reply["detail"]);
+    let repeated = response_body(
+        &planes,
+        4,
+        "browser.close",
+        json!({
+            "browser_session_id": launched["browser_session_id"],
+        }),
+    )
+    .await;
+    assert_eq!(repeated["detail"], reply["detail"]);
+    let relaunch = response_body(&planes, 5, "browser.launch", json!({})).await;
+    assert_eq!(relaunch["outcome"], "cleanup_failure");
+    assert_eq!(relaunch["detail"], reply["detail"]);
+    assert!(!reply.to_string().contains("/private/secret"));
+    assert!(!launcher.effects.lock().unwrap().contains(&"cleanup"));
 }
 
 #[tokio::test]

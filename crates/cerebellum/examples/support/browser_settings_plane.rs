@@ -5,7 +5,7 @@ use cerebellum::browser::{BrowserPlane, Tracker};
 use cerebellum::browser_launch::ExecutableIdentityCheckpoints;
 use cerebellum::browser_session::{
     BrowserScrollTarget, BrowserSessionLauncher, CleanupStage, LaunchedBrowser,
-    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure,
+    NavigationDriveError, NavigationWait, OwnedBrowserProcess, ProcessControlFailure, ProcessControlStep,
     SessionCleanup, SessionCleanupOutcome,
 };
 use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
@@ -124,7 +124,7 @@ impl OwnedBrowserProcess for Process {
         if let Some(child) = self.child.lock().unwrap().take() {
             child
                 .terminate_and_reap()
-                .map_err(|_| ProcessControlFailure)?;
+                .map_err(|_| ProcessControlFailure::new(ProcessControlStep::GracefulCloseRequest))?;
         }
         Ok(())
     }
