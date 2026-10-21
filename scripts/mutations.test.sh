@@ -7,7 +7,10 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/mutations-test.XXXXXX")"
+# macOS's TMPDIR ends in a slash, so the joined path holds "//". mutations.sh
+# prints its root as `pwd` spells it, with single slashes, so spell the scratch
+# root the same way or the refusal cases never find the path they expect.
+scratch="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/mutations-test.XXXXXX")" && pwd)"
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 
@@ -39,11 +42,12 @@ write_record() {
 JSON
 }
 
-# run_case NAME EXPECTED_STATUS SETUP: build a fresh scratch checkout holding a
-# copy of mutations.sh, let SETUP install runners into it, then run a full-only
-# replay with a decoy runner first on PATH and in CARGO_HOME.
+# run_case NAME EXPECTED_STATUS SETUP [MODE]: build a fresh scratch checkout
+# holding a copy of mutations.sh, let SETUP install runners into it, then run
+# mutations.sh in MODE (default --full-only) with a decoy runner first on PATH
+# and in CARGO_HOME.
 run_case() {
-  local name="$1" expected="$2" setup="$3"
+  local name="$1" expected="$2" setup="$3" mode="${4:---full-only}"
   local case_dir="$scratch/$name"
   local repo="$case_dir/repo"
   mkdir -p "$repo/scripts" "$repo/mutations.d"
@@ -55,7 +59,7 @@ run_case() {
   "$setup" "$case_dir" "$repo"
   env CALL_LOG="$case_dir/calls" CARGO_HOME="$case_dir/cargo-home" \
     PATH="$case_dir/path-bin:/usr/bin:/bin" \
-    "$repo/scripts/mutations.sh" --full-only >"$case_dir/out" 2>&1
+    "$repo/scripts/mutations.sh" "$mode" >"$case_dir/out" 2>&1
   local status=$?
   local problem=""
   [ "$status" = "$expected" ] || problem="exit $status, expected $expected"
@@ -63,8 +67,14 @@ run_case() {
     problem="${problem:+$problem; }a shared runner was invoked"
   fi
   if [ "$expected" = 0 ]; then
-    if ! grep -qx 'private check --catalogue mutations.d --strict' "$case_dir/calls" ||
-      ! grep -qx 'private run --catalogue mutations.d --all' "$case_dir/calls"; then
+    if ! grep -qx 'private check --catalogue mutations.d --strict' "$case_dir/calls"; then
+      problem="${problem:+$problem; }the private runner did not check the catalogue"
+    fi
+    if [ "$mode" = "--check-only" ]; then
+      if grep -q '^private run ' "$case_dir/calls"; then
+        problem="${problem:+$problem; }a check-only run replayed rows"
+      fi
+    elif ! grep -qx 'private run --catalogue mutations.d --all' "$case_dir/calls"; then
       problem="${problem:+$problem; }the private runner did not run the replay"
     fi
   elif ! grep -qF "cargo install --locked --root \"$repo/target/tools\" --git https://github.com/cortexkit/commons --rev $pinned_revision cortexkit-mutate" "$case_dir/out"; then
@@ -120,5 +130,9 @@ run_case private_pinned_runs_despite_wrong_path_runner 0 setup_private_pinned
 run_case private_wrong_version_refuses 2 setup_private_wrong_version
 run_case private_wrong_revision_refuses 2 setup_private_wrong_revision
 run_case private_without_install_record_refuses 2 setup_private_unrecorded
+# A landing gate validates the catalogue without replaying any row, and still
+# only through the private pinned runner.
+run_case check_only_validates_without_replaying 0 setup_private_pinned --check-only
+run_case check_only_still_refuses_a_missing_private_runner 2 setup_private_missing --check-only
 
 [ "$failures" = 0 ]

@@ -383,6 +383,12 @@ fi
 
 if [ "$mutations" -eq 1 ]; then
   run_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
+elif grep -q '^mutations\.d/' <<< "$changed_files"; then
+  # A catalogue row the runner refuses under --strict would stop every later
+  # replay, and the anchor check above does not parse rows that strictly.
+  run_phase "mutation catalogue --strict check (a catalogue file changed)" ./scripts/mutations.sh --check-only
+else
+  echo "==> SKIP: mutation catalogue --strict check (no catalogue file changed)"
 fi
 
 echo "FAST GATE PASSED: all selected phases are green"

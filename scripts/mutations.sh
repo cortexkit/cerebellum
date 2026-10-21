@@ -11,8 +11,9 @@ base="${MUTATION_BASE:-origin/main}"
 narrow=1
 full=1
 only_mode=""
+check_only=0
 usage() {
-  echo "usage: $0 [--diff REF] [--narrow-only | --full-only]"
+  echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only]"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -33,6 +34,10 @@ while [ "$#" -gt 0 ]; do
       narrow=0
       shift
       ;;
+    --check-only)
+      check_only=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -44,6 +49,10 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+if [ "$check_only" -eq 1 ] && [ -n "$only_mode" ]; then
+  echo "--check-only replays nothing, so it takes no replay mode" >&2
+  exit 2
+fi
 
 # The runner lives in this checkout's own install root. ~/.cargo/bin is shared
 # by every repository on the machine, so another repository installing a
@@ -108,6 +117,14 @@ trap cleanup EXIT INT TERM HUP QUIT
 export TMPDIR="$tmpdir"
 
 "$mutate" check --catalogue mutations.d --strict
+
+# Validating the catalogue alone is what a landing gate needs when a change
+# touches it: a row the runner refuses under --strict stops every later replay,
+# and nothing else would notice until someone ran one.
+if [ "$check_only" -eq 1 ]; then
+  echo "mutations: the catalogue is valid under --strict"
+  exit 0
+fi
 
 if [ "$narrow" -eq 1 ]; then
   if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
