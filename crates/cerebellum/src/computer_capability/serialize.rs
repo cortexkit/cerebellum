@@ -625,6 +625,9 @@ mod tests {
             self.launch_released.1.notify_all();
         }
     }
+    /// The window-server number of the window `move_request`'s image shows.
+    const MOVE_IMAGE_WINDOW: u32 = 1;
+
     struct ReleaseHit(Arc<Desk>);
     impl Drop for ReleaseHit {
         fn drop(&mut self) {
@@ -686,6 +689,11 @@ mod tests {
             }
             self.hits_returned.fetch_add(1, Ordering::SeqCst);
             Ok(None)
+        }
+        /// The window `move_request`'s image shows is on top everywhere, so
+        /// a move reaches its placement hit tests.
+        fn topmost_window_at(&self, _: (f64, f64)) -> Option<u32> {
+            Some(MOVE_IMAGE_WINDOW)
         }
         fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
             self.running_queries.fetch_add(1, Ordering::SeqCst);
@@ -1078,23 +1086,28 @@ mod tests {
                 .unwrap()
                 .identity
                 .conversation_key;
-            let image = self.planes.management.app_state_sessions().register_image(
-                &conversation,
-                RegisteredImage {
-                    bundle_identity: APP.to_string(),
-                    pid: 42,
-                    process_generation: "fixture-generation".into(),
-                    width_px: 100,
-                    height_px: 100,
-                    mapping: ImageMapping::for_window(
-                        (0.0, 0.0),
-                        (100.0, 100.0),
-                        (100, 100),
-                        (100, 100),
-                    )
-                    .unwrap(),
-                },
-            );
+            let image = self
+                .planes
+                .management
+                .app_state_sessions()
+                .register_window_image(
+                    &conversation,
+                    RegisteredImage {
+                        bundle_identity: APP.to_string(),
+                        pid: 42,
+                        process_generation: "fixture-generation".into(),
+                        width_px: 100,
+                        height_px: 100,
+                        mapping: ImageMapping::for_window(
+                            (0.0, 0.0),
+                            (100.0, 100.0),
+                            (100, 100),
+                            (100, 100),
+                        )
+                        .unwrap(),
+                    },
+                    MOVE_IMAGE_WINDOW,
+                );
             frame(
                 FrameType::Request,
                 channel,

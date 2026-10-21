@@ -194,6 +194,59 @@ pub fn cursor_element_window(element: &AxRetainedElement) -> Option<AxRetainedEl
         .map(AxRetainedElement)
 }
 
+/// `AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *)`.
+type GetWindow = unsafe extern "C" fn(CfTypeRef, *mut u32) -> i32;
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const std::ffi::c_char) -> *mut c_void;
+}
+
+/// The window-server number (`CGWindowID`) of the window `element` sits in,
+/// or `None` when that cannot be positively established.
+///
+/// The element's own `AXWindow` is asked for (a window is its own window),
+/// and its number is read with the private `_AXUIElementGetWindow`, looked
+/// up at run time (see `window_identity.rs`). An element with no window, such
+/// as a menu bar item, a missing symbol and a failed call all answer `None`.
+pub fn element_window_number(element: &AxRetainedElement) -> Option<u32> {
+    require_trust().ok()?;
+    bound_messages(element.as_ptr());
+    let window = if string(element.as_ptr(), "AXRole").ok()?.as_deref() == Some("AXWindow") {
+        AxRetainedElement(element.0.clone())
+    } else {
+        copy(element.as_ptr(), "AXWindow")
+            .ok()?
+            .filter(|value| is_ax_element(value))
+            .map(AxRetainedElement)?
+    };
+    crate::window_identity::window_number_from(
+        || {
+            // SAFETY: RTLD_DEFAULT (-2 on macOS) searches every loaded image;
+            // the accessibility framework is linked by this module, and the
+            // name is a NUL-terminated C string.
+            let symbol =
+                unsafe { dlsym((-2isize) as *mut c_void, c"_AXUIElementGetWindow".as_ptr()) };
+            if symbol.is_null() {
+                None
+            } else {
+                // SAFETY: the symbol is the accessibility framework's
+                // `AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *)`,
+                // the declaration window managers built on the accessibility
+                // API use. AXError is a 32-bit integer and CGWindowID a 32-bit
+                // unsigned integer, so the function type matches.
+                Some(unsafe { std::mem::transmute::<*mut c_void, GetWindow>(symbol) })
+            }
+        },
+        |get| {
+            let mut number = 0u32;
+            // SAFETY: the window element is retained for the call, and
+            // `number` is writable storage for one CGWindowID.
+            let code = unsafe { get(window.as_ptr(), &mut number) };
+            (code, number)
+        },
+    )
+}
+
 /// The application's focused window, for a cursor picture with no element.
 /// Unlike `focused_window` it prepares nothing in the application.
 pub fn cursor_focused_window(pid: u32) -> Option<AxRetainedElement> {

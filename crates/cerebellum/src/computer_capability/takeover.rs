@@ -528,22 +528,45 @@ where
             _ => return Err(image_unknown()),
         }
 
+        let window_number = management
+            .app_state_sessions()
+            .image_window(conversation_key, image_id);
         let desktop_points: Vec<SyntheticPoint> =
             points.iter().map(|point| desktop(&image, *point)).collect();
         let source = self.app_state_source.clone();
         let hit_management = Arc::clone(management);
         let hit_image = image.clone();
         let hit_points = desktop_points.clone();
-        let owners = tokio::task::spawn_blocking(move || {
-            hit_points
-                .iter()
-                .map(|point| {
-                    application_under(source.as_ref(), &hit_management, &hit_image, *point)
-                })
-                .collect::<Vec<_>>()
+        let placed = tokio::task::spawn_blocking(move || {
+            // The real pointer reaches whichever window is on top at a point,
+            // which may be another window than the image shows, of this
+            // application or another. Every point must land on the imaged
+            // window itself, positively identified; otherwise nothing is
+            // posted, whatever is there and whatever grant it holds.
+            let on_imaged_window = window_number.is_some()
+                && hit_points
+                    .iter()
+                    .all(|point| source.topmost_window_at((point.x, point.y)) == window_number);
+            on_imaged_window.then(|| {
+                hit_points
+                    .iter()
+                    .map(|point| {
+                        application_under(source.as_ref(), &hit_management, &hit_image, *point)
+                    })
+                    .collect::<Vec<_>>()
+            })
         })
-        .await
-        .unwrap_or_else(|_| vec![Err(nothing_identifiable_at_point())]);
+        .await;
+        let owners = match placed {
+            Ok(Some(owners)) => owners,
+            Ok(None) => {
+                return Err(super::element_actions::point_in_another_window_reply(
+                    &management.application_name(&image_grant(&image)),
+                    "nothing was posted",
+                ))
+            }
+            Err(_) => vec![Err(nothing_identifiable_at_point())],
+        };
         let mut owners = owners.into_iter();
         let target = owners
             .next()

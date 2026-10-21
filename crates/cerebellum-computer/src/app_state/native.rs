@@ -311,6 +311,14 @@ impl AppStateSource for MacAppStateSource {
         )
     }
 
+    fn element_window_number(&self, element: &ElementHandle) -> Option<u32> {
+        cerebellum_macos::element_window_number(retained(element).ok()?)
+    }
+
+    fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        cerebellum_macos::topmost_window_at(point.0, point.1)
+    }
+
     /// Read only while the process is still the granted one, for the same
     /// reason a state read is.
     fn focused_element(

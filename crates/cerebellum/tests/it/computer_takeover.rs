@@ -374,15 +374,20 @@ impl Rig {
     }
 }
 
+/// The window-server number of the fixture window the rig's image shows.
+const IMAGED_WINDOW: u32 = 77;
+
 /// The fixture application frontmost, with an image of its window whose
 /// pixels map one to one onto the desktop at (100, 50); whatever is under a
-/// point belongs to it unless a test says otherwise. No grant is held.
+/// point belongs to it, and the imaged window is on top there, unless a test
+/// says otherwise. No grant is held.
 fn rig() -> Rig {
     let desk = Desk::new(vec![RawElement::fixture(1, "AXWindow").titled("Fixture")]);
     {
         let mut state = desk.state();
         state.application_hit = Some((60, Some(grant().pid)));
         state.system_wide_hit = Some((60, Some(grant().pid)));
+        state.topmost_window = Some(IMAGED_WINDOW);
     }
     let pointer = Arc::new(Mutex::new(Pointer {
         idle_ms: 60_000,
@@ -403,7 +408,7 @@ fn rig() -> Rig {
     .with_permission_liveness(super::support::computer::live_permissions())
     .with_app_state_source(desk.source());
     let management = Arc::new(ManagementPlane::new(Arc::new(TwoApplications)));
-    let image_id = management.app_state_sessions().register_image(
+    let image_id = management.app_state_sessions().register_window_image(
         &identity().conversation_key,
         RegisteredImage {
             bundle_identity: TARGET_BUNDLE_ID.to_string(),
@@ -419,6 +424,7 @@ fn rig() -> Rig {
             )
             .expect("a whole-window mapping"),
         },
+        IMAGED_WINDOW,
     );
     Rig {
         desk,
@@ -567,10 +573,11 @@ async fn a_move_into_an_application_without_a_grant_asks_nobody_and_posts_nothin
     assert!(rig.posts().is_empty());
 }
 
-/// The application under the point is the containment target even when it
-/// is not the image's: with its own grant, the move is contained to it.
+/// A point another application's window covers is not a point of the image:
+/// the image shows a window that is not there. Even with every grant held
+/// for that application, the move is refused and nothing is posted.
 #[tokio::test]
-async fn a_move_is_contained_to_the_application_under_its_point() {
+async fn a_move_onto_another_application_s_window_is_refused_even_with_its_grant() {
     let rig = granted_rig().await;
     hold_other_app(&rig.management).await;
     {
@@ -578,6 +585,7 @@ async fn a_move_is_contained_to_the_application_under_its_point() {
         state.application_hit = None;
         state.system_wide_hit = Some((99, Some(OTHER_PID)));
         state.frontmost = Some(OTHER_PID);
+        state.topmost_window = Some(500);
     }
     let reply = serve(
         &rig,
@@ -585,8 +593,45 @@ async fn a_move_is_contained_to_the_application_under_its_point() {
         json!({"image_id": rig.image_id, "to": {"x": 10, "y": 20}}),
     )
     .await;
-    assert_eq!(reply["outcome"], "completed", "{reply}");
-    assert_eq!(rig.dispatched()[0].target, other());
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(rig.dispatched().is_empty());
+    assert!(rig.posts().is_empty());
+}
+
+/// A drag whose end lands on another window of the image's own application,
+/// in front of the imaged one, is refused before anything is posted: the
+/// application-scoped hit test would call that point the same application,
+/// but the real pointer would release over a window the image does not show.
+#[tokio::test]
+async fn a_drag_onto_another_window_of_the_same_application_posts_nothing() {
+    let rig = granted_rig().await;
+    rig.desk.state().topmost_windows_at = vec![((400.0, 450.0), IMAGED_WINDOW + 1)];
+    let reply = serve(
+        &rig,
+        "computer.takeover_drag",
+        json!({"image_id": rig.image_id, "from": {"x": 10, "y": 20}, "to": {"x": 300, "y": 400}}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(rig.dispatched().is_empty());
+    assert!(rig.posts().is_empty());
+}
+
+/// When the window list cannot say which window is on top at the point, the
+/// move is refused and nothing is posted.
+#[tokio::test]
+async fn a_move_whose_window_cannot_be_established_posts_nothing() {
+    let rig = granted_rig().await;
+    rig.desk.state().topmost_window = None;
+    let reply = serve(
+        &rig,
+        "computer.takeover_move",
+        json!({"image_id": rig.image_id, "to": {"x": 10, "y": 20}}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(rig.dispatched().is_empty());
+    assert!(rig.posts().is_empty());
 }
 
 /// A drag that starts and ends in one application presses, moves and

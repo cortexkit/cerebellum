@@ -388,6 +388,21 @@ pub trait AppStateSource: Send + Sync {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 
+    /// The window-server number of the window `element` sits in, the same
+    /// number an image's capture names its window by. `None` when it cannot
+    /// be positively established, which a caller must treat as "not the
+    /// window it expected", never as a match.
+    fn element_window_number(&self, _element: &ElementHandle) -> Option<u32> {
+        None
+    }
+
+    /// The window-server number of the topmost on-screen window at a desktop
+    /// point: the window a real pointer event there would reach. `None` when
+    /// it cannot be established.
+    fn topmost_window_at(&self, _point: (f64, f64)) -> Option<u32> {
+        None
+    }
+
     /// The target application's own focused element, asked of that
     /// application rather than of whichever one is frontmost.
     fn focused_element(

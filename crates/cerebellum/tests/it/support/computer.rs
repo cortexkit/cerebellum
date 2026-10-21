@@ -698,6 +698,14 @@ pub struct DeskState {
     /// of `system_wide_hit` there. How a test puts two applications under
     /// the two ends of one drag.
     pub system_wide_hits_at: Vec<((f64, f64), DeskHit)>,
+    /// The window-server number of the window each element sits in. An
+    /// element missing here is one whose window cannot be established.
+    pub element_windows: std::collections::HashMap<u64, u32>,
+    /// The topmost on-screen window at any point, unless
+    /// `topmost_windows_at` names another one there; `None` when the window
+    /// list does not settle it.
+    pub topmost_window: Option<u32>,
+    pub topmost_windows_at: Vec<((f64, f64), u32)>,
     pub presses: Vec<u64>,
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,
@@ -745,6 +753,9 @@ impl Desk {
             application_hit: None,
             system_wide_hit: None,
             system_wide_hits_at: Vec::new(),
+            element_windows: std::collections::HashMap::new(),
+            topmost_window: None,
+            topmost_windows_at: Vec::new(),
             presses: Vec::new(),
             writes: Vec::new(),
             hit_scopes: Vec::new(),
@@ -951,6 +962,21 @@ impl AppStateSource for Desk {
                 .or(state.system_wide_hit),
         };
         Ok(hit.map(|(token, pid)| (fixture_handle(token), pid)))
+    }
+
+    fn element_window_number(&self, element: &ElementHandle) -> Option<u32> {
+        let token = token_of(element)?;
+        self.state().element_windows.get(&token).copied()
+    }
+
+    fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        let state = self.state();
+        state
+            .topmost_windows_at
+            .iter()
+            .find(|(at, _)| (at.0 - point.0).abs() < 0.5 && (at.1 - point.1).abs() < 0.5)
+            .map(|(_, window)| *window)
+            .or(state.topmost_window)
     }
 
     fn focused_element(

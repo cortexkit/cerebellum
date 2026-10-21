@@ -1332,17 +1332,25 @@ where
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
                 }
-                let image_id = sessions.register_image(
-                    &conversation_key,
-                    RegisteredImage {
-                        bundle_identity: grant.bundle_identity.clone(),
-                        pid: grant.pid,
-                        process_generation: grant.process_generation_evidence.clone(),
-                        width_px: image.width_px,
-                        height_px: image.height_px,
-                        mapping: image.mapping,
-                    },
-                );
+                let registered = RegisteredImage {
+                    bundle_identity: grant.bundle_identity.clone(),
+                    pid: grant.pid,
+                    process_generation: grant.process_generation_evidence.clone(),
+                    width_px: image.width_px,
+                    height_px: image.height_px,
+                    mapping: image.mapping,
+                };
+                // The captured window is remembered with the image, so a
+                // coordinate action can refuse a point that lands in another
+                // window. A window id that is not a window-server number is
+                // not remembered, and such an image refuses every coordinate
+                // action rather than acting on an unconfirmed window.
+                let image_id = match image.window_id.parse::<u32>() {
+                    Ok(window_number) if window_number != 0 => {
+                        sessions.register_window_image(&conversation_key, registered, window_number)
+                    }
+                    _ => sessions.register_image(&conversation_key, registered),
+                };
                 reply["image"] = json!({
                     "image_id": image_id,
                     "mime": "image/jpeg",
