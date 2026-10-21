@@ -95,7 +95,8 @@ mod probe {
     use cerebellum::browser_session::{
         BrowserClickOutcome, BrowserInputEvent, BrowserSessionLauncher, CleanupStage,
         ClickDriveError, LaunchedBrowser, NavigationDriveError, NavigationWait,
-        OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
+        OwnedBrowserProcess, ProcessControlFailure, ProcessControlStep, SessionCleanup,
+        SessionCleanupOutcome,
     };
     use cerebellum::browser_type::{BrowserTypeResult, TypeDispatch};
     use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
@@ -555,9 +556,9 @@ mod probe {
         }
         fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
             if let Some(child) = self.child.take() {
-                child
-                    .terminate_and_reap()
-                    .map_err(|_| ProcessControlFailure)?;
+                child.terminate_and_reap().map_err(|_| {
+                    ProcessControlFailure::new(ProcessControlStep::GracefulCloseRequest)
+                })?;
             }
             Ok(())
         }
