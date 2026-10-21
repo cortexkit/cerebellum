@@ -6005,9 +6005,12 @@ mod tests {
     /// One session is stuck inside a browser call, holding the registry-wide
     /// lock; another is idle but its browser never exits, under a configured
     /// grace of an hour (60 HANG_GUARDs). Shutdown must still release custody
-    /// for both inside the budget: the stuck browser is killed out of band once
-    /// the in-flight wait is over, and the idle one's graceful wait is cut to
-    /// what the budget has left before the cleanup reserve.
+    /// for both long before that grace could end: the test allows only one hang
+    /// guard, a sixtieth of it. The stuck browser is killed out of band once the
+    /// in-flight wait is over, and the idle one's graceful wait is cut to what
+    /// the budget has left before the cleanup reserve; that the cut lands exactly
+    /// at the budget is checked on its own, on a fixed clock, by
+    /// `shutdown_plan_caps_grace_at_the_exact_budget_boundary`.
     #[test]
     fn a_stuck_call_and_a_huge_grace_still_release_custody_within_the_budget() {
         let budget = ShutdownBudget {
