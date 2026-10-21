@@ -634,6 +634,41 @@ async fn a_move_whose_window_cannot_be_established_posts_nothing() {
     assert!(rig.posts().is_empty());
 }
 
+/// An image registered without the window it shows names no window to
+/// compare with. Where the window list cannot say what is on top either, the
+/// two unknowns are not a match: the move is refused and nothing is posted.
+#[tokio::test]
+async fn a_move_on_an_image_registered_without_its_window_posts_nothing() {
+    let rig = granted_rig().await;
+    rig.desk.state().topmost_window = None;
+    let image_id = rig.management.app_state_sessions().register_image(
+        &identity().conversation_key,
+        RegisteredImage {
+            bundle_identity: TARGET_BUNDLE_ID.to_string(),
+            pid: grant().pid,
+            process_generation: grant().process_generation_evidence,
+            width_px: 1000,
+            height_px: 600,
+            mapping: ImageMapping::for_window(
+                (100.0, 50.0),
+                (1000.0, 600.0),
+                (1000, 600),
+                (1000, 600),
+            )
+            .expect("a whole-window mapping"),
+        },
+    );
+    let reply = serve(
+        &rig,
+        "computer.takeover_move",
+        json!({"image_id": image_id, "to": {"x": 10, "y": 20}}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(rig.dispatched().is_empty());
+    assert!(rig.posts().is_empty());
+}
+
 /// A drag that starts and ends in one application presses, moves and
 /// releases there.
 #[tokio::test]
