@@ -5247,7 +5247,9 @@ mod tests {
     }
 
     #[test]
-    fn teardown_all_finishes_n_sessions_in_about_one_grace_period() {
+    fn teardown_all_starts_every_grace_wait_before_releasing_any() {
+        // A wall-clock elapsed-time assertion is sensitive to host load. Hold
+        // each fake process at graceful wait and prove every session reaches it before release.
         const SESSION_COUNT: usize = 6;
         const GRACE_PERIOD_MS: u64 = 100;
 
@@ -6002,10 +6004,10 @@ mod tests {
 
     /// One session is stuck inside a browser call, holding the registry-wide
     /// lock; another is idle but its browser never exits, under a configured
-    /// grace of an hour. Shutdown must still release custody for both inside
-    /// the budget: the stuck browser is killed out of band once the in-flight
-    /// wait is over, and the idle one's graceful wait is cut to what the budget
-    /// has left before the cleanup reserve.
+    /// grace of an hour (60 HANG_GUARDs). Shutdown must still release custody
+    /// for both inside the budget: the stuck browser is killed out of band once
+    /// the in-flight wait is over, and the idle one's graceful wait is cut to
+    /// what the budget has left before the cleanup reserve.
     #[test]
     fn a_stuck_call_and_a_huge_grace_still_release_custody_within_the_budget() {
         let budget = ShutdownBudget {
@@ -6969,6 +6971,8 @@ mod tests {
             let (session, call_gate, call) =
                 stuck_call_on(&sessions, "stuck", &clock, killer, Gate::opened());
             let budget = short_budget();
+            // The 600s fake grace is ten HANG_GUARDs; waiting for it cannot
+            // masquerade as a successful custody-handoff outcome.
             let mut long_grace = config();
             long_grace.termination_grace_period_ms = 600_000;
             let sessions_for_shutdown = sessions.clone();
@@ -7035,6 +7039,8 @@ mod tests {
             });
         clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
         let mut huge_grace = config();
+        // The 600s fake grace is ten HANG_GUARDs; the test checks that shutdown
+        // cuts and joins it, not that host scheduling meets a short duration.
         huge_grace.termination_grace_period_ms = 600_000;
         let expiring = sessions.clone();
         let expiry = in_thread(move || expiring.expire_idle("route", &clock, &huge_grace));
@@ -7111,6 +7117,8 @@ mod tests {
     fn shutdown_leaves_custody_held_when_after_reap_overruns_the_budget() {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
+        // Gate cleanup to make custody ordering observable instead of comparing
+        // elapsed time with the shutdown budget on a loaded host.
         let cleanup_gate = Arc::new(Gate::default());
         let session = establish_test_browser(
             &sessions,

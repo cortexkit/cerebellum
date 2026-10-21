@@ -8,7 +8,7 @@ use cerebellum::cingulate_client::ScriptedAnswer;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
-use crate::support::HANG_GUARD;
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 const GRANTEE: &str = "pj-example";
 
 /// A carrier whose answers the test scripts.
@@ -173,8 +173,9 @@ impl ScriptedCarrier {
     /// Wrap the next recorded service question in a synthetic frame for
     /// inspection. Nothing is sent back to the calling agent; that caller's
     /// ordinary replies are read from its own writer separately.
-    /// Use wall time in tests so paused Tokio clocks cannot consume the guard
-    /// while this helper waits for a scripted Cingulate card.
+    /// Use wall time so paused Tokio clocks cannot consume this guard.
+    /// Integration and library targets compile this helper from different
+    /// support modules, so its wait bound mirrors the shared 60s guard.
     pub async fn card(&self, channel: u16, epoch: u32) -> subc_protocol::Frame {
         #[cfg(test)]
         let end = std::time::Instant::now() + HANG_GUARD;

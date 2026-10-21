@@ -1306,6 +1306,9 @@ mod tests {
             release: std::sync::Mutex::new(Some(release_rx)),
             finished: std::sync::Mutex::new(Some(finished_tx)),
         });
+        // A wall-clock speed assertion would fail under load. The read stays
+        // blocked here, so event ordering proves scheduling and runtime work
+        // continue without comparing real elapsed time with READ_BUDGET.
         let scheduling_cursor = cursor.clone();
         let runtime = tokio::runtime::Handle::current();
         let scheduling = tokio::task::spawn_blocking(move || {
@@ -1782,7 +1785,7 @@ mod tests {
     async fn next_line(receiver: &mut mpsc::Receiver<CursorLine>) -> CursorLine {
         tokio::time::timeout(HANG_GUARD, receiver.recv())
             .await
-            .expect("a line within a second")
+            .expect("a cursor line before HANG_GUARD")
             .unwrap()
     }
 
@@ -1935,9 +1938,9 @@ mod tests {
     }
 
     /// Wait, in real time, until `done` holds: a read runs on a plain thread
-    /// that tokio's clock knows nothing of.
+    /// that tokio's clock knows nothing of. The deadline only detects a stuck read.
     fn until_read(done: impl Fn() -> bool) {
-        let give_up = Instant::now() + Duration::from_secs(10);
+        let give_up = Instant::now() + HANG_GUARD;
         while !done() {
             assert!(Instant::now() < give_up, "the read never finished");
             std::thread::sleep(Duration::from_millis(1));
@@ -1968,8 +1971,8 @@ mod tests {
     async fn pictures_never_read_reduce_motion_themselves() {
         let (cursor, mut receiver) = Coordinator::channel();
         let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        // The read is held until the test lets it finish (or two seconds
-        // pass, so a read made where it must not be cannot hang the test).
+        // The read remains parked until the test releases it; the shared guard
+        // only prevents a broken test from leaving the reader thread stuck.
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = std::sync::Mutex::new(released);
         let recorded = reads.clone();
@@ -1979,10 +1982,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(thread.name().unwrap_or_default().to_owned());
-            let _ = released
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(2));
+            let _ = released.lock().unwrap().recv_timeout(HANG_GUARD);
             true
         });
         let geometry = FollowGeometry::new();

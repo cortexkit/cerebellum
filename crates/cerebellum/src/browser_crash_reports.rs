@@ -440,7 +440,7 @@ mod macos {
 
             /// A query that never answers.
             pub(crate) fn silent() -> Self {
-                Self::new("exec /bin/sleep 30")
+                Self::new("exec /bin/sleep 600")
             }
         }
 
@@ -525,6 +525,8 @@ mod macos {
 
         #[test]
         fn a_backup_check_that_does_not_answer_in_time_is_refused_at_its_deadline() {
+            // The fake query sleeps 600s (10x HANG_GUARD), so a disabled
+            // 200ms production deadline cannot pass by waiting for its natural exit.
             let parent = TestParent::new("silent");
             let path = parent.0.clone();
             let query = ScriptedQuery::silent();

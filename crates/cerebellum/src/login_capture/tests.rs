@@ -497,7 +497,9 @@ fn run_bounded_deadline_expires_at_its_exact_boundary() {
     ));
 }
 
-/// The bound on a tool call holds even when the tool never answers.
+/// The bound on a tool call holds even when the tool never answers. The fake
+/// child sleeps ten `HANG_GUARD`s, so a missing 100ms tool deadline cannot be
+/// confused with the child finishing on its own.
 #[cfg(unix)]
 #[test]
 fn a_tool_that_never_answers_times_out() {
@@ -505,7 +507,7 @@ fn a_tool_that_never_answers_times_out() {
     std::thread::spawn(move || {
         let result = run_bounded(
             Path::new("/bin/sleep"),
-            &["5".as_ref()],
+            &["600".as_ref()],
             Duration::from_millis(100),
         );
         let _ = reply.send(result);

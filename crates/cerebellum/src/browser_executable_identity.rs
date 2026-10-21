@@ -434,8 +434,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_verifier_that_never_answers_times_out_rather_than_hanging() {
-        // A fake verifier that outlives any sane deadline. The test checks the
-        // timeout outcome and uses HANG_GUARD only to catch a wait that never ends.
+        // A fake verifier sleeps600s (ten HANG_GUARDs), so its natural exit
+        // cannot conceal a missing verifier deadline; the test guard only
+        // catches a wait that never ends.
         let verifier = crate::content_named_fixture::content_named_fixture(
             "slow-verifier",
             "codesign",

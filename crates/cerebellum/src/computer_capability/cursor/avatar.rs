@@ -683,6 +683,8 @@ mod tests {
 
     #[tokio::test]
     async fn hanging_or_failed_avatar_fetch_never_delays_the_action_or_plain_badge() {
+        // Prove ordering while the optional fetch is unresolved instead of
+        // asserting a wall-clock latency that can vary with host load.
         for fail in [false, true] {
             let avatars = source(None, fail);
             let mut events = scheduled(avatars.clone()).await;

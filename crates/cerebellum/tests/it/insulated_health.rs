@@ -384,6 +384,8 @@ fn blocked_dispatch_future_does_not_block_health_check() {
         std::thread::yield_now();
     }
 
+    // Avoid a host-load latency claim: health must answer while dispatch stays
+    // parked, which proves it does not wait for that operation.
     let mut clock2 = clock.clone();
     clock2.advance(Duration::from_millis(100));
     let report = health_check_with_hang_guard(state, clock2);
@@ -466,6 +468,8 @@ fn absent_browser_gauges_do_not_delay_or_alter_health() {
         browser_process_alive: None,
     };
 
+    // The contract is independence from these absent gauges, not a wall-clock
+    // completion threshold; assert the outcome and unchanged health status.
     let report = health_check_with_hang_guard(state, clock2)
         .expect("health check did not return with browser gauges absent");
     assert_eq!(report.status, HealthStatus::Ok);
