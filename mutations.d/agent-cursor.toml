@@ -41,9 +41,9 @@ build_timeout_s = 1800
 [[control]]
 id = "agent-cursor-badge-stays-while-its-agent-acts"
 guards = "a resting agent cursor badge stays at full opacity while its agent works, for minutes without an event, instead of greying out after 30 s in the middle of a turn"
-file = "crates/cerebellum-macos/src/cursor_schedule.rs"
-old = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(2 * 60);"
-new = "pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(30); // NON-VACUITY BREAK"
+file = "crates/cerebellum-computer/src/cursor_timeline.rs"
+old = "pub const IDLE_FADE_AFTER_MS: u64 = 2 * 60 * 1000;"
+new = "pub const IDLE_FADE_AFTER_MS: u64 = 30 * 1000; // NON-VACUITY BREAK"
 edits = []
 test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
 runner = "cargo"
@@ -181,8 +181,8 @@ build_timeout_s = 1800
 id = "agent-cursor-entry-is-a-plain-fade-under-reduce-motion"
 guards = "with Reduce Motion on, the agent cursor's entry only fades the resting badge in, with no scaling or travel"
 file = "crates/cerebellum-macos/src/cursor_schedule.rs"
-old = "    if reduce_motion {\n        return Some(EntryFrame {"
-new = "    if false && reduce_motion { // NON-VACUITY BREAK\n        return Some(EntryFrame {"
+old = "    if shape.fade_only {\n        return Some(EntryFrame {"
+new = "    if false && shape.fade_only { // NON-VACUITY BREAK\n        return Some(EntryFrame {"
 edits = []
 test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
 runner = "cargo"
