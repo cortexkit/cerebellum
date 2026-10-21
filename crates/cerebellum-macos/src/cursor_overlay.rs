@@ -103,7 +103,8 @@ pub struct OverlayAccent {
 /// picture to take off the screen now because that agent is done, or the
 /// window under one agent's picture having moved.
 pub enum OverlayMessage {
-    Show(OverlayEvent),
+    /// Boxed: a picture is far larger than the other messages.
+    Show(Box<OverlayEvent>),
     Hide {
         agent: String,
     },
@@ -1151,7 +1152,7 @@ fn run_cursor_loop(
                             pictures
                                 .picture_for_event(event.agent.clone(), now, || Picture::new(mtm))
                         {
-                            picture.update(mtm, event, now);
+                            picture.update(mtm, *event, now);
                         }
                     }
                     Err(TryRecvError::Disconnected) => return None,
@@ -1328,7 +1329,7 @@ pub fn probe_cursor_motion(
     // the glide at the length the supplied curve gives for that distance.
     let glide_ms = (motion.duration_ms)((to[0] - from[0]).hypot(to[1] - from[1]), false);
     let event = move |serial: u64, at: [f64; 2]| {
-        OverlayMessage::Show(OverlayEvent {
+        OverlayMessage::Show(Box::new(OverlayEvent {
             agent: PROBE_AGENT.into(),
             initial: 'P',
             accent: PROBE_ACCENT,
@@ -1350,7 +1351,7 @@ pub fn probe_cursor_motion(
                 },
                 reduce_motion: false,
             },
-        })
+        }))
     };
     let start = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);

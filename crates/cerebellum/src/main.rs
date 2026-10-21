@@ -101,36 +101,38 @@ fn agent_cursor() {
                         accent,
                         pill: pill_colour(accent),
                     };
-                    cerebellum_macos::OverlayMessage::Show(cerebellum_macos::OverlayEvent {
-                        accent: cerebellum_macos::OverlayAccent {
-                            light: pair(colours.light),
-                            dark: pair(colours.dark),
+                    cerebellum_macos::OverlayMessage::Show(Box::new(
+                        cerebellum_macos::OverlayEvent {
+                            accent: cerebellum_macos::OverlayAccent {
+                                light: pair(colours.light),
+                                dark: pair(colours.dark),
+                            },
+                            accent_known: event.avatar_tint.is_some(),
+                            agent: event.agent,
+                            initial: event.initial,
+                            to: event.to,
+                            target: event.target,
+                            resting: event.resting,
+                            label: event.label,
+                            gesture: match event.kind {
+                                CursorKind::Press => cerebellum_macos::OverlayGesture::Press,
+                                CursorKind::Write | CursorKind::Type | CursorKind::Keys => {
+                                    cerebellum_macos::OverlayGesture::Type
+                                }
+                                CursorKind::Reading => cerebellum_macos::OverlayGesture::Read,
+                            },
+                            serial: event.serial,
+                            avatar_rgba: event.avatar_rgba,
+                            avatar_update: event.avatar_update,
+                            // The module's chosen motion, passed through as it is.
+                            motion: cerebellum_macos::PictureTiming {
+                                entry: event.motion.style
+                                    == cerebellum_computer::cursor::MotionStyle::Entry,
+                                duration_ms: event.motion.duration_ms,
+                                reduce_motion: event.motion.reduce_motion,
+                            },
                         },
-                        accent_known: event.avatar_tint.is_some(),
-                        agent: event.agent,
-                        initial: event.initial,
-                        to: event.to,
-                        target: event.target,
-                        resting: event.resting,
-                        label: event.label,
-                        gesture: match event.kind {
-                            CursorKind::Press => cerebellum_macos::OverlayGesture::Press,
-                            CursorKind::Write | CursorKind::Type | CursorKind::Keys => {
-                                cerebellum_macos::OverlayGesture::Type
-                            }
-                            CursorKind::Reading => cerebellum_macos::OverlayGesture::Read,
-                        },
-                        serial: event.serial,
-                        avatar_rgba: event.avatar_rgba,
-                        avatar_update: event.avatar_update,
-                        // The module's chosen motion, passed through as it is.
-                        motion: cerebellum_macos::PictureTiming {
-                            entry: event.motion.style
-                                == cerebellum_computer::cursor::MotionStyle::Entry,
-                            duration_ms: event.motion.duration_ms,
-                            reduce_motion: event.motion.reduce_motion,
-                        },
-                    })
+                    ))
                 }
             };
             let _ = sender.try_send(message);
