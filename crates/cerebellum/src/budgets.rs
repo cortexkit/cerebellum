@@ -1039,7 +1039,7 @@ mod tests {
         // The wait never changes the computer reply bound: open_app's launch
         // still dominates the work every computer action can take.
         assert_eq!(COMPUTER_MAX_WORK_MS, COMPUTER_OPEN_APP.work_ms);
-        assert!(COMPUTER_PRESS_ELEMENT.work_ms < COMPUTER_MAX_WORK_MS);
+        const { assert!(COMPUTER_PRESS_ELEMENT.work_ms < COMPUTER_MAX_WORK_MS) };
     }
 
     #[test]

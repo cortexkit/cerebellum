@@ -693,9 +693,31 @@ pub enum DeskFocus {
     Element(u64),
 }
 
+/// Something a test runs at one moment of the desk's work, such as ending
+/// the agent's badge while its geometry is read or as a press arrives.
+#[derive(Clone)]
+pub struct DeskHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for DeskHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeskHook")
+    }
+}
+
 #[derive(Debug)]
 pub struct DeskState {
     pub cursor_frame: Option<[f64; 4]>,
+    /// Frames for particular elements, which take the place of
+    /// `cursor_frame` for them, so each element's badge aims somewhere of
+    /// its own.
+    pub cursor_frames: std::collections::HashMap<u64, [f64; 4]>,
+    /// Run once, on the next read of an element's frame for the badge.
+    pub on_cursor_frame: Option<DeskHook>,
+    /// Run once, as the next press reaches the desk, after it is recorded.
+    pub on_press: Option<DeskHook>,
+    /// When each press and write reached the desk, on tokio's clock, so a
+    /// test on a paused clock can tell exactly when an action was sent.
+    pub dispatched_at: Vec<tokio::time::Instant>,
     pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
     /// Swapped in for `roots` by the first press or write, so the diff that
@@ -760,6 +782,10 @@ impl Desk {
     pub fn new(roots: Vec<RawElement>) -> Self {
         Self(Arc::new(Mutex::new(DeskState {
             cursor_frame: None,
+            cursor_frames: std::collections::HashMap::new(),
+            on_cursor_frame: None,
+            on_press: None,
+            dispatched_at: Vec::new(),
             cursor_visible: false,
             roots,
             after_action: None,
@@ -851,8 +877,18 @@ fn utf16_byte_offset(text: &str, utf16: usize) -> usize {
 }
 
 impl AppStateSource for Desk {
-    fn cursor_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
-        self.state().cursor_frame
+    fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+        let (frame, hook) = {
+            let mut state = self.state();
+            let frame = token_of(element)
+                .and_then(|token| state.cursor_frames.get(&token).copied())
+                .or(state.cursor_frame);
+            (frame, state.on_cursor_frame.take())
+        };
+        if let Some(DeskHook(hook)) = hook {
+            hook();
+        }
+        frame
     }
 
     fn visible_cursor_point(
@@ -897,13 +933,20 @@ impl AppStateSource for Desk {
 
     fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
         let token = token_of(element).ok_or(ElementActionError::Gone)?;
-        let mut state = self.state();
-        state.presses.push(token);
-        if let Some(after) = state.after_action.take() {
-            state.roots = after;
-        }
-        if let Some(focus) = state.focus_after_action.take() {
-            state.focus = focus;
+        let hook = {
+            let mut state = self.state();
+            state.presses.push(token);
+            state.dispatched_at.push(tokio::time::Instant::now());
+            if let Some(after) = state.after_action.take() {
+                state.roots = after;
+            }
+            if let Some(focus) = state.focus_after_action.take() {
+                state.focus = focus;
+            }
+            state.on_press.take()
+        };
+        if let Some(DeskHook(hook)) = hook {
+            hook();
         }
         Ok(())
     }
@@ -943,6 +986,7 @@ impl AppStateSource for Desk {
         let token = token_of(element).ok_or(ElementActionError::Gone)?;
         let mut state = self.state();
         state.writes.push((token, attribute));
+        state.dispatched_at.push(tokio::time::Instant::now());
         if let Some(after) = state.after_action.take() {
             state.roots = after;
         }

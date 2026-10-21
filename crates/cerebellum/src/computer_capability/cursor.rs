@@ -898,8 +898,8 @@ pub(crate) enum Landing {
     Arrived { drawn: bool },
     /// The call was cancelled while it waited.
     Cancelled,
-    /// The agent's badge was ended (its turn ended, its route closed) after
-    /// this action scheduled its picture: the agent is done with the
+    /// The agent's badge was ended (its turn ended, its route closed) while
+    /// it travelled to this action's target: the agent is done with the
     /// computer, so the action is not sent.
     Ended,
     /// The call's work deadline passed, or its dispatch gate closed.
@@ -968,9 +968,6 @@ impl Arrival {
         };
         let mut landing = None;
         loop {
-            if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
-                return Landing::Ended;
-            }
             if stopped() {
                 return Landing::Stopped;
             }
@@ -981,8 +978,18 @@ impl Arrival {
                 match landing {
                     // A stopped helper draws nothing more: nothing to wait for.
                     Some(at) if !self.watch.as_ref().is_some_and(BadgeWatch::helper_stopped) => {
+                        // The badge is on its way. Ended meanwhile, it is gone
+                        // from the screen and the agent is done: stop now
+                        // rather than wait out a glide nobody sees.
+                        if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
+                            return Landing::Ended;
+                        }
                         std::cmp::min(at, cap)
                     }
+                    // No picture was drawn, so there is nothing to wait for.
+                    // An end that landed while the geometry read ran is what
+                    // dropped the picture; the dispatch gate refuses that
+                    // action when it would be sent (see `BadgeWatch::ended`).
                     _ => return Landing::Arrived { drawn },
                 }
             };
@@ -1003,6 +1010,20 @@ impl Arrival {
                 }
                 () = tokio::time::sleep_until(wake) => {}
             }
+        }
+    }
+}
+
+impl Arrival {
+    /// A picture already decided on, whose badge lands at `at`.
+    #[cfg(test)]
+    pub(crate) fn landing_at(at: tokio::time::Instant) -> Self {
+        let (decided, decision) = oneshot::channel();
+        let _ = decided.send(Some(at));
+        Self {
+            decision: Some(decision),
+            scheduled: tokio::time::Instant::now(),
+            watch: None,
         }
     }
 }
@@ -1162,6 +1183,40 @@ mod tests {
                 .is_err(),
             "late geometry must not reach the helper"
         );
+    }
+
+    /// No action waits past the cap after its picture was scheduled: not
+    /// for a landing named far in the future, and not for a decision that
+    /// never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_badge_wait_never_runs_past_its_cap() {
+        let far = tokio::time::Instant::now() + Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let landing = Arrival::landing_at(far)
+            .wait(
+                far + Duration::from_secs(10),
+                std::future::pending(),
+                || false,
+            )
+            .await;
+        assert_eq!(landing, Landing::Arrived { drawn: true });
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
+
+        let (_undecided, decision) = oneshot::channel();
+        let start = tokio::time::Instant::now();
+        let landing = Arrival {
+            decision: Some(decision),
+            scheduled: start,
+            watch: None,
+        }
+        .wait(
+            start + Duration::from_secs(10),
+            std::future::pending(),
+            || false,
+        )
+        .await;
+        assert_eq!(landing, Landing::Arrived { drawn: false });
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
     }
 
     const SESSION: &str = "0123456789abcdef0123456789abcdef";

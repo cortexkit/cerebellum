@@ -88,9 +88,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
     probe_cursor_hide, probe_cursor_motion, reduce_motion, render_cursor_gallery_png,
-    run_agent_cursor,
-    CursorMotion, GalleryShot, HideProbe, MotionProbe, OverlayAccent, OverlayColours, OverlayEvent,
-    OverlayGesture, OverlayMessage, ProbePass, AVATAR_PIXELS,
+    run_agent_cursor, CursorMotion, GalleryShot, HideProbe, MotionProbe, OverlayAccent,
+    OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, ProbePass, AVATAR_PIXELS,
 };
 #[cfg(target_os = "macos")]
 mod peer_attestation;

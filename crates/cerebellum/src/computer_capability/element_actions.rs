@@ -107,6 +107,22 @@ pub(crate) fn cancelled_before_dispatch_reply() -> Value {
     })
 }
 
+/// Wait for the badge an action scheduled, within the call's work budget.
+/// `Ok` says whether a badge was drawn; `Err` is the before-dispatch reply
+/// for a call cancelled, stopped or out of time while it waited.
+async fn badge_landing(arrival: Arrival, cancel: &CancelHandle) -> Result<bool, Value> {
+    let work = super::quarantine::CallWork::current();
+    let deadline = tokio::time::Instant::from_std(work.deadline());
+    match arrival
+        .wait(deadline, cancel.cancelled(), || work.stopped())
+        .await
+    {
+        Landing::Arrived { drawn } => Ok(drawn),
+        Landing::Cancelled | Landing::Ended => Err(cancelled_before_dispatch_reply()),
+        Landing::Stopped => Err(super::quarantine::stopped_before_dispatch_reply()),
+    }
+}
+
 /// The call's dispatch gate for an action that showed a badge. It also
 /// refuses once that badge was ended after the action scheduled it (the
 /// agent's turn ended, or its route closed): the check is made at the moment
@@ -1667,24 +1683,15 @@ where
         conversation_key: &str,
         grant: &ProcessGrant,
     ) -> Result<(), Value> {
-        let work = super::quarantine::CallWork::current();
-        let deadline = tokio::time::Instant::from_std(work.deadline());
-        match arrival
-            .wait(deadline, cancel.cancelled(), || work.stopped())
+        if !badge_landing(arrival, cancel).await? {
+            return Ok(());
+        }
+        match self
+            .refuse_if_person_changed(management, conversation_key, grant)
             .await
         {
-            Landing::Arrived { drawn: false } => Ok(()),
-            Landing::Arrived { drawn: true } => {
-                match self
-                    .refuse_if_person_changed(management, conversation_key, grant)
-                    .await
-                {
-                    Some(refusal) => Err(refusal),
-                    None => Ok(()),
-                }
-            }
-            Landing::Cancelled | Landing::Ended => Err(cancelled_before_dispatch_reply()),
-            Landing::Stopped => Err(super::quarantine::stopped_before_dispatch_reply()),
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
         }
     }
 
@@ -1784,10 +1791,19 @@ where
         // the press's own journal row.
         let (element_id, handle, point, reads) = match target {
             PressTarget::Element { element_id, handle } => (element_id, handle, None, None),
-            PressTarget::Point { point, window_number, application_name } => {
+            PressTarget::Point {
+                point,
+                window_number,
+                application_name,
+            } => {
                 let mut audit = AuditToken::new(self.audit.clone(), work.gate());
-                let (source, sessions, grant, identity, work) =
-                    (source.clone(), sessions.clone(), grant.clone(), identity.clone(), work.clone());
+                let (source, sessions, grant, identity, work) = (
+                    source.clone(),
+                    sessions.clone(),
+                    grant.clone(),
+                    identity.clone(),
+                    work.clone(),
+                );
                 let found = tokio::task::spawn_blocking(move || {
                     let _ax = work.bound_ax();
                     let _scope = AccessibilityReadScope::new(grant.pid, None);
@@ -1868,7 +1884,8 @@ where
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
-            let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
+            let mut reply =
+                press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if gate.refused_for_end() {
                 reply = cancelled_before_dispatch_reply();
             }
@@ -1879,7 +1896,11 @@ where
                     &identity.conversation_key,
                     &grant,
                     settle,
-                    sessions.zoom_expands_menus(&identity.conversation_key, &grant, view.zoom.as_deref()),
+                    sessions.zoom_expands_menus(
+                        &identity.conversation_key,
+                        &grant,
+                        view.zoom.as_deref(),
+                    ),
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
@@ -1911,6 +1932,53 @@ mod tests {
             Some("hEYo")
         );
         assert_eq!(expected_after_insert("hi", (1, 5), "X"), None);
+    }
+
+    /// A call whose work deadline passes, or whose dispatch gate closes (its
+    /// route envelope ran out), while its badge is still on the way is not
+    /// sent: the reply is the usual before-dispatch deadline one, never an
+    /// unknown outcome.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_during_the_badge_wait_replies_before_dispatch() {
+        use super::super::quarantine::CallWork;
+        let before_dispatch = json!({
+            "outcome": "action_deadline_exceeded",
+            "detail": {"dispatched": false, "step": "dispatch"},
+        });
+        let landing = || Arrival::landing_at(tokio::time::Instant::now() + Duration::from_secs(1));
+
+        // The call's work budget ends 100 ms in; the badge lands at 1 s.
+        let work = CallWork::new(None, Duration::from_millis(100), None, None);
+        let start = tokio::time::Instant::now();
+        let reply = work
+            .scope(badge_landing(landing(), &CancelHandle::pending()))
+            .await
+            .expect_err("a call out of time is not sent");
+        assert_eq!(reply, before_dispatch);
+        assert!(tokio::time::Instant::now() - start < Duration::from_secs(1));
+
+        // The route's envelope runs out at 200 ms and closes the gate.
+        let request = subc_protocol::Frame::build_with_version(
+            crate::PROTOCOL_VERSION,
+            subc_protocol::FrameType::Request,
+            crate::control_flags(),
+            1,
+            1,
+            1,
+            serde_json::to_vec(&json!({"name": "computer_use"})).unwrap(),
+        )
+        .unwrap();
+        let terminal = Arc::new(crate::TerminalArbiter::new(request));
+        let work = CallWork::new(Some(terminal.clone()), Duration::from_secs(60), None, None);
+        let cancel = CancelHandle::pending();
+        let (reply, ()) = tokio::join!(work.scope(badge_landing(landing(), &cancel)), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            terminal.stop(crate::TerminalCause::Deadline);
+        });
+        assert_eq!(
+            reply.expect_err("a stopped call is not sent"),
+            before_dispatch
+        );
     }
 
     #[test]
