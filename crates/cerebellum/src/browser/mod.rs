@@ -5027,7 +5027,7 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
     };
     let cleanup_detail = closed_object(
         json!({
-            "step": enum_schema(&["graceful_close_request", "wait_for_exit", "forced_termination", "reap_wait"]),
+            "step": enum_schema(&["graceful_close_request", "wait_for_exit", "forced_termination", "generation_unverified", "reap_wait"]),
             "error_kind": string_schema(),
         }),
         &["step"],

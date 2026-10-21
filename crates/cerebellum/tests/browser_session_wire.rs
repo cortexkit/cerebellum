@@ -2016,6 +2016,22 @@ async fn wire_launch_withholds_undeclared_launcher_reply_at_the_dispatch_site() 
 }
 
 #[test]
+fn generation_unverified_cleanup_detail_passes_the_closed_wire_schema() {
+    for capability_id in ["browser.launch", "browser.status", "browser.close"] {
+        let mut reply = json!({
+            "outcome": "cleanup_failure", "browser_session_id": "session",
+            "stage": "reap", "detail": {"step": "generation_unverified"},
+        });
+        cerebellum::browser::validate_browser_result(capability_id, &reply).unwrap();
+
+        reply["detail"]["unexpected"] = json!(true);
+        assert!(cerebellum::browser::validate_browser_result(capability_id, &reply).is_err());
+        reply["detail"] = json!({"step": "unknown_step"});
+        assert!(cerebellum::browser::validate_browser_result(capability_id, &reply).is_err());
+    }
+}
+
+#[test]
 fn browser_control_outcome_vocabularies_reject_undeclared_words() {
     for capability_id in ["browser.launch", "browser.status", "browser.close"] {
         let error = cerebellum::browser::validate_browser_result(
