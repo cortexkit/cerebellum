@@ -68,11 +68,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long a test waits for a call to reply, end, or reach a step before it
 /// fails as hung. It is a hang detector, not a timing claim: these calls take
-/// about 2 s alone, but the whole library suite runs over a thousand tests at
-/// once, often on a heavily loaded Mac, and a 5 s bound failed one of them
-/// there with nothing wrong. The tests that do assert timing run on a paused
-/// clock. A call that would otherwise sit out the in-call consent wait
-/// (120 s) still fails this bound.
+/// about 2 s alone, but the library suite runs its tests concurrently, often on
+/// a heavily loaded Mac, and a 5 s bound failed one of them there with nothing
+/// wrong. The tests that do assert timing run on a paused clock. A call that
+/// would otherwise sit out the in-call consent wait (120 s) still fails this
+/// bound.
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
