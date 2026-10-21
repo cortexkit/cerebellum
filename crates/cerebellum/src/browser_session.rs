@@ -4887,6 +4887,46 @@ mod tests {
         .expect("shutdown must finish without dropping an unverified child");
     }
 
+    #[test]
+    fn registry_teardown_after_shutdown_skips_busy_recovery_never_drops_unverified_process() {
+        in_thread(|| {
+            let (events, weak_recovery) = {
+                let session = UnverifiedSession::new();
+                assert_eq!(session.close()["outcome"], "cleanup_failure");
+                let recovery = {
+                    let registry = recovered(session.sessions.registry());
+                    Arc::clone(
+                        registry.routes["route"].retained[0]
+                            .reap_recovery
+                            .as_ref()
+                            .unwrap(),
+                    )
+                };
+                let weak_recovery = Arc::downgrade(&recovery);
+                {
+                    // A retry holding this lock makes shutdown skip the retained
+                    // handle rather than wait for the retry to finish.
+                    let pending = recovery.state.lock().unwrap();
+                    assert!(pending.process.is_some());
+                    let report = session
+                        .sessions
+                        .teardown_all_within(&config(), short_budget());
+                    assert_eq!(report.teardowns_running, 0);
+                    assert!(pending.process.is_some());
+                    assert_eq!(*session.events.lock().unwrap(), ["graceful"]);
+                }
+                // No strong recovery reference escapes the session owner's scope,
+                // so registry destruction must destroy the recovery without running
+                // the unverified child's destructor.
+                (Arc::clone(&session.events), weak_recovery)
+            };
+            assert!(weak_recovery.upgrade().is_none());
+            assert_eq!(*events.lock().unwrap(), ["graceful"]);
+        })
+        .recv_timeout(Duration::from_secs(2))
+        .expect("registry teardown must not drop an unverified process");
+    }
+
     struct PausingClock {
         now: MonoInstant,
         paused: std::sync::atomic::AtomicBool,
