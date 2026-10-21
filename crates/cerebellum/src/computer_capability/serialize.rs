@@ -1306,6 +1306,8 @@ mod tests {
                 selected: false,
                 enabled: true,
                 focused: false,
+                main_window: false,
+                focused_window: false,
                 expanded: None,
                 menu_visible: false,
                 closed_menu_children: 0,

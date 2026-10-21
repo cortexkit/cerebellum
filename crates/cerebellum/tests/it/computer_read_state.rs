@@ -341,6 +341,128 @@ async fn read_state_serves_the_tree_and_passes_withholding() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+/// The words every background-app sentence carries.
+const BACKGROUND_SENTENCE: &str = "is in the background, so none of its windows has keyboard focus";
+
+/// A compose window whose Send button the application reports disabled, the
+/// way a background app's window buttons read, next to an enabled button.
+fn compose_window_with_disabled_send() -> RawElement {
+    let mut send = RawElement::fixture(2, "AXButton").titled("Send");
+    send.enabled = false;
+    RawElement::fixture(1, "AXWindow")
+        .titled("New Message")
+        .with_children(vec![
+            send,
+            RawElement::fixture(3, "AXButton").titled("Attach"),
+        ])
+}
+
+/// Reads of `desk`'s application under `arguments`, with `frontmost` as the
+/// frontmost application, returning the state text.
+async fn read_text(
+    desk: &support::computer::Desk,
+    plane: &Plane,
+    management: &Arc<ManagementPlane>,
+    frontmost: Option<u32>,
+    arguments: Value,
+) -> String {
+    desk.state().frontmost = frontmost;
+    let reply = serve(
+        plane,
+        management,
+        "conversation-1",
+        no_relay(),
+        arguments,
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    reply["state_text"].as_str().unwrap().to_string()
+}
+
+/// A background application whose reply shows nothing disabled gets no
+/// background sentence: here neither a tree with no disabled element nor a
+/// filtered read that leaves its disabled element out, since the sentence
+/// would explain nothing the caller sees.
+#[tokio::test]
+async fn a_background_read_showing_nothing_disabled_has_no_background_sentence() {
+    let background = Some(grant().pid + 1);
+    let management = granted_management().await;
+
+    let chat = support::computer::Desk::new(vec![chat_window()]);
+    let chat_plane = plane(chat.source());
+    let text = read_text(
+        &chat,
+        &chat_plane,
+        &management,
+        background,
+        json!({"target": TARGET_BUNDLE_ID}),
+    )
+    .await;
+    assert!(!text.contains(BACKGROUND_SENTENCE), "{text}");
+    assert!(chat_plane.result_schema_findings().is_empty());
+
+    let compose = support::computer::Desk::new(vec![compose_window_with_disabled_send()]);
+    let compose_plane = plane(compose.source());
+    let text = read_text(
+        &compose,
+        &compose_plane,
+        &management,
+        background,
+        json!({"target": TARGET_BUNDLE_ID, "text_filter": "Attach"}),
+    )
+    .await;
+    // The filter kept the enabled button and left the disabled one out.
+    line_with(&text, "button Attach");
+    assert!(!text.contains("(disabled)"), "{text}");
+    assert!(!text.contains(BACKGROUND_SENTENCE), "{text}");
+    assert!(compose_plane.result_schema_findings().is_empty());
+}
+
+/// A background application whose reply shows a disabled element says once,
+/// in plain words, why its window buttons can read as disabled. A frontmost
+/// application gets no such sentence, and neither does one whose frontmost
+/// state cannot be read, since that would be a guess.
+#[tokio::test]
+async fn a_background_read_showing_a_disabled_element_says_why() {
+    let desk = support::computer::Desk::new(vec![compose_window_with_disabled_send()]);
+    let plane = plane(desk.source());
+    let management = granted_management().await;
+    for (frontmost, sentences) in [
+        (Some(grant().pid + 1), 1),
+        (Some(grant().pid), 0),
+        (None, 0),
+    ] {
+        let text = read_text(
+            &desk,
+            &plane,
+            &management,
+            frontmost,
+            json!({"target": TARGET_BUNDLE_ID}),
+        )
+        .await;
+        line_with(&text, "button (disabled) Send");
+        assert_eq!(
+            text.matches(BACKGROUND_SENTENCE).count(),
+            sentences,
+            "frontmost {frontmost:?}:\n{text}"
+        );
+        if sentences == 1 {
+            // The fixture management plane knows the application only by
+            // its bundle identity, so that is the name the sentence uses.
+            assert_eq!(
+                line_with(&text, BACKGROUND_SENTENCE),
+                format!(
+                    "{TARGET_BUNDLE_ID} is in the background, so none of its windows has \
+                     keyboard focus; buttons that act on a window, such as Send or Save, can \
+                     read as disabled until {TARGET_BUNDLE_ID} is the active app."
+                )
+            );
+        }
+    }
+    assert!(plane.result_schema_findings().is_empty());
+}
+
 /// Filters narrow the reply and keep the ancestor path; a zoom id this
 /// session does not hold is refused as stale.
 #[tokio::test]

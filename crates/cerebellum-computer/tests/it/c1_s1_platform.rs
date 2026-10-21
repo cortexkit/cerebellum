@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v26.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v27.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -771,7 +771,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v24_from_v23(&generated, historical_revision(24).as_str().unwrap());
     let generated =
         vocabulary_mint::v25_from_v24(&generated, historical_revision(25).as_str().unwrap());
-    let generated = vocabulary_mint::v26_from_v25(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v26_from_v25(&generated, historical_revision(26).as_str().unwrap());
+    let generated = vocabulary_mint::v27_from_v26(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1549,13 +1551,13 @@ fn v25_only_adds_partial_name_matching_and_the_list_filter_to_the_recreated_v24(
     );
 }
 
-/// The shipped artifact with v26's additions taken back out: the
+/// v26 with its additions taken back out: the
 /// `point_in_another_window` outcome of each image-coordinate row and the
 /// sentence that describes it. Each removal asserts what it removes was
 /// there, so a v26 that stopped adding either is caught here as well as by
 /// the digest.
 fn recreated_v25() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v26();
     vocabulary["revision"] = historical_revision(25);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
@@ -1583,5 +1585,43 @@ fn v26_only_adds_the_imaged_window_refusal_to_the_recreated_v25() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v25()).unwrap()),
         "db496b3e5f4e63096677239c1342a18b4e64034ad3046de657daeddcd799bbe6"
+    );
+}
+
+/// The shipped artifact with v27's additions taken back out: the
+/// `element_disabled` outcome of each press row and the sentence that
+/// describes it. Each removal asserts what it removes was there, so a v27
+/// that stopped adding either is caught here as well as by the digest.
+fn recreated_v26() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(26);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if !vocabulary_mint::PRESS_ROW_IDS.contains(&capability.as_str()) {
+            continue;
+        }
+        let outcome = &mut row["result_schema"]["properties"]["outcome"];
+        assert_eq!(
+            outcome["enum"].as_array_mut().unwrap().pop().unwrap(),
+            "element_disabled"
+        );
+        let description = outcome["description"].as_str().unwrap();
+        let previous = description
+            .strip_suffix(vocabulary_mint::ELEMENT_DISABLED_DESCRIPTION)
+            .and_then(|rest| rest.strip_suffix(' '))
+            .unwrap_or_else(|| panic!("{capability} does not describe element_disabled"))
+            .to_string();
+        outcome["description"] = json!(previous);
+    }
+    vocabulary
+}
+
+/// The recreated v26 is byte for byte the v26 that shipped: its digest is
+/// the one v26's mirrors and source lock carried.
+#[test]
+fn v27_only_adds_the_disabled_element_refusal_to_the_recreated_v26() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v26()).unwrap()),
+        "a683d08ade5a013b162db22dfa2d7f2244e6a6f95fce4f3fb5381ac4e20490b6"
     );
 }

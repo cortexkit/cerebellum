@@ -235,7 +235,13 @@ pub fn describe(element: &RawElement) -> ElementDescription {
     if !element.enabled {
         markers.push("disabled");
     }
-    if element.focused {
+    // A window is `main` or `focused` only when the application positively
+    // said so. An application that is not the active one has neither, which
+    // is why its window-scoped buttons can read as disabled.
+    if element.main_window {
+        markers.push("main");
+    }
+    if element.focused || element.focused_window {
         markers.push("focused");
     }
     if element.expanded == Some(true) {
@@ -864,6 +870,8 @@ struct Emitter {
     omitted: usize,
     labels_truncated: bool,
     capped: bool,
+    /// Whether an element line that made it into `text` is marked disabled.
+    disabled_shown: bool,
 }
 
 impl Emitter {
@@ -874,6 +882,7 @@ impl Emitter {
             omitted: 0,
             labels_truncated: false,
             capped: false,
+            disabled_shown: false,
         }
     }
 
@@ -901,7 +910,13 @@ impl Emitter {
         }
         if self.push(depth, &text) {
             self.labels_truncated |= truncated;
+            self.note_shown(view);
         }
+    }
+
+    /// Remember that a line just pushed for `view` showed it disabled.
+    fn note_shown(&mut self, view: &View<'_>) {
+        self.disabled_shown |= view.node.description.markers.contains(&"disabled");
     }
 }
 
@@ -995,6 +1010,7 @@ fn emit_region(view: &View<'_>, depth: usize, out: &mut Emitter) {
     let (text, truncated) = view.line();
     if out.push(depth, &format!("{text}  [{}]", region_summary(view))) {
         out.labels_truncated |= truncated;
+        out.note_shown(view);
     }
 }
 
@@ -1130,6 +1146,10 @@ pub struct RenderedState {
     pub truncation: Option<Truncation>,
     /// Whether the element or menu bar `zoom` named was in the read.
     pub zoom_found: bool,
+    /// Whether at least one element line in `text` is marked disabled. An
+    /// element left out by a filter, a zoom, a summary or the byte bound
+    /// does not count.
+    pub shows_disabled: bool,
 }
 
 fn role_matches(description: &ElementDescription, roles: &[String]) -> bool {
@@ -1422,6 +1442,7 @@ pub fn render_state_bounded(
         text: out.text,
         truncation,
         zoom_found,
+        shows_disabled: out.disabled_shown,
     }
 }
 

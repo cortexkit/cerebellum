@@ -30,6 +30,7 @@ const AX_VALUE_ERROR_TYPE: u32 = 5;
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: c_int) -> CfTypeRef;
+    fn AXUIElementGetPid(element: CfTypeRef, pid: *mut c_int) -> i32;
     fn AXUIElementGetTypeID() -> usize;
     fn AXUIElementSetMessagingTimeout(element: CfTypeRef, timeout: f32) -> i32;
     fn AXUIElementCopyAttributeValue(
@@ -124,6 +125,13 @@ pub struct AxStateElement {
     pub selected: bool,
     pub enabled: bool,
     pub focused: bool,
+    /// Whether this window reports `AXMain`, or the application names it as
+    /// its `AXMainWindow`. Read only for top-level windows; `false` when
+    /// neither could be read.
+    pub main: bool,
+    /// Whether the application names this window as its `AXFocusedWindow`.
+    /// Read only for top-level windows; `false` when that could not be read.
+    pub focused_window: bool,
     pub expanded: Option<bool>,
     pub menu_visible: bool,
     pub closed_menu_children: usize,
@@ -386,6 +394,8 @@ impl Reader {
             selected: bool_at(6).unwrap_or(false),
             enabled: bool_at(7).unwrap_or(true),
             focused: bool_at(8).unwrap_or(false),
+            main: false,
+            focused_window: false,
             expanded: bool_at(9),
             menu_visible: bool_at(12).unwrap_or(false) || selected_menu,
             closed_menu_children: 0,
@@ -464,6 +474,42 @@ fn copy_attribute(
         Ok(unsafe { owned(value) })
     } else {
         Err(code)
+    }
+}
+
+/// Mark which top-level windows are the application's main window and its
+/// focused window.
+///
+/// A window counts as main when it reports `AXMain` or when the application
+/// names it as its `AXMainWindow`, and as focused when the application names
+/// it as its `AXFocusedWindow`. Only a positive answer marks a window: an
+/// attribute that cannot be read marks nothing. With no `application`, as
+/// when one retained element is read alone, only the window's own `AXMain`
+/// is asked. These are reads; no window is raised or focused.
+fn mark_windows(roots: &mut [AxStateElement], application: Option<&AxRetainedElement>) {
+    let named_window = |name: &'static str| {
+        application
+            .and_then(|application| copy_attribute(application, name).ok().flatten())
+            .filter(|value| is_ax_element(value))
+            .map(AxRetainedElement)
+    };
+    let main_window = named_window("AXMainWindow");
+    let focused_window = named_window("AXFocusedWindow");
+    for root in roots
+        .iter_mut()
+        .filter(|root| root.role.as_deref() == Some("AXWindow"))
+    {
+        let reports_main = copy_attribute(&root.element, "AXMain")
+            .ok()
+            .flatten()
+            .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool));
+        root.main = reports_main == Some(true)
+            || main_window
+                .as_ref()
+                .is_some_and(|window| window.same_element(&root.element));
+        root.focused_window = focused_window
+            .as_ref()
+            .is_some_and(|window| window.same_element(&root.element));
     }
 }
 
@@ -595,12 +641,36 @@ pub fn read_app_state_with_menus(
             ElementRead::Unreadable => reader.unreadable += 1,
         }
     }
+    mark_windows(&mut roots, Some(&application));
     Ok(AxAppState {
         roots,
         focused,
         unreadable_subtrees: reader.unreadable,
         bound_reached: reader.bound_reached,
     })
+}
+
+/// The application element of the process that owns `element`, with its
+/// messages bounded like a read's. `None` when the owner cannot be read.
+fn application_of(element: &AxRetainedElement, timeout: Duration) -> Option<AxRetainedElement> {
+    let mut pid: c_int = 0;
+    // SAFETY: the element is retained for the call; `pid` is writable storage.
+    let code = unsafe { AXUIElementGetPid(element.as_ptr(), &mut pid) };
+    if code != AX_ERROR_SUCCESS || pid <= 0 {
+        return None;
+    }
+    // SAFETY: creates an application element for a pid passed by value; it
+    // returns one owned reference or null.
+    let application = unsafe { owned(AXUIElementCreateApplication(pid)) }.map(AxRetainedElement)?;
+    // SAFETY: the timeout applies to this element's messages and changes
+    // nothing in the target.
+    unsafe {
+        AXUIElementSetMessagingTimeout(
+            application.as_ptr(),
+            crate::ax_budget::messaging_timeout(timeout).as_secs_f32(),
+        )
+    };
+    Some(application)
 }
 
 /// Read only one retained element and its descendants, within one bounded traversal.
@@ -633,7 +703,7 @@ pub fn read_element_state(
         bound_reached: false,
     };
     reader.first_visit(element);
-    let roots = if reader.visited >= reader.max_elements {
+    let mut roots = if reader.visited >= reader.max_elements {
         reader.bound_reached = true;
         Vec::new()
     } else {
@@ -646,6 +716,15 @@ pub fn read_element_state(
             }
         }
     };
+    // A zoomed window is marked against its own application, so the same
+    // window does not read as focused in an outline and unfocused in a zoom.
+    // Only a window root needs the application; any other zoom asks nothing.
+    let application = roots
+        .iter()
+        .any(|root| root.role.as_deref() == Some("AXWindow"))
+        .then(|| application_of(element, bounds.timeout))
+        .flatten();
+    mark_windows(&mut roots, application.as_ref());
     Ok(AxAppState {
         roots,
         focused: None,

@@ -86,6 +86,8 @@ fn convert(element: AxStateElement) -> RawElement {
         selected: element.selected,
         enabled: element.enabled,
         focused: element.focused,
+        main_window: element.main,
+        focused_window: element.focused_window,
         expanded: element.expanded,
         menu_visible: element.menu_visible,
         closed_menu_children: element.closed_menu_children,
@@ -264,6 +266,10 @@ impl AppStateSource for MacAppStateSource {
             value_settable: facts.value_settable,
             selected_text_settable: facts.selected_text_settable,
         })
+    }
+
+    fn element_enabled(&self, element: &ElementHandle) -> Option<bool> {
+        cerebellum_macos::element_enabled(retained(element).ok()?)
     }
 
     fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {

@@ -649,7 +649,7 @@ use cerebellum_computer::app_state::source::{
 };
 
 /// One element's behaviour on the desk.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeskElement {
     pub facts: ElementFacts,
     pub value: Option<String>,
@@ -661,6 +661,24 @@ pub struct DeskElement {
     /// Whether a write changes `value`. An application that accepts a write
     /// and keeps its old value is how a read-back mismatch is produced.
     pub applies_writes: bool,
+    /// The element's live `AXEnabled` as the desk reports it at press time;
+    /// `None` is an attribute that cannot be read. Enabled unless a test says
+    /// otherwise, so the unreadable case is exercised only where a test asks
+    /// for it.
+    pub enabled: Option<bool>,
+}
+
+impl Default for DeskElement {
+    fn default() -> Self {
+        Self {
+            facts: ElementFacts::default(),
+            value: None,
+            selection: None,
+            readbacks: std::collections::VecDeque::new(),
+            applies_writes: false,
+            enabled: Some(true),
+        }
+    }
 }
 
 /// What a hit test finds: an element token and the pid that owns it.
@@ -870,6 +888,11 @@ impl AppStateSource for Desk {
             .get(&token)
             .map(|element| element.facts.clone())
             .ok_or(ElementActionError::Gone)
+    }
+
+    fn element_enabled(&self, element: &ElementHandle) -> Option<bool> {
+        let token = token_of(element)?;
+        self.state().elements.get(&token)?.enabled
     }
 
     fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {

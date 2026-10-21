@@ -268,6 +268,38 @@ fn markers_appear_in_fixed_order_and_only_when_true() {
     }
 }
 
+/// A window is marked `main` or `focused` only where the application said so,
+/// inside the usual parenthesised states. A window whose `AXMain`,
+/// `AXMainWindow` and `AXFocusedWindow` could not be read reaches the
+/// renderer with both flags false, and gets no marker.
+#[test]
+fn windows_are_marked_main_and_focused_only_when_the_application_says_so() {
+    let mut inbox = RawElement::fixture(1, "AXWindow").titled("Inbox");
+    inbox.main_window = true;
+    let mut compose = RawElement::fixture(2, "AXWindow").titled("New Message");
+    compose.focused_window = true;
+    let mut both = RawElement::fixture(3, "AXWindow").titled("Drafts");
+    both.main_window = true;
+    both.focused_window = true;
+    // A window that reports `AXFocused` and is the focused window is still
+    // marked focused once.
+    both.focused = true;
+    let unread = RawElement::fixture(4, "AXWindow").titled("Outbox");
+    let sessions = AppStateSessions::new();
+    let observed = read(&sessions, &state(vec![inbox, compose, both, unread]));
+    let tree = tree_of(&observed);
+    let id = |needle| id_of(&observed, needle);
+    assert_eq!(
+        tree.lines().collect::<Vec<_>>(),
+        vec![
+            format!("{} window (main) Inbox", id("Inbox")),
+            format!("{} window (focused) New Message", id("New Message")),
+            format!("{} window (main, focused) Drafts", id("Drafts")),
+            format!("{} window Outbox", id("Outbox")),
+        ]
+    );
+}
+
 /// A checkbox's number is a state, shown as a state; a slider's is a
 /// quantity, shown as a value. Either way, toggling it is a change.
 #[test]
