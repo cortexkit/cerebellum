@@ -584,9 +584,10 @@ async fn an_id_from_an_ended_process_generation_is_stale() {
     assert!(desk.state().presses.is_empty());
 }
 
-/// The application reports the button disabled at press time, as a
-/// background app's window buttons are: nothing is pressed, the reply says
-/// so by name, and the refusal is journaled before anything is sent.
+/// The application reports the button disabled at press time: nothing is
+/// pressed, the reply says so by name, and the refusal is journaled before
+/// anything is sent. The application is frontmost, so the remedy does not
+/// blame its being in the background.
 #[tokio::test]
 async fn a_disabled_element_is_not_pressed() {
     let desk = desk();
@@ -610,8 +611,8 @@ async fn a_disabled_element_is_not_pressed() {
     assert_eq!(reply["outcome"], "element_disabled", "{reply}");
     assert_eq!(
         reply["remedy"],
-        "Send is disabled, so pressing it would do nothing. A background app's window buttons \
-         can stay disabled until the app is active. Read the app again after its state changes.",
+        "Send is disabled, so pressing it would do nothing. Read the app again after its state \
+         changes.",
         "{reply}"
     );
     assert!(desk.state().presses.is_empty());
@@ -621,6 +622,39 @@ async fn a_disabled_element_is_not_pressed() {
         1,
         "the refusal has its own journal row"
     );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// The same refusal for an application that is not frontmost says why a
+/// background app's window buttons stay disabled.
+#[tokio::test]
+async fn a_background_app_s_disabled_press_says_why_it_stays_disabled() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        let send = state.elements.get_mut(&10).unwrap();
+        send.enabled = Some(false);
+        send.facts.title = Some("Send".into());
+        state.frontmost = Some(grant().pid + 1);
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": id_of(&tree, " button Send")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    assert_eq!(
+        reply["remedy"],
+        "Send is disabled, so pressing it would do nothing. A background app's window buttons \
+         can stay disabled until the app is active. Read the app again after its state changes.",
+        "{reply}"
+    );
+    assert!(desk.state().presses.is_empty());
     assert!(plane.result_schema_findings().is_empty());
 }
 

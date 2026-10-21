@@ -1263,12 +1263,16 @@ where
         );
         // An application that is not the active one has no key window and no
         // main window, so controls that act on a window find no target and
-        // read as disabled. Said once, from the same frontmost reading the
-        // keystroke rows use; when that reading fails, nothing is said.
-        if let Some(sentence) =
-            background_app_sentence(&app_name, self.app_state_source.frontmost_pid(), &grant)
-        {
-            rendered.text.push_str(&sentence);
+        // read as disabled. Said once, and only when this reply shows a
+        // disabled element, since otherwise the sentence explains nothing
+        // the caller sees. It uses the same frontmost reading the keystroke
+        // rows use; when that reading fails, nothing is said.
+        if rendered.shows_disabled {
+            if let Some(sentence) =
+                background_app_sentence(&app_name, self.app_state_source.frontmost_pid(), &grant)
+            {
+                rendered.text.push_str(&sentence);
+            }
         }
         if unpopulated > 0 {
             rendered.text.push_str("Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n");
@@ -2558,7 +2562,8 @@ fn stale_zoom_reply() -> Value {
 /// the frontmost one: an inactive application has no key window and no main
 /// window, so its window-scoped buttons can read as disabled. `None` when the
 /// application is frontmost or the frontmost application could not be read,
-/// since a guess would mislead either way.
+/// since a guess would mislead either way. The caller adds it only to a reply
+/// that shows a disabled element.
 fn background_app_sentence(
     app_name: &str,
     frontmost_pid: Option<u32>,

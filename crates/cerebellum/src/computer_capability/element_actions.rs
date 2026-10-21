@@ -148,8 +148,14 @@ const DISABLED_LABEL_CHARS: usize = 60;
 
 /// The refusal for a press on an element the application reports disabled.
 /// Nothing was sent. The element is named by its title when it has one, made
-/// one line and cut short, and otherwise by its id.
-pub(crate) fn element_disabled_reply(title: Option<&str>, element_id: &str) -> Value {
+/// one line and cut short, and otherwise by its id. `background` says the
+/// application is known not to be frontmost; only then does the remedy say
+/// that an inactive application's window buttons can stay disabled.
+pub(crate) fn element_disabled_reply(
+    title: Option<&str>,
+    element_id: &str,
+    background: bool,
+) -> Value {
     let title = title
         .map(cerebellum_computer::app_state::render::one_line)
         .filter(|title| !title.is_empty());
@@ -161,12 +167,16 @@ pub(crate) fn element_disabled_reply(title: Option<&str>, element_id: &str) -> V
         Some(title) => title,
         None => format!("Element {element_id}"),
     };
+    let background = if background {
+        " A background app's window buttons can stay disabled until the app is active."
+    } else {
+        ""
+    };
     json!({
         "outcome": "element_disabled",
         "remedy": format!(
-            "{label} is disabled, so pressing it would do nothing. A background app's window \
-             buttons can stay disabled until the app is active. Read the app again after its \
-             state changes."
+            "{label} is disabled, so pressing it would do nothing.{background} Read the app \
+             again after its state changes."
         ),
     })
 }
@@ -689,7 +699,10 @@ where
         if journal.refused(&role, "element_disabled").is_err() {
             return audit_unavailable_reply(false);
         }
-        return element_disabled_reply(facts.title.as_deref(), element_id);
+        let background = source
+            .frontmost_pid()
+            .is_some_and(|frontmost| frontmost != grant.pid);
+        return element_disabled_reply(facts.title.as_deref(), element_id, background);
     }
     let token = match journal.intent(grant, element_id, "AXPress", &role) {
         Ok(token) => token,
