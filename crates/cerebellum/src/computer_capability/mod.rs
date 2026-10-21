@@ -29,7 +29,7 @@ use cerebellum_computer::app_state::session::{ElementResolution, RegisteredImage
 use cerebellum_computer::app_state::source::RunningApp;
 use cerebellum_computer::app_state::source::{
     AppStateReadError, AppStateSource, ElementActionError, ElementHandle, ElementReadError,
-    RawAppState, ReadBounds,
+    RawAppState, ReadBounds, RereadTiming,
 };
 use cerebellum_computer::app_state::AuditImageCustody;
 use cerebellum_computer::audit::{
@@ -1109,7 +1109,35 @@ where
                 } else {
                     source.read_app_state(&read_grant, ReadBounds::default())
                 };
-                raw.map_err(StateReadFailure::Application)
+                raw.map(|mut raw| {
+                    // A window that shows only its own buttons is usually a
+                    // WebKit page still being built: wait once and read that
+                    // window again. The wait is skipped when it would run past
+                    // the call's work deadline; the re-reads together are held
+                    // to the tree read's allowance and to that deadline.
+                    raw.reread_shell_windows(
+                        source.as_ref(),
+                        &read_grant,
+                        RereadTiming {
+                            phase: std::time::Duration::from_millis(
+                                crate::budgets::AX_TREE_PHASE_MS,
+                            ),
+                            now: &std::time::Instant::now,
+                            call_end: read_work.deadline(),
+                        },
+                        |delay| {
+                            if read_work.stopped()
+                                || std::time::Instant::now() + delay >= read_work.deadline()
+                            {
+                                return false;
+                            }
+                            std::thread::sleep(delay);
+                            !read_work.stopped()
+                        },
+                    );
+                    raw
+                })
+                .map_err(StateReadFailure::Application)
             };
             Some((
                 raw,
