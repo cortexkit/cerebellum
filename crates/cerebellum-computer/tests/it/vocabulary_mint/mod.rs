@@ -2131,11 +2131,13 @@ pub const POINT_IN_ANOTHER_WINDOW_DESCRIPTION: &str = "point_in_another_window m
 /// An image-coordinate action lands only in the window the image shows.
 ///
 /// The image's pixels map onto the desktop, and at that desktop point there
-/// may be another window: a second window of the same application, which an
-/// application-scoped hit test still finds, or any window on top, which a
-/// real pointer event reaches. Each image-coordinate row now refuses with
-/// `point_in_another_window` when the point lands anywhere but the captured
-/// window, or when that cannot be confirmed, and says so in its outcome
+/// may be another window. `press_point` hit-tests the image's application, so
+/// it can find an element in a second window of that application; it now
+/// refuses with `point_in_another_window` unless the element it found is
+/// positively in the captured window. `takeover_move` and `takeover_drag`
+/// move the real pointer, which reaches whatever window is on top; they now
+/// refuse with the same outcome unless the topmost window at every point is
+/// confirmed to be the captured one. Each row says so in its outcome
 /// description. No request field changes, so the advertised tool does not.
 pub fn v26_from_v25(previous: &Value, revision: &str) -> Value {
     let mut next = previous.clone();
