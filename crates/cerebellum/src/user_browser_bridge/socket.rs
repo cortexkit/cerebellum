@@ -247,8 +247,9 @@ async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier:
                 return write_end_reason(&error);
             }
         }
-        // The queue only closes once the connection was already taken, so
-        // this reason is never the one recorded.
+        // `outgoing` ends only after `disconnect` has removed this connection
+        // from the bridge, and `disconnect` records the end with its own reason
+        // first, so this value is never the one recorded.
         DisconnectReason::PeerClosed
     };
     tokio::select! {

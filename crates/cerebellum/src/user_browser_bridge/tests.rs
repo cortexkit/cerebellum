@@ -740,7 +740,8 @@ fn every_disconnect_reason_has_its_own_word() {
 }
 
 /// A production bridge records into the process gauges the health reply
-/// reads. Other tests' bridges also connect, so only growth is asserted.
+/// reads. Other bridges in this process share those gauges, so the test checks
+/// that the connection count grew and that a disconnect was recorded.
 #[tokio::test]
 async fn the_module_health_reply_carries_the_production_bridge_history() {
     let read = || {

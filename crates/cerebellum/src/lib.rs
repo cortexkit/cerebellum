@@ -8173,9 +8173,10 @@ fn record_turn_ended_received(at_ms: u64) {
 }
 
 /// Process-lifetime history of the Chrome extension's native-host connection:
-/// when it last connected and disconnected, and why it last ended. The
-/// extension returns every claimed tab to the person whenever this connection
-/// drops, so health is where that drop can be seen.
+/// when it last connected and disconnected, and why it last ended. A drop of
+/// this connection normally makes the extension release the tabs agents had
+/// claimed and hand them back to the person, so health is where that drop can
+/// be timed.
 static USER_BROWSER_CONNECTION_GAUGES: user_browser_bridge::ConnectionGauges =
     user_browser_bridge::ConnectionGauges::new();
 
