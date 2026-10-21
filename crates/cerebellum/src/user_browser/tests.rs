@@ -66,6 +66,15 @@ use crate::cingulate_client::{Reply, ScriptedCingulate};
 use crate::user_browser_bridge::{Message, MessageBody};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// How long a test waits for a call to reply, end, or reach a step before it
+/// fails as hung. It is a hang detector, not a timing claim: these calls take
+/// about 2 s alone, but the whole library suite runs over a thousand tests at
+/// once, often on a heavily loaded Mac, and a 5 s bound failed one of them
+/// there with nothing wrong. The tests that do assert timing run on a paused
+/// clock. A call that would otherwise sit out the in-call consent wait
+/// (120 s) still fails this bound.
+const HANG_GUARD: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct DoubleTab {
     owner: Option<Route>,
@@ -558,7 +567,7 @@ impl Fixture {
     /// The reply to a started call. Nothing but the reply may reach the
     /// call's route: no consent question travels back along it.
     async fn finish(&self, mut started: Started) -> Value {
-        let frame = tokio::time::timeout(Duration::from_secs(5), started.replies.recv())
+        let frame = tokio::time::timeout(HANG_GUARD, started.replies.recv())
             .await
             .expect("bounded tool invocation")
             .expect("tool response");
@@ -2455,7 +2464,7 @@ async fn authority_changing_severity_is_never_grantable_in_the_user_browser() {
 
 /// Wait until `check` holds, for a test that acts while a call is held.
 async fn until(mut check: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !check() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2568,7 +2577,7 @@ async fn cancel_route_close_and_drain_withdraw_a_held_site_card() {
             }
             None => {
                 let mut started = started;
-                tokio::time::timeout(Duration::from_secs(5), &mut started.task)
+                tokio::time::timeout(HANG_GUARD, &mut started.task)
                     .await
                     .expect("the call ends when its route closes")
                     .unwrap();
@@ -2617,9 +2626,9 @@ async fn turn_stop_cancel_user_browser_site_card_has_no_retry_advice() {
     crate::handle_frame_for_test(cancel.clone(), &writer, &fixture.planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, replies.recv())
         .await
-        .expect("cancelled user-browser card answers promptly")
+        .expect("cancelled user-browser card answers without waiting out the card")
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&reply.body).unwrap(),
