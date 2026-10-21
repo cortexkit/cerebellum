@@ -358,6 +358,7 @@ pub enum ProcessControlStep {
     GracefulCloseRequest,
     WaitForExit,
     ForcedTermination,
+    GenerationUnverified,
     ReapWait,
 }
 
@@ -367,6 +368,7 @@ impl ProcessControlStep {
             Self::GracefulCloseRequest => "graceful_close_request",
             Self::WaitForExit => "wait_for_exit",
             Self::ForcedTermination => "forced_termination",
+            Self::GenerationUnverified => "generation_unverified",
             Self::ReapWait => "reap_wait",
         }
     }
@@ -1539,7 +1541,19 @@ struct ReapRecovery {
 
 struct ReapRecoveryState {
     cleanup: Box<dyn SessionCleanup>,
+    process: Option<Box<dyn OwnedBrowserProcess>>,
     outcome: Option<SessionCleanupOutcome>,
+}
+
+impl Drop for ReapRecoveryState {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            // An unreaped handle can signal and block in its destructor. Without
+            // exit proofs, leave the child for OS adoption when the parent process
+            // exits, and the unsettled journal for generation-checked startup recovery.
+            std::mem::forget(process);
+        }
+    }
 }
 
 impl SessionRecord {
@@ -2279,6 +2293,17 @@ impl BrowserSessions {
                     pending.cleanup.prove_profile_unused().map_err(|remedy| refusal(
                         CleanupStage::Reap, format!("{remedy}; then retry browser.close for this session or browser.launch")
                     ))?;
+                    if let Some(process) = pending.process.as_mut() {
+                        process.wait_until_reaped().map_err(|failure| {
+                            let mut reply = refusal(
+                                CleanupStage::Reap,
+                                "the proven-exited browser could not be reaped; retry browser.close or browser.launch".into(),
+                            );
+                            reply["detail"] = failure.detail();
+                            reply
+                        })?;
+                        pending.process.take();
+                    }
                     pending
                         .cleanup
                         .set_terminal_outcome(BrowserSessionTerminalOutcome::Closed);
@@ -3439,7 +3464,39 @@ impl BrowserSessions {
             }
             report.operations_running += meta.pending_operations;
         }
+        self.release_retained_processes();
         report
+    }
+
+    fn release_retained_processes(&self) {
+        let recoveries: Vec<_> = recovered(self.registry())
+            .routes
+            .values()
+            .flat_map(|slot| {
+                slot.retained
+                    .iter()
+                    .filter_map(|record| record.reap_recovery.clone())
+            })
+            .collect();
+        for recovery in recoveries {
+            // A retry may already own this handle. Do not wait for it to release
+            // the handle during shutdown; the recovery state's destructor also
+            // avoids reaping without proof of exit.
+            let Ok(mut pending) = recovery.state.try_lock() else {
+                continue;
+            };
+            let Some(mut process) = pending.process.take() else {
+                continue;
+            };
+            if pending.cleanup.prove_profile_unused().is_ok() && process.wait_until_reaped().is_ok()
+            {
+                drop(process);
+            } else {
+                // Dropping an unverified child would signal or wait without a
+                // deadline. Startup recovery still owns its unsettled journal.
+                std::mem::forget(process);
+            }
+        }
     }
 
     /// Tear one session down inside the shutdown plan.
@@ -3746,6 +3803,9 @@ impl BrowserSessions {
         outcome: Result<SessionCleanupOutcome, CleanupStage>,
         process_control_failure: Option<ProcessControlFailure>,
     ) {
+        let retain_process = process_control_failure
+            .is_some_and(|failure| failure.step == ProcessControlStep::GenerationUnverified);
+        let mut process = Some(process);
         // The retained record is built before the registry lock is taken.
         let mut record = recovered(cell.meta()).record(&cell.browser_session_id);
         match outcome {
@@ -3767,6 +3827,7 @@ impl BrowserSessions {
                             durable_project,
                             state: Mutex::new(ReapRecoveryState {
                                 cleanup,
+                                process: if retain_process { process.take() } else { None },
                                 outcome: None,
                             }),
                         })
@@ -3808,11 +3869,20 @@ impl BrowserSessions {
         };
         cell.notify();
         self.registry.1.notify_all();
-        // Dropped only now, with every lock released: a process handle that
-        // was never reaped kills and waits for its child when dropped.
+        // Release remaining ownership only after every lock is released. An
+        // unverified child stays in recovery because its destructor can kill and
+        // wait; all other process handles keep their normal destructor cleanup.
         drop(removed);
         drop(cleanup);
-        drop(process);
+        if retain_process {
+            // If cleanup ownership was missing, there is no recovery state to
+            // retain the child. Its destructor is still unsafe without exit proof.
+            if let Some(process) = process {
+                std::mem::forget(process);
+            }
+        } else {
+            drop(process);
+        }
     }
 
     /// Finish a teardown whose terminal outcome is already set.
@@ -3990,6 +4060,13 @@ fn teardown_process_with_grace(
         // been recycled since the initial exit observation or graceful wait.
         if process.generation_matches() {
             process.force_terminate()?;
+        } else if !process.generation_gone() {
+            // A process whose generation cannot be read may still be running.
+            // Without proof of its identity or exit, neither signaling the process
+            // nor blocking in reap is safe.
+            return Err(ProcessControlFailure::new(
+                ProcessControlStep::GenerationUnverified,
+            ));
         }
     }
     process.wait_until_reaped()
@@ -4103,6 +4180,7 @@ mod tests {
         graceful_failure: bool,
         wait_failure: bool,
         unreadable: bool,
+        gone_after_request: bool,
     }
 
     impl OwnedBrowserProcess for FaultyCloseProcess {
@@ -4111,7 +4189,7 @@ mod tests {
         }
 
         fn generation_gone(&self) -> bool {
-            false
+            self.inner.checks > 0 && self.gone_after_request
         }
 
         fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
@@ -4503,17 +4581,34 @@ mod tests {
                     graceful_failure,
                     wait_failure,
                     unreadable,
+                    gone_after_request: !generation_matches,
                 }),
                 Box::new(RecordingCleanup(Arc::clone(&cleanup))),
             )
             .unwrap();
-        assert_eq!(
-            sessions.close("route", &id, &config()),
-            json!({
-                "outcome": "closed", "browser_session_id": id,
-            })
-        );
-        assert_eq!(cleanup.lock().unwrap().as_slice(), ["cleanup"]);
+        let reply = sessions.close("route", &id, &config());
+        if unreadable && generation_matches {
+            assert_eq!(
+                reply,
+                json!({
+                    "outcome": "cleanup_failure", "browser_session_id": id,
+                    "stage": "reap", "detail": {"step": "generation_unverified"},
+                })
+            );
+            assert_eq!(
+                sessions.status("route", &clock, UNIX_EPOCH)["detail"],
+                reply["detail"]
+            );
+            assert!(cleanup.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(
+                reply,
+                json!({
+                    "outcome": "closed", "browser_session_id": id,
+                })
+            );
+            assert_eq!(cleanup.lock().unwrap().as_slice(), ["cleanup"]);
+        }
         let recorded = events.lock().unwrap().clone();
         recorded
     }
@@ -4527,9 +4622,22 @@ mod tests {
     }
 
     #[test]
-    fn failed_graceful_request_with_unreadable_generation_only_reaps_and_closes() {
+    fn failed_graceful_request_with_unreadable_generation_fails_without_signal_or_reap() {
+        assert_eq!(close_with_faults(true, false, true, true), ["graceful"]);
+    }
+
+    #[test]
+    fn graceful_exit_timeout_with_unreadable_generation_fails_without_signal_or_reap() {
         assert_eq!(
-            close_with_faults(true, false, true, true),
+            close_with_faults(false, false, true, true),
+            ["graceful", "grace_wait"]
+        );
+    }
+
+    #[test]
+    fn failed_graceful_request_with_zombie_generation_reaps_and_closes() {
+        assert_eq!(
+            close_with_faults(true, false, true, false),
             ["graceful", "reap"]
         );
     }
@@ -4577,6 +4685,206 @@ mod tests {
             reply["detail"]
         );
         assert!(!reply.to_string().contains("/private/secret"));
+    }
+
+    struct UnverifiedProcess(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for UnverifiedProcess {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("drop");
+        }
+    }
+
+    impl OwnedBrowserProcess for UnverifiedProcess {
+        fn generation_matches(&self) -> bool {
+            false
+        }
+
+        fn generation_gone(&self) -> bool {
+            false
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.0.lock().unwrap().push("graceful");
+            Err(ProcessControlFailure::new(
+                ProcessControlStep::GracefulCloseRequest,
+            ))
+        }
+
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            self.0.lock().unwrap().push("grace_wait");
+            Ok(false)
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.0.lock().unwrap().push("force");
+            Ok(())
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            self.0.lock().unwrap().push("reap");
+            Ok(())
+        }
+    }
+
+    struct ExitProofCleanup {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        exit_proven: Arc<AtomicBool>,
+    }
+
+    impl SessionCleanup for ExitProofCleanup {
+        fn durable_profile_project(&self) -> Option<&str> {
+            Some("project")
+        }
+
+        fn prove_profile_unused(&self) -> Result<(), String> {
+            self.events.lock().unwrap().push("proof");
+            if self.exit_proven.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err("exit evidence is unreadable".into())
+            }
+        }
+
+        fn after_proven_exit(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            self.events.lock().unwrap().push("after_proven_exit");
+            Ok(SessionCleanupOutcome::Complete)
+        }
+
+        fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
+            self.events.lock().unwrap().push("cleanup");
+            Ok(SessionCleanupOutcome::Complete)
+        }
+    }
+
+    struct UnverifiedSession {
+        sessions: BrowserSessions,
+        id: String,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        exit_proven: Arc<AtomicBool>,
+    }
+
+    impl UnverifiedSession {
+        fn new() -> Self {
+            let sessions = BrowserSessions::default();
+            let clock = FakeClock::new();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let exit_proven = Arc::new(AtomicBool::new(false));
+            let _ = sessions.acquire_launch_slot("route");
+            let (id, _, _) = sessions
+                .establish_ready(
+                    "route",
+                    ProfileDisposition::Durable,
+                    &config(),
+                    &clock,
+                    Box::new(UnverifiedProcess(Arc::clone(&events))),
+                    Box::new(ExitProofCleanup {
+                        events: Arc::clone(&events),
+                        exit_proven: Arc::clone(&exit_proven),
+                    }),
+                )
+                .unwrap();
+            Self {
+                sessions,
+                id,
+                events,
+                exit_proven,
+            }
+        }
+
+        fn close(&self) -> Value {
+            self.sessions.close("route", &self.id, &config())
+        }
+    }
+
+    #[test]
+    fn unverified_teardown_retains_the_process_without_dropping_it() {
+        let session = UnverifiedSession::new();
+        assert_eq!(
+            session.close()["detail"],
+            json!({"step": "generation_unverified"})
+        );
+        assert_eq!(*session.events.lock().unwrap(), ["graceful"]);
+        let registry = recovered(session.sessions.registry());
+        let recovery = registry.routes["route"].retained[0]
+            .reap_recovery
+            .as_ref()
+            .unwrap();
+        assert!(recovery.state.lock().unwrap().process.is_some());
+    }
+
+    #[test]
+    fn failed_reap_retry_with_unproven_exit_keeps_the_handle_without_reaping() {
+        let session = UnverifiedSession::new();
+        assert_eq!(session.close()["outcome"], "cleanup_failure");
+        let retry = session.close();
+        assert_eq!(retry["detail"], json!({"step": "generation_unverified"}));
+        assert!(retry["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("retry browser.close"));
+        assert!(matches!(
+            session
+                .sessions
+                .acquire_launch_slot_for_profile("other-route", Some("project")),
+            LaunchSlot::Refused(_)
+        ));
+        assert_eq!(
+            *session.events.lock().unwrap(),
+            ["graceful", "proof", "proof"]
+        );
+        let registry = recovered(session.sessions.registry());
+        let recovery = registry.routes["route"].retained[0]
+            .reap_recovery
+            .as_ref()
+            .unwrap();
+        assert!(recovery.state.lock().unwrap().process.is_some());
+    }
+
+    #[test]
+    fn failed_reap_retry_with_proven_exit_reaps_once_then_closes() {
+        let session = UnverifiedSession::new();
+        assert_eq!(session.close()["outcome"], "cleanup_failure");
+        session.exit_proven.store(true, Ordering::Release);
+        assert_eq!(session.close()["outcome"], "closed");
+        assert_eq!(session.close()["outcome"], "closed");
+        assert_eq!(
+            *session.events.lock().unwrap(),
+            ["graceful", "proof", "reap", "drop", "after_proven_exit"]
+        );
+        assert!(matches!(
+            session
+                .sessions
+                .acquire_launch_slot_for_profile("route", Some("project")),
+            LaunchSlot::Acquired { .. }
+        ));
+    }
+
+    #[test]
+    fn shutdown_reaps_proven_retained_processes_and_forgets_unverified_ones_without_signalling() {
+        in_thread(|| {
+            for exit_proven in [false, true] {
+                let session = UnverifiedSession::new();
+                assert_eq!(session.close()["outcome"], "cleanup_failure");
+                session.exit_proven.store(exit_proven, Ordering::Release);
+                let report = session
+                    .sessions
+                    .teardown_all_within(&config(), short_budget());
+                assert_eq!(report.teardowns_running, 0);
+                let events = Arc::clone(&session.events);
+                drop(session);
+                if exit_proven {
+                    assert_eq!(
+                        *events.lock().unwrap(),
+                        ["graceful", "proof", "reap", "drop"]
+                    );
+                } else {
+                    assert_eq!(*events.lock().unwrap(), ["graceful", "proof"]);
+                }
+            }
+        })
+        .recv_timeout(Duration::from_secs(2))
+        .expect("shutdown must finish without dropping an unverified child");
     }
 
     struct PausingClock {
