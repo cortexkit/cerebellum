@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::agent_grants::{AgentGrant, GrantHolder, GrantSubject};
+use crate::test_support::HANG_GUARD;
 
 fn seed(planes: &Planes, holder: GrantHolder) -> String {
     let store = planes.management.agent_grants();
@@ -41,7 +42,7 @@ async fn dispatch(
     crate::handle_frame(app_request(1), &tx, &planes)
         .await
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -323,7 +324,7 @@ async fn worker_describe_spends_only_the_calls_remaining_deadline() {
     planes.scopes.control.connect(&tx);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
     let result = tokio::time::timeout(
-        Duration::from_millis(200),
+        HANG_GUARD,
         crate::call_context::CALL_DEADLINE.scope(
             deadline,
             crate::permission_scope::resolve_worker(&facts, &planes.scopes),

@@ -2,6 +2,7 @@
 //! route binds. A separate test checks catalog bytes through the real daemon.
 
 use super::*;
+use crate::hang_guard::HANG_GUARD;
 use async_trait::async_trait;
 use cerebellum::journal::call_records::{CallRecords, FilesystemCallRecordStorage};
 use cerebellum::{BrowserConfig, JournalPersistence, Planes};
@@ -293,7 +294,7 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
     request.header.epoch = address.1;
     let corr = request.header.corr;
     write_frame(&mut client, &request).await.unwrap();
-    let response = timeout(Duration::from_secs(5), async {
+    let response = timeout(HANG_GUARD, async {
         loop {
             let response = read_frame(&mut client).await.unwrap().unwrap();
             if response.header.corr == corr {

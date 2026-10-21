@@ -27,7 +27,10 @@
 //! covers that answer.
 #![cfg(unix)]
 
+#[path = "it/support/hang_guard.rs"]
+mod hang_guard;
 mod support;
+use hang_guard::HANG_GUARD;
 
 use std::fs;
 use std::path::PathBuf;
@@ -59,7 +62,7 @@ const CONVERSATION: &str = "live-scope-conversation";
 const SCOPE_REF: &str = "live-s-1";
 
 /// Generous: it only decides how long a broken boot takes to fail.
-const STARTUP: Duration = Duration::from_secs(60);
+const STARTUP: Duration = HANG_GUARD;
 
 fn browser_config() -> BrowserConfig {
     BrowserConfig {
@@ -130,14 +133,14 @@ async fn connect(connection: &subc_transport::ConnectionInfo) -> TcpStream {
     let mut stream = TcpStream::connect(format!("{}:{}", endpoint.host, endpoint.port))
         .await
         .expect("connect to the daemon");
-    authenticate_client(&mut stream, connection, Duration::from_secs(5))
+    authenticate_client(&mut stream, connection, HANG_GUARD)
         .await
         .expect("authenticate");
     stream
 }
 
 async fn next_frame(stream: &mut TcpStream) -> Frame {
-    timeout(Duration::from_secs(10), read_frame(stream))
+    timeout(HANG_GUARD, read_frame(stream))
         .await
         .expect("the daemon answers")
         .expect("readable frame")
@@ -304,7 +307,7 @@ impl Owner {
         )
         .unwrap();
         self.writer.send(frame).await.unwrap();
-        let answer = timeout(Duration::from_secs(10), self.answers.recv())
+        let answer = timeout(HANG_GUARD, self.answers.recv())
             .await
             .expect("the sync is answered")
             .expect("owner connection open");
@@ -325,7 +328,7 @@ fn scope_record() -> ScopeRecord {
 }
 
 async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    timeout(Duration::from_secs(10), async {
+    timeout(HANG_GUARD, async {
         while !done() {
             sleep(Duration::from_millis(10)).await;
         }

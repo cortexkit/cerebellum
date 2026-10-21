@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::support::permissions as permission_support;
+use crate::support::HANG_GUARD;
 use cerebellum::agent_grants::{
     AgentGrantStorage, AgentGrants, FilesystemAgentGrantStorage, GrantSubject,
     InMemoryAgentGrantStorage,
@@ -2367,7 +2368,7 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
         )
         .await;
     assert_eq!(cards.len(), 1);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while permission_support::count(&fixture.planes) == 0 {
             tokio::task::yield_now().await;
         }

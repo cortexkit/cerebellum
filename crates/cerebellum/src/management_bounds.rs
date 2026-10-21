@@ -211,6 +211,7 @@ mod tests {
         CleanupStage, NavigationDriveError, OwnedBrowserProcess, ProcessControlFailure,
         SessionCleanup, SessionCleanupOutcome,
     };
+    use crate::test_support::HANG_GUARD;
     use crate::{
         budgets, computer_grants, handle_frame, login_capture, management, route_limits,
         ProfileDisposition,
@@ -227,7 +228,7 @@ mod tests {
     /// How long a held step stays held at most, in real time. A test whose
     /// own runtime thread is stuck behind the held step then sees the step
     /// released and fails its "still held" check, rather than hanging.
-    const HOLD_BACKSTOP: Duration = Duration::from_secs(10);
+    const HOLD_BACKSTOP: Duration = HANG_GUARD;
 
     /// Parks the fake browser at one named step until released, standing for
     /// a CDP command whose write never completes.
@@ -404,7 +405,7 @@ mod tests {
     /// checks rather than sleeping on its clock, which a paused clock would
     /// not move while a blocking job runs.
     async fn until(what: &str, done: impl Fn() -> bool) {
-        let give_up = std::time::Instant::now() + HOLD_BACKSTOP + Duration::from_secs(5);
+        let give_up = std::time::Instant::now() + HANG_GUARD;
         while !done() {
             assert!(std::time::Instant::now() < give_up, "never: {what}");
             std::thread::sleep(Duration::from_millis(1));
@@ -544,19 +545,39 @@ mod tests {
             blocked.pass("finish_handoff");
             true
         });
+        // Keep Tokio from auto-advancing to the next timer while the test
+        // checks the poll boundary; only the explicit advances move this clock.
+        let keep_clock_manual = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let interval = Duration::from_millis(browser_session::HANDOFF_POLL_INTERVAL_MS);
+        let poll_started_at = tokio::time::Instant::now();
         let poll = spawn_handoff_poll(&planes, route_identity(&planes), 1, 100, Some(settle));
         // Let the poll start its first wait before the clock moves.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_millis(
-            browser_session::HANDOFF_POLL_INTERVAL_MS,
-        ))
-        .await;
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.reached("finish_handoff"),
+            0,
+            "the handoff poll started before its cadence interval"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
         until("the poll starts the record write", || {
             store.reached("finish_handoff") == 1
         })
         .await;
+        assert_eq!(
+            tokio::time::Instant::now() - poll_started_at,
+            interval,
+            "the first handoff poll did not start at its cadence interval"
+        );
         // The poll arms the record write's `CALL_RECORD_SETTLE_MS` timer
         // before the write starts, so the poll must end within that bound of
         // now.
@@ -581,6 +602,7 @@ mod tests {
             "the poll ended only once the write was released"
         );
         drop(held);
+        keep_clock_manual.abort();
     }
 
     /// With no browser work permit free, no poll job runs: the handoff stays

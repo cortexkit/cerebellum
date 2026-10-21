@@ -160,7 +160,7 @@ pub(super) async fn withdraw_asked_call_and_apply_late_grant(planes: Planes) {
         display_name: APP.into(),
         code: Arc::new(computer_grants::SignedByFixtureTeam),
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !planes.management.computer_grants().holds(&caller, &need) {
             tokio::task::yield_now().await;
         }

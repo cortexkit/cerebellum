@@ -68,7 +68,7 @@ async fn interrupted_keys(goodbye: bool) {
     tokio::select! {
         _ = sequence.posted.notified() => {},
         early = rx.recv() => panic!("keys must reach the fake platform: {}", String::from_utf8_lossy(&early.unwrap().body)),
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("keys never reached their second press"),
+        _ = tokio::time::sleep(HANG_GUARD) => panic!("keys never reached their second press"),
     }
     if goodbye {
         let close = Frame::build_with_version(
@@ -112,7 +112,7 @@ async fn interrupted_keys(goodbye: bool) {
         let mut replies = Vec::new();
         for _ in 0..2 {
             replies.push(
-                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                tokio::time::timeout(HANG_GUARD, rx.recv())
                     .await
                     .unwrap()
                     .unwrap(),

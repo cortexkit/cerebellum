@@ -1211,6 +1211,7 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
 
     /// Geometry that takes the given time to read.
     struct SlowGeometry(Duration);
@@ -1242,6 +1243,53 @@ mod tests {
         }
     }
 
+    /// Keeps an AX read blocked until the test releases it, without sleeping on
+    /// the runtime thread that schedules the cursor update.
+    struct HeldGeometry {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        finished: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl AppStateSource for HeldGeometry {
+        fn read_app_state(
+            &self,
+            _: &ProcessGrant,
+            _: cerebellum_computer::app_state::source::ReadBounds,
+        ) -> Result<
+            cerebellum_computer::app_state::source::RawAppState,
+            cerebellum_computer::app_state::source::AppStateReadError,
+        > {
+            Err(cerebellum_computer::app_state::source::AppStateReadError::Unreadable)
+        }
+
+        fn cursor_label(&self, _: &ElementHandle) -> Option<(Option<String>, bool)> {
+            Some((Some("Send".into()), false))
+        }
+
+        fn cursor_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            if let Some(release) = self.release.lock().unwrap().take() {
+                let _ = release.blocking_recv();
+            }
+            if let Some(finished) = self.finished.lock().unwrap().take() {
+                let _ = finished.send(());
+            }
+            Some([0.0, 0.0, 10.0, 10.0])
+        }
+
+        fn visible_cursor_point(
+            &self,
+            _: &ProcessGrant,
+            point: Option<[f64; 2]>,
+            _: Option<[f64; 4]>,
+        ) -> Option<[f64; 2]> {
+            point
+        }
+    }
+
     #[tokio::test]
     async fn cursor_geometry_deadline_discards_late_reads_without_blocking_actions() {
         let (cursor, mut receiver) = Coordinator::channel();
@@ -1250,25 +1298,60 @@ mod tests {
             pid: 7,
             process_generation_evidence: "generation".into(),
         };
-        let start = Instant::now();
-        cursor.schedule(
-            Identity::current("agent".into()),
-            CursorKind::Press,
-            grant,
-            Arc::new(SlowGeometry(Duration::from_millis(150))),
-            Some(cerebellum_computer::app_state::source::RawElement::fixture(1, "AXButton").handle),
-            None,
-        );
-        assert!(
-            start.elapsed() < READ_BUDGET,
-            "scheduling must not read geometry inline"
-        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let geometry = Arc::new(HeldGeometry {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            finished: std::sync::Mutex::new(Some(finished_tx)),
+        });
+        // A wall-clock speed assertion would fail under load. The read stays
+        // blocked here, so event ordering proves scheduling and runtime work
+        // continue without comparing real elapsed time with READ_BUDGET.
+        let scheduling_cursor = cursor.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let scheduling = tokio::task::spawn_blocking(move || {
+            let _entered = runtime.enter();
+            scheduling_cursor.schedule(
+                Identity::current("agent".into()),
+                CursorKind::Press,
+                grant,
+                geometry,
+                Some(
+                    cerebellum_computer::app_state::source::RawElement::fixture(1, "AXButton")
+                        .handle,
+                ),
+                None,
+            );
+        });
+        let scheduled = tokio::time::timeout(HANG_GUARD, scheduling).await;
+        if scheduled.is_err() {
+            let _ = release_tx.send(());
+            panic!("scheduling waited for the blocked geometry read");
+        }
+        scheduled.unwrap().unwrap();
+        tokio::time::timeout(HANG_GUARD, started_rx)
+            .await
+            .expect("the geometry worker never started")
+            .unwrap();
+        let runtime_work = tokio::time::timeout(HANG_GUARD, tokio::spawn(async { "completed" }))
+            .await
+            .expect("the runtime stopped dispatching while geometry was blocked")
+            .unwrap();
+        assert_eq!(runtime_work, "completed");
         assert!(
             tokio::time::timeout(Duration::from_millis(250), receiver.recv())
                 .await
                 .is_err(),
             "late geometry must not reach the helper"
         );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(HANG_GUARD, finished_rx)
+            .await
+            .expect("the released geometry worker did not finish")
+            .unwrap();
+        assert!(receiver.try_recv().is_err(), "a late picture was sent");
     }
 
     /// No action waits past the cap after its picture was scheduled: not
@@ -1389,7 +1472,7 @@ mod tests {
         };
         schedule();
         cursor.end("agent-a");
-        let hide = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        let hide = tokio::time::timeout(HANG_GUARD, receiver.recv())
             .await
             .expect("end sends a hide at once")
             .unwrap();
@@ -1401,7 +1484,7 @@ mod tests {
             "the read that finished after the end must not redraw the badge"
         );
         schedule();
-        let picture = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        let picture = tokio::time::timeout(HANG_GUARD, receiver.recv())
             .await
             .unwrap()
             .unwrap()
@@ -1700,9 +1783,9 @@ mod tests {
     }
 
     async fn next_line(receiver: &mut mpsc::Receiver<CursorLine>) -> CursorLine {
-        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        tokio::time::timeout(HANG_GUARD, receiver.recv())
             .await
-            .expect("a line within a second")
+            .expect("a cursor line before HANG_GUARD")
             .unwrap()
     }
 
@@ -1719,7 +1802,7 @@ mod tests {
     async fn until(what: &str, done: impl Fn() -> bool) {
         let start = Instant::now();
         while !done() {
-            assert!(start.elapsed() < Duration::from_secs(1), "never {what}");
+            assert!(start.elapsed() < HANG_GUARD, "never {what}");
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
@@ -1849,15 +1932,15 @@ mod tests {
             let _ = done.send(());
         });
         assert!(
-            received.recv_timeout(Duration::from_millis(100)).is_ok(),
+            received.recv_timeout(HANG_GUARD).is_ok(),
             "cursor send awaited a full channel"
         );
     }
 
     /// Wait, in real time, until `done` holds: a read runs on a plain thread
-    /// that tokio's clock knows nothing of.
+    /// that tokio's clock knows nothing of. The deadline only detects a stuck read.
     fn until_read(done: impl Fn() -> bool) {
-        let give_up = Instant::now() + Duration::from_secs(10);
+        let give_up = Instant::now() + HANG_GUARD;
         while !done() {
             assert!(Instant::now() < give_up, "the read never finished");
             std::thread::sleep(Duration::from_millis(1));
@@ -1888,8 +1971,8 @@ mod tests {
     async fn pictures_never_read_reduce_motion_themselves() {
         let (cursor, mut receiver) = Coordinator::channel();
         let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        // The read is held until the test lets it finish (or two seconds
-        // pass, so a read made where it must not be cannot hang the test).
+        // The read remains parked until the test releases it; the shared guard
+        // only prevents a broken test from leaving the reader thread stuck.
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = std::sync::Mutex::new(released);
         let recorded = reads.clone();
@@ -1899,10 +1982,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(thread.name().unwrap_or_default().to_owned());
-            let _ = released
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(2));
+            let _ = released.lock().unwrap().recv_timeout(HANG_GUARD);
             true
         });
         let geometry = FollowGeometry::new();

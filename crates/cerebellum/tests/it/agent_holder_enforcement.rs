@@ -1,4 +1,5 @@
 use super::*;
+use crate::support::HANG_GUARD;
 use cerebellum::agent_grants::{AgentGrant, AgentGrants, BrowserTarget, GrantHolder, GrantSubject};
 
 fn store() -> Arc<AgentGrants> {
@@ -101,7 +102,7 @@ async fn revoking_the_delegated_browser_row_stops_the_production_inflight_action
     effect_seen(&launcher, "navigate").await;
     assert!(store.is_in_use(&id));
     store.revoke(&id, store.now_ms()).unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();

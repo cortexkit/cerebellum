@@ -5,6 +5,7 @@
 //! answers scripted. Journals and grant stores are held in memory throughout.
 
 use super::support;
+use crate::support::HANG_GUARD;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -247,7 +248,7 @@ fn answer(decision: &str) -> ScriptedAnswer {
 }
 
 async fn until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !condition() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

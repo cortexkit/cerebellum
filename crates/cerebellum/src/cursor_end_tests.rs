@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::computer_capability::cursor::{Coordinator, Identity, SessionScope};
+use crate::test_support::HANG_GUARD;
 use cerebellum_computer::cursor::CursorLine;
 use sha2::{Digest, Sha256};
 
@@ -202,7 +203,7 @@ fn turn_ended_request(corr: u64, params: Value) -> Frame {
 async fn served(planes: &Planes, request: &Frame) -> Frame {
     let (tx, mut rx) = mpsc::channel(8);
     handle_frame(request.clone(), &tx, planes).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the call answers promptly")
         .expect("the writer stays open");

@@ -4,6 +4,7 @@ use crate::agent_grants::{
     InMemoryAgentGrantStorage, LegacyGrantSource,
 };
 use crate::browser_standing_grants::WallClock;
+use crate::test_support::HANG_GUARD;
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -191,7 +192,7 @@ async fn call(
     crate::handle_route_request(request, &tx, planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -329,7 +330,7 @@ async fn provider_revoke_stopping() {
         let (ty, reply) = call(&planes, aggregator(), REVOKE, expected["request"].clone()).await;
         assert_vector("provider-revoke-stopping", expected, ty, reply);
     };
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         tokio::join!(work, revoke);
     })
     .await
@@ -546,7 +547,7 @@ async fn provider_revoke_stops_only_the_authorizing_app_row() {
             json!({"outcome":"revoked","stopping":true})
         );
     };
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         tokio::join!(work, revoke);
     })
     .await
@@ -655,7 +656,7 @@ async fn provider_does_not_report_finished_work_as_stopping_after_a_slow_revoke(
     ));
     started.await.unwrap();
     let revoke = std::thread::spawn(move || store.revoke_with_stopping("grt_02", NOW));
-    tokio::time::timeout(std::time::Duration::from_secs(2), writing.notified())
+    tokio::time::timeout(HANG_GUARD, writing.notified())
         .await
         .unwrap();
     finish.send(()).unwrap();

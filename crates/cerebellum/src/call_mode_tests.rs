@@ -1,5 +1,6 @@
 //! A run's route lifetime must not outlive its in-flight browser calls.
 
+use crate::test_support::HANG_GUARD;
 use crate::*;
 
 #[path = "held_reply_tests.rs"]
@@ -72,7 +73,7 @@ async fn ending_a_run_cancels_its_queued_call_without_ending_the_head() {
     handle_frame_for_test(goodbye, &tx, &planes).await.unwrap();
     drop(tx);
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .is_none(),
@@ -131,7 +132,7 @@ async fn exchange(planes: &Planes, channel: u16, corr: u64, body: Value) -> Fram
     handle_frame_for_test(request(channel, corr, body), &tx, planes)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap()
@@ -742,7 +743,7 @@ async fn start_queued_run(planes: &Planes, key: &str) -> (mpsc::Receiver<Frame>,
     .await
     .unwrap();
     let cancel = planes.cancellations.get((9, 3, 30)).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if matches!(
                 planes.calls.lookup_exact("reserved:basal", key),
@@ -809,7 +810,7 @@ async fn withdraw_fires_run_cancellation_and_reports_started_honestly() {
     let answer = withdraw(&planes, 9, "cancel-run", None).await;
     assert_eq!(answer["answer"], "already_started", "{answer}");
     assert!(cancel.is_cancelled());
-    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, replies.recv())
         .await
         .unwrap()
         .unwrap();

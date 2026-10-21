@@ -12,6 +12,7 @@
 //! recorded instead of sent to the window server.
 
 use super::support;
+use crate::support::HANG_GUARD;
 
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
@@ -896,7 +897,7 @@ async fn a_cancel_mid_drag_releases_the_button() {
         cancel.clone(),
     );
     let interrupt = async {
-        tokio::time::timeout(std::time::Duration::from_secs(5), posted.notified())
+        tokio::time::timeout(HANG_GUARD, posted.notified())
             .await
             .expect("the drag never reached its first post");
         cancel.cancel();

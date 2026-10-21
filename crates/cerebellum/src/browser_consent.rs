@@ -431,6 +431,7 @@ mod tests {
     use crate::browser_standing_grants::ManualWallClock;
     use crate::cingulate_client::desk::FileRegistryStore;
     use crate::cingulate_client::double::{Reply, ScriptedCingulate};
+    use crate::test_support::HANG_GUARD;
     use crate::{Frame, FrameType, JournalPersistence};
     use cerebellum_core::health::HealthState;
     use subc_protocol::{BindIdentity, Flags, Priority, RouteTarget, PROTOCOL_VERSION};
@@ -546,7 +547,7 @@ mod tests {
             crate::handle_frame_for_test(frame, &tx, &self.planes)
                 .await
                 .unwrap();
-            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -721,7 +722,7 @@ mod tests {
         crate::handle_frame_for_test(frame.clone(), &tx, &fixture.planes)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !fixture
                 .service
                 .methods()

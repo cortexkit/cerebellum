@@ -5,6 +5,7 @@
 mod codemode;
 pub(crate) mod stack_tests;
 use super::*;
+use crate::test_support::HANG_GUARD;
 use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
 
 const CHANNEL: u16 = 7;
@@ -120,7 +121,7 @@ fn counters(planes: &Planes) -> (u64, u64) {
 }
 
 async fn settle_to(planes: &Planes, expected: (u64, u64)) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while counters(planes) != expected {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -155,7 +156,7 @@ async fn parked_call(
 }
 
 async fn reply(rx: &mut mpsc::Receiver<Frame>) -> Value {
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the parked call answered at once")
         .unwrap();
@@ -325,7 +326,7 @@ async fn turn_stop_cancel_computer_app_card_accepts_empty_and_legacy_bodies() {
         handle_frame_for_test(stop.clone(), &tx, &planes)
             .await
             .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .expect("cancelled app-card call must not hang")
             .unwrap();
@@ -383,7 +384,7 @@ async fn turn_stop_cancel_computer_queued_answers_before_the_head_card() {
     handle_frame_for_test(stop.clone(), &tx, &planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("queued cancellation must not wait on the head's card")
         .unwrap();
@@ -468,13 +469,13 @@ async fn turn_stop_cancel_running_keys_releases_both_presses() {
     tokio::select! {
         _ = sequence.posted.notified() => {},
         early = rx.recv() => panic!("keys must reach the scripted platform: {}", String::from_utf8_lossy(&early.unwrap().body)),
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("scripted sequence did not reach its second press"),
+        _ = tokio::time::sleep(HANG_GUARD) => panic!("scripted sequence did not reach its second press"),
     }
     let stop = crate::turn_stop_vectors::cancel(&request);
     handle_frame_for_test(stop.clone(), &tx, &planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("running sequence cancellation must answer")
         .unwrap();

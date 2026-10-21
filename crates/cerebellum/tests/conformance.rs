@@ -15,7 +15,10 @@
 
 #![cfg(test)]
 
+#[path = "it/support/hang_guard.rs"]
+mod hang_guard;
 mod support;
+use hang_guard::HANG_GUARD;
 #[path = "conformance/tool_provider.rs"]
 mod tool_provider;
 
@@ -1282,7 +1285,7 @@ async fn start_live_daemon_with_browser(
     // Same reasoning as `wait_for_cerebellum_catalog`: this is a startup race
     // against a real daemon process, not a network operation, so the bound is
     // generous and only decides how long a genuinely broken boot takes to fail.
-    let connection = timeout(Duration::from_secs(60), async {
+    let connection = timeout(HANG_GUARD, async {
         loop {
             if let Ok(connection) = connection_file::read(&connection_file_path) {
                 break connection;
@@ -1441,7 +1444,7 @@ async fn send_control_request(
     write_frame(stream, &frame)
         .await
         .expect("write control request to real subc");
-    timeout(Duration::from_secs(5), read_frame(stream))
+    timeout(HANG_GUARD, read_frame(stream))
         .await
         .expect("real subc response deadline")
         .expect("read real subc response")
@@ -1458,7 +1461,7 @@ async fn send_control_request(
 /// (the loop returns as soon as the module appears) and still fails a genuinely
 /// unregistrable module, just later.
 async fn wait_for_cerebellum_catalog(stream: &mut TcpStream) -> ClientControlResponse {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + HANG_GUARD;
     for corr in 10.. {
         if std::time::Instant::now() >= deadline {
             break;
@@ -1538,7 +1541,7 @@ async fn send_live_tool_request(
     write_frame(stream, &frame)
         .await
         .expect("write live capability request");
-    timeout(Duration::from_secs(5), read_frame(stream))
+    timeout(HANG_GUARD, read_frame(stream))
         .await
         .expect("live capability response deadline")
         .expect("read live capability response")

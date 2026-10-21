@@ -251,6 +251,7 @@ mod tests {
     use crate::cingulate_client::wire;
     use crate::cingulate_client::{Reply, ScriptedCingulate};
     use crate::terminal_arbiter::{TerminalArbiter, TerminalCause, CALL_TERMINAL};
+    use crate::test_support::HANG_GUARD;
     use cerebellum_core::health::HealthState;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -366,7 +367,7 @@ mod tests {
         crate::handle_frame_for_test(request(channel), &writer, planes)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap()

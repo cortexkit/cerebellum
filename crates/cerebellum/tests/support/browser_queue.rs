@@ -1,4 +1,5 @@
 use super::*;
+use crate::support::HANG_GUARD;
 
 fn call(corr: u64, action: &str, arguments: Value) -> Frame {
     let mut arguments = arguments.as_object().unwrap().clone();
@@ -16,7 +17,7 @@ fn navigation() -> Frame {
 
 async fn send(planes: &Planes, tx: &mpsc::Sender<Frame>, frame: Frame) {
     tokio::time::timeout(
-        Duration::from_millis(500),
+        HANG_GUARD,
         cerebellum::handle_frame_for_test(frame, tx, planes),
     )
     .await
@@ -390,7 +391,7 @@ async fn browser_queue_goodbye_removes_queued_call() {
         break frame;
     };
     assert_eq!(cancelled.header.corr, 802);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if ScriptedCarrier::for_planes(&planes)
                 .calls()

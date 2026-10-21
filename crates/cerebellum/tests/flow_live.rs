@@ -1,7 +1,10 @@
 //! Flow admission and consent over real daemon routes to the supervised binary.
 #![cfg(unix)]
 
+#[path = "it/support/hang_guard.rs"]
+mod hang_guard;
 mod support;
+use hang_guard::HANG_GUARD;
 
 use cortexkit_test_support::{fenced_subc_env_dir, ScratchDir};
 use serde_json::{json, Value};
@@ -21,21 +24,21 @@ use tokio::{
 
 const OWNER: &str = "prefrontal-core";
 const AGENT: &str = "flow-live-agent";
-const STARTUP: Duration = Duration::from_secs(60);
+const STARTUP: Duration = HANG_GUARD;
 
 async fn connect(connection: &subc_transport::ConnectionInfo) -> TcpStream {
     let endpoint = connection.endpoints.first().unwrap();
     let mut stream = TcpStream::connect(format!("{}:{}", endpoint.host, endpoint.port))
         .await
         .unwrap();
-    authenticate_client(&mut stream, connection, Duration::from_secs(5))
+    authenticate_client(&mut stream, connection, HANG_GUARD)
         .await
         .unwrap();
     stream
 }
 
 async fn next_frame(stream: &mut TcpStream) -> Frame {
-    timeout(Duration::from_secs(10), read_frame(stream))
+    timeout(HANG_GUARD, read_frame(stream))
         .await
         .expect("daemon answers")
         .unwrap()
@@ -171,7 +174,7 @@ impl Owner {
         )
         .unwrap();
         self.writer.send(frame).await.unwrap();
-        let answer = timeout(Duration::from_secs(10), self.answers.recv())
+        let answer = timeout(HANG_GUARD, self.answers.recv())
             .await
             .unwrap()
             .unwrap();

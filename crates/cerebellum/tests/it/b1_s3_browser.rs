@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::support::HANG_GUARD;
+
 use cerebellum::authorization::{ActionGrant, GrantStore, HazardClass, Severity};
 use cerebellum::browser::navigation::VISION_LONG_EDGE_PX;
 use cerebellum::browser::navigation::{
@@ -2976,12 +2978,9 @@ async fn same_context_dispatches_serialize_and_different_contexts_do_not() {
 
     // Two different contexts are independent: holding A's lane must not block B.
     let guard_a = plane.lane_for_test(&route_a.conversation_key).await;
-    let guard_b = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        plane.lane_for_test(&route_b.conversation_key),
-    )
-    .await
-    .expect("a different context must not block on another context's lane");
+    let guard_b = tokio::time::timeout(HANG_GUARD, plane.lane_for_test(&route_b.conversation_key))
+        .await
+        .expect("a different context must not block on another context's lane");
     drop(guard_b);
     drop(guard_a);
 }

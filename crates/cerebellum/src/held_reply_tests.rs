@@ -1,6 +1,7 @@
 //! Held first replies use the production dispatcher and the published wire vectors.
 
 use super::*;
+use crate::test_support::HANG_GUARD;
 use cortexkit_role_tool_provider::{result, CONTENT_V1_CAPABILITY, HELD_REPLY_V1};
 use std::sync::atomic::Ordering;
 
@@ -13,7 +14,7 @@ async fn exchange(planes: &Planes, channel: u16, corr: u64, body: Value) -> Fram
     handle_frame_for_test(request(channel, corr, body), &tx, planes)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the provider must answer; consent may not park for 120 seconds")
         .unwrap()
@@ -92,7 +93,7 @@ async fn declared_consent_is_held_immediately_without_parking() {
     );
     bind_held(&planes).await;
     let reply = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         exchange(&planes, 9, 3, grant_request(Some("held-site-key"))),
     )
     .await
@@ -390,7 +391,7 @@ async fn consent_approval_never_executes_original_capture_and_retry_holds_login_
     );
     assert_eq!(fixture.vault.calls(), 0);
     let reply = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         exchange(&planes, 9, 4, capture_request("capture-retry")),
     )
     .await
@@ -398,7 +399,7 @@ async fn consent_approval_never_executes_original_capture_and_retry_holds_login_
     assert_held(&decode(reply), "login_capture");
     assert_eq!(consent.cards().len(), 1);
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 1);
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
+    let result = tokio::time::timeout(HANG_GUARD, async {
         loop {
             let entries = late(&planes, 9).await;
             if let Some(entry) = entries["entries"]
@@ -575,10 +576,10 @@ async fn present_holds_login_handoff_and_settles_under_basal_call_key() {
             Box::new(Cleanup)
         )
         .is_some());
-    let reply = tokio::time::timeout(Duration::from_secs(5), exchange(&planes, 9, 3, json!({"name":"browser_use","call_key":"present-held","arguments":{"action":"present","origin":"https://example.com"}}))).await.unwrap();
+    let reply = tokio::time::timeout(HANG_GUARD, exchange(&planes, 9, 3, json!({"name":"browser_use","call_key":"present-held","arguments":{"action":"present","origin":"https://example.com"}}))).await.unwrap();
     assert_held(&decode(reply), "login_handoff");
     logged_in.store(true, Ordering::SeqCst);
-    let entry = tokio::time::timeout(Duration::from_secs(20), async {
+    let entry = tokio::time::timeout(HANG_GUARD, async {
         loop {
             let entries = late(&planes, 9).await;
             if !entries["entries"].as_array().unwrap().is_empty() {
@@ -783,7 +784,7 @@ async fn consent_drain_cannot_overtake_the_held_custody_write() {
             async move { exchange(&planes, 9, 3, grant_request(Some("racing-key"))).await },
         )
     };
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+    tokio::time::timeout(HANG_GUARD, gate.entered.notified())
         .await
         .expect("the real custody write was reached");
     consent.feed(json!([answered("racing-card", "allow_30m")]));
@@ -802,9 +803,7 @@ async fn consent_drain_cannot_overtake_the_held_custody_write() {
     );
     drop(release);
     assert_held(&decode(raising.await.unwrap()), "consent");
-    let result = tokio::time::timeout(Duration::from_secs(5), poll)
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(HANG_GUARD, poll).await.unwrap();
     assert_eq!(result["entries"][0]["detail"]["consent"], "approved");
 }
 

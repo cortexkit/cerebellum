@@ -7,6 +7,7 @@
 //! outcome assertion cannot see it.
 
 use super::support;
+use crate::support::HANG_GUARD;
 
 use std::sync::{Arc, Mutex};
 
@@ -1147,7 +1148,7 @@ async fn a_single_thread_runtime_can_interrupt_a_posting_computer_action() {
         |_| InMemoryCaptureBackend::default(),
     );
     let interrupt = async {
-        tokio::time::timeout(std::time::Duration::from_secs(5), posted.notified())
+        tokio::time::timeout(HANG_GUARD, posted.notified())
             .await
             .expect("the cancel never reached the loop: the action did not signal its second post; check fixture admission and synchronous dispatch scheduling");
         cancel.cancel();
@@ -2094,7 +2095,7 @@ async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pi
             let call = serve(&plane, action, arguments.clone(), &management, &clock);
             let reply = if mode == 2 {
                 let (reply, ()) = tokio::join!(call, async {
-                    tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    tokio::time::timeout(HANG_GUARD, receiver.recv())
                         .await
                         .unwrap()
                         .unwrap();
@@ -2105,7 +2106,7 @@ async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pi
             } else {
                 let reply = call.await;
                 if mode == 1 {
-                    tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    tokio::time::timeout(HANG_GUARD, receiver.recv())
                         .await
                         .unwrap_or_else(|e| panic!("{action} mode {mode}: {e}; reply={reply}"))
                         .unwrap();

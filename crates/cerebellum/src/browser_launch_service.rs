@@ -3879,6 +3879,7 @@ mod orphan_recovery_tests {
     use crate::profile_custody::{
         SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe,
     };
+    use crate::test_support::HANG_GUARD;
 
     struct TestRoot(PathBuf);
 
@@ -4340,7 +4341,7 @@ mod orphan_recovery_tests {
         });
 
         entered_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("startup recovery did not begin");
         assert!(matches!(
             service_rx.try_recv(),
@@ -4395,6 +4396,7 @@ mod orphan_recovery_tests {
             SystemProcessTable, Unreadable,
         };
         use crate::management::{ClearSettlement, ManagementPlane, TargetResolver};
+        use crate::test_support::HANG_GUARD;
         use cerebellum_core::identity::{
             AcceptedBindFacts, RouteIdentity, RouteSurface, SessionKind,
         };
@@ -4856,7 +4858,7 @@ mod orphan_recovery_tests {
             fn wait_for_namers(&self, directory: &Path, count: usize) -> Vec<u32> {
                 let mut naming = OsString::from("--user-data-dir=");
                 naming.push(directory);
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + HANG_GUARD;
                 loop {
                     let namers: Vec<u32> =
                         crate::launch_recovery::user_process_arguments(&ScopedTable::system())

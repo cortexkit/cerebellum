@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::HANG_GUARD;
 use serde_json::json;
 
 const ROUTE: Route = Route {
@@ -19,7 +20,7 @@ fn launch(
 
 #[cfg(unix)]
 async fn registered(bridge: &UserBrowserBridge, count: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while bridge.state().calls.len() != count {
             tokio::task::yield_now().await;
         }
@@ -235,7 +236,7 @@ mod wire {
         }
     }
     async fn bounded_read(stream: &mut UnixStream) -> Frame {
-        tokio::time::timeout(Duration::from_secs(2), read_frame(stream))
+        tokio::time::timeout(HANG_GUARD, read_frame(stream))
             .await
             .expect("extension double timed out")
             .unwrap()

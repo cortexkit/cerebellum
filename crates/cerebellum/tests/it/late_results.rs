@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::support::HANG_GUARD;
+
 use cerebellum::browser_session::{
     CleanupStage, NavigationDriveError, OwnedBrowserProcess, ProcessControlFailure, SessionCleanup,
     SessionCleanupOutcome, HANDOFF_DURATION_MS, HANDOFF_POLL_INTERVAL_MS,
@@ -28,6 +30,9 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
+// `management_bounds::tests::a_handoff_poll_whose_record_write_hangs_ends_at_the_settle_bound`
+// owns the poll-cadence claim on a paused clock. These file-backed integration
+// waits only guard against a handoff or dispatcher that never settles.
 const ORIGIN: &str = "https://login.example";
 const OWNER: &str = "reserved:prefrontal-core";
 const LEAKS: [&str; 3] = [
@@ -196,7 +201,7 @@ async fn exchange(planes: &Planes, request: Frame) -> Frame {
     cerebellum::handle_frame_for_test(request, &tx, planes)
         .await
         .unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let response = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("dispatcher replies within its deadline")
         .unwrap();
@@ -302,7 +307,7 @@ async fn read(
     .unwrap()
 }
 async fn observe_login(planes: &Planes, facts: &LoginFacts) -> LateResultsReply {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !facts.credential_polled.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -310,7 +315,7 @@ async fn observe_login(planes: &Planes, facts: &LoginFacts) -> LateResultsReply 
     .await
     .expect("the handoff poller first observes the credential step");
     facts.logged_in.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(6), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             let reply = read(planes, 9, None, None).await;
             if !reply.entries.is_empty() {
@@ -341,20 +346,17 @@ fn seed_version_2(scratch: &Scratch) {
 }
 
 async fn next_ending(planes: &Planes) -> LateResultsReply {
-    tokio::time::timeout(
-        Duration::from_millis(HANDOFF_POLL_INTERVAL_MS + 1_000),
-        async {
-            loop {
-                let reply = read(planes, 9, None, None).await;
-                if !reply.entries.is_empty() {
-                    break reply;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let reply = read(planes, 9, None, None).await;
+            if !reply.entries.is_empty() {
+                break reply;
             }
-        },
-    )
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("the handoff settles within one poll interval plus scheduling slack")
+    .expect("the handoff watcher did not settle before the test hang guard")
 }
 
 #[tokio::test]
@@ -416,14 +418,11 @@ async fn handoff_watch_unreadable_opening_field_is_not_login_evidence() {
     facts.credential_unreadable.store(false, Ordering::SeqCst);
     // A second poll can start only after the first returned without settling;
     // this observes the classifier's decision, not just the start of a read.
-    tokio::time::timeout(
-        Duration::from_millis(HANDOFF_POLL_INTERVAL_MS * 2 + 1_000),
-        async {
-            while facts.reads.load(Ordering::SeqCst) < 3 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        },
-    )
+    tokio::time::timeout(HANG_GUARD, async {
+        while facts.reads.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
     .expect("a background observation ran");
     assert_eq!(

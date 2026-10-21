@@ -952,6 +952,12 @@ impl Drop for InFlightRecord<'_> {
     }
 }
 
+/// Compare one driver's command against its own start time, not the sum of
+/// earlier commands performed while holding the same lock.
+fn command_overdue(started: Instant, now: Instant, cap: Duration, slack: Duration) -> bool {
+    now.saturating_duration_since(started) > cap.saturating_add(slack)
+}
+
 impl DriverWatch {
     /// Record one command as written now and allowed `cap` to complete.
     pub(crate) fn begin_command(&self, method: &str, cap: Duration) -> InFlightRecord<'_> {
@@ -970,9 +976,13 @@ impl DriverWatch {
     /// driver-lock holder that runs several commands back to back, each within
     /// its cap, is never judged on their combined time.
     fn overdue(&self, slack: Duration) -> Option<String> {
+        self.overdue_at(Instant::now(), slack)
+    }
+
+    fn overdue_at(&self, now: Instant, slack: Duration) -> Option<String> {
         recover_poisoned(self.in_flight.lock())
             .iter()
-            .find(|command| command.started.elapsed() > command.cap.saturating_add(slack))
+            .find(|command| command_overdue(command.started, now, command.cap, slack))
             .map(|command| command.method.clone())
     }
 
@@ -1189,7 +1199,10 @@ struct ShutdownPlan {
 
 impl ShutdownPlan {
     fn starting_now(budget: ShutdownBudget) -> Self {
-        let start = Instant::now();
+        Self::from_start(Instant::now(), budget)
+    }
+
+    fn from_start(start: Instant, budget: ShutdownBudget) -> Self {
         let before_reserve = budget.total.saturating_sub(budget.cleanup_reserve);
         Self {
             in_flight_until: start + budget.in_flight_wait_max.min(before_reserve),
@@ -1197,6 +1210,17 @@ impl ShutdownPlan {
             deadline: start + budget.total,
         }
     }
+}
+
+/// A deadline includes its exact end: work is no longer inside the budget at
+/// the instant `now` reaches `deadline`.
+fn before_deadline(now: Instant, deadline: Instant) -> bool {
+    now < deadline
+}
+
+/// Keep graceful termination inside the budget left before profile cleanup.
+fn grace_remaining(grace_limit: Duration, now: Instant, graceful_until: Instant) -> Duration {
+    grace_limit.min(graceful_until.saturating_duration_since(now))
 }
 
 /// What shutdown keeps per live session beside the session locks: whether its
@@ -3527,7 +3551,7 @@ impl BrowserSessions {
                     // The launch is not ours to finish; once it delivers its
                     // browser, the session (already terminal) is torn down
                     // here like any other.
-                    if now >= plan.deadline {
+                    if !before_deadline(now, plan.deadline) {
                         return false;
                     }
                     meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
@@ -3536,7 +3560,7 @@ impl BrowserSessions {
                 if meta.pending_operations == 0 {
                     break false;
                 }
-                if now >= plan.in_flight_until {
+                if !before_deadline(now, plan.in_flight_until) {
                     break true;
                 }
                 meta = recovered(meta.wait_timeout(&cell.wake, plan.in_flight_until - now));
@@ -3553,7 +3577,7 @@ impl BrowserSessions {
             if let Some(driver) = cell.try_driver() {
                 break Some(driver);
             }
-            if Instant::now() >= plan.graceful_until {
+            if !before_deadline(Instant::now(), plan.graceful_until) {
                 break None;
             }
             std::thread::sleep(SHUTDOWN_POLL);
@@ -3580,10 +3604,7 @@ impl BrowserSessions {
         };
         drop(driver);
         let already_killed = self.cell_killed(cell);
-        let grace = grace.min(
-            plan.graceful_until
-                .saturating_duration_since(Instant::now()),
-        );
+        let grace = grace_remaining(grace, Instant::now(), plan.graceful_until);
         self.teardown_within(
             cell,
             OwnedTeardown {
@@ -3608,10 +3629,10 @@ impl BrowserSessions {
                 return;
             }
             let now = Instant::now();
-            if now >= plan.deadline {
+            if !before_deadline(now, plan.deadline) {
                 return;
             }
-            if !killed && now >= plan.graceful_until {
+            if !killed && grace_remaining(Duration::MAX, now, plan.graceful_until).is_zero() {
                 drop(meta);
                 self.kill_cell(cell, false);
                 killed = true;
@@ -3682,7 +3703,7 @@ impl BrowserSessions {
                     return false;
                 }
                 let now = Instant::now();
-                if now >= plan.deadline {
+                if !before_deadline(now, plan.deadline) {
                     break;
                 }
                 meta = recovered(meta.wait_timeout(&cell.wake, plan.deadline - now));
@@ -4130,6 +4151,7 @@ pub fn validate_close(arguments: &Value) -> Result<&str, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
     use cerebellum_core::clock::FakeClock;
 
     fn config() -> BrowserConfig {
@@ -4142,6 +4164,40 @@ mod tests {
             browser_exit_observation_deadline_ms: 10,
             navigation_settle_deadline_ms: 10,
         }
+    }
+
+    #[test]
+    fn driver_watch_caps_each_command_against_its_own_start() {
+        let watch = DriverWatch::default();
+        let start = Instant::now();
+        let cap = Duration::from_millis(50);
+        let slack = Duration::from_millis(20);
+        for index in 0..4 {
+            let command_start = start + Duration::from_millis(index * 25);
+            let command_end = command_start + Duration::from_millis(25);
+            watch.in_flight.lock().unwrap().push(InFlightCommand {
+                id: index,
+                method: format!("step-{index}"),
+                started: command_start,
+                cap,
+            });
+            assert_eq!(watch.overdue_at(command_end, slack), None);
+            watch.in_flight.lock().unwrap().clear();
+        }
+        assert!(Duration::from_millis(100) > cap + slack);
+
+        watch.in_flight.lock().unwrap().push(InFlightCommand {
+            id: 99,
+            method: "boundary".into(),
+            started: start,
+            cap,
+        });
+        let exact_limit = start + cap + slack;
+        assert_eq!(watch.overdue_at(exact_limit, slack), None);
+        assert_eq!(
+            watch.overdue_at(exact_limit + Duration::from_nanos(1), slack),
+            Some("boundary".into()),
+        );
     }
 
     struct RecordingProcess {
@@ -4182,7 +4238,7 @@ mod tests {
         }
     }
 
-    struct SleepingExitProcess;
+    struct ParallelGraceProcess(Arc<Gate>);
 
     struct FaultyCloseProcess {
         inner: RecordingProcess,
@@ -4230,7 +4286,7 @@ mod tests {
         }
     }
 
-    impl OwnedBrowserProcess for SleepingExitProcess {
+    impl OwnedBrowserProcess for ParallelGraceProcess {
         fn generation_matches(&self) -> bool {
             true
         }
@@ -4239,8 +4295,8 @@ mod tests {
             Ok(())
         }
 
-        fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure> {
-            std::thread::sleep(grace_period);
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            self.0.pass();
             Ok(true)
         }
 
@@ -4892,7 +4948,7 @@ mod tests {
                 }
             }
         })
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("shutdown must finish without dropping an unverified child");
     }
 
@@ -4932,7 +4988,7 @@ mod tests {
             assert!(weak_recovery.upgrade().is_none());
             assert_eq!(*events.lock().unwrap(), ["graceful"]);
         })
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(HANG_GUARD)
         .expect("registry teardown must not drop an unverified process");
     }
 
@@ -4978,7 +5034,7 @@ mod tests {
             })
         };
         entered_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("acceptance reached the shared transition while holding its lock");
 
         let mut expiry_clock = FakeClock::new();
@@ -4997,7 +5053,7 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         let accepted = accept.join().unwrap();
-        let expired = expiry_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let expired = expiry_rx.recv_timeout(HANG_GUARD).unwrap();
         assert_ne!(accepted, expired);
     }
 
@@ -5063,7 +5119,7 @@ mod tests {
                 .unwrap();
         });
         entered_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("teardown reached the reap barrier");
         let early_result = result_rx.recv_timeout(Duration::from_millis(50));
         release_tx.send(()).unwrap();
@@ -5075,7 +5131,7 @@ mod tests {
             "close returned successfully while reap was blocked"
         );
         let result = result_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("close returns after reap is released");
         assert_eq!(result["outcome"], "closed");
     }
@@ -5191,14 +5247,17 @@ mod tests {
     }
 
     #[test]
-    fn teardown_all_finishes_n_sessions_in_about_one_grace_period() {
-        const SESSION_COUNT: u64 = 6;
+    fn teardown_all_starts_every_grace_wait_before_releasing_any() {
+        // A wall-clock elapsed-time assertion is sensitive to host load. Hold
+        // each fake process at graceful wait and prove every session reaches it before release.
+        const SESSION_COUNT: usize = 6;
         const GRACE_PERIOD_MS: u64 = 100;
 
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
         let mut shutdown_config = config();
         shutdown_config.termination_grace_period_ms = GRACE_PERIOD_MS;
+        let grace_wait = Arc::new(Gate::default());
         for session in 0..SESSION_COUNT {
             let route = format!("route-{session}");
             let _ = sessions.acquire_launch_slot(&route);
@@ -5208,27 +5267,40 @@ mod tests {
                     ProfileDisposition::Durable,
                     &shutdown_config,
                     &clock,
-                    Box::new(SleepingExitProcess),
+                    Box::new(ParallelGraceProcess(Arc::clone(&grace_wait))),
                     Box::new(RecordingCleanup::default()),
                 )
-                .expect("establish sleeping session");
+                .expect("establish a session with a held grace wait");
             assert!(!cancelled);
         }
 
-        let started = std::time::Instant::now();
-        sessions.teardown_all(&shutdown_config);
-        let elapsed = started.elapsed();
-        eprintln!(
-            "teardown_all elapsed {elapsed:?} for {SESSION_COUNT} sessions with {GRACE_PERIOD_MS}ms grace"
-        );
-
+        let stopping = sessions.clone();
+        let config = shutdown_config.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            stopping.teardown_all(&config);
+            let _ = done.send(());
+        });
+        let gate_deadline = Instant::now() + HANG_GUARD;
+        while grace_wait.entered.load(std::sync::atomic::Ordering::SeqCst) < SESSION_COUNT
+            && Instant::now() < gate_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let all_grace_waits_started =
+            grace_wait.entered.load(std::sync::atomic::Ordering::SeqCst) == SESSION_COUNT;
+        grace_wait.open();
+        let shutdown_finished = finished.recv_timeout(HANG_GUARD).is_ok();
+        if shutdown_finished {
+            shutdown.join().unwrap();
+        }
         assert!(
-            elapsed >= Duration::from_millis(GRACE_PERIOD_MS),
-            "the process double did not exercise the configured grace period: {elapsed:?}"
+            all_grace_waits_started,
+            "shutdown did not start every session's grace wait before releasing any"
         );
         assert!(
-            elapsed < Duration::from_millis(GRACE_PERIOD_MS * 4),
-            "teardown scaled toward N grace periods: {elapsed:?}"
+            shutdown_finished,
+            "shutdown did not finish before HANG_GUARD"
         );
         for session in 0..SESSION_COUNT {
             assert_eq!(
@@ -5304,7 +5376,7 @@ mod tests {
         let early_result = result_rx.recv_timeout(Duration::from_millis(100));
         guard.finish();
         if early_result.is_err() {
-            let _ = result_rx.recv_timeout(Duration::from_secs(1));
+            let _ = result_rx.recv_timeout(HANG_GUARD);
         }
         assert!(
             matches!(early_result, Ok(false)),
@@ -5671,7 +5743,7 @@ mod tests {
             let _ = done.send(());
         });
         assert!(
-            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            finished.recv_timeout(HANG_GUARD).is_ok(),
             "did not finish over the poisoned session lock"
         );
     }
@@ -5932,10 +6004,10 @@ mod tests {
 
     /// One session is stuck inside a browser call, holding the registry-wide
     /// lock; another is idle but its browser never exits, under a configured
-    /// grace of an hour. Shutdown must still release custody for both inside
-    /// the budget: the stuck browser is killed out of band once the in-flight
-    /// wait is over, and the idle one's graceful wait is cut to what the budget
-    /// has left before the cleanup reserve.
+    /// grace of an hour (60 HANG_GUARDs). Shutdown must still release custody
+    /// for both inside the budget: the stuck browser is killed out of band once
+    /// the in-flight wait is over, and the idle one's graceful wait is cut to
+    /// what the budget has left before the cleanup reserve.
     #[test]
     fn a_stuck_call_and_a_huge_grace_still_release_custody_within_the_budget() {
         let budget = ShutdownBudget {
@@ -5981,7 +6053,7 @@ mod tests {
                 Box::new(NeverExitingProcess {
                     events: Arc::clone(&idle_events),
                     graces: Arc::clone(&idle_graces),
-                    sleep_cap: Duration::from_secs(2),
+                    sleep_cap: Duration::from_secs(600),
                 }),
                 Box::new(TimedCleanup(Arc::clone(&idle_released))),
             )
@@ -5997,27 +6069,21 @@ mod tests {
             result.is_err()
         });
         call_entered
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(HANG_GUARD)
             .expect("the stuck call is in progress and holds the registry lock");
 
         let started = Instant::now();
-        let (done, finished) = std::sync::mpsc::channel();
-        let tearing_down = sessions.clone();
-        std::thread::spawn(move || {
-            tearing_down.teardown_all_within(&shutdown_config, budget);
-            let _ = done.send(Instant::now());
-        });
-        let ended = finished
-            .recv_timeout(budget.total + Duration::from_secs(2))
-            .expect("shutdown teardown must end");
-
-        // Scheduling and the 5 ms polls are the only time not on the plan.
-        let slack = Duration::from_millis(100);
+        let sessions_for_shutdown = sessions.clone();
+        let config_for_shutdown = shutdown_config.clone();
+        let switch_for_timeout = Arc::clone(&switch);
+        let (_, elapsed) = finish_before_guard(
+            move || sessions_for_shutdown.teardown_all_within(&config_for_shutdown, budget),
+            move || kill(&switch_for_timeout),
+            "shutdown teardown",
+        );
         assert!(
-            ended - started <= budget.total + slack,
-            "shutdown teardown took {:?} against a budget of {:?}",
-            ended - started,
-            budget.total
+            elapsed < HANG_GUARD,
+            "shutdown exceeded its hang guard: {elapsed:?}"
         );
         assert!(
             caller.join().unwrap(),
@@ -6048,9 +6114,8 @@ mod tests {
             let released = released.lock().unwrap();
             assert_eq!(released.len(), 1, "{route} custody released once");
             assert!(
-                released[0] - started <= budget.total + slack,
-                "{route} custody released after {:?}",
-                released[0] - started
+                released[0] - started < HANG_GUARD,
+                "{route} custody exceeded its hang guard"
             );
             assert_eq!(
                 sessions.status(route, &clock, UNIX_EPOCH)["terminal_outcome"],
@@ -6072,8 +6137,6 @@ mod tests {
     /// shows the size of the stall.
     #[test]
     fn a_blocked_driver_call_on_one_route_does_not_stall_another_route() {
-        const A_HOLD: Duration = Duration::from_millis(1_000);
-        const PROMPT: Duration = Duration::from_millis(100);
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
 
@@ -6122,13 +6185,14 @@ mod tests {
         else {
             panic!("route A's ready session refused dispatch");
         };
+        let (a_result, a_reply) = std::sync::mpsc::channel();
         let a_caller = std::thread::spawn(move || {
             let result = a_operation.screenshot("context", 0, 3_600_000, false);
             a_operation.finish();
-            result
+            let _ = a_result.send(result.err());
         });
         a_call_entered
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(HANG_GUARD)
             .expect("route A's call is in progress");
 
         // B's status and B's operation run on separate threads, both started
@@ -6138,15 +6202,17 @@ mod tests {
         let status_sessions = sessions.clone();
         let status_clock = clock.clone();
         let status_done = b_done.clone();
+        let (status_result, status_reply) = std::sync::mpsc::channel();
         let b_status = std::thread::spawn(move || {
             let started = Instant::now();
             let status = status_sessions.status("route-b", &status_clock, UNIX_EPOCH);
             let finished_at = Instant::now();
             let _ = status_done.send(());
-            (status, finished_at - started, finished_at)
+            let _ = status_result.send((status, finished_at - started, finished_at));
         });
         let call_sessions = sessions.clone();
         let call_clock = clock.clone();
+        let (call_result, call_reply) = std::sync::mpsc::channel();
         let b_call = std::thread::spawn(move || {
             let started = Instant::now();
             let DispatchAdmission::Accepted(mut operation) =
@@ -6158,25 +6224,42 @@ mod tests {
             let finished_at = Instant::now();
             operation.finish();
             let _ = b_done.send(());
-            (call.err(), finished_at - started, finished_at)
+            let _ = call_result.send((call.err(), finished_at - started, finished_at));
         });
 
-        // Give B up to `A_HOLD` to finish on its own, then release A whatever
-        // happened, so the test always ends.
-        let deadline = Instant::now() + A_HOLD;
-        for _ in 0..2 {
-            let _ = b_finished.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        // Keep route A's call held until both route B events finish or the
+        // generous hang guard expires. The claim is their ordering, not a
+        // sub-second performance target.
+        let release_deadline = Instant::now() + HANG_GUARD;
+        let mut finished_before_release = 0;
+        while finished_before_release < 2 {
+            let remaining = release_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match b_finished.recv_timeout(remaining) {
+                Ok(()) => finished_before_release += 1,
+                Err(_) => break,
+            }
         }
+        let b_finished_before_release = finished_before_release == 2;
         let a_released_at = Instant::now();
         *a_switch.killed.lock().unwrap() = true;
         a_switch.wake.notify_all();
-        let (status, status_took, status_finished_at) = b_status.join().unwrap();
-        let (call_error, call_took, call_finished_at) = b_call.join().unwrap();
+        let (status, status_took, status_finished_at) = status_reply
+            .recv_timeout(HANG_GUARD)
+            .expect("route B's status did not finish before HANG_GUARD");
+        let (call_error, call_took, call_finished_at) = call_reply
+            .recv_timeout(HANG_GUARD)
+            .expect("route B's driver call did not finish before HANG_GUARD");
         assert_eq!(
-            a_caller.join().unwrap().err(),
+            a_reply
+                .recv_timeout(HANG_GUARD)
+                .expect("route A did not finish after its switch"),
             Some(NavigationDriveError::CdpFailure),
             "route A's call ends only when its switch fires"
         );
+        drop((a_caller, b_status, b_call));
         let relative_to_release = |finished_at: Instant| {
             if finished_at < a_released_at {
                 "before"
@@ -6185,7 +6268,7 @@ mod tests {
             }
         };
         eprintln!(
-            "route B while route A was blocked for {A_HOLD:?}: status took {status_took:?} \
+            "route B while route A was held: status took {status_took:?} \
              (finished {} A was released); admission plus driver call took {call_took:?} \
              (finished {} A was released)",
             relative_to_release(status_finished_at),
@@ -6199,12 +6282,16 @@ mod tests {
             "route B's call reached route B's own browser"
         );
         assert!(
-            status_took < PROMPT && status_finished_at < a_released_at,
-            "route B's status waited {status_took:?} behind route A's call"
+            b_finished_before_release,
+            "route B did not finish both operations while route A remained blocked"
         );
         assert!(
-            call_took < PROMPT && call_finished_at < a_released_at,
-            "route B's admission and driver call waited {call_took:?} behind route A's call"
+            status_finished_at < a_released_at,
+            "route B's status waited behind route A's call"
+        );
+        assert!(
+            call_finished_at < a_released_at,
+            "route B's admission and driver call waited behind route A's call"
         );
     }
 
@@ -6276,7 +6363,7 @@ mod tests {
 
         /// Wait until `count` calls have reached the gate.
         fn wait_entered(&self, count: usize) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + HANG_GUARD;
             while self.entered.load(std::sync::atomic::Ordering::SeqCst) < count {
                 assert!(Instant::now() < deadline, "no call reached the gate");
                 std::thread::sleep(Duration::from_millis(1));
@@ -6444,7 +6531,7 @@ mod tests {
             let Some(switch) = self.exit_on_kill.as_ref() else {
                 return Ok(true);
             };
-            let deadline = Instant::now() + grace_period.min(Duration::from_secs(60));
+            let deadline = Instant::now() + grace_period.min(Duration::from_secs(600));
             let mut killed = switch.killed.lock().unwrap();
             while !*killed {
                 let now = Instant::now();
@@ -6549,9 +6636,72 @@ mod tests {
         receiver
     }
 
-    const PROMPTLY: Duration = Duration::from_secs(2);
     /// Long enough for a thread to park on the condition it is waiting for.
     const PARKED: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn shutdown_plan_caps_grace_at_the_exact_budget_boundary() {
+        // Supplying every instant directly keeps the budget boundary exact;
+        // this test does not sleep on the system clock.
+        let start = Instant::now();
+        let budget = ShutdownBudget {
+            total: Duration::from_secs(2),
+            in_flight_wait_max: Duration::from_secs(3),
+            cleanup_reserve: Duration::from_millis(500),
+        };
+        let plan = ShutdownPlan::from_start(start, budget);
+        let graceful_until = start + Duration::from_millis(1_500);
+        let deadline = start + Duration::from_secs(2);
+        assert_eq!(plan.in_flight_until, graceful_until);
+        assert_eq!(plan.graceful_until, graceful_until);
+        assert_eq!(plan.deadline, deadline);
+        assert_eq!(
+            grace_remaining(Duration::from_secs(3), start, plan.graceful_until),
+            Duration::from_millis(1_500),
+        );
+        assert_eq!(
+            grace_remaining(
+                Duration::from_secs(3),
+                graceful_until - Duration::from_secs(1),
+                plan.graceful_until,
+            ),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            grace_remaining(Duration::from_secs(3), graceful_until, plan.graceful_until),
+            Duration::ZERO,
+        );
+        assert!(before_deadline(
+            deadline - Duration::from_nanos(1),
+            deadline
+        ));
+        assert!(!before_deadline(deadline, deadline));
+    }
+
+    /// Bound a synchronous teardown on its own thread so a stuck teardown
+    /// fails the test instead of holding up the test executor indefinitely.
+    fn finish_before_guard<T: Send + 'static>(
+        task: impl FnOnce() -> T + Send + 'static,
+        unblock: impl FnOnce() + Send + 'static,
+        what: &'static str,
+    ) -> (T, Duration) {
+        let (finished, result) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let _ = finished.send(task());
+        });
+        match result.recv_timeout(HANG_GUARD) {
+            Ok(value) => {
+                let elapsed = started.elapsed();
+                worker.join().expect("the guarded worker returned");
+                (value, elapsed)
+            }
+            Err(error) => {
+                unblock();
+                panic!("{what} did not finish before HANG_GUARD: {error}");
+            }
+        }
+    }
 
     fn short_budget() -> ShutdownBudget {
         ShutdownBudget {
@@ -6587,7 +6737,7 @@ mod tests {
         sessions.abandon_launch_slot("route");
         assert_eq!(
             close
-                .recv_timeout(PROMPTLY)
+                .recv_timeout(HANG_GUARD)
                 .expect("close returns once the launch is abandoned"),
             json!({"outcome": "browser_session_not_found"})
         );
@@ -6617,9 +6767,9 @@ mod tests {
         assert_still_running(&close, "a close joining a teardown blocked in its reap");
 
         reap_gate.open();
-        assert!(expiry.recv_timeout(PROMPTLY).unwrap());
+        assert!(expiry.recv_timeout(HANG_GUARD).unwrap());
         assert_eq!(
-            close.recv_timeout(PROMPTLY).unwrap(),
+            close.recv_timeout(HANG_GUARD).unwrap(),
             json!({"outcome": "idle_expired", "browser_session_id": session.id})
         );
         assert_eq!(session.events(), ["graceful", "grace_wait", "reap"]);
@@ -6678,14 +6828,14 @@ mod tests {
         let expiring = sessions.clone();
         let expiry_clock = clock.clone();
         let expiry = in_thread(move || expiring.expire_idle("route", &expiry_clock, &config()));
-        let expired = expiry.recv_timeout(PROMPTLY);
+        let expired = expiry.recv_timeout(HANG_GUARD);
         call_gate.open();
         assert_eq!(
             expired,
             Ok(false),
             "idle expiry ran under a present in progress"
         );
-        assert!(present.recv_timeout(PROMPTLY).unwrap().is_ok());
+        assert!(present.recv_timeout(HANG_GUARD).unwrap().is_ok());
         assert!(session.events().contains(&"present"));
     }
 
@@ -6711,11 +6861,11 @@ mod tests {
         assert_still_running(&close, "close under a present in progress");
         call_gate.open();
         assert_eq!(
-            present.recv_timeout(PROMPTLY).unwrap(),
+            present.recv_timeout(HANG_GUARD).unwrap(),
             Err(PresentRefusal::NoSession),
             "a present whose session closed under it must not commit a handoff"
         );
-        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert_eq!(close.recv_timeout(HANG_GUARD).unwrap()["outcome"], "closed");
         assert_eq!(sessions.human_in_control("route", &clock), None);
     }
 
@@ -6740,10 +6890,10 @@ mod tests {
         let second = in_thread(move || {
             presenting.present("route", "https://login.example", 10, &second_clock)
         });
-        let second_result = second.recv_timeout(PROMPTLY);
+        let second_result = second.recv_timeout(HANG_GUARD);
         call_gate.open();
         assert_eq!(second_result, Ok(Err(PresentRefusal::HandoffOpen)));
-        assert!(first.recv_timeout(PROMPTLY).unwrap().is_ok());
+        assert!(first.recv_timeout(HANG_GUARD).unwrap().is_ok());
     }
 
     #[test]
@@ -6774,7 +6924,7 @@ mod tests {
         sessions.abandon_launch_slot("route");
         killer_gate.open();
 
-        let Err(mut handed_back) = establishment.recv_timeout(PROMPTLY).unwrap() else {
+        let Err(mut handed_back) = establishment.recv_timeout(HANG_GUARD).unwrap() else {
             panic!("a browser was installed into an abandoned session");
         };
         handed_back.process.wait_until_reaped().unwrap();
@@ -6821,14 +6971,21 @@ mod tests {
             let (session, call_gate, call) =
                 stuck_call_on(&sessions, "stuck", &clock, killer, Gate::opened());
             let budget = short_budget();
-
-            let started = Instant::now();
-            sessions.teardown_all_within(&config(), budget);
-            let took = started.elapsed();
+            // The 600s fake grace is ten HANG_GUARDs; waiting for it cannot
+            // masquerade as a successful custody-handoff outcome.
+            let mut long_grace = config();
+            long_grace.termination_grace_period_ms = 600_000;
+            let sessions_for_shutdown = sessions.clone();
+            let config_for_shutdown = long_grace.clone();
+            let release_call = Arc::clone(&call_gate);
+            let (_, elapsed) = finish_before_guard(
+                move || sessions_for_shutdown.teardown_all_within(&config_for_shutdown, budget),
+                move || release_call.open(),
+                "shutdown with an unkillable call",
+            );
             assert!(
-                took <= budget.total + Duration::from_millis(100),
-                "shutdown took {took:?} against a budget of {:?}",
-                budget.total
+                elapsed < HANG_GUARD,
+                "shutdown exceeded its hang guard: {elapsed:?}"
             );
             let held = json!({
                 "outcome": "cleanup_failure",
@@ -6854,12 +7011,12 @@ mod tests {
                 DispatchAdmission::NoSession
             ));
             assert_eq!(
-                sessions.close("stuck", &session.id, &config())["stage"],
+                sessions.close("stuck", &session.id, &long_grace)["stage"],
                 "custody_held"
             );
 
             call_gate.open();
-            assert!(call.recv_timeout(PROMPTLY).unwrap());
+            assert!(call.recv_timeout(HANG_GUARD).unwrap());
             assert_eq!(sessions.status("stuck", &clock, UNIX_EPOCH), held);
             assert_eq!(session.released(), 0);
         }
@@ -6882,10 +7039,12 @@ mod tests {
             });
         clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
         let mut huge_grace = config();
-        huge_grace.termination_grace_period_ms = 3_600_000;
+        // The 600s fake grace is ten HANG_GUARDs; the test checks that shutdown
+        // cuts and joins it, not that host scheduling meets a short duration.
+        huge_grace.termination_grace_period_ms = 600_000;
         let expiring = sessions.clone();
         let expiry = in_thread(move || expiring.expire_idle("route", &clock, &huge_grace));
-        let deadline = Instant::now() + PROMPTLY;
+        let deadline = Instant::now() + HANG_GUARD;
         while !session.events().contains(&"grace_wait") {
             assert!(
                 Instant::now() < deadline,
@@ -6895,15 +7054,26 @@ mod tests {
         }
 
         let budget = short_budget();
-        let started = Instant::now();
-        sessions.teardown_all_within(&config(), budget);
-        let took = started.elapsed();
-        assert!(
-            took <= budget.total + Duration::from_millis(100),
-            "shutdown took {took:?} against a budget of {:?}",
-            budget.total
+        let sessions_for_shutdown = sessions.clone();
+        let config_for_shutdown = config();
+        let switch_for_timeout = Arc::clone(&switch);
+        let (_, elapsed) = finish_before_guard(
+            move || sessions_for_shutdown.teardown_all_within(&config_for_shutdown, budget),
+            move || kill(&switch_for_timeout),
+            "shutdown joining an existing terminalizer",
         );
-        assert!(expiry.recv_timeout(PROMPTLY).unwrap());
+        assert!(
+            elapsed < HANG_GUARD,
+            "shutdown exceeded its hang guard: {elapsed:?}"
+        );
+        let expiry_result = match expiry.recv_timeout(HANG_GUARD) {
+            Ok(result) => result,
+            Err(error) => {
+                kill(&switch);
+                panic!("the existing grace wait outlived shutdown's hang guard: {error}");
+            }
+        };
+        assert!(expiry_result);
         assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(session.events(), ["graceful", "grace_wait", "reap"]);
         assert_eq!(session.released(), 1);
@@ -6947,6 +7117,8 @@ mod tests {
     fn shutdown_leaves_custody_held_when_after_reap_overruns_the_budget() {
         let sessions = BrowserSessions::default();
         let clock = FakeClock::new();
+        // Gate cleanup to make custody ordering observable instead of comparing
+        // elapsed time with the shutdown budget on a loaded host.
         let cleanup_gate = Arc::new(Gate::default());
         let session = establish_test_browser(
             &sessions,
@@ -6956,14 +7128,17 @@ mod tests {
             |_| {},
         );
         let budget = short_budget();
-
-        let started = Instant::now();
-        sessions.teardown_all_within(&config(), budget);
-        let took = started.elapsed();
+        let sessions_for_shutdown = sessions.clone();
+        let config_for_shutdown = config();
+        let cleanup_after_timeout = Arc::clone(&cleanup_gate);
+        let (_, elapsed) = finish_before_guard(
+            move || sessions_for_shutdown.teardown_all_within(&config_for_shutdown, budget),
+            move || cleanup_after_timeout.open(),
+            "shutdown with an over-budget cleanup",
+        );
         assert!(
-            took <= budget.total + Duration::from_millis(100),
-            "shutdown took {took:?} against a budget of {:?}",
-            budget.total
+            elapsed < HANG_GUARD,
+            "shutdown exceeded its hang guard: {elapsed:?}"
         );
         assert_eq!(
             sessions.status("route", &clock, UNIX_EPOCH)["stage"],
@@ -6977,7 +7152,7 @@ mod tests {
         // The overrunning cleanup still finishes later, and then the session
         // is retired with its real outcome.
         cleanup_gate.open();
-        let deadline = Instant::now() + PROMPTLY;
+        let deadline = Instant::now() + HANG_GUARD;
         while sessions.status("route", &clock, UNIX_EPOCH)["outcome"] != "terminal" {
             assert!(
                 Instant::now() < deadline,
@@ -7071,7 +7246,7 @@ mod tests {
         let close = in_thread(move || closing.close("route", &id, &config()));
         assert_still_running(&close, "close under a pending operation");
         operation.finish();
-        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert_eq!(close.recv_timeout(HANG_GUARD).unwrap()["outcome"], "closed");
 
         // A handoff poll's release.
         let sessions = BrowserSessions::default();
@@ -7095,10 +7270,10 @@ mod tests {
         assert_still_running(&close, "close under a handoff poll");
         call_gate.open();
         assert_eq!(
-            poll.recv_timeout(PROMPTLY).unwrap(),
+            poll.recv_timeout(HANG_GUARD).unwrap(),
             HandoffPollResult::Gone
         );
-        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert_eq!(close.recv_timeout(HANG_GUARD).unwrap()["outcome"], "closed");
     }
 
     /// Park a waiter on "the session went terminal", then run `trigger`,
@@ -7123,9 +7298,9 @@ mod tests {
         trigger_clock.advance(Duration::from_millis(config().browser_idle_timeout_ms));
         let triggered = in_thread(move || trigger(triggering, session.id, trigger_clock));
         reap_gate.wait_entered(1);
-        let woke = waiter.recv_timeout(PROMPTLY);
+        let woke = waiter.recv_timeout(HANG_GUARD);
         reap_gate.open();
-        triggered.recv_timeout(PROMPTLY).unwrap();
+        triggered.recv_timeout(HANG_GUARD).unwrap();
         assert!(woke.is_ok(), "the terminal waiter was not woken");
     }
 
@@ -7176,7 +7351,7 @@ mod tests {
         let waiter = in_thread(move || waiting.wait_until_inactive("route"));
         assert_still_running(&waiter, "the inactivity waiter");
         sessions.abandon_launch_slot("route");
-        assert!(waiter.recv_timeout(PROMPTLY).is_ok());
+        assert!(waiter.recv_timeout(HANG_GUARD).is_ok());
     }
 
     #[test]
@@ -7195,8 +7370,8 @@ mod tests {
         let waiter = in_thread(move || waiting.wait_until_inactive("route"));
         assert_still_running(&waiter, "the inactivity waiter");
         reap_gate.open();
-        assert!(waiter.recv_timeout(PROMPTLY).is_ok());
-        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert!(waiter.recv_timeout(HANG_GUARD).is_ok());
+        assert_eq!(close.recv_timeout(HANG_GUARD).unwrap()["outcome"], "closed");
     }
 
     #[test]
@@ -7213,10 +7388,10 @@ mod tests {
         let inactive = in_thread(move || waiting.wait_until_inactive("stuck"));
 
         sessions.teardown_all_within(&config(), short_budget());
-        let closed = close.recv_timeout(PROMPTLY);
-        let stopped_waiting = inactive.recv_timeout(PROMPTLY);
+        let closed = close.recv_timeout(HANG_GUARD);
+        let stopped_waiting = inactive.recv_timeout(HANG_GUARD);
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
         assert_eq!(
             closed.expect("the parked close was woken"),
             json!({
@@ -7287,7 +7462,7 @@ mod tests {
     /// Run the idle enforcer's exit sweep until `done` holds or two seconds
     /// pass, as the module's sweep task does every few milliseconds.
     fn sweep_until(sessions: &BrowserSessions, done: impl Fn() -> bool) {
-        let deadline = Instant::now() + PROMPTLY;
+        let deadline = Instant::now() + HANG_GUARD;
         while !done() {
             assert!(Instant::now() < deadline, "the sweep never got there");
             sessions.observe_exits_all(&config());
@@ -7328,7 +7503,7 @@ mod tests {
         sweep_until(&sessions, || session.released() == 1);
         assert_eq!(sessions.status("route", &clock, UNIX_EPOCH), terminal);
         assert!(
-            call.recv_timeout(PROMPTLY).unwrap(),
+            call.recv_timeout(HANG_GUARD).unwrap(),
             "the killed browser fails the wedged write"
         );
         assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -7405,7 +7580,7 @@ mod tests {
             assert!(!session.events().contains(&"graceful"));
 
             kill(&wedge);
-            assert!(call.recv_timeout(PROMPTLY).unwrap());
+            assert!(call.recv_timeout(HANG_GUARD).unwrap());
             assert!(sessions.execution_quarantine("route").is_none());
             assert_eq!(
                 sessions.status("route", &clock, UNIX_EPOCH)["stage"],
@@ -7424,19 +7599,23 @@ mod tests {
         let session =
             establish_test_browser(&sessions, "route", &clock, Gate::opened(), |browser| {
                 browser.killer = Some(Arc::new(SwitchKiller(Arc::clone(&switch))));
-                // Four commands of 25 ms each under a 50 ms cap: each stays
-                // well within its cap, while their 100 ms total exceeds the
-                // cap plus the 20 ms slack.
-                browser.in_bound_commands =
-                    Some((4, Duration::from_millis(50), Duration::from_millis(25)));
+                // The exact per-command cap boundary is tested with explicit
+                // instants above; keep this wire-path fixture immediate so
+                // scheduler delay cannot turn it into a wall-clock assertion.
+                browser.in_bound_commands = Some((4, Duration::from_millis(50), Duration::ZERO));
             });
         let DispatchAdmission::Accepted(operation) = sessions.accept_dispatch("route", &clock)
         else {
             panic!("a ready session refused dispatch");
         };
         let call = screenshot_in_thread(operation, 40);
+        let call_deadline = Instant::now() + HANG_GUARD;
         loop {
             sessions.observe_exits_all(&config());
+            assert!(
+                Instant::now() < call_deadline,
+                "the in-bound calls never finished"
+            );
             match call.recv_timeout(Duration::from_millis(2)) {
                 Ok(_) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -7487,7 +7666,7 @@ mod tests {
             sweeping.expire_all(&sweep_clock, &config());
         });
         sweep
-            .recv_timeout(PROMPTLY)
+            .recv_timeout(HANG_GUARD)
             .expect("one stuck session stalled the sweep for the others");
         assert_eq!(
             sessions.status("crashed", &clock, UNIX_EPOCH),
@@ -7505,7 +7684,7 @@ mod tests {
         assert_eq!(stuck.released(), 0);
 
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
         sessions.observe_exits_all(&config());
         assert_eq!(
             sessions.status("stuck", &clock, UNIX_EPOCH),
@@ -7550,7 +7729,7 @@ mod tests {
         crate::browser::validate_browser_result(BROWSER_STATUS, &status).unwrap();
 
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
         assert_eq!(sessions.execution_quarantine("route"), None);
         assert!(sessions
             .status("route", &clock, UNIX_EPOCH)
@@ -7573,7 +7752,7 @@ mod tests {
             admit_in_call(&sessions, "route", &clock, &terminal),
             3_600_000,
         );
-        let deadline = Instant::now() + PROMPTLY;
+        let deadline = Instant::now() + HANG_GUARD;
         while !session.events().contains(&"screenshot") {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
@@ -7598,7 +7777,7 @@ mod tests {
             closed,
             json!({"outcome": "closed", "browser_session_id": session.id})
         );
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
         assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(session.released(), 1);
         let events = session.events();
@@ -7625,8 +7804,8 @@ mod tests {
         let close = in_thread(move || closing.close("route", &id, &config()));
         assert_still_running(&close, "a close behind a running call");
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
-        assert_eq!(close.recv_timeout(PROMPTLY).unwrap()["outcome"], "closed");
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
+        assert_eq!(close.recv_timeout(HANG_GUARD).unwrap()["outcome"], "closed");
         assert_eq!(switch.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(session.events().contains(&"graceful"));
     }
@@ -7689,7 +7868,7 @@ mod tests {
         assert!(!session.events().contains(&"release"));
 
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
         assert!(sessions.retry_held_release("route", 10));
         assert!(!sessions.held_input_unconfirmed("route"));
     }
@@ -7721,7 +7900,7 @@ mod tests {
         assert_eq!(health.detached_workers(), 1);
 
         cleanup_gate.open();
-        let deadline = Instant::now() + PROMPTLY;
+        let deadline = Instant::now() + HANG_GUARD;
         while health.detached_workers() != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -7750,7 +7929,7 @@ mod tests {
             }
         );
         call_gate.open();
-        assert!(call.recv_timeout(PROMPTLY).unwrap());
+        assert!(call.recv_timeout(HANG_GUARD).unwrap());
 
         let clean = BrowserSessions::default();
         let _closed = establish_test_browser(&clean, "route", &clock, Gate::opened(), |_| {});

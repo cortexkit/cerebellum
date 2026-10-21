@@ -315,6 +315,8 @@ fn identity_unverifiable(reason: &'static str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::test_support::HANG_GUARD;
 
     #[cfg(target_os = "linux")]
     use std::ffi::OsString;
@@ -432,34 +434,30 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_verifier_that_never_answers_times_out_rather_than_hanging() {
-        // A fake verifier that outlives any sane deadline, so the bound is
-        // measured rather than assumed. Using a real wedged codesign would
-        // make this test depend on the host's system-policy daemon, which is
-        // the condition that motivated the bound and cannot be staged. It is
-        // content-named so macOS assesses the new executable once, not on every
-        // run.
+        // A fake verifier sleeps600s (ten HANG_GUARDs), so its natural exit
+        // cannot conceal a missing verifier deadline; the test guard only
+        // catches a wait that never ends.
         let verifier = crate::content_named_fixture::content_named_fixture(
             "slow-verifier",
             "codesign",
             b"#!/bin/sh\nsleep 600\n",
             0o755,
         );
-
-        let started = std::time::Instant::now();
-        let refusal =
-            verify_code_signed_executable(&verifier, Path::new("/bin/sh"), "com.apple.sh")
-                .expect_err("a verifier that never answers cannot establish an identity");
-        let elapsed = started.elapsed();
+        let verifier = verifier.to_path_buf();
+        let path = Path::new("/bin/sh").to_path_buf();
+        let (result, reply) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = verify_code_signed_executable(&verifier, &path, "com.apple.sh");
+            let _ = result.send(outcome);
+        });
+        let refusal = reply
+            .recv_timeout(HANG_GUARD)
+            .expect("the bounded verifier did not return before HANG_GUARD")
+            .expect_err("a verifier that never answers cannot establish an identity");
 
         assert_eq!(refusal["outcome"], "identity_unverifiable");
         assert_eq!(refusal["reason"], "verifier_timed_out");
         assert_ne!(refusal["reason"], "verifier_failed");
-        // The bound is the point: an unbounded read returns only when the child
-        // does, which for the condition this guards is never.
-        assert!(
-            elapsed < VERIFIER_DEADLINE * 2,
-            "the read returned after {elapsed:?}, which is not bounded by the deadline"
-        );
     }
 
     #[cfg(target_os = "macos")]

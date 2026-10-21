@@ -39,6 +39,10 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
+#[path = "it/support/hang_guard.rs"]
+mod support;
+use support::HANG_GUARD;
+
 #[path = "../examples/support/cingulate_answer.rs"]
 mod cingulate_answer;
 use cingulate_answer::cingulate::ScriptedCarrier;
@@ -204,7 +208,7 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
     .await
     .expect("the grant request and its question complete");
     assert_eq!(reply["outcome"], "consent_pending", "{reply}");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !planes
             .management
             .agent_grants()
@@ -3068,7 +3072,7 @@ async fn cookie_values_never_leave_the_driver() {
     )
     .await;
     assert_eq!(presented["outcome"], "presented", "{presented}");
-    tokio::time::timeout(Duration::from_secs(6), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if planes
                 .browser
@@ -5101,7 +5105,7 @@ async fn drain_browser(planes: &Planes) {
 async fn consent_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
     // Production deadlines are asserted separately; this receive bound also
     // allows for a loaded test runner scheduling the reply producer.
-    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("prompt reply")
         .unwrap()
@@ -5424,7 +5428,7 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
     assert_eq!(metrics["inFlightActions"], 0);
     assert_eq!(metrics["awaitingConsent"], 1);
     let status = tokio::time::timeout(
-        Duration::from_secs(1),
+        HANG_GUARD,
         invoke_existing(&planes, 802, "browser.status", json!({})),
     )
     .await
@@ -5432,12 +5436,9 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
     assert_eq!(status.header.ty, FrameType::Response);
     // Status reads the session table. The inner CDP lane is also released:
     // consent holds only the outer call queue, not access needed by idle sweeps.
-    let lane = tokio::time::timeout(
-        Duration::from_secs(1),
-        planes.browser.lane_for_test("test-session"),
-    )
-    .await
-    .expect("conversation lane must not wait on consent");
+    let lane = tokio::time::timeout(HANG_GUARD, planes.browser.lane_for_test("test-session"))
+        .await
+        .expect("conversation lane must not wait on consent");
     drop(lane);
     answer_browser(&planes, &tx, &question, "deny").await;
     consent_frame(&mut rx).await;
@@ -5525,7 +5526,7 @@ async fn blocking_browser_grant_goodbye_and_drain_withdraw_only_held_cards() {
                 consent_frame(&mut rx).await;
             }
             if !timed_out {
-                tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::time::timeout(HANG_GUARD, async {
                     while !ScriptedCarrier::for_planes(&planes)
                         .calls()
                         .iter()
@@ -6251,7 +6252,7 @@ async fn flow_id_scope_stamp_binds_but_session_calls_are_refused() {
 
 /// Wait until the launcher's browser has recorded `effect`.
 async fn effect_seen(launcher: &RecordingLauncher, effect: &'static str) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !launcher.effects.lock().unwrap().contains(&effect) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -6262,7 +6263,7 @@ async fn effect_seen(launcher: &RecordingLauncher, effect: &'static str) {
 
 /// The next frame the module writes for `corr`, skipping frames for others.
 async fn frame_for(rx: &mut mpsc::Receiver<Frame>, corr: u64) -> Frame {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             let frame = rx.recv().await.unwrap();
             if frame.header.corr == corr {
@@ -6387,7 +6388,7 @@ async fn a_call_on_a_quarantined_session_is_a_target_busy_result_recorded_refuse
 
     // The quarantine clears when the worker ends.
     drop(hold);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             let status = invoke_existing(&planes, 804, "browser.status", json!({})).await;
             if body(&status).get("remedy").is_none() {
@@ -6533,7 +6534,7 @@ async fn a_stuck_worker_keeps_its_permits_until_it_ends() {
     );
 
     drop(hold);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         for corr in 803.. {
             cerebellum::handle_frame_for_test(other_close(corr), &tx, &planes)
                 .await
@@ -6989,7 +6990,7 @@ async fn close_scoped_route(
 }
 
 async fn next_describe(rx: &mut mpsc::Receiver<Frame>) -> Frame {
-    let question = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let question = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the module asks the daemon about the scope")
         .unwrap();
@@ -7045,7 +7046,7 @@ fn describe_answer(
 }
 
 async fn wait_until_closed(planes: &Planes) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while planes.sessions.has_open_session("test-session") {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -8092,7 +8093,7 @@ mod resource_busy_wire {
     }
 
     async fn resource_busy_pair(flow_holds: Option<bool>) {
-        let since = SystemTime::now()
+        let run_stamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
@@ -8103,7 +8104,7 @@ mod resource_busy_wire {
         static ROOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = ROOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root: PathBuf = std::env::temp_dir().join(format!(
-            "ck-resource-busy-{}-{since}-{sequence}",
+            "ck-resource-busy-{}-{run_stamp_ms}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir(&root).unwrap();
@@ -8183,7 +8184,17 @@ mod resource_busy_wire {
             .unwrap();
             assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
         }
+        // The holder timestamp is recorded during this launch. Bracket that
+        // operation at millisecond precision so setup time under load cannot
+        // make freshness a fixed-width timing assertion.
+        let before_holder_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let launched = launch(&planes, 9).await;
+        let after_holder = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let after_holder_ms = after_holder.as_millis() as u64
+            + u64::from(!after_holder.subsec_nanos().is_multiple_of(1_000_000));
         assert_eq!(launched["outcome"], "launched", "{launched}");
         tokio::time::sleep(Duration::from_millis(80)).await;
         let reply = launch(&planes, 10).await;
@@ -8206,7 +8217,7 @@ mod resource_busy_wire {
         if flow_holds != Some(true) {
             assert!(reply["detail"]["holder"].get("flow_id").is_none());
         }
-        assert!(detail.since_ms >= since && detail.since_ms <= since + 3000);
+        assert!(detail.since_ms >= before_holder_ms && detail.since_ms <= after_holder_ms);
         assert!(
             detail.retry_after_ms <= config().browser_idle_timeout_ms - 50,
             "retry hint ignores activity: {reply}"
@@ -8744,7 +8755,7 @@ async fn flow_wire_call(planes: &Planes, corr: u64, action: Value) -> Value {
     cerebellum::handle_frame_for_test(request(corr, "browser_use", action), &tx, planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -8949,7 +8960,7 @@ async fn flow_recovery_and_profile_rebind_consent_sites_never_open_cards() {
         cerebellum::handle_frame_for_test(frame, &tx, &planes)
             .await
             .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -9070,7 +9081,7 @@ async fn flow_operator_operations_cannot_list_or_revoke_app_grants() {
         cerebellum::handle_frame_for_test(frame, &tx, &planes)
             .await
             .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -9851,7 +9862,7 @@ async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Val
     cerebellum::handle_frame_for_test(frame, &tx, planes)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -10081,7 +10092,7 @@ impl cerebellum::agent_grants::AgentGrantStorage for HeldAgentGrantSave {
         let (_released, wait) = self
             .release
             .1
-            .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+            .wait_timeout_while(released, HANG_GUARD, |released| !*released)
             .unwrap();
         assert!(
             !wait.timed_out(),
@@ -10115,7 +10126,7 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
     cerebellum::handle_frame_for_test(blocking_navigation(3), &tx, &planes)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !service
             .calls()
             .iter()
@@ -10143,7 +10154,7 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
             drain_browser(&planes).await;
         })
     };
-    tokio::time::timeout(Duration::from_secs(10), storage.started.notified())
+    tokio::time::timeout(HANG_GUARD, storage.started.notified())
         .await
         .unwrap();
     assert_eq!(
