@@ -248,26 +248,12 @@ impl CursorLine {
     }
 }
 
-/// Glide time grows with distance, from a quick 180 ms hop to a 450 ms
-/// cross-screen move, so short moves feel snappy and long ones stay legible.
-/// With Reduce Motion the picture does a short fade-move instead of gliding.
-/// A zero or malformed distance needs no glide at all.
-pub fn duration_ms(distance: f64, reduce_motion: bool) -> f64 {
-    let distance = if distance.is_finite() {
-        distance.max(0.0)
-    } else {
-        0.0
-    };
-    if distance < 0.5 {
-        return 0.0;
-    }
-    if reduce_motion {
-        return REDUCED_MOVE_MS;
-    }
-    (180.0 + distance * 0.25).min(450.0)
-}
-
-const REDUCED_MOVE_MS: f64 = 140.0;
+// The glide and entry timings live in one file shared with the helper's
+// crate, so the helper's animation and the module's wait for it agree.
+pub use crate::cursor_timeline::{
+    duration_ms, entry_ms, tip_arrival_ms, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
+    LONGEST_GLIDE_MS,
+};
 const TAP_MS: f64 = 180.0;
 const SETTLE_MS: f64 = 220.0;
 
@@ -783,9 +769,28 @@ mod tests {
             last = ms;
         }
         // Reduce Motion: a short fade-move, the same for every distance.
-        assert_eq!(duration_ms(10.0, true), REDUCED_MOVE_MS);
-        assert_eq!(duration_ms(5000.0, true), REDUCED_MOVE_MS);
+        assert_eq!(duration_ms(10.0, true), 140.0);
+        assert_eq!(duration_ms(5000.0, true), 140.0);
         assert_eq!(duration_ms(0.0, true), 0.0);
+    }
+
+    #[test]
+    fn a_first_appearance_arrives_when_its_entry_ends_and_a_later_event_when_its_glide_does() {
+        // A first appearance plays its entry on the target whatever the
+        // distance: 1040 ms, or a 300 ms fade under Reduce Motion.
+        for distance in [0.0, 400.0, 10_000.0] {
+            assert_eq!(tip_arrival_ms(distance, true, false), 1040.0);
+            assert_eq!(tip_arrival_ms(distance, true, true), 300.0);
+        }
+        // Every later event glides.
+        assert_eq!(tip_arrival_ms(400.0, false, false), 280.0);
+        assert_eq!(tip_arrival_ms(10_000.0, false, false), 450.0);
+        assert_eq!(tip_arrival_ms(400.0, false, true), 140.0);
+        assert_eq!(tip_arrival_ms(0.0, false, false), 0.0);
+        // Nothing takes longer than the longest arrival, which is the entry.
+        assert_eq!(LONGEST_ARRIVAL_MS, 1040.0);
+        assert_eq!(LONGEST_GLIDE_MS, 450.0);
+        assert_eq!(entry_ms(false), LONGEST_ARRIVAL_MS);
     }
 
     #[test]

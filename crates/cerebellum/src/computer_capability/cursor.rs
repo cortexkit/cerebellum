@@ -2,6 +2,7 @@
 //! returns an action outcome or receives a request body.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(any(target_os = "macos", test))]
@@ -9,15 +10,26 @@ use std::time::Instant;
 
 use cerebellum_computer::app_state::source::{AppStateSource, CursorWindowWatch, ElementHandle};
 use cerebellum_computer::cursor::{
-    follow_offset, label, CursorEvent, CursorFollow, CursorHide, CursorKind, CursorLine,
-    WindowChange,
+    follow_offset, label, tip_arrival_ms, CursorEvent, CursorFollow, CursorHide, CursorKind,
+    CursorLine, WindowChange, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
 };
 use cerebellum_computer::platform::ProcessGrant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::terminal_arbiter::TerminalArbiter;
 
 const READ_BUDGET: Duration = Duration::from_millis(50);
+/// The longest an action waits for its badge before it is sent: the badge's
+/// geometry read, then the longest animation the helper plays before the
+/// badge is on its target (a first appearance's entry; a glide is shorter).
+/// The action waits so that the real click and the badge's tap happen
+/// together. The call's work budget counts this as
+/// `budgets::CURSOR_ARRIVAL_MS`.
+pub(crate) const ARRIVAL_CAP: Duration =
+    Duration::from_millis(READ_BUDGET.as_millis() as u64 + LONGEST_ARRIVAL_MS as u64);
+/// How often a waiting action looks again at what can only be read, not
+/// awaited: the call's dispatch gate and whether the badge was ended.
+const ARRIVAL_POLL: Duration = Duration::from_millis(10);
 const CAPACITY: usize = 32;
 /// Bounds each memory-only record of who drew a badge. Far more than the agents
 /// one person runs at once; past it the oldest record goes, and that agent's
@@ -90,6 +102,79 @@ struct Drawn {
     /// Which head session drew which agent's badge, least recently drawn
     /// first.
     sessions: VecDeque<(SessionScope, String)>,
+    /// Where each agent's badge was last sent, so the next picture's glide
+    /// length, and so the moment it arrives, can be worked out here.
+    tips: HashMap<String, Tip>,
+}
+
+/// One agent's badge as the module last sent it to the helper.
+struct Tip {
+    /// The picture event it was sent for.
+    serial: u64,
+    /// Where its tip was sent.
+    to: [f64; 2],
+    /// How far the window under it has moved since, as last reported to the
+    /// helper, which moves the badge by as much.
+    offset: [f64; 2],
+    /// When that event was sent: the helper's idle fade counts from it.
+    sent: tokio::time::Instant,
+}
+
+impl Tip {
+    fn place(&self) -> [f64; 2] {
+        [self.to[0] + self.offset[0], self.to[1] + self.offset[1]]
+    }
+}
+
+impl Drawn {
+    /// Record a picture just sent to the helper and answer when its badge
+    /// will be on its target, by the timeline the helper animates.
+    ///
+    /// A badge the helper is not showing (never drawn, ended, or faded out
+    /// after the idle timeout) appears with its entry animation; one already
+    /// on screen glides from where it rests. A read with nothing to aim at
+    /// leaves a shown badge where it is.
+    fn land(
+        &mut self,
+        event: &CursorEvent,
+        now: tokio::time::Instant,
+        reduce_motion: bool,
+    ) -> tokio::time::Instant {
+        let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
+        let shown = self
+            .tips
+            .get(&event.agent)
+            .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
+            .map(Tip::place);
+        let to = match (event.resting, shown) {
+            (true, Some(resting)) => resting,
+            _ => event.to,
+        };
+        let distance = shown.map_or(0.0, |from| (to[0] - from[0]).hypot(to[1] - from[1]));
+        let arrival_ms = tip_arrival_ms(distance, shown.is_none(), reduce_motion);
+        if self.tips.len() >= RECORD_CAP && !self.tips.contains_key(&event.agent) {
+            // Bounded like the other records: the oldest goes, and its agent's
+            // next picture is simply taken for a first appearance.
+            if let Some(oldest) = self
+                .tips
+                .iter()
+                .min_by_key(|(_, tip)| tip.sent)
+                .map(|(agent, _)| agent.clone())
+            {
+                self.tips.remove(&oldest);
+            }
+        }
+        self.tips.insert(
+            event.agent.clone(),
+            Tip {
+                serial: event.serial,
+                to,
+                offset: [0.0, 0.0],
+                sent: now,
+            },
+        );
+        now + Duration::from_secs_f64(arrival_ms.max(0.0) / 1000.0)
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +190,12 @@ struct State {
     avatars: OnceLock<Arc<avatar::Avatars>>,
     #[cfg(target_os = "macos")]
     generation: std::sync::Mutex<Option<cerebellum_macos::ProcessGeneration>>,
+    /// The helper could not be started and will not be retried, so nothing
+    /// sent to it is drawn and no action waits for a badge.
+    helper_down: std::sync::atomic::AtomicBool,
+    /// Stands in for the system's Reduce Motion setting in tests.
+    #[cfg(test)]
+    reduce_motion_for_test: std::sync::Mutex<Option<bool>>,
 }
 
 /// One badge following its window: when the person moves or resizes the
@@ -207,12 +298,37 @@ impl Coordinator {
         self.send_line(CursorLine::Picture(event));
     }
 
-    fn send_line(&self, line: CursorLine) {
+    /// Whether the line was put on the pipe to the helper.
+    fn send_line(&self, line: CursorLine) -> bool {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+            return false;
         }
-        if let Some(sender) = self.0.sender.get() {
-            let _ = sender.try_send(line);
+        self.0
+            .sender
+            .get()
+            .is_some_and(|sender| sender.try_send(line).is_ok())
+    }
+
+    /// The system's Reduce Motion setting, read the way the helper reads it,
+    /// so both work out the same animation. Where it cannot be read, the
+    /// full animation is assumed.
+    fn reduce_motion(&self) -> bool {
+        #[cfg(test)]
+        if let Some(reduce) = *self
+            .0
+            .reduce_motion_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return reduce;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            cerebellum_macos::reduce_motion()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
         }
     }
 
@@ -241,6 +357,9 @@ impl Coordinator {
             agent.to_owned(),
             self.0.serial.load(std::sync::atomic::Ordering::SeqCst),
         );
+        // The helper takes the badge off the screen, so the agent's next
+        // picture is a new appearance.
+        drawn.tips.remove(agent);
         // Sent while holding the record, so a picture whose read finishes now
         // either goes out before this hide or sees the end and is dropped.
         self.send_line(CursorLine::Hide(CursorHide::new(agent)));
@@ -423,15 +542,27 @@ impl Coordinator {
         let follows = self.follows();
         // Sent only if the badge still rests on the same event, so a report
         // computed against an older event never moves a newer picture.
-        if follows
+        let moved = follows
             .get(agent)
             .is_some_and(|follow| follow.id == id && follow.serial == serial)
-        {
-            self.send_line(CursorLine::Follow(CursorFollow {
+            && self.send_line(CursorLine::Follow(CursorFollow {
                 agent: agent.to_owned(),
                 serial,
                 offset,
             }));
+        // Released first: the record's lock is always taken before this one.
+        drop(follows);
+        if moved {
+            // The helper moves the badge with the window, so the next glide
+            // starts from there.
+            if let Some(tip) = self
+                .drawn()
+                .tips
+                .get_mut(agent)
+                .filter(|tip| tip.serial == serial)
+            {
+                tip.offset = offset;
+            }
         }
     }
 
@@ -511,17 +642,30 @@ impl Coordinator {
     }
 
     /// Send a scheduled picture unless its agent was ended after it was
-    /// scheduled.
-    fn send_unless_ended(&self, event: CursorEvent) {
-        let drawn = self.drawn();
+    /// scheduled. Answers when the badge will be on its target, or `None`
+    /// when nothing will be drawn.
+    fn send_unless_ended(
+        &self,
+        event: CursorEvent,
+        reduce_motion: bool,
+    ) -> Option<tokio::time::Instant> {
+        let mut drawn = self.drawn();
         if drawn
             .ended_at
             .get(&event.agent)
             .is_some_and(|ended| event.serial < *ended)
         {
-            return;
+            return None;
         }
-        self.send(event);
+        if !self.send_line(CursorLine::Picture(event.clone())) {
+            return None;
+        }
+        let arrival = drawn.land(&event, tokio::time::Instant::now(), reduce_motion);
+        (!self
+            .0
+            .helper_down
+            .load(std::sync::atomic::Ordering::Acquire))
+        .then_some(arrival)
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
@@ -535,7 +679,7 @@ impl Coordinator {
         source: Arc<dyn AppStateSource>,
         handle: Option<ElementHandle>,
         point: Option<[f64; 2]>,
-    ) {
+    ) -> Arrival {
         self.schedule_with_fallback(
             identity,
             kind,
@@ -546,7 +690,7 @@ impl Coordinator {
                 focused: None,
             },
             point,
-        );
+        )
     }
 
     /// Schedule a read with a focused fallback if its preferred element has
@@ -560,11 +704,11 @@ impl Coordinator {
         source: Arc<dyn AppStateSource>,
         aim: ReadAim,
         point: Option<[f64; 2]>,
-    ) {
+    ) -> Arrival {
         if self.0.sender.get().is_none()
             || self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return Arrival::none();
         }
         let cursor = self.clone();
         // Numbered before it is recorded: an end that lands in between then
@@ -574,8 +718,19 @@ impl Coordinator {
             .serial
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cursor.record(&identity);
+        let (decided, decision) = oneshot::channel();
+        let arrival = Arrival {
+            decision: Some(decision),
+            scheduled: tokio::time::Instant::now(),
+            watch: Some(BadgeWatch {
+                cursor: self.clone(),
+                agent: identity.badge.clone(),
+                serial,
+            }),
+        };
         let source_for_follow = source.clone();
         let read_grant = grant.clone();
+        let reader = self.clone();
         tokio::spawn(async move {
             let agent = identity.badge;
             #[cfg(not(target_os = "macos"))]
@@ -618,6 +773,7 @@ impl Coordinator {
                     return None;
                 }
                 let to = source.visible_cursor_point(&read_grant, point, frame)?;
+                let reduce_motion = reader.reduce_motion();
                 Some((
                     CursorEvent {
                         initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
@@ -633,9 +789,12 @@ impl Coordinator {
                         avatar_tint: None,
                     },
                     aimed_handle,
+                    reduce_motion,
                 ))
             });
-            if let Ok(Ok(Some((event, followed_element)))) =
+            // A read that fails or runs out of time drops `decided`, which
+            // tells a waiting action that no badge will be drawn.
+            if let Ok(Ok(Some((event, followed_element, reduce_motion)))) =
                 tokio::time::timeout(READ_BUDGET, read).await
             {
                 // A badge for an agent whose avatar colour is already known
@@ -650,7 +809,7 @@ impl Coordinator {
                     }
                     event
                 };
-                cursor.send_unless_ended(event.clone());
+                let _ = decided.send(cursor.send_unless_ended(event.clone(), reduce_motion));
                 // Off the read's deadline: following the window is a nicety
                 // that must never hold up or drop the picture itself.
                 let follower = cursor.clone();
@@ -674,6 +833,7 @@ impl Coordinator {
                 }
             }
         });
+        arrival
     }
 
     /// Signal before browser teardown starts. Reaping and any blocked pipe write
@@ -683,6 +843,7 @@ impl Coordinator {
             .stopped
             .store(true, std::sync::atomic::Ordering::Release);
         self.follows().clear();
+        self.drawn().tips.clear();
         #[cfg(target_os = "macos")]
         if let Some(generation) = *self
             .0
@@ -708,6 +869,140 @@ impl Coordinator {
                 avatar_update: false,
                 avatar_tint: None,
             }));
+        }
+    }
+}
+
+/// When the badge an action scheduled will be on its target.
+///
+/// An action that shows a badge waits for this before it is sent, so the real
+/// press or write happens as the badge arrives and taps, not before it sets
+/// off. The wait first hears whether a picture went out at all (the geometry
+/// read decides that, within `READ_BUDGET`), then lasts until the arrival
+/// the helper's timeline gives. Nothing to see means no wait.
+pub(crate) struct Arrival {
+    /// Answers once the picture is sent, with the moment its badge arrives,
+    /// or with nothing (or is dropped) when no picture will be drawn.
+    decision: Option<oneshot::Receiver<Option<tokio::time::Instant>>>,
+    /// When the picture was scheduled; no wait runs past this plus
+    /// `ARRIVAL_CAP`.
+    scheduled: tokio::time::Instant,
+    watch: Option<BadgeWatch>,
+}
+
+/// How a wait for a badge ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Landing {
+    /// Send the action now: the badge is on its target, or no picture will
+    /// be drawn. `drawn` says whether a picture was drawn for it.
+    Arrived { drawn: bool },
+    /// The call was cancelled while it waited.
+    Cancelled,
+    /// The agent's badge was ended (its turn ended, its route closed) after
+    /// this action scheduled its picture: the agent is done with the
+    /// computer, so the action is not sent.
+    Ended,
+    /// The call's work deadline passed, or its dispatch gate closed.
+    Stopped,
+}
+
+/// One scheduled picture, as an action that waits for it watches it.
+#[derive(Clone)]
+pub(crate) struct BadgeWatch {
+    cursor: Coordinator,
+    agent: String,
+    serial: u64,
+}
+
+impl BadgeWatch {
+    /// Whether the agent's badge was ended after this picture was scheduled.
+    /// An end before it (the previous turn's) does not count: this picture
+    /// draws a new badge.
+    pub(crate) fn ended(&self) -> bool {
+        self.cursor
+            .drawn()
+            .ended_at
+            .get(&self.agent)
+            .is_some_and(|ended| self.serial < *ended)
+    }
+
+    fn helper_stopped(&self) -> bool {
+        self.cursor
+            .0
+            .stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Arrival {
+    /// No picture: the action goes ahead at once.
+    pub(crate) fn none() -> Self {
+        Self {
+            decision: None,
+            scheduled: tokio::time::Instant::now(),
+            watch: None,
+        }
+    }
+
+    /// The picture this waits for, to check right before the action is sent
+    /// whether its badge was ended meanwhile.
+    pub(crate) fn watch(&self) -> Option<BadgeWatch> {
+        self.watch.clone()
+    }
+
+    /// Wait until the badge is on its target, or until the call must not be
+    /// sent: `cancelled` resolves, `stopped` answers true (the call's
+    /// dispatch gate closed), or `deadline` passes first. Never longer than
+    /// `ARRIVAL_CAP` after the picture was scheduled.
+    pub(crate) async fn wait(
+        self,
+        deadline: tokio::time::Instant,
+        cancelled: impl Future<Output = ()>,
+        stopped: impl Fn() -> bool,
+    ) -> Landing {
+        tokio::pin!(cancelled);
+        let cap = self.scheduled + ARRIVAL_CAP;
+        let (mut decision, mut deciding) = match self.decision {
+            Some(decision) => (decision, true),
+            None => (oneshot::channel().1, false),
+        };
+        let mut landing = None;
+        loop {
+            if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
+                return Landing::Ended;
+            }
+            if stopped() {
+                return Landing::Stopped;
+            }
+            let drawn = landing.is_some();
+            let until = if deciding {
+                cap
+            } else {
+                match landing {
+                    // A stopped helper draws nothing more: nothing to wait for.
+                    Some(at) if !self.watch.as_ref().is_some_and(BadgeWatch::helper_stopped) => {
+                        std::cmp::min(at, cap)
+                    }
+                    _ => return Landing::Arrived { drawn },
+                }
+            };
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                return Landing::Arrived { drawn };
+            }
+            if now >= deadline {
+                return Landing::Stopped;
+            }
+            let wake = until.min(deadline).min(now + ARRIVAL_POLL);
+            tokio::select! {
+                biased;
+                () = &mut cancelled => return Landing::Cancelled,
+                decided = &mut decision, if deciding => {
+                    deciding = false;
+                    landing = decided.ok().flatten();
+                }
+                () = tokio::time::sleep_until(wake) => {}
+            }
         }
     }
 }
@@ -758,6 +1053,9 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 continue;
             }
             if !restarts.admit(Instant::now()) {
+                state
+                    .helper_down
+                    .store(true, std::sync::atomic::Ordering::Release);
                 continue;
             }
             let launched = (|| {
@@ -779,6 +1077,11 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 Some((child, std::fs::File::from(pipe)))
             })();
             helper = launched;
+            // A helper that did not start draws nothing; until another one
+            // starts, no action waits for its badge.
+            state
+                .helper_down
+                .store(helper.is_none(), std::sync::atomic::Ordering::Release);
         }
         let Some(line) = event.encode_line() else {
             continue;

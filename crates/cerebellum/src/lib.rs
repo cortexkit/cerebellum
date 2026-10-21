@@ -7805,7 +7805,9 @@ fn session_flow_refusal(facts: &AcceptedBindFacts) -> Option<Value> {
 /// a Prefrontal-only operation. Once admitted and well formed, the reply is
 /// always an acknowledgement, even for a session that drew no badge: the
 /// caller learns nothing about which sessions used the computer. It writes no
-/// journal, cancels nothing, and touches nothing but the cursor badge.
+/// journal and touches nothing but the cursor badge: it hides the badge, and
+/// an action of that agent still waiting for its badge to arrive will not
+/// start. It never touches an action already dispatched.
 async fn handle_session_turn_ended(
     writer: &mpsc::Sender<Frame>,
     facts: &AcceptedBindFacts,

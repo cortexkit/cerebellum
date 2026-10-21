@@ -17,6 +17,8 @@
 //! guards against a caller that confused two applications' ids: one naming
 //! another application is refused, and otherwise it changes nothing.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::person::{person_change, PersonChange, SeenMarks};
@@ -31,9 +33,10 @@ use cerebellum_computer::app_state::source::{
     TextAttribute,
 };
 use cerebellum_computer::audit::{
-    ActuationElementIdentity, ActuationIntent, AuditToken, ComputerCapability,
-    ComputerPlaneDescriptor, ObservationState,
+    AccessibilityReadScope, ActuationElementIdentity, ActuationIntent, AuditToken,
+    ComputerCapability, ComputerPlaneDescriptor, ObservationState,
 };
+use cerebellum_computer::dispatch::MutationGate;
 use cerebellum_computer::grounding::ContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     frozen_row_bound_ms, frozen_row_effect_deadline_ms,
@@ -44,6 +47,7 @@ use cerebellum_core::journal::{
 };
 use serde_json::{json, Value};
 
+use super::cursor::{Arrival, BadgeWatch, Landing};
 use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
@@ -90,6 +94,57 @@ pub(crate) fn previous_run_reply() -> Value {
         "outcome": "stale_element",
         "remedy": "read_state again; ids from before a restart no longer apply",
     })
+}
+
+/// The reply for an action that waited for its badge and was cancelled
+/// before it was sent: by the caller, or by the agent's turn ending while the
+/// badge was still on its way. Nothing was pressed or written.
+pub(crate) fn cancelled_before_dispatch_reply() -> Value {
+    json!({
+        "outcome": "cancelled",
+        "detail": {"dispatched": false, "step": "dispatch", "reason": "cancelled"},
+        "remedy": "the call was cancelled before the action was sent; nothing was done",
+    })
+}
+
+/// The call's dispatch gate for an action that showed a badge. It also
+/// refuses once that badge was ended after the action scheduled it (the
+/// agent's turn ended, or its route closed): the check is made at the moment
+/// the action would be sent, so an end that lands while the element is still
+/// being checked still stops it.
+struct BadgeGate {
+    call: Arc<dyn MutationGate>,
+    watch: Option<BadgeWatch>,
+    ended: AtomicBool,
+}
+
+impl BadgeGate {
+    fn new(call: Arc<dyn MutationGate>, watch: Option<BadgeWatch>) -> Arc<Self> {
+        Arc::new(Self {
+            call,
+            watch,
+            ended: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether this gate refused the action because the badge was ended.
+    fn refused_for_end(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+}
+
+impl MutationGate for BadgeGate {
+    fn begin_mutation(&self) -> bool {
+        if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
+            self.ended.store(true, Ordering::SeqCst);
+            return false;
+        }
+        self.call.begin_mutation()
+    }
+
+    fn stopped(&self) -> bool {
+        self.call.stopped()
+    }
 }
 
 /// The refusal for an action on an application the person used since this
@@ -1109,6 +1164,15 @@ pub(crate) fn target_mismatch_reply(target: &str) -> Value {
     })
 }
 
+/// Who presses, for which call, and through which capability.
+struct PressCall<'a> {
+    identity: JournalIdentity,
+    management: &'a ManagementPlane,
+    cancel: &'a CancelHandle,
+    sessions: Arc<AppStateSessions>,
+    capability: ComputerCapability,
+}
+
 enum PressTarget {
     Element {
         element_id: String,
@@ -1335,9 +1399,13 @@ where
         }
         let mut reply = self
             .press_and_diff(
-                identity,
-                sessions,
-                ComputerCapability::PressElement,
+                PressCall {
+                    identity,
+                    management,
+                    cancel: &cancel,
+                    sessions,
+                    capability: ComputerCapability::PressElement,
+                },
                 grant,
                 PressTarget::Element { element_id, handle },
                 view,
@@ -1426,9 +1494,13 @@ where
         let application_name = management.application_name(&grant);
         let mut reply = self
             .press_and_diff(
-                identity,
-                sessions,
-                ComputerCapability::PressPoint,
+                PressCall {
+                    identity,
+                    management,
+                    cancel: &cancel,
+                    sessions,
+                    capability: ComputerCapability::PressPoint,
+                },
                 grant,
                 PressTarget::Point {
                     point,
@@ -1515,10 +1587,9 @@ where
             admission.decorate(&mut busy);
             return busy;
         }
-        let audit = AuditToken::new(self.audit.clone(), work.gate());
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
-        self.cursor.schedule(
+        let arrival = self.cursor.schedule(
             super::cursor::Identity::current(identity.agent_project_id.clone()),
             cerebellum_computer::cursor::CursorKind::Write,
             grant.clone(),
@@ -1526,9 +1597,19 @@ where
             Some(handle.clone()),
             None,
         );
+        let watch = arrival.watch();
+        if let Err(mut refusal) = self
+            .hold_for_badge(arrival, &cancel, management, &conversation_key, &grant)
+            .await
+        {
+            admission.decorate(&mut refusal);
+            return refusal;
+        }
+        let gate = BadgeGate::new(work.gate(), watch);
+        let audit = AuditToken::new(self.audit.clone(), gate.clone());
         let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
-            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+            let _scope = AccessibilityReadScope::new(grant.pid, None);
             let mut journal =
                 ElementJournal::new(audit, identity, ComputerCapability::WriteText, &grant);
             let written = write_blocking(
@@ -1539,7 +1620,11 @@ where
                 &parsed,
                 settle,
             );
-            let mut reply = written;
+            let mut reply = if gate.refused_for_end() {
+                cancelled_before_dispatch_reply()
+            } else {
+                written
+            };
             if matches!(
                 reply["outcome"].as_str(),
                 Some("completed" | "delivery_unconfirmed")
@@ -1563,6 +1648,44 @@ where
         .unwrap_or_else(|_| audit_unavailable_reply(true));
         admission.decorate(&mut reply);
         reply
+    }
+
+    /// Hold an action until its badge is on what it acts on, so the action
+    /// and the badge's tap happen together. When a badge was drawn, the
+    /// person had time to use the application while it travelled, so that is
+    /// asked again here, right before the action is sent. `Err` is the reply
+    /// for an action that will not be sent; nothing was sent for it.
+    ///
+    /// The wait counts against the call's work budget: past the work
+    /// deadline, or once the call's dispatch gate closes, the action is not
+    /// sent and the reply is the usual before-dispatch one.
+    async fn hold_for_badge(
+        &self,
+        arrival: Arrival,
+        cancel: &CancelHandle,
+        management: &ManagementPlane,
+        conversation_key: &str,
+        grant: &ProcessGrant,
+    ) -> Result<(), Value> {
+        let work = super::quarantine::CallWork::current();
+        let deadline = tokio::time::Instant::from_std(work.deadline());
+        match arrival
+            .wait(deadline, cancel.cancelled(), || work.stopped())
+            .await
+        {
+            Landing::Arrived { drawn: false } => Ok(()),
+            Landing::Arrived { drawn: true } => {
+                match self
+                    .refuse_if_person_changed(management, conversation_key, grant)
+                    .await
+                {
+                    Some(refusal) => Err(refusal),
+                    None => Ok(()),
+                }
+            }
+            Landing::Cancelled | Landing::Ended => Err(cancelled_before_dispatch_reply()),
+            Landing::Stopped => Err(super::quarantine::stopped_before_dispatch_reply()),
+        }
     }
 
     /// The refusal for an action on an application the person used since
@@ -1630,34 +1753,44 @@ where
     }
 
     /// Press an element and, when the press went through, wait for its effect
-    /// and add the diff.
+    /// and add the diff. The press waits for the agent's badge to reach the
+    /// element first, so the badge's tap and the press happen together.
     async fn press_and_diff(
         &self,
-        identity: JournalIdentity,
-        sessions: std::sync::Arc<AppStateSessions>,
-        capability: ComputerCapability,
+        call: PressCall<'_>,
         grant: ProcessGrant,
         target: PressTarget,
         view: super::StateView,
     ) -> Value {
+        let PressCall {
+            identity,
+            management,
+            cancel,
+            sessions,
+            capability,
+        } = call;
         let work = super::quarantine::CallWork::current();
         if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
             return busy;
         }
-        let mut audit = AuditToken::new(self.audit.clone(), work.gate());
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
-        let cursor = self.cursor.clone();
-        // Capture the acting agent before the blocking accessibility task: Tokio
-        // task-local session identity does not follow work onto another thread.
+        // Capture the acting agent on the async side: Tokio task-local
+        // session identity does not follow work onto a blocking thread.
         let cursor_identity = super::cursor::Identity::current(identity.agent_project_id.clone());
-        tokio::task::spawn_blocking(move || {
-            let _ax = work.bound_ax();
-            let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            let point = match &target { PressTarget::Point { point, .. } => Some([point.0, point.1]), _ => None };
-            let (element_id, handle) = match target {
-                PressTarget::Element { element_id, handle } => (element_id, handle),
-                PressTarget::Point { point, window_number, application_name } => {
+        let conversation_key = identity.conversation_key.clone();
+        // A point names no element, so the element under it is found first.
+        // `reads` carries what that hit test's accessibility reads found on to
+        // the press's own journal row.
+        let (element_id, handle, point, reads) = match target {
+            PressTarget::Element { element_id, handle } => (element_id, handle, None, None),
+            PressTarget::Point { point, window_number, application_name } => {
+                let mut audit = AuditToken::new(self.audit.clone(), work.gate());
+                let (source, sessions, grant, identity, work) =
+                    (source.clone(), sessions.clone(), grant.clone(), identity.clone(), work.clone());
+                let found = tokio::task::spawn_blocking(move || {
+                    let _ax = work.bound_ax();
+                    let _scope = AccessibilityReadScope::new(grant.pid, None);
                     let hit = hit_test(source.as_ref(), &grant, point);
                     let found = match hit {
                         // Checked before the element is given an id, so an
@@ -1679,20 +1812,66 @@ where
                         })),
                     };
                     match found {
-                        Ok(found) => found,
+                        Ok((id, handle)) => Ok((id, handle, AccessibilityReadScope::current())),
                         Err(reply) => {
-                            if audit.record_accessibility_read(identity.clone(), capability, &grant, || ()).is_err() {
-                                return audit_unavailable_reply(false);
+                            if audit.record_accessibility_read(identity, capability, &grant, || ()).is_err() {
+                                return Err(audit_unavailable_reply(false));
                             }
-                            return reply;
+                            Err(reply)
                         }
                     }
+                })
+                .await
+                .unwrap_or_else(|_| Err(audit_unavailable_reply(false)));
+                match found {
+                    Ok((id, handle, reads)) => (id, handle, Some([point.0, point.1]), reads),
+                    Err(reply) => return reply,
                 }
-            };
-            cursor.schedule(cursor_identity, cerebellum_computer::cursor::CursorKind::Press,
-                grant.clone(), source.clone(), Some(handle.clone()), point);
+            }
+        };
+        let arrival = self.cursor.schedule(
+            cursor_identity,
+            cerebellum_computer::cursor::CursorKind::Press,
+            grant.clone(),
+            source.clone(),
+            Some(handle.clone()),
+            point,
+        );
+        let watch = arrival.watch();
+        if let Err(reply) = self
+            .hold_for_badge(arrival, cancel, management, &conversation_key, &grant)
+            .await
+        {
+            if point.is_none() {
+                return reply;
+            }
+            // The hit test read the application; journal that read, as a
+            // refused hit test does.
+            let mut audit = AuditToken::new(self.audit.clone(), work.gate());
+            return tokio::task::spawn_blocking(move || {
+                let _ax = work.bound_ax();
+                let _scope = AccessibilityReadScope::new(grant.pid, reads);
+                if audit
+                    .record_accessibility_read(identity, capability, &grant, || ())
+                    .is_err()
+                {
+                    return audit_unavailable_reply(false);
+                }
+                reply
+            })
+            .await
+            .unwrap_or_else(|_| audit_unavailable_reply(false));
+        }
+        let gate = BadgeGate::new(work.gate(), watch);
+        let audit = AuditToken::new(self.audit.clone(), gate.clone());
+        tokio::task::spawn_blocking(move || {
+            let _ax = work.bound_ax();
+            let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
             let mut reply = press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
+            if gate.refused_for_end() {
+                reply = cancelled_before_dispatch_reply();
+            }
             if reply["outcome"] == "completed" {
                 let observed = settle_and_observe_view(
                     source.as_ref(),

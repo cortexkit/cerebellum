@@ -50,20 +50,15 @@ impl FrameClock {
     }
 }
 
-/// How long a first appearance takes, in ms: the avatar pops in large on the
-/// target, holds a moment, then shrinks onto its place behind the pointer as
-/// the pointer and label come in. The original entry felt too quick, so each
-/// phase now takes twice as long while the gentler Reduce Motion fade stays short.
-pub(crate) const ENTRY_MS: f64 = 1040.0;
+// The entry's whole length, shared with the module, which waits for the
+// entry to end before a first action is sent.
+pub(crate) use crate::cursor_timeline::{ENTRY_MS, REDUCED_ENTRY_MS};
 /// The avatar alone fades in, at its large entry size, over this long.
 const ENTRY_POP_MS: f64 = 200.0;
 /// Then it shrinks from here to the end of the entry.
 const ENTRY_SHRINK_FROM_MS: f64 = 360.0;
 /// The pointer and the label grow and fade in from here to the end.
 const ENTRY_POINTER_FROM_MS: f64 = 520.0;
-/// Under Reduce Motion an entry is a plain fade of the resting badge, with
-/// no scaling and no travel.
-const REDUCED_ENTRY_MS: f64 = 300.0;
 /// The pointer's scale about its tip when it starts to grow in.
 pub(crate) const ENTRY_POINTER_SCALE: f64 = 0.5;
 
@@ -658,11 +653,13 @@ impl ActivityGate {
 /// the call was cancelled), which hides it at once. This timeout is only the
 /// safety net for an end signal that never arrives: two minutes outlasts an
 /// ordinary pause between actions while not leaving a stale badge on screen
-/// for long if an end is lost.
-pub(crate) const IDLE_FADE_AFTER: Duration = Duration::from_secs(2 * 60);
+/// for long if an end is lost. Shared with the module, which treats an action
+/// after the fade as a new first appearance.
+pub(crate) const IDLE_FADE_AFTER: Duration =
+    Duration::from_millis(crate::cursor_timeline::IDLE_FADE_AFTER_MS);
 
 /// The fade itself stays short: once the agent is idle, the badge should go.
-const FADE: Duration = Duration::from_millis(250);
+const FADE: Duration = Duration::from_millis(crate::cursor_timeline::IDLE_FADE_MS);
 
 /// What a drawn picture still needs from the helper's loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1718,5 +1715,78 @@ mod tests {
         assert_eq!(timed_waits, 1, "one sleep across the quiet period");
         assert!(flew, "the flight back drew frames");
         assert!(!gate.held(), "released once the badge landed");
+    }
+
+    /// The module waits for the shared arrival before it presses, so the
+    /// helper must really have the badge on its target by then: no sooner
+    /// (the click would land before the badge) and no later (the badge would
+    /// tap after the click). Steps the helper's own entry and glide clocks a
+    /// millisecond at a time with the shared glide curve, as the module
+    /// supplies it, and reads off when the tip is on the target, fully
+    /// visible, with no entry still playing.
+    #[test]
+    fn the_helper_reaches_its_target_when_the_shared_arrival_says() {
+        use crate::cursor_timeline::{duration_ms, tip_arrival_ms};
+        const STEP: Duration = Duration::from_millis(1);
+        let curves = CursorMotion {
+            duration_ms,
+            position: test_position,
+            settle_scale: |_, _, _| 1.0,
+            fade_alpha: test_fade,
+        };
+        let short = [START[0] + 3.0, START[1] + 4.0];
+        let across = [START[0] + 3000.0, START[1] + 2000.0];
+        for reduce in [false, true] {
+            for (first, to) in [(true, across), (false, short), (false, across)] {
+                let start = Instant::now();
+                let mut appearance = Appearance::default();
+                let mut motion = BadgeMotion::new(start);
+                let mut now = start;
+                if !first {
+                    // A badge already shown, its entry over, resting on START.
+                    appearance.on_event(now, reduce);
+                    motion.on_event(
+                        MotionEvent {
+                            first: true,
+                            ..aim(START, reduce)
+                        },
+                        now,
+                        &curves,
+                    );
+                    while appearance.entering() {
+                        now += STEP;
+                        appearance.frame(now);
+                        motion.frame(now, &curves);
+                    }
+                }
+                let sent = now;
+                assert_eq!(appearance.on_event(sent, reduce), first);
+                motion.on_event(
+                    MotionEvent {
+                        first,
+                        ..aim(to, reduce)
+                    },
+                    sent,
+                    &curves,
+                );
+                let arrived = loop {
+                    let frame = motion.frame(now, &curves);
+                    let entry = appearance.frame(now);
+                    if frame.tip == to && frame.alpha == 1.0 && entry == EntryFrame::REST {
+                        break now;
+                    }
+                    now += STEP;
+                    assert!(now - sent < SECOND * 5, "the badge never arrived");
+                };
+                let distance = (to[0] - START[0]).hypot(to[1] - START[1]);
+                let shared = tip_arrival_ms(distance, first, reduce);
+                let helper = ms(arrived - sent);
+                assert!(
+                    (helper - shared).abs() <= ms(STEP),
+                    "first {first}, reduce {reduce}, to {to:?}: the helper arrived after \
+                     {helper} ms, the shared arrival says {shared} ms"
+                );
+            }
+        }
     }
 }

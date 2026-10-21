@@ -265,9 +265,9 @@ impl CallWork {
     }
 
     /// When the work budget ends: lane acquisition plus the budget, with the
-    /// time parked on a person added back. Only macOS caps its accessibility
-    /// messages by it today.
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    /// time parked on a person added back. macOS caps its accessibility
+    /// messages by it, and an action waiting for its badge to arrive is not
+    /// sent once it has passed.
     pub(crate) fn deadline(&self) -> Instant {
         self.started + self.budget + *self.parked.lock().unwrap()
     }

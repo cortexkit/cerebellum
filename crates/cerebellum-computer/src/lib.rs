@@ -8,6 +8,7 @@ pub mod audit;
 pub mod capture;
 pub mod capture_custody;
 pub mod cursor;
+mod cursor_timeline;
 pub mod dispatch;
 pub mod grounding;
 pub mod platform;

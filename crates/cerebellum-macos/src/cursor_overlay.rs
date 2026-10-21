@@ -750,7 +750,7 @@ impl Picture {
         self.serial = event.serial;
         self.fields.set_avatar(event.avatar_rgba.as_deref());
         self.fields.set_initial(event.initial);
-        let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        let reduce = reduce_motion();
         (self.displays, self.primary_height) = read_displays(mtm);
         let first = self.appearance.on_event(now, reduce);
         // The agent's own colour replaces whatever is shown; the neutral one
@@ -1024,6 +1024,14 @@ fn window_listed_on_screen(number: isize) -> bool {
 
 /// Run only in the hidden helper mode, before any asynchronous runtime exists.
 /// EOF closes the channel and ends the main-thread run loop without saving state.
+/// Whether the person has asked macOS to reduce motion. The helper reads it
+/// for every picture it draws, and the module reads it the same way to know
+/// how long that picture's animation takes before it sends the action.
+/// NSWorkspace answers on any thread.
+pub fn reduce_motion() -> bool {
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
 pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) {
     run_cursor_loop(events, motion, None);
 }
