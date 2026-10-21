@@ -5025,7 +5025,14 @@ fn browser_control_result_schema(outcomes: &[&str], mut properties: Value) -> Va
         Some(detail) => json!({"anyOf": [invalid_request_detail_result_schema(), detail]}),
         None => invalid_request_detail_result_schema(),
     };
-    properties.insert("detail".into(), detail);
+    let cleanup_detail = closed_object(
+        json!({
+            "step": enum_schema(&["graceful_close_request", "wait_for_exit", "forced_termination", "reap_wait"]),
+            "error_kind": string_schema(),
+        }),
+        &["step"],
+    );
+    properties.insert("detail".into(), json!({"anyOf": [detail, cleanup_detail]}));
     properties.insert("remedy".into(), string_schema());
     // `browser.launch` already carries a free-form `reason` for its own
     // refusals; the other two get the closed admission vocabulary.

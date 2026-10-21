@@ -354,7 +354,55 @@ pub trait BrowserSessionLauncher: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessControlFailure;
+pub enum ProcessControlStep {
+    GracefulCloseRequest,
+    WaitForExit,
+    ForcedTermination,
+    ReapWait,
+}
+
+impl ProcessControlStep {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::GracefulCloseRequest => "graceful_close_request",
+            Self::WaitForExit => "wait_for_exit",
+            Self::ForcedTermination => "forced_termination",
+            Self::ReapWait => "reap_wait",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessControlFailure {
+    pub step: ProcessControlStep,
+    pub error_kind: Option<std::io::ErrorKind>,
+}
+
+impl ProcessControlFailure {
+    pub const fn new(step: ProcessControlStep) -> Self {
+        Self {
+            step,
+            error_kind: None,
+        }
+    }
+
+    pub fn from_io(step: ProcessControlStep, error: &std::io::Error) -> Self {
+        Self {
+            step,
+            error_kind: Some(error.kind()),
+        }
+    }
+
+    fn detail(self) -> Value {
+        let mut detail = json!({ "step": self.step.as_str() });
+        if let Some(kind) = self.error_kind {
+            // ErrorKind's variant name is a code word, not the OS message,
+            // which can contain paths or other session data.
+            detail["error_kind"] = json!(format!("{kind:?}"));
+        }
+        detail
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationDriveError {
@@ -1424,6 +1472,7 @@ struct SessionMeta {
     pending_operations: usize,
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
+    process_control_failure: Option<ProcessControlFailure>,
     cleanup_outcome: Option<SessionCleanupOutcome>,
     handoff: Option<HandoffState>,
     /// A `present` has been admitted and has not committed or given up yet.
@@ -1462,6 +1511,7 @@ impl SessionMeta {
             lease: self.lease.clone(),
             terminal: self.terminal,
             cleanup_failure: self.cleanup_failure,
+            process_control_failure: self.process_control_failure,
             cleanup_outcome: self.cleanup_outcome,
             reap_recovery: None,
         }
@@ -1477,6 +1527,7 @@ struct SessionRecord {
     lease: BrowserLease,
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
+    process_control_failure: Option<ProcessControlFailure>,
     cleanup_outcome: Option<SessionCleanupOutcome>,
     reap_recovery: Option<Arc<ReapRecovery>>,
 }
@@ -1494,12 +1545,16 @@ struct ReapRecoveryState {
 impl SessionRecord {
     fn status_json<C: MonotonicClock>(&self, clock: &C, wall_now: SystemTime) -> Value {
         if let Some(stage) = self.cleanup_failure {
-            return json!({
+            let mut reply = json!({
                 "outcome": "cleanup_failure",
                 "browser_session_id": self.browser_session_id,
                 "profile_disposition": self.disposition.as_str(),
                 "stage": stage.as_str(),
             });
+            if let Some(failure) = self.process_control_failure {
+                reply["detail"] = failure.detail();
+            }
+            return reply;
         }
         if let Some(failed_signals) = self
             .cleanup_outcome
@@ -1529,11 +1584,15 @@ impl SessionRecord {
 
     fn close_result(&self) -> Value {
         if let Some(stage) = self.cleanup_failure {
-            return json!({
+            let mut reply = json!({
                 "outcome": "cleanup_failure",
                 "browser_session_id": self.browser_session_id,
                 "stage": stage.as_str(),
             });
+            if let Some(failure) = self.process_control_failure {
+                reply["detail"] = failure.detail();
+            }
+            return reply;
         }
         if let Some(failed_signals) = self
             .cleanup_outcome
@@ -1591,6 +1650,7 @@ impl SessionCell {
                 pending_operations: 0,
                 terminal: None,
                 cleanup_failure: None,
+                process_control_failure: None,
                 cleanup_outcome: None,
                 handoff: None,
                 handoff_opening: false,
@@ -2179,12 +2239,17 @@ impl BrowserSessions {
                 .flat_map(|(route, slot)| {
                     slot.retained.iter().filter_map(|record| {
                         let recovery = record.reap_recovery.clone()?;
-                        Some((route.clone(), record.browser_session_id.clone(), recovery))
+                        Some((
+                            route.clone(),
+                            record.browser_session_id.clone(),
+                            recovery,
+                            record.process_control_failure,
+                        ))
                     })
                 })
                 .collect()
         };
-        for (route, id, recovery) in candidates {
+        for (route, id, recovery, process_control_failure) in candidates {
             let same_session = route == route_key && session_id.is_none_or(|wanted| wanted == id);
             let same_profile = session_id.is_none()
                 && durable_project.is_some()
@@ -2197,10 +2262,16 @@ impl BrowserSessions {
                 .lock()
                 .map_err(|_| internal_failure_reply(BROWSER_SESSION_LOCK_STAGE))?;
             let refusal = |stage: CleanupStage, remedy: String| {
-                json!({
+                let mut reply = json!({
                     "outcome": "cleanup_failure", "browser_session_id": id,
                     "stage": stage.as_str(), "remedy": remedy,
-                })
+                });
+                if stage == CleanupStage::Reap {
+                    if let Some(failure) = process_control_failure {
+                        reply["detail"] = failure.detail();
+                    }
+                }
+                reply
             };
             let outcome = match pending.outcome {
                 Some(outcome) => outcome,
@@ -2232,6 +2303,7 @@ impl BrowserSessions {
             }) {
                 record.terminal = Some(BrowserSessionTerminalOutcome::Closed);
                 record.cleanup_failure = None;
+                record.process_control_failure = None;
                 record.cleanup_outcome = Some(outcome);
                 record.reap_recovery = None;
             }
@@ -3575,19 +3647,22 @@ impl BrowserSessions {
             already_killed,
             grace,
         } = owned;
-        let outcome = if already_killed {
+        let process_outcome = if already_killed {
             // Already dead by the shutdown killer: a graceful close would only
             // write to a closed pipe, so all that is left is the reap.
-            process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
+            process.wait_until_reaped()
         } else {
             teardown_process_with_grace(process.as_mut(), grace)
-        }
-        .and_then(|()| {
-            let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
-            cleanup.set_terminal_outcome(terminal_outcome);
-            cleanup.after_reap()
-        });
-        self.retire(cell, process, cleanup, outcome);
+        };
+        let process_control_failure = process_outcome.err();
+        let outcome = process_outcome
+            .map_err(|_| CleanupStage::Reap)
+            .and_then(|()| {
+                let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
+                cleanup.set_terminal_outcome(terminal_outcome);
+                cleanup.after_reap()
+            });
+        self.retire(cell, process, cleanup, outcome, process_control_failure);
     }
 
     /// Leave the session active with its custody held, if it is still in the
@@ -3669,6 +3744,7 @@ impl BrowserSessions {
         process: Box<dyn OwnedBrowserProcess>,
         mut cleanup: Option<Box<dyn SessionCleanup>>,
         outcome: Result<SessionCleanupOutcome, CleanupStage>,
+        process_control_failure: Option<ProcessControlFailure>,
     ) {
         // The retained record is built before the registry lock is taken.
         let mut record = recovered(cell.meta()).record(&cell.browser_session_id);
@@ -3677,10 +3753,12 @@ impl BrowserSessions {
                 // A shutdown that gave up waiting marked custody held; this
                 // late finish did release it, so that mark no longer applies.
                 record.cleanup_failure = None;
+                record.process_control_failure = None;
                 record.cleanup_outcome = Some(cleanup_outcome);
             }
             Err(stage) => {
                 record.cleanup_failure = Some(stage);
+                record.process_control_failure = process_control_failure;
                 record.terminal = Some(BrowserSessionTerminalOutcome::CleanupFailure);
                 if stage == CleanupStage::Reap {
                     record.reap_recovery = cleanup.take().map(|cleanup| {
@@ -3715,6 +3793,7 @@ impl BrowserSessions {
                 meta.lifecycle = Lifecycle::Retired;
                 meta.terminal = record.terminal;
                 meta.cleanup_failure = record.cleanup_failure;
+                meta.process_control_failure = record.process_control_failure;
                 meta.cleanup_outcome = record.cleanup_outcome;
                 let mut side = self.side();
                 if side
@@ -3779,24 +3858,23 @@ impl BrowserSessions {
                 (process, meta.cleanup.take())
             })
         };
-        let Some((mut process, mut cleanup)) = owned else {
+        let Some((process, cleanup)) = owned else {
             cell.wait_settled();
             return;
         };
         // A browser already killed by its exact generation (the write
         // backstop or a quarantined close) has only its reap left: a graceful
         // close would write to the pipe that wedged.
-        let outcome = if self.cell_killed(cell) {
-            process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
-        } else {
-            teardown_process_with_grace(process.as_mut(), grace)
-        }
-        .and_then(|()| {
-            let cleanup = cleanup.as_mut().ok_or(CleanupStage::CustodyRelease)?;
-            cleanup.set_terminal_outcome(terminal_outcome);
-            cleanup.after_reap()
-        });
-        self.retire(cell, process, cleanup, outcome);
+        self.run_owned_teardown(
+            cell,
+            OwnedTeardown {
+                process,
+                cleanup,
+                terminal_outcome,
+                already_killed: self.cell_killed(cell),
+                grace,
+            },
+        );
     }
 }
 
@@ -3896,27 +3974,25 @@ fn navigation_drive_error_text(error: NavigationDriveError) -> String {
 fn teardown_process_with_grace(
     process: &mut dyn OwnedBrowserProcess,
     grace_period: Duration,
-) -> Result<(), CleanupStage> {
+) -> Result<(), ProcessControlFailure> {
     // Only a browser known to be gone skips the close request. One whose
     // generation could not be read may still be running, and the reap below
     // would wait on it with nothing asking it to quit.
     if process.generation_gone() {
-        return process.wait_until_reaped().map_err(|_| CleanupStage::Reap);
+        return process.wait_until_reaped();
     }
-    process
-        .request_graceful_termination()
-        .map_err(|_| CleanupStage::Reap)?;
-    let exited = process
-        .wait_for_exit(grace_period)
-        .map_err(|_| CleanupStage::Reap)?;
+    // A broken close pipe or failed exit observation is not proof of death.
+    // If the close request fails, skip the grace wait and try the generation-checked kill.
+    let exited = process.request_graceful_termination().is_ok()
+        && process.wait_for_exit(grace_period).unwrap_or(false);
     if !exited {
-        // The second generation check is the fence against signaling a recycled
-        // PID after the graceful-wait interval gave another process time to appear.
+        // Recheck the generation immediately before signaling: the PID may have
+        // been recycled since the initial exit observation or graceful wait.
         if process.generation_matches() {
-            process.force_terminate().map_err(|_| CleanupStage::Reap)?;
+            process.force_terminate()?;
         }
     }
-    process.wait_until_reaped().map_err(|_| CleanupStage::Reap)
+    process.wait_until_reaped()
 }
 
 fn stable_route_id(route_key: &str) -> String {
@@ -4022,6 +4098,51 @@ mod tests {
 
     struct SleepingExitProcess;
 
+    struct FaultyCloseProcess {
+        inner: RecordingProcess,
+        graceful_failure: bool,
+        wait_failure: bool,
+        unreadable: bool,
+    }
+
+    impl OwnedBrowserProcess for FaultyCloseProcess {
+        fn generation_matches(&self) -> bool {
+            !self.unreadable && self.inner.generation_matches()
+        }
+
+        fn generation_gone(&self) -> bool {
+            false
+        }
+
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.inner.request_graceful_termination()?;
+            if self.graceful_failure {
+                Err(ProcessControlFailure::new(
+                    ProcessControlStep::GracefulCloseRequest,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_exit(&mut self, grace: Duration) -> Result<bool, ProcessControlFailure> {
+            let exited = self.inner.wait_for_exit(grace)?;
+            if self.wait_failure {
+                Err(ProcessControlFailure::new(ProcessControlStep::WaitForExit))
+            } else {
+                Ok(exited)
+            }
+        }
+
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.inner.force_terminate()
+        }
+
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            self.inner.wait_until_reaped()
+        }
+    }
+
     impl OwnedBrowserProcess for SleepingExitProcess {
         fn generation_matches(&self) -> bool {
             true
@@ -4065,7 +4186,10 @@ mod tests {
         }
 
         fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
-            Err(ProcessControlFailure)
+            Err(ProcessControlFailure::from_io(
+                ProcessControlStep::ReapWait,
+                &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "/private/secret"),
+            ))
         }
     }
 
@@ -4295,6 +4419,7 @@ mod tests {
                 "outcome": "cleanup_failure",
                 "browser_session_id": reap_id,
                 "stage": "reap",
+                "detail": {"step": "reap_wait", "error_kind": "PermissionDenied"},
             })
         );
         assert!(cleanup_events.lock().unwrap().is_empty());
@@ -4349,6 +4474,109 @@ mod tests {
             process.lock().unwrap().as_slice(),
             ["graceful", "grace_wait", "reap"]
         );
+    }
+
+    fn close_with_faults(
+        graceful_failure: bool,
+        wait_failure: bool,
+        unreadable: bool,
+        generation_matches: bool,
+    ) -> Vec<&'static str> {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+        let _ = sessions.acquire_launch_slot("route");
+        let (id, _, _) = sessions
+            .establish_ready(
+                "route",
+                ProfileDisposition::Durable,
+                &config(),
+                &clock,
+                Box::new(FaultyCloseProcess {
+                    inner: RecordingProcess {
+                        events: Arc::clone(&events),
+                        checks: 0,
+                        first_generation_match: true,
+                        second_generation_match: generation_matches,
+                    },
+                    graceful_failure,
+                    wait_failure,
+                    unreadable,
+                }),
+                Box::new(RecordingCleanup(Arc::clone(&cleanup))),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions.close("route", &id, &config()),
+            json!({
+                "outcome": "closed", "browser_session_id": id,
+            })
+        );
+        assert_eq!(cleanup.lock().unwrap().as_slice(), ["cleanup"]);
+        let recorded = events.lock().unwrap().clone();
+        recorded
+    }
+
+    #[test]
+    fn failed_graceful_request_kills_matching_generation_and_closes() {
+        assert_eq!(
+            close_with_faults(true, false, false, true),
+            ["graceful", "force", "reap"]
+        );
+    }
+
+    #[test]
+    fn failed_graceful_request_with_unreadable_generation_only_reaps_and_closes() {
+        assert_eq!(
+            close_with_faults(true, false, true, true),
+            ["graceful", "reap"]
+        );
+    }
+
+    #[test]
+    fn failed_exit_wait_kills_matching_generation_and_closes() {
+        assert_eq!(
+            close_with_faults(false, true, false, true),
+            ["graceful", "grace_wait", "force", "reap"]
+        );
+    }
+
+    #[test]
+    fn failed_graceful_request_never_signals_recycled_generation() {
+        assert_eq!(
+            close_with_faults(true, false, false, false),
+            ["graceful", "reap"]
+        );
+    }
+
+    #[test]
+    fn failed_reap_reports_the_step_and_safe_error_kind() {
+        let sessions = BrowserSessions::default();
+        let clock = FakeClock::new();
+        let _ = sessions.acquire_launch_slot("route");
+        let (id, _, _) = sessions
+            .establish_ready(
+                "route",
+                ProfileDisposition::Durable,
+                &config(),
+                &clock,
+                Box::new(FailingReapProcess),
+                Box::new(RecordingCleanup(Arc::new(Mutex::new(Vec::new())))),
+            )
+            .unwrap();
+        let reply = sessions.close("route", &id, &config());
+        assert_eq!(reply["outcome"], "cleanup_failure");
+        assert_eq!(reply["stage"], "reap");
+        assert_eq!(
+            reply["detail"],
+            json!({"step": "reap_wait", "error_kind": "PermissionDenied"})
+        );
+        assert_eq!(
+            sessions.status("route", &clock, UNIX_EPOCH)["detail"],
+            reply["detail"]
+        );
+        assert!(!reply.to_string().contains("/private/secret"));
     }
 
     struct PausingClock {
@@ -4441,8 +4669,10 @@ mod tests {
         fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
             self.entered_reap
                 .send(())
-                .map_err(|_| ProcessControlFailure)?;
-            self.release_reap.recv().map_err(|_| ProcessControlFailure)
+                .map_err(|_| ProcessControlFailure::new(ProcessControlStep::ReapWait))?;
+            self.release_reap
+                .recv()
+                .map_err(|_| ProcessControlFailure::new(ProcessControlStep::ReapWait))
         }
     }
 

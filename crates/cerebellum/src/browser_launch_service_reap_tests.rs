@@ -12,6 +12,28 @@ const PROJECT: &str = "project-1";
 const SEQUENCE: u64 = 1;
 const PLANTED_PID: u32 = 4_000_001;
 
+#[test]
+fn process_control_errors_preserve_the_operation_and_os_kind() {
+    let forced = process_control_failure(
+        ProcessControlStep::ForcedTermination,
+        PlatformProcessControlError::Signal(io::ErrorKind::PermissionDenied),
+    );
+    assert_eq!(forced.step, ProcessControlStep::ForcedTermination);
+    assert_eq!(forced.error_kind, Some(io::ErrorKind::PermissionDenied));
+    let reap = process_control_failure(
+        ProcessControlStep::ForcedTermination,
+        PlatformProcessControlError::Reap(io::ErrorKind::Interrupted),
+    );
+    assert_eq!(reap.step, ProcessControlStep::ReapWait);
+    assert_eq!(reap.error_kind, Some(io::ErrorKind::Interrupted));
+    let generation = process_control_failure(
+        ProcessControlStep::ForcedTermination,
+        PlatformProcessControlError::GenerationChanged,
+    );
+    assert_eq!(generation.step, ProcessControlStep::ForcedTermination);
+    assert_eq!(generation.error_kind, None);
+}
+
 fn test_config() -> BrowserConfig {
     BrowserConfig {
         executable_path: None,
@@ -115,7 +137,7 @@ impl OwnedBrowserProcess for FailedReapProcess {
         Ok(())
     }
     fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
-        Err(ProcessControlFailure)
+        Err(ProcessControlFailure::new(ProcessControlStep::ReapWait))
     }
 }
 

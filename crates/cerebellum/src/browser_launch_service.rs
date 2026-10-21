@@ -38,7 +38,8 @@ use crate::browser_session::{
     BrowserClickOutcome, BrowserClickPosition, BrowserExitProbe, BrowserInputEvent, BrowserKiller,
     BrowserSessionLauncher, BrowserSessionTerminalOutcome, CleanupStage, ClickDriveError,
     ClickPointDriveError, KillOutcome, LaunchedBrowser, NavigationDriveError, NavigationWait,
-    OwnedBrowserProcess, ProcessControlFailure, SessionCleanup, SessionCleanupOutcome,
+    OwnedBrowserProcess, ProcessControlFailure, ProcessControlStep, SessionCleanup,
+    SessionCleanupOutcome,
 };
 use crate::cdp::{CdpFrameDecoder, CdpTransport};
 use crate::profile::{
@@ -58,6 +59,25 @@ use crate::snapshot_store::{BackendNodeIdentity, SnapshotKind};
 type ProductionLaunchJournal = DurableLaunchJournal<crate::PlaneJournalStorage>;
 
 type SharedLaunchJournal = Arc<Mutex<Option<ProductionLaunchJournal>>>;
+
+#[cfg(target_os = "linux")]
+use cerebellum_linux::ProcessControlError as PlatformProcessControlError;
+#[cfg(target_os = "macos")]
+use cerebellum_macos::ProcessControlError as PlatformProcessControlError;
+
+fn process_control_failure(
+    step: ProcessControlStep,
+    error: PlatformProcessControlError,
+) -> ProcessControlFailure {
+    let (step, error_kind) = match error {
+        PlatformProcessControlError::Reap(kind) => (ProcessControlStep::ReapWait, Some(kind)),
+        PlatformProcessControlError::Signal(kind) => (step, Some(kind)),
+        #[cfg(target_os = "linux")]
+        PlatformProcessControlError::Ptrace(kind) => (step, Some(kind)),
+        _ => (step, None),
+    };
+    ProcessControlFailure { step, error_kind }
+}
 
 #[cfg(test)]
 #[path = "browser_launch_service_reap_tests.rs"]
@@ -2339,9 +2359,11 @@ impl OwnedBrowserProcess for ProductionProcess {
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
         self.driver
             .as_mut()
-            .ok_or(ProcessControlFailure)?
+            .ok_or(ProcessControlFailure::new(
+                ProcessControlStep::GracefulCloseRequest,
+            ))?
             .request_browser_close()
-            .map_err(|_| ProcessControlFailure)
+            .map_err(|_| ProcessControlFailure::new(ProcessControlStep::GracefulCloseRequest))
     }
 
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure> {
@@ -2360,10 +2382,12 @@ impl OwnedBrowserProcess for ProductionProcess {
     }
 
     fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
-        let process = self.process.take().ok_or(ProcessControlFailure)?;
-        process
-            .terminate_and_reap()
-            .map_err(|_| ProcessControlFailure)?;
+        let process = self.process.take().ok_or(ProcessControlFailure::new(
+            ProcessControlStep::ForcedTermination,
+        ))?;
+        process.terminate_and_reap().map_err(|error| {
+            process_control_failure(ProcessControlStep::ForcedTermination, error)
+        })?;
         self.reaped = true;
         Ok(())
     }
@@ -2372,9 +2396,14 @@ impl OwnedBrowserProcess for ProductionProcess {
         if self.reaped {
             return Ok(());
         }
-        let process = self.process.take().ok_or(ProcessControlFailure)?;
-        if process.wait().is_err() && !self.shutdown_kill.dead.load(Ordering::Acquire) {
-            return Err(ProcessControlFailure);
+        let process = self
+            .process
+            .take()
+            .ok_or(ProcessControlFailure::new(ProcessControlStep::ReapWait))?;
+        if let Err(error) = process.wait() {
+            if !self.shutdown_kill.dead.load(Ordering::Acquire) {
+                return Err(process_control_failure(ProcessControlStep::ReapWait, error));
+            }
         }
         // A failed wait after the shutdown killer confirmed this generation
         // dead means the child was already reaped (Linux reaps inside the
