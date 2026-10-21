@@ -182,6 +182,10 @@ mod wire {
 
     impl Fixture {
         fn new(signed: bool) -> Self {
+            Self::on(UserBrowserBridge::new(), signed)
+        }
+
+        fn on(bridge: UserBrowserBridge, signed: bool) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let directory = std::env::temp_dir().join(format!(
                 "ck-bridge-{}-{}",
@@ -190,7 +194,6 @@ mod wire {
             ));
             cerebellum_core::private_fs::create_dir(&directory).unwrap();
             let path = directory.join("user-browser.sock");
-            let bridge = UserBrowserBridge::new();
             let listener = Some(test_listener(bridge.clone(), &path, signed).unwrap());
             Self {
                 bridge,
@@ -642,6 +645,124 @@ mod wire {
         );
         assert_eq!(fixture.bridge.connected_epoch(), None);
     }
+
+    /// Waits until the bridge has let go of the host's connection, which is
+    /// also when its end has been recorded on the gauges.
+    async fn disconnected(bridge: &UserBrowserBridge) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while bridge.connected_epoch().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the bridge never noticed the host leaving");
+    }
+
+    #[tokio::test]
+    async fn health_shows_when_the_host_connected_and_that_it_closed_the_socket() {
+        let gauges = private_gauges();
+        let fixture = Fixture::on(UserBrowserBridge::with_gauges_for_test(gauges), true);
+        let before = wall_clock_ms();
+        let (extension, _) = fixture.connect().await;
+        let connected = health(gauges);
+        let after_connect = wall_clock_ms();
+        assert_eq!(connected["userBrowserConnections"], 1);
+        let connected_at = connected["userBrowserConnectedAtMs"].as_u64().unwrap();
+        assert!((before..=after_connect).contains(&connected_at));
+        assert_eq!(connected["userBrowserDisconnects"], 0);
+        assert_eq!(connected["userBrowserDisconnectedAtMs"], Value::Null);
+        assert_eq!(connected["userBrowserLastDisconnectReason"], Value::Null);
+
+        drop(extension);
+        disconnected(&fixture.bridge).await;
+        let ended = health(gauges);
+        let after_end = wall_clock_ms();
+        assert_eq!(ended["userBrowserConnections"], 1);
+        assert_eq!(ended["userBrowserConnectedAtMs"], connected_at);
+        assert_eq!(ended["userBrowserDisconnects"], 1);
+        let disconnected_at = ended["userBrowserDisconnectedAtMs"].as_u64().unwrap();
+        assert!((connected_at..=after_end).contains(&disconnected_at));
+        assert_eq!(ended["userBrowserLastDisconnectReason"], "peer_closed");
+    }
+
+    #[tokio::test]
+    async fn health_names_a_bad_frame_from_the_host_as_a_protocol_error() {
+        let gauges = private_gauges();
+        let fixture = Fixture::on(UserBrowserBridge::with_gauges_for_test(gauges), true);
+        let (mut extension, _) = fixture.connect().await;
+        // After admission only relay frames are valid; a second hello is not.
+        write_frame(&mut extension, &hello()).await.unwrap();
+        disconnected(&fixture.bridge).await;
+        let ended = health(gauges);
+        assert_eq!(ended["userBrowserConnections"], 1);
+        assert_eq!(ended["userBrowserDisconnects"], 1);
+        assert_eq!(ended["userBrowserLastDisconnectReason"], "protocol_error");
+        drop(extension);
+    }
+}
+
+/// Gauges owned by one test, so other tests' bridges cannot move its numbers.
+fn private_gauges() -> &'static ConnectionGauges {
+    Box::leak(Box::new(ConnectionGauges::new()))
+}
+
+/// The user-browser fields exactly as the health reply renders them.
+fn health(gauges: &ConnectionGauges) -> Value {
+    let mut metrics = serde_json::Map::new();
+    gauges.insert_into(&mut metrics);
+    Value::Object(metrics)
+}
+
+#[test]
+fn health_reads_zero_and_null_before_any_connection() {
+    let fresh = health(private_gauges());
+    assert_eq!(fresh["userBrowserConnections"], 0);
+    assert_eq!(fresh["userBrowserConnectedAtMs"], Value::Null);
+    assert_eq!(fresh["userBrowserDisconnects"], 0);
+    assert_eq!(fresh["userBrowserDisconnectedAtMs"], Value::Null);
+    assert_eq!(fresh["userBrowserLastDisconnectReason"], Value::Null);
+}
+
+#[test]
+fn every_disconnect_reason_has_its_own_word() {
+    let reasons = [
+        DisconnectReason::PeerClosed,
+        DisconnectReason::ReadError,
+        DisconnectReason::ProtocolError,
+        DisconnectReason::WriteStalled,
+        DisconnectReason::WriteError,
+        DisconnectReason::ReplyUndeliverable,
+        DisconnectReason::CancelDeadline,
+        DisconnectReason::Shutdown,
+    ];
+    let words: Vec<_> = reasons.iter().map(|reason| reason.word()).collect();
+    assert_eq!(words, DISCONNECT_REASONS);
+}
+
+/// A production bridge records into the process gauges the health reply
+/// reads. Other tests' bridges also connect, so only growth is asserted.
+#[tokio::test]
+async fn the_module_health_reply_carries_the_production_bridge_history() {
+    let read = || {
+        let crate::ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = crate::with_process_gauges(crate::HealthState::default().report())
+        else {
+            panic!("health reply without metrics")
+        };
+        metrics
+    };
+    let before = read()["userBrowserConnections"].as_u64().unwrap();
+    let bridge = UserBrowserBridge::new();
+    let (epoch, _outgoing, _) = bridge.connect().unwrap();
+    bridge.disconnect(epoch, DisconnectReason::PeerClosed);
+    let after = read();
+    assert!(after["userBrowserConnections"].as_u64().unwrap() > before);
+    assert!(after["userBrowserDisconnects"].as_u64().unwrap() >= 1);
+    assert!(after["userBrowserConnectedAtMs"].is_u64());
+    assert!(after["userBrowserDisconnectedAtMs"].is_u64());
+    assert!(after["userBrowserLastDisconnectReason"].is_string());
 }
 
 #[tokio::test]
@@ -688,7 +809,7 @@ async fn disconnect_after_a_no_input_yet_ack_does_not_claim_no_input_occurred() 
         },
     });
     tokio::task::yield_now().await;
-    bridge.disconnect(epoch);
+    bridge.disconnect(epoch, DisconnectReason::PeerClosed);
     let result = task.await.unwrap();
     assert_eq!(result.terminal, Terminal::OutcomeUnknown);
     assert_eq!(result.input_dispatched, None);

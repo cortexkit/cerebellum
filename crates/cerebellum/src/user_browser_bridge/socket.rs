@@ -198,11 +198,12 @@ async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier:
             return;
         }
     };
-    let _connection = DisconnectOnDrop {
+    let mut connection = DisconnectOnDrop {
         bridge: bridge.clone(),
         epoch,
+        reason: DisconnectReason::Shutdown,
     };
-    if write_frame(
+    if let Err(error) = write_frame(
         &mut stream,
         &Frame::HostAccepted {
             protocol: PROTOCOL_VERSION,
@@ -210,23 +211,28 @@ async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier:
         },
     )
     .await
-    .is_err()
     {
+        connection.reason = write_end_reason(&error);
         return;
     }
     let (mut reader, mut writer) = stream.into_split();
     let receiving = bridge.clone();
     let read_task = tokio::spawn(async move {
-        while let Ok(Frame::Relay { message }) = read_frame(&mut reader).await {
+        let reason = loop {
+            let message = match read_frame(&mut reader).await {
+                Ok(Frame::Relay { message }) => message,
+                Ok(_) => break DisconnectReason::ProtocolError,
+                Err(error) => break read_end_reason(&error),
+            };
             if serde_json::to_vec(&message).map_or(true, |bytes| bytes.len() > MAX_MESSAGE_BYTES) {
-                break;
+                break DisconnectReason::ProtocolError;
             }
             let Ok(message) = serde_json::from_value::<Message>(message) else {
-                break;
+                break DisconnectReason::ProtocolError;
             };
             receiving.receive(message);
-        }
-        receiving.disconnect(epoch);
+        };
+        receiving.disconnect(epoch, reason);
     });
     let _reader = AbortOnDrop(read_task);
     let writing = async {
@@ -235,19 +241,39 @@ async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier:
                 continue;
             }
             let Ok(value) = serde_json::to_value(message) else {
-                break;
+                return DisconnectReason::WriteError;
             };
-            if write_frame(&mut writer, &Frame::Relay { message: value })
-                .await
-                .is_err()
-            {
-                break;
+            if let Err(error) = write_frame(&mut writer, &Frame::Relay { message: value }).await {
+                return write_end_reason(&error);
             }
         }
+        // The queue only closes once the connection was already taken, so
+        // this reason is never the one recorded.
+        DisconnectReason::PeerClosed
     };
     tokio::select! {
         _ = wait_closed(&mut closed) => {},
-        _ = writing => {},
+        reason = writing => connection.reason = reason,
+    }
+}
+
+/// What a failed socket read says about how the connection ended.
+fn read_end_reason(error: &io::Error) -> DisconnectReason {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof => DisconnectReason::PeerClosed,
+        // The protocol crate reports oversized and undecodable frames as
+        // invalid data.
+        io::ErrorKind::InvalidData => DisconnectReason::ProtocolError,
+        _ => DisconnectReason::ReadError,
+    }
+}
+
+/// What a failed frame write says about how the connection ended.
+fn write_end_reason(error: &io::Error) -> DisconnectReason {
+    match error.kind() {
+        // `write_frame` reports its own deadline as timed out.
+        io::ErrorKind::TimedOut => DisconnectReason::WriteStalled,
+        _ => DisconnectReason::WriteError,
     }
 }
 
@@ -257,13 +283,19 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+/// Ends the connection when the peer task stops for any reason. `reason` is
+/// what this task saw; it stays `Shutdown` only when the task stopped without
+/// seeing an end of its own: the close signal fired (the bridge already holds
+/// the earlier reason, which takes precedence) or the listener aborted the task
+/// while shutting down.
 struct DisconnectOnDrop {
     bridge: UserBrowserBridge,
     epoch: u64,
+    reason: DisconnectReason,
 }
 impl Drop for DisconnectOnDrop {
     fn drop(&mut self) {
-        self.bridge.disconnect(self.epoch);
+        self.bridge.disconnect(self.epoch, self.reason);
     }
 }
 
