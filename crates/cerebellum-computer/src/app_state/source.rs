@@ -9,7 +9,7 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::ProcessGrant;
 
@@ -144,15 +144,21 @@ impl RawAppState {
     /// often turns a read that would say "read again" into the page itself.
     /// `wait` sleeps for the delay it is given and returns `false` when the
     /// call has no time left or was stopped, in which case nothing is read
-    /// again. A window is read again at most once per call. A re-read that
-    /// fails or still finds a shell leaves the first read's window in place,
-    /// for [`RawAppState::mark_unpopulated_content`] to flag. Returns how
-    /// many windows were read again.
+    /// again.
+    ///
+    /// All the re-reads of one call share one allowance, `timing.phase`,
+    /// counted from the end of the wait: each is held to whichever ends
+    /// first of what is left of that allowance and what is left of the call,
+    /// and once that is nothing, the remaining windows are not read again. A
+    /// window is read again at most once per call. A re-read that fails or
+    /// still finds a shell leaves the first read's window in place, for
+    /// [`RawAppState::mark_unpopulated_content`] to flag. Returns how many
+    /// windows were read again.
     pub fn reread_shell_windows(
         &mut self,
         source: &dyn AppStateSource,
         target: &ProcessGrant,
-        bounds: ReadBounds,
+        timing: RereadTiming<'_>,
         wait: impl FnOnce(Duration) -> bool,
     ) -> usize {
         let shells: Vec<usize> = self
@@ -165,7 +171,20 @@ impl RawAppState {
         if shells.is_empty() || !wait(Duration::from_millis(SHELL_RETRY_DELAY_MS)) {
             return 0;
         }
+        let phase_end = (timing.now)() + timing.phase;
+        let mut reread_count = 0;
         for &index in &shells {
+            let left = phase_end
+                .min(timing.call_end)
+                .saturating_duration_since((timing.now)());
+            if left.is_zero() {
+                break;
+            }
+            reread_count += 1;
+            let bounds = ReadBounds {
+                timeout: left,
+                ..ReadBounds::default()
+            };
             let window = &self.roots[index];
             let Ok(mut reread) = source.read_element_state(target, &window.handle, bounds, false)
             else {
@@ -181,7 +200,7 @@ impl RawAppState {
             self.unreadable_subtrees += reread.unreadable_subtrees;
             self.read_bound_reached |= reread.read_bound_reached;
         }
-        shells.len()
+        reread_count
     }
 
     /// Whether every requested subtree was read. Closed menu contents are
@@ -196,6 +215,18 @@ impl RawAppState {
 /// [`RawAppState::reread_shell_windows`]): long enough for WebKit to expose a
 /// page it was still building, short enough to cost a read little.
 pub const SHELL_RETRY_DELAY_MS: u64 = 200;
+
+/// The time [`RawAppState::reread_shell_windows`] may spend reading windows
+/// again.
+#[derive(Clone, Copy)]
+pub struct RereadTiming<'a> {
+    /// What all of one call's re-reads may take together.
+    pub phase: Duration,
+    /// The current time, on the clock `call_end` is on.
+    pub now: &'a dyn Fn() -> Instant,
+    /// When the call's work must be done.
+    pub call_end: Instant,
+}
 
 /// Whether a window exposes nothing of its own content: everything in it is
 /// a layout container with no content inside, or, in a standard window, one

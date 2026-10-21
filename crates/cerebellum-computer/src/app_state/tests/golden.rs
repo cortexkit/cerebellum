@@ -1170,8 +1170,9 @@ const SUMMARISED_MAIN: &str = "\nkq376 main  [46 elements, like \"Projects\", ~2
 /// main region is still there, as one line with its count and an id to zoom
 /// into, after which the outline says what it cut. An action reply that
 /// shows a replaced page as an outline has less room than a read; the main
-/// region keeps its line there too, because the outline stops short of the
-/// reply's bound to leave room for it.
+/// region keeps its place there too, because the outline stops short of the
+/// reply's bound while the main region is still to come: summarised when
+/// only its line fits, in full when it fits whole.
 #[test]
 fn an_outline_past_its_budget_still_summarises_the_main_region() {
     let read = observe(tauri_dashboard_with(42, 60, 0));
@@ -1187,7 +1188,8 @@ fn an_outline_past_its_budget_still_summarises_the_main_region() {
     for limit in (1_500..=MAX_DIFF_BYTES - 32).step_by(97) {
         let reply_outline = bounded_outline_of(&read, limit);
         assert!(
-            reply_outline.contains(SUMMARISED_MAIN),
+            reply_outline.contains(SUMMARISED_MAIN)
+                || reply_outline.contains("\nkq376 main\n  kq377 heading Projects, Value: 1\n"),
             "{limit}: {reply_outline}"
         );
         assert!(reply_outline.len() < limit, "{} bytes", reply_outline.len());
@@ -1208,4 +1210,49 @@ fn a_main_region_below_the_deepest_region_shown_is_still_named() {
         outline.contains("\n      kq18 main  [46 elements, like \"Projects\", ~202 B]\n"),
         "{outline}"
     );
+}
+
+/// Every element of `roots` and beneath, depth first, for a fixture to edit.
+fn each_element(roots: &mut [RawElement], edit: &mut dyn FnMut(&mut RawElement)) {
+    for root in roots {
+        edit(root);
+        each_element(&mut root.children, edit);
+    }
+}
+
+/// Room below an action reply's bound is kept for the main region's line
+/// only while that line is still to come. A page with no main landmark is
+/// reached as soon as the outline enters it, and a main region ahead of the
+/// banner is printed first; either way the banner then fills the reply to
+/// its bound, with no room held back for content already shown.
+#[test]
+fn an_outline_keeps_no_room_once_its_content_is_shown() {
+    let limit = MAX_DIFF_BYTES - 32;
+    let mut no_main = tauri_dashboard_with(42, 60, 0);
+    each_element(&mut no_main, &mut |element| {
+        if element.subrole.as_deref() == Some("AXLandmarkMain") {
+            element.subrole = None;
+        }
+    });
+    let mut main_first = tauri_dashboard_with(42, 60, 0);
+    each_element(&mut main_first, &mut |element| {
+        if element.role.as_deref() == Some("AXWebArea") {
+            // The banner leads the page; move it behind the footer.
+            element.children.rotate_left(1);
+        }
+    });
+    for (name, roots) in [("no main", no_main), ("main first", main_first)] {
+        let read = observe(roots);
+        let outline = bounded_outline_of(&read, limit);
+        assert!(
+            outline.len() > limit - 512 && outline.len() < limit,
+            "{name}: {} of {limit} bytes:\n{outline}",
+            outline.len()
+        );
+        if name == "main first" {
+            let main = outline.find(" main\n").expect("the main region is outlined");
+            let banner = outline.find(" banner").expect("the banner is outlined");
+            assert!(main < banner, "{outline}");
+        }
+    }
 }

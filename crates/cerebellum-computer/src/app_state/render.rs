@@ -59,11 +59,6 @@ pub const MAX_DIFF_BYTES: usize = 4 * 1024;
 /// up to this many; a longer run is one line, `<count> <role>s, like "…"`.
 pub const REPEAT_RUN_LIMIT: usize = 3;
 
-/// The bytes an outline keeps free below its reply's bound for the lines
-/// that lead to the main content once the rest of the outline is cut: a few
-/// summary lines of at most a few hundred bytes each.
-const CONTENT_PATH_RESERVE_BYTES: usize = 1024;
-
 /// What `zoom` names to print the menu bar, which the outline leaves out.
 pub const MENU_BAR_ZOOM: &str = "menubar";
 
@@ -879,6 +874,12 @@ struct Emitter {
     disabled_shown: bool,
     /// How many web areas the outline is currently looking through.
     pages_entered: usize,
+    /// The ids of the main landmarks, or of a page's web area when it has
+    /// none, that the outline has not reached yet (see [`content_path`]).
+    content_pending: Vec<String>,
+    /// The bytes the lines leading to those take, kept free below `limit`
+    /// while any of them is pending.
+    content_reserve: usize,
 }
 
 impl Emitter {
@@ -891,6 +892,8 @@ impl Emitter {
             capped: false,
             disabled_shown: false,
             pages_entered: 0,
+            content_pending: Vec::new(),
+            content_reserve: 0,
         }
     }
 
@@ -919,15 +922,30 @@ impl Emitter {
         if self.push(depth, &text) {
             self.labels_truncated |= truncated;
             self.note_shown(view);
+            self.content_reached(view.id);
         }
     }
 
-    /// Whether the outline has spent its bytes: past [`MAX_OUTLINE_BYTES`],
-    /// or so close to this reply's own bound that the lines leading to the
-    /// main content (see [`content_path`]) would no longer fit.
-    fn over_outline_budget(&self) -> bool {
-        self.text.len()
-            > MAX_OUTLINE_BYTES.min(self.limit.saturating_sub(CONTENT_PATH_RESERVE_BYTES))
+    /// Whether `cost` more bytes still leave room below the reply's bound for
+    /// the lines leading to the content not yet reached. Always true once
+    /// that content is in the outline, or when there is none.
+    fn fits_beside_content(&self, cost: usize) -> bool {
+        self.content_pending.is_empty()
+            || self.text.len() + cost + self.content_reserve <= self.limit
+    }
+
+    /// Whether the outline has spent its bytes before printing something
+    /// that costs `cost`: past [`MAX_OUTLINE_BYTES`], or so close to this
+    /// reply's own bound that the lines leading to the main content (see
+    /// [`content_path`]) would no longer fit after it.
+    fn over_outline_budget(&self, cost: usize) -> bool {
+        self.text.len() > MAX_OUTLINE_BYTES || !self.fits_beside_content(cost)
+    }
+
+    /// `id` is in the outline: when it is content the outline still had to
+    /// reach, the room kept for it is no longer needed.
+    fn content_reached(&mut self, id: &str) {
+        self.content_pending.retain(|pending| pending != id);
     }
 
     /// Remember that a line just pushed for `view` showed it disabled.
@@ -1023,11 +1041,26 @@ fn region_summary(view: &View<'_>) -> String {
 }
 
 fn emit_region(view: &View<'_>, depth: usize, out: &mut Emitter) {
-    let (text, truncated) = view.line();
-    if out.push(depth, &format!("{text}  [{}]", region_summary(view))) {
-        out.labels_truncated |= truncated;
+    if out.push(depth, &region_line(view)) {
+        out.labels_truncated |= view.line().1;
         out.note_shown(view);
+        out.content_reached(view.id);
     }
+}
+
+/// A summarised region's line: its own line, then what it holds.
+fn region_line(view: &View<'_>) -> String {
+    format!("{}  [{}]", view.line().0, region_summary(view))
+}
+
+/// What printing `view` at `depth` in full costs, indentation included.
+fn full_cost(view: &View<'_>, depth: usize) -> usize {
+    view.bytes + 2 * depth * view.lines
+}
+
+/// What a region's summary line at `depth` costs.
+fn region_cost(view: &View<'_>, depth: usize) -> usize {
+    2 * depth + region_line(view).len() + 1
 }
 
 /// Whether the outline looks through an element rather than naming it: an
@@ -1045,11 +1078,26 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
     for run in runs(views) {
         let members = &views[run];
         if members.len() > REPEAT_RUN_LIMIT {
-            out.push(depth, &repeat_summary(members, parent_id));
+            let summary = repeat_summary(members, parent_id);
+            if out.fits_beside_content(2 * depth + summary.len() + 1) {
+                out.push(depth, &summary);
+            } else {
+                out.omitted += 1;
+            }
             continue;
         }
         for view in members {
-            if out.over_outline_budget() {
+            let in_full = is_menu_bar(view.node)
+                || view.bytes <= INLINE_REGION_BYTES
+                || is_small_table(view);
+            let cost = if in_full {
+                full_cost(view, depth)
+            } else if is_transparent(view) {
+                0
+            } else {
+                region_cost(view, depth)
+            };
+            if out.over_outline_budget(cost) {
                 // Inside a page, its own frames' web areas are not the
                 // content a caller is looking for; only its main landmark is.
                 if holds_main(view) || (out.pages_entered == 0 && holds_web_area(view)) {
@@ -1067,10 +1115,14 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
             } else if is_small_table(view) {
                 print_full(view, depth, Expand::Children, out);
             } else if is_transparent(view) {
-                let page = usize::from(raw_role(view.node) == "AXWebArea");
-                out.pages_entered += page;
+                let page = raw_role(view.node) == "AXWebArea";
+                if page {
+                    // The page is being outlined, so its own lines follow.
+                    out.content_reached(view.id);
+                }
+                out.pages_entered += usize::from(page);
                 outline(&view.children, view.id, depth, out);
-                out.pages_entered -= page;
+                out.pages_entered -= usize::from(page);
             } else {
                 emit_region(view, depth, out);
                 outline_regions(&view.children, view.id, depth + 1, 1, out);
@@ -1118,6 +1170,21 @@ fn content_path(view: &View<'_>, depth: usize, out: &mut Emitter) {
     }
 }
 
+/// The ids [`content_path`] would end at from `view`: each main landmark it
+/// leads to, or the web area of a page with none.
+fn content_endpoints(view: &View<'_>, ids: &mut Vec<String>) {
+    let main_inside = view.children.iter().any(holds_main);
+    if is_main(view.node) || (raw_role(view.node) == "AXWebArea" && !main_inside) {
+        ids.push(view.id.to_string());
+        return;
+    }
+    for child in &view.children {
+        if holds_main(child) || (!main_inside && holds_web_area(child)) {
+            content_endpoints(child, ids);
+        }
+    }
+}
+
 /// Inside a summarised region, only the regions it holds are named, one line
 /// each, and only the large ones are opened further. The rest of a region's
 /// content is what zooming into it shows, except that a main landmark below
@@ -1133,12 +1200,24 @@ fn outline_regions(
         let members = &views[run];
         if members.len() > REPEAT_RUN_LIMIT {
             if members.iter().any(|view| is_region(view.node)) {
-                out.push(depth, &repeat_summary(members, parent_id));
+                let summary = repeat_summary(members, parent_id);
+                if out.fits_beside_content(2 * depth + summary.len() + 1) {
+                    out.push(depth, &summary);
+                } else {
+                    out.omitted += 1;
+                }
             }
             continue;
         }
         for view in members {
-            if out.over_outline_budget() {
+            let cost = if is_small_table(view) {
+                full_cost(view, depth)
+            } else if is_region(view.node) {
+                region_cost(view, depth)
+            } else {
+                0
+            };
+            if out.over_outline_budget(cost) {
                 if holds_main(view) {
                     content_path(view, depth, out);
                 } else {
@@ -1462,10 +1541,32 @@ pub fn render_state_bounded(
         // The first window is named by the header, so its own line would say
         // nothing more; its content starts the outline. Any other window or
         // sheet is a region of its own.
-        let mut header_window_seen = false;
-        for view in &scope {
-            if raw_role(view.node) == "AXWindow" && !header_window_seen {
-                header_window_seen = true;
+        let is_header_window = |index: usize, view: &View<'_>| {
+            raw_role(view.node) == "AXWindow"
+                && !scope[..index]
+                    .iter()
+                    .any(|earlier| raw_role(earlier.node) == "AXWindow")
+        };
+        // Measure once the lines that lead to each window's content, and
+        // keep that much room below the bound until the outline reaches it.
+        let mut paths = Emitter::new(usize::MAX);
+        for (index, view) in scope.iter().enumerate() {
+            let tops: &[View<'_>] = if !is_header_window(index, view) {
+                std::slice::from_ref(view)
+            } else if view.bytes > INLINE_REGION_BYTES {
+                &view.children
+            } else {
+                // Printed in full, content and all.
+                &[]
+            };
+            for top in tops.iter().filter(|top| holds_main(top) || holds_web_area(top)) {
+                content_path(top, 0, &mut paths);
+                content_endpoints(top, &mut out.content_pending);
+            }
+        }
+        out.content_reserve = paths.text.len();
+        for (index, view) in scope.iter().enumerate() {
+            if is_header_window(index, view) {
                 if view.bytes <= INLINE_REGION_BYTES {
                     print_full(view, 0, Expand::Nothing, &mut out);
                 } else {

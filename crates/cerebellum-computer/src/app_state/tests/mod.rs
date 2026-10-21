@@ -1201,3 +1201,76 @@ fn windows_with_any_other_child_are_never_empty_shells() {
     dialog.subrole = Some("AXDialog".into());
     assert!(!is_empty_shell_window(&dialog));
 }
+
+/// The re-reads of empty-shell windows in one call share one allowance: each
+/// is held to what is left of it (or of the call, when that ends first), so
+/// three windows whose re-reads each use all the time they are given take
+/// that allowance once, not three times. The clock is the fake source's own,
+/// moved on by each re-read, so nothing here depends on real time.
+#[test]
+fn shell_window_rereads_share_one_allowance() {
+    use super::source::{
+        AppStateReadError, AppStateSource, ElementHandle, ElementReadError, ReadBounds,
+        RereadTiming,
+    };
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct TimedSource {
+        clock: Mutex<Instant>,
+        granted: Mutex<Vec<Duration>>,
+    }
+    impl AppStateSource for TimedSource {
+        fn read_app_state(
+            &self,
+            _target: &ProcessGrant,
+            _bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            Err(AppStateReadError::Unreadable)
+        }
+        fn read_element_state(
+            &self,
+            _target: &ProcessGrant,
+            _element: &ElementHandle,
+            bounds: ReadBounds,
+            _expand_menus: bool,
+        ) -> Result<RawAppState, ElementReadError> {
+            self.granted.lock().unwrap().push(bounds.timeout);
+            // The read used all the time it was given and still found nothing.
+            *self.clock.lock().unwrap() += bounds.timeout;
+            Err(ElementReadError::Unreadable)
+        }
+    }
+
+    let shell = |token| {
+        RawElement::fixture(token, "AXWindow")
+            .with_children(vec![window_control(token + 100, "AXCloseButton")])
+    };
+    let phase = Duration::from_millis(1_000);
+    let start = Instant::now();
+    for (call_left, expected) in [
+        (Duration::from_secs(60), vec![phase]),
+        (Duration::from_millis(300), vec![Duration::from_millis(300)]),
+    ] {
+        let source = TimedSource {
+            clock: Mutex::new(start),
+            granted: Mutex::new(Vec::new()),
+        };
+        let now = || *source.clock.lock().unwrap();
+        let mut raw = state(vec![shell(1), shell(2), shell(3)]);
+        let reread = raw.reread_shell_windows(
+            &source,
+            &grant(),
+            RereadTiming {
+                phase,
+                now: &now,
+                call_end: start + call_left,
+            },
+            |_| true,
+        );
+        let granted = source.granted.lock().unwrap().clone();
+        assert_eq!(granted, expected, "with {call_left:?} left in the call");
+        assert!(granted.iter().sum::<Duration>() <= phase, "{granted:?}");
+        assert_eq!(reread, 1);
+    }
+}
