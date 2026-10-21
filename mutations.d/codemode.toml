@@ -10,7 +10,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_parent_must_be_linked"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -26,7 +26,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_agent_must_match_attested_head"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -42,7 +42,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_requires_live_head_at_parent_epoch"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -58,7 +58,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_head_identity_requires_provider_attestation"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -74,7 +74,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::basal_requires_run_id_and_codemode"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 [control.scope]
@@ -93,7 +93,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::basal_requires_run_id_and_codemode"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -109,7 +109,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_resolves_head_computer_images_and_elements_not_run_bind_handles"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -125,7 +125,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/browser/codemode_tests.rs"
 select = "expected"
 expect_red = ["browser::codemode_tests::run_resolves_head_browser_snapshot_and_ref_not_run_bind_context"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -141,7 +141,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::flow_and_worker_admission_stay_separate_from_run_context"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -157,7 +157,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::flow_and_worker_admission_stay_separate_from_run_context"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -173,7 +173,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::legacy_run_without_call_mode_keeps_no_ask_policy"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -189,7 +189,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::withdraw_fires_run_cancellation_and_reports_started_honestly"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 [control.scope]
@@ -208,7 +208,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::withdraw_cannot_cancel_another_carriers_matching_key"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -224,7 +224,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::codemode_image_results_keep_handles_and_dimensions_without_bytes"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -240,7 +240,7 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::codemode_image_results_keep_handles_and_dimensions_without_bytes"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
 
@@ -256,6 +256,6 @@ target = "--lib"
 test_file = "crates/cerebellum/src/call_mode_tests.rs"
 select = "expected"
 expect_red = ["call_mode_tests::run_rejects_superseded_head_routes_before_bind"]
-only = true
+only = false
 timeout_s = 30
 build_timeout_s = 1200
