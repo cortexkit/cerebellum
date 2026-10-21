@@ -395,14 +395,16 @@ impl ProcessControlFailure {
         }
     }
 
-    fn detail(self) -> Value {
-        let mut detail = json!({ "step": self.step.as_str() });
+    /// Put this failure on a reply as its `detail` object: the step and, when
+    /// the OS reported one, the `io::ErrorKind` variant name. That name is a code
+    /// word, never the OS message, which can contain paths or other session data.
+    /// The object is written here as a literal, so the launch-path scan sees an
+    /// object-valued `detail` rather than an opaque value it cannot check.
+    fn write_detail(self, reply: &mut Value) {
+        reply["detail"] = json!({ "step": self.step.as_str() });
         if let Some(kind) = self.error_kind {
-            // ErrorKind's variant name is a code word, not the OS message,
-            // which can contain paths or other session data.
-            detail["error_kind"] = json!(format!("{kind:?}"));
+            reply["detail"]["error_kind"] = json!(format!("{kind:?}"));
         }
-        detail
     }
 }
 
@@ -1566,7 +1568,7 @@ impl SessionRecord {
                 "stage": stage.as_str(),
             });
             if let Some(failure) = self.process_control_failure {
-                reply["detail"] = failure.detail();
+                failure.write_detail(&mut reply);
             }
             return reply;
         }
@@ -1604,7 +1606,7 @@ impl SessionRecord {
                 "stage": stage.as_str(),
             });
             if let Some(failure) = self.process_control_failure {
-                reply["detail"] = failure.detail();
+                failure.write_detail(&mut reply);
             }
             return reply;
         }
@@ -2282,7 +2284,7 @@ impl BrowserSessions {
                 });
                 if stage == CleanupStage::Reap {
                     if let Some(failure) = process_control_failure {
-                        reply["detail"] = failure.detail();
+                        failure.write_detail(&mut reply);
                     }
                 }
                 reply
@@ -2299,7 +2301,7 @@ impl BrowserSessions {
                                 CleanupStage::Reap,
                                 "the proven-exited browser could not be reaped; retry browser.close or browser.launch".into(),
                             );
-                            reply["detail"] = failure.detail();
+                            failure.write_detail(&mut reply);
                             reply
                         })?;
                         pending.process.take();
