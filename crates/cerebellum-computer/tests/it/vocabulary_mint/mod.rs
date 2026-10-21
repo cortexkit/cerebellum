@@ -2159,3 +2159,37 @@ pub fn v26_from_v25(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The rows that press an element: by id, or at a pixel of an image.
+pub const PRESS_ROW_IDS: [&str; 2] = ["computer.press_element", "computer.press_point"];
+
+/// What v27 appends to each press row's outcome description, separated from
+/// the existing text by one space.
+pub const ELEMENT_DISABLED_DESCRIPTION: &str = "element_disabled means the application reports the element disabled at the moment of the press, so nothing was pressed; a background app's window buttons can stay disabled until the app is active, so read the app again after its state changes.";
+
+/// A press refuses an element the application reports disabled.
+///
+/// The element's live `AXEnabled` is read just before the press, after the
+/// element is resolved again; when it is false nothing is sent and the press
+/// answers `element_disabled`, so a caller is not told `completed` for a
+/// press that did nothing. An unreadable state still presses. Each press row
+/// says so in its outcome description. No request field changes, so the
+/// advertised tool does not.
+pub fn v27_from_v26(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if !PRESS_ROW_IDS.contains(&capability.as_str()) {
+            continue;
+        }
+        let outcome = &mut row["result_schema"]["properties"]["outcome"];
+        outcome["enum"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("element_disabled"));
+        let description = outcome["description"].as_str().unwrap();
+        outcome["description"] = json!(format!("{description} {ELEMENT_DISABLED_DESCRIPTION}"));
+    }
+    next
+}

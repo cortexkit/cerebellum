@@ -143,6 +143,34 @@ fn blocked_menu_item_reply() -> Value {
     })
 }
 
+/// The longest element title an `element_disabled` remedy quotes.
+const DISABLED_LABEL_CHARS: usize = 60;
+
+/// The refusal for a press on an element the application reports disabled.
+/// Nothing was sent. The element is named by its title when it has one, made
+/// one line and cut short, and otherwise by its id.
+pub(crate) fn element_disabled_reply(title: Option<&str>, element_id: &str) -> Value {
+    let title = title
+        .map(cerebellum_computer::app_state::render::one_line)
+        .filter(|title| !title.is_empty());
+    let label = match title {
+        Some(title) if title.chars().count() > DISABLED_LABEL_CHARS => {
+            let cut: String = title.chars().take(DISABLED_LABEL_CHARS).collect();
+            format!("{}…", cut.trim_end())
+        }
+        Some(title) => title,
+        None => format!("Element {element_id}"),
+    };
+    json!({
+        "outcome": "element_disabled",
+        "remedy": format!(
+            "{label} is disabled, so pressing it would do nothing. A background app's window \
+             buttons can stay disabled until the app is active. Read the app again after its \
+             state changes."
+        ),
+    })
+}
+
 fn audit_unavailable_reply(acted: bool) -> Value {
     if acted {
         json!({
@@ -652,6 +680,16 @@ where
                 describe_actions(&facts.actions)
             ),
         });
+    }
+    // Read just before pressing, after the checks above: a press on an
+    // element the application reports disabled does nothing, and saying so is
+    // better than a completed reply with no effect. An unreadable state is
+    // unknown, not disabled, so it presses as before.
+    if source.element_enabled(handle) == Some(false) {
+        if journal.refused(&role, "element_disabled").is_err() {
+            return audit_unavailable_reply(false);
+        }
+        return element_disabled_reply(facts.title.as_deref(), element_id);
     }
     let token = match journal.intent(grant, element_id, "AXPress", &role) {
         Ok(token) => token,

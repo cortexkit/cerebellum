@@ -486,6 +486,47 @@ async fn pressing_a_session_ending_menu_item_is_refused() {
     assert!(desk.state().presses.is_empty());
 }
 
+/// A point that lands, inside the imaged window, on an element the
+/// application reports disabled presses nothing and says why.
+#[tokio::test]
+async fn a_point_on_a_disabled_element_presses_nothing() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((60, Some(grant().pid)));
+        state.element_windows.insert(60, 77);
+        let mut send = facts("AXButton", &["AXPress"]);
+        send.title = Some("Send".into());
+        state.elements.insert(
+            60,
+            DeskElement {
+                facts: send,
+                enabled: Some(false),
+                ..DeskElement::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.starts_with("Send is disabled")),
+        "{reply}"
+    );
+    assert!(desk.state().presses.is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
 /// An element with no press refuses by name, the refusal names the standard
 /// actions it does offer and counts the rest without quoting them, and the
 /// pointer is never used in its place.
@@ -541,6 +582,120 @@ async fn an_id_from_an_ended_process_generation_is_stale() {
     .await;
     assert_eq!(reply["outcome"], "stale_element", "{reply}");
     assert!(desk.state().presses.is_empty());
+}
+
+/// The application reports the button disabled at press time, as a
+/// background app's window buttons are: nothing is pressed, the reply says
+/// so by name, and the refusal is journaled before anything is sent.
+#[tokio::test]
+async fn a_disabled_element_is_not_pressed() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        let send = state.elements.get_mut(&10).unwrap();
+        send.enabled = Some(false);
+        send.facts.title = Some("Send".into());
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let journaled = plane.journal_entry_count().await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": id_of(&tree, " button Send")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    assert_eq!(
+        reply["remedy"],
+        "Send is disabled, so pressing it would do nothing. A background app's window buttons \
+         can stay disabled until the app is active. Read the app again after its state changes.",
+        "{reply}"
+    );
+    assert!(desk.state().presses.is_empty());
+    assert!(reply.get("state_text").is_none(), "{reply}");
+    assert_eq!(
+        plane.journal_entry_count().await - journaled,
+        1,
+        "the refusal has its own journal row"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// A batch stops at the disabled entry like at any other failed step: the
+/// press before it happened, the one after it is never sent.
+#[tokio::test]
+async fn a_press_batch_stops_at_a_disabled_element() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.roots[0]
+            .children
+            .push(RawElement::fixture(14, "AXButton").titled("Archive"));
+        state.elements.insert(
+            14,
+            DeskElement {
+                facts: facts("AXButton", &["AXPress"]),
+                enabled: Some(false),
+                ..DeskElement::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let send = id_of(&tree, " button Send");
+    let archive = id_of(&tree, " button Archive");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_ids": [send, archive, send]}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    assert_eq!(reply["stopped_at"], 2, "{reply}");
+    assert_eq!(reply["steps"].as_array().unwrap().len(), 2, "{reply}");
+    assert_eq!(reply["steps"][0]["outcome"], "completed");
+    assert_eq!(reply["steps"][1]["outcome"], "element_disabled");
+    assert_eq!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .split_once(" is disabled")
+            .map(|(label, _)| label),
+        Some(format!("Element {archive}").as_str()),
+        "an element with no title is named by its id: {reply}"
+    );
+    assert_eq!(
+        desk.state().presses,
+        [10],
+        "neither the disabled entry nor the one after it reaches the source"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+/// An `AXEnabled` that cannot be read is unknown, not disabled: the element
+/// is pressed as before.
+#[tokio::test]
+async fn an_element_whose_enabled_state_cannot_be_read_is_still_pressed() {
+    let desk = desk();
+    desk.state().elements.get_mut(&10).unwrap().enabled = None;
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": id_of(&tree, " button Send")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().presses, vec![10]);
+    assert!(plane.result_schema_findings().is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -235,7 +235,13 @@ pub fn describe(element: &RawElement) -> ElementDescription {
     if !element.enabled {
         markers.push("disabled");
     }
-    if element.focused {
+    // A window is `main` or `focused` only when the application positively
+    // said so. An application that is not the active one has neither, which
+    // is why its window-scoped buttons can read as disabled.
+    if element.main_window {
+        markers.push("main");
+    }
+    if element.focused || element.focused_window {
         markers.push("focused");
     }
     if element.expanded == Some(true) {

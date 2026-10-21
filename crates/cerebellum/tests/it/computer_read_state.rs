@@ -341,6 +341,55 @@ async fn read_state_serves_the_tree_and_passes_withholding() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+/// A read of an application that is not frontmost says once, in plain words,
+/// why its window buttons can read as disabled. A frontmost application gets
+/// no such sentence, and neither does one whose frontmost state cannot be
+/// read, since that would be a guess.
+#[tokio::test]
+async fn a_background_application_is_said_to_be_in_the_background() {
+    let desk = support::computer::Desk::new(vec![chat_window()]);
+    let plane = plane(desk.source());
+    let management = granted_management().await;
+    let marker = "is in the background, so none of its windows has keyboard focus";
+    for (frontmost, sentences) in [
+        (Some(grant().pid + 1), 1),
+        (Some(grant().pid), 0),
+        (None, 0),
+    ] {
+        desk.state().frontmost = frontmost;
+        let reply = serve(
+            &plane,
+            &management,
+            "conversation-1",
+            no_relay(),
+            json!({"target": TARGET_BUNDLE_ID}),
+            InMemoryCaptureBackend::default(),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        let tree = reply["state_text"].as_str().unwrap();
+        assert_eq!(
+            tree.matches(marker).count(),
+            sentences,
+            "frontmost {frontmost:?}:\n{tree}"
+        );
+        if sentences == 1 {
+            // The fixture management plane knows the application only by
+            // its bundle identity, so that is the name the sentence uses.
+            let line = line_with(tree, marker);
+            assert_eq!(
+                line,
+                format!(
+                    "{TARGET_BUNDLE_ID} is in the background, so none of its windows has \
+                     keyboard focus; buttons that act on a window, such as Send or Save, can \
+                     read as disabled until {TARGET_BUNDLE_ID} is the active app."
+                )
+            );
+        }
+    }
+    assert!(plane.result_schema_findings().is_empty());
+}
+
 /// Filters narrow the reply and keep the ancestor path; a zoom id this
 /// session does not hold is refused as stale.
 #[tokio::test]

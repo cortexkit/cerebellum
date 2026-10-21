@@ -424,6 +424,18 @@ pub fn element_facts(element: &AxRetainedElement) -> Result<AxElementFacts, AxEl
     })
 }
 
+/// The element's live `AXEnabled`. `None` when it cannot be read or is not a
+/// Boolean, which a caller must treat as unknown rather than as disabled.
+/// This is a read: nothing in the application is prepared or changed.
+pub fn element_enabled(element: &AxRetainedElement) -> Option<bool> {
+    require_trust().ok()?;
+    let pointer = element.as_ptr();
+    bound_messages(pointer);
+    copy(pointer, "AXEnabled")
+        .ok()?
+        .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
+}
+
 /// Ask the element to perform `AXPress`. The pointer is never touched: this
 /// is a message to the application, which runs the element's own handler.
 pub fn press_element(element: &AxRetainedElement) -> Result<(), AxElementActionError> {

@@ -71,6 +71,14 @@ pub struct RawElement {
     /// marked disabled on a guess.
     pub enabled: bool,
     pub focused: bool,
+    /// Whether this window is the application's main window: the window
+    /// reports `AXMain`, or the application names it as its `AXMainWindow`.
+    /// `false` when neither could be read, so no window is called main on a
+    /// guess.
+    pub main_window: bool,
+    /// Whether this window is the application's focused window, the one its
+    /// `AXFocusedWindow` names. `false` when that could not be read.
+    pub focused_window: bool,
     /// `None` where the element exposes no expanded state.
     pub expanded: Option<bool>,
     /// Whether a menu is currently on screen; only menu roles use this field.
@@ -347,6 +355,13 @@ pub trait AppStateSource: Send + Sync {
     /// What the element is now: owner, role, title, actions, settability.
     fn element_facts(&self, _element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// The element's live `AXEnabled`, read now rather than taken from an
+    /// earlier read. `None` when it cannot be read, which a caller must treat
+    /// as unknown, never as disabled.
+    fn element_enabled(&self, _element: &ElementHandle) -> Option<bool> {
+        None
     }
 
     /// Ask the element to perform its press action.
@@ -644,6 +659,8 @@ impl RawElement {
             selected: false,
             enabled: true,
             focused: false,
+            main_window: false,
+            focused_window: false,
             expanded: None,
             menu_visible: false,
             closed_menu_children: 0,
