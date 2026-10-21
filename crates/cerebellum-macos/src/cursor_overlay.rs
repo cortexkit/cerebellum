@@ -1027,7 +1027,8 @@ fn window_listed_on_screen(number: isize) -> bool {
 /// Whether the person has asked macOS to reduce motion. The helper reads it
 /// for every picture it draws, and the module reads it the same way to know
 /// how long that picture's animation takes before it sends the action.
-/// NSWorkspace answers on any thread.
+/// AppKit does not restrict NSWorkspace to the main thread, so the module
+/// reads it from a worker thread.
 pub fn reduce_motion() -> bool {
     NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
