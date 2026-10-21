@@ -2129,7 +2129,8 @@ async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pi
 /// A keystroke action that draws its badge on the focused element posts once
 /// the badge is there, so the text or keys appear with it rather than ahead
 /// of it. Timed on tokio's paused clock against the motion the picture line
-/// itself carries, which is exactly what the helper animates.
+/// itself carries, which is exactly what the helper animates. The badge is
+/// already showing, so this is a glide.
 async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
     use cerebellum::computer_capability::cursor::Coordinator;
     let management = granted_management().await;
@@ -2138,18 +2139,22 @@ async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
     let desk = focused_text_desk();
     desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
     desk.state().cursor_visible = true;
-    let base = plane_with(&shared).with_app_state_source(desk.source());
-    // Read without a badge, so the action's own picture is the first.
+    let (cursor, mut pictures) = Coordinator::channel();
+    let plane = plane_with(&shared)
+        .with_app_state_source(desk.source())
+        .with_cursor(cursor);
     serve(
-        &base,
+        &plane,
         "computer.read_state",
         json!({"target": TARGET_BUNDLE_ID}),
         &management,
         &clock,
     )
     .await;
-    let (cursor, mut pictures) = Coordinator::channel();
-    let plane = base.with_cursor(cursor);
+    // The read's picture: the badge appears on the focused field.
+    pictures.recv().await.expect("the pipe stays open");
+    // The field moved since, so the badge has somewhere to go.
+    desk.state().cursor_frame = Some([500.0, 400.0, 80.0, 20.0]);
     let start = tokio::time::Instant::now();
     let reply = serve(&plane, action, arguments, &management, &clock).await;
     assert!(!dispatched_calls(&shared).is_empty(), "{action}: {reply}");
@@ -2162,6 +2167,11 @@ async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
     assert!(
         !picture.resting,
         "{action}: the badge aims at the focused element"
+    );
+    assert_eq!(
+        picture.motion.style,
+        cerebellum_computer::cursor::MotionStyle::Glide,
+        "{action}"
     );
     assert!(
         picture.motion.duration_ms > 0.0,
