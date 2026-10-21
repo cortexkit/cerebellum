@@ -412,10 +412,10 @@ mod computer {
     /// Send one `computer_use` call and return its reply, allowing every
     /// consent question it puts while it waits.
     ///
-    /// `CardService::card` panics with "Cingulate received no card" once ten
-    /// seconds pass without a new card, so it is only ever awaited here in
-    /// short slices that are dropped when they find nothing: a call that is
-    /// slow without asking anything must not read as a missing card.
+    /// `CardService::card` panics with "Cingulate received no card" only after
+    /// `HANG_GUARD`, so it is only ever awaited here in short slices that are
+    /// dropped when they find nothing: a call that is slow without asking anything
+    /// must not read as a missing card.
     async fn call(planes: &Planes, corr: u64, arguments: Value) -> Frame {
         let label = arguments.to_string();
         let (tx, mut rx) = mpsc::channel(8);
@@ -444,7 +444,7 @@ mod computer {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "computer call {label} did not reply within 30 s"
+                "computer call {label} did not reply before the test hang guard"
             );
         }
     }

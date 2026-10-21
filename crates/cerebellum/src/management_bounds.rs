@@ -545,19 +545,39 @@ mod tests {
             blocked.pass("finish_handoff");
             true
         });
+        // Keep Tokio from auto-advancing to the next timer while the test
+        // checks the poll boundary; only the explicit advances move this clock.
+        let keep_clock_manual = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let interval = Duration::from_millis(browser_session::HANDOFF_POLL_INTERVAL_MS);
+        let poll_started_at = tokio::time::Instant::now();
         let poll = spawn_handoff_poll(&planes, route_identity(&planes), 1, 100, Some(settle));
         // Let the poll start its first wait before the clock moves.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_millis(
-            browser_session::HANDOFF_POLL_INTERVAL_MS,
-        ))
-        .await;
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.reached("finish_handoff"),
+            0,
+            "the handoff poll started before its cadence interval"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
         until("the poll starts the record write", || {
             store.reached("finish_handoff") == 1
         })
         .await;
+        assert_eq!(
+            tokio::time::Instant::now() - poll_started_at,
+            interval,
+            "the first handoff poll did not start at its cadence interval"
+        );
         // The poll arms the record write's `CALL_RECORD_SETTLE_MS` timer
         // before the write starts, so the poll must end within that bound of
         // now.
@@ -582,6 +602,7 @@ mod tests {
             "the poll ended only once the write was released"
         );
         drop(held);
+        keep_clock_manual.abort();
     }
 
     /// With no browser work permit free, no poll job runs: the handoff stays

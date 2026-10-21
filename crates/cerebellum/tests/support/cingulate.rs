@@ -7,6 +7,8 @@ use cerebellum::computer_grants::QuestionCarrier;
 use cerebellum::cingulate_client::ScriptedAnswer;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use crate::support::HANG_GUARD;
 const GRANTEE: &str = "pj-example";
 
 /// A carrier whose answers the test scripts.
@@ -171,7 +173,12 @@ impl ScriptedCarrier {
     /// Wrap the next recorded service question in a synthetic frame for
     /// inspection. Nothing is sent back to the calling agent; that caller's
     /// ordinary replies are read from its own writer separately.
+    /// Use wall time in tests so paused Tokio clocks cannot consume the guard
+    /// while this helper waits for a scripted Cingulate card.
     pub async fn card(&self, channel: u16, epoch: u32) -> subc_protocol::Frame {
+        #[cfg(test)]
+        let end = std::time::Instant::now() + HANG_GUARD;
+        #[cfg(not(test))]
         let end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let next = {
@@ -194,10 +201,11 @@ impl ScriptedCarrier {
                 )
                 .unwrap();
             }
-            assert!(
-                tokio::time::Instant::now() < end,
-                "Cingulate received no card"
-            );
+            #[cfg(test)]
+            let still_waiting = std::time::Instant::now() < end;
+            #[cfg(not(test))]
+            let still_waiting = tokio::time::Instant::now() < end;
+            assert!(still_waiting, "Cingulate received no card");
             tokio::task::yield_now().await;
         }
     }
@@ -358,7 +366,9 @@ impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
                         })
                     };
                     if let Some(deferred) = deferred {
-                        let _ = tokio::time::timeout(std::time::Duration::from_millis(params["timeout_ms"].as_u64().unwrap()), deferred).await;
+                        let wait =
+                            std::time::Duration::from_millis(params["timeout_ms"].as_u64().unwrap());
+                        let _ = tokio::time::timeout(wait, deferred).await;
                         return Ok(self.0.lock().unwrap().records[&id].clone());
                     }
                     let waiting = {
@@ -384,7 +394,7 @@ impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
                         receiver
                     };
                     let wait =
-                        std::time::Duration::from_millis(params["timeout_ms"].as_u64().unwrap());
+                            std::time::Duration::from_millis(params["timeout_ms"].as_u64().unwrap());
                     let record = tokio::time::timeout(wait, waiting)
                         .await
                         .ok()
