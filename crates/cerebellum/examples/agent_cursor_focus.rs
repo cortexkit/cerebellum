@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             avatar_rgba: None,
             avatar_update: false,
             avatar_tint: None,
+            motion: cerebellum_computer::cursor::PictureMotion::chosen(400.0, false, false),
             agent: "Focus probe".into(),
             initial: 'F',
             to: point,

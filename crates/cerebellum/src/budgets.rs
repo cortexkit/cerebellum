@@ -22,6 +22,14 @@ pub const AX_MENU_PHASE_MS: u64 = 1_000;
 pub const SHELL_RETRY_PHASE_MS: u64 =
     cerebellum_computer::app_state::source::SHELL_RETRY_DELAY_MS + AX_TREE_PHASE_MS;
 pub const COMPUTER_SETTLE_MS: u64 = 500;
+/// An action that shows the agent's badge waits for the badge to arrive on
+/// the element before it acts, so the click and the badge's tap animation
+/// happen together. This is the longest that wait can be: the badge's
+/// geometry read, then its longest animation (a first appearance's entry; a
+/// glide is shorter). Taken from the cursor's own timeline, so a change to
+/// the entry or glide timing changes this budget with it.
+pub const CURSOR_ARRIVAL_MS: u64 =
+    crate::computer_capability::cursor::ARRIVAL_CAP.as_millis() as u64;
 pub const COMPUTER_OBSERVE_MS: u64 = 1_000;
 pub const KEYS_OBSERVE_MS: u64 = 1_500;
 pub const MOVE_OBSERVE_MS: u64 = 200;
@@ -192,6 +200,7 @@ budget!(
     "press_element",
     [
         ("preflight", PREFLIGHT_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, MAX_ELEMENT_PRESSES),
         ("press", AX_STEP_MS, MAX_ELEMENT_PRESSES),
         ("settle", COMPUTER_SETTLE_MS, MAX_ELEMENT_PRESSES),
         ("observe", COMPUTER_OBSERVE_MS, MAX_ELEMENT_PRESSES),
@@ -204,6 +213,7 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("hit_test", AX_STEP_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("press", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
         ("observe", COMPUTER_OBSERVE_MS, 1),
@@ -216,6 +226,7 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("target", AX_STEP_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("write", AX_STEP_MS, 1),
         ("read_back", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
@@ -229,6 +240,7 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("security", AX_STEP_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -243,6 +255,7 @@ budget!(
     "keys",
     [
         ("preflight", PREFLIGHT_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -1015,6 +1028,28 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_arrival_budget_is_the_read_plus_the_longest_arrival_the_timeline_gives() {
+        use cerebellum_computer::cursor::tip_arrival_ms;
+        // Every distance, Reduce Motion setting and first-or-later event the
+        // badge can be sent with: the longest arrival among them, after the
+        // geometry read's 50 ms, is the budget.
+        let mut longest = 0.0_f64;
+        for distance in [0.0, 1.0, 400.0, 1_080.0, 10_000.0, f64::MAX, f64::NAN] {
+            for first in [false, true] {
+                for reduce_motion in [false, true] {
+                    longest = longest.max(tip_arrival_ms(distance, first, reduce_motion));
+                }
+            }
+        }
+        assert_eq!(CURSOR_ARRIVAL_MS, 50 + longest as u64);
+        assert_eq!(CURSOR_ARRIVAL_MS, 1_090);
+        // The wait never changes the computer reply bound: open_app's launch
+        // still dominates the work every computer action can take.
+        assert_eq!(COMPUTER_MAX_WORK_MS, COMPUTER_OPEN_APP.work_ms);
+        const { assert!(COMPUTER_PRESS_ELEMENT.work_ms < COMPUTER_MAX_WORK_MS) };
+    }
+
+    #[test]
     fn computer_phase_accounting_matches_each_path() {
         let expected = [
             (
@@ -1046,19 +1081,34 @@ mod tests {
                 COMPUTER_PRESS_ELEMENT,
                 PREFLIGHT_MS
                     + MAX_ELEMENT_PRESSES
-                        * (AX_STEP_MS + COMPUTER_SETTLE_MS + COMPUTER_OBSERVE_MS + STORE_MS),
+                        * (CURSOR_ARRIVAL_MS
+                            + AX_STEP_MS
+                            + COMPUTER_SETTLE_MS
+                            + COMPUTER_OBSERVE_MS
+                            + STORE_MS),
             ),
             (
                 COMPUTER_PRESS_POINT,
-                PREFLIGHT_MS + 2 * AX_STEP_MS + COMPUTER_SETTLE_MS + COMPUTER_OBSERVE_MS + STORE_MS,
+                PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
+                    + 2 * AX_STEP_MS
+                    + COMPUTER_SETTLE_MS
+                    + COMPUTER_OBSERVE_MS
+                    + STORE_MS,
             ),
             (
                 COMPUTER_WRITE_TEXT,
-                PREFLIGHT_MS + 3 * AX_STEP_MS + COMPUTER_SETTLE_MS + COMPUTER_OBSERVE_MS + STORE_MS,
+                PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
+                    + 3 * AX_STEP_MS
+                    + COMPUTER_SETTLE_MS
+                    + COMPUTER_OBSERVE_MS
+                    + STORE_MS,
             ),
             (
                 COMPUTER_TYPE,
                 PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
                     + 3 * AX_STEP_MS
                     + FRONTING_BRACKET_MS
                     + SYNTHETIC_POST_PHASE_MS
@@ -1069,6 +1119,7 @@ mod tests {
             (
                 COMPUTER_KEYS,
                 PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
                     + FRONTING_BRACKET_MS
                     + AX_STEP_MS
                     + SYNTHETIC_POST_PHASE_MS

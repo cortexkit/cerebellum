@@ -82,6 +82,64 @@ pub struct CursorEvent {
     /// a picture without it keeps the shape it had before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_tint: Option<AvatarTint>,
+    /// How the badge reaches `to`, and how long it takes. The module chooses
+    /// it and waits exactly this long before it sends the action, and the
+    /// helper animates exactly this, so the two cannot disagree. Required on
+    /// every picture: a helper never works out a motion of its own.
+    pub motion: PictureMotion,
+}
+
+/// How a picture's badge reaches its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionStyle {
+    /// The badge appears on the target with its entry animation.
+    Entry,
+    /// The badge glides there from wherever it is.
+    Glide,
+}
+
+/// The motion the module chose for one picture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PictureMotion {
+    pub style: MotionStyle,
+    /// How long after the picture arrives the badge's tip is on `to`, ms.
+    pub duration_ms: f64,
+    /// Whether the motion is the Reduce Motion form: a plain fade for an
+    /// entry, a fade-move for a glide.
+    pub reduce_motion: bool,
+}
+
+impl PictureMotion {
+    /// The motion for a picture whose badge is not on screen yet (`first`)
+    /// or rests `distance` points from its new target. This is the one place
+    /// the module works a motion out; the helper only follows it.
+    pub fn chosen(distance: f64, first: bool, reduce_motion: bool) -> Self {
+        Self {
+            style: if first {
+                MotionStyle::Entry
+            } else {
+                MotionStyle::Glide
+            },
+            duration_ms: tip_arrival_ms(distance, first, reduce_motion),
+            reduce_motion,
+        }
+    }
+
+    /// A badge that stays where it is, or a line that moves nothing.
+    pub fn still() -> Self {
+        Self {
+            style: MotionStyle::Glide,
+            duration_ms: 0.0,
+            reduce_motion: false,
+        }
+    }
+
+    /// No motion longer than the longest the timeline ever gives.
+    pub fn valid(&self) -> bool {
+        self.duration_ms.is_finite() && (0.0..=LONGEST_ARRIVAL_MS).contains(&self.duration_ms)
+    }
 }
 
 impl CursorEvent {
@@ -105,6 +163,7 @@ impl CursorEvent {
                 .is_none_or(|rgba| rgba.len() == (AVATAR_SIZE * AVATAR_SIZE * 4) as usize)
             && (!self.avatar_update || self.avatar_rgba.is_some())
             && self.avatar_tint.is_none_or(AvatarTint::valid)
+            && self.motion.valid()
     }
 }
 
@@ -248,26 +307,12 @@ impl CursorLine {
     }
 }
 
-/// Glide time grows with distance, from a quick 180 ms hop to a 450 ms
-/// cross-screen move, so short moves feel snappy and long ones stay legible.
-/// With Reduce Motion the picture does a short fade-move instead of gliding.
-/// A zero or malformed distance needs no glide at all.
-pub fn duration_ms(distance: f64, reduce_motion: bool) -> f64 {
-    let distance = if distance.is_finite() {
-        distance.max(0.0)
-    } else {
-        0.0
-    };
-    if distance < 0.5 {
-        return 0.0;
-    }
-    if reduce_motion {
-        return REDUCED_MOVE_MS;
-    }
-    (180.0 + distance * 0.25).min(450.0)
-}
-
-const REDUCED_MOVE_MS: f64 = 140.0;
+// The glide and entry timings live in one file shared with the helper's
+// crate, so the helper's animation and the module's wait for it agree.
+pub use crate::cursor_timeline::{
+    duration_ms, entry_ms, tip_arrival_ms, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
+    LONGEST_GLIDE_MS,
+};
 const TAP_MS: f64 = 180.0;
 const SETTLE_MS: f64 = 220.0;
 
@@ -783,9 +828,71 @@ mod tests {
             last = ms;
         }
         // Reduce Motion: a short fade-move, the same for every distance.
-        assert_eq!(duration_ms(10.0, true), REDUCED_MOVE_MS);
-        assert_eq!(duration_ms(5000.0, true), REDUCED_MOVE_MS);
+        assert_eq!(duration_ms(10.0, true), 140.0);
+        assert_eq!(duration_ms(5000.0, true), 140.0);
         assert_eq!(duration_ms(0.0, true), 0.0);
+    }
+
+    #[test]
+    fn every_picture_line_carries_the_motion_the_module_chose() {
+        let event = CursorEvent {
+            agent: "agent".into(),
+            initial: 'A',
+            to: [1.0, 2.0],
+            target: None,
+            resting: false,
+            label: None,
+            kind: CursorKind::Press,
+            serial: 3,
+            avatar_rgba: None,
+            avatar_update: false,
+            avatar_tint: None,
+            motion: PictureMotion::chosen(400.0, false, true),
+        };
+        assert_eq!(
+            event.motion,
+            PictureMotion {
+                style: MotionStyle::Glide,
+                duration_ms: 140.0,
+                reduce_motion: true,
+            }
+        );
+        assert_eq!(
+            PictureMotion::chosen(400.0, true, false).style,
+            MotionStyle::Entry
+        );
+        let line = event.encode_line().unwrap();
+        assert_eq!(serde_json::from_slice::<CursorEvent>(&line).unwrap(), event);
+        // A picture without a motion is no picture: the helper never makes
+        // one up.
+        let mut value = serde_json::to_value(&event).unwrap();
+        value.as_object_mut().unwrap().remove("motion");
+        assert!(serde_json::from_value::<CursorEvent>(value).is_err());
+        // Nor one longer than the timeline ever gives, or malformed.
+        for duration_ms in [LONGEST_ARRIVAL_MS + 1.0, -1.0, f64::NAN] {
+            let mut bad = event.clone();
+            bad.motion.duration_ms = duration_ms;
+            assert!(bad.encode_line().is_none(), "{duration_ms}");
+        }
+    }
+
+    #[test]
+    fn a_first_appearance_arrives_when_its_entry_ends_and_a_later_event_when_its_glide_does() {
+        // A first appearance plays its entry on the target whatever the
+        // distance: 1040 ms, or a 300 ms fade under Reduce Motion.
+        for distance in [0.0, 400.0, 10_000.0] {
+            assert_eq!(tip_arrival_ms(distance, true, false), 1040.0);
+            assert_eq!(tip_arrival_ms(distance, true, true), 300.0);
+        }
+        // Every later event glides.
+        assert_eq!(tip_arrival_ms(400.0, false, false), 280.0);
+        assert_eq!(tip_arrival_ms(10_000.0, false, false), 450.0);
+        assert_eq!(tip_arrival_ms(400.0, false, true), 140.0);
+        assert_eq!(tip_arrival_ms(0.0, false, false), 0.0);
+        // Nothing takes longer than the longest arrival, which is the entry.
+        assert_eq!(LONGEST_ARRIVAL_MS, 1040.0);
+        assert_eq!(LONGEST_GLIDE_MS, 450.0);
+        assert_eq!(entry_ms(false), LONGEST_ARRIVAL_MS);
     }
 
     #[test]
@@ -885,6 +992,7 @@ mod tests {
             avatar_rgba: None,
             avatar_update: false,
             avatar_tint: None,
+            motion: PictureMotion::chosen(400.0, false, false),
         };
         let encoded = event.encode_line().unwrap();
         assert_eq!(encoded.iter().filter(|c| **c == b'\n').count(), 1);
@@ -1026,6 +1134,7 @@ mod tests {
             avatar_rgba: Some(vec![255; (AVATAR_SIZE * AVATAR_SIZE * 4) as usize]),
             avatar_update: true,
             avatar_tint: None,
+            motion: PictureMotion::chosen(0.0, true, false),
         };
         let line = event.encode_line().unwrap();
         assert!(line.len() <= MAX_CURSOR_LINE);

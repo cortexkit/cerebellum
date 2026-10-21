@@ -2,6 +2,7 @@
 //! returns an action outcome or receives a request body.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(any(target_os = "macos", test))]
@@ -10,14 +11,48 @@ use std::time::Instant;
 use cerebellum_computer::app_state::source::{AppStateSource, CursorWindowWatch, ElementHandle};
 use cerebellum_computer::cursor::{
     follow_offset, label, CursorEvent, CursorFollow, CursorHide, CursorKind, CursorLine,
-    WindowChange,
+    PictureMotion, WindowChange, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
 };
 use cerebellum_computer::platform::ProcessGrant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::terminal_arbiter::TerminalArbiter;
 
 const READ_BUDGET: Duration = Duration::from_millis(50);
+/// The longest an action waits for its badge before it is sent: the badge's
+/// geometry read, then the longest animation the helper plays before the
+/// badge is on its target (a first appearance's entry; a glide is shorter).
+/// The action waits so that the real click and the badge's tap happen
+/// together. The call's work budget counts this as
+/// `budgets::CURSOR_ARRIVAL_MS`.
+pub(crate) const ARRIVAL_CAP: Duration =
+    Duration::from_millis(READ_BUDGET.as_millis() as u64 + LONGEST_ARRIVAL_MS as u64);
+/// How often a waiting action looks again at what can only be read, not
+/// awaited: the call's dispatch gate and whether the badge was ended.
+const ARRIVAL_POLL: Duration = Duration::from_millis(10);
+/// Reduce Motion is read again at most this often, and only when a picture
+/// is scheduled: a change the person makes shows within about this long.
+const REDUCE_MOTION_REFRESH: Duration = Duration::from_secs(30);
+/// The thread that reads Reduce Motion, named so a test can tell its reads
+/// from any made on the picture path.
+pub(crate) const REDUCE_MOTION_THREAD: &str = "agent-cursor-reduce-motion";
+
+/// Reads the system's Reduce Motion setting. May be slow: the first read in
+/// this process loads AppKit, which has taken hundreds of milliseconds.
+type ReduceMotionReader = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The Reduce Motion setting as last read, off the picture path. A picture
+/// only ever takes the value already here; it never waits for a read.
+#[derive(Default)]
+struct ReduceMotionCache {
+    /// 0 until the first read finishes (the full animation is assumed), then
+    /// 1 for off and 2 for on.
+    value: std::sync::atomic::AtomicU8,
+    /// When the latest read was started.
+    started: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// The platform's reader unless a test supplied one.
+    reader: OnceLock<ReduceMotionReader>,
+}
 const CAPACITY: usize = 32;
 /// Bounds each memory-only record of who drew a badge. Far more than the agents
 /// one person runs at once; past it the oldest record goes, and that agent's
@@ -90,6 +125,85 @@ struct Drawn {
     /// Which head session drew which agent's badge, least recently drawn
     /// first.
     sessions: VecDeque<(SessionScope, String)>,
+    /// Where each agent's badge was last sent, so the next picture's glide
+    /// length, and so the moment it arrives, can be worked out here.
+    tips: HashMap<String, Tip>,
+}
+
+/// One agent's badge as the module last sent it to the helper.
+struct Tip {
+    /// The picture event it was sent for.
+    serial: u64,
+    /// Where its tip was sent.
+    to: [f64; 2],
+    /// How far the window under it has moved since, as last reported to the
+    /// helper, which moves the badge by as much.
+    offset: [f64; 2],
+    /// When that event was sent: the helper's idle fade counts from it.
+    sent: tokio::time::Instant,
+}
+
+impl Tip {
+    fn place(&self) -> [f64; 2] {
+        [self.to[0] + self.offset[0], self.to[1] + self.offset[1]]
+    }
+}
+
+impl Drawn {
+    /// Choose the motion for a picture about to be sent to the helper, and
+    /// the record of where its badge will then be. Nothing is recorded yet:
+    /// `keep` does that once the picture is really on its way.
+    ///
+    /// A badge the module has not seen drawn (never drawn, ended, or faded
+    /// out after the idle timeout) appears with its entry animation; one
+    /// already on screen glides from where it was last sent. A read with
+    /// nothing to aim at leaves a shown badge where it is. The helper follows
+    /// the chosen motion from wherever its badge really is, so even where
+    /// this record is out of date the badge arrives when the motion says.
+    fn aim(
+        &self,
+        event: &CursorEvent,
+        now: tokio::time::Instant,
+        reduce_motion: bool,
+    ) -> (PictureMotion, Tip) {
+        let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
+        let shown = self
+            .tips
+            .get(&event.agent)
+            .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
+            .map(Tip::place);
+        let to = match (event.resting, shown) {
+            (true, Some(resting)) => resting,
+            _ => event.to,
+        };
+        let distance = shown.map_or(0.0, |from| (to[0] - from[0]).hypot(to[1] - from[1]));
+        (
+            PictureMotion::chosen(distance, shown.is_none(), reduce_motion),
+            Tip {
+                serial: event.serial,
+                to,
+                offset: [0.0, 0.0],
+                sent: now,
+            },
+        )
+    }
+
+    /// Record where an agent's badge was just sent.
+    fn keep(&mut self, agent: &str, tip: Tip) {
+        if self.tips.len() >= RECORD_CAP && !self.tips.contains_key(agent) {
+            // Bounded like the other records: the oldest goes, and its agent's
+            // next picture is simply taken for a first appearance.
+            if let Some(oldest) = self
+                .tips
+                .iter()
+                .min_by_key(|(_, tip)| tip.sent)
+                .map(|(agent, _)| agent.clone())
+            {
+                self.tips.remove(&oldest);
+            }
+        }
+        self.tips.insert(agent.to_owned(), tip);
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +219,13 @@ struct State {
     avatars: OnceLock<Arc<avatar::Avatars>>,
     #[cfg(target_os = "macos")]
     generation: std::sync::Mutex<Option<cerebellum_macos::ProcessGeneration>>,
+    /// The helper could not be started and will not be retried, so nothing
+    /// sent to it is drawn and no action waits for a badge.
+    helper_down: std::sync::atomic::AtomicBool,
+    reduce_motion: ReduceMotionCache,
+    /// Stands in for the system's Reduce Motion setting in tests.
+    #[cfg(test)]
+    reduce_motion_for_test: std::sync::Mutex<Option<bool>>,
 }
 
 /// One badge following its window: when the person moves or resizes the
@@ -194,6 +315,9 @@ impl Coordinator {
         if enabled && self.0.sender.get().is_none() {
             let (tx, rx) = mpsc::channel(CAPACITY);
             if self.0.sender.set(tx).is_ok() {
+                // Read now, in the background, so the first picture already
+                // has the person's setting.
+                self.refresh_reduce_motion();
                 let state = self.0.clone();
                 let _ = std::thread::Builder::new()
                     .name("agent-cursor-pipe".into())
@@ -207,13 +331,71 @@ impl Coordinator {
         self.send_line(CursorLine::Picture(event));
     }
 
-    fn send_line(&self, line: CursorLine) {
+    /// Whether the line was put on the pipe to the helper.
+    fn send_line(&self, line: CursorLine) -> bool {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+            return false;
         }
-        if let Some(sender) = self.0.sender.get() {
-            let _ = sender.try_send(line);
+        self.0
+            .sender
+            .get()
+            .is_some_and(|sender| sender.try_send(line).is_ok())
+    }
+
+    /// The system's Reduce Motion setting as last read, without reading it.
+    /// Until a first read has finished, the full animation. The picture line
+    /// carries whichever value is used, so the helper always agrees.
+    fn reduce_motion(&self) -> bool {
+        #[cfg(test)]
+        if let Some(reduce) = *self
+            .0
+            .reduce_motion_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return reduce;
         }
+        self.0
+            .reduce_motion
+            .value
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 2
+    }
+
+    /// Start a read of Reduce Motion on a thread of its own, unless one was
+    /// started less than `REDUCE_MOTION_REFRESH` ago. Never waits for it.
+    fn refresh_reduce_motion(&self) {
+        let cache = &self.0.reduce_motion;
+        let now = tokio::time::Instant::now();
+        {
+            let mut started = cache
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if started.is_some_and(|at| now.saturating_duration_since(at) < REDUCE_MOTION_REFRESH) {
+                return;
+            }
+            *started = Some(now);
+        }
+        let reader = cache.reader.get_or_init(platform_reduce_motion).clone();
+        let state = Arc::downgrade(&self.0);
+        let _ = std::thread::Builder::new()
+            .name(REDUCE_MOTION_THREAD.into())
+            .spawn(move || {
+                let on = reader();
+                if let Some(state) = state.upgrade() {
+                    state
+                        .reduce_motion
+                        .value
+                        .store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Release);
+                }
+            });
+    }
+
+    /// Read Reduce Motion with this reader instead of the platform's.
+    #[cfg(test)]
+    fn with_reduce_motion_reader(&self, reader: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.0.reduce_motion.reader.set(Arc::new(reader));
     }
 
     fn drawn(&self) -> std::sync::MutexGuard<'_, Drawn> {
@@ -241,6 +423,9 @@ impl Coordinator {
             agent.to_owned(),
             self.0.serial.load(std::sync::atomic::Ordering::SeqCst),
         );
+        // The helper takes the badge off the screen, so the agent's next
+        // picture is a new appearance.
+        drawn.tips.remove(agent);
         // Sent while holding the record, so a picture whose read finishes now
         // either goes out before this hide or sees the end and is dropped.
         self.send_line(CursorLine::Hide(CursorHide::new(agent)));
@@ -423,15 +608,27 @@ impl Coordinator {
         let follows = self.follows();
         // Sent only if the badge still rests on the same event, so a report
         // computed against an older event never moves a newer picture.
-        if follows
+        let moved = follows
             .get(agent)
             .is_some_and(|follow| follow.id == id && follow.serial == serial)
-        {
-            self.send_line(CursorLine::Follow(CursorFollow {
+            && self.send_line(CursorLine::Follow(CursorFollow {
                 agent: agent.to_owned(),
                 serial,
                 offset,
             }));
+        // Released first: the record's lock is always taken before this one.
+        drop(follows);
+        if moved {
+            // The helper moves the badge with the window, so the next glide
+            // starts from there.
+            if let Some(tip) = self
+                .drawn()
+                .tips
+                .get_mut(agent)
+                .filter(|tip| tip.serial == serial)
+            {
+                tip.offset = offset;
+            }
         }
     }
 
@@ -511,17 +708,35 @@ impl Coordinator {
     }
 
     /// Send a scheduled picture unless its agent was ended after it was
-    /// scheduled.
-    fn send_unless_ended(&self, event: CursorEvent) {
-        let drawn = self.drawn();
+    /// scheduled. Answers when the badge will be on its target, or `None`
+    /// when nothing will be drawn.
+    fn send_unless_ended(&self, mut event: CursorEvent) -> Option<tokio::time::Instant> {
+        let mut drawn = self.drawn();
         if drawn
             .ended_at
             .get(&event.agent)
             .is_some_and(|ended| event.serial < *ended)
         {
-            return;
+            return None;
         }
-        self.send(event);
+        let now = tokio::time::Instant::now();
+        let (motion, tip) = drawn.aim(&event, now, self.reduce_motion());
+        // The line carries the motion, so the helper animates exactly what
+        // this wait is timed by.
+        event.motion = motion;
+        let (agent, resting) = (event.agent.clone(), event.resting);
+        if !self.send_line(CursorLine::Picture(event)) {
+            return None;
+        }
+        drawn.keep(&agent, tip);
+        // A badge that only rests somewhere aims at nothing an action waits
+        // for.
+        let waits = !resting
+            && !self
+                .0
+                .helper_down
+                .load(std::sync::atomic::Ordering::Acquire);
+        waits.then(|| now + Duration::from_secs_f64(motion.duration_ms / 1000.0))
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
@@ -535,7 +750,7 @@ impl Coordinator {
         source: Arc<dyn AppStateSource>,
         handle: Option<ElementHandle>,
         point: Option<[f64; 2]>,
-    ) {
+    ) -> Arrival {
         self.schedule_with_fallback(
             identity,
             kind,
@@ -546,7 +761,7 @@ impl Coordinator {
                 focused: None,
             },
             point,
-        );
+        )
     }
 
     /// Schedule a read with a focused fallback if its preferred element has
@@ -560,11 +775,11 @@ impl Coordinator {
         source: Arc<dyn AppStateSource>,
         aim: ReadAim,
         point: Option<[f64; 2]>,
-    ) {
+    ) -> Arrival {
         if self.0.sender.get().is_none()
             || self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return Arrival::none();
         }
         let cursor = self.clone();
         // Numbered before it is recorded: an end that lands in between then
@@ -574,6 +789,18 @@ impl Coordinator {
             .serial
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cursor.record(&identity);
+        // Off the picture path: this picture uses the value already read.
+        self.refresh_reduce_motion();
+        let (decided, decision) = oneshot::channel();
+        let arrival = Arrival {
+            decision: Some(decision),
+            scheduled: tokio::time::Instant::now(),
+            watch: Some(BadgeWatch {
+                cursor: self.clone(),
+                agent: identity.badge.clone(),
+                serial,
+            }),
+        };
         let source_for_follow = source.clone();
         let read_grant = grant.clone();
         tokio::spawn(async move {
@@ -631,10 +858,14 @@ impl Coordinator {
                         avatar_rgba: None,
                         avatar_update: false,
                         avatar_tint: None,
+                        // Chosen when the picture is sent, from where the badge is then.
+                        motion: PictureMotion::still(),
                     },
                     aimed_handle,
                 ))
             });
+            // A read that fails or runs out of time drops `decided`, which
+            // tells a waiting action that no badge will be drawn.
             if let Ok(Ok(Some((event, followed_element)))) =
                 tokio::time::timeout(READ_BUDGET, read).await
             {
@@ -650,7 +881,7 @@ impl Coordinator {
                     }
                     event
                 };
-                cursor.send_unless_ended(event.clone());
+                let _ = decided.send(cursor.send_unless_ended(event.clone()));
                 // Off the read's deadline: following the window is a nicety
                 // that must never hold up or drop the picture itself.
                 let follower = cursor.clone();
@@ -674,6 +905,7 @@ impl Coordinator {
                 }
             }
         });
+        arrival
     }
 
     /// Signal before browser teardown starts. Reaping and any blocked pipe write
@@ -683,6 +915,7 @@ impl Coordinator {
             .stopped
             .store(true, std::sync::atomic::Ordering::Release);
         self.follows().clear();
+        self.drawn().tips.clear();
         #[cfg(target_os = "macos")]
         if let Some(generation) = *self
             .0
@@ -707,7 +940,163 @@ impl Coordinator {
                 avatar_rgba: None,
                 avatar_update: false,
                 avatar_tint: None,
+                motion: PictureMotion::still(),
             }));
+        }
+    }
+}
+
+/// When the badge an action scheduled will be on its target.
+///
+/// An action that shows a badge waits for this before it is sent, so the real
+/// press or write happens as the badge arrives and taps, not before it sets
+/// off. The wait first hears whether a picture went out at all (the geometry
+/// read decides that, within `READ_BUDGET`), then lasts until the arrival
+/// the helper's timeline gives. Nothing to see means no wait.
+pub(crate) struct Arrival {
+    /// Answers once the picture is sent, with the moment its badge arrives,
+    /// or with nothing (or is dropped) when no picture will be drawn.
+    decision: Option<oneshot::Receiver<Option<tokio::time::Instant>>>,
+    /// When the picture was scheduled; no wait runs past this plus
+    /// `ARRIVAL_CAP`.
+    scheduled: tokio::time::Instant,
+    watch: Option<BadgeWatch>,
+}
+
+/// How a wait for a badge ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Landing {
+    /// Send the action now: the badge is on its target, or no picture will
+    /// be drawn. `drawn` says whether a picture was drawn for it.
+    Arrived { drawn: bool },
+    /// The call was cancelled while it waited.
+    Cancelled,
+    /// The agent's badge was ended (its turn ended, its route closed) while
+    /// it travelled to this action's target: the agent is done with the
+    /// computer, so the action is not sent.
+    Ended,
+    /// The call's work deadline passed, or its dispatch gate closed.
+    Stopped,
+}
+
+/// One scheduled picture, as an action that waits for it watches it.
+#[derive(Clone)]
+pub(crate) struct BadgeWatch {
+    cursor: Coordinator,
+    agent: String,
+    serial: u64,
+}
+
+impl BadgeWatch {
+    /// Whether the agent's badge was ended after this picture was scheduled.
+    /// An end before it (the previous turn's) does not count: this picture
+    /// draws a new badge.
+    pub(crate) fn ended(&self) -> bool {
+        self.cursor
+            .drawn()
+            .ended_at
+            .get(&self.agent)
+            .is_some_and(|ended| self.serial < *ended)
+    }
+
+    fn helper_stopped(&self) -> bool {
+        self.cursor
+            .0
+            .stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Arrival {
+    /// No picture: the action goes ahead at once.
+    pub(crate) fn none() -> Self {
+        Self {
+            decision: None,
+            scheduled: tokio::time::Instant::now(),
+            watch: None,
+        }
+    }
+
+    /// The picture this waits for, to check right before the action is sent
+    /// whether its badge was ended meanwhile.
+    pub(crate) fn watch(&self) -> Option<BadgeWatch> {
+        self.watch.clone()
+    }
+
+    /// Wait until the badge is on its target, or until the call must not be
+    /// sent: `cancelled` resolves, `stopped` answers true (the call's
+    /// dispatch gate closed), or `deadline` passes first. Never longer than
+    /// `ARRIVAL_CAP` after the picture was scheduled.
+    pub(crate) async fn wait(
+        self,
+        deadline: tokio::time::Instant,
+        cancelled: impl Future<Output = ()>,
+        stopped: impl Fn() -> bool,
+    ) -> Landing {
+        tokio::pin!(cancelled);
+        let cap = self.scheduled + ARRIVAL_CAP;
+        let (mut decision, mut deciding) = match self.decision {
+            Some(decision) => (decision, true),
+            None => (oneshot::channel().1, false),
+        };
+        let mut landing = None;
+        loop {
+            if stopped() {
+                return Landing::Stopped;
+            }
+            let drawn = landing.is_some();
+            let until = if deciding {
+                cap
+            } else {
+                match landing {
+                    // A stopped helper draws nothing more: nothing to wait for.
+                    Some(at) if !self.watch.as_ref().is_some_and(BadgeWatch::helper_stopped) => {
+                        // The badge is on its way. Ended meanwhile, it is gone
+                        // from the screen and the agent is done: stop now
+                        // rather than wait out a glide nobody sees.
+                        if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
+                            return Landing::Ended;
+                        }
+                        std::cmp::min(at, cap)
+                    }
+                    // No picture was drawn, so there is nothing to wait for.
+                    // An end that landed while the geometry read ran is what
+                    // dropped the picture; the dispatch gate refuses that
+                    // action when it would be sent (see `BadgeWatch::ended`).
+                    _ => return Landing::Arrived { drawn },
+                }
+            };
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                return Landing::Arrived { drawn };
+            }
+            if now >= deadline {
+                return Landing::Stopped;
+            }
+            let wake = until.min(deadline).min(now + ARRIVAL_POLL);
+            tokio::select! {
+                biased;
+                () = &mut cancelled => return Landing::Cancelled,
+                decided = &mut decision, if deciding => {
+                    deciding = false;
+                    landing = decided.ok().flatten();
+                }
+                () = tokio::time::sleep_until(wake) => {}
+            }
+        }
+    }
+}
+
+impl Arrival {
+    /// A picture already decided on, whose badge lands at `at`.
+    #[cfg(test)]
+    pub(crate) fn landing_at(at: tokio::time::Instant) -> Self {
+        let (decided, decision) = oneshot::channel();
+        let _ = decided.send(Some(at));
+        Self {
+            decision: Some(decision),
+            scheduled: tokio::time::Instant::now(),
+            watch: None,
         }
     }
 }
@@ -738,6 +1127,19 @@ impl Coordinator {
     }
 }
 
+/// The platform's Reduce Motion reader; the full animation where there is
+/// no setting to read.
+fn platform_reduce_motion() -> ReduceMotionReader {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(cerebellum_macos::reduce_motion)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(|| false)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
     use std::io::Write;
@@ -758,6 +1160,9 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 continue;
             }
             if !restarts.admit(Instant::now()) {
+                state
+                    .helper_down
+                    .store(true, std::sync::atomic::Ordering::Release);
                 continue;
             }
             let launched = (|| {
@@ -779,6 +1184,11 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 Some((child, std::fs::File::from(pipe)))
             })();
             helper = launched;
+            // A helper that did not start draws nothing; until another one
+            // starts, no action waits for its badge.
+            state
+                .helper_down
+                .store(helper.is_none(), std::sync::atomic::Ordering::Release);
         }
         let Some(line) = event.encode_line() else {
             continue;
@@ -859,6 +1269,40 @@ mod tests {
                 .is_err(),
             "late geometry must not reach the helper"
         );
+    }
+
+    /// No action waits past the cap after its picture was scheduled: not
+    /// for a landing named far in the future, and not for a decision that
+    /// never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_badge_wait_never_runs_past_its_cap() {
+        let far = tokio::time::Instant::now() + Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let landing = Arrival::landing_at(far)
+            .wait(
+                far + Duration::from_secs(10),
+                std::future::pending(),
+                || false,
+            )
+            .await;
+        assert_eq!(landing, Landing::Arrived { drawn: true });
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
+
+        let (_undecided, decision) = oneshot::channel();
+        let start = tokio::time::Instant::now();
+        let landing = Arrival {
+            decision: Some(decision),
+            scheduled: start,
+            watch: None,
+        }
+        .wait(
+            start + Duration::from_secs(10),
+            std::future::pending(),
+            || false,
+        )
+        .await;
+        assert_eq!(landing, Landing::Arrived { drawn: false });
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
     }
 
     const SESSION: &str = "0123456789abcdef0123456789abcdef";
@@ -1392,6 +1836,7 @@ mod tests {
             avatar_rgba: None,
             avatar_update: false,
             avatar_tint: None,
+            motion: PictureMotion::still(),
         };
         for _ in 0..CAPACITY {
             cursor.send(event.clone());
@@ -1407,5 +1852,111 @@ mod tests {
             received.recv_timeout(Duration::from_millis(100)).is_ok(),
             "cursor send awaited a full channel"
         );
+    }
+
+    /// Wait, in real time, until `done` holds: a read runs on a plain thread
+    /// that tokio's clock knows nothing of.
+    fn until_read(done: impl Fn() -> bool) {
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < give_up, "the read never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The first Reduce Motion read in a process can take hundreds of
+    /// milliseconds (it loads AppKit), far past the geometry read's budget.
+    /// A picture never waits for it: it still goes out at once.
+    #[tokio::test]
+    async fn a_slow_reduce_motion_read_never_holds_back_a_picture() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        cursor.with_reduce_motion_reader(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            true
+        });
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().expect("a picture");
+    }
+
+    /// Pictures take Reduce Motion from what was last read and never read it
+    /// themselves. Before the first read has finished they use the full
+    /// animation, and say so on their line; once it has, the value read.
+    /// Every read happens on the reading thread, none on the path that sends
+    /// a picture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pictures_never_read_reduce_motion_themselves() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // The read is held until the test lets it finish (or two seconds
+        // pass, so a read made where it must not be cannot hang the test).
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let recorded = reads.clone();
+        cursor.with_reduce_motion_reader(move || {
+            let thread = std::thread::current();
+            recorded
+                .lock()
+                .unwrap()
+                .push(thread.name().unwrap_or_default().to_owned());
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2));
+            true
+        });
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        let before = next_line(&mut receiver).await.picture().expect("a picture");
+        assert!(
+            !before.motion.reduce_motion,
+            "no read had finished, so the full animation"
+        );
+        release.send(()).unwrap();
+        until_read(|| cursor.reduce_motion());
+        for kind in [CursorKind::Press, CursorKind::Write, CursorKind::Reading] {
+            schedule_on(&cursor, &geometry, kind);
+            let picture = next_line(&mut receiver).await.picture().expect("a picture");
+            assert!(picture.motion.reduce_motion, "{kind:?}: the value read");
+        }
+        let elsewhere: Vec<String> = reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|thread| *thread != REDUCE_MOTION_THREAD)
+            .cloned()
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "read on the picture path, on {elsewhere:?}"
+        );
+    }
+
+    /// Scheduling pictures starts a background read of the setting at most
+    /// every 30 seconds, on tokio's paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn reduce_motion_is_read_again_at_most_every_30_seconds() {
+        let (cursor, _receiver) = Coordinator::channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = count.clone();
+        cursor.with_reduce_motion_reader(move || {
+            // Only the background reads; this test is about how often they
+            // start, not about where else a read might happen.
+            if std::thread::current().name() == Some(REDUCE_MOTION_THREAD) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            false
+        });
+        let reads = || count.load(std::sync::atomic::Ordering::SeqCst);
+        let geometry = FollowGeometry::new();
+        // At 0 s, 10 s, 29.9 s, 30 s and 31 s.
+        for (advance_ms, expected) in [(0, 1), (10_000, 1), (19_900, 1), (100, 2), (1_000, 2)] {
+            tokio::time::advance(Duration::from_millis(advance_ms)).await;
+            schedule_on(&cursor, &geometry, CursorKind::Reading);
+            // A read that was started has had ample time to count.
+            std::thread::sleep(Duration::from_millis(30));
+            until_read(|| reads() >= expected);
+            assert_eq!(reads(), expected, "after {advance_ms} ms more");
+        }
     }
 }

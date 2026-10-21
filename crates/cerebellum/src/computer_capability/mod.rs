@@ -1764,7 +1764,7 @@ where
                 return unposted(reply);
             }
         };
-        self.cursor.schedule(
+        let arrival = self.cursor.schedule(
             cursor::Identity::current(identity.agent_project_id.clone()),
             if capability == ComputerCapability::Type {
                 cerebellum_computer::cursor::CursorKind::Type
@@ -1879,6 +1879,34 @@ where
             );
         }
 
+        // Posted only once the badge is on the focused element, so the text or
+        // keys arrive with it rather than ahead of it. Waited for before the
+        // attendance lease below is taken, so the wait never ages the lease.
+        let watch = arrival.watch();
+        if let Err(held) = self
+            .hold_for_badge(
+                arrival,
+                &cancel,
+                management,
+                &identity.conversation_key,
+                &grant,
+            )
+            .await
+        {
+            let mut reply = match held {
+                element_actions::Held::Cancelled => {
+                    synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                        posts_returned: 0,
+                        held_state: HeldStateDisposition::NoneHeld,
+                    })
+                }
+                element_actions::Held::Stopped => quarantine::stopped_before_dispatch_reply(),
+                element_actions::Held::Refused(reply) => reply,
+            };
+            admission.decorate(&mut reply);
+            return unposted(reply);
+        }
+
         // Every served capability has a dispatch row; a missing one is a table
         // disagreement to report, not a reason to take the module down.
         let Some(mut row) = FrozenDispatchRow::for_capability(capability_id) else {
@@ -1958,7 +1986,9 @@ where
         // The journal entry is reserved here, under a short lock, before the
         // blocking worker starts; the worker commits and finalizes it through
         // the token, so no audit lock is held across platform work.
-        let mut token = AuditToken::new(self.audit.clone(), work.gate());
+        // Also refuses once the badge was ended after it was scheduled.
+        let badge_gate = element_actions::BadgeGate::new(work.gate(), watch);
+        let mut token = AuditToken::new(self.audit.clone(), badge_gate.clone());
         if cerebellum_computer::dispatch::reserve_actuation_ahead(
             &mut token,
             identity.clone(),
@@ -2060,6 +2090,14 @@ where
         // posting, and that reply must still say nothing was posted.
         if unposted_refusal {
             reply = unposted(reply);
+        }
+        // The agent's turn ended while the badge was on its way: nothing was
+        // posted, and the call reads as cancelled before it ran.
+        if badge_gate.refused_for_end() {
+            reply = unposted(synthetic_dispatch_refusal(&DispatchError::Cancelled {
+                posts_returned: 0,
+                held_state: HeldStateDisposition::NoneHeld,
+            }));
         }
 
         let posted = matches!(
