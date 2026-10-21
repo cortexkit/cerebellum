@@ -1168,7 +1168,10 @@ const SUMMARISED_MAIN: &str = "\nkq376 main  [46 elements, like \"Projects\", ~2
 
 /// A banner ahead of the main region spends the outline's whole budget. The
 /// main region is still there, as one line with its count and an id to zoom
-/// into, after which the outline says what it cut.
+/// into, after which the outline says what it cut. An action reply that
+/// shows a replaced page as an outline has less room than a read; the main
+/// region keeps its line there too, because the outline stops short of the
+/// reply's bound to leave room for it.
 #[test]
 fn an_outline_past_its_budget_still_summarises_the_main_region() {
     let read = observe(tauri_dashboard_with(42, 60, 0));
@@ -1179,17 +1182,16 @@ fn an_outline_past_its_budget_still_summarises_the_main_region() {
         "{outline}"
     );
     assert!(!outline.contains("menu bar item"), "{outline}");
-}
 
-/// An action reply that shows a replaced page as an outline has less room
-/// than a read; the main region keeps its line there too, because the
-/// outline stops short of the reply's bound to leave room for it.
-#[test]
-fn an_action_replys_outline_keeps_room_for_the_main_region() {
-    let read = observe(tauri_dashboard_with(42, 60, 0));
-    let outline = bounded_outline_of(&read, MAX_DIFF_BYTES - 32);
-    assert!(outline.contains(SUMMARISED_MAIN), "{outline}");
-    assert!(outline.len() < MAX_DIFF_BYTES, "{} bytes", outline.len());
+    // Whatever the reply's bound, from a small one up to an action reply's.
+    for limit in (1_500..=MAX_DIFF_BYTES - 32).step_by(97) {
+        let reply_outline = bounded_outline_of(&read, limit);
+        assert!(
+            reply_outline.contains(SUMMARISED_MAIN),
+            "{limit}: {reply_outline}"
+        );
+        assert!(reply_outline.len() < limit, "{} bytes", reply_outline.len());
+    }
 }
 
 /// A main region nested below more named regions than the outline opens is
