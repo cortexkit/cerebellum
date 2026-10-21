@@ -956,9 +956,9 @@ fn tauri_dashboard(projects: usize) -> Vec<RawElement> {
 }
 
 /// [`tauri_dashboard`] with a banner of `banner_sections` named sections
-/// ahead of the main region, each a few kilobytes' worth of outline lines
-/// between them, and the main region wrapped in `named_wrappers` nested
-/// named groups.
+/// ahead of the main region, each holding five buttons with long labels, so
+/// enough sections spend the outline's budget before the main region; and
+/// the main region wrapped in `named_wrappers` nested named groups.
 fn tauri_dashboard_with(
     projects: usize,
     banner_sections: usize,

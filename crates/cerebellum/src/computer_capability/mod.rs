@@ -1112,7 +1112,9 @@ where
                 raw.map(|mut raw| {
                     // A window that shows only its own buttons is usually a
                     // WebKit page still being built: wait once and read that
-                    // window again, within the call's remaining work time.
+                    // window again. The wait is skipped when it would run past
+                    // the call's work deadline; the re-read is held to the
+                    // tree read's timeout.
                     raw.reread_shell_windows(
                         source.as_ref(),
                         &read_grant,
