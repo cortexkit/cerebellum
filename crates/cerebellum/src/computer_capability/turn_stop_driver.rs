@@ -1,6 +1,7 @@
 //! A scripted platform constructed only by the held-key vector fixture. It has
 //! no native fallback, so an unexpected operation cannot reach the desktop.
 
+use crate::test_support::HANG_GUARD;
 use cerebellum_computer::platform::*;
 use std::sync::{Arc, Mutex};
 
@@ -79,7 +80,7 @@ impl PlatformDriver for Driver {
             // run the paired recovery releases, but never the remaining step.
             if index == 2 && event.is_none() && !recovery {
                 sequence.posted.notify_one();
-                let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let end = std::time::Instant::now() + HANG_GUARD;
                 while !cancelled() && std::time::Instant::now() < end {
                     std::thread::yield_now();
                 }

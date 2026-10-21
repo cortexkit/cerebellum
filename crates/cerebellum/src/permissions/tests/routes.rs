@@ -16,7 +16,7 @@ async fn exchange(planes: &Planes, channel: u16, corr: u64, body: Value) -> Fram
     crate::handle_frame_for_test(frame, &tx, planes)
         .await
         .unwrap();
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+    let response = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -183,7 +183,7 @@ async fn cingulate_management_route_refuses_requests_it_cannot_read_as_a_permiss
         crate::handle_frame_for_test(frame, &tx, &planes)
             .await
             .unwrap();
-        let refused = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        let refused = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();

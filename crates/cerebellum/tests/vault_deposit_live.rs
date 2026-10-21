@@ -21,7 +21,10 @@
 //! answer to a caller without the deposit grant, `not_found`.
 #![cfg(unix)]
 
+#[path = "it/support/hang_guard.rs"]
+mod hang_guard;
 mod support;
+use hang_guard::HANG_GUARD;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,21 +49,21 @@ const CLAUSTRUM: &str = "claustrum";
 const CREDENTIAL_ID: &str = "cookie:ollama.com:work";
 
 /// Generous: it only decides how long a broken boot takes to fail.
-const STARTUP: Duration = Duration::from_secs(60);
+const STARTUP: Duration = HANG_GUARD;
 
 async fn connect(connection: &subc_transport::ConnectionInfo) -> TcpStream {
     let endpoint = connection.endpoints.first().expect("an endpoint");
     let mut stream = TcpStream::connect(format!("{}:{}", endpoint.host, endpoint.port))
         .await
         .expect("connect to the daemon");
-    authenticate_client(&mut stream, connection, Duration::from_secs(5))
+    authenticate_client(&mut stream, connection, HANG_GUARD)
         .await
         .expect("authenticate");
     stream
 }
 
 async fn next_frame(stream: &mut TcpStream) -> Frame {
-    timeout(Duration::from_secs(10), read_frame(stream))
+    timeout(HANG_GUARD, read_frame(stream))
         .await
         .expect("the daemon answers")
         .expect("readable frame")

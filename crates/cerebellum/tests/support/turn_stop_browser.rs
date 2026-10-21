@@ -1,5 +1,6 @@
 use super::turn_stop_vectors::{cancel, check};
 use super::*;
+use crate::support::HANG_GUARD;
 
 fn navigation(corr: u64) -> Frame {
     request(
@@ -107,7 +108,7 @@ async fn turn_stop_cancel_browser_running_reports_uncertainty() {
     effect_seen(&launcher, "navigate").await;
     let stop = cancel(&request);
     send(&planes, &tx, stop.clone()).await;
-    let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("running browser cancellation answers within its release/cleanup budget")
         .unwrap();

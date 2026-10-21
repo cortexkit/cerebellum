@@ -125,6 +125,7 @@ fn permission_states_never_change_serialized_tool_definitions() {
 mod wire {
     use super::*;
     use crate::computer_capability::permissions::live_for_test;
+    use crate::test_support::HANG_GUARD;
     use cerebellum_computer::platform::TargetResolution;
     use serde_json::{json, Value};
     use std::sync::{
@@ -230,7 +231,7 @@ mod wire {
         )
         .await
         .unwrap();
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .expect("permission admission must answer without waiting for consent")
             .unwrap();

@@ -9,6 +9,7 @@
 //! passed its row's result schema.
 
 use super::support;
+use crate::support::HANG_GUARD;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -322,7 +323,7 @@ fn assert_screen_locked(name: &str, reply: &Value) {
 }
 
 async fn until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         while !condition() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

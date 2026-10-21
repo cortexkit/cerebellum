@@ -1,5 +1,6 @@
 //! A completed late capture is visible before its separate audit write.
 
+use super::HANG_GUARD;
 use super::*;
 use std::future::Future;
 
@@ -22,7 +23,7 @@ pub(super) async fn captured_count(planes: &Planes, credential_id: &str) -> usiz
 
 pub(super) async fn wait_for_new_capture(planes: &Planes, credential_id: &str, before: usize) {
     let mut last = String::new();
-    let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+    let recorded = tokio::time::timeout(HANG_GUARD, async {
         loop {
             last = planes.browser.journal_export_for_test().await;
             if captured_in(&last, credential_id) > before {

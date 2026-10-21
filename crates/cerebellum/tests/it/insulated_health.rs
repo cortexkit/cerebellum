@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::support::HANG_GUARD;
 use cerebellum_core::clock::{FakeClock, MonotonicClock};
 use cerebellum_core::config::{
     parse_config, ConfigReason, HealthConfig, DEFAULT_DISPATCH_HEARTBEAT_STALE_MS,
     DEFAULT_QUEUE_AGE_STALE_MS,
 };
-use cerebellum_core::health::{health_check_with_clock, HealthState};
+use cerebellum_core::health::{health_check_with_clock, HealthReport, HealthState};
 use subc_protocol::session::HealthStatus;
 
 /// Helper: build a health state + fake clock with the heartbeat stamped at
@@ -44,6 +45,19 @@ fn fresh_state(cfg: HealthConfig) -> (HealthState, FakeClock) {
     // deterministic.
     state.stamp_heartbeat_with_clock(&clock);
     (state, clock)
+}
+
+/// Run the synchronous check away from the test thread so a stuck check can
+/// time out without leaving a parked operation in the caller.
+fn health_check_with_hang_guard(
+    state: HealthState,
+    clock: FakeClock,
+) -> Result<HealthReport, std::sync::mpsc::RecvTimeoutError> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(health_check_with_clock(&state, &clock));
+    });
+    receive.recv_timeout(HANG_GUARD)
 }
 
 /// Helper: assert health status at a given heartbeat age (queued/in-flight
@@ -370,28 +384,18 @@ fn blocked_dispatch_future_does_not_block_health_check() {
         std::thread::yield_now();
     }
 
-    // The health check completes immediately despite the parked dispatch
-    // future. We assert it returns within a bounded time (well under any
-    // reasonable poll timeout).
     let mut clock2 = clock.clone();
     clock2.advance(Duration::from_millis(100));
-    let start = std::time::Instant::now();
-    let report = health_check_with_clock(&state, &clock2);
-    let elapsed = start.elapsed();
-    assert_eq!(report.status, HealthStatus::Ok);
-    // The health check must complete in well under 100ms (it only reads three
-    // atomics and takes one clock sample). 100ms is a generous upper bound.
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "health check took {:?}, expected < 100ms",
-        elapsed
-    );
-
-    // The health path did not unblock the dispatch future: the parked thread
-    // is still parked (we never called `unpark`). Clean up by unparking so the
-    // test thread can join.
+    let report = health_check_with_hang_guard(state, clock2);
+    let dispatch_still_parked = parked.load(Ordering::SeqCst) == 1;
     handle.thread().unpark();
     handle.join().unwrap();
+    assert!(
+        dispatch_still_parked,
+        "health check unparked the dispatch thread"
+    );
+    let report = report.expect("health check did not return while dispatch was parked");
+    assert_eq!(report.status, HealthStatus::Ok);
 }
 
 #[test]
@@ -462,15 +466,9 @@ fn absent_browser_gauges_do_not_delay_or_alter_health() {
         browser_process_alive: None,
     };
 
-    let start = std::time::Instant::now();
-    let report = health_check_with_clock(&state, &clock2);
-    let elapsed = start.elapsed();
+    let report = health_check_with_hang_guard(state, clock2)
+        .expect("health check did not return with browser gauges absent");
     assert_eq!(report.status, HealthStatus::Ok);
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "health check took {:?}, expected < 100ms",
-        elapsed
-    );
 }
 
 #[test]

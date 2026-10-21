@@ -4,8 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::support::HANG_GUARD;
 use cerebellum::browser_launch::map_profile_outcome;
 use cerebellum::management::{ManagementPlane, TargetResolver, REBIND_PROFILE_ROOT};
 use cerebellum::profile::{
@@ -819,7 +820,7 @@ async fn open_rebind_over_wire(
     cerebellum::handle_frame_for_test(rebind_request(10, json!({})), writer, planes)
         .await
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -873,7 +874,7 @@ async fn answer_rebind(
     cerebellum::handle_frame_for_test(frame, &tx, planes)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -995,7 +996,7 @@ async fn management_wire_names_a_rebind_question_nobody_was_asked() {
             cerebellum::handle_frame_for_test(rebind_request(20, json!({})), &writer, &planes)
                 .await
                 .unwrap();
-            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1072,7 +1073,7 @@ async fn rebind_attributed_conversation(label: &str, principal: Option<Principal
         cerebellum::handle_frame_for_test(rebind_request(10, json!({})), &writer, &planes)
             .await
             .unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();

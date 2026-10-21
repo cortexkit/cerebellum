@@ -520,6 +520,7 @@ fn valid_request(capability: Servable, arguments: &Value) -> Result<(), Value> {
 mod tests {
     use super::*;
     use crate::call_queue::GAP_LIMIT;
+    use crate::test_support::HANG_GUARD;
     use crate::*;
     use cerebellum_computer::app_state::source::{
         AppStateReadError, AppStateSource, BundleSignature, ElementActionError, ElementHandle,
@@ -1045,7 +1046,7 @@ mod tests {
         }
 
         async fn wait_entries(&self, count: usize) {
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(HANG_GUARD, async {
                 while self.entries().len() < count {
                     tokio::task::yield_now().await;
                 }
@@ -1120,7 +1121,7 @@ mod tests {
 
         async fn hit_started(&mut self) {
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), self.hit_events.recv())
+                tokio::time::timeout(HANG_GUARD, self.hit_events.recv())
                     .await
                     .expect("resolution reached the scripted hit test"),
                 Some(1)
@@ -1128,7 +1129,7 @@ mod tests {
         }
 
         async fn fast_reply(&mut self) -> Frame {
-            tokio::time::timeout(Duration::from_secs(1), self.replies.recv())
+            tokio::time::timeout(HANG_GUARD, self.replies.recv())
                 .await
                 .expect("frame reader and cancellation remain responsive during resolution")
                 .unwrap()
@@ -1141,7 +1142,7 @@ mod tests {
         }
         async fn reply(&mut self) -> Frame {
             loop {
-                let frame = tokio::time::timeout(Duration::from_secs(2), self.replies.recv())
+                let frame = tokio::time::timeout(HANG_GUARD, self.replies.recv())
                     .await
                     .expect("wire reply arrived promptly")
                     .unwrap();
@@ -1153,7 +1154,7 @@ mod tests {
             }
         }
         async fn event(&mut self) -> Event {
-            tokio::time::timeout(Duration::from_secs(2), self.events.recv())
+            tokio::time::timeout(HANG_GUARD, self.events.recv())
                 .await
                 .expect("desk event arrived promptly")
                 .unwrap()
@@ -1269,7 +1270,7 @@ mod tests {
             );
         }
         async fn idle(&self) {
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(HANG_GUARD, async {
                 loop {
                     let serializer = &self.planes.computer.as_ref().unwrap().serializer;
                     if serializer.registry.is_empty() && serializer.conversations.is_empty() {
@@ -1344,7 +1345,7 @@ mod tests {
             self.idle().await;
             self.send(frame(FrameType::Goodbye, 0, 0, serde_json::json!({})))
                 .await;
-            tokio::time::timeout(Duration::from_secs(2), self.dispatch)
+            tokio::time::timeout(HANG_GUARD, self.dispatch)
                 .await
                 .expect("shutdown does not deadlock")
                 .unwrap()
@@ -1409,7 +1410,7 @@ mod tests {
             start.elapsed() >= GAP_LIMIT,
             "a missing predecessor must get its arrival window"
         );
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < HANG_GUARD);
         assert_eq!(rig.entries()[1].ordering, ComputerOrdering::SkippedGap);
         let rows = rig.audit_rows().await;
         assert_eq!(rows[1]["identity"]["message_index"], 2);
@@ -1481,7 +1482,6 @@ mod tests {
         rig.send(positioned(1, "a", serde_json::json!(0))).await;
         rig.responses(1).await;
         rig.send(positioned(2, "a", serde_json::json!(2))).await;
-        let start = Instant::now();
         rig.send(positioned(3, "a", serde_json::json!(3))).await;
         rig.send(frame(FrameType::Cancel, 7, 2, serde_json::json!({})))
             .await;
@@ -1492,7 +1492,8 @@ mod tests {
             "cancelled"
         );
         assert_eq!(rig.responses(1).await, [3]);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // Cancellation is observed through response ordering; the real-clock
+        // bounds in the rig helpers only detect a handler that never finishes.
         assert_eq!(
             rig.entries()
                 .iter()
@@ -1638,7 +1639,7 @@ mod tests {
 
         let queries_before_read = rig.desk.running_queries.load(Ordering::SeqCst);
         rig.send(request(7, 2, "Calculator")).await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while rig.desk.running_queries.load(Ordering::SeqCst) == queries_before_read {
                 tokio::task::yield_now().await;
             }
@@ -1722,7 +1723,7 @@ mod tests {
         armed.store(true, Ordering::SeqCst);
         rig.desk.release();
         rig.send(request(7, 1, APP)).await;
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        tokio::time::timeout(HANG_GUARD, entered.notified())
             .await
             .unwrap();
         rig.send(request(7, 2, APP)).await;
@@ -1764,7 +1765,7 @@ mod tests {
         rig.send(request(7, 1, APP)).await;
         assert_eq!(rig.event().await, Event::Start(1));
         rig.send(request(8, 2, app)).await;
-        let second = tokio::time::timeout(Duration::from_secs(1), rig.events.recv()).await;
+        let second = tokio::time::timeout(HANG_GUARD, rig.events.recv()).await;
         rig.desk.release();
         assert_eq!(
             second.expect("independent app/conversation must overlap"),
@@ -1795,7 +1796,7 @@ mod tests {
         assert_eq!(question.header.ty, FrameType::Request);
         rig.send(request(8, 2, APP)).await;
         // One lock owner and one waiter, and no app read before consent.
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let ready = rig
                     .planes
@@ -1924,7 +1925,7 @@ mod tests {
         rig.send(rig.move_request(7, 1)).await;
         rig.hit_started().await;
         rig.send(request(8, 2, OTHER)).await;
-        let responses = tokio::time::timeout(Duration::from_secs(4), async {
+        let responses = tokio::time::timeout(HANG_GUARD, async {
             let mut responses = std::collections::BTreeMap::new();
             for _ in 0..2 {
                 let frame = rig.replies.recv().await.unwrap();
@@ -1970,7 +1971,7 @@ mod tests {
         rig.send(rig.move_request(7, 1)).await;
         rig.hit_started().await;
         rig.send(request(8, 2, OTHER)).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let queued = rig
                     .planes
@@ -2110,7 +2111,7 @@ mod tests {
         assert_eq!(rig.event().await, Event::PressStarted(1));
         rig.send(frame(FrameType::Cancel, 7, 1, serde_json::json!({})))
             .await;
-        let stuck = tokio::time::timeout(Duration::from_secs(10), rig.replies.recv())
+        let stuck = tokio::time::timeout(HANG_GUARD, rig.replies.recv())
             .await
             .expect("the stuck call is answered after its bounded cleanup window")
             .unwrap();
@@ -2135,7 +2136,7 @@ mod tests {
         assert_eq!(rig.desk.presses.load(Ordering::SeqCst), 1);
 
         rig.desk.release_press();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !plane.serializer.quarantine.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

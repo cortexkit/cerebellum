@@ -5,6 +5,7 @@
 //! fixture's record of presses and writes rather than the reply.
 
 use super::support;
+use crate::support::HANG_GUARD;
 
 use std::sync::Arc;
 
@@ -1808,11 +1809,10 @@ async fn cursor_every_action_reply_is_byte_identical_on_off_and_dead_transport()
             let call = serve(&plane, &management, action, args);
             let reply = if mode == 2 && has_picture {
                 let (reply, killed) = tokio::join!(call, async {
-                    let event =
-                        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-                            .await
-                            .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
-                            .unwrap();
+                    let event = tokio::time::timeout(HANG_GUARD, receiver.recv())
+                        .await
+                        .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
+                        .unwrap();
                     assert!(!serde_json::to_string(&event)
                         .unwrap()
                         .contains("planted typed secret"));
@@ -1827,11 +1827,10 @@ async fn cursor_every_action_reply_is_byte_identical_on_off_and_dead_transport()
                 }
                 let reply = call.await;
                 if mode == 1 && has_picture {
-                    let event =
-                        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-                            .await
-                            .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
-                            .unwrap();
+                    let event = tokio::time::timeout(HANG_GUARD, receiver.recv())
+                        .await
+                        .unwrap_or_else(|e| panic!("{action} mode {mode} no picture: {e}"))
+                        .unwrap();
                     assert!(!serde_json::to_string(&event)
                         .unwrap()
                         .contains("planted typed secret"));
@@ -1886,7 +1885,7 @@ async fn cursor_planted_label_reaches_pipe_but_not_journal_or_call_records() {
         json!({"element_id":button}),
     )
     .await;
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+    let event = tokio::time::timeout(HANG_GUARD, receiver.recv())
         .await
         .unwrap()
         .unwrap()

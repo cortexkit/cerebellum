@@ -5,6 +5,7 @@ use crate::authorization::{
 };
 use crate::browser_standing_grants::ManualWallClock;
 use crate::computer_grants::SignedByFixtureTeam;
+use crate::test_support::HANG_GUARD;
 
 fn head() -> GrantHolder {
     GrantHolder::Head {
@@ -350,7 +351,7 @@ async fn revoking_the_selected_row_stops_inflight_work_but_revoking_a_covering_r
             assert!(task.await.unwrap());
             assert!(!cancel.is_cancelled());
         } else {
-            tokio::time::timeout(std::time::Duration::from_secs(2), cancel.cancelled())
+            tokio::time::timeout(HANG_GUARD, cancel.cancelled())
                 .await
                 .unwrap();
             assert!(!task.await.unwrap());

@@ -5,6 +5,7 @@ use crate::cingulate_client::desk::RegistryStore;
 use crate::cingulate_client::route::{BoxFuture, CallError, CingulateOpener, CingulateRoute};
 use crate::cingulate_client::wire;
 use crate::cingulate_client::ScriptedAnswer;
+use crate::test_support::HANG_GUARD;
 use crate::{Frame, FrameType, Planes};
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
 use subc_protocol::{Flags, Principal, Priority, PROTOCOL_VERSION};
@@ -74,7 +75,16 @@ impl CardService {
     /// Read a raised card's params. The synthetic frame is only an inspection
     /// wrapper for older tests; it is never sent to a route writer.
     pub(crate) async fn card(&self, channel: u16, epoch: u32) -> Frame {
-        let end = tokio::time::Instant::now() + Duration::from_secs(10);
+        self.card_with_timeout(channel, epoch, HANG_GUARD).await
+    }
+
+    pub(crate) async fn card_with_timeout(
+        &self,
+        channel: u16,
+        epoch: u32,
+        bound: Duration,
+    ) -> Frame {
+        let end = tokio::time::Instant::now() + bound;
         loop {
             let changed = self.changed.notified();
             let params = {
@@ -298,7 +308,7 @@ pub(crate) async fn drain_call(planes: &Planes, channel: u16, epoch: u32) {
     .unwrap();
     let (writer, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame(request, &writer, planes).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -337,7 +347,7 @@ fn app_request(corr: u64) -> Frame {
 }
 
 async fn wire_reply(rx: &mut tokio::sync::mpsc::Receiver<Frame>) -> Value {
-    let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the holder replies")
         .unwrap();
@@ -350,8 +360,12 @@ async fn wire_reply(rx: &mut tokio::sync::mpsc::Receiver<Frame>) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
-async fn until(mut check: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+async fn until(check: impl FnMut() -> bool) {
+    until_with_timeout(check, HANG_GUARD).await;
+}
+
+async fn until_with_timeout(mut check: impl FnMut() -> bool, bound: Duration) {
+    tokio::time::timeout(bound, async {
         while !check() {
             tokio::task::yield_now().await;
         }
@@ -426,7 +440,7 @@ async fn computer_cards_require_an_attested_agent_session_not_elicitation() {
             .await
             .unwrap();
         if mode == "direct" {
-            let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -952,7 +966,7 @@ async fn login_holder_takes_the_drain_approval_without_a_second_request() {
         .run(&carrier.desk, &carrier.live().unwrap())
         .await
         .unwrap();
-    let consent = tokio::time::timeout(Duration::from_secs(10), holder)
+    let consent = tokio::time::timeout(HANG_GUARD, holder)
         .await
         .unwrap()
         .unwrap();
@@ -995,16 +1009,21 @@ async fn a_login_call_that_loses_its_approval_parks_no_longer_than_one_allowance
         })
     };
     let first = call();
-    let card = service.card(1, 1).await;
+    let card = service
+        .card_with_timeout(1, 1, Duration::from_secs(10))
+        .await;
     let second = call();
-    until(|| {
-        service
-            .calls()
-            .iter()
-            .filter(|(method, _)| method == wire::CONSENT_AWAIT)
-            .count()
-            == 2
-    })
+    until_with_timeout(
+        || {
+            service
+                .calls()
+                .iter()
+                .filter(|(method, _)| method == wire::CONSENT_AWAIT)
+                .count()
+                == 2
+        },
+        Duration::from_secs(10),
+    )
     .await;
     tokio::time::sleep(Duration::from_secs(100)).await;
     assert!(service.answer(
@@ -1287,7 +1306,7 @@ async fn a_losing_holder_cannot_reply_before_the_winner_stores_the_effect() {
         card.header.corr,
         ScriptedAnswer::Answered(json!({"decision":"allow_always"}))
     ));
-    tokio::time::timeout(Duration::from_secs(10), saved)
+    tokio::time::timeout(HANG_GUARD, saved)
         .await
         .expect("the agent grant store write began")
         .unwrap();

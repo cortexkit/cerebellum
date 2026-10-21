@@ -77,6 +77,8 @@ mod route_future_size_tests;
 pub mod scope_watch;
 pub mod snapshot_store;
 mod terminal_arbiter;
+#[cfg(test)]
+mod test_support;
 mod tool_provider;
 mod tool_result;
 mod turn_ended;
@@ -8614,6 +8616,7 @@ fn assert_no_card_raised(planes: &Planes) {
 #[cfg(test)]
 mod tests {
     mod capture_audit_tests;
+    use crate::test_support::HANG_GUARD;
     #[tokio::test]
     async fn isolated_plane_without_profile_lifecycle_refuses_rebind_without_touching_data_home() {
         use super::*;
@@ -9777,7 +9780,7 @@ mod tests {
         )
         .unwrap();
         assert!(handle_frame(frame, &tx, &planes).await.unwrap());
-        let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -9796,7 +9799,7 @@ mod tests {
     }
 
     async fn browser_grants_settled(planes: &Planes) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while planes.management.browser_grant_pending_count().await != 0 {
                 tokio::task::yield_now().await;
             }
@@ -10438,7 +10441,7 @@ mod tests {
     }
 
     async fn next_frame(rx: &mut mpsc::Receiver<Frame>) -> Frame {
-        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .expect("the capture answers promptly")
             .expect("the writer stays open")
@@ -10712,7 +10715,7 @@ mod tests {
         // Wait on CallRecords first: a late_results request also reads the
         // consent answer feed, which must not race the scripted Cingulate
         // report that a consumed approval was executed.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let reply = planes
                     .calls
@@ -10745,7 +10748,7 @@ mod tests {
         let principal = journal::call_records::principal_label(
             planes.routes.get(4, 1).unwrap().principal.as_ref(),
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 let reply = planes
                     .calls
@@ -10780,12 +10783,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capture_returns_pending_without_waiting_for_sign_in() {
-        // The handoff lasts a minute while the call is allowed ten seconds: a
-        // call that waited for the sign-in would overrun by far more than any
-        // scheduling delay under a loaded full-suite run, so the bound measures
-        // the behaviour rather than the machine.
+        // The handoff lasts ten hang guards while the call is allowed one: a
+        // reply that waits for sign-in cannot arrive under load before this
+        // guard, so the outcome still proves the call handed off promptly.
         let fixture = login_capture::test_support::fixture_with(|env| {
-            env.handoff_duration = Duration::from_secs(60);
+            env.handoff_duration = HANG_GUARD * 10;
             env.poll_interval = Duration::from_millis(20);
         });
         fixture.launcher.script.lock().unwrap().logs_in = false;
@@ -10796,14 +10798,14 @@ mod tests {
         let planes = cingulate.planes(&fixture);
         let (tx, mut rx) = mpsc::channel(8);
         let reply = tokio::time::timeout(
-            Duration::from_secs(10),
+            HANG_GUARD,
             capture_initial_reply(&planes, &tx, &mut rx, 340, ollama_capture_params()),
         )
         .await
         .expect("consent was answered; sign-in must not hold the call");
         assert_eq!(reply["outcome"], "capture_pending", "{reply}");
         assert_eq!(reply["origin"], "https://ollama.com");
-        assert_eq!(reply["expires_in_ms"], 60_000);
+        assert_eq!(reply["expires_in_ms"], (HANG_GUARD * 10).as_millis() as u64);
         assert!(reply["message"]
             .as_str()
             .unwrap()
@@ -11350,7 +11352,7 @@ mod tests {
         handle_frame_for_test(request.clone(), &writer_tx, &planes)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while cingulate.methods().len() < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -11380,7 +11382,7 @@ mod tests {
             &cancel,
             Some(&reply),
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while cingulate.methods().len() < 3 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -12374,6 +12376,7 @@ mod tests {
 #[cfg(test)]
 mod connection_liveness_tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -12427,7 +12430,7 @@ mod connection_liveness_tests {
         let planes = isolated_test_planes(&Arc::new(HealthState::with_config(config.health)));
 
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            HANG_GUARD,
             run_connection(&mut parked_reader, FailingWriter, &config, planes),
         )
         .await
@@ -12569,7 +12572,7 @@ mod connection_liveness_tests {
                     subc_transport::write_frame(&mut daemon_write, &notice(123))
                         .await
                         .unwrap();
-                    tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::time::timeout(HANG_GUARD, async {
                         loop {
                             if observed_outcomes.lock().unwrap().len() == 2 {
                                 break;
@@ -12608,7 +12611,7 @@ mod connection_liveness_tests {
             });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
+            HANG_GUARD,
             serve_until_disconnect(
                 &mut module_read,
                 module_write,
@@ -12690,6 +12693,7 @@ mod connection_liveness_tests {
 #[cfg(test)]
 mod dispatch_idle_tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
     use cerebellum_core::clock::{FakeClock, MonoInstant, MonotonicClock};
     use cerebellum_core::health::health_check_with_clock;
     use std::sync::Mutex;
@@ -12978,7 +12982,7 @@ mod dispatch_idle_tests {
         writer_io.write_all(part2).await.unwrap();
 
         // True if the handler recorded the frame; false on timeout (corruption).
-        tokio::time::timeout(Duration::from_millis(500), done_rx.recv())
+        tokio::time::timeout(HANG_GUARD, done_rx.recv())
             .await
             .is_ok()
     }
@@ -13164,6 +13168,7 @@ mod dispatch_idle_tests {
 #[cfg(test)]
 mod drain_tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
 
     fn planes() -> Planes {
         Planes::with_browser_config_journaling(
@@ -13206,7 +13211,7 @@ mod drain_tests {
     }
 
     async fn await_count(planes: &Planes, expected: u64) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while count(planes) != expected {
                 tokio::task::yield_now().await;
             }
@@ -13361,7 +13366,7 @@ mod drain_tests {
         assert_eq!(count(&planes), 0);
         handle_frame(draining(), &tx, &planes).await.unwrap();
         assert_eq!(count(&planes), 0);
-        let result = tokio::time::timeout(Duration::from_secs(2), result_rx)
+        let result = tokio::time::timeout(HANG_GUARD, result_rx)
             .await
             .unwrap()
             .unwrap();
@@ -13374,7 +13379,7 @@ mod drain_tests {
                     && params["elicitation_id"] == format!("el_test_{}", question.header.corr)),
             "the drain withdraws the card at Cingulate"
         );
-        let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -13405,6 +13410,7 @@ mod drain_tests {
 #[cfg(test)]
 mod login_import_consent_tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
 
     fn plan(root: &std::path::Path) -> login_import::LoginImportPlan {
         let executable = root.join("browser");
@@ -13477,7 +13483,7 @@ mod login_import_consent_tests {
                 .await
             })
         };
-        let reply = tokio::time::timeout(Duration::from_secs(5), running)
+        let reply = tokio::time::timeout(HANG_GUARD, running)
             .await
             .expect("the import replies")
             .unwrap();
@@ -13523,7 +13529,7 @@ mod login_import_consent_tests {
             Some(cancel.clone()),
         ));
         let stop = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(HANG_GUARD, async {
                 while consent.methods().len() < 2 {
                     tokio::task::yield_now().await;
                 }
@@ -13532,11 +13538,9 @@ mod login_import_consent_tests {
             .expect("import is waiting on its card");
             cancel.cancel();
         };
-        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(waiting, stop)
-        })
-        .await
-        .expect("cancelled import answers promptly");
+        let (reply, ()) = tokio::time::timeout(HANG_GUARD, async { tokio::join!(waiting, stop) })
+            .await
+            .expect("cancelled import answers promptly");
         assert_eq!(reply["outcome"], "cancelled");
         assert!(reply.get("remedy").is_none());
         assert!(reply.get("grant_request").is_none());
@@ -13954,6 +13958,7 @@ mod computer_consent_wire_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod relayed_computer_call_tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
     use cerebellum_computer::app_state::source::{
         AppStateReadError, AppStateSource, RawAppState, ReadBounds,
     };
@@ -14113,7 +14118,7 @@ mod relayed_computer_call_tests {
             question.header.corr,
             cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))
         ));
-        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -14288,7 +14293,7 @@ mod relayed_computer_call_tests {
             )
             .await
             .unwrap();
-            let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -14422,7 +14427,7 @@ mod relayed_computer_call_tests {
                 )
                 .await
                 .unwrap();
-                let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
                     .await
                     .unwrap()
                     .unwrap();
@@ -14505,7 +14510,7 @@ mod relayed_computer_call_tests {
             )
             .await
             .unwrap();
-            let reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -14600,7 +14605,7 @@ mod relayed_computer_call_tests {
             .await
             .unwrap();
             let mut reply = if flow_id.is_some() {
-                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                tokio::time::timeout(HANG_GUARD, rx.recv())
                     .await
                     .unwrap()
                     .unwrap()
@@ -14636,7 +14641,7 @@ mod relayed_computer_call_tests {
                     reply.header.corr,
                     cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})),
                 ));
-                reply = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                reply = tokio::time::timeout(HANG_GUARD, rx.recv())
                     .await
                     .unwrap()
                     .unwrap();

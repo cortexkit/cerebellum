@@ -211,6 +211,7 @@ mod tests {
         CleanupStage, NavigationDriveError, OwnedBrowserProcess, ProcessControlFailure,
         SessionCleanup, SessionCleanupOutcome,
     };
+    use crate::test_support::HANG_GUARD;
     use crate::{
         budgets, computer_grants, handle_frame, login_capture, management, route_limits,
         ProfileDisposition,
@@ -227,7 +228,7 @@ mod tests {
     /// How long a held step stays held at most, in real time. A test whose
     /// own runtime thread is stuck behind the held step then sees the step
     /// released and fails its "still held" check, rather than hanging.
-    const HOLD_BACKSTOP: Duration = Duration::from_secs(10);
+    const HOLD_BACKSTOP: Duration = HANG_GUARD;
 
     /// Parks the fake browser at one named step until released, standing for
     /// a CDP command whose write never completes.
@@ -404,7 +405,7 @@ mod tests {
     /// checks rather than sleeping on its clock, which a paused clock would
     /// not move while a blocking job runs.
     async fn until(what: &str, done: impl Fn() -> bool) {
-        let give_up = std::time::Instant::now() + HOLD_BACKSTOP + Duration::from_secs(5);
+        let give_up = std::time::Instant::now() + HANG_GUARD;
         while !done() {
             assert!(std::time::Instant::now() < give_up, "never: {what}");
             std::thread::sleep(Duration::from_millis(1));

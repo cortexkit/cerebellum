@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cerebellum_core::identity::AcceptedBindFacts;
 use serde_json::{json, Value};
 use subc_protocol::Principal;
+
+use crate::test_support::HANG_GUARD;
 
 use super::test_support::{
     contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, FakeReply, Fixture,
@@ -474,18 +476,44 @@ async fn tmutil_output_is_read_strictly() {
     assert_eq!(parse_isexcluded("Excluded"), Err(ToolError::Failed));
 }
 
+#[test]
+fn run_bounded_deadline_expires_at_its_exact_boundary() {
+    let started = Instant::now();
+    let deadline = Duration::from_millis(100);
+    assert!(super::before_deadline(
+        started,
+        started + deadline - Duration::from_nanos(1),
+        deadline
+    ));
+    assert!(!super::before_deadline(
+        started,
+        started + deadline,
+        deadline
+    ));
+    assert!(!super::before_deadline(
+        started,
+        started + deadline + Duration::from_nanos(1),
+        deadline,
+    ));
+}
+
 /// The bound on a tool call holds even when the tool never answers.
 #[cfg(unix)]
 #[test]
 fn a_tool_that_never_answers_times_out() {
-    let started = std::time::Instant::now();
-    let result = run_bounded(
-        Path::new("/bin/sleep"),
-        &["5".as_ref()],
-        Duration::from_millis(100),
-    );
+    let (reply, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = run_bounded(
+            Path::new("/bin/sleep"),
+            &["5".as_ref()],
+            Duration::from_millis(100),
+        );
+        let _ = reply.send(result);
+    });
+    let result = wait
+        .recv_timeout(HANG_GUARD)
+        .expect("the bounded tool call never returned");
     assert_eq!(result, Err(ToolError::TimedOut));
-    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 // --- ordering -------------------------------------------------------------
@@ -1311,12 +1339,9 @@ async fn an_unreachable_vault_and_a_refused_route_each_have_their_own_reason() {
 async fn a_vault_that_never_answers_is_bounded_by_the_deposit_deadline() {
     let fixture = fixture_with(|env| env.deposit_deadline = Duration::from_millis(50));
     fixture.vault.script([FakeReply::Hangs]);
-    let (outcome, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        capture(&fixture, &ollama(), allow()),
-    )
-    .await
-    .expect("the deposit deadline ended the wait");
+    let (outcome, _) = tokio::time::timeout(HANG_GUARD, capture(&fixture, &ollama(), allow()))
+        .await
+        .expect("the deposit deadline ended the wait");
     assert_eq!(outcome.reply["outcome"], "capture_not_stored");
     assert_eq!(outcome.reply["reason"], VAULT_DEADLINE_EXCEEDED);
     assert!(outcome.reply["remedy"]
@@ -1812,7 +1837,7 @@ async fn a_cancel_while_the_question_is_open_ends_the_capture() {
         );
     let waiting = Arc::clone(&script);
     let (outcome, _) = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         capture_with(&fixture, &ollama(), &script, true, move || {
             waiting
                 .methods()

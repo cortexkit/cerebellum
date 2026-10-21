@@ -365,6 +365,7 @@ impl ConversationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::HANG_GUARD;
 
     #[tokio::test]
     async fn message_tracking_is_capped_with_arrival_fallback() {
@@ -394,7 +395,7 @@ mod tests {
             message.state.lock().unwrap().last_used = Instant::now() - MESSAGE_RETENTION;
             message.changed.notify_waiters();
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !serializer.messages.0.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }

@@ -17,6 +17,10 @@
 //! releases profile custody) runs, so the parent can see the teardown happen.
 #![cfg(unix)]
 
+#[path = "it/support/hang_guard.rs"]
+mod hang_guard;
+use hang_guard::HANG_GUARD;
+
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -45,7 +49,7 @@ const CHILD_CLOSE_MS_ENV: &str = "CEREBELLUM_ENDING_CHILD_CLOSE_MS";
 const ROUTES: [&str; 2] = ["route-a", "route-b"];
 
 /// Generous, because it only decides how long a broken child takes to fail.
-const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+const CHILD_DEADLINE: Duration = HANG_GUARD;
 
 // ---------------------------------------------------------------------------
 // The child side.
@@ -298,7 +302,7 @@ impl Harness {
             &self.key,
             &self.daemon_id,
             "test",
-            Duration::from_secs(10),
+            HANG_GUARD,
         )
         .await
         .expect("the module authenticates");

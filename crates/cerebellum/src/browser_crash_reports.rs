@@ -465,6 +465,7 @@ mod macos {
     mod tests {
         use super::test_support::{excluded_directory, ScriptedQuery};
         use super::*;
+        use crate::test_support::HANG_GUARD;
         use std::os::unix::fs::PermissionsExt;
 
         /// A private directory for one test, removed when the test ends.
@@ -525,20 +526,17 @@ mod macos {
         #[test]
         fn a_backup_check_that_does_not_answer_in_time_is_refused_at_its_deadline() {
             let parent = TestParent::new("silent");
-            let started = Instant::now();
-            let result = check_excluded_from_backup(
-                &ScriptedQuery::silent(),
-                &parent.0,
-                Duration::from_millis(200),
-            );
-            assert_eq!(result, Err(CrashReportRefusal::ExclusionCheckTimedOut));
-            // The query sleeps for 30 s; returning well before that shows the
-            // deadline ended the wait rather than the query finishing.
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "the check waited {:?} for a query that never answers",
-                started.elapsed()
-            );
+            let path = parent.0.clone();
+            let query = ScriptedQuery::silent();
+            let (completed, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let refusal = check_excluded_from_backup(&query, &path, Duration::from_millis(200));
+                let _ = completed.send(refusal);
+            });
+            let refusal = result
+                .recv_timeout(HANG_GUARD)
+                .expect("the bounded backup check did not return before HANG_GUARD");
+            assert_eq!(refusal, Err(CrashReportRefusal::ExclusionCheckTimedOut));
         }
 
         #[test]

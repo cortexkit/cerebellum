@@ -5,6 +5,7 @@
 //! caller, and send real frames through `handle_frame_for_test`. An unauthorized
 //! caller must be refused before it can use that agent's permission.
 
+use crate::support::HANG_GUARD;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -170,7 +171,7 @@ async fn frames_for(planes: &Planes, request: Frame) -> Vec<Frame> {
     cerebellum::handle_frame_for_test(request, &tx, planes)
         .await
         .expect("the request is handled");
-    let mut frames = vec![tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let mut frames = vec![tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .expect("the request is answered promptly")
         .expect("the writer stays open")];

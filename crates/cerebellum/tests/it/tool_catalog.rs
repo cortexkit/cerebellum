@@ -1,6 +1,7 @@
 //! Catalog and schema-pin checks enter the production frame dispatcher after
 //! route.bind installs a verified caller identity on the tool-provider route.
 
+use crate::support::HANG_GUARD;
 use cerebellum::{BrowserConfig, JournalPersistence, Planes};
 use cerebellum_core::health::HealthState;
 use cortexkit_role_tool_provider::call::SchemaPin;
@@ -44,7 +45,7 @@ async fn exchange(planes: &Planes, channel: u16, body: Value) -> Frame {
         .await
         .unwrap();
     drop(tx);
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+    let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -682,7 +683,7 @@ async fn classic_still_elicits_a_consent_card() {
     cerebellum::handle_frame_for_test(request, &tx, &planes)
         .await
         .unwrap();
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
         .await
         .unwrap()
         .unwrap();

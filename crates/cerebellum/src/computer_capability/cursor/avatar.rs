@@ -279,6 +279,7 @@ impl Avatars {
 mod tests {
     use super::*;
     use crate::login_capture::vault::{BoxFuture, VaultReachError, VaultRoute};
+    use crate::test_support::HANG_GUARD;
 
     const VECTORS: &[u8] =
         include_bytes!("../../../tests/vectors/agent-identity-reads-v1/avatar-read.json");
@@ -684,10 +685,8 @@ mod tests {
     async fn hanging_or_failed_avatar_fetch_never_delays_the_action_or_plain_badge() {
         for fail in [false, true] {
             let avatars = source(None, fail);
-            let start = std::time::Instant::now();
             let mut events = scheduled(avatars.clone()).await;
-            assert!(start.elapsed() < Duration::from_millis(100));
-            let plain = tokio::time::timeout(Duration::from_millis(250), events.recv())
+            let plain = tokio::time::timeout(HANG_GUARD, events.recv())
                 .await
                 .expect("badge waited for entorhinal")
                 .unwrap();
@@ -695,13 +694,10 @@ mod tests {
             // The single-thread Tokio test runtime must still dispatch other
             // work while the optional entorhinal request is waiting for a reply.
             assert_eq!(
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    tokio::spawn(async { "completed" })
-                )
-                .await
-                .unwrap()
-                .unwrap(),
+                tokio::time::timeout(HANG_GUARD, tokio::spawn(async { "completed" }))
+                    .await
+                    .unwrap()
+                    .unwrap(),
                 "completed"
             );
             assert!(

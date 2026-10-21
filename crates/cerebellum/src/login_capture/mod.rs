@@ -771,7 +771,7 @@ pub fn run_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= deadline => {
+            Ok(None) if !before_deadline(started, Instant::now(), deadline) => {
                 let _ = child.kill();
                 std::thread::sleep(POLL);
                 let _ = child.try_wait();
@@ -786,6 +786,12 @@ pub fn run_bounded(
         return Err(ToolError::Failed);
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The child is still inside its allowed tool window only while the measured
+/// duration from `started` is strictly less than `deadline`.
+fn before_deadline(started: Instant, now: Instant, deadline: Duration) -> bool {
+    now.saturating_duration_since(started) < deadline
 }
 
 /// The real file system, with the permissions the design requires.

@@ -12,6 +12,7 @@
 //! platform refusal produces.
 
 use super::*;
+use crate::test_support::HANG_GUARD;
 
 const CHANNEL: u16 = 7;
 const EPOCH: u32 = 1;
@@ -165,7 +166,7 @@ async fn every_browser_action_reads_as_plain_words() {
         )
         .await
         .unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        let frame = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .unwrap_or_else(|_| panic!("browser {action} never answered"))
             .unwrap();
@@ -426,7 +427,7 @@ mod computer {
         .await
         .unwrap();
         let consent = planes.consent_test.as_ref().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + HANG_GUARD;
         loop {
             if let Ok(frame) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                 return frame.expect("the reply channel stayed open");
@@ -520,7 +521,7 @@ mod computer {
             .unwrap();
         // Read the reply before looking for the card, so a read that did not
         // ask fails here naming what it replied instead.
-        let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let reply = tokio::time::timeout(HANG_GUARD, rx.recv())
             .await
             .expect("the parked read replied")
             .unwrap();
@@ -541,7 +542,7 @@ mod computer {
             cingulate_client::ScriptedAnswer::Answered(json!({"decision": "allow_30m"})),
         ));
         computer_grants::tests::drain_call(&planes, CHANNEL, EPOCH).await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(HANG_GUARD, async {
             while !grants.holds(&caller, &need) {
                 tokio::task::yield_now().await;
             }
