@@ -20,7 +20,7 @@ use cerebellum::management::ManagementPlane;
 use cerebellum::CancelHandle;
 use cerebellum_computer::app_state::source::{ElementFacts, RawElement};
 use cerebellum_computer::capture::{EnumeratedWindow, InMemoryCaptureBackend, WindowFrame};
-use cerebellum_computer::cursor::{duration_ms, entry_ms, CursorEvent, CursorLine};
+use cerebellum_computer::cursor::{duration_ms, entry_ms, CursorEvent, CursorLine, MotionStyle};
 use cerebellum_computer::platform::ProcessGrant;
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy};
@@ -65,25 +65,13 @@ fn ms(value: f64) -> Duration {
     Duration::from_secs_f64(value / 1000.0)
 }
 
-/// Reduce Motion as the module reads it: the system setting on macOS, and
-/// the full animation everywhere else.
-fn reduce_motion() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        cerebellum_macos::reduce_motion()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-/// How long the badge takes to glide between two element centres.
-fn glide(from: [f64; 4], to: [f64; 4]) -> Duration {
+/// How long the badge takes to glide between two element centres, with or
+/// without Reduce Motion (each picture line says which the module used).
+fn glide(from: [f64; 4], to: [f64; 4], reduce_motion: bool) -> Duration {
     let (from, to) = (centre(from), centre(to));
     ms(duration_ms(
         (to[0] - from[0]).hypot(to[1] - from[1]),
-        reduce_motion(),
+        reduce_motion,
     ))
 }
 
@@ -272,7 +260,6 @@ async fn rig_with_badge_shown() -> Rig {
 /// then: not before, and no later than the cap.
 #[tokio::test(start_paused = true)]
 async fn an_action_with_a_drawn_badge_is_sent_when_the_badge_arrives_and_not_before() {
-    let entry = ms(entry_ms(reduce_motion()));
     for action in [
         "computer.press_element",
         "computer.write_text",
@@ -315,7 +302,11 @@ async fn an_action_with_a_drawn_badge_is_sent_when_the_badge_arrives_and_not_bef
         let reply = serve(&plane, &management, action, arguments).await;
         assert_eq!(reply["outcome"], "completed", "{action}: {reply}");
         assert!(plane.result_schema_findings().is_empty(), "{action}");
-        assert!(picture(&mut pictures).await.label.is_some(), "{action}");
+        let drawn = picture(&mut pictures).await;
+        assert!(drawn.label.is_some(), "{action}");
+        assert_eq!(drawn.motion.style, MotionStyle::Entry, "{action}");
+        let entry = ms(entry_ms(drawn.motion.reduce_motion));
+        assert_eq!(ms(drawn.motion.duration_ms), entry, "{action}");
         let sent = desk.state().dispatched_at.clone();
         assert_eq!(sent.len(), 1, "{action}: one action reached the desk");
         assert!(
@@ -390,13 +381,26 @@ async fn a_batch_of_three_waits_for_each_badge_in_turn() {
     .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert_eq!(desk.state().presses, [20, 21, 22], "pressed in order");
+    let mut drawn = Vec::new();
     for (_, _, frame) in BUTTONS {
-        assert_eq!(picture(&mut pictures).await.to, centre(frame));
+        let next = picture(&mut pictures).await;
+        assert_eq!(next.to, centre(frame));
+        drawn.push(next);
     }
     let sent = desk.state().dispatched_at.clone();
     assert!(sent[0] >= start);
     for step in 1..3 {
-        let expected = glide(BUTTONS[step - 1].2, BUTTONS[step].2);
+        let expected = glide(
+            BUTTONS[step - 1].2,
+            BUTTONS[step].2,
+            drawn[step].motion.reduce_motion,
+        );
+        assert_eq!(
+            ms(drawn[step].motion.duration_ms),
+            expected,
+            "press {}: the glide from the previous element",
+            step + 1
+        );
         let waited = sent[step] - sent[step - 1];
         assert!(
             waited >= expected && waited <= expected + Duration::from_millis(1),
@@ -482,8 +486,7 @@ async fn the_person_acting_while_the_badge_travels_refuses_the_press() {
 async fn ending_the_badge_while_it_travels_sends_nothing_and_answers_at_once() {
     let mut rig = rig_with_badge_shown().await;
     let cursor = rig.cursor.clone();
-    let glide = glide([100.0, 50.0, 24.0, 24.0], BUTTONS[0].2);
-    let ((reply, replied), ended) = tokio::join!(
+    let ((reply, replied), (ended, glide)) = tokio::join!(
         async {
             let reply = serve(
                 &rig.plane,
@@ -495,9 +498,9 @@ async fn ending_the_badge_while_it_travels_sends_nothing_and_answers_at_once() {
             (reply, Instant::now())
         },
         async {
-            picture(&mut rig.pictures).await;
+            let drawn = picture(&mut rig.pictures).await;
             cursor.end(&agent());
-            Instant::now()
+            (Instant::now(), ms(drawn.motion.duration_ms))
         }
     );
     assert_eq!(reply["outcome"], "cancelled", "{reply}");
