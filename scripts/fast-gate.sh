@@ -100,6 +100,16 @@ for package in packages:
             mapped.update(target["name"] for target in test_targets)
         selected_suites.update((package["name"], suite) for suite in mapped)
 
+# cerebellum's `it` target holds the source scans over its shipped code: the
+# single launch-secret reader, zero runtime prints, declared launch-path outcome
+# words, the one lease clock, private file writes and more. Each reads files
+# under src/, so a change there can break one while no test file changed. A
+# hand-picked subset of modules misses whichever scan reads the changed file, so
+# run the whole target whenever the package is selected. It takes about 15 s
+# once built, and the gate builds it either way.
+if "cerebellum" in selected_packages:
+    selected_suites.add(("cerebellum", "it"))
+
 for name in sorted(selected_packages):
     print(f"P|{name}")
     package = next(package for package in packages if package["name"] == name)
@@ -147,6 +157,25 @@ if [ "$self_test" -eq 1 ]; then
     exit 1
   fi
   echo "SELF-TEST PASSED: a root engram-catalog.json change runs cerebellum-core --lib"
+
+  # A shipped-source change with no test file in the diff must still run every
+  # source scan in cerebellum's `it` target, which reads src/ directly.
+  scan_plan="$(plan_for_files 'crates/cerebellum/src/browser_session.rs')"
+  if ! printf '%s\n' "$scan_plan" | grep -Fxq 'T|cerebellum|it'; then
+    echo "SELF-TEST FAILED: a cerebellum src change did not select the whole it target" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a cerebellum src change runs every source scan in suite it"
+
+  # The control: a change outside cerebellum must not schedule cerebellum's `it`
+  # target, which shows the rule above follows package selection and is not a
+  # blanket run.
+  core_plan="$(plan_for_files 'crates/cerebellum-core/src/private_fs.rs')"
+  if printf '%s\n' "$core_plan" | grep -Fxq 'T|cerebellum|it'; then
+    echo "SELF-TEST FAILED: a cerebellum-core-only change scheduled cerebellum's it target" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a change outside cerebellum leaves its it target to the mandatory modules"
 
   if plan_for_files '' >/dev/null 2>&1; then
     echo "SELF-TEST FAILED: an empty diff was accepted" >&2
