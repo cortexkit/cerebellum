@@ -8172,6 +8172,13 @@ fn record_turn_ended_received(at_ms: u64) {
     TURN_ENDED_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-lifetime history of the Chrome extension's native-host connection:
+/// when it last connected and disconnected, and why it last ended. The
+/// extension returns every claimed tab to the person whenever this connection
+/// drops, so health is where that drop can be seen.
+static USER_BROWSER_CONNECTION_GAUGES: user_browser_bridge::ConnectionGauges =
+    user_browser_bridge::ConnectionGauges::new();
+
 /// Write `engram-catalog.json` into the module's data directory, so the
 /// fleet's backup module knows what that directory holds on every machine,
 /// including a new one where nobody placed the file by hand.
@@ -8202,6 +8209,12 @@ fn record_engram_catalog_write() {
 /// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
 ///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
 ///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
+/// - `userBrowserConnections` and `userBrowserDisconnects`, how many Chrome
+///   extension native-host connections were accepted (after the host's hello
+///   was verified) and how many of them ended; `userBrowserConnectedAtMs` and
+///   `userBrowserDisconnectedAtMs`, the wall-clock milliseconds of the latest
+///   of each or `null`; and `userBrowserLastDisconnectReason`, one word from
+///   [`user_browser_bridge::DISCONNECT_REASONS`] for the latest end or `null`;
 /// - `sigtermListener`, whether SIGTERM will run the module's teardown or
 ///   just end the process (see [`sigterm_listener_state`]);
 /// - `computerGrantStore`, whether the operator's "always allow" app grants are
@@ -8262,6 +8275,7 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
             Value::Null
         };
         metrics.insert("turnEndedLastAtMs".into(), last_at_ms);
+        USER_BROWSER_CONNECTION_GAUGES.insert_into(metrics);
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),

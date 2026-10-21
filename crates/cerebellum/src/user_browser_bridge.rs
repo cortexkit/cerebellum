@@ -26,6 +26,7 @@ use cerebellum_bridge_protocol::MAX_FRAME_BYTES;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -172,6 +173,150 @@ struct Connection {
     epoch: u64,
     outgoing: mpsc::Sender<Message>,
     closed: watch::Sender<bool>,
+    /// The first reason passed to [`Connection::close`]: Goodbye could not
+    /// enter the full writer queue, a reply could not be delivered, or the
+    /// module shut down. Close only signals the socket tasks; they end the
+    /// connection afterwards, so this reason wins over what they then see.
+    ending: Option<DisconnectReason>,
+}
+
+impl Connection {
+    fn close(&mut self, reason: DisconnectReason) {
+        self.ending.get_or_insert(reason);
+        self.closed.send_replace(true);
+    }
+}
+
+/// The closed set of words health uses for why the latest user-browser
+/// connection ended, indexed by [`DisconnectReason`]. Each word names only
+/// what cerebellum itself observed:
+///
+/// - `peer_closed`: the native host closed the socket (end of file, including
+///   a frame cut short by that close);
+/// - `read_error`: reading from the socket failed for another reason;
+/// - `protocol_error`: the host sent a frame that is not a valid relay message;
+/// - `write_stalled`: a frame write passed its deadline, or Goodbye found the
+///   writer queue full;
+/// - `write_error`: a frame write failed for another reason;
+/// - `reply_undeliverable`: a reply from the host could not be handed to its
+///   waiting action;
+/// - `cancel_deadline`: cleanup of a failed or cancelled action got no usable
+///   detach acknowledgement in time (missing, late, or contradicting input
+///   already reported as dispatched);
+/// - `shutdown`: the module stopped the bridge.
+pub const DISCONNECT_REASONS: [&str; 8] = [
+    "peer_closed",
+    "read_error",
+    "protocol_error",
+    "write_stalled",
+    "write_error",
+    "reply_undeliverable",
+    "cancel_deadline",
+    "shutdown",
+];
+
+/// Why a user-browser connection ended; see [`DISCONNECT_REASONS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectReason {
+    PeerClosed,
+    ReadError,
+    ProtocolError,
+    WriteStalled,
+    WriteError,
+    ReplyUndeliverable,
+    CancelDeadline,
+    Shutdown,
+}
+
+impl DisconnectReason {
+    pub fn word(self) -> &'static str {
+        DISCONNECT_REASONS[self as usize]
+    }
+}
+
+/// Process-lifetime connection history for the health reply: counts, two
+/// wall-clock times and one reason word, never anything that identifies a
+/// route, agent, tab or page. Everything is an atomic, so the health lane
+/// reads it without touching the bridge or any lock a stuck connection holds.
+pub struct ConnectionGauges {
+    connections: AtomicU64,
+    /// Unix milliseconds of the latest accepted connection; 0 means none.
+    connected_at_ms: AtomicU64,
+    disconnects: AtomicU64,
+    /// Unix milliseconds of the latest end; 0 means none.
+    disconnected_at_ms: AtomicU64,
+    /// Index into [`DISCONNECT_REASONS`] plus one; 0 means none.
+    last_reason: AtomicU8,
+}
+
+impl ConnectionGauges {
+    pub(crate) const fn new() -> Self {
+        Self {
+            connections: AtomicU64::new(0),
+            connected_at_ms: AtomicU64::new(0),
+            disconnects: AtomicU64::new(0),
+            disconnected_at_ms: AtomicU64::new(0),
+            last_reason: AtomicU8::new(0),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn record_connected(&self) {
+        self.connected_at_ms
+            .store(wall_clock_ms(), Ordering::Relaxed);
+        self.connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_disconnected(&self, reason: DisconnectReason) {
+        self.last_reason.store(reason as u8 + 1, Ordering::Relaxed);
+        self.disconnected_at_ms
+            .store(wall_clock_ms(), Ordering::Relaxed);
+        self.disconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `userBrowserConnections`, `userBrowserConnectedAtMs`,
+    /// `userBrowserDisconnects`, `userBrowserDisconnectedAtMs` and
+    /// `userBrowserLastDisconnectReason` to a health metrics object. The two
+    /// times and the reason are `null` until the first connection or end.
+    pub(crate) fn insert_into(&self, metrics: &mut serde_json::Map<String, Value>) {
+        let time = |at: &AtomicU64| match at.load(Ordering::Relaxed) {
+            0 => Value::Null,
+            ms => Value::from(ms),
+        };
+        let reason = match self.last_reason.load(Ordering::Relaxed) {
+            0 => Value::Null,
+            index => DISCONNECT_REASONS
+                .get(usize::from(index) - 1)
+                .map_or(Value::Null, |word| Value::from(*word)),
+        };
+        metrics.insert(
+            "userBrowserConnections".into(),
+            Value::from(self.connections.load(Ordering::Relaxed)),
+        );
+        metrics.insert(
+            "userBrowserConnectedAtMs".into(),
+            time(&self.connected_at_ms),
+        );
+        metrics.insert(
+            "userBrowserDisconnects".into(),
+            Value::from(self.disconnects.load(Ordering::Relaxed)),
+        );
+        metrics.insert(
+            "userBrowserDisconnectedAtMs".into(),
+            time(&self.disconnected_at_ms),
+        );
+        metrics.insert("userBrowserLastDisconnectReason".into(), reason);
+    }
+}
+
+/// Wall-clock Unix milliseconds, never 0 so that 0 can mean "never".
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+        .max(1)
 }
 
 struct State {
@@ -189,6 +334,7 @@ struct Inner {
     state: Mutex<State>,
     lane: tokio::sync::Mutex<()>,
     target: crate::user_browser::UserBrowser,
+    gauges: &'static ConnectionGauges,
 }
 
 #[derive(Clone)]
@@ -254,6 +400,24 @@ impl UserBrowserBridge {
     pub(crate) fn with_user_grants(
         grants: Arc<crate::browser_standing_grants::StandingBrowserGrants>,
     ) -> Self {
+        Self::with_gauges(grants, &crate::USER_BROWSER_CONNECTION_GAUGES)
+    }
+
+    /// A bridge that records its connection history into `gauges` instead of
+    /// the process-wide health gauges, so a test can read exact values while
+    /// other tests connect their own bridges.
+    #[cfg(test)]
+    pub(crate) fn with_gauges_for_test(gauges: &'static ConnectionGauges) -> Self {
+        Self::with_gauges(
+            Arc::new(crate::browser_standing_grants::StandingBrowserGrants::in_memory()),
+            gauges,
+        )
+    }
+
+    fn with_gauges(
+        grants: Arc<crate::browser_standing_grants::StandingBrowserGrants>,
+        gauges: &'static ConnectionGauges,
+    ) -> Self {
         // Keep epochs exactly representable by JavaScript. A daemon restart and
         // each Chrome extension service-worker reconnect need distinct epochs
         // so neither can consume the previous connection's replies.
@@ -274,6 +438,7 @@ impl UserBrowserBridge {
             }),
             lane: tokio::sync::Mutex::new(()),
             target: crate::user_browser::UserBrowser::new(grants),
+            gauges,
         }))
     }
 
@@ -294,7 +459,7 @@ impl UserBrowserBridge {
 
     #[cfg(test)]
     pub(crate) fn disconnect_for_policy_test(&self, epoch: u64) {
-        self.disconnect(epoch);
+        self.disconnect(epoch, DisconnectReason::PeerClosed);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -359,13 +524,13 @@ impl UserBrowserBridge {
 
     pub fn goodbye(&self, route: Route) {
         self.0.target.end_route(route);
-        let state = self.state();
+        let mut state = self.state();
         for (owner, cancel) in state.calls.values() {
             if *owner == route {
                 cancel.cancel();
             }
         }
-        if let Some(connection) = &state.connection {
+        if let Some(connection) = state.connection.as_mut() {
             let message = Message {
                 id: 0,
                 epoch: connection.epoch,
@@ -373,7 +538,7 @@ impl UserBrowserBridge {
             };
             // A saturated writer cannot promise timely Goodbye or detach.
             if connection.outgoing.try_send(message).is_err() {
-                connection.closed.send_replace(true);
+                connection.close(DisconnectReason::WriteStalled);
             }
         }
     }
@@ -385,8 +550,8 @@ impl UserBrowserBridge {
         for (_, cancel) in state.calls.values() {
             cancel.cancel();
         }
-        if let Some(connection) = &state.connection {
-            connection.closed.send_replace(true);
+        if let Some(connection) = state.connection.as_mut() {
+            connection.close(DisconnectReason::Shutdown);
         }
     }
 
@@ -407,16 +572,24 @@ impl UserBrowserBridge {
             epoch,
             outgoing,
             closed,
+            ending: None,
         });
+        self.0.gauges.record_connected();
         Ok((epoch, receiver, stop))
     }
 
-    fn disconnect(&self, epoch: u64) {
+    /// End the connection with this epoch, if it is still the current one.
+    /// `reason` is what the caller saw; a reason recorded earlier by whoever
+    /// first asked the connection to close takes precedence.
+    fn disconnect(&self, epoch: u64, reason: DisconnectReason) {
         let mut state = self.state();
         if state.connection.as_ref().map(|c| c.epoch) == Some(epoch) {
             self.0.target.disconnect();
             if let Some(connection) = state.connection.take() {
                 connection.closed.send_replace(true);
+                self.0
+                    .gauges
+                    .record_disconnected(connection.ending.unwrap_or(reason));
             }
             state.replies.clear();
         }
@@ -424,15 +597,17 @@ impl UserBrowserBridge {
 
     #[cfg(any(target_os = "macos", test))]
     fn receive(&self, message: Message) {
-        let state = self.state();
+        let mut state = self.state();
         if state.connection.as_ref().map(|c| c.epoch) != Some(message.epoch) {
             return;
         }
-        if let Some(sender) = state.replies.get(&message.id) {
-            if sender.try_send(message.body).is_err() {
-                if let Some(connection) = &state.connection {
-                    connection.closed.send_replace(true);
-                }
+        let undeliverable = state
+            .replies
+            .get(&message.id)
+            .is_some_and(|sender| sender.try_send(message.body).is_err());
+        if undeliverable {
+            if let Some(connection) = state.connection.as_mut() {
+                connection.close(DisconnectReason::ReplyUndeliverable);
             }
         }
     }
@@ -686,7 +861,7 @@ impl UserBrowserBridge {
                 outcome.finish(terminal, Some(reason));
             }
             _ => {
-                self.disconnect(epoch);
+                self.disconnect(epoch, DisconnectReason::CancelDeadline);
                 if outcome.phases.contains(&ActionPhase::Dispatched)
                     && outcome.input_dispatched != Some(true)
                 {
