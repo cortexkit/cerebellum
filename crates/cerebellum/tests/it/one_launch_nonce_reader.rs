@@ -24,12 +24,16 @@ const ALLOWED_MENTIONS: &[(&str, &str)] = &[(
 )];
 
 /// Text that marks an identifier as naming the nonce's environment variables:
-/// the variable names themselves (which `SUBC_LAUNCH_NONCE_FD` contains too)
-/// and `subc_os`'s constants for them.
+/// the variable names themselves (which `SUBC_LAUNCH_NONCE_FD` and the Windows
+/// `SUBC_LAUNCH_NONCE_PIPE` variables contain too) and `subc_os`'s constants
+/// for them. The pipe constants need their own entries because neither contains
+/// `LAUNCH_NONCE_ENV`.
 const VARIABLE_NAMES: &[&str] = &[
     "SUBC_LAUNCH_NONCE",
     "LAUNCH_NONCE_ENV",
     "LAUNCH_NONCE_FD_ENV",
+    "LAUNCH_NONCE_PIPE_ENV",
+    "LAUNCH_NONCE_PIPE_FALLBACK_ENV",
 ];
 
 /// The accessor `subc_os` reads the nonce through.
@@ -215,6 +219,9 @@ const READS: &[&str] = &[
     "let fd = std::env::var_os(\"SUBC_LAUNCH_NONCE_FD\");",
     "let nonce = std::env::var(subc_os::LAUNCH_NONCE_ENV);",
     "let fd = std::env::var_os(subc_os::LAUNCH_NONCE_FD_ENV);",
+    "let pipe = std::env::var_os(\"SUBC_LAUNCH_NONCE_PIPE\");",
+    "let pipe = std::env::var_os(subc_os::LAUNCH_NONCE_PIPE_ENV);",
+    "let fallback = std::env::var(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV);",
     "let nonce = subc_os::launch_nonce();",
 ];
 

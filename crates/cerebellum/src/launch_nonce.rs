@@ -2,24 +2,27 @@
 //! it spawns it, which HELLO presents to prove the connection comes from the
 //! process the daemon started.
 //!
-//! The daemon hands it over through a pipe on descriptor 3, and during the
-//! transition also as the `SUBC_LAUNCH_NONCE` environment variable. Both are
-//! read by `subc_os::launch_nonce()` and nothing else: that accessor reads the
-//! pipe once, closes it, and caches the value and where it came from for the
-//! life of the process. A second, independent reader would find descriptor 3
-//! reused by some unrelated socket or file and read and close that instead.
+//! On Unix the daemon hands it over through a pipe on descriptor 3. On Windows
+//! it serves it once on a named pipe it creates before starting the module,
+//! named in `SUBC_LAUNCH_NONCE_PIPE`. During the transition it also passes the
+//! nonce as the `SUBC_LAUNCH_NONCE` environment variable. All of these are read
+//! by `subc_os::launch_nonce()` and nothing else: that accessor reads the pipe
+//! once, closes it, and caches the value and where it came from for the life of
+//! the process. A second, independent reader would find descriptor 3 reused by
+//! some unrelated socket or file and read and close that instead.
 //!
 //! Two consequences for the rest of the module live here as well:
 //!
 //! - The accessor has to run before the module spawns anything. Until it
-//!   reads, the pipe is an ordinary inheritable descriptor (it has to be, to
-//!   survive the daemon's exec), and a child spawned earlier would inherit it.
+//!   reads, the Unix pipe is an ordinary inheritable descriptor (it has to be,
+//!   to survive the daemon's exec), and a child spawned earlier would inherit it.
 //! - A child must not see the nonce through the environment either. The
 //!   accessor deliberately leaves the environment alone (changing it in a
 //!   multi-threaded process is unsound), so every `std::process::Command` the
-//!   module runs removes both variables through [`without_launch_nonce`]. The
-//!   browser launchers in the platform crates need no such step: they hand the
-//!   browser an explicit environment built from scratch, never this process's.
+//!   module runs removes every launch-nonce variable through
+//!   [`without_launch_nonce`]. The browser launchers in the platform crates need
+//!   no such step: they hand the browser an explicit environment built from
+//!   scratch, never this process's.
 
 use std::process::Command;
 
@@ -59,8 +62,8 @@ pub(crate) fn for_consumer_identity() -> Option<String> {
 }
 
 /// Where this process read its nonce from, as module provenance reports it
-/// (`fd` or `env`). `None` when there is no nonce or it could not be read:
-/// then there is no source to claim.
+/// (`fd`, `pipe` or `env`). `None` when there is no nonce or it could not be
+/// read: then there is no source to claim.
 pub(crate) fn provenance_source() -> Option<ProvenanceSource> {
     provenance_source_from(
         subc_os::launch_nonce()
@@ -78,16 +81,21 @@ fn provenance_source_from(source: Option<subc_os::LaunchNonceSource>) -> Option<
     source.map(|source| ProvenanceSource::from_wire_name(source.as_str()))
 }
 
-/// Keep both launch-nonce variables out of a child's environment.
+/// Keep every launch-nonce variable out of a child's environment.
 ///
 /// A child that inherited `SUBC_LAUNCH_NONCE` could present it and be admitted
-/// as this module. `SUBC_LAUNCH_NONCE_FD` carries no secret, but a child that
-/// inherits it would try to read a descriptor it was never given; dropping it
-/// too means the child sees no sign of a nonce at all.
+/// as this module. The other three carry no secret. `SUBC_LAUNCH_NONCE_FD` and
+/// `SUBC_LAUNCH_NONCE_PIPE` only say where the nonce was delivered, and a child
+/// that inherits them would try to read a descriptor or pipe it was never given.
+/// `SUBC_LAUNCH_NONCE_PIPE_FALLBACK` only permits the environment copy, and
+/// subc-os requires it to be removed together with that copy. Dropping all four
+/// means a child sees no sign of a nonce at all.
 pub(crate) fn without_launch_nonce(command: &mut Command) -> &mut Command {
     command
         .env_remove(subc_os::LAUNCH_NONCE_ENV)
         .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
+        .env_remove(subc_os::LAUNCH_NONCE_PIPE_ENV)
+        .env_remove(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV)
 }
 
 #[cfg(test)]
@@ -103,6 +111,10 @@ mod tests {
         assert_eq!(
             provenance_source_from(Some(subc_os::LaunchNonceSource::Env)),
             Some(ProvenanceSource::Env)
+        );
+        assert_eq!(
+            provenance_source_from(Some(subc_os::LaunchNonceSource::Pipe)),
+            Some(ProvenanceSource::Pipe)
         );
         assert_eq!(provenance_source_from(None), None);
     }
@@ -173,7 +185,14 @@ mod tests {
             .args([PROBE_TEST, "--exact", "--nocapture", "--test-threads=1"])
             .env(PROBE_MODE, mode)
             .env(subc_os::LAUNCH_NONCE_ENV, PROBE_NONCE)
-            .env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
+            .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
+            // The Windows delivery variables, which a Unix accessor never
+            // reads. They are set so the removal check covers them too.
+            .env(
+                subc_os::LAUNCH_NONCE_PIPE_ENV,
+                r"\\.\pipe\cerebellum-probe-unused",
+            )
+            .env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
         if pipe {
             let handoff = subc_os::LaunchNonceHandoff::new(PROBE_NONCE).expect("nonce pipe");
             command.env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
@@ -218,19 +237,25 @@ mod tests {
         assert!(has(&report, "hello_nonce_matches=true"), "{report:#?}");
     }
 
-    /// A process the module spawns sees neither variable, although the module
-    /// itself was started with both. The probe mode variable reaching the
-    /// grandchild shows the environment was inherited at all, so the absence
-    /// of the other two is the removal and not an empty environment.
+    /// A process the module spawns sees none of the launch-nonce variables,
+    /// although the module itself was started with all four. The probe mode
+    /// variable reaching the grandchild shows the environment was inherited at
+    /// all, so the absence of the others is the removal and not an empty
+    /// environment.
     #[cfg(unix)]
     #[test]
-    fn a_spawned_child_sees_neither_launch_nonce_variable() {
+    fn a_spawned_child_sees_no_launch_nonce_variable() {
         let report = probe("read-first", true);
         assert!(
             has(&report, &format!("grandchild:{PROBE_MODE}=read-first")),
             "the grandchild did not inherit the environment at all: {report:#?}"
         );
-        for name in [subc_os::LAUNCH_NONCE_ENV, subc_os::LAUNCH_NONCE_FD_ENV] {
+        for name in [
+            subc_os::LAUNCH_NONCE_ENV,
+            subc_os::LAUNCH_NONCE_FD_ENV,
+            subc_os::LAUNCH_NONCE_PIPE_ENV,
+            subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV,
+        ] {
             assert!(
                 !report
                     .iter()
