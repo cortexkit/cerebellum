@@ -1109,7 +1109,32 @@ where
                 } else {
                     source.read_app_state(&read_grant, ReadBounds::default())
                 };
-                raw.map_err(StateReadFailure::Application)
+                raw.map(|mut raw| {
+                    // A window that shows only its own buttons is usually a
+                    // WebKit page still being built: wait once and read that
+                    // window again, within the call's remaining work time.
+                    raw.reread_shell_windows(
+                        source.as_ref(),
+                        &read_grant,
+                        ReadBounds {
+                            timeout: std::time::Duration::from_millis(
+                                crate::budgets::AX_TREE_PHASE_MS,
+                            ),
+                            ..ReadBounds::default()
+                        },
+                        |delay| {
+                            if read_work.stopped()
+                                || std::time::Instant::now() + delay >= read_work.deadline()
+                            {
+                                return false;
+                            }
+                            std::thread::sleep(delay);
+                            !read_work.stopped()
+                        },
+                    );
+                    raw
+                })
+                .map_err(StateReadFailure::Application)
             };
             Some((
                 raw,

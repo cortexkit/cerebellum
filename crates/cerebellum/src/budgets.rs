@@ -17,6 +17,10 @@ pub const PREFLIGHT_MS: u64 = TARGET_CHECK_MS + CODE_IDENTITY_MS + GRANT_LOOKUP_
 pub const AX_STEP_MS: u64 = 1_000;
 pub const AX_TREE_PHASE_MS: u64 = 1_000;
 pub const AX_MENU_PHASE_MS: u64 = 1_000;
+// A read that finds a window showing only its own buttons waits once and
+// reads that window again, bounded like the tree read.
+pub const SHELL_RETRY_PHASE_MS: u64 =
+    cerebellum_computer::app_state::source::SHELL_RETRY_DELAY_MS + AX_TREE_PHASE_MS;
 pub const COMPUTER_SETTLE_MS: u64 = 500;
 pub const COMPUTER_OBSERVE_MS: u64 = 1_000;
 pub const KEYS_OBSERVE_MS: u64 = 1_500;
@@ -144,6 +148,7 @@ budget!(
         ("preflight", PREFLIGHT_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("tree", AX_TREE_PHASE_MS, 1),
+        ("shell_retry", SHELL_RETRY_PHASE_MS, 1),
         ("menubar", AX_MENU_PHASE_MS, 1),
         ("fronting_read", FRONTING_READ_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
@@ -1016,6 +1021,7 @@ mod tests {
                 COMPUTER_READ_STATE,
                 PREFLIGHT_MS
                     + 2 * AX_STEP_MS
+                    + SHELL_RETRY_PHASE_MS
                     + AX_MENU_PHASE_MS
                     + FRONTING_READ_MS
                     + COMPUTER_SETTLE_MS

@@ -112,20 +112,15 @@ pub struct RawAppState {
 }
 
 impl RawAppState {
-    /// Empty web areas and windows containing only layout shells cannot prove
-    /// that their content is absent. WebKit can expose these shells before its
+    /// Empty web areas and windows holding only layout shells or their own
+    /// window controls (see [`is_empty_shell_window`]) cannot prove that
+    /// their content is absent. WebKit can expose these shells before its
     /// accessibility tree is populated. Mark the gap before filtering, so a
     /// no-match result does not certify that a control is missing.
     pub fn mark_unpopulated_content(&mut self) -> usize {
-        fn content(node: &RawElement) -> bool {
-            !matches!(
-                node.role.as_deref(),
-                Some("AXWindow" | "AXGroup" | "AXScrollArea" | "AXSplitGroup" | "AXWebArea")
-            ) || node.children.iter().any(content)
-        }
         fn mark(node: &mut RawElement) -> usize {
             let shell = (node.role.as_deref() == Some("AXWebArea") && node.children.is_empty())
-                || (node.role.as_deref() == Some("AXWindow") && !content(node));
+                || is_empty_shell_window(node);
             if shell {
                 if node.unreadable_children == 0 {
                     node.unreadable_children = 1;
@@ -140,12 +135,119 @@ impl RawAppState {
         gaps
     }
 
+    /// Read each top-level window that is an empty shell (see
+    /// [`is_empty_shell_window`]) once more, after one wait of
+    /// [`SHELL_RETRY_DELAY_MS`], and put what that read found in its place.
+    ///
+    /// WebKit can answer the first read of a window with only the window's
+    /// own buttons and fill in the page a moment later, so one short wait
+    /// often turns a read that would say "read again" into the page itself.
+    /// `wait` sleeps for the delay it is given and returns `false` when the
+    /// call has no time left or was stopped, in which case nothing is read
+    /// again. A window is read again at most once per call. A re-read that
+    /// fails or still finds a shell leaves the first read's window in place,
+    /// for [`RawAppState::mark_unpopulated_content`] to flag. Returns how
+    /// many windows were read again.
+    pub fn reread_shell_windows(
+        &mut self,
+        source: &dyn AppStateSource,
+        target: &ProcessGrant,
+        bounds: ReadBounds,
+        wait: impl FnOnce(Duration) -> bool,
+    ) -> usize {
+        let shells: Vec<usize> = self
+            .roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| is_empty_shell_window(root))
+            .map(|(index, _)| index)
+            .collect();
+        if shells.is_empty() || !wait(Duration::from_millis(SHELL_RETRY_DELAY_MS)) {
+            return 0;
+        }
+        for &index in &shells {
+            let window = &self.roots[index];
+            let Ok(mut reread) = source.read_element_state(target, &window.handle, bounds, false)
+            else {
+                continue;
+            };
+            if reread.roots.len() != 1
+                || !reread.roots[0].handle.same_element(window.handle.as_ref())
+                || is_empty_shell_window(&reread.roots[0])
+            {
+                continue;
+            }
+            self.roots[index] = reread.roots.remove(0);
+            self.unreadable_subtrees += reread.unreadable_subtrees;
+            self.read_bound_reached |= reread.read_bound_reached;
+        }
+        shells.len()
+    }
+
     /// Whether every requested subtree was read. Closed menu contents are
     /// deliberately unrequested, not unreadable; the session preserves known
     /// descendant identities beneath those menus instead of removing them.
     pub fn is_complete(&self) -> bool {
         self.unreadable_subtrees == 0 && !self.read_bound_reached
     }
+}
+
+/// How long a read waits before reading an empty-shell window again (see
+/// [`RawAppState::reread_shell_windows`]): long enough for WebKit to expose a
+/// page it was still building, short enough to cost a read little.
+pub const SHELL_RETRY_DELAY_MS: u64 = 200;
+
+/// Whether a window exposes nothing of its own content: everything in it is
+/// a layout container with no content inside, or, in a standard window, one
+/// of the window's own buttons (close, minimize, zoom, full screen) or the
+/// text of its title. Such a window cannot show that its content is absent;
+/// WebKit exposes exactly this while it is still building a page's
+/// accessibility tree.
+///
+/// Any other child makes the window not a shell, whatever it is: a dialog's
+/// own buttons, an empty text area of a blank document, a button with no
+/// title. Only window chrome and empty layout are taken for missing content.
+pub fn is_empty_shell_window(node: &RawElement) -> bool {
+    fn content(node: &RawElement) -> bool {
+        !matches!(
+            node.role.as_deref(),
+            Some("AXWindow" | "AXGroup" | "AXScrollArea" | "AXSplitGroup" | "AXWebArea")
+        ) || node.children.iter().any(content)
+    }
+    if node.role.as_deref() != Some("AXWindow") {
+        return false;
+    }
+    // A dialog, sheet-like or floating window's few buttons may be all it
+    // has, so only a standard window's chrome is set aside.
+    let standard = matches!(node.subrole.as_deref(), None | Some("AXStandardWindow"));
+    let title = node.title.as_deref().unwrap_or("").trim();
+    let chrome = |child: &RawElement| {
+        standard
+            && child.children.is_empty()
+            && match child.role.as_deref() {
+                Some("AXButton") => matches!(
+                    child.subrole.as_deref(),
+                    Some(
+                        "AXCloseButton"
+                            | "AXMinimizeButton"
+                            | "AXZoomButton"
+                            | "AXFullScreenButton"
+                    )
+                ),
+                Some("AXStaticText") => {
+                    let text = match &child.value {
+                        ElementValue::Text(text) => text.as_str(),
+                        _ => child.title.as_deref().unwrap_or(""),
+                    };
+                    !title.is_empty() && text.trim() == title
+                }
+                _ => false,
+            }
+    };
+    !node
+        .children
+        .iter()
+        .any(|child| !chrome(child) && content(child))
 }
 
 /// The bounds one read is held to.

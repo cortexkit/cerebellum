@@ -1545,3 +1545,168 @@ async fn classic_computer_read_keeps_the_desk_card_flow() {
     assert_eq!(carrier.questions().len(), 1);
     assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));
 }
+
+// ---------------------------------------------------------------------------
+// A window that shows only its own buttons is read once more
+// ---------------------------------------------------------------------------
+
+/// A WebKit window as its first read can find it: only the window's own
+/// buttons and its title, the page not exposed yet.
+fn shell_window() -> RawElement {
+    let control = |token, subrole: &str| {
+        let mut button = RawElement::fixture(token, "AXButton");
+        button.subrole = Some(subrole.into());
+        button
+    };
+    let mut title = RawElement::fixture(5, "AXStaticText");
+    title.value = ElementValue::Text("Magic Context".into());
+    RawElement::fixture(1, "AXWindow")
+        .titled("Magic Context")
+        .with_children(vec![
+            control(2, "AXCloseButton"),
+            control(3, "AXFullScreenButton"),
+            control(4, "AXMinimizeButton"),
+            title,
+        ])
+}
+
+/// The same window once WebKit has exposed the page beneath it.
+fn populated_window() -> RawElement {
+    let mut window = shell_window();
+    let main = RawElement::fixture(12, "AXGroup")
+        .with_subrole("AXLandmarkMain")
+        .with_children(vec![
+            RawElement::fixture(13, "AXHeading").titled("Projects"),
+            RawElement::fixture(14, "AXButton").titled("Refresh"),
+        ]);
+    let web = RawElement::fixture(11, "AXWebArea")
+        .titled("Magic Context Dashboard")
+        .with_url("tauri://localhost")
+        .with_children(vec![main]);
+    window.children.insert(
+        0,
+        RawElement::fixture(10, "AXScrollArea").with_children(vec![web]),
+    );
+    window
+}
+
+/// A reader whose application read returns `first`, and whose read of a
+/// window by itself returns `reread`, counting both kinds of read.
+struct ShellSource {
+    first: RawElement,
+    reread: RawElement,
+    app_reads: AtomicUsize,
+    window_reads: AtomicUsize,
+}
+
+impl ShellSource {
+    fn new(first: RawElement, reread: RawElement) -> Arc<Self> {
+        Arc::new(Self {
+            first,
+            reread,
+            app_reads: AtomicUsize::new(0),
+            window_reads: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl AppStateSource for ShellSource {
+    fn read_app_state(
+        &self,
+        _target: &ProcessGrant,
+        _bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        self.app_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(RawAppState {
+            roots: vec![self.first.clone()],
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn read_element_state(
+        &self,
+        _target: &ProcessGrant,
+        element: &ElementHandle,
+        _bounds: ReadBounds,
+        _expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        self.window_reads.fetch_add(1, Ordering::SeqCst);
+        if !element.same_element(self.reread.handle.as_ref()) {
+            return Err(ElementReadError::Gone);
+        }
+        Ok(RawAppState {
+            roots: vec![self.reread.clone()],
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+}
+
+const INCOMPLETE_NOTE: &str = "Accessibility content incomplete";
+
+async fn read_shell(source: &Arc<ShellSource>) -> Value {
+    let management = granted_management().await;
+    let plane = plane(source.clone());
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+    reply
+}
+
+/// A window that shows only its buttons on the first read and its page on
+/// the second is shown with its page, in the one call, with no note that
+/// anything is missing: the application once, the window once more.
+#[tokio::test]
+async fn a_shell_window_read_again_shows_its_page_without_a_note() {
+    let source = ShellSource::new(shell_window(), populated_window());
+    let reply = read_shell(&source).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    line_with(tree, "heading Projects");
+    line_with(tree, "button Refresh");
+    assert!(
+        tree.lines()
+            .next()
+            .unwrap()
+            .ends_with(" · window \"Magic Context\" · tauri://localhost"),
+        "{tree}"
+    );
+    assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(reply["unreadable_subtrees"], 0);
+    assert_eq!(source.app_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
+}
+
+/// A window still showing only its buttons when read again is disclosed as
+/// incomplete, and is read again only once.
+#[tokio::test]
+async fn a_window_still_a_shell_when_read_again_is_disclosed_as_incomplete() {
+    let source = ShellSource::new(shell_window(), shell_window());
+    let reply = read_shell(&source).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(reply["unreadable_subtrees"], 1);
+    assert_eq!(source.app_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
+}
+
+/// A window whose first read already shows content is never read again.
+#[tokio::test]
+async fn a_window_with_content_is_not_read_again() {
+    let source = ShellSource::new(populated_window(), populated_window());
+    let reply = read_shell(&source).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(source.app_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 0);
+}

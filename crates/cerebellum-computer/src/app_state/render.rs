@@ -59,6 +59,11 @@ pub const MAX_DIFF_BYTES: usize = 4 * 1024;
 /// up to this many; a longer run is one line, `<count> <role>s, like "…"`.
 pub const REPEAT_RUN_LIMIT: usize = 3;
 
+/// The bytes an outline keeps free below its reply's bound for the lines
+/// that lead to the main content once the rest of the outline is cut: a few
+/// summary lines of at most a few hundred bytes each.
+const CONTENT_PATH_RESERVE_BYTES: usize = 1024;
+
 /// What `zoom` names to print the menu bar, which the outline leaves out.
 pub const MENU_BAR_ZOOM: &str = "menubar";
 
@@ -872,6 +877,8 @@ struct Emitter {
     capped: bool,
     /// Whether an element line that made it into `text` is marked disabled.
     disabled_shown: bool,
+    /// How many web areas the outline is currently looking through.
+    pages_entered: usize,
 }
 
 impl Emitter {
@@ -883,6 +890,7 @@ impl Emitter {
             labels_truncated: false,
             capped: false,
             disabled_shown: false,
+            pages_entered: 0,
         }
     }
 
@@ -912,6 +920,14 @@ impl Emitter {
             self.labels_truncated |= truncated;
             self.note_shown(view);
         }
+    }
+
+    /// Whether the outline has spent its bytes: past [`MAX_OUTLINE_BYTES`],
+    /// or so close to this reply's own bound that the lines leading to the
+    /// main content (see [`content_path`]) would no longer fit.
+    fn over_outline_budget(&self) -> bool {
+        self.text.len()
+            > MAX_OUTLINE_BYTES.min(self.limit.saturating_sub(CONTENT_PATH_RESERVE_BYTES))
     }
 
     /// Remember that a line just pushed for `view` showed it disabled.
@@ -1033,8 +1049,14 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
             continue;
         }
         for view in members {
-            if out.text.len() > MAX_OUTLINE_BYTES {
-                out.omitted += 1;
+            if out.over_outline_budget() {
+                // Inside a page, its own frames' web areas are not the
+                // content a caller is looking for; only its main landmark is.
+                if holds_main(view) || (out.pages_entered == 0 && holds_web_area(view)) {
+                    content_path(view, depth, out);
+                } else {
+                    out.omitted += 1;
+                }
             } else if is_menu_bar(view.node) {
                 out.element(depth, view);
                 for title in &view.children {
@@ -1045,7 +1067,10 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
             } else if is_small_table(view) {
                 print_full(view, depth, Expand::Children, out);
             } else if is_transparent(view) {
+                let page = usize::from(raw_role(view.node) == "AXWebArea");
+                out.pages_entered += page;
                 outline(&view.children, view.id, depth, out);
+                out.pages_entered -= page;
             } else {
                 emit_region(view, depth, out);
                 outline_regions(&view.children, view.id, depth + 1, 1, out);
@@ -1054,9 +1079,49 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
     }
 }
 
+/// A page's main content: its main landmark.
+fn is_main(node: &ObservedNode) -> bool {
+    raw_subrole(node) == "AXLandmarkMain"
+}
+
+fn holds_main(view: &View<'_>) -> bool {
+    is_main(view.node) || view.children.iter().any(holds_main)
+}
+
+fn holds_web_area(view: &View<'_>) -> bool {
+    raw_role(view.node) == "AXWebArea" || view.children.iter().any(holds_web_area)
+}
+
+/// The lines that lead from `view` down to a window's content, for where the
+/// outline has run out of bytes: the main landmark as one summary line with
+/// its counts, under a summary line for each region it sits in, with
+/// unnamed wrappers looked through as everywhere else. A page with no main
+/// landmark ends at its web area, summarised the same way. Whatever else
+/// the budget leaves out, a caller always sees where the content is and an
+/// id to zoom into it, never a window that looks empty.
+fn content_path(view: &View<'_>, depth: usize, out: &mut Emitter) {
+    let main_inside = view.children.iter().any(holds_main);
+    if is_main(view.node) || (raw_role(view.node) == "AXWebArea" && !main_inside) {
+        emit_region(view, depth, out);
+        return;
+    }
+    let depth = if is_transparent(view) {
+        depth
+    } else {
+        emit_region(view, depth, out);
+        depth + 1
+    };
+    for child in &view.children {
+        if holds_main(child) || (!main_inside && holds_web_area(child)) {
+            content_path(child, depth, out);
+        }
+    }
+}
+
 /// Inside a summarised region, only the regions it holds are named, one line
 /// each, and only the large ones are opened further. The rest of a region's
-/// content is what zooming into it shows.
+/// content is what zooming into it shows, except that a main landmark below
+/// the deepest region shown is still named (see [`content_path`]).
 fn outline_regions(
     views: &[View<'_>],
     parent_id: &str,
@@ -1073,14 +1138,22 @@ fn outline_regions(
             continue;
         }
         for view in members {
-            if out.text.len() > MAX_OUTLINE_BYTES {
-                out.omitted += 1;
+            if out.over_outline_budget() {
+                if holds_main(view) {
+                    content_path(view, depth, out);
+                } else {
+                    out.omitted += 1;
+                }
             } else if is_small_table(view) {
                 print_full(view, depth, Expand::Children, out);
             } else if is_region(view.node) {
                 emit_region(view, depth, out);
                 if view.bytes > INLINE_REGION_BYTES && nesting < OUTLINE_NESTING {
                     outline_regions(&view.children, view.id, depth + 1, nesting + 1, out);
+                } else if !is_main(view.node) {
+                    for child in view.children.iter().filter(|child| holds_main(child)) {
+                        content_path(child, depth + 1, out);
+                    }
                 }
             } else {
                 outline_regions(&view.children, view.id, depth, nesting, out);

@@ -1114,3 +1114,90 @@ fn every_image_unavailable_reason_is_reachable() {
             .collect()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Windows that expose no content yet
+// ---------------------------------------------------------------------------
+
+fn window_control(token: u64, subrole: &str) -> RawElement {
+    RawElement::fixture(token, "AXButton").with_subrole(subrole)
+}
+
+fn window_title(token: u64, text: &str) -> RawElement {
+    let mut title = RawElement::fixture(token, "AXStaticText");
+    title.value = ElementValue::Text(text.into());
+    title
+}
+
+/// A standard window holding only its close, minimize, zoom and full-screen
+/// buttons and its title, or only empty layout, shows none of its content.
+#[test]
+fn a_window_with_only_its_controls_and_title_is_an_empty_shell() {
+    use super::source::is_empty_shell_window;
+    let chrome = || {
+        vec![
+            window_control(2, "AXCloseButton"),
+            window_control(3, "AXMinimizeButton"),
+            window_control(4, "AXZoomButton"),
+            window_control(5, "AXFullScreenButton"),
+            window_title(6, "Magic Context"),
+        ]
+    };
+    let controls_only = RawElement::fixture(1, "AXWindow")
+        .titled("Magic Context")
+        .with_children(chrome());
+    assert!(is_empty_shell_window(&controls_only));
+    let mut standard = controls_only.clone();
+    standard.subrole = Some("AXStandardWindow".into());
+    assert!(is_empty_shell_window(&standard));
+    let mut with_layout = chrome();
+    with_layout.push(
+        RawElement::fixture(7, "AXScrollArea")
+            .with_children(vec![RawElement::fixture(8, "AXWebArea")]),
+    );
+    assert!(is_empty_shell_window(
+        &RawElement::fixture(1, "AXWindow")
+            .titled("Magic Context")
+            .with_children(with_layout)
+    ));
+}
+
+/// Any child but a standard window's own buttons, its title and empty
+/// layout means the window shows content: a dialog's buttons, a blank
+/// document's text area, a text that is not the title, and any button of a
+/// dialog window, even its close button.
+#[test]
+fn windows_with_any_other_child_are_never_empty_shells() {
+    use super::source::is_empty_shell_window;
+    let standard = |children| {
+        RawElement::fixture(1, "AXWindow")
+            .titled("Untitled")
+            .with_children(children)
+    };
+    let dialog_buttons = standard(vec![
+        RawElement::fixture(2, "AXButton").titled("OK"),
+        RawElement::fixture(3, "AXButton").titled("Cancel"),
+        window_control(4, "AXCloseButton"),
+    ]);
+    assert!(!is_empty_shell_window(&dialog_buttons));
+    let untitled_button = standard(vec![
+        RawElement::fixture(2, "AXButton"),
+        window_control(4, "AXCloseButton"),
+    ]);
+    assert!(!is_empty_shell_window(&untitled_button));
+    let blank_document = standard(vec![
+        RawElement::fixture(2, "AXScrollArea")
+            .with_children(vec![RawElement::fixture(3, "AXTextArea")]),
+        window_control(4, "AXCloseButton"),
+        window_title(5, "Untitled"),
+    ]);
+    assert!(!is_empty_shell_window(&blank_document));
+    let other_text = standard(vec![
+        window_control(4, "AXCloseButton"),
+        window_title(5, "Loading…"),
+    ]);
+    assert!(!is_empty_shell_window(&other_text));
+    let mut dialog = standard(vec![window_control(4, "AXCloseButton")]);
+    dialog.subrole = Some("AXDialog".into());
+    assert!(!is_empty_shell_window(&dialog));
+}

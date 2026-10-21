@@ -942,3 +942,268 @@ fn a_long_table_keeps_its_summary_and_the_outline_cap() {
     assert!(zoomed.contains(" cell Memory 5\n"), "{zoomed}");
     assert!(!zoomed.contains("cells (zoom"), "{zoomed}");
 }
+
+// ---------------------------------------------------------------------------
+// A WebKit window: the page under a scroll area, next to the window buttons
+// ---------------------------------------------------------------------------
+
+/// The Magic Context dashboard as its Tauri build exposes it in WKWebView:
+/// the page sits in a scroll area under the window, beside the window's own
+/// buttons, and the application has a second, status-item menu bar.
+/// `projects` is how many project buttons the main region lists.
+fn tauri_dashboard(projects: usize) -> Vec<RawElement> {
+    tauri_dashboard_with(projects, 0, 0)
+}
+
+/// [`tauri_dashboard`] with a banner of `banner_sections` named sections
+/// ahead of the main region, each a few kilobytes' worth of outline lines
+/// between them, and the main region wrapped in `named_wrappers` nested
+/// named groups.
+fn tauri_dashboard_with(
+    projects: usize,
+    banner_sections: usize,
+    named_wrappers: usize,
+) -> Vec<RawElement> {
+    let t = Tokens::new();
+    let control = |subrole: &str| t.element("AXButton").with_subrole(subrole);
+    let mut themes = Vec::new();
+    for (title, on) in [("Light", false), ("Dark", true), ("System", false)] {
+        let mut check = t.titled("AXCheckBox", title);
+        check.value = ElementValue::Number(if on { 1.0 } else { 0.0 });
+        themes.push(check);
+    }
+    let mut navigation_items: Vec<RawElement> = [
+        "Projects",
+        "Workspaces",
+        "Cache",
+        "User Directives",
+        "Config",
+        "Logs",
+    ]
+    .iter()
+    .map(|title| t.titled("AXButton", title))
+    .collect();
+    navigation_items.push(t.titled("AXGroup", "THEME").with_children(themes));
+    let navigation = t
+        .element("AXGroup")
+        .with_subrole("AXLandmarkNavigation")
+        .with_children(navigation_items);
+    let mut heading = t.titled("AXHeading", "Projects");
+    heading.value = ElementValue::Number(1.0);
+    let mut search = t.element("AXTextField");
+    search.value_settable = true;
+    let mut main_items = vec![
+        heading,
+        t.text("42 tracked"),
+        t.titled("AXButton", "↻ Refresh"),
+        search,
+    ];
+    main_items.extend((0..projects).map(|index| {
+        t.titled(
+            "AXButton",
+            &format!("project-{index:02} · /Users/me/Work/project-{index:02} · 1,204 memories"),
+        )
+    }));
+    let main = t
+        .element("AXGroup")
+        .with_subrole("AXLandmarkMain")
+        .with_children(main_items);
+    let main = (0..named_wrappers).fold(main, |inner, level| {
+        let mut children = vec![inner];
+        for action in ["Collapse", "Expand", "Pin"] {
+            children.push(t.titled(
+                "AXButton",
+                &format!(
+                    "{action} the layout level {level} pane, which holds every panel below it and keeps its size"
+                ),
+            ));
+        }
+        t.titled("AXGroup", &format!("Layout level {level}"))
+            .with_children(children)
+    });
+    // Sections alternate between a group and a list, so no two neighbours
+    // share a role and the outline names each one on its own line.
+    let banner = t
+        .element("AXGroup")
+        .with_subrole("AXLandmarkBanner")
+        .with_children(
+            (0..banner_sections)
+                .map(|section| {
+                    t.titled(
+                        if section % 2 == 0 { "AXGroup" } else { "AXList" },
+                        &format!("Announcement {section:02}: a release note long enough to fill its line"),
+                    )
+                    .with_children(
+                        (0..5)
+                            .map(|index| {
+                                t.titled(
+                                    "AXButton",
+                                    &format!("Action {index} of announcement {section:02}, with a long accessible name"),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+    let footer = t
+        .element("AXGroup")
+        .with_subrole("AXLandmarkContentInfo")
+        .with_children(
+            [
+                "DB",
+                "7208.9 MB",
+                "Memories",
+                "17927",
+                "Compartments",
+                "11834",
+                "Notes",
+                "3170",
+                "Version",
+                "0.9.4",
+            ]
+            .iter()
+            .map(|text| t.text(text))
+            .collect(),
+        );
+    let web = t
+        .titled("AXWebArea", "Magic Context Dashboard")
+        .with_url("tauri://localhost")
+        .with_children(if banner_sections > 0 {
+            vec![banner, navigation, main, footer]
+        } else {
+            vec![navigation, main, footer]
+        });
+    let scroll = t.element("AXScrollArea").with_children(vec![web]);
+    let mut window = t.titled("AXWindow", "Magic Context").with_children(vec![
+        scroll,
+        control("AXCloseButton"),
+        control("AXFullScreenButton"),
+        control("AXMinimizeButton"),
+    ]);
+    window.main_window = true;
+    window.focused_window = true;
+    let closed = |title: &str, items: usize| {
+        let mut menu = t.element("AXMenu");
+        menu.closed_menu_children = items;
+        t.titled("AXMenuBarItem", title).with_children(vec![menu])
+    };
+    let menu_bar = t.element("AXMenuBar").with_children(vec![
+        closed("Apple", 21),
+        closed("Magic Context Dashboard", 9),
+        closed("Edit", 11),
+    ]);
+    let extras = t.element("AXMenuBar").with_children(vec![closed("", 4)]);
+    vec![window, menu_bar, extras]
+}
+
+const TAURI_OUTLINE: &str = "\
+Magic Context Dashboard · window \"Magic Context\" · tauri://localhost
+kq4 navigation
+  kq5 button Projects
+  kq6 button Workspaces
+  kq7 button Cache
+  kq8 button User Directives
+  kq9 button Config
+  kq10 button Logs
+  kq11 group THEME
+    kq12 check box Light
+    kq13 check box (checked) Dark
+    kq14 check box System
+kq15 main
+  kq16 heading Projects, Value: 1
+  kq17 text 42 tracked
+  kq18 button ↻ Refresh
+  kq19 text field (settable)
+  42 buttons, like \"project-00 · /Users/me/Work/project-00 ·…\" (zoom: kq15)
+kq62 content info
+  kq63 text DB
+  kq64 text 7208.9 MB
+  kq65 text Memories
+  kq66 text 17927
+  kq67 text Compartments
+  kq68 text 11834
+  kq69 text Notes
+  kq70 text 3170
+  kq71 text Version
+  kq72 text 0.9.4
+kq73 close button
+kq74 full screen button
+kq75 minimize button
+kq76 menu bar
+  kq77 menu bar item Apple  [21 children; closed]
+  kq79 menu bar item Magic Context Dashboard  [9 children; closed]
+  kq81 menu bar item Edit  [11 children; closed]
+kq83 menu bar
+  kq84 menu bar item  [4 children; closed]
+";
+
+/// The page under a WebKit window's scroll area is the outline: the scroll
+/// area and the web area are looked through (the header names the page by
+/// its address), and the navigation, the main region with its project
+/// buttons counted, and the footer come before the window's own buttons
+/// and the menu bars.
+#[test]
+fn a_webkit_window_outlines_the_page_beneath_its_scroll_area() {
+    let read = observe(tauri_dashboard(42));
+    assert_eq!(outline_of("Magic Context Dashboard", &read), TAURI_OUTLINE);
+}
+
+fn bounded_outline_of(read: &SessionRead, limit: usize) -> String {
+    super::super::render::render_state_bounded(
+        &StateHeader {
+            app_name: "Magic Context Dashboard",
+            focused_element_id: None,
+        },
+        &read.roots,
+        &StateRequest::default(),
+        limit,
+    )
+    .text
+}
+
+/// The line the main region of [`tauri_dashboard_with`] gets when the outline
+/// has no room left to print it: its id and a count of what it holds.
+const SUMMARISED_MAIN: &str = "\nkq376 main  [46 elements, like \"Projects\", ~208 B]\n";
+
+/// A banner ahead of the main region spends the outline's whole budget. The
+/// main region is still there, as one line with its count and an id to zoom
+/// into, after which the outline says what it cut.
+#[test]
+fn an_outline_past_its_budget_still_summarises_the_main_region() {
+    let read = observe(tauri_dashboard_with(42, 60, 0));
+    let outline = outline_of("Magic Context Dashboard", &read);
+    assert!(outline.contains(SUMMARISED_MAIN), "{outline}");
+    assert!(
+        outline.ends_with("outline elements cut (menus and sidebars after main content); zoom or filter to see the rest\n"),
+        "{outline}"
+    );
+    assert!(!outline.contains("menu bar item"), "{outline}");
+}
+
+/// An action reply that shows a replaced page as an outline has less room
+/// than a read; the main region keeps its line there too, because the
+/// outline stops short of the reply's bound to leave room for it.
+#[test]
+fn an_action_replys_outline_keeps_room_for_the_main_region() {
+    let read = observe(tauri_dashboard_with(42, 60, 0));
+    let outline = bounded_outline_of(&read, MAX_DIFF_BYTES - 32);
+    assert!(outline.contains(SUMMARISED_MAIN), "{outline}");
+    assert!(outline.len() < MAX_DIFF_BYTES, "{} bytes", outline.len());
+}
+
+/// A main region nested below more named regions than the outline opens is
+/// still named, under the innermost region shown.
+#[test]
+fn a_main_region_below_the_deepest_region_shown_is_still_named() {
+    let read = observe(tauri_dashboard_with(42, 0, 3));
+    let outline = outline_of("Magic Context Dashboard", &read);
+    assert!(
+        outline.contains("\n    kq17 group Layout level 0  ["),
+        "{outline}"
+    );
+    assert!(
+        outline.contains("\n      kq18 main  [46 elements, like \"Projects\", ~202 B]\n"),
+        "{outline}"
+    );
+}
