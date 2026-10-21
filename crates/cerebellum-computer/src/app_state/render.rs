@@ -936,7 +936,8 @@ impl Emitter {
 
     /// Whether the outline has spent its bytes before printing something
     /// that costs `cost`: past [`MAX_OUTLINE_BYTES`], or so close to this
-    /// reply's own bound that the lines leading to the main content (see
+    /// reply's own bound that the lines leading to the content not yet
+    /// reached (a main landmark, or a page's web area when it has none; see
     /// [`content_path`]) would no longer fit after it.
     fn over_outline_budget(&self, cost: usize) -> bool {
         self.text.len() > MAX_OUTLINE_BYTES || !self.fits_beside_content(cost)
@@ -1087,9 +1088,8 @@ fn outline(views: &[View<'_>], parent_id: &str, depth: usize, out: &mut Emitter)
             continue;
         }
         for view in members {
-            let in_full = is_menu_bar(view.node)
-                || view.bytes <= INLINE_REGION_BYTES
-                || is_small_table(view);
+            let in_full =
+                is_menu_bar(view.node) || view.bytes <= INLINE_REGION_BYTES || is_small_table(view);
             let cost = if in_full {
                 full_cost(view, depth)
             } else if is_transparent(view) {
@@ -1559,7 +1559,10 @@ pub fn render_state_bounded(
                 // Printed in full, content and all.
                 &[]
             };
-            for top in tops.iter().filter(|top| holds_main(top) || holds_web_area(top)) {
+            for top in tops
+                .iter()
+                .filter(|top| holds_main(top) || holds_web_area(top))
+            {
                 content_path(top, 0, &mut paths);
                 content_endpoints(top, &mut out.content_pending);
             }

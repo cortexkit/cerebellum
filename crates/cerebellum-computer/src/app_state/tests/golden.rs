@@ -1250,7 +1250,9 @@ fn an_outline_keeps_no_room_once_its_content_is_shown() {
             outline.len()
         );
         if name == "main first" {
-            let main = outline.find(" main\n").expect("the main region is outlined");
+            let main = outline
+                .find(" main\n")
+                .expect("the main region is outlined");
             let banner = outline.find(" banner").expect("the banner is outlined");
             assert!(main < banner, "{outline}");
         }

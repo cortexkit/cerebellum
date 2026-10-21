@@ -1236,7 +1236,7 @@ fn shell_window_rereads_share_one_allowance() {
             _expand_menus: bool,
         ) -> Result<RawAppState, ElementReadError> {
             self.granted.lock().unwrap().push(bounds.timeout);
-            // The read used all the time it was given and still found nothing.
+            // The read used all the time it was given, then failed.
             *self.clock.lock().unwrap() += bounds.timeout;
             Err(ElementReadError::Unreadable)
         }
