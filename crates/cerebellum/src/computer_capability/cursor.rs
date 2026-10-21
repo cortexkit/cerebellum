@@ -1866,8 +1866,7 @@ mod tests {
 
     /// The first Reduce Motion read in a process can take hundreds of
     /// milliseconds (it loads AppKit), far past the geometry read's budget.
-    /// A picture never waits for it: it goes out at once, with the full
-    /// animation until a read has finished, and says so on its line.
+    /// A picture never waits for it: it still goes out at once.
     #[tokio::test]
     async fn a_slow_reduce_motion_read_never_holds_back_a_picture() {
         let (cursor, mut receiver) = Coordinator::channel();
@@ -1877,20 +1876,22 @@ mod tests {
         });
         let geometry = FollowGeometry::new();
         schedule_on(&cursor, &geometry, CursorKind::Press);
-        let picture = next_line(&mut receiver).await.picture().expect("a picture");
-        assert!(
-            !picture.motion.reduce_motion,
-            "no read had finished, so the full animation"
-        );
+        next_line(&mut receiver).await.picture().expect("a picture");
     }
 
-    /// Once the setting has been read, pictures take it from what was read
-    /// and never read it themselves: every read happens on the reading
-    /// thread, none on the path that sends a picture.
-    #[tokio::test]
+    /// Pictures take Reduce Motion from what was last read and never read it
+    /// themselves. Before the first read has finished they use the full
+    /// animation, and say so on their line; once it has, the value read.
+    /// Every read happens on the reading thread, none on the path that sends
+    /// a picture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pictures_never_read_reduce_motion_themselves() {
         let (cursor, mut receiver) = Coordinator::channel();
         let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // The read is held until the test lets it finish (or two seconds
+        // pass, so a read made where it must not be cannot hang the test).
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
         let recorded = reads.clone();
         cursor.with_reduce_motion_reader(move || {
             let thread = std::thread::current();
@@ -1898,11 +1899,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(thread.name().unwrap_or_default().to_owned());
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2));
             true
         });
-        cursor.refresh_reduce_motion();
-        until_read(|| cursor.reduce_motion());
         let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        let before = next_line(&mut receiver).await.picture().expect("a picture");
+        assert!(
+            !before.motion.reduce_motion,
+            "no read had finished, so the full animation"
+        );
+        release.send(()).unwrap();
+        until_read(|| cursor.reduce_motion());
         for kind in [CursorKind::Press, CursorKind::Write, CursorKind::Reading] {
             schedule_on(&cursor, &geometry, kind);
             let picture = next_line(&mut receiver).await.picture().expect("a picture");
@@ -1921,15 +1932,19 @@ mod tests {
         );
     }
 
-    /// Scheduling pictures reads the setting again at most every 30 seconds,
-    /// on tokio's paused clock.
+    /// Scheduling pictures starts a background read of the setting at most
+    /// every 30 seconds, on tokio's paused clock.
     #[tokio::test(start_paused = true)]
     async fn reduce_motion_is_read_again_at_most_every_30_seconds() {
         let (cursor, _receiver) = Coordinator::channel();
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = count.clone();
         cursor.with_reduce_motion_reader(move || {
-            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Only the background reads; this test is about how often they
+            // start, not about where else a read might happen.
+            if std::thread::current().name() == Some(REDUCE_MOTION_THREAD) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             false
         });
         let reads = || count.load(std::sync::atomic::Ordering::SeqCst);
