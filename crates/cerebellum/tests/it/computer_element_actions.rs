@@ -805,6 +805,59 @@ async fn a_hit_whose_window_cannot_be_established_presses_nothing() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+/// An image registered without the window it shows ties its pixels to no
+/// window, so no hit can be confirmed to lie in it: even an element that sits
+/// in a window of the application is not pressed.
+#[tokio::test]
+async fn a_point_of_an_image_registered_without_its_window_presses_nothing() {
+    use cerebellum_computer::app_state::{image::ImageMapping, session::RegisteredImage};
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((60, Some(grant().pid)));
+        state.element_windows.insert(60, 77);
+        state.elements.insert(
+            60,
+            DeskElement {
+                facts: facts("AXButton", &["AXPress"]),
+                ..DeskElement::default()
+            },
+        );
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    // A read with an image first, so the conversation has seen the
+    // application; the image acted on is a second one with no window.
+    read_with_image(&plane, &management).await;
+    let image_id = management.app_state_sessions().register_image(
+        &identity().conversation_key,
+        RegisteredImage {
+            bundle_identity: grant().bundle_identity,
+            pid: grant().pid,
+            process_generation: grant().process_generation_evidence,
+            width_px: 1000,
+            height_px: 600,
+            mapping: ImageMapping::for_window(
+                (100.0, 50.0),
+                (1000.0, 600.0),
+                (1000, 600),
+                (1000, 600),
+            )
+            .expect("a whole-window mapping"),
+        },
+    );
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 500, "y": 100}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "point_in_another_window", "{reply}");
+    assert!(desk.state().presses.is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // write_text
 // ---------------------------------------------------------------------------
