@@ -3492,8 +3492,12 @@ impl BrowserSessions {
             {
                 drop(process);
             } else {
-                // Dropping an unverified child would signal or wait without a
-                // deadline. Startup recovery still owns its unsettled journal.
+                // The platform handle's destructor would signal the pid or block in
+                // waitpid on a browser that may still be running, so the handle is
+                // leaked instead. When this module exits, the OS adopts and reaps
+                // the child. The launch journal still records this launch as
+                // unsettled, so the next start's recovery checks the browser's
+                // pid and start time and stops it if it is still running.
                 std::mem::forget(process);
             }
         }
@@ -3875,8 +3879,11 @@ impl BrowserSessions {
         drop(removed);
         drop(cleanup);
         if retain_process {
-            // If cleanup ownership was missing, there is no recovery state to
-            // retain the child. Its destructor is still unsafe without exit proof.
+            // Normally the unverified child moved into the session's failed-reap
+            // recovery above. If this session had no cleanup object, there was
+            // nowhere to keep it, and dropping it is still unsafe: the platform
+            // destructor would signal or block in waitpid without proof that the
+            // browser exited. Leak it; the OS reaps it when this module exits.
             if let Some(process) = process {
                 std::mem::forget(process);
             }
