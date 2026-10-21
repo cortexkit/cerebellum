@@ -107,10 +107,32 @@ pub(crate) fn cancelled_before_dispatch_reply() -> Value {
     })
 }
 
+/// Why an action that waited for its badge will not be sent. Nothing was
+/// sent for it.
+pub(super) enum Held {
+    /// The call was cancelled, or the agent's badge was ended, while it waited.
+    Cancelled,
+    /// The call's work deadline passed, or its dispatch gate closed.
+    Stopped,
+    /// The person used the application while the badge travelled; the reply
+    /// says how.
+    Refused(Value),
+}
+
+impl Held {
+    /// The reply an element action gives for it.
+    fn reply(self) -> Value {
+        match self {
+            Self::Cancelled => cancelled_before_dispatch_reply(),
+            Self::Stopped => super::quarantine::stopped_before_dispatch_reply(),
+            Self::Refused(reply) => reply,
+        }
+    }
+}
+
 /// Wait for the badge an action scheduled, within the call's work budget.
-/// `Ok` says whether a badge was drawn; `Err` is the before-dispatch reply
-/// for a call cancelled, stopped or out of time while it waited.
-async fn badge_landing(arrival: Arrival, cancel: &CancelHandle) -> Result<bool, Value> {
+/// `Ok` says whether a badge was drawn.
+async fn badge_landing(arrival: Arrival, cancel: &CancelHandle) -> Result<bool, Held> {
     let work = super::quarantine::CallWork::current();
     let deadline = tokio::time::Instant::from_std(work.deadline());
     match arrival
@@ -118,8 +140,8 @@ async fn badge_landing(arrival: Arrival, cancel: &CancelHandle) -> Result<bool, 
         .await
     {
         Landing::Arrived { drawn } => Ok(drawn),
-        Landing::Cancelled | Landing::Ended => Err(cancelled_before_dispatch_reply()),
-        Landing::Stopped => Err(super::quarantine::stopped_before_dispatch_reply()),
+        Landing::Cancelled | Landing::Ended => Err(Held::Cancelled),
+        Landing::Stopped => Err(Held::Stopped),
     }
 }
 
@@ -128,14 +150,14 @@ async fn badge_landing(arrival: Arrival, cancel: &CancelHandle) -> Result<bool, 
 /// agent's turn ended, or its route closed): the check is made at the moment
 /// the action would be sent, so an end that lands while the element is still
 /// being checked still stops it.
-struct BadgeGate {
+pub(super) struct BadgeGate {
     call: Arc<dyn MutationGate>,
     watch: Option<BadgeWatch>,
     ended: AtomicBool,
 }
 
 impl BadgeGate {
-    fn new(call: Arc<dyn MutationGate>, watch: Option<BadgeWatch>) -> Arc<Self> {
+    pub(super) fn new(call: Arc<dyn MutationGate>, watch: Option<BadgeWatch>) -> Arc<Self> {
         Arc::new(Self {
             call,
             watch,
@@ -144,7 +166,7 @@ impl BadgeGate {
     }
 
     /// Whether this gate refused the action because the badge was ended.
-    fn refused_for_end(&self) -> bool {
+    pub(super) fn refused_for_end(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
     }
 }
@@ -1614,10 +1636,11 @@ where
             None,
         );
         let watch = arrival.watch();
-        if let Err(mut refusal) = self
+        if let Err(held) = self
             .hold_for_badge(arrival, &cancel, management, &conversation_key, &grant)
             .await
         {
+            let mut refusal = held.reply();
             admission.decorate(&mut refusal);
             return refusal;
         }
@@ -1669,20 +1692,20 @@ where
     /// Hold an action until its badge is on what it acts on, so the action
     /// and the badge's tap happen together. When a badge was drawn, the
     /// person had time to use the application while it travelled, so that is
-    /// asked again here, right before the action is sent. `Err` is the reply
-    /// for an action that will not be sent; nothing was sent for it.
+    /// asked again here, right before the action is sent. `Err` says why the
+    /// action will not be sent; nothing was sent for it.
     ///
     /// The wait counts against the call's work budget: past the work
     /// deadline, or once the call's dispatch gate closes, the action is not
     /// sent and the reply is the usual before-dispatch one.
-    async fn hold_for_badge(
+    pub(super) async fn hold_for_badge(
         &self,
         arrival: Arrival,
         cancel: &CancelHandle,
         management: &ManagementPlane,
         conversation_key: &str,
         grant: &ProcessGrant,
-    ) -> Result<(), Value> {
+    ) -> Result<(), Held> {
         if !badge_landing(arrival, cancel).await? {
             return Ok(());
         }
@@ -1690,7 +1713,7 @@ where
             .refuse_if_person_changed(management, conversation_key, grant)
             .await
         {
-            Some(refusal) => Err(refusal),
+            Some(refusal) => Err(Held::Refused(refusal)),
             None => Ok(()),
         }
     }
@@ -1854,10 +1877,11 @@ where
             point,
         );
         let watch = arrival.watch();
-        if let Err(reply) = self
+        if let Err(held) = self
             .hold_for_badge(arrival, cancel, management, &conversation_key, &grant)
             .await
         {
+            let reply = held.reply();
             if point.is_none() {
                 return reply;
             }
@@ -1953,6 +1977,7 @@ mod tests {
         let reply = work
             .scope(badge_landing(landing(), &CancelHandle::pending()))
             .await
+            .map_err(Held::reply)
             .expect_err("a call out of time is not sent");
         assert_eq!(reply, before_dispatch);
         assert!(tokio::time::Instant::now() - start < Duration::from_secs(1));
@@ -1976,7 +2001,9 @@ mod tests {
             terminal.stop(crate::TerminalCause::Deadline);
         });
         assert_eq!(
-            reply.expect_err("a stopped call is not sent"),
+            reply
+                .map_err(Held::reply)
+                .expect_err("a stopped call is not sent"),
             before_dispatch
         );
     }

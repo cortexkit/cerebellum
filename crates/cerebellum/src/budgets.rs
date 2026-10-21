@@ -235,6 +235,7 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("security", AX_STEP_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -249,6 +250,7 @@ budget!(
     "keys",
     [
         ("preflight", PREFLIGHT_MS, 1),
+        ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -1100,6 +1102,7 @@ mod tests {
             (
                 COMPUTER_TYPE,
                 PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
                     + 3 * AX_STEP_MS
                     + FRONTING_BRACKET_MS
                     + SYNTHETIC_POST_PHASE_MS
@@ -1110,6 +1113,7 @@ mod tests {
             (
                 COMPUTER_KEYS,
                 PREFLIGHT_MS
+                    + CURSOR_ARRIVAL_MS
                     + FRONTING_BRACKET_MS
                     + AX_STEP_MS
                     + SYNTHETIC_POST_PHASE_MS

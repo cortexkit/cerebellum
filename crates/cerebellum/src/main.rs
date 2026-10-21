@@ -123,6 +123,13 @@ fn agent_cursor() {
                         serial: event.serial,
                         avatar_rgba: event.avatar_rgba,
                         avatar_update: event.avatar_update,
+                        // The module's chosen motion, passed through as it is.
+                        motion: cerebellum_macos::PictureTiming {
+                            entry: event.motion.style
+                                == cerebellum_computer::cursor::MotionStyle::Entry,
+                            duration_ms: event.motion.duration_ms,
+                            reduce_motion: event.motion.reduce_motion,
+                        },
                     })
                 }
             };

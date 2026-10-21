@@ -18,11 +18,11 @@ use crate::cursor_geometry::{
     CHIP_RIM, CHIP_RING, LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER,
     POINTER_CORNER,
 };
-pub use crate::cursor_schedule::CursorMotion;
 use crate::cursor_schedule::{
-    entry_frame, ActivityChange, ActivityGate, Appearance, BadgeMotion, ColourFade, Colours,
-    CursorSchedule, EntryFrame, MotionEvent, PictureNeed, PictureStep, Wait,
+    begin_picture, entry_frame, ActivityChange, ActivityGate, Appearance, BadgeMotion, ColourFade,
+    Colours, CursorSchedule, EntryFrame, PictureAim, PictureNeed, PictureStep, Wait,
 };
+pub use crate::cursor_schedule::{CursorMotion, PictureTiming};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -78,6 +78,9 @@ pub struct OverlayEvent {
     pub serial: u64,
     pub avatar_rgba: Option<Vec<u8>>,
     pub avatar_update: bool,
+    /// How the badge reaches `to` and how long that takes, as the module
+    /// chose it. The helper follows it exactly.
+    pub motion: PictureTiming,
 }
 
 /// The colours a badge is drawn in for one system appearance, sRGB in [0, 1].
@@ -740,19 +743,24 @@ impl Picture {
         }
     }
 
-    fn update(
-        &mut self,
-        mtm: MainThreadMarker,
-        event: OverlayEvent,
-        motion: CursorMotion,
-        now: Instant,
-    ) {
+    fn update(&mut self, mtm: MainThreadMarker, event: OverlayEvent, now: Instant) {
         self.serial = event.serial;
         self.fields.set_avatar(event.avatar_rgba.as_deref());
         self.fields.set_initial(event.initial);
-        let reduce = reduce_motion();
         (self.displays, self.primary_height) = read_displays(mtm);
-        let first = self.appearance.on_event(now, reduce);
+        // The module's motion, from wherever this badge really is: its entry
+        // or glide ends exactly when the module sends the action.
+        let (to, first) = begin_picture(
+            &mut self.appearance,
+            &mut self.motion,
+            PictureAim {
+                to: event.to,
+                resting: event.resting,
+                press: event.gesture == OverlayGesture::Press,
+                timing: event.motion,
+            },
+            now,
+        );
         // The agent's own colour replaces whatever is shown; the neutral one
         // only stands in until that is known, so it never replaces it. The
         // appearance is read again either way, so a switch between Light and
@@ -762,17 +770,6 @@ impl Picture {
             _ => event.accent,
         };
         self.recolour(mtm, accent, now, !first);
-        let to = self.motion.on_event(
-            MotionEvent {
-                to: event.to,
-                resting: event.resting,
-                first,
-                press: event.gesture == OverlayGesture::Press,
-                reduce_motion: reduce,
-            },
-            now,
-            &motion,
-        );
 
         let display = display_at(to, &self.displays);
         let tip = snap_tip(to, display.map_or(1.0, |d| d.scale));
@@ -951,6 +948,10 @@ pub struct HideProbe {
 /// frame) and never animated, so nothing appears on the desk.
 #[doc(hidden)]
 pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
+    // A picture's motion now comes on its event, and this one never moves,
+    // so the curves are not needed; the parameter keeps the probe's callers
+    // unchanged.
+    let _ = motion;
     let mtm = MainThreadMarker::new().ok_or("the hide probe must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -976,8 +977,12 @@ pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
             serial: 1,
             avatar_rgba: None,
             avatar_update: false,
+            motion: PictureTiming {
+                entry: true,
+                duration_ms: crate::cursor_schedule::ENTRY_MS,
+                reduce_motion: false,
+            },
         },
-        motion,
         Instant::now(),
     );
     // The helper's loop sends window changes between frames; do the same
@@ -1022,17 +1027,18 @@ fn window_listed_on_screen(number: isize) -> bool {
     })
 }
 
-/// Run only in the hidden helper mode, before any asynchronous runtime exists.
-/// EOF closes the channel and ends the main-thread run loop without saving state.
-/// Whether the person has asked macOS to reduce motion. The helper reads it
-/// for every picture it draws, and the module reads it the same way to know
-/// how long that picture's animation takes before it sends the action.
-/// AppKit does not restrict NSWorkspace to the main thread, so the module
-/// reads it from a worker thread.
+/// Whether the person has asked macOS to reduce motion. Only the module reads
+/// it: it chooses each picture's motion and sends that, Reduce Motion or not,
+/// on the picture line, so the helper never reads the setting itself. The
+/// module process runs no AppKit event loop, so this may keep answering the
+/// value it first read after the person changes the setting; since the line
+/// carries the value, the module and the helper still agree on it.
 pub fn reduce_motion() -> bool {
     NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
 
+/// Run only in the hidden helper mode, before any asynchronous runtime exists.
+/// EOF closes the channel and ends the main-thread run loop without saving state.
 pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) {
     run_cursor_loop(events, motion, None);
 }
@@ -1145,7 +1151,7 @@ fn run_cursor_loop(
                             pictures
                                 .picture_for_event(event.agent.clone(), now, || Picture::new(mtm))
                         {
-                            picture.update(mtm, event, motion, now);
+                            picture.update(mtm, event, now);
                         }
                     }
                     Err(TryRecvError::Disconnected) => return None,
@@ -1318,7 +1324,10 @@ pub fn probe_cursor_motion(
     let from = [centre[0] - 200.0, centre[1] - 50.0];
     let to = [centre[0] + 120.0, centre[1] + 190.0];
     let follow_offset = [40.0, 30.0];
-    let event = |serial: u64, at: [f64; 2]| {
+    // The probe stands in for the module: the entry at its usual length, and
+    // the glide at the length the supplied curve gives for that distance.
+    let glide_ms = (motion.duration_ms)((to[0] - from[0]).hypot(to[1] - from[1]), false);
+    let event = move |serial: u64, at: [f64; 2]| {
         OverlayMessage::Show(OverlayEvent {
             agent: PROBE_AGENT.into(),
             initial: 'P',
@@ -1332,6 +1341,15 @@ pub fn probe_cursor_motion(
             serial,
             avatar_rgba: None,
             avatar_update: false,
+            motion: PictureTiming {
+                entry: serial == 1,
+                duration_ms: if serial == 1 {
+                    crate::cursor_schedule::ENTRY_MS
+                } else {
+                    glide_ms
+                },
+                reduce_motion: false,
+            },
         })
     };
     let start = Instant::now();

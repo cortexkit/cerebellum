@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use cerebellum_computer::app_state::source::{AppStateSource, CursorWindowWatch, ElementHandle};
 use cerebellum_computer::cursor::{
-    follow_offset, label, tip_arrival_ms, CursorEvent, CursorFollow, CursorHide, CursorKind,
-    CursorLine, WindowChange, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
+    follow_offset, label, CursorEvent, CursorFollow, CursorHide, CursorKind, CursorLine,
+    PictureMotion, WindowChange, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
 };
 use cerebellum_computer::platform::ProcessGrant;
 use tokio::sync::{mpsc, oneshot};
@@ -127,19 +127,22 @@ impl Tip {
 }
 
 impl Drawn {
-    /// Record a picture just sent to the helper and answer when its badge
-    /// will be on its target, by the timeline the helper animates.
+    /// Choose the motion for a picture about to be sent to the helper, and
+    /// the record of where its badge will then be. Nothing is recorded yet:
+    /// `keep` does that once the picture is really on its way.
     ///
-    /// A badge the helper is not showing (never drawn, ended, or faded out
-    /// after the idle timeout) appears with its entry animation; one already
-    /// on screen glides from where it rests. A read with nothing to aim at
-    /// leaves a shown badge where it is.
-    fn land(
-        &mut self,
+    /// A badge the module has not seen drawn (never drawn, ended, or faded
+    /// out after the idle timeout) appears with its entry animation; one
+    /// already on screen glides from where it was last sent. A read with
+    /// nothing to aim at leaves a shown badge where it is. The helper follows
+    /// the chosen motion from wherever its badge really is, so even where
+    /// this record is out of date the badge arrives when the motion says.
+    fn aim(
+        &self,
         event: &CursorEvent,
         now: tokio::time::Instant,
         reduce_motion: bool,
-    ) -> tokio::time::Instant {
+    ) -> (PictureMotion, Tip) {
         let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
         let shown = self
             .tips
@@ -151,8 +154,20 @@ impl Drawn {
             _ => event.to,
         };
         let distance = shown.map_or(0.0, |from| (to[0] - from[0]).hypot(to[1] - from[1]));
-        let arrival_ms = tip_arrival_ms(distance, shown.is_none(), reduce_motion);
-        if self.tips.len() >= RECORD_CAP && !self.tips.contains_key(&event.agent) {
+        (
+            PictureMotion::chosen(distance, shown.is_none(), reduce_motion),
+            Tip {
+                serial: event.serial,
+                to,
+                offset: [0.0, 0.0],
+                sent: now,
+            },
+        )
+    }
+
+    /// Record where an agent's badge was just sent.
+    fn keep(&mut self, agent: &str, tip: Tip) {
+        if self.tips.len() >= RECORD_CAP && !self.tips.contains_key(agent) {
             // Bounded like the other records: the oldest goes, and its agent's
             // next picture is simply taken for a first appearance.
             if let Some(oldest) = self
@@ -164,16 +179,7 @@ impl Drawn {
                 self.tips.remove(&oldest);
             }
         }
-        self.tips.insert(
-            event.agent.clone(),
-            Tip {
-                serial: event.serial,
-                to,
-                offset: [0.0, 0.0],
-                sent: now,
-            },
-        );
-        now + Duration::from_secs_f64(arrival_ms.max(0.0) / 1000.0)
+        self.tips.insert(agent.to_owned(), tip);
     }
 }
 
@@ -646,7 +652,7 @@ impl Coordinator {
     /// when nothing will be drawn.
     fn send_unless_ended(
         &self,
-        event: CursorEvent,
+        mut event: CursorEvent,
         reduce_motion: bool,
     ) -> Option<tokio::time::Instant> {
         let mut drawn = self.drawn();
@@ -657,15 +663,24 @@ impl Coordinator {
         {
             return None;
         }
-        if !self.send_line(CursorLine::Picture(event.clone())) {
+        let now = tokio::time::Instant::now();
+        let (motion, tip) = drawn.aim(&event, now, reduce_motion);
+        // The line carries the motion, so the helper animates exactly what
+        // this wait is timed by.
+        event.motion = motion;
+        let (agent, resting) = (event.agent.clone(), event.resting);
+        if !self.send_line(CursorLine::Picture(event)) {
             return None;
         }
-        let arrival = drawn.land(&event, tokio::time::Instant::now(), reduce_motion);
-        (!self
-            .0
-            .helper_down
-            .load(std::sync::atomic::Ordering::Acquire))
-        .then_some(arrival)
+        drawn.keep(&agent, tip);
+        // A badge that only rests somewhere aims at nothing an action waits
+        // for.
+        let waits = !resting
+            && !self
+                .0
+                .helper_down
+                .load(std::sync::atomic::Ordering::Acquire);
+        waits.then(|| now + Duration::from_secs_f64(motion.duration_ms / 1000.0))
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
@@ -787,6 +802,8 @@ impl Coordinator {
                         avatar_rgba: None,
                         avatar_update: false,
                         avatar_tint: None,
+                        // Chosen when the picture is sent, from where the badge is then.
+                        motion: PictureMotion::still(),
                     },
                     aimed_handle,
                     reduce_motion,
@@ -868,6 +885,7 @@ impl Coordinator {
                 avatar_rgba: None,
                 avatar_update: false,
                 avatar_tint: None,
+                motion: PictureMotion::still(),
             }));
         }
     }
@@ -1750,6 +1768,7 @@ mod tests {
             avatar_rgba: None,
             avatar_update: false,
             avatar_tint: None,
+            motion: PictureMotion::still(),
         };
         for _ in 0..CAPACITY {
             cursor.send(event.clone());

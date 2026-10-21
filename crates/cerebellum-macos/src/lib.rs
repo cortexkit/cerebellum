@@ -74,11 +74,11 @@ mod cursor_geometry;
 mod cursor_overlay;
 #[cfg(any(target_os = "macos", test))]
 mod cursor_schedule;
-// The badge's arrival timings, shared with the module through one source
-// file: this crate cannot depend on `cerebellum-computer`, which declares the
-// same file as its own module. The helper uses the entry and idle timings;
-// the glide and arrival functions are the module's half of the file, used
-// here only by the test that checks the helper's animation against them.
+// The badge's timings, shared with the module through one source file: this
+// crate cannot depend on `cerebellum-computer`, which declares the same file
+// as its own module. The module works out each picture's motion with it and
+// sends that on the picture line; the helper takes only the entry's phase
+// proportions and the idle fade from it, never a length of its own.
 #[cfg(any(target_os = "macos", test))]
 #[allow(dead_code)]
 #[path = "../../cerebellum-computer/src/cursor_timeline.rs"]
@@ -89,7 +89,8 @@ mod macos;
 pub use cursor_overlay::{
     probe_cursor_hide, probe_cursor_motion, reduce_motion, render_cursor_gallery_png,
     run_agent_cursor, CursorMotion, GalleryShot, HideProbe, MotionProbe, OverlayAccent,
-    OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, ProbePass, AVATAR_PIXELS,
+    OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, PictureTiming, ProbePass,
+    AVATAR_PIXELS,
 };
 #[cfg(target_os = "macos")]
 mod peer_attestation;

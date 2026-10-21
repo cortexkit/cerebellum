@@ -105,28 +105,50 @@ fn share(elapsed: f64, from: f64, to: f64) -> f64 {
     ((elapsed - from) / (to - from)).clamp(0.0, 1.0)
 }
 
-/// The entry's frame `elapsed_ms` into it, or `None` once it is over. A
-/// malformed time ends it: a badge must never be left half-entered.
+/// The entry's frame `elapsed_ms` into it, or `None` once it is over: the
+/// full entry, or under Reduce Motion the plain fade, at their usual lengths.
 pub(crate) fn entry_frame(elapsed_ms: f64, reduce_motion: bool) -> Option<EntryFrame> {
-    let total = if reduce_motion {
-        REDUCED_ENTRY_MS
-    } else {
-        ENTRY_MS
-    };
-    if !elapsed_ms.is_finite() || elapsed_ms >= total {
+    shaped_entry_frame(
+        elapsed_ms,
+        EntryShape {
+            total_ms: if reduce_motion {
+                REDUCED_ENTRY_MS
+            } else {
+                ENTRY_MS
+            },
+            fade_only: reduce_motion,
+        },
+    )
+}
+
+/// How one appearance enters: over `total_ms`, either the full entry with its
+/// phases stretched or squeezed to that length, or a plain fade.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EntryShape {
+    pub total_ms: f64,
+    pub fade_only: bool,
+}
+
+/// An entry's frame `elapsed_ms` into it, or `None` once it is over. A
+/// malformed time ends it: a badge must never be left half-entered.
+pub(crate) fn shaped_entry_frame(elapsed_ms: f64, shape: EntryShape) -> Option<EntryFrame> {
+    let total = shape.total_ms;
+    if !elapsed_ms.is_finite() || !total.is_finite() || elapsed_ms >= total {
         return None;
     }
     let elapsed = elapsed_ms.max(0.0);
-    if reduce_motion {
+    if shape.fade_only {
         return Some(EntryFrame {
             alpha: share(elapsed, 0.0, total),
             ..EntryFrame::REST
         });
     }
+    // The phases keep their places as shares of the whole entry.
+    let scale = total / ENTRY_MS;
     Some(EntryFrame {
-        chip: ease_in_out(share(elapsed, ENTRY_SHRINK_FROM_MS, total)),
-        pointer: ease_out(share(elapsed, ENTRY_POINTER_FROM_MS, total)),
-        alpha: ease_out(share(elapsed, 0.0, ENTRY_POP_MS)),
+        chip: ease_in_out(share(elapsed, ENTRY_SHRINK_FROM_MS * scale, total)),
+        pointer: ease_out(share(elapsed, ENTRY_POINTER_FROM_MS * scale, total)),
+        alpha: ease_out(share(elapsed, 0.0, ENTRY_POP_MS * scale)),
     })
 }
 
@@ -138,18 +160,18 @@ pub(crate) fn entry_frame(elapsed_ms: f64, reduce_motion: bool) -> Option<EntryF
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Appearance {
     shown: bool,
-    entry: Option<(FrameClock, bool)>,
+    entry: Option<(FrameClock, EntryShape)>,
 }
 
 impl Appearance {
     /// An event arrived. Answers whether this is the first appearance, which
-    /// starts the entry.
-    pub(crate) fn on_event(&mut self, now: Instant, reduce_motion: bool) -> bool {
+    /// starts an entry of the given shape.
+    pub(crate) fn on_event(&mut self, now: Instant, shape: EntryShape) -> bool {
         if self.shown {
             return false;
         }
         self.shown = true;
-        self.entry = Some((FrameClock::start(now), reduce_motion));
+        self.entry = Some((FrameClock::start(now), shape));
         true
     }
 
@@ -159,10 +181,10 @@ impl Appearance {
 
     /// The entry frame to draw at `now`; the resting frame once it is over.
     pub(crate) fn frame(&mut self, now: Instant) -> EntryFrame {
-        let Some((clock, reduce)) = self.entry.as_mut() else {
+        let Some((clock, shape)) = self.entry.as_mut() else {
             return EntryFrame::REST;
         };
-        match entry_frame(clock.advance(now), *reduce) {
+        match shaped_entry_frame(clock.advance(now), *shape) {
             Some(frame) => frame,
             None => {
                 self.entry = None;
@@ -170,6 +192,64 @@ impl Appearance {
             }
         }
     }
+}
+
+/// The motion the module chose for one picture, as the helper receives it on
+/// the picture's line. The helper animates exactly this and never works out
+/// a length or a style of its own: the module waits exactly `duration_ms`
+/// before it sends the action, so the badge must be on its target by then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PictureTiming {
+    /// The module expects the badge to appear with its entry; otherwise to
+    /// glide from where it is.
+    pub entry: bool,
+    pub duration_ms: f64,
+    pub reduce_motion: bool,
+}
+
+/// One picture event, as the helper received it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PictureAim {
+    pub to: [f64; 2],
+    pub resting: bool,
+    pub press: bool,
+    pub timing: PictureTiming,
+}
+
+/// Start one picture event with the module's chosen motion, from wherever
+/// the badge really is. Answers the tip's destination and whether this is
+/// the picture's first appearance.
+///
+/// The module's idea of whether the badge is on screen can be out of date
+/// (the helper faded it out, or never drew it). Either way the badge is on
+/// its target, fully shown, after exactly `duration_ms`: a glide for a badge
+/// the helper is not showing appears on its target with a plain fade over
+/// that time, and an entry for a badge already on screen glides there over
+/// that time.
+pub(crate) fn begin_picture(
+    appearance: &mut Appearance,
+    motion: &mut BadgeMotion,
+    aim: PictureAim,
+    now: Instant,
+) -> ([f64; 2], bool) {
+    let timing = aim.timing;
+    let shape = EntryShape {
+        total_ms: timing.duration_ms,
+        fade_only: timing.reduce_motion || !timing.entry,
+    };
+    let first = appearance.on_event(now, shape);
+    let to = motion.on_event(
+        MotionEvent {
+            to: aim.to,
+            resting: aim.resting,
+            first,
+            press: aim.press,
+            reduce_motion: timing.reduce_motion,
+            duration_ms: timing.duration_ms,
+        },
+        now,
+    );
+    (to, first)
 }
 
 /// How long a badge takes to change colour, in ms: when its agent's avatar
@@ -307,6 +387,8 @@ pub(crate) struct MotionEvent {
     /// A press lands with a tap rather than a settle.
     pub press: bool,
     pub reduce_motion: bool,
+    /// How long the glide takes, as the module chose it.
+    pub duration_ms: f64,
 }
 
 /// Where a picture is and what its pointer does on one frame.
@@ -394,12 +476,7 @@ impl BadgeMotion {
 
     /// An agent event arrived. Answers the tip's destination, which the
     /// badge's layout is computed for.
-    pub(crate) fn on_event(
-        &mut self,
-        event: MotionEvent,
-        now: Instant,
-        curves: &CursorMotion,
-    ) -> [f64; 2] {
+    pub(crate) fn on_event(&mut self, event: MotionEvent, now: Instant) -> [f64; 2] {
         self.reduce = event.reduce_motion;
         self.press = event.press;
         // A window move reported from here on counts from this event.
@@ -423,7 +500,9 @@ impl BadgeMotion {
             self.duration_ms = 0.0;
             self.settles = false;
         } else {
-            self.duration_ms = (curves.duration_ms)(distance(self.from, to), self.reduce);
+            // The module's length, never one worked out here: it waits exactly
+            // this long before it sends the action.
+            self.duration_ms = event.duration_ms.max(0.0);
             self.settles = true;
         }
         // A new aim ends a swing; the pointer turns back to rest on the way
@@ -1264,7 +1343,13 @@ mod tests {
             schedule
                 .picture_for_event("agent".into(), at, Appearance::default)
                 .unwrap()
-                .on_event(at, false)
+                .on_event(
+                    at,
+                    EntryShape {
+                        total_ms: ENTRY_MS,
+                        fade_only: false,
+                    },
+                )
         };
         entries += usize::from(event(&mut schedule, start));
         // More actions, during the entry and after it: no second entry, and
@@ -1410,6 +1495,7 @@ mod tests {
             first: false,
             press: true,
             reduce_motion,
+            duration_ms: test_duration(1.0, reduce_motion),
         }
     }
 
@@ -1422,7 +1508,6 @@ mod tests {
                 ..aim(START, reduce_motion)
             },
             start,
-            &CURVES,
         );
         let frame = motion.frame(start, &CURVES);
         assert_eq!(frame.need, PictureNeed::Rest);
@@ -1619,10 +1704,7 @@ mod tests {
         frames_until_still(&mut motion, moved);
         let elsewhere = [900.0, 700.0];
         let acted = moved + Duration::from_millis(300);
-        assert_eq!(
-            motion.on_event(aim(elsewhere, false), acted, &CURVES),
-            elsewhere
-        );
+        assert_eq!(motion.on_event(aim(elsewhere, false), acted), elsewhere);
         let (frames, landed) = frames_until_still(&mut motion, acted);
         // It glides from where the chip held still, turning the pointer back.
         assert_eq!(frames[0].tip, START);
@@ -1717,74 +1799,87 @@ mod tests {
         assert!(!gate.held(), "released once the badge landed");
     }
 
-    /// The module waits for the shared arrival before it presses, so the
-    /// helper must really have the badge on its target by then: no sooner
-    /// (the click would land before the badge) and no later (the badge would
-    /// tap after the click). Steps the helper's own entry and glide clocks a
-    /// millisecond at a time with the shared glide curve, as the module
-    /// supplies it, and reads off when the tip is on the target, fully
-    /// visible, with no entry still playing.
+    /// The module waits exactly the length it put on the picture's line
+    /// before it sends the action, so the helper must have the badge on its
+    /// target, fully shown and with no entry still playing, exactly then: not
+    /// sooner (the badge would sit there before the click) and not later (the
+    /// click would land first). The lengths here are ones the helper's own
+    /// curves would never give, so a helper that worked out its own length
+    /// instead of following the line arrives at the wrong time. It holds for
+    /// every case of the module's view being out of date: an entry for a
+    /// badge the helper already shows, and a glide for one it does not.
     #[test]
-    fn the_helper_reaches_its_target_when_the_shared_arrival_says() {
-        use crate::cursor_timeline::{duration_ms, tip_arrival_ms};
+    fn the_helper_reaches_the_target_when_the_picture_line_says() {
         const STEP: Duration = Duration::from_millis(1);
-        let curves = CursorMotion {
-            duration_ms,
-            position: test_position,
-            settle_scale: |_, _, _| 1.0,
-            fade_alpha: test_fade,
-        };
-        let short = [START[0] + 3.0, START[1] + 4.0];
         let across = [START[0] + 3000.0, START[1] + 2000.0];
+        let short = [START[0] + 3.0, START[1] + 4.0];
         for reduce in [false, true] {
-            for (first, to) in [(true, across), (false, short), (false, across)] {
+            for (shown, entry, to, length) in [
+                (false, true, across, 777.0),
+                (false, true, across, 0.0),
+                (true, false, short, 123.0),
+                (true, false, across, 411.0),
+                // The module thought the badge was gone, but it is on screen.
+                (true, true, across, 640.0),
+                // The module thought the badge was on screen, but it is gone.
+                (false, false, across, 333.0),
+                (false, false, short, 0.0),
+            ] {
                 let start = Instant::now();
                 let mut appearance = Appearance::default();
                 let mut motion = BadgeMotion::new(start);
                 let mut now = start;
-                if !first {
+                let timing = |entry: bool, duration_ms: f64| PictureTiming {
+                    entry,
+                    duration_ms,
+                    reduce_motion: reduce,
+                };
+                if shown {
                     // A badge already shown, its entry over, resting on START.
-                    appearance.on_event(now, reduce);
-                    motion.on_event(
-                        MotionEvent {
-                            first: true,
-                            ..aim(START, reduce)
+                    begin_picture(
+                        &mut appearance,
+                        &mut motion,
+                        PictureAim {
+                            to: START,
+                            resting: false,
+                            press: true,
+                            timing: timing(true, 500.0),
                         },
                         now,
-                        &curves,
                     );
                     while appearance.entering() {
                         now += STEP;
                         appearance.frame(now);
-                        motion.frame(now, &curves);
+                        motion.frame(now, &CURVES);
                     }
                 }
                 let sent = now;
-                assert_eq!(appearance.on_event(sent, reduce), first);
-                motion.on_event(
-                    MotionEvent {
-                        first,
-                        ..aim(to, reduce)
+                let (_, first) = begin_picture(
+                    &mut appearance,
+                    &mut motion,
+                    PictureAim {
+                        to,
+                        resting: false,
+                        press: true,
+                        timing: timing(entry, length),
                     },
                     sent,
-                    &curves,
                 );
+                assert_eq!(first, !shown);
                 let arrived = loop {
-                    let frame = motion.frame(now, &curves);
-                    let entry = appearance.frame(now);
-                    if frame.tip == to && frame.alpha == 1.0 && entry == EntryFrame::REST {
+                    let frame = motion.frame(now, &CURVES);
+                    let entered = appearance.frame(now);
+                    if frame.tip == to && frame.alpha == 1.0 && entered == EntryFrame::REST {
                         break now;
                     }
                     now += STEP;
                     assert!(now - sent < SECOND * 5, "the badge never arrived");
                 };
-                let distance = (to[0] - START[0]).hypot(to[1] - START[1]);
-                let shared = tip_arrival_ms(distance, first, reduce);
-                let helper = ms(arrived - sent);
+                let took = ms(arrived - sent);
                 assert!(
-                    (helper - shared).abs() <= ms(STEP),
-                    "first {first}, reduce {reduce}, to {to:?}: the helper arrived after \
-                     {helper} ms, the shared arrival says {shared} ms"
+                    (took - length).abs() <= ms(STEP),
+                    "shown {shown}, entry {entry}, reduce {reduce}, to {to:?}: the line said \
+                     {length} ms and the helper took {took} ms"
                 );
             }
         }

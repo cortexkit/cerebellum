@@ -49,6 +49,8 @@ enum DispatchedCall {
 #[derive(Debug)]
 struct Shared {
     calls: Vec<DispatchedCall>,
+    /// When each per-process post reached the driver, on tokio's clock.
+    posted_at: Vec<tokio::time::Instant>,
     interrupt_after_two: Option<Arc<tokio::sync::Notify>>,
     per_pid: Result<DispatchResult, DriverError>,
     global: Result<DispatchResult, DriverError>,
@@ -62,6 +64,7 @@ impl Shared {
     fn handle() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             calls: Vec::new(),
+            posted_at: Vec::new(),
             interrupt_after_two: None,
             per_pid: Ok(DispatchResult {
                 accepted_by_platform: true,
@@ -138,6 +141,7 @@ impl PlatformDriver for SyntheticDriver {
     ) -> Result<DispatchResult, DriverError> {
         let mut shared = self.0.lock().unwrap();
         shared.calls.push(DispatchedCall::PerPid(request));
+        shared.posted_at.push(tokio::time::Instant::now());
         if let Some(posted) = shared.interrupt_after_two.clone() {
             drop(shared);
             use cerebellum_computer::platform::process_event::*;
@@ -2120,4 +2124,66 @@ async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pi
         assert_eq!(posts[0], posts[1], "{action}");
         assert_eq!(posts[0], posts[2], "{action}");
     }
+}
+
+/// A keystroke action that draws its badge on the focused element posts once
+/// the badge is there, so the text or keys appear with it rather than ahead
+/// of it. Timed on tokio's paused clock against the motion the picture line
+/// itself carries, which is exactly what the helper animates.
+async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
+    use cerebellum::computer_capability::cursor::Coordinator;
+    let management = granted_management().await;
+    let clock = FakeClock::new();
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
+    desk.state().cursor_visible = true;
+    let base = plane_with(&shared).with_app_state_source(desk.source());
+    // Read without a badge, so the action's own picture is the first.
+    serve(
+        &base,
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID}),
+        &management,
+        &clock,
+    )
+    .await;
+    let (cursor, mut pictures) = Coordinator::channel();
+    let plane = base.with_cursor(cursor);
+    let start = tokio::time::Instant::now();
+    let reply = serve(&plane, action, arguments, &management, &clock).await;
+    assert!(!dispatched_calls(&shared).is_empty(), "{action}: {reply}");
+    let picture = pictures
+        .recv()
+        .await
+        .expect("the pipe stays open")
+        .picture()
+        .expect("a picture");
+    assert!(
+        !picture.resting,
+        "{action}: the badge aims at the focused element"
+    );
+    assert!(
+        picture.motion.duration_ms > 0.0,
+        "{action}: the badge moves"
+    );
+    let arrival = start + std::time::Duration::from_secs_f64(picture.motion.duration_ms / 1000.0);
+    let posted = shared.lock().unwrap().posted_at.clone();
+    assert_eq!(posted.len(), 1, "{action}");
+    assert!(
+        posted[0] >= arrival,
+        "{action}: posted {:?} after it was asked for, before the badge's {} ms",
+        posted[0] - start,
+        picture.motion.duration_ms
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn typing_is_posted_when_the_badge_reaches_the_focused_field() {
+    posted_when_the_badge_arrives("computer.type", type_request()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_are_posted_when_the_badge_reaches_the_focused_element() {
+    posted_when_the_badge_arrives("computer.keys", keys_request(&["return"])).await;
 }
