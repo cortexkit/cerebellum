@@ -13,9 +13,9 @@
 
 /// How long a first appearance takes, in ms: the avatar pops in large on the
 /// target, holds a moment, then shrinks onto its place behind the pointer as
-/// the pointer and label come in. The original entry felt too quick, so each
-/// phase now takes twice as long while the gentler Reduce Motion fade stays
-/// short.
+/// the pointer and label come in. About a second, so a person watching notices
+/// that an agent has started using the computer; the Reduce Motion fade is
+/// shorter because it moves nothing.
 pub const ENTRY_MS: f64 = 1040.0;
 
 /// Under Reduce Motion an entry is a plain fade of the resting badge, with no
