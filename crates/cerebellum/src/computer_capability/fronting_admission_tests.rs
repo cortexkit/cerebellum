@@ -408,6 +408,9 @@ fn keys(chord: &[&str]) -> Value {
 /// without takeover it is refused, naming the takeover permission, and
 /// nothing is posted. Foreground mode does not front the application for a
 /// chord it then refuses. With takeover held it runs in the takeover bracket.
+/// macOS only: the system-wide chord table is per platform, and Command-Space
+/// and Command-Tab are macOS chords.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_system_shortcut_takes_the_takeover_route_even_to_a_frontmost_app() {
     let rig = rig(AppUse::Background, mail_desk()).await;
