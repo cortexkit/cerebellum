@@ -409,3 +409,42 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-only-module-startup-reads-the-config-file"
+guards = "the module's own startup, which loads cerebellum.jsonc to register, is what points the computer plane at that file for the live app_use read"
+file = "crates/cerebellum/src/lib.rs"
+old = '        computer.read_app_use_from_config_file();'
+new = '        let _ = computer; // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "live_settings_tests::module_startup_points_the_computer_plane_at_the_config_file",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-planes-read-no-config-file-by-default"
+guards = "a computer plane from any constructor reads no config file, so test binaries and examples never take a mode or a config_invalid refusal from the config of whoever runs them"
+file = "crates/cerebellum/src/computer_capability/app_use.rs"
+old = '        Self::new(None, Arc::new(NativeConfigFiles))'
+new = '        Self::new(cerebellum_core::config::config_path(), Arc::new(NativeConfigFiles)) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::serve_tests::a_plane_from_any_constructor_reads_no_config_file",
+    "live_settings_tests::module_startup_points_the_computer_plane_at_the_config_file",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
