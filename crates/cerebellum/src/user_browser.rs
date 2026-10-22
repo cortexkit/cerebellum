@@ -18,6 +18,7 @@ use subc_protocol::Frame;
 use tokio::sync::mpsc;
 
 use crate::authorization::{self, Action, HazardClass, Severity};
+use crate::browser::dom_layout::{self, DomLandmark};
 use crate::browser::navigation::{classify_flattened_document, snapshot_from_capture};
 use crate::browser::state_text::{self, Filters, RenderInput, Zoom};
 use crate::browser_standing_grants::{always_subject, RevokeTarget, StandingBrowserGrants};
@@ -1618,6 +1619,9 @@ fn validate(action: &str, args: &Value) -> Result<(), Value> {
     }
     if action == "snapshot" && object.get("mode").is_some_and(|mode| mode != "actionable") {
         for field in ["zoom", "text_filter", "role_filter"] {
+            if field == "zoom" && object.get("mode").is_some_and(|mode| mode == "dom_full") {
+                continue;
+            }
             if object.contains_key(field) {
                 return Err(invalid(field, "unsupported_value"));
             }
@@ -2675,6 +2679,7 @@ async fn capture_attempt(
     let mut failed_frames = BTreeSet::new();
     let mut facts = HashMap::new();
     let mut html = Vec::new();
+    let mut landmark_html = BTreeMap::new();
     let mut popup = false;
     let mut ax_truncated = false;
     let mut refs_truncated = false;
@@ -2985,9 +2990,16 @@ async fn capture_attempt(
             record_frames.extend(owners);
         }
         if args["mode"] == "dom_full" {
-            let root = nodes
-                .first()
-                .and_then(|node| node["backendDOMNodeId"].as_u64());
+            if expected_zoom.is_some_and(|reference| !reference.frame.same_document(frame)) {
+                continue;
+            }
+            let root = expected_zoom
+                .map(|reference| reference.identity.backend_node_id)
+                .or_else(|| {
+                    nodes
+                        .first()
+                        .and_then(|node| node["backendDOMNodeId"].as_u64())
+                });
             let Some(root) = root else {
                 if frame.parent_id.is_some() {
                     failed_frames.insert(frame.frame_id.clone());
@@ -2995,13 +3007,57 @@ async fn capture_attempt(
                 }
                 return Err(refusal("snapshot_not_ready"));
             };
-            let outer = context
-                .cdp_frame(
-                    tab,
-                    Some(document.interaction),
-                    frame,
-                    vec![command("DOM.getOuterHTML", json!({"backendNodeId":root}))],
+            // Read only outermost landmarks in the requested subtree. Nested
+            // landmarks are already held by their parent's markup, and a cap
+            // bounds the extra CDP reads on pages with many landmarks.
+            let frame_records: Vec<_> = records
+                .iter()
+                .zip(&record_frames)
+                .filter(|(_, owner)| *owner == &frame.frame_id)
+                .map(|(record, _)| record)
+                .collect();
+            let start = zoom_target
+                .as_ref()
+                .and_then(|target| {
+                    frame_records
+                        .iter()
+                        .position(|record| record.reference.as_ref() == Some(target))
+                })
+                .unwrap_or(0);
+            let mut inside = None;
+            let mut landmarks = Vec::new();
+            for record in frame_records.iter().skip(start + 1) {
+                if record.depth <= frame_records[start].depth {
+                    break;
+                }
+                if inside.is_some_and(|depth| record.depth > depth) {
+                    continue;
+                }
+                inside = None;
+                if !dom_layout::is_landmark(&record.role) {
+                    continue;
+                }
+                if let Some(reference) = record
+                    .reference
+                    .as_ref()
+                    .filter(|reference| snapshot.refs.contains_key(*reference))
+                {
+                    landmarks.push(reference.clone());
+                    inside = Some(record.depth);
+                    if landmarks.len() == 16 {
+                        break;
+                    }
+                }
+            }
+            let mut commands = vec![command("DOM.getOuterHTML", json!({"backendNodeId":root}))];
+            commands.extend(landmarks.iter().map(|reference| {
+                command(
+                    "DOM.getOuterHTML",
+                    json!({"backendNodeId":snapshot.refs[reference].identity.backend_node_id}),
                 )
+            }));
+            let outer = context
+                .cdp_frame(tab, Some(document.interaction), frame, commands)
                 .await;
             let outer = match outer {
                 Ok(outer) => outer,
@@ -3021,6 +3077,15 @@ async fn capture_attempt(
                     .ok_or_else(|| protocol_field_error("DOM.getOuterHTML", "outerHTML"))?
                     .to_owned(),
             ));
+            for (reference, result) in landmarks.into_iter().zip(outer.results.iter().skip(1)) {
+                landmark_html.insert(
+                    reference,
+                    result["outerHTML"]
+                        .as_str()
+                        .ok_or_else(|| protocol_field_error("DOM.getOuterHTML", "outerHTML"))?
+                        .to_owned(),
+                );
+            }
         }
     }
     // A parent AX tree can expose an iframe that neither frame discovery nor
@@ -3216,14 +3281,13 @@ async fn capture_attempt(
         filters: &filters,
         max_bytes,
     });
-    snapshot
-        .refs
-        .retain(|reference, _| rendered.printed_refs.contains(reference));
     let (text, text_truncated) = if args["mode"] == "dom_full" {
-        snapshot.refs.clear();
         let mut seen = BTreeSet::new();
         let mut documents = Vec::new();
         for frame in document.frames.iter().chain(&observed.frames) {
+            if expected_zoom.is_some_and(|reference| !reference.frame.same_document(frame)) {
+                continue;
+            }
             if !seen.insert(&frame.frame_id) {
                 continue;
             }
@@ -3238,12 +3302,37 @@ async fn capture_attempt(
             }
         }
         for (record, frame) in records.iter().zip(&record_frames) {
-            if !seen.contains(frame) && record.name.starts_with("[embedded frame not readable:") {
+            if !seen.contains(frame)
+                && record.name.starts_with("[embedded frame not readable:")
+                && expected_zoom.is_none_or(|reference| &reference.frame.frame_id == frame)
+            {
                 documents.push(record.name.as_str());
             }
         }
-        crate::snapshot_store::encode_dom_text(&documents.join("\n"), max_bytes)
+        let landmarks: Vec<_> = records
+            .iter()
+            .filter_map(|record| {
+                let reference = record.reference.as_ref()?;
+                snapshot.refs.get(reference)?;
+                Some(DomLandmark {
+                    role: &record.role,
+                    reference,
+                    markup: landmark_html.get(reference)?,
+                })
+            })
+            .collect();
+        let layout = dom_layout::lay_out(&documents.join("\n"), &landmarks, max_bytes);
+        snapshot
+            .refs
+            .retain(|reference, _| layout.named_refs.contains(reference));
+        (
+            layout.text,
+            layout.omitted_bytes > 0 || layout.omitted_lines > 0,
+        )
     } else {
+        snapshot
+            .refs
+            .retain(|reference, _| rendered.printed_refs.contains(reference));
         // AX and actionable reads share the renderer that withholds protected
         // field values. Its output budget can cut an otherwise complete tree.
         (

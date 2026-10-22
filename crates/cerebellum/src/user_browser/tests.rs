@@ -113,6 +113,8 @@ struct DoubleState {
     untyped_button: bool,
     submit_button: bool,
     ax_override: Option<Value>,
+    dom_override: Option<Value>,
+    outer_html: BTreeMap<(String, u64), String>,
     top_level_only: bool,
     unmapped_child_owner: bool,
     same_origin_child: bool,
@@ -937,12 +939,14 @@ fn execute(
                 }
             }
             "DOM.getFlattenedDocument" => {
-                let mut dom = dom(
-                    state.new_tab_link,
-                    state.password,
-                    state.payment,
-                    state.untyped_button,
-                );
+                let mut dom = state.dom_override.clone().unwrap_or_else(|| {
+                    dom(
+                        state.new_tab_link,
+                        state.password,
+                        state.payment,
+                        state.untyped_button,
+                    )
+                });
                 if state.submit_button {
                     let button = dom["nodes"]
                         .as_array_mut()
@@ -974,7 +978,10 @@ fn execute(
             }
             "DOM.getContentQuads" => json!({"quads":[[0,0,20,0,20,20,0,20]]}),
             "DOM.getOuterHTML" => {
-                json!({"outerHTML":format!("HTML-{}", command["frame_id"].as_str().unwrap())})
+                let frame = command["frame_id"].as_str().unwrap();
+                let backend = command["params"]["backendNodeId"].as_u64().unwrap();
+                json!({"outerHTML":state.outer_html.get(&(frame.into(), backend)).cloned()
+                    .unwrap_or_else(|| format!("HTML-{frame}"))})
             }
             "DOM.getFrameOwner" => {
                 json!({"backendNodeId":match command["params"]["frameId"].as_str() { Some("pair-one") => 7, Some("pair-two") => 8, _ => 6 }})
@@ -2900,6 +2907,7 @@ mod worker;
 
 mod agent_enforcement;
 mod codemode;
+mod dom_full;
 mod observer_wait;
 mod person_check;
 

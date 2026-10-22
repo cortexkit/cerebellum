@@ -59,6 +59,7 @@ test("the exact admitted CDP subset excludes broader driver commands", () => {
   assert.equal(classifyCommand({ method: "Page.navigate", params: { url: "http://localhost/" } }), "navigate");
   assert.equal(classifyCommand({ method: "Emulation.setFocusEmulationEnabled", params: { enabled: true } }), "input");
   assert.equal(classifyCommand({ method: "DOM.scrollIntoViewIfNeeded", params: { backendNodeId: 9 } }), "input");
+  assert.equal(classifyCommand({ method: "DOM.getOuterHTML", params: { backendNodeId: 9 } }), "read");
   for (const method of ["Runtime.resolveNode", "Runtime.evaluate", "Page.enable", "Page.createIsolatedWorld", "DOM.getDocument", "Accessibility.getRootAXNode", "Input.dispatchTouchEvent", "Target.setAutoAttach", "Network.enable"]) {
     assert.throws(() => classifyCommand({ method, params: {} }), { reason: "unsupported_cdp_method" });
   }

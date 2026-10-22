@@ -1,0 +1,83 @@
+[[control]]
+id = "user-dom-full-main-first-with-zoomable-markers"
+guards = "over-limit user-browser markup puts main content first and retains the refs printed in cut chrome markers"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "let layout = dom_layout::lay_out(&documents.join(\"\\n\"), &landmarks, max_bytes);"
+new = "let layout = dom_layout::lay_out(&documents.join(\"\\n\"), &[], max_bytes);"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::over_limit_main_comes_first_and_cut_chrome_refs_are_retained"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn capture_attempt("
+before = "async fn screenshot("
+
+[[control]]
+id = "user-dom-full-zoom-reads-the-named-node"
+guards = "dom_full zoom reads the saved backend node's outerHTML rather than the whole frame"
+file = "crates/cerebellum/src/user_browser.rs"
+old = ".map(|reference| reference.identity.backend_node_id)"
+new = ".and_then(|_| None::<u64>)"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::dom_full_zoom_reads_the_named_outer_html_and_ax_still_refuses_zoom"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "let root = expected_zoom"
+before = "let Some(root) = root else"
+
+[[control]]
+id = "user-dom-full-within-limit-preserves-bytes"
+guards = "markup within max_bytes is unchanged, including UTF-8 and the source-order frame separators"
+file = "crates/cerebellum/src/browser/dom_layout.rs"
+old = "if markup.len() <= max_bytes {"
+new = "if false && markup.len() <= max_bytes {"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::within_limit_dom_full_bytes_are_unchanged_including_frame_separators"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn lay_out("
+before = "fn cut_point("
+
+[[control]]
+id = "user-ax-still-refuses-zoom"
+guards = "accepting zoom for dom_full does not enable it for ax snapshots"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "if object.contains_key(field) {"
+new = "if field != \"zoom\" && object.contains_key(field) {"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::dom_full_zoom_reads_the_named_outer_html_and_ax_still_refuses_zoom"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "if action == \"snapshot\" && object.get(\"mode\").is_some_and(|mode| mode != \"actionable\") {"
+before = "fn matches_schema("

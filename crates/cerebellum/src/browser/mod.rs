@@ -5,7 +5,7 @@
 //! Browser-specific state is kept behind a per-context lane so CDP operations
 //! and final verification cannot interleave across invocations.
 
-mod dom_layout;
+pub(crate) mod dom_layout;
 pub mod extraction;
 pub mod geometry;
 pub mod navigation;
