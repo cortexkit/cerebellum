@@ -2505,7 +2505,7 @@ target = "--lib"
 select = "expected"
 expect_red = [
     "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
-    "computer_capability::preview_wire_tests::an_unadmitted_build_captures_nothing_and_shows_the_icon",
+    "computer_capability::preview_wire_tests::a_build_without_capture_review_shows_the_preview_icon",
 ]
 only = false
 timeout_s = 600
@@ -2680,7 +2680,7 @@ target = "--lib"
 select = "expected"
 expect_red = [
     "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
-    "computer_capability::preview_wire_tests::an_unadmitted_build_captures_nothing_and_shows_the_icon",
+    "computer_capability::preview_wire_tests::a_build_without_capture_review_shows_the_preview_icon",
 ]
 only = false
 timeout_s = 600
