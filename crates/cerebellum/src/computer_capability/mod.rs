@@ -754,6 +754,7 @@ where
             Arc::new(preview::native_preview_capture()),
             admitted,
             preview::platform_frontmost_window(),
+            preview::platform_bundle_path(),
         ));
         self
     }
@@ -819,6 +820,15 @@ where
 
     pub fn cursor(&self) -> cursor::Coordinator {
         self.cursor.clone()
+    }
+
+    /// Serve every call in foreground mode, whatever the config file says.
+    /// For tests of the on-screen badge, which background mode (the default)
+    /// never draws.
+    #[doc(hidden)]
+    pub fn with_foreground_app_use_for_test(mut self) -> Self {
+        self.app_use = app_use::LiveAppUse::foreground_for_test();
+        self
     }
 
     /// Inject a memory-only cursor transport for deterministic desk doubles.

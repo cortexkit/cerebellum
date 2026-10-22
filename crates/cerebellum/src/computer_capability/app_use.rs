@@ -49,6 +49,19 @@ impl ConfigFiles for NativeConfigFiles {
     }
 }
 
+/// A config file that has always said `"app_use": "foreground"`.
+struct ForegroundFile;
+
+impl ConfigFiles for ForegroundFile {
+    fn modified(&self, _path: &Path) -> io::Result<SystemTime> {
+        Ok(SystemTime::UNIX_EPOCH)
+    }
+
+    fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+        Ok(r#"{"computer_use":{"app_use":"foreground"}}"#.to_owned())
+    }
+}
+
 /// Why the mode could not be read: the file exists but did not parse, or
 /// reading it failed for a reason other than its absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +136,15 @@ impl LiveAppUse {
     /// Reading no file: every call is background.
     pub(crate) fn without_file() -> Self {
         Self::new(None, Arc::new(NativeConfigFiles))
+    }
+
+    /// Every call foreground, whatever any config file says: for tests about
+    /// the on-screen badge, which background mode never draws.
+    pub(crate) fn foreground_for_test() -> Self {
+        Self::new(
+            Some(PathBuf::from("/fixed/app_use/foreground.jsonc")),
+            Arc::new(ForegroundFile),
+        )
     }
 
     /// Read the person's config file, `config_path()`, from the next call on.

@@ -830,6 +830,7 @@ pub(crate) struct PreviewPlane {
     capturer: Arc<dyn PreviewCapturer>,
     capture_admitted: bool,
     frontmost: super::cursor::FrontmostWindow,
+    bundle: super::cursor::BundlePath,
     worker: std::sync::OnceLock<Arc<PreviewWorker>>,
 }
 
@@ -838,11 +839,13 @@ impl PreviewPlane {
         capturer: Arc<dyn PreviewCapturer>,
         capture_admitted: bool,
         frontmost: super::cursor::FrontmostWindow,
+        bundle: super::cursor::BundlePath,
     ) -> Self {
         Self {
             capturer,
             capture_admitted,
             frontmost,
+            bundle,
             worker: std::sync::OnceLock::new(),
         }
     }
@@ -854,6 +857,7 @@ impl PreviewPlane {
             Arc::new(NoPreviewCapture),
             false,
             platform_frontmost_window(),
+            platform_bundle_path(),
         )
     }
 
@@ -880,6 +884,23 @@ impl PreviewPlane {
 
     pub(crate) fn frontmost(&self) -> super::cursor::FrontmostWindow {
         self.frontmost.clone()
+    }
+
+    pub(crate) fn bundle(&self) -> super::cursor::BundlePath {
+        self.bundle.clone()
+    }
+}
+
+/// The application bundle a process runs from, as the platform reads it
+/// (the executable's path cut back to its `.app`); nothing elsewhere.
+pub(crate) fn platform_bundle_path() -> super::cursor::BundlePath {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(|grant: &ProcessGrant| cerebellum_macos::application_bundle_path(grant.pid))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(|_: &ProcessGrant| None)
     }
 }
 

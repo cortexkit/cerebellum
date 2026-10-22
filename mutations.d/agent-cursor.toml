@@ -2294,6 +2294,7 @@ select = "expected"
 expect_red = [
     "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
     "computer_capability::preview_wire_tests::an_action_in_a_covered_apps_second_window_retargets_the_preview_there",
+    "computer_capability::preview_wire_tests::keys_and_type_preview_the_focused_elements_window_or_the_focused_window",
 ]
 only = false
 timeout_s = 600
@@ -2389,6 +2390,8 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
+    "computer_capability::preview_wire_tests::a_cancel_frame_hides_the_preview_its_call_showed",
+    "computer_capability::preview_wire_tests::a_goodbye_frame_hides_the_previews_its_route_showed",
     "computer_capability::preview_wire_tests::previews_stack_for_three_agents_and_a_fourth_gets_not_shown_capacity",
     "computer_capability::preview_wire_tests::the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreground",
 ]
@@ -2467,6 +2470,83 @@ target = "--lib"
 select = "expected"
 expect_red = [
     "computer_capability::preview_wire_tests::one_refresh_moves_each_preview_gauge_by_one_and_a_hidden_preview_neither",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-no-window-draws-no-badge"
+guards = "in background mode a window that cannot be read means no badge for that action: no preview, no on-screen picture and no wait"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "            let (read_source, read_grant) = (source.clone(), grant.clone());\n            let (frontmost, bundle) = (preview.frontmost.clone(), preview.bundle.clone());\n            let choice = preview.window;\n            let read = tokio::task::spawn_blocking(move || {\n                background_read(\n                    read_source.as_ref(),\n                    &read_grant,\n                    kind,\n                    aim,\n                    point,\n                    choice,\n                    frontmost.as_ref(),\n                    bundle.as_ref(),\n                )\n            });\n            match tokio::time::timeout(READ_BUDGET, read).await {\n                Ok(Ok(Some(aimed))) => {\n                    cursor\n                        .draw_in_preview(\n                            aimed,\n                            PreviewDraw {\n                                agent,\n                                serial,\n                                kind,\n                                grant,\n                                app: preview.app,\n                                worker: preview.worker,\n                                call: preview.call,\n                            },\n                            avatar_agent,\n                            decision,\n                        )\n                        .await;\n                }\n                // No window could be read, or the read failed or ran out of\n                // time: `decided` is dropped, so nothing is drawn and\n                // nothing is waited for.\n                _ => preview.worker.release_unshown(&agent),\n"
+new = "            // NON-VACUITY BREAK: the on-screen fallback restored.\n            let (screen_aim, screen_source, screen_grant, screen_agent) =\n                (aim.clone(), source.clone(), grant.clone(), agent.clone());\n            let (read_source, read_grant) = (source.clone(), grant.clone());\n            let (frontmost, bundle) = (preview.frontmost.clone(), preview.bundle.clone());\n            let choice = preview.window;\n            let read = tokio::task::spawn_blocking(move || {\n                background_read(\n                    read_source.as_ref(),\n                    &read_grant,\n                    kind,\n                    aim,\n                    point,\n                    choice,\n                    frontmost.as_ref(),\n                    bundle.as_ref(),\n                )\n            });\n            match tokio::time::timeout(READ_BUDGET, read).await {\n                Ok(Ok(Some(aimed))) => {\n                    cursor\n                        .draw_in_preview(\n                            aimed,\n                            PreviewDraw {\n                                agent,\n                                serial,\n                                kind,\n                                grant,\n                                app: preview.app,\n                                worker: preview.worker,\n                                call: preview.call,\n                            },\n                            avatar_agent,\n                            decision,\n                        )\n                        .await;\n                }\n                Ok(Ok(None)) => {\n                    preview.worker.release_unshown(&agent);\n                    let screen = tokio::task::spawn_blocking(move || {\n                        screen_read(screen_source.as_ref(), &screen_grant, kind, screen_aim, point, screen_agent, serial)\n                    })\n                    .await;\n                    if let Ok(Some((event, followed))) = screen {\n                        cursor.draw_on_screen(event, followed, grant, source, avatar_agent, decision).await;\n                    }\n                }\n                _ => preview.worker.release_unshown(&agent),\n"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_background_action_with_no_readable_window_draws_nothing_and_does_not_wait",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-fallback-shows-the-app-icon"
+guards = "a preview showing a fallback (capture refused or unadmitted, a minimized window) carries the application bundle's path so the helper draws its icon"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        icon_path: bundle(grant),"
+new = "        icon_path: None, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
+    "computer_capability::preview_wire_tests::an_unadmitted_build_captures_nothing_and_shows_the_icon",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-keys-and-type-show-the-focused-element-window"
+guards = "keys and type preview the focused element's window, not just the application's focused window"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "                preferred: focus.as_ref().map(|focus| focus.handle.clone()),"
+new = "                preferred: None, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::keys_and_type_preview_the_focused_elements_window_or_the_focused_window",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-bundle-path-is-the-enclosing-app-directory"
+guards = "the preview's icon path is the directory of the nearest enclosing .app, never a file merely named like one"
+file = "crates/cerebellum-macos/src/macos.rs"
+old = "        if component.len() > \".app\".len() && component.ends_with(\".app\") && after < path.len() {"
+new = "        if component.len() > \".app\".len() && component.ends_with(\".app\") { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/macos.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "macos::tests::an_executable_is_cut_back_to_its_nearest_enclosing_app_bundle",
 ]
 only = false
 timeout_s = 600

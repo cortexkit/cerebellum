@@ -187,6 +187,7 @@ impl Badges {
                 window,
                 app: self.app.clone(),
                 frontmost: self.preview.frontmost(),
+                bundle: self.preview.bundle(),
                 call: self.call.clone(),
             },
         )

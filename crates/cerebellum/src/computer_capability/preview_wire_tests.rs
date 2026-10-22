@@ -48,6 +48,9 @@ const BODY: (u64, [f64; 4]) = (2, [400.0, 250.0, 100.0, 50.0]);
 const SAVE: (u64, [f64; 4]) = (3, [600.0, 500.0, 80.0, 20.0]);
 /// The application the person has in front: not the target.
 const PERSONS_APP: u32 = 100;
+/// The bundle the fixture application runs from, whose icon a preview shows
+/// in place of a frame.
+const BUNDLE: &str = "/Applications/Safari.app";
 
 /// A covered application with two windows, focused in the front one.
 fn two_window_desk() -> support::Desk {
@@ -246,6 +249,9 @@ async fn rig(mode: AppUse, admitted: bool, cursor_on: bool) -> Rig {
     let desk = two_window_desk();
     let captures = Arc::new(CountingCapture::default());
     let frontmost: super::cursor::FrontmostWindow = Arc::new(|_: &ProcessGrant| Some(FRONT.1));
+    let bundle: super::cursor::BundlePath = Arc::new(|grant: &ProcessGrant| {
+        (grant.pid == support::grant().pid).then(|| BUNDLE.to_owned())
+    });
     let mut plane = ComputerPlane::with_result_schema_enforcement(
         support::audit(),
         ResultSchemaEnforcement::Withhold,
@@ -253,7 +259,12 @@ async fn rig(mode: AppUse, admitted: bool, cursor_on: bool) -> Rig {
     .with_permission_liveness(support::live_permissions())
     .with_app_state_source(desk.source())
     .with_app_use(app_use_file(mode))
-    .with_preview(PreviewPlane::new(captures.clone(), admitted, frontmost));
+    .with_preview(PreviewPlane::new(
+        captures.clone(),
+        admitted,
+        frontmost,
+        bundle,
+    ));
     let mut receiver = None;
     if cursor_on {
         let (cursor, lines) = Coordinator::channel();
@@ -591,6 +602,7 @@ async fn an_unadmitted_build_captures_nothing_and_shows_the_icon() {
             preview.preview_fallback,
             Some(PreviewFallback::CaptureRefused)
         );
+        assert_eq!(preview.preview_icon_path.as_deref(), Some(BUNDLE));
     }
     assert!(rig.lines.motions(&agent()).is_empty());
     assert_eq!(rig.lines.pictures(&agent()), 0);
@@ -629,6 +641,7 @@ async fn a_minimized_window_shows_the_minimized_fallback() {
     let preview = rig.lines.previews(&agent()).pop().unwrap();
     assert_eq!(preview.preview_window, BEHIND.1);
     assert_eq!(preview.preview_fallback, Some(PreviewFallback::Minimized));
+    assert_eq!(preview.preview_icon_path.as_deref(), Some(BUNDLE));
     assert!(rig.lines.motions(&agent()).is_empty());
     let captured = rig.captures();
     for _ in 0..50 {
@@ -659,10 +672,10 @@ async fn with_the_agent_cursor_off_there_is_no_preview_badge_or_wait() {
 }
 
 /// Every end hides the agent's preview with its badge, and nothing more is
-/// captured for it: the session's turn ending, an end signal such as a
-/// consumer's Cancel or a route closing (each arrives as
-/// `Coordinator::end`), and a switch to foreground mode, whose next action
-/// hides the preview and draws the badge on the screen again.
+/// captured for it: the session's turn ending, `Coordinator::end` itself
+/// (where a Cancel and a closed route arrive; the frame tests below send
+/// those through the wire handler), and a switch to foreground mode, whose
+/// next action hides the preview and draws the badge on the screen again.
 #[tokio::test(start_paused = true)]
 async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreground() {
     let mut rig = rig(AppUse::Background, true, true).await;
@@ -838,4 +851,234 @@ async fn one_refresh_moves_each_preview_gauge_by_one_and_a_hidden_preview_neithe
         "a hidden preview was captured"
     );
     assert_eq!(gauges.frames_written(), 1, "a hidden preview wrote a frame");
+}
+
+/// In background mode a window that cannot be read means no badge at all for
+/// that action: no preview, no badge inside one, no on-screen picture (which
+/// would point at whatever covers the application), and no wait.
+#[tokio::test(start_paused = true)]
+async fn a_background_action_with_no_readable_window_draws_nothing_and_does_not_wait() {
+    let mut rig = rig(AppUse::Background, true, true).await;
+    {
+        let mut state = rig.desk.state();
+        // The badge would be visible on the screen, were it drawn there.
+        state.cursor_visible = true;
+        state.cursor_windows.clear();
+        state.focused_cursor_window = None;
+    }
+    let tree = rig.read().await;
+    let start = tokio::time::Instant::now();
+    let reply = rig
+        .call(
+            "computer.press_element",
+            json!({"element_id": id_of(&tree, "Save")}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply.get("preview"), None, "{reply}");
+    assert_eq!(rig.dispatched(), [start], "the press waited");
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    rig.lines.take();
+    assert!(
+        rig.lines.seen.iter().all(|line| !matches!(
+            line,
+            CursorLine::Picture(_) | CursorLine::Preview(_) | CursorLine::PreviewMotion(_)
+        )),
+        "something was drawn: {:?}",
+        rig.lines.seen
+    );
+    assert!(!rig.shown(&agent()));
+}
+
+/// `keys` and `type` show the focused element's window: the field focused in
+/// the covered window brings the preview there. With no element focused,
+/// the application's focused window.
+#[tokio::test(start_paused = true)]
+async fn keys_and_type_preview_the_focused_elements_window_or_the_focused_window() {
+    for (action, arguments) in [
+        (
+            "computer.type",
+            json!({"target": support::TARGET_BUNDLE_ID, "text": "hi"}),
+        ),
+        (
+            "computer.keys",
+            json!({"keys": ["s"], "target": support::TARGET_BUNDLE_ID}),
+        ),
+    ] {
+        let mut rig = rig(AppUse::Background, true, true).await;
+        rig.desk.state().focus = support::DeskFocus::Element(BODY.0);
+        rig.call(action, arguments.clone()).await;
+        rig.lines
+            .until("the preview", |seen| {
+                seen.iter()
+                    .any(|line| matches!(line, CursorLine::Preview(_)))
+            })
+            .await;
+        let preview = rig.lines.previews(&agent()).pop().unwrap();
+        assert_eq!(
+            preview.preview_window, BEHIND.1,
+            "{action}: focused element"
+        );
+        let motion = rig.lines.motions(&agent()).pop().expect("a motion");
+        assert_eq!(motion.pmotion_window, BEHIND.1, "{action}");
+
+        // Nothing focused: the focused window, in front.
+        let mut rig = self::rig(AppUse::Background, true, true).await;
+        rig.desk.state().focus = support::DeskFocus::Nothing;
+        rig.call(action, arguments).await;
+        rig.lines
+            .until("the preview", |seen| {
+                seen.iter()
+                    .any(|line| matches!(line, CursorLine::Preview(_)))
+            })
+            .await;
+        let preview = rig.lines.previews(&agent()).pop().unwrap();
+        assert_eq!(preview.preview_window, FRONT.1, "{action}: focused window");
+        assert!(
+            rig.lines.motions(&agent()).is_empty(),
+            "{action}: no element, no motion"
+        );
+    }
+}
+
+/// The wire handler's planes with this rig's cursor, and a route request
+/// handler that serves one background read on the rig's plane and then stays
+/// open until `release` fires, so a Cancel finds it running. The receiver
+/// yields once the read has shown its preview.
+fn planes_serving_a_read(
+    rig: Rig,
+    release: Arc<tokio::sync::Notify>,
+) -> (crate::Planes, tokio::sync::mpsc::Receiver<()>, Arc<Rig>) {
+    let mut planes = crate::Planes::with_browser_config_journaling(
+        Arc::new(cerebellum_core::health::HealthState::default()),
+        None,
+        crate::JournalPersistence::Isolated,
+    );
+    planes.cursor_for_test = Some(rig.plane.cursor());
+    let rig = Arc::new(rig);
+    let (read, read_rx) = tokio::sync::mpsc::channel(4);
+    let serving = rig.clone();
+    planes.route_test_handler = Some(Arc::new(move || {
+        let (rig, release, read) = (serving.clone(), release.clone(), read.clone());
+        Box::pin(async move {
+            let reply = rig.call("computer.read_state", read_arguments()).await;
+            assert_eq!(reply["outcome"], "completed", "{reply}");
+            let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+            while !rig.shown(&agent()) {
+                assert!(std::time::Instant::now() < give_up, "no preview shown");
+                tokio::task::yield_now().await;
+            }
+            let _ = read.send(()).await;
+            release.notified().await;
+        })
+    }));
+    (planes, read_rx, rig)
+}
+
+fn wire_frame(
+    ty: subc_protocol::FrameType,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> subc_protocol::Frame {
+    subc_protocol::Frame::build(
+        ty,
+        crate::wire::control_flags(),
+        channel,
+        epoch,
+        corr,
+        b"{}".to_vec(),
+    )
+    .unwrap()
+}
+
+/// A consumer's Cancel of the computer call, sent through the wire handler,
+/// hides the preview that call showed: nothing more is captured for it.
+#[tokio::test]
+async fn a_cancel_frame_hides_the_preview_its_call_showed() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (planes, mut read, rig) =
+        planes_serving_a_read(rig(AppUse::Background, true, true).await, release.clone());
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Request, 7, 1, 42),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    read.recv().await.unwrap();
+    rig.until_captured(1);
+    // A correlation nobody is running cancels nothing.
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Cancel, 7, 1, 99),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(rig.shown(&agent()));
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Cancel, 7, 1, 42),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(!rig.shown(&agent()), "the Cancel left the preview showing");
+    let captured = rig.captures();
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rig.captures(), captured, "captured after the Cancel");
+    release.notify_waiters();
+}
+
+/// A route's GOODBYE, sent through the wire handler, hides the previews its
+/// calls showed; another epoch of the channel is another route and hides
+/// nothing.
+#[tokio::test]
+async fn a_goodbye_frame_hides_the_previews_its_route_showed() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (planes, mut read, rig) =
+        planes_serving_a_read(rig(AppUse::Background, true, true).await, release.clone());
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Request, 7, 1, 42),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    read.recv().await.unwrap();
+    rig.until_captured(1);
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Goodbye, 7, 2, 0),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(
+        rig.shown(&agent()),
+        "another route's GOODBYE hid the preview"
+    );
+    crate::handle_frame(
+        wire_frame(subc_protocol::FrameType::Goodbye, 7, 1, 0),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    assert!(!rig.shown(&agent()), "the GOODBYE left the preview showing");
+    let captured = rig.captures();
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rig.captures(), captured, "captured after the GOODBYE");
+    release.notify_waiters();
 }

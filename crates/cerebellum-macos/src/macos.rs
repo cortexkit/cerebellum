@@ -198,6 +198,47 @@ pub fn responsible_process() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The application bundle a running process belongs to: its executable's
+/// path (`proc_pidpath`), cut back to the nearest enclosing `.app`
+/// directory. For display only (the agent cursor's preview loads the
+/// application's icon from it); it proves nothing about the process.
+/// `None` when the path cannot be read or is not inside an `.app`.
+pub fn application_bundle_path(pid: u32) -> Option<String> {
+    let pid = c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let mut buffer = vec![0 as c_char; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: the buffer is owned here, and its true capacity is passed, so the
+    // call cannot write past it. The value written is a NUL-terminated path.
+    let written =
+        unsafe { proc_pidpath(pid, buffer.as_mut_ptr(), PROC_PIDPATHINFO_MAXSIZE as c_uint) };
+    if written <= 0 {
+        return None;
+    }
+    // SAFETY: the call above reported success, so the buffer holds a
+    // NUL-terminated string within its capacity, and it outlives this read.
+    let executable = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str().ok()?;
+    enclosing_app_bundle(executable).map(str::to_owned)
+}
+
+/// The nearest directory of `path` whose name ends in `.app`, as an
+/// absolute path: `/Applications/Mail.app` for
+/// `/Applications/Mail.app/Contents/MacOS/Mail`, and a helper application
+/// nested inside another's bundle for its own executable.
+fn enclosing_app_bundle(path: &str) -> Option<&str> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut end = None;
+    let mut offset = 0;
+    for component in path.split('/') {
+        let after = offset + component.len();
+        if component.len() > ".app".len() && component.ends_with(".app") && after < path.len() {
+            end = Some(after);
+        }
+        offset = after + 1;
+    }
+    end.map(|end| &path[..end])
+}
+
 /// Whether screen capture is usable by this process right now.
 ///
 /// This is the non-prompting query. The prompting variant exists and is
@@ -1239,6 +1280,28 @@ fn repack_rows(source: &[u8], width: usize, height: usize, bytes_per_row: usize)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_executable_is_cut_back_to_its_nearest_enclosing_app_bundle() {
+        use super::enclosing_app_bundle;
+        assert_eq!(
+            enclosing_app_bundle("/Applications/Mail.app/Contents/MacOS/Mail"),
+            Some("/Applications/Mail.app")
+        );
+        assert_eq!(
+            enclosing_app_bundle(
+                "/Applications/Big.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper"
+            ),
+            Some("/Applications/Big.app/Contents/Frameworks/Helper.app")
+        );
+        assert_eq!(enclosing_app_bundle("/usr/bin/true"), None);
+        assert_eq!(
+            enclosing_app_bundle("relative/Mail.app/Contents/MacOS/Mail"),
+            None
+        );
+        // A file named like a bundle is not a directory holding the executable.
+        assert_eq!(enclosing_app_bundle("/tmp/thing.app"), None);
+        assert_eq!(enclosing_app_bundle("/tmp/.app/x"), None);
+    }
 
     /// The kernel read of the hardware UUID agrees with `ioreg`'s
     /// IOPlatformUUID, the value an operator would look up by hand.

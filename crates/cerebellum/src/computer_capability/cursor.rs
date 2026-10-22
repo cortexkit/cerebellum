@@ -337,6 +337,7 @@ struct Follow {
 
 /// Preferred element for a read picture and the focused element to use when
 /// the preferred element has no readable frame.
+#[derive(Clone)]
 pub(crate) struct ReadAim {
     pub(crate) preferred: Option<ElementHandle>,
     pub(crate) focused: Option<ElementHandle>,
@@ -361,6 +362,9 @@ pub(crate) enum WindowChoice {
 
 /// Reads the window server's frontmost window of a process, by id.
 pub(crate) type FrontmostWindow = Arc<dyn Fn(&ProcessGrant) -> Option<u32> + Send + Sync>;
+/// Finds the application bundle a process runs from, for the icon a preview
+/// shows in place of a frame. Display only: never an authority.
+pub(crate) type BundlePath = Arc<dyn Fn(&ProcessGrant) -> Option<String> + Send + Sync>;
 
 /// What a background-mode badge needs beyond an on-screen one.
 pub(crate) struct PreviewAim {
@@ -369,17 +373,10 @@ pub(crate) struct PreviewAim {
     /// The application's name, shown on the preview.
     pub(crate) app: String,
     pub(crate) frontmost: FrontmostWindow,
+    pub(crate) bundle: BundlePath,
     /// The call the badge belongs to, whose reply says when the preview did
     /// not track the action.
     pub(crate) call: Option<Arc<PreviewCall>>,
-}
-
-/// What the background read found.
-enum BackgroundRead {
-    /// A window to show in the preview, and where the badge goes in it.
-    Preview(PreviewAimed),
-    /// No window could be read; the on-screen picture, if any.
-    Screen(Option<(CursorEvent, Option<ElementHandle>)>),
 }
 
 /// The window a preview shows and where its badge goes, read in one step.
@@ -389,6 +386,9 @@ struct PreviewAimed {
     /// in the window from 0 to 1; `None` for no motion.
     to: Option<([f64; 2], [f64; 2])>,
     label: Option<String>,
+    /// The application bundle's path, for the icon shown in place of a
+    /// frame; `None` when it cannot be found.
+    icon_path: Option<String>,
 }
 
 /// Whose preview `draw_in_preview` draws, and for which action.
@@ -1171,9 +1171,9 @@ impl Coordinator {
     /// icon, an element with no geometry in that window, or a read that
     /// finds nothing makes no motion and no wait.
     ///
-    /// When no window can be read at all and the agent has no preview
-    /// showing, nothing could be shown in a preview, so the badge is drawn
-    /// on the screen exactly as `schedule_with_fallback` draws it.
+    /// Nothing is ever drawn on the screen from here: a window that cannot
+    /// be read means no badge and no wait for this action, because an
+    /// on-screen badge would point at whatever covers the application.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule_in_preview(
         &self,
@@ -1223,9 +1223,8 @@ impl Coordinator {
         let cursor = self.clone();
         tokio::spawn(async move {
             let avatar_agent = identity.avatar_agent;
-            let (read_source, read_grant, read_agent) =
-                (source.clone(), grant.clone(), agent.clone());
-            let frontmost = preview.frontmost.clone();
+            let (read_source, read_grant) = (source.clone(), grant.clone());
+            let (frontmost, bundle) = (preview.frontmost.clone(), preview.bundle.clone());
             let choice = preview.window;
             let read = tokio::task::spawn_blocking(move || {
                 background_read(
@@ -1236,12 +1235,11 @@ impl Coordinator {
                     point,
                     choice,
                     frontmost.as_ref(),
-                    read_agent,
-                    serial,
+                    bundle.as_ref(),
                 )
             });
             match tokio::time::timeout(READ_BUDGET, read).await {
-                Ok(Ok(BackgroundRead::Preview(aimed))) => {
+                Ok(Ok(Some(aimed))) => {
                     cursor
                         .draw_in_preview(
                             aimed,
@@ -1259,23 +1257,9 @@ impl Coordinator {
                         )
                         .await;
                 }
-                Ok(Ok(BackgroundRead::Screen(read))) => {
-                    preview.worker.release_unshown(&agent);
-                    if let Some((event, followed_element)) = read {
-                        cursor
-                            .draw_on_screen(
-                                event,
-                                followed_element,
-                                grant,
-                                source,
-                                avatar_agent,
-                                decision,
-                            )
-                            .await;
-                    }
-                }
-                // A read that fails or runs out of time drops `decided`:
-                // nothing is drawn and nothing is waited for.
+                // No window could be read, or the read failed or ran out of
+                // time: `decided` is dropped, so nothing is drawn and
+                // nothing is waited for.
                 _ => preview.worker.release_unshown(&agent),
             }
         });
@@ -1320,7 +1304,7 @@ impl Coordinator {
                 target: grant,
                 window: aimed.window,
                 app,
-                icon_path: None,
+                icon_path: aimed.icon_path,
                 label: aimed.label,
                 backing_scale: PREVIEW_BACKING_SCALE,
             });
@@ -1924,7 +1908,7 @@ fn screen_read(
 /// and for a read its element (or the focused one) when it lies in the
 /// window. An exact point (a press on an image point) is where the tip goes.
 /// A press or a write with no geometry in the window makes no motion. With
-/// no window at all, the on-screen picture is read instead.
+/// no window at all, `None`: nothing is drawn.
 #[allow(clippy::too_many_arguments)]
 fn background_read(
     source: &dyn AppStateSource,
@@ -1934,17 +1918,14 @@ fn background_read(
     point: Option<[f64; 2]>,
     choice: WindowChoice,
     frontmost: &(dyn Fn(&ProcessGrant) -> Option<u32> + Send + Sync),
-    agent: String,
-    serial: u64,
-) -> BackgroundRead {
+    bundle: &(dyn Fn(&ProcessGrant) -> Option<String> + Send + Sync),
+) -> Option<PreviewAimed> {
     let which = match (choice, aim.preferred.as_ref()) {
         (WindowChoice::Element, Some(element)) => PreviewWindowSource::Element(element),
         (WindowChoice::Element, None) => PreviewWindowSource::Focused(None),
         (WindowChoice::Frontmost, _) => PreviewWindowSource::Frontmost(frontmost(grant)),
     };
-    let Some(window) = preview_window(source, grant, which) else {
-        return BackgroundRead::Screen(screen_read(source, grant, kind, aim, point, agent, serial));
-    };
+    let window = preview_window(source, grant, which)?;
     let mut frame = aim
         .preferred
         .as_ref()
@@ -1969,7 +1950,12 @@ fn background_read(
         Some(tip) => Some((tip, target.unwrap_or(tip))),
         None => target.map(|target| (target, target)),
     };
-    BackgroundRead::Preview(PreviewAimed { window, to, label })
+    Some(PreviewAimed {
+        window,
+        to,
+        label,
+        icon_path: bundle(grant),
+    })
 }
 
 /// The platform's Reduce Motion reader; the full animation where there is
