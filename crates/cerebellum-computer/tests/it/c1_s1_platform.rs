@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v27.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v28.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -773,7 +773,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v25_from_v24(&generated, historical_revision(25).as_str().unwrap());
     let generated =
         vocabulary_mint::v26_from_v25(&generated, historical_revision(26).as_str().unwrap());
-    let generated = vocabulary_mint::v27_from_v26(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v27_from_v26(&generated, historical_revision(27).as_str().unwrap());
+    let generated = vocabulary_mint::v28_from_v27(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1588,12 +1590,12 @@ fn v26_only_adds_the_imaged_window_refusal_to_the_recreated_v25() {
     );
 }
 
-/// The shipped artifact with v27's additions taken back out: the
+/// v27 with its additions taken back out: the
 /// `element_disabled` outcome of each press row and the sentence that
 /// describes it. Each removal asserts what it removes was there, so a v27
 /// that stopped adding either is caught here as well as by the digest.
 fn recreated_v26() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v27();
     vocabulary["revision"] = historical_revision(26);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
@@ -1623,5 +1625,135 @@ fn v27_only_adds_the_disabled_element_refusal_to_the_recreated_v26() {
     assert_eq!(
         hex_digest(&canonical_json_bytes(&recreated_v26()).unwrap()),
         "a683d08ade5a013b162db22dfa2d7f2244e6a6f95fce4f3fb5381ac4e20490b6"
+    );
+}
+
+/// The shipped artifact with v28's additions taken back out: every row's
+/// `config_invalid` outcome; each fronting row's `fronting`, `preview` and
+/// `fronting_bound_exceeded` fields and its `not_fronted` outcome, plus
+/// `restore_failed` where v27 lacked it; `open_app`'s
+/// `state_changed_by_person`; `press_element`'s `bundle_identity`; and the
+/// sentences describing the new outcomes. Each removal asserts what it
+/// removes was there, so a v28 that stopped adding any of them is caught here
+/// as well as by the digest.
+fn recreated_v27() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(27);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        let fronting_row = vocabulary_mint::FRONTING_ROW_IDS.contains(&capability.as_str());
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        // The outcomes v28 appended to this row, last first.
+        let mut appended = Vec::new();
+        if capability == "computer.open_app" {
+            appended.push("state_changed_by_person");
+        }
+        // The keystroke rows already answered restore_failed before v28.
+        if fronting_row && !["computer.type", "computer.keys"].contains(&capability.as_str()) {
+            appended.push("restore_failed");
+        }
+        if fronting_row {
+            appended.push("not_fronted");
+        }
+        appended.push("config_invalid");
+        let outcome = &mut properties["outcome"];
+        for expected in appended {
+            assert_eq!(
+                outcome["enum"].as_array_mut().unwrap().pop().unwrap(),
+                expected,
+                "{capability}"
+            );
+        }
+        let mut addition = vocabulary_mint::CONFIG_INVALID_DESCRIPTION.to_string();
+        if fronting_row {
+            addition = format!(
+                "{addition} {}",
+                vocabulary_mint::FRONTING_OUTCOMES_DESCRIPTION
+            );
+        }
+        let description = outcome["description"].as_str().unwrap();
+        let previous = description
+            .strip_suffix(addition.as_str())
+            .and_then(|rest| rest.strip_suffix(' '))
+            .unwrap_or_else(|| panic!("{capability} does not describe the v28 outcomes"))
+            .to_string();
+        outcome["description"] = json!(previous);
+        if fronting_row {
+            for (field, schema) in [
+                ("fronting", vocabulary_mint::v28_fronting_field()),
+                ("preview", vocabulary_mint::v28_preview_field()),
+                (
+                    "fronting_bound_exceeded",
+                    vocabulary_mint::v28_fronting_bound_exceeded_field(),
+                ),
+            ] {
+                assert_eq!(
+                    properties.remove(field),
+                    Some(schema),
+                    "{capability}.{field}"
+                );
+            }
+        } else {
+            for field in ["fronting", "preview", "fronting_bound_exceeded"] {
+                assert!(!properties.contains_key(field), "{capability}.{field}");
+            }
+        }
+        if capability == "computer.press_element" {
+            assert_eq!(
+                properties.remove("bundle_identity"),
+                Some(vocabulary_mint::v28_press_element_bundle_identity_field())
+            );
+        }
+    }
+    vocabulary
+}
+
+/// The recreated v27 is byte for byte the v27 that shipped: its digest is
+/// the one v27's mirrors and source lock carried.
+#[test]
+fn v28_only_adds_app_use_and_fronting_replies_to_the_recreated_v27() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v27()).unwrap()),
+        "54aff871c6fcc4c18b5dfd3ebe272ab86c3724f5264a763a29ef63fe454cb2df"
+    );
+}
+
+/// v28 changes nothing outside the rows' `result_schema`s. The advertised
+/// `computer_use` definition is built from each row's `request_schema`, so
+/// those must keep their exact bytes, and every other row field is what
+/// `validate_row` checks, so it must not move either.
+#[test]
+fn v28_changes_only_result_schemas() {
+    let previous = recreated_v27();
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let previous_rows = previous["rows"].as_array().unwrap();
+    let current_rows = current["rows"].as_array().unwrap();
+    assert_eq!(previous_rows.len(), current_rows.len());
+    for (before, after) in previous_rows.iter().zip(current_rows) {
+        let id = after["capability_id"].as_str().unwrap();
+        assert_eq!(
+            canonical_json_bytes(&before["request_schema"]).unwrap(),
+            canonical_json_bytes(&after["request_schema"]).unwrap(),
+            "{id} request_schema"
+        );
+        let mut before = before.clone();
+        let mut after = after.clone();
+        before.as_object_mut().unwrap().remove("result_schema");
+        after.as_object_mut().unwrap().remove("result_schema");
+        assert_eq!(before, after, "{id} changed outside its result_schema");
+    }
+    let image_fronting = |vocabulary: &Value| {
+        row(vocabulary, "computer.read_state")["result_schema"]["properties"]["image_fronting"]
+            .clone()
+    };
+    assert_eq!(image_fronting(&previous), image_fronting(&current));
+    let mut previous = previous;
+    let mut current = current;
+    previous.as_object_mut().unwrap().remove("rows");
+    current.as_object_mut().unwrap().remove("rows");
+    previous["revision"] = current["revision"].clone();
+    assert_eq!(
+        previous, current,
+        "a document field other than revision changed"
     );
 }
