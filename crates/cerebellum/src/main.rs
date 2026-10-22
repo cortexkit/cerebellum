@@ -134,6 +134,11 @@ fn agent_cursor() {
                         },
                     ))
                 }
+                // This helper does not draw the background-mode preview yet,
+                // so its lines are read and dropped.
+                CursorLine::Preview(_) | CursorLine::Frame(_) | CursorLine::PreviewMotion(_) => {
+                    continue
+                }
             };
             let _ = sender.try_send(message);
         }

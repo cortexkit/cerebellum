@@ -10,8 +10,9 @@ use std::time::Instant;
 
 use cerebellum_computer::app_state::source::{AppStateSource, CursorWindowWatch, ElementHandle};
 use cerebellum_computer::cursor::{
-    follow_offset, label, CursorEvent, CursorFollow, CursorHide, CursorKind, CursorLine,
-    PictureMotion, WindowChange, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
+    follow_offset, label, CursorEvent, CursorFollow, CursorFrame, CursorHide, CursorKind,
+    CursorLine, CursorPreview, CursorPreviewMotion, PictureMotion, WindowChange,
+    IDLE_FADE_AFTER_MS, IDLE_FADE_MS, LONGEST_ARRIVAL_MS,
 };
 use cerebellum_computer::platform::ProcessGrant;
 use tokio::sync::{mpsc, oneshot};
@@ -61,6 +62,17 @@ const RECORD_CAP: usize = 256;
 /// At most this many windows are watched at once, one per badge on screen:
 /// the helper draws no more badges than this either.
 const FOLLOW_CAP: usize = 64;
+
+/// At most this many agents' frames wait for the pipe at once, one each.
+/// The helper shows at most three previews; past this bound a new agent's
+/// frame is dropped, which only leaves its preview on the previous frame.
+const PENDING_FRAME_CAP: usize = 8;
+
+/// Told when a line's write to the helper completed, or `None` when it was
+/// not written.
+type WriteNote = oneshot::Sender<Option<tokio::time::Instant>>;
+/// The lines actions wait for, by agent and serial.
+type AwaitedWrites = HashMap<(String, u64), WriteNote>;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod avatar;
@@ -130,11 +142,23 @@ struct Drawn {
     tips: HashMap<String, Tip>,
 }
 
+/// Where a badge is drawn: on the screen, or inside its agent's preview of
+/// one window. A badge that moves to another space appears there anew, with
+/// its entry, rather than gliding across from somewhere it cannot be seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Space {
+    Screen,
+    Preview { window: u32 },
+}
+
 /// One agent's badge as the module last sent it to the helper.
 struct Tip {
     /// The picture event it was sent for.
     serial: u64,
-    /// Where its tip was sent.
+    /// The space it was drawn in; `to` and `offset` are in that space.
+    space: Space,
+    /// Where its tip was sent: global screen points on the screen, or the
+    /// window-relative 0..1 point inside a preview.
     to: [f64; 2],
     /// How far the window under it has moved since, as last reported to the
     /// helper, which moves the badge by as much.
@@ -149,38 +173,58 @@ impl Tip {
     }
 }
 
+/// Where a badge is about to be sent, for choosing its motion.
+struct Aim<'a> {
+    agent: &'a str,
+    serial: u64,
+    space: Space,
+    to: [f64; 2],
+    /// `to` is only a place to appear: a badge already showing in the same
+    /// space stays where it is.
+    resting: bool,
+    /// Points per unit of `to` on each axis: 1 on the screen, the
+    /// thumbnail's size in points inside a preview, so a glide's length (and
+    /// so its duration) is measured in the points the person sees it travel.
+    scale: [f64; 2],
+}
+
 impl Drawn {
     /// Choose the motion for a picture about to be sent to the helper, and
     /// the record of where its badge will then be. Nothing is recorded yet:
     /// `keep` does that once the picture is really on its way.
     ///
-    /// A badge the module has not seen drawn (never drawn, ended, or faded
-    /// out after the idle timeout) appears with its entry animation; one
-    /// already on screen glides from where it was last sent. A read with
-    /// nothing to aim at leaves a shown badge where it is. The helper follows
-    /// the chosen motion from wherever its badge really is, so even where
-    /// this record is out of date the badge arrives when the motion says.
+    /// A badge the module has not seen drawn in this space (never drawn,
+    /// ended, faded out after the idle timeout, or last drawn in another
+    /// space) appears with its entry animation; one already showing there
+    /// glides from where it was last sent. A read with nothing to aim at
+    /// leaves a shown badge where it is. The helper follows the chosen motion
+    /// from wherever its badge really is, so even where this record is out of
+    /// date the badge arrives when the motion says.
     fn aim(
         &self,
-        event: &CursorEvent,
+        aim: &Aim<'_>,
         now: tokio::time::Instant,
         reduce_motion: bool,
     ) -> (PictureMotion, Tip) {
         let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
         let shown = self
             .tips
-            .get(&event.agent)
+            .get(aim.agent)
+            .filter(|tip| tip.space == aim.space)
             .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
             .map(Tip::place);
-        let to = match (event.resting, shown) {
+        let to = match (aim.resting, shown) {
             (true, Some(resting)) => resting,
-            _ => event.to,
+            _ => aim.to,
         };
-        let distance = shown.map_or(0.0, |from| (to[0] - from[0]).hypot(to[1] - from[1]));
+        let distance = shown.map_or(0.0, |from| {
+            ((to[0] - from[0]) * aim.scale[0]).hypot((to[1] - from[1]) * aim.scale[1])
+        });
         (
             PictureMotion::chosen(distance, shown.is_none(), reduce_motion),
             Tip {
-                serial: event.serial,
+                serial: aim.serial,
+                space: aim.space,
                 to,
                 offset: [0.0, 0.0],
                 sent: now,
@@ -223,6 +267,20 @@ struct State {
     /// sent to it is drawn and no action waits for a badge.
     helper_down: std::sync::atomic::AtomicBool,
     reduce_motion: ReduceMotionCache,
+    /// Preview frames waiting for the pipe: at most one per agent, the
+    /// latest. The writer takes one only when no other line is waiting.
+    frames: std::sync::Mutex<VecDeque<CursorFrame>>,
+    /// For each picture or preview motion an action waits for, by agent and
+    /// serial: told when the writer has written it to the helper, or that it
+    /// was not written.
+    awaiting: std::sync::Mutex<AwaitedWrites>,
+    /// A writer takes lines off the channel and says when each was written.
+    /// Without one (a test reading the channel itself), a line counts as
+    /// written the moment it is queued.
+    writes_confirmed: std::sync::atomic::AtomicBool,
+    /// How many awaited lines the writer has settled, written or not.
+    #[cfg(test)]
+    settled: std::sync::atomic::AtomicUsize,
     /// Stands in for the system's Reduce Motion setting in tests.
     #[cfg(test)]
     reduce_motion_for_test: std::sync::Mutex<Option<bool>>,
@@ -318,6 +376,9 @@ impl Coordinator {
                 // Read now, in the background, so the first picture already
                 // has the person's setting.
                 self.refresh_reduce_motion();
+                self.0
+                    .writes_confirmed
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let state = self.0.clone();
                 let _ = std::thread::Builder::new()
                     .name("agent-cursor-pipe".into())
@@ -430,6 +491,9 @@ impl Coordinator {
         // either goes out before this hide or sees the end and is dropped.
         self.send_line(CursorLine::Hide(CursorHide::new(agent)));
         drop(drawn);
+        // A frame still waiting would be drawn into nothing: the helper drops
+        // a frame after a hide, so it is not sent at all.
+        self.frames().retain(|frame| frame.frame_agent != agent);
         // The badge is gone, so its window needs no watching.
         self.follows().remove(agent);
     }
@@ -708,9 +772,9 @@ impl Coordinator {
     }
 
     /// Send a scheduled picture unless its agent was ended after it was
-    /// scheduled. Answers when the badge will be on its target, or `None`
-    /// when nothing will be drawn.
-    fn send_unless_ended(&self, mut event: CursorEvent) -> Option<tokio::time::Instant> {
+    /// scheduled. Answers how an action waits for its badge, or `None` when
+    /// nothing will be drawn or there is nothing to wait for.
+    fn send_unless_ended(&self, mut event: CursorEvent) -> Option<Sent> {
         let mut drawn = self.drawn();
         if drawn
             .ended_at
@@ -720,23 +784,256 @@ impl Coordinator {
             return None;
         }
         let now = tokio::time::Instant::now();
-        let (motion, tip) = drawn.aim(&event, now, self.reduce_motion());
+        let (motion, tip) = drawn.aim(
+            &Aim {
+                agent: &event.agent,
+                serial: event.serial,
+                space: Space::Screen,
+                to: event.to,
+                resting: event.resting,
+                scale: [1.0, 1.0],
+            },
+            now,
+            self.reduce_motion(),
+        );
         // The line carries the motion, so the helper animates exactly what
         // this wait is timed by.
         event.motion = motion;
-        let (agent, resting) = (event.agent.clone(), event.resting);
-        if !self.send_line(CursorLine::Picture(event)) {
-            return None;
-        }
-        drawn.keep(&agent, tip);
         // A badge that only rests somewhere aims at nothing an action waits
         // for.
-        let waits = !resting
+        let waits = !event.resting
             && !self
                 .0
                 .helper_down
                 .load(std::sync::atomic::Ordering::Acquire);
-        waits.then(|| now + Duration::from_secs_f64(motion.duration_ms / 1000.0))
+        let agent = event.agent.clone();
+        let sent = self.send_awaited(CursorLine::Picture(event), &agent, tip.serial, waits)?;
+        drawn.keep(&agent, tip);
+        sent.map(|written| Sent {
+            duration: Duration::from_secs_f64(motion.duration_ms / 1000.0),
+            written,
+        })
+    }
+
+    /// Put a picture or a preview motion on the pipe. `None` when it could
+    /// not be queued; otherwise, when `waits`, how to learn when it was
+    /// written. With a writer that is a note the writer settles once the line
+    /// is through; without one, the moment it was queued.
+    fn send_awaited(
+        &self,
+        line: CursorLine,
+        agent: &str,
+        serial: u64,
+        waits: bool,
+    ) -> Option<Option<Written>> {
+        let confirmed = self
+            .0
+            .writes_confirmed
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !waits || !confirmed {
+            let queued_at = tokio::time::Instant::now();
+            return self
+                .send_line(line)
+                .then(|| waits.then_some(Written::At(queued_at)));
+        }
+        let key = (agent.to_owned(), serial);
+        let (settle, settled) = oneshot::channel();
+        {
+            // Noted before the line is queued, so the writer always finds it.
+            let mut awaiting = self.awaiting();
+            if awaiting.len() >= RECORD_CAP {
+                // Each note lives at most until its action's cap, so a full
+                // record means notes nobody waits for any more.
+                awaiting.clear();
+            }
+            awaiting.insert(key.clone(), settle);
+        }
+        if !self.send_line(line) {
+            self.awaiting().remove(&key);
+            return None;
+        }
+        Some(Some(Written::Pending(key, settled)))
+    }
+
+    fn awaiting(&self) -> std::sync::MutexGuard<'_, AwaitedWrites> {
+        self.0
+            .awaiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn frames(&self) -> std::sync::MutexGuard<'_, VecDeque<CursorFrame>> {
+        self.0
+            .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Answer an action's wait once its line is written: the badge is on its
+    /// target the line's motion duration after the write completed. A line
+    /// that was not written draws nothing, so nothing is waited for. A write
+    /// still not done by the cap is given up on; the action has already gone
+    /// ahead, unsynchronized.
+    async fn decide(
+        self,
+        decided: oneshot::Sender<Option<tokio::time::Instant>>,
+        sent: Option<Sent>,
+        queued: Arc<std::sync::atomic::AtomicBool>,
+        cap: tokio::time::Instant,
+    ) {
+        let Some(sent) = sent else {
+            let _ = decided.send(None);
+            return;
+        };
+        let written = match sent.written {
+            Written::At(at) => Some(at),
+            Written::Pending(key, settled) => {
+                queued.store(true, std::sync::atomic::Ordering::Release);
+                match tokio::time::timeout_at(cap, settled).await {
+                    Ok(written) => written.ok().flatten(),
+                    Err(_) => {
+                        self.awaiting().remove(&key);
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = decided.send(written.map(|at| at + sent.duration));
+    }
+
+    /// Show an agent's preview, or point it at another window. It may start
+    /// the helper.
+    // Only this module's tests call it so far; the background-mode preview
+    // calls it as it shows and retargets.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_preview(&self, preview: CursorPreview) -> bool {
+        self.send_line(CursorLine::Preview(preview))
+    }
+
+    /// Queue a frame for an agent's preview. It never waits and never starts
+    /// the helper, and it is not an action: the badge's idle clock is not
+    /// restarted by it. At most one frame per agent waits for the pipe; a
+    /// newer one replaces it. A frame over `MAX_FRAME_BYTES` is dropped.
+    // Only this module's tests call it so far; the background-mode preview's
+    // capture worker calls it with each frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_frame(&self, frame: CursorFrame) -> bool {
+        if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) || !frame.valid() {
+            return false;
+        }
+        let Some(sender) = self.0.sender.get() else {
+            return false;
+        };
+        if !self
+            .0
+            .writes_confirmed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // No writer: whoever reads the channel stands for the pipe.
+            return sender.try_send(CursorLine::Frame(frame)).is_ok();
+        }
+        let mut frames = self.frames();
+        if let Some(waiting) = frames
+            .iter_mut()
+            .find(|waiting| waiting.frame_agent == frame.frame_agent)
+        {
+            // Latest wins; the writer was already woken for the older one.
+            *waiting = frame;
+            return true;
+        }
+        if frames.len() >= PENDING_FRAME_CAP {
+            return false;
+        }
+        // Only a wake: the writer takes frames from the record, never from
+        // the channel. If the channel is full the writer is busy and finds
+        // the frame once it has written the lines ahead of it.
+        let wake = CursorFrame {
+            frame_agent: frame.frame_agent.clone(),
+            frame_generation: frame.frame_generation,
+            frame_window: frame.frame_window,
+            frame_w: frame.frame_w,
+            frame_h: frame.frame_h,
+            frame_jpeg: String::new(),
+        };
+        frames.push_back(frame);
+        let _ = sender.try_send(CursorLine::Frame(wake));
+        true
+    }
+
+    /// Move an agent's badge inside its preview of `motion.pmotion_window`,
+    /// and answer when its tip lands. The serial and the motion on the line
+    /// are chosen here: the motion from where the badge last was in that
+    /// preview, measured in the thumbnail's points (`thumbnail` is its width
+    /// and height). A badge last drawn on the screen or in another window's
+    /// preview appears with its entry.
+    // Only this module's tests call it so far; the background-mode preview
+    // calls it before each action.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn schedule_preview_motion(
+        &self,
+        mut motion: CursorPreviewMotion,
+        thumbnail: [f64; 2],
+    ) -> Arrival {
+        if self.0.sender.get().is_none()
+            || self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
+            || !thumbnail.iter().all(|v| v.is_finite() && *v > 0.0)
+        {
+            return Arrival::none();
+        }
+        let serial = self
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.refresh_reduce_motion();
+        let scheduled = tokio::time::Instant::now();
+        let agent = motion.pmotion_agent.clone();
+        let queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent = {
+            let mut drawn = self.drawn();
+            let (chosen, tip) = drawn.aim(
+                &Aim {
+                    agent: &agent,
+                    serial,
+                    space: Space::Preview {
+                        window: motion.pmotion_window,
+                    },
+                    to: motion.pmotion_to,
+                    resting: false,
+                    scale: thumbnail,
+                },
+                scheduled,
+                self.reduce_motion(),
+            );
+            motion.pmotion_serial = serial;
+            motion.pmotion_motion = chosen;
+            let waits = !self
+                .0
+                .helper_down
+                .load(std::sync::atomic::Ordering::Acquire);
+            let sent = self.send_awaited(CursorLine::PreviewMotion(motion), &agent, serial, waits);
+            if sent.is_some() {
+                drawn.keep(&agent, tip);
+            }
+            sent.flatten().map(|written| Sent {
+                duration: Duration::from_secs_f64(chosen.duration_ms / 1000.0),
+                written,
+            })
+        };
+        let (decided, decision) = oneshot::channel();
+        tokio::spawn(
+            self.clone()
+                .decide(decided, sent, queued.clone(), scheduled + ARRIVAL_CAP),
+        );
+        Arrival {
+            decision: Some(decision),
+            scheduled,
+            queued,
+            watch: Some(BadgeWatch {
+                cursor: self.clone(),
+                agent,
+                serial,
+            }),
+        }
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
@@ -795,12 +1092,14 @@ impl Coordinator {
         let arrival = Arrival {
             decision: Some(decision),
             scheduled: tokio::time::Instant::now(),
+            queued: Arc::default(),
             watch: Some(BadgeWatch {
                 cursor: self.clone(),
                 agent: identity.badge.clone(),
                 serial,
             }),
         };
+        let (queued, cap) = (arrival.queued.clone(), arrival.scheduled + ARRIVAL_CAP);
         let source_for_follow = source.clone();
         let read_grant = grant.clone();
         tokio::spawn(async move {
@@ -881,7 +1180,10 @@ impl Coordinator {
                     }
                     event
                 };
-                let _ = decided.send(cursor.send_unless_ended(event.clone()));
+                // Its own task: the wait for the write must not hold up the
+                // window watch or the avatar below.
+                let sent = cursor.send_unless_ended(event.clone());
+                tokio::spawn(cursor.clone().decide(decided, sent, queued, cap));
                 // Off the read's deadline: following the window is a nicety
                 // that must never hold up or drop the picture itself.
                 let follower = cursor.clone();
@@ -916,6 +1218,10 @@ impl Coordinator {
             .store(true, std::sync::atomic::Ordering::Release);
         self.follows().clear();
         self.drawn().tips.clear();
+        self.frames().clear();
+        // Every action still waiting for a write hears now that nothing more
+        // will be written.
+        self.awaiting().clear();
         #[cfg(target_os = "macos")]
         if let Some(generation) = *self
             .0
@@ -951,16 +1257,56 @@ impl Coordinator {
 /// An action that shows a badge waits for this before it is sent, so the real
 /// press or write happens as the badge arrives and taps, not before it sets
 /// off. The wait first hears whether a picture went out at all (the geometry
-/// read decides that, within `READ_BUDGET`), then lasts until the arrival
-/// the helper's timeline gives. Nothing to see means no wait.
+/// read decides that, within `READ_BUDGET`) and when the writer finished
+/// writing it to the helper, then lasts until that write plus the motion the
+/// line carries. Nothing to see means no wait.
 pub(crate) struct Arrival {
-    /// Answers once the picture is sent, with the moment its badge arrives,
-    /// or with nothing (or is dropped) when no picture will be drawn.
+    /// Answers once the picture is written, with the moment its badge
+    /// arrives, or with nothing (or is dropped) when no picture will be
+    /// drawn.
     decision: Option<oneshot::Receiver<Option<tokio::time::Instant>>>,
     /// When the picture was scheduled; no wait runs past this plus
     /// `ARRIVAL_CAP`.
     scheduled: tokio::time::Instant,
+    /// Set once the line is queued for a writer that has not yet said it
+    /// wrote it: a wait that reaches the cap then knows a badge is still on
+    /// its way, so the action goes ahead unsynchronized.
+    queued: Arc<std::sync::atomic::AtomicBool>,
     watch: Option<BadgeWatch>,
+}
+
+/// Whether an action went ahead together with its badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArrivalSync {
+    /// The badge landed before the action went, or there was no badge to
+    /// wait for.
+    OnTime,
+    /// The cap came first: the line was not yet written, or its badge lands
+    /// after the cap. The action went ahead at the cap, and its reply says
+    /// `preview: "not_synchronized"` rather than claiming the badge arrived.
+    NotSynchronized,
+}
+
+/// A picture or preview motion on its way, as an action waits for it.
+struct Sent {
+    /// The line's serialized motion duration: the badge lands this long
+    /// after the line was written.
+    duration: Duration,
+    written: Written,
+}
+
+/// When a line an action waits for was written to the helper.
+enum Written {
+    /// At this moment (a line with no writer to confirm it counts as
+    /// written when it is queued).
+    At(tokio::time::Instant),
+    /// The writer settles the note for this agent and serial once the line
+    /// is through, with the moment its write completed, or with nothing
+    /// when it was not written.
+    Pending(
+        (String, u64),
+        oneshot::Receiver<Option<tokio::time::Instant>>,
+    ),
 }
 
 /// How a wait for a badge ended.
@@ -1013,6 +1359,7 @@ impl Arrival {
         Self {
             decision: None,
             scheduled: tokio::time::Instant::now(),
+            queued: Arc::default(),
             watch: None,
         }
     }
@@ -1033,6 +1380,17 @@ impl Arrival {
         cancelled: impl Future<Output = ()>,
         stopped: impl Fn() -> bool,
     ) -> Landing {
+        self.wait_reporting(deadline, cancelled, stopped).await.0
+    }
+
+    /// `wait`, also saying whether the action goes with its badge or ahead
+    /// of it at the cap.
+    pub(crate) async fn wait_reporting(
+        self,
+        deadline: tokio::time::Instant,
+        cancelled: impl Future<Output = ()>,
+        stopped: impl Fn() -> bool,
+    ) -> (Landing, ArrivalSync) {
         tokio::pin!(cancelled);
         let cap = self.scheduled + ARRIVAL_CAP;
         let (mut decision, mut deciding) = match self.decision {
@@ -1040,9 +1398,10 @@ impl Arrival {
             None => (oneshot::channel().1, false),
         };
         let mut landing = None;
+        let on_time = |landing: Landing| (landing, ArrivalSync::OnTime);
         loop {
             if stopped() {
-                return Landing::Stopped;
+                return on_time(Landing::Stopped);
             }
             let drawn = landing.is_some();
             let until = if deciding {
@@ -1055,7 +1414,7 @@ impl Arrival {
                         // from the screen and the agent is done: stop now
                         // rather than wait out a glide nobody sees.
                         if self.watch.as_ref().is_some_and(BadgeWatch::ended) {
-                            return Landing::Ended;
+                            return on_time(Landing::Ended);
                         }
                         std::cmp::min(at, cap)
                     }
@@ -1063,20 +1422,34 @@ impl Arrival {
                     // An end that landed while the geometry read ran is what
                     // dropped the picture; the dispatch gate refuses that
                     // action when it would be sent (see `BadgeWatch::ended`).
-                    _ => return Landing::Arrived { drawn },
+                    _ => return on_time(Landing::Arrived { drawn }),
                 }
             };
             let now = tokio::time::Instant::now();
             if now >= until {
-                return Landing::Arrived { drawn };
+                // At the cap with the line still unwritten, or with a badge
+                // that lands after it: the action goes now, ahead of it.
+                let late = if deciding {
+                    self.queued.load(std::sync::atomic::Ordering::Acquire)
+                } else {
+                    landing.is_some_and(|at| at > cap)
+                };
+                return if late {
+                    (
+                        Landing::Arrived { drawn: true },
+                        ArrivalSync::NotSynchronized,
+                    )
+                } else {
+                    on_time(Landing::Arrived { drawn })
+                };
             }
             if now >= deadline {
-                return Landing::Stopped;
+                return on_time(Landing::Stopped);
             }
             let wake = until.min(deadline).min(now + ARRIVAL_POLL);
             tokio::select! {
                 biased;
-                () = &mut cancelled => return Landing::Cancelled,
+                () = &mut cancelled => return on_time(Landing::Cancelled),
                 decided = &mut decision, if deciding => {
                     deciding = false;
                     landing = decided.ok().flatten();
@@ -1096,6 +1469,7 @@ impl Arrival {
         Self {
             decision: Some(decision),
             scheduled: tokio::time::Instant::now(),
+            queued: Arc::default(),
             watch: None,
         }
     }
@@ -1140,30 +1514,111 @@ fn platform_reduce_motion() -> ReduceMotionReader {
     }
 }
 
+/// The writer's loop: take each line to send, hand it to `deliver`, which
+/// answers whether it reached the helper, and settle any action waiting for
+/// it with the moment its write completed. Returns when the channel closes
+/// or the cursor is shut down.
+///
+/// Every line on the channel (a picture, preview, preview motion, hide or
+/// follow) is written before any waiting frame, in the order it was queued.
+/// Frames are taken from the per-agent record, one at a time, only when no
+/// other line is waiting. A frame already being written still delays the
+/// lines queued behind it: `deliver` writes a whole line at once.
+// Outside macOS only this module's tests run a writer.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn write_lines(
+    state: &State,
+    rx: &mut mpsc::Receiver<CursorLine>,
+    mut deliver: impl FnMut(&CursorLine) -> bool,
+) {
+    let mut waiting: VecDeque<CursorLine> = VecDeque::new();
+    // A frame on the channel is only a wake for one in the record.
+    let keep = |waiting: &mut VecDeque<CursorLine>, line: CursorLine| {
+        if !matches!(line, CursorLine::Frame(_)) {
+            waiting.push_back(line);
+        }
+    };
+    loop {
+        if state.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        // Taken from the channel only once the last batch is written, so
+        // what waits here stays within the channel's own bound.
+        if waiting.is_empty() {
+            while let Ok(line) = rx.try_recv() {
+                keep(&mut waiting, line);
+            }
+        }
+        let next = waiting.pop_front().or_else(|| {
+            state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .map(CursorLine::Frame)
+        });
+        let Some(line) = next else {
+            match rx.blocking_recv() {
+                Some(line) => {
+                    keep(&mut waiting, line);
+                    continue;
+                }
+                None => break,
+            }
+        };
+        let written = deliver(&line);
+        let at = tokio::time::Instant::now();
+        state.settle(&line, written.then_some(at));
+    }
+}
+
+impl State {
+    /// Tell the action waiting for `line`, if any, when its write completed,
+    /// or that it was not written.
+    fn settle(&self, line: &CursorLine, written: Option<tokio::time::Instant>) {
+        let key = match line {
+            CursorLine::Picture(event) => (event.agent.clone(), event.serial),
+            CursorLine::PreviewMotion(motion) => {
+                (motion.pmotion_agent.clone(), motion.pmotion_serial)
+            }
+            _ => return,
+        };
+        let waiter = self
+            .awaiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(written);
+            #[cfg(test)]
+            self.settled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
     use std::io::Write;
     let mut helper: Option<(cerebellum_macos::ReleasedChild, std::fs::File)> = None;
     let mut restarts = RestartLimit::default();
-    while let Some(event) = rx.blocking_recv() {
-        if state.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
+    write_lines(&state, &mut rx, |event| {
         // A locked or unreadable screen never launches or displays the helper.
         if cerebellum_macos::screen_is_locked() != Some(false) {
-            continue;
+            return false;
         }
         if helper.is_none() {
-            // No helper means no badge on screen, so there is nothing to hide
-            // or move; never launch a helper just for that.
-            if matches!(event, CursorLine::Hide(_) | CursorLine::Follow(_)) {
-                continue;
+            // No helper means no badge and no preview on screen, so there is
+            // nothing to hide, move or fill in; never launch a helper just
+            // for that.
+            if !event.launches_helper() {
+                return false;
             }
             if !restarts.admit(Instant::now()) {
                 state
                     .helper_down
                     .store(true, std::sync::atomic::Ordering::Release);
-                continue;
+                return false;
             }
             let launched = (|| {
                 let executable = std::env::current_exe().ok()?;
@@ -1191,27 +1646,62 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 .store(helper.is_none(), std::sync::atomic::Ordering::Release);
         }
         let Some(line) = event.encode_line() else {
-            continue;
+            return false;
         };
-        if helper
-            .as_mut()
-            .is_some_and(|(_, pipe)| pipe.write_all(&line).is_err())
-        {
-            helper.take();
-            cerebellum_macos::register_cursor_generation(None);
-            *state
-                .generation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let Some((_, pipe)) = helper.as_mut() else {
+            return false;
+        };
+        if pipe.write_all(&line).is_ok() {
+            return true;
         }
-    }
+        helper.take();
+        cerebellum_macos::register_cursor_generation(None);
+        *state
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        false
+    });
     drop(helper);
+}
+
+impl Coordinator {
+    /// A cursor whose lines go through the real writer to `deliver`, which
+    /// stands for the helper's pipe, on a thread of its own. It runs on the
+    /// calling runtime's clock, so a test on a paused clock sees each write
+    /// complete at the paused time.
+    #[cfg(test)]
+    pub(crate) fn piped_for_test(
+        deliver: impl FnMut(&CursorLine) -> bool + Send + 'static,
+    ) -> Self {
+        let result = Self::default();
+        let (tx, mut rx) = mpsc::channel(CAPACITY);
+        let _ = result.0.sender.set(tx);
+        result
+            .0
+            .writes_confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let state = result.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            write_lines(&state, &mut rx, deliver);
+        });
+        result
+    }
+
+    /// How many awaited lines the writer has settled so far.
+    #[cfg(test)]
+    fn settled(&self) -> usize {
+        self.0.settled.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::HANG_GUARD;
+    use cerebellum_computer::cursor::MAX_FRAME_BYTES;
 
     /// Geometry that takes the given time to read.
     struct SlowGeometry(Duration);
@@ -1376,6 +1866,7 @@ mod tests {
         let landing = Arrival {
             decision: Some(decision),
             scheduled: start,
+            queued: Arc::default(),
             watch: None,
         }
         .wait(
@@ -1407,6 +1898,7 @@ mod tests {
             CursorLine::Follow(follow) => {
                 panic!("expected a hide, got a follow for {}", follow.agent)
             }
+            other => panic!("expected a hide, got {other:?}"),
         }
     }
 
@@ -2038,5 +2530,440 @@ mod tests {
             until_read(|| reads() >= expected);
             assert_eq!(reads(), expected, "after {advance_ms} ms more");
         }
+    }
+
+    /// Stands for the helper's pipe: keeps each line written in full, and can
+    /// be made to stop partway through one line until the test releases it.
+    #[derive(Clone, Default)]
+    struct FakePipe(Arc<FakePipeState>);
+
+    #[derive(Default)]
+    struct FakePipeState {
+        written: std::sync::Mutex<Vec<CursorLine>>,
+        hold: std::sync::Mutex<Option<Hold>>,
+    }
+
+    /// Stop writing the next line `matches` accepts after `after_bytes`
+    /// bytes, say so on `stalled`, and go on once `release` hears.
+    struct Hold {
+        matches: fn(&CursorLine) -> bool,
+        after_bytes: usize,
+        stalled: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    /// One line's bytes as the pipe takes them, a write call at a time.
+    struct Sink {
+        line: Vec<u8>,
+        hold: Option<Hold>,
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(hold) = &self.hold {
+                if self.line.len() < hold.after_bytes {
+                    let taken = buf.len().min(hold.after_bytes - self.line.len());
+                    self.line.extend_from_slice(&buf[..taken]);
+                    return Ok(taken);
+                }
+                // Partway through the line: the reader stops reading.
+                let hold = self.hold.take().unwrap();
+                let _ = hold.stalled.send(());
+                let _ = hold.release.recv_timeout(HANG_GUARD);
+            }
+            self.line.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl FakePipe {
+        fn deliver(&self) -> impl FnMut(&CursorLine) -> bool + Send + 'static {
+            let pipe = self.clone();
+            move |line| {
+                let Some(bytes) = line.encode_line() else {
+                    return false;
+                };
+                let hold = {
+                    let mut hold = pipe.0.hold.lock().unwrap();
+                    if hold.as_ref().is_some_and(|hold| (hold.matches)(line)) {
+                        hold.take()
+                    } else {
+                        None
+                    }
+                };
+                let mut sink = Sink {
+                    line: Vec::new(),
+                    hold,
+                };
+                std::io::Write::write_all(&mut sink, &bytes).unwrap();
+                pipe.0
+                    .written
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&sink.line).unwrap());
+                true
+            }
+        }
+
+        /// Hold the next matching line; answers the stall notice and the
+        /// release.
+        fn hold(
+            &self,
+            matches: fn(&CursorLine) -> bool,
+            after_bytes: usize,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (stalled, stall) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *self.0.hold.lock().unwrap() = Some(Hold {
+                matches,
+                after_bytes,
+                stalled,
+                release: released,
+            });
+            (stall, release)
+        }
+
+        fn written(&self) -> Vec<CursorLine> {
+            self.0.written.lock().unwrap().clone()
+        }
+
+        /// Each written line, named by its shape and agent (and a frame by
+        /// its generation).
+        fn names(&self) -> Vec<String> {
+            self.written()
+                .iter()
+                .map(|line| match line {
+                    CursorLine::Frame(frame) => {
+                        format!("frame:{}:{}", frame.frame_agent, frame.frame_generation)
+                    }
+                    CursorLine::Picture(_) => format!("picture:{}", line.agent()),
+                    CursorLine::Hide(_) => format!("hide:{}", line.agent()),
+                    CursorLine::Follow(_) => format!("follow:{}", line.agent()),
+                    CursorLine::Preview(_) => format!("preview:{}", line.agent()),
+                    CursorLine::PreviewMotion(_) => format!("pmotion:{}", line.agent()),
+                })
+                .collect()
+        }
+
+        /// Wait, in real time, until `count` lines were written: the writer
+        /// runs on a plain thread.
+        fn until_written(&self, count: usize) {
+            until_read(|| self.0.written.lock().unwrap().len() >= count);
+        }
+    }
+
+    fn stalled(stall: &std::sync::mpsc::Receiver<()>) {
+        stall
+            .recv_timeout(HANG_GUARD)
+            .expect("the writer never reached the held line");
+    }
+
+    fn frame(agent: &str, generation: u64, bytes: usize) -> CursorFrame {
+        let jpeg: Vec<u8> = (0..bytes).map(|at| at as u8).collect();
+        CursorFrame::new(agent, generation, 77, [280, 187], &jpeg)
+    }
+
+    fn picture(agent: &str) -> CursorEvent {
+        CursorEvent {
+            agent: agent.into(),
+            initial: 'A',
+            to: [10.0, 10.0],
+            target: None,
+            resting: false,
+            label: None,
+            kind: CursorKind::Press,
+            serial: 0,
+            avatar_rgba: None,
+            avatar_update: false,
+            avatar_tint: None,
+            motion: PictureMotion::still(),
+        }
+    }
+
+    /// A badge motion inside `agent`'s preview of `window`. The serial and
+    /// motion are placeholders: scheduling chooses both.
+    fn preview_motion(agent: &str, window: u32, to: [f64; 2]) -> CursorPreviewMotion {
+        CursorPreviewMotion {
+            pmotion_agent: agent.into(),
+            pmotion_serial: 0,
+            pmotion_generation: 1,
+            pmotion_window: window,
+            pmotion_kind: CursorKind::Press,
+            pmotion_to: to,
+            pmotion_target: to,
+            pmotion_motion: PictureMotion::still(),
+        }
+    }
+
+    const THUMBNAIL: [f64; 2] = [280.0, 187.0];
+
+    fn is_hide(line: &CursorLine) -> bool {
+        matches!(line, CursorLine::Hide(_))
+    }
+
+    fn is_frame(line: &CursorLine) -> bool {
+        matches!(line, CursorLine::Frame(_))
+    }
+
+    fn is_preview_motion(line: &CursorLine) -> bool {
+        matches!(line, CursorLine::PreviewMotion(_))
+    }
+
+    #[tokio::test]
+    async fn a_picture_queued_behind_a_pending_frame_is_written_first() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        // The writer is busy with a hide while the rest is queued.
+        let (stall, release) = pipe.hold(is_hide, 5);
+        cursor.end("agent-x");
+        stalled(&stall);
+        assert!(cursor.send_frame(frame("agent-a", 1, 100)));
+        assert!(cursor.send_frame(frame("agent-b", 1, 100)));
+        // Latest wins, in the older frame's place.
+        assert!(cursor.send_frame(frame("agent-a", 2, 100)));
+        cursor.send(picture("agent-a"));
+        assert!(cursor.send_preview(CursorPreview {
+            preview_agent: "agent-a".into(),
+            preview_generation: 2,
+            preview_slot: 0,
+            preview_window: 77,
+            preview_app: "Mail".into(),
+            preview_aspect: [1200.0, 800.0],
+            preview_label: None,
+            preview_fallback: None,
+            preview_icon_path: None,
+        }));
+        release.send(()).unwrap();
+        pipe.until_written(5);
+        assert_eq!(
+            pipe.names(),
+            [
+                "hide:agent-x",
+                "picture:agent-a",
+                "preview:agent-a",
+                "frame:agent-a:2",
+                "frame:agent-b:1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_end_drops_the_agents_waiting_frame() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        let (stall, release) = pipe.hold(is_hide, 5);
+        cursor.end("agent-x");
+        stalled(&stall);
+        assert!(cursor.send_frame(frame("agent-a", 1, 100)));
+        cursor.end("agent-a");
+        release.send(()).unwrap();
+        pipe.until_written(2);
+        // Give a frame that was wrongly kept the time to be written.
+        cursor.end("agent-y");
+        pipe.until_written(3);
+        assert_eq!(
+            pipe.names(),
+            ["hide:agent-x", "hide:agent-a", "hide:agent-y"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_is_dropped_before_the_pipe() {
+        let oversized = frame("agent-a", 1, MAX_FRAME_BYTES + 1);
+        let (cursor, mut receiver) = Coordinator::channel();
+        assert!(!cursor.send_frame(oversized.clone()));
+        assert!(receiver.try_recv().is_err());
+        assert!(cursor.send_frame(frame("agent-a", 1, MAX_FRAME_BYTES)));
+        assert!(matches!(receiver.try_recv(), Ok(CursorLine::Frame(_))));
+
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        assert!(!cursor.send_frame(oversized));
+        assert!(cursor.frames().is_empty());
+        assert!(cursor.send_frame(frame("agent-a", 1, MAX_FRAME_BYTES)));
+        pipe.until_written(1);
+        assert_eq!(pipe.names(), ["frame:agent-a:1"]);
+    }
+
+    /// A consumer that stops reading partway through a frame holds back the
+    /// preview motion, picture and hide queued after it. The action waiting
+    /// for that motion goes ahead at the cap, not synchronized, rather than
+    /// claiming the badge arrived; once the consumer reads again, every
+    /// queued line is written before the agent's latest frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_stalled_mid_frame_gives_a_motion_that_is_not_synchronized() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        let (stall, release) = pipe.hold(is_frame, 1000);
+        assert!(cursor.send_frame(frame("agent-a", 1, 4000)));
+        stalled(&stall);
+        assert!(cursor.send_frame(frame("agent-a", 2, 4000)));
+        assert!(cursor.send_frame(frame("agent-a", 3, 4000)));
+        let start = tokio::time::Instant::now();
+        let arrival =
+            cursor.schedule_preview_motion(preview_motion("agent-a", 77, [0.5, 0.5]), THUMBNAIL);
+        cursor.send(picture("agent-b"));
+        cursor.end("agent-c");
+        let (landing, sync) = arrival
+            .wait_reporting(
+                start + Duration::from_secs(10),
+                std::future::pending(),
+                || false,
+            )
+            .await;
+        assert_eq!(landing, Landing::Arrived { drawn: true });
+        assert_eq!(sync, ArrivalSync::NotSynchronized);
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
+        release.send(()).unwrap();
+        pipe.until_written(5);
+        assert_eq!(
+            pipe.names(),
+            [
+                "frame:agent-a:1",
+                "pmotion:agent-a",
+                "picture:agent-b",
+                "hide:agent-c",
+                "frame:agent-a:3"
+            ]
+        );
+    }
+
+    /// The badge lands its serialized motion after the write completes, not
+    /// after the line was queued: a first appearance (a 1040 ms entry) whose
+    /// write completes 30 ms after scheduling lands at 1070 ms, on time.
+    #[tokio::test(start_paused = true)]
+    async fn arrival_counts_from_the_write_not_the_queue() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        let (stall, release) = pipe.hold(is_preview_motion, 10);
+        let start = tokio::time::Instant::now();
+        let arrival =
+            cursor.schedule_preview_motion(preview_motion("agent-a", 77, [0.5, 0.5]), THUMBNAIL);
+        stalled(&stall);
+        tokio::time::advance(Duration::from_millis(30)).await;
+        release.send(()).unwrap();
+        // Blocks this thread, so the paused clock cannot move on while the
+        // writer finishes: its write completes at exactly 30 ms.
+        until_read(|| cursor.settled() == 1);
+        let (landing, sync) = arrival
+            .wait_reporting(
+                start + Duration::from_secs(10),
+                std::future::pending(),
+                || false,
+            )
+            .await;
+        assert_eq!(landing, Landing::Arrived { drawn: true });
+        assert_eq!(sync, ArrivalSync::OnTime);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            Duration::from_millis(30 + 1040)
+        );
+    }
+
+    /// A write that completes at 1000 ms puts the badge's landing past the
+    /// cap, though queuing plus the entry (1040 ms) would be within it: the
+    /// action goes at 1090 ms, not synchronized.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_completing_at_1000_ms_is_not_synchronized_at_the_cap() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        let (stall, release) = pipe.hold(is_preview_motion, 10);
+        let start = tokio::time::Instant::now();
+        let arrival =
+            cursor.schedule_preview_motion(preview_motion("agent-a", 77, [0.5, 0.5]), THUMBNAIL);
+        stalled(&stall);
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        release.send(()).unwrap();
+        until_read(|| cursor.settled() == 1);
+        let (landing, sync) = arrival
+            .wait_reporting(
+                start + Duration::from_secs(10),
+                std::future::pending(),
+                || false,
+            )
+            .await;
+        assert_eq!(landing, Landing::Arrived { drawn: true });
+        assert_eq!(sync, ArrivalSync::NotSynchronized);
+        assert_eq!(tokio::time::Instant::now() - start, ARRIVAL_CAP);
+        assert_eq!(ARRIVAL_CAP, Duration::from_millis(1090));
+    }
+
+    async fn next_motion(receiver: &mut mpsc::Receiver<CursorLine>) -> PictureMotion {
+        match next_line(receiver).await {
+            CursorLine::Picture(event) => event.motion,
+            CursorLine::PreviewMotion(motion) => motion.pmotion_motion,
+            other => panic!("expected a motion, got {other:?}"),
+        }
+    }
+
+    /// The last tip is kept with its space: a badge moving between the
+    /// screen and a preview, or to another window's preview, appears anew.
+    /// Inside one preview it glides, timed by the distance in thumbnail
+    /// points.
+    #[tokio::test]
+    async fn the_last_tip_is_keyed_by_space() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let entry = PictureMotion::chosen(0.0, true, false);
+        let mut screen = picture(AGENT);
+        screen.serial = 1;
+        assert!(cursor.send_unless_ended(screen.clone()).is_some());
+        assert_eq!(next_motion(&mut receiver).await, entry, "first on screen");
+
+        cursor.schedule_preview_motion(preview_motion(AGENT, 77, [0.5, 0.5]), THUMBNAIL);
+        assert_eq!(next_motion(&mut receiver).await, entry, "screen to preview");
+        cursor.schedule_preview_motion(preview_motion(AGENT, 77, [0.0, 0.5]), THUMBNAIL);
+        assert_eq!(
+            next_motion(&mut receiver).await,
+            // Half the thumbnail's 280-point width.
+            PictureMotion::chosen(140.0, false, false),
+            "within one preview"
+        );
+        cursor.schedule_preview_motion(preview_motion(AGENT, 78, [0.0, 0.5]), THUMBNAIL);
+        assert_eq!(
+            next_motion(&mut receiver).await,
+            entry,
+            "another window's preview"
+        );
+        screen.serial = 9;
+        assert!(cursor.send_unless_ended(screen).is_some());
+        assert_eq!(next_motion(&mut receiver).await, entry, "preview to screen");
+    }
+
+    /// Frames are not actions: an agent's frames arriving all through the
+    /// idle timeout leave its badge to idle out, so its next motion is a
+    /// first appearance again.
+    #[tokio::test(start_paused = true)]
+    async fn frames_never_restart_the_idle_clock() {
+        let pipe = FakePipe::default();
+        let cursor = Coordinator::piped_for_test(pipe.deliver());
+        let idle = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
+        cursor.schedule_preview_motion(preview_motion(AGENT, 77, [0.5, 0.5]), THUMBNAIL);
+        let mut elapsed = Duration::ZERO;
+        let step = Duration::from_secs(30);
+        while elapsed + step < idle {
+            tokio::time::advance(step).await;
+            elapsed += step;
+            assert!(cursor.send_frame(frame(AGENT, 1, 100)));
+        }
+        tokio::time::advance(idle - elapsed).await;
+        cursor.schedule_preview_motion(preview_motion(AGENT, 77, [0.0, 0.5]), THUMBNAIL);
+        // Frames may replace one another before they are written, so count
+        // the motions, which are never replaced.
+        let motions = || -> Vec<PictureMotion> {
+            pipe.written()
+                .into_iter()
+                .filter_map(|line| match line {
+                    CursorLine::PreviewMotion(motion) => Some(motion.pmotion_motion),
+                    _ => None,
+                })
+                .collect()
+        };
+        until_read(|| motions().len() == 2);
+        let entry = PictureMotion::chosen(0.0, true, false);
+        assert_eq!(motions(), [entry, entry]);
     }
 }
