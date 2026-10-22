@@ -82,9 +82,9 @@ async fn a_committed_navigation_whose_page_read_fails_reports_the_navigation() {
 async fn a_navigation_page_read_waits_for_an_observer_lost_during_the_capture() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
-    // The capture's accessibility plan and the next two document reads find
-    // no observer, as when the landed page commits a child frame mid-read.
-    fixture.state.lock().unwrap().observer_loss_on_capture = 3;
+    // The capture's accessibility plan and the next document read find no
+    // observer, as when the landed page commits a child frame mid-read.
+    fixture.state.lock().unwrap().observer_loss_on_capture = 2;
     let (reply, _) = fixture.call(1, navigate_and_read(&tab), "allow_30m").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     let read = &reply["read_page"];
