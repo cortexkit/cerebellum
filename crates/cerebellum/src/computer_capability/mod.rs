@@ -526,7 +526,8 @@ where
     cursor: cursor::Coordinator,
     /// The config file's `computer_use.app_use`, checked as each call
     /// arrives. The only setting whose edits are acted on while the module
-    /// runs.
+    /// runs. No file is read until module startup calls
+    /// [`Self::read_app_use_from_config_file`].
     app_use: app_use::LiveAppUse,
     /// The mode each call's work saw, in order, for tests that check an edit
     /// to the config file reaches the very next call.
@@ -633,7 +634,7 @@ where
             fronting_bracket_admitted: false,
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),
-            app_use: app_use::LiveAppUse::for_plane(),
+            app_use: app_use::LiveAppUse::without_file(),
             #[cfg(test)]
             app_use_seen_for_test: StdMutex::new(Vec::new()),
             #[cfg(test)]
@@ -683,6 +684,25 @@ where
     pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
         self.app_state_source = source;
         self
+    }
+
+    /// Read `computer_use.app_use` from the person's config file,
+    /// `config_path()`, for every call from now on.
+    ///
+    /// Every constructor builds a plane that reads no file, so test binaries
+    /// and examples never act on the config of whoever runs them. Only the
+    /// module's own startup, which already loads that file to register,
+    /// calls this.
+    // Only macOS and Windows build a computer plane in a running module.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn read_app_use_from_config_file(&self) {
+        self.app_use.read_config_file();
+    }
+
+    /// The config file this plane's calls read `app_use` from, if any.
+    #[cfg(test)]
+    pub(crate) fn app_use_config_path_for_test(&self) -> Option<PathBuf> {
+        self.app_use.path()
     }
 
     /// Read `computer_use.app_use` through `live` instead of the plane's

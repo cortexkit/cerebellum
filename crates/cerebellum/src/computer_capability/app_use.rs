@@ -89,50 +89,71 @@ struct Reading {
 
 /// The config file's `computer_use.app_use`, re-read whenever the file
 /// changes.
+///
+/// A plane starts with no file to read, so every call is background. Only the
+/// module a person runs switches it to their config file, through
+/// [`LiveAppUse::read_config_file`]. Test binaries and examples build planes
+/// too, and must never take a mode, or a `config_invalid` refusal, from
+/// whatever the developer running them has in their own config file.
 pub(crate) struct LiveAppUse {
-    /// `None` when there is no config directory to look in, which reads as a
-    /// missing file.
-    path: Option<PathBuf>,
-    files: Arc<dyn ConfigFiles>,
     /// Held across the `stat` and any re-read, so two calls arriving together
     /// parse a changed file once rather than twice.
-    last: StdMutex<Option<Reading>>,
+    state: StdMutex<State>,
+}
+
+struct State {
+    /// `None` when there is no file to look at, which reads as a missing
+    /// file.
+    path: Option<PathBuf>,
+    files: Arc<dyn ConfigFiles>,
+    last: Option<Reading>,
 }
 
 impl LiveAppUse {
     pub(crate) fn new(path: Option<PathBuf>, files: Arc<dyn ConfigFiles>) -> Self {
         Self {
-            path,
-            files,
-            last: StdMutex::new(None),
+            state: StdMutex::new(State {
+                path,
+                files,
+                last: None,
+            }),
         }
     }
 
-    /// The setting a plane starts with. A running module reads the person's
-    /// config file. This crate's unit tests read no file, so the developer's
-    /// own config can never change what they assert; a test that exercises
-    /// the setting supplies its own file system.
-    pub(crate) fn for_plane() -> Self {
-        if cfg!(test) {
-            Self::new(None, Arc::new(NativeConfigFiles))
-        } else {
-            Self::new(
-                cerebellum_core::config::config_path(),
-                Arc::new(NativeConfigFiles),
-            )
-        }
+    /// Reading no file: every call is background.
+    pub(crate) fn without_file() -> Self {
+        Self::new(None, Arc::new(NativeConfigFiles))
+    }
+
+    /// Read the person's config file, `config_path()`, from the next call on.
+    /// Whatever was read before is forgotten, so that call parses the file.
+    pub(crate) fn read_config_file(&self) {
+        let mut state = self.lock();
+        state.path = cerebellum_core::config::config_path();
+        state.files = Arc::new(NativeConfigFiles);
+        state.last = None;
+    }
+
+    /// The file calls are read from, if any.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        self.lock().path.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The mode for the call about to run.
     pub(crate) fn current(&self) -> Result<AppUse, ConfigInvalid> {
-        let Some(path) = self.path.as_deref() else {
+        let mut state = self.lock();
+        let State { path, files, last } = &mut *state;
+        let Some(path) = path.as_deref() else {
             return Ok(AppUse::Background);
         };
-        let mut last = self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stamp = match self.files.modified(path) {
+        let stamp = match files.modified(path) {
             Ok(modified) => Stamp::Modified(modified),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Stamp::Absent,
             Err(error) => {
@@ -150,7 +171,7 @@ impl LiveAppUse {
         }
         let (stamp, outcome) = match stamp {
             Stamp::Absent => (Stamp::Absent, Ok(AppUse::Background)),
-            Stamp::Modified(_) => match self.files.read_to_string(path) {
+            Stamp::Modified(_) => match files.read_to_string(path) {
                 Ok(text) => (
                     stamp,
                     parse_config(&text)
@@ -492,7 +513,9 @@ mod serve_tests {
         }
     }
 
-    fn plane(live: LiveAppUse) -> Plane {
+    fn audit(
+    ) -> ComputerAudit<ExcludeApplicationText, ValidatedSeverityTaxonomy, InMemoryJournalStorage>
+    {
         let custody = CaptureCustody::new(
             CustodyBounds {
                 maximum_verification_duration_ms: 100,
@@ -505,7 +528,7 @@ mod serve_tests {
             InMemoryCustodyStorage::new(),
         )
         .unwrap();
-        let audit = ComputerAudit::new(
+        ComputerAudit::new(
             ExcludeApplicationText,
             cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
             JournalConfig {
@@ -515,12 +538,42 @@ mod serve_tests {
             InMemoryJournalStorage::default(),
             custody,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn plane(live: LiveAppUse) -> Plane {
         // Detect-only: the frozen result schemas predate `config_invalid`, and
         // these tests are about when the refusal is given, not its schema.
-        ComputerPlane::with_result_schema_enforcement(audit, ResultSchemaEnforcement::DetectOnly)
+        ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::DetectOnly)
             .with_permission_liveness(permissions::live_for_test())
             .with_app_use(live)
+    }
+
+    /// Test binaries and examples build planes with these same
+    /// constructors, so none of them may read the config file of whoever
+    /// runs them. Only the explicit opt-in that module startup makes points a
+    /// plane at `config_path()`.
+    #[test]
+    fn a_plane_from_any_constructor_reads_no_config_file() {
+        let planes: [Plane; 3] = [
+            ComputerPlane::new(audit()),
+            ComputerPlane::with_result_schema_enforcement(
+                audit(),
+                ResultSchemaEnforcement::Withhold,
+            ),
+            ComputerPlane::with_synthetic_driver(
+                audit(),
+                cerebellum_computer::platform::UnsupportedPlatformDriver::new,
+            ),
+        ];
+        for plane in planes {
+            assert_eq!(plane.app_use_config_path_for_test(), None);
+            plane.read_app_use_from_config_file();
+            assert_eq!(
+                plane.app_use_config_path_for_test(),
+                cerebellum_core::config::config_path()
+            );
+        }
     }
 
     fn identity() -> JournalIdentity {
