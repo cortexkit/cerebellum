@@ -338,38 +338,56 @@ async fn without_the_review_a_bring_to_front_read_runs_the_bracket_without_the_l
     drop(held);
 }
 
-/// The check every temporary front makes for itself once it holds the
-/// lock: in a build that may not front, preparing one fails, whichever
-/// caller asked, and the lock is released again.
-#[tokio::test]
-async fn a_temporary_front_is_never_prepared_where_fronting_is_not_admitted() {
-    let rig = unadmitted(AppUse::Background, mail_desk(), true).await;
+/// Prepare a temporary front of the fixture application for the fixture
+/// conversation, as a call served under its own arbiter would.
+async fn prepare(rig: &Rig) -> Result<(), PrepareStop> {
     let who = Who::fixture();
     let consent = who.consent();
     let cancel = crate::CancelHandle::pending();
     let grant = support::grant();
-    let prepared = crate::CALL_TERMINAL
-        .scope(under_terminal(), async {
-            rig.plane
-                .prepare_temporary_front(
-                    FrontCall {
-                        grant: &grant,
-                        consent: &consent,
-                        cancel: &cancel,
-                        management: &rig.management,
-                        conversation_key: &who.identity.conversation_key,
-                        input_follows: false,
-                    },
-                    crate::terminal_arbiter::FrontingPurpose::BringToFront,
-                    true,
-                )
-                .await
-                .map(|_| ())
-        })
-        .await;
+    let work = super::super::quarantine::CallWork::new(
+        Some(under_terminal()),
+        Duration::from_millis(crate::budgets::MAX_ACTION_WORK_MS),
+        None,
+        None,
+    );
+    work.scope(async {
+        rig.plane
+            .prepare_temporary_front(
+                FrontCall {
+                    grant: &grant,
+                    consent: &consent,
+                    cancel: &cancel,
+                    management: &rig.management,
+                    conversation_key: &who.identity.conversation_key,
+                    input_follows: false,
+                },
+                crate::terminal_arbiter::FrontingPurpose::BringToFront,
+                true,
+            )
+            .await
+            .map(|_| ())
+    })
+    .await
+}
+
+/// The check every temporary front makes for itself once it holds the
+/// lock: in a build that may not front, preparing one fails, whichever
+/// caller asked, and the lock is released again. The same preparation in a
+/// build that may front succeeds, so the refusal is that check's.
+#[tokio::test]
+async fn a_temporary_front_is_never_prepared_where_fronting_is_not_admitted() {
+    let admitted = rig(AppUse::Background, mail_desk()).await;
+    assert_eq!(prepare(&admitted).await, Ok(()));
+    assert!(
+        !admitted.lock.held(),
+        "the unused preparation released the lock"
+    );
+
+    let rig = unadmitted(AppUse::Background, mail_desk(), true).await;
     assert_eq!(
-        prepared.err().map(|stopped| stopped.stop),
-        Some(FrontingStop::FrontingNotAdmitted)
+        prepare(&rig).await.map_err(|stopped| stopped.stop),
+        Err(FrontingStop::FrontingNotAdmitted)
     );
     assert!(!rig.lock.held());
     assert!(rig.screen.log().is_empty());
