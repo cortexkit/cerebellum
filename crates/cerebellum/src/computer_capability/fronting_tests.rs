@@ -341,8 +341,9 @@ struct ScreenState {
     post_unknown: bool,
     /// Whether the paired release of held keys returns.
     release_ok: bool,
-    /// Once the target is fronted, this element of the desk reads enabled.
-    enable_on_front: Option<u64>,
+    /// These elements of the desk read enabled while the target is
+    /// fronted, and disabled again once another application is.
+    enable_on_front: Vec<u64>,
     /// A chord's post stays in flight, with its keys down, until this call's
     /// terminal is chosen, and then fails with them possibly held.
     hold_until_stopped: Option<Arc<crate::TerminalArbiter>>,
@@ -383,7 +384,7 @@ impl Screen {
                 last_input_ms: None,
                 post_unknown: false,
                 release_ok: true,
-                enable_on_front: None,
+                enable_on_front: Vec::new(),
                 hold_until_stopped: None,
                 posting: None,
                 releasing: None,
@@ -412,16 +413,14 @@ impl Screen {
         let (comes_forward, enable) = {
             let mut state = self.state();
             state.log.push(format!("{who}:{pid}"));
-            (state.comes_forward, state.enable_on_front)
+            (state.comes_forward, state.enable_on_front.clone())
         };
         if comes_forward {
             let mut desk = self.desk.state();
             desk.frontmost = Some(pid);
-            if pid == TARGET {
-                if let Some(token) = enable {
-                    if let Some(element) = desk.elements.get_mut(&token) {
-                        element.enabled = Some(true);
-                    }
+            for token in enable {
+                if let Some(element) = desk.elements.get_mut(&token) {
+                    element.enabled = Some(pid == TARGET);
                 }
             }
         }
@@ -1375,7 +1374,7 @@ async fn a_press_on_a_button_disabled_in_the_background_fronts_presses_and_resto
     let rig = rig(AppUse::Background, mail_desk()).await;
     let send = rig.send_id().await;
     rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
-    rig.screen.state().enable_on_front = Some(10);
+    rig.screen.state().enable_on_front = vec![10];
     let reply = rig
         .call_under(
             &under_terminal(),
@@ -1424,7 +1423,7 @@ async fn a_person_switch_with_input_is_left_alone_and_one_without_is_restored() 
         let rig = rig(AppUse::Background, mail_desk()).await;
         let send = rig.send_id().await;
         rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
-        rig.screen.state().enable_on_front = Some(10);
+        rig.screen.state().enable_on_front = vec![10];
         let (desk, screen) = (rig.desk.clone(), rig.screen.clone());
         rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
             desk.state().frontmost = Some(THIRD);
@@ -2108,7 +2107,7 @@ async fn press_cancelled_while_blocked(switch: bool, input: bool) -> (Rig, Route
     let rig = rig(AppUse::Background, mail_desk()).await;
     let send = rig.send_id().await;
     rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
-    rig.screen.state().enable_on_front = Some(10);
+    rig.screen.state().enable_on_front = vec![10];
     let pressing = Arc::new(tokio::sync::Notify::new());
     let terminal_slot: Arc<StdMutex<Option<Arc<crate::TerminalArbiter>>>> = Arc::default();
     {
@@ -2183,4 +2182,482 @@ async fn a_person_switch_with_input_under_cancel_is_skipped_by_cleanup() {
     );
     routed.worker_finished_silently().await;
     assert_eq!(rig.screen.log(), ["front:4242"], "no restore request");
+}
+
+// ---------------------------------------------------------------------------
+// Batches, the press's own fronting outcomes, and the journal's records
+// ---------------------------------------------------------------------------
+
+/// A window with a Send and an Archive button, both of which the
+/// application disables while it is in the background.
+fn two_button_desk() -> support::Desk {
+    support::Desk::new(vec![RawElement::fixture(1, "AXWindow")
+        .titled("Mail")
+        .with_children(vec![
+            RawElement::fixture(10, "AXButton").titled("Send"),
+            RawElement::fixture(11, "AXButton").titled("Archive"),
+        ])])
+    .with_element(
+        10,
+        support::DeskElement {
+            facts: ElementFacts {
+                title: Some("Send".into()),
+                ..support::facts("AXButton", &["AXPress"])
+            },
+            ..support::DeskElement::default()
+        },
+    )
+    .with_element(
+        11,
+        support::DeskElement {
+            facts: ElementFacts {
+                title: Some("Archive".into()),
+                ..support::facts("AXButton", &["AXPress"])
+            },
+            ..support::DeskElement::default()
+        },
+    )
+}
+
+/// The ids of the Send and Archive buttons, from a background read, with
+/// both buttons then reading disabled until the target is fronted.
+async fn two_disabled_buttons(rig: &Rig) -> (String, String) {
+    let reply = rig.read().await;
+    let tree = reply["state_text"].as_str().unwrap();
+    let id_of = |label: &str| {
+        tree.lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no {label} in {tree}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let ids = (id_of("Send"), id_of("Archive"));
+    for token in [10, 11] {
+        rig.desk.state().elements.get_mut(&token).unwrap().enabled = Some(false);
+    }
+    rig.screen.state().enable_on_front = vec![10, 11];
+    ids
+}
+
+/// The open results of the journal's finalized and rejected rows, in order.
+/// Every entry is decoded with the codec's own entry decoder.
+fn journal_results(rig: &Rig) -> Vec<Value> {
+    let bytes = cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+        .journal()
+        .export_bytes();
+    let mut results = Vec::new();
+    for entry in serde_json::Deserializer::from_slice(&bytes).into_iter::<Value>() {
+        let entry = entry.expect("each entry is a JSON object");
+        let entry = cerebellum_computer::audit::ComputerJournalCodec::decode_entry(
+            entry.to_string().as_bytes(),
+        )
+        .expect("the codec decodes every entry");
+        let Some(material) = entry
+            .get("completed_result")
+            .or_else(|| entry.get("rejection_material"))
+        else {
+            continue;
+        };
+        let material: Vec<u8> = serde_json::from_value(material.clone()).unwrap();
+        results.push(serde_json::from_slice(&material).expect("an open JSON result"));
+    }
+    results
+}
+
+/// The `fronting` member of a row, decoded with the journal's record type.
+fn row_fronting(row: &Value) -> cerebellum_computer::audit::FrontingRecord {
+    serde_json::from_value(row["fronting"].clone())
+        .unwrap_or_else(|error| panic!("no fronting record in {row}: {error}"))
+}
+
+/// A batch of two presses on buttons the application disables in the
+/// background brings it forward once, presses both with it in front, and
+/// makes one restore decision after the last press.
+#[tokio::test]
+async fn a_batch_fronts_once_and_restores_once_after_its_last_press() {
+    let rig = rig(AppUse::Background, two_button_desk()).await;
+    let (send, archive) = two_disabled_buttons(&rig).await;
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_ids": [send, archive]}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(reply.get("stopped_at").is_none(), "{reply}");
+    assert_eq!(
+        reply["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["outcome"].clone())
+            .collect::<Vec<_>>(),
+        [json!("completed"), json!("completed")]
+    );
+    assert_eq!(
+        reply["fronting"],
+        json!({"mode":"background","fronted":true,"purpose":"needs_front",
+            "restore":"restored"})
+    );
+    assert_eq!(rig.desk.state().presses, [10, 11]);
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "restore:100"],
+        "one front and one restore for the whole batch"
+    );
+    assert!(!rig.lock.held());
+}
+
+/// A later step whose admission would have to ask the person, because the
+/// app grant is no longer held, stops the batch there with `stopped_at`
+/// instead of waiting with the application in front; the restore decision
+/// still runs.
+#[tokio::test]
+async fn a_batch_step_that_would_wait_stops_the_run_and_still_restores() {
+    let rig = rig(AppUse::Background, two_button_desk()).await;
+    let (send, archive) = two_disabled_buttons(&rig).await;
+    let management = rig.management.clone();
+    rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+        let store = management.computer_grants().agent_grants();
+        let _ = store.revoke_matching(store.now_ms(), |_| true);
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_ids": [send, archive]}),
+        )
+        .await;
+    assert_eq!(reply["stopped_at"], 2, "{reply}");
+    assert_eq!(reply["steps"][0]["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["steps"][1]["outcome"], "consent_unavailable",
+        "{reply}"
+    );
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(
+        rig.desk.state().presses,
+        [10],
+        "the later step was not pressed"
+    );
+    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    assert!(!rig.lock.held());
+}
+
+/// A press on an element that reads disabled while its application is
+/// already frontmost takes the ordinary path: it refuses at once, never
+/// waiting on a fronting lock another call holds, and fronts nothing.
+#[tokio::test(start_paused = true)]
+async fn a_disabled_press_on_a_frontmost_app_never_waits_on_the_lock() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.desk.state().frontmost = Some(TARGET);
+    let held = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
+    drop(held);
+}
+
+/// The previous application could not be put back after a fronted press:
+/// the reply is `restore_failed` with a remedy naming the target left in
+/// front and its bundle identity, and none of the keystroke rows' restore
+/// fields.
+#[tokio::test]
+async fn a_failed_press_restore_discloses_only_the_press_fields() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let screen = rig.screen.clone();
+    rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+        // The previous application will not come back.
+        screen.state().comes_forward = false;
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "restore_failed", "{reply}");
+    assert_eq!(
+        reply["bundle_identity"],
+        support::TARGET_BUNDLE_ID,
+        "{reply}"
+    );
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("was left in front"),
+        "{reply}"
+    );
+    assert_eq!(reply["fronting"]["restore"], "failed", "{reply}");
+    for field in [
+        "detail",
+        "effect_status",
+        "posts_returned",
+        "target_fronted",
+        "held_state",
+    ] {
+        assert!(reply.get(field).is_none(), "{field} in {reply}");
+    }
+    assert_eq!(rig.desk.state().presses, [10]);
+}
+
+/// A fronted press that took effect after its front outlasted the bound is
+/// returned as completed, saying so, rather than refused.
+#[tokio::test]
+async fn a_press_that_took_effect_past_the_bound_says_so() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let screen = rig.screen.clone();
+    rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+        screen.state().now += 2 * cerebellum_computer::dispatch::PRESS_FRONTING_BOUND_MS;
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting_bound_exceeded"], true, "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+
+    // Within the bound, the reply does not carry the field at all.
+    let rig = rig_again(AppUse::Background).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(reply.get("fronting_bound_exceeded").is_none(), "{reply}");
+}
+
+async fn rig_again(mode: AppUse) -> Rig {
+    rig(mode, mail_desk()).await
+}
+
+/// The rows of a fronted press record how its front ended: the press's
+/// finalized row, and a refusal's rejected row, each carry the fronting the
+/// reply reports, and a still-disabled element is refused once.
+#[tokio::test]
+async fn fronted_press_rows_record_how_the_front_ended() {
+    use cerebellum_computer::audit::{
+        FrontingRecordMode, FrontingRecordPurpose, FrontingRecordRestore,
+    };
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    let rows = journal_results(&rig);
+    let pressed: Vec<_> = rows
+        .iter()
+        .filter(|row| row["outcome"] == "completed")
+        .collect();
+    assert_eq!(pressed.len(), 1, "{rows:?}");
+    let record = row_fronting(pressed[0]);
+    assert_eq!(record.mode, FrontingRecordMode::Background);
+    assert!(record.fronted);
+    assert_eq!(record.purpose, FrontingRecordPurpose::NeedsFront);
+    assert_eq!(record.restore, FrontingRecordRestore::Restored);
+    assert_eq!(record.preview_frames, 0);
+
+    // Still disabled in front: one refusal, written after the restore.
+    let rig = rig_again(AppUse::Background).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "element_disabled", "{reply}");
+    let rows = journal_results(&rig);
+    let refused: Vec<_> = rows
+        .iter()
+        .filter(|row| row["outcome"] == "element_disabled")
+        .collect();
+    assert_eq!(refused.len(), 1, "one refusal, not two: {rows:?}");
+    let record = row_fronting(refused[0]);
+    assert!(record.fronted);
+    assert_eq!(record.restore, FrontingRecordRestore::Restored);
+}
+
+/// A foreground read's row records its one-way front under `fronting`, and
+/// an ordinary background press's row records that nothing was fronted.
+#[tokio::test]
+async fn read_and_ordinary_press_rows_record_their_fronting() {
+    use cerebellum_computer::audit::{FrontingRecordPurpose, FrontingRecordRestore};
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    let reply = rig.read().await;
+    assert_eq!(reply["fronting"]["fronted"], true, "{reply}");
+    let rows = journal_results(&rig);
+    let read = rows
+        .iter()
+        .find(|row| row.get("element_count").is_some())
+        .unwrap_or_else(|| panic!("no read row in {rows:?}"));
+    let record = row_fronting(read);
+    assert!(record.fronted);
+    assert_eq!(record.purpose, FrontingRecordPurpose::ForegroundMode);
+    assert_eq!(record.restore, FrontingRecordRestore::LeftInFront);
+    assert!(
+        rows.iter().all(|row| row["outcome"] != "fronted"),
+        "the read's own row records the front: {rows:?}"
+    );
+
+    let rig = rig_again(AppUse::Background).await;
+    let send = rig.send_id().await;
+    let reply = rig
+        .call("computer.press_element", json!({"element_id": send}))
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    let rows = journal_results(&rig);
+    let pressed = rows
+        .iter()
+        .find(|row| row["outcome"] == "completed")
+        .unwrap_or_else(|| panic!("no press row in {rows:?}"));
+    let record = row_fronting(pressed);
+    assert!(!record.fronted);
+    assert_eq!(record.purpose, FrontingRecordPurpose::None);
+    assert_eq!(record.restore, FrontingRecordRestore::NotNeeded);
+}
+
+/// A foreground press fronts and then presses: its own row records the
+/// one-way front, and no separate `fronted` row is written for it.
+#[tokio::test]
+async fn a_foreground_press_records_its_front_on_its_own_row() {
+    use cerebellum_computer::audit::FrontingRecordRestore;
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    let rig = rig.with_mode(AppUse::Foreground);
+    let reply = rig
+        .call("computer.press_element", json!({"element_id": send}))
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "left_in_front", "{reply}");
+    let rows = journal_results(&rig);
+    assert!(
+        rows.iter().all(|row| row["outcome"] != "fronted"),
+        "{rows:?}"
+    );
+    let pressed = rows
+        .iter()
+        .find(|row| row["outcome"] == "completed")
+        .unwrap_or_else(|| panic!("no press row in {rows:?}"));
+    assert_eq!(
+        row_fronting(pressed).restore,
+        FrontingRecordRestore::LeftInFront
+    );
+}
+
+/// A foreground front followed by a refusal before the action wrote any row
+/// of its own: the front is journaled on its own rejected row, with outcome
+/// `fronted`, once.
+#[tokio::test]
+async fn a_front_then_an_early_refusal_writes_its_own_fronted_row() {
+    use cerebellum_computer::audit::FrontingRecordRestore;
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    // The keystrokes are refused once the front is done, when the focused
+    // element they would go to cannot be read.
+    rig.desk.state().focus = support::DeskFocus::Unreadable;
+    let before = journal_results(&rig).len();
+    let reply = rig
+        .call(
+            "computer.type",
+            json!({"text": "hi", "target": support::TARGET_BUNDLE_ID}),
+        )
+        .await;
+    assert_eq!(reply["fronting"]["fronted"], true, "{reply}");
+    assert_ne!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242"]);
+    let rows = journal_results(&rig);
+    let fronted: Vec<_> = rows[before..]
+        .iter()
+        .filter(|row| row["outcome"] == "fronted")
+        .collect();
+    assert_eq!(fronted.len(), 1, "{rows:?}");
+    let record = row_fronting(fronted[0]);
+    assert!(record.fronted);
+    assert_eq!(record.restore, FrontingRecordRestore::LeftInFront);
+    assert_eq!(
+        fronted[0]["grant_identity"]["bundle_identity"],
+        support::TARGET_BUNDLE_ID
+    );
+}
+
+/// A background Command chord's actuation row records its temporary front,
+/// and it still decodes with the row type as it was before the record
+/// existed.
+#[tokio::test]
+async fn a_chord_row_records_its_front_and_decodes_with_the_older_type() {
+    use cerebellum_computer::audit::{
+        ActuationOutcome, FrontingRecordPurpose, FrontingRecordRestore, RecordedActuationOutcome,
+    };
+    /// `RecordedActuationOutcome` as it was before it gained `fronting`.
+    #[derive(serde::Deserialize)]
+    struct BeforeFronting {
+        #[serde(flatten)]
+        outcome: ActuationOutcome,
+        #[serde(flatten, default)]
+        #[allow(dead_code)]
+        routes: cerebellum_computer::platform::input_route::InputRouteEvidence,
+    }
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let reply = rig
+        .call_under(&under_terminal(), "computer.keys", command_chord())
+        .await;
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    let rows = journal_results(&rig);
+    let actuation = rows
+        .iter()
+        .find(|row| row.get("fronting").is_some() && row["outcome"] == "handler_returned")
+        .unwrap_or_else(|| panic!("no actuation row with fronting in {rows:?}"));
+    let recorded: RecordedActuationOutcome = serde_json::from_value(actuation.clone()).unwrap();
+    let record = recorded
+        .fronting
+        .expect("the chord's row records its front");
+    assert!(record.fronted);
+    assert_eq!(record.purpose, FrontingRecordPurpose::NeedsFront);
+    assert_eq!(record.restore, FrontingRecordRestore::Restored);
+    let older: BeforeFronting = serde_json::from_value(actuation.clone()).unwrap();
+    assert_eq!(older.outcome, recorded.outcome);
 }

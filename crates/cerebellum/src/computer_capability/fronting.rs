@@ -287,26 +287,36 @@ pub(crate) struct PendingFrontRow {
     pub(crate) fronting: Fronting,
 }
 
-/// The call's [`PendingFrontRow`], shared between the action and the code
-/// that serves it.
-pub(crate) type CallFront = Arc<StdMutex<Option<PendingFrontRow>>>;
+/// What the code serving a call learns of the call's one-way front once the
+/// action returned.
+#[derive(Default)]
+pub(crate) struct CallFrontEnd {
+    /// The one-way front the call made, if it made one. A reply that ended
+    /// without saying how it used the front reports this.
+    pub(crate) fronting: Option<Fronting>,
+    /// That front, when no row of the action recorded it.
+    pub(crate) unrecorded: Option<PendingFrontRow>,
+}
+
+type CallFront = Arc<StdMutex<CallFrontEnd>>;
 
 tokio::task_local! {
     static CALL_FRONT: CallFront;
 }
 
-/// Run `action` with a fresh [`CallFront`], returned with its reply so the
-/// caller can journal a front that no row of the action recorded.
+/// Run `action` while recording any one-way front it makes, returned with
+/// its reply so the caller can report and journal that front.
 pub(crate) async fn tracking_call_front<F: std::future::Future>(
     action: F,
-) -> (F::Output, Option<PendingFrontRow>) {
+) -> (F::Output, CallFrontEnd) {
     let cell = CallFront::default();
     let output = CALL_FRONT.scope(Arc::clone(&cell), action).await;
-    let pending = cell
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    (output, pending)
+    let end = std::mem::take(
+        &mut *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    (output, end)
 }
 
 /// Remember that this call brought `grant` to the front one way. Until the
@@ -315,9 +325,11 @@ pub(crate) async fn tracking_call_front<F: std::future::Future>(
 /// unrecorded. Outside a tracked call this does nothing.
 fn note_one_way_front(grant: &ProcessGrant, fronting: Fronting) {
     let _ = CALL_FRONT.try_with(|cell| {
-        *cell
+        let mut end = cell
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingFrontRow {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        end.fronting = Some(fronting);
+        end.unrecorded = Some(PendingFrontRow {
             grant: grant.clone(),
             fronting,
         });
@@ -331,6 +343,7 @@ pub(crate) fn action_row_started() {
     let _ = CALL_FRONT.try_with(|cell| {
         cell.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unrecorded
             .take();
     });
 }

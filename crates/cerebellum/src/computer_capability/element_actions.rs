@@ -49,9 +49,9 @@ use serde_json::{json, Value};
 
 use super::cursor::{Arrival, BadgeWatch, Landing};
 use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
-use cerebellum_core::config::AppUse;
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
+use cerebellum_core::config::AppUse;
 
 /// How often the state is re-read while waiting for an action's effect.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
@@ -640,9 +640,8 @@ where
     }
 
     fn write_refusal(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
-        let material = self.with_fronting(
-            json!({"outcome": outcome, "role": role, "grant_identity": self.grant}),
-        );
+        let material = self
+            .with_fronting(json!({"outcome": outcome, "role": role, "grant_identity": self.grant}));
         self.audit
             .reject(self.identity.clone(), descriptor(self.capability), material)
             .map_err(|_| ())
@@ -2043,33 +2042,37 @@ where
             // refused hit test does. That row is this action's own.
             super::fronting::action_row_started();
             let mut audit = AuditToken::new(self.audit.clone(), work.gate());
-            return PressDone::alone(tokio::task::spawn_blocking(move || {
-                let _ax = work.bound_ax();
-                let _scope = AccessibilityReadScope::new(grant.pid, reads);
-                if audit
-                    .record_accessibility_read(identity, capability, &grant, || ())
-                    .is_err()
-                {
-                    return audit_unavailable_reply(false);
-                }
-                reply
-            })
-            .await
-            .unwrap_or_else(|_| audit_unavailable_reply(false)));
+            return PressDone::alone(
+                tokio::task::spawn_blocking(move || {
+                    let _ax = work.bound_ax();
+                    let _scope = AccessibilityReadScope::new(grant.pid, reads);
+                    if audit
+                        .record_accessibility_read(identity, capability, &grant, || ())
+                        .is_err()
+                    {
+                        return audit_unavailable_reply(false);
+                    }
+                    reply
+                })
+                .await
+                .unwrap_or_else(|_| audit_unavailable_reply(false)),
+            );
         }
         let gate = BadgeGate::new(work.gate(), watch);
         // The press's own row records any front this call made.
         super::fronting::action_row_started();
         if needs_front {
-            let later = (!later.is_empty()).then(|| fronted_press::later_steps(
-                &self.cursor,
-                &source,
-                management,
-                consent,
-                &grant,
-                &identity.agent_project_id,
-                later,
-            ));
+            let later = (!later.is_empty()).then(|| {
+                fronted_press::later_steps(
+                    &self.cursor,
+                    &source,
+                    management,
+                    consent,
+                    &grant,
+                    &identity.agent_project_id,
+                    later,
+                )
+            });
             return self
                 .press_fronted(FrontedPress {
                     identity,

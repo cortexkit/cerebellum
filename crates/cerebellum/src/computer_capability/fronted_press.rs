@@ -526,10 +526,7 @@ where
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut later = later;
-            let mut steps = vec![PressStep {
-                element_id,
-                handle,
-            }];
+            let mut steps = vec![PressStep { element_id, handle }];
             if let Some(later) = later.as_mut() {
                 steps.append(&mut later.steps);
             }
@@ -688,11 +685,18 @@ where
             }
             let mut restore_failed = json!({});
             if let Some(decided) = decided {
-                disclose_failed_press_restore(&mut restore_failed, decided.restore, &grant, &app_name);
+                disclose_failed_press_restore(
+                    &mut restore_failed,
+                    decided.restore,
+                    &grant,
+                    &app_name,
+                );
             }
             let mut replies = replies.into_iter();
             PressDone {
-                reply: replies.next().unwrap_or_else(|| audit_unavailable_reply(false)),
+                reply: replies
+                    .next()
+                    .unwrap_or_else(|| audit_unavailable_reply(false)),
                 later: replies.collect(),
                 ending: Some(FrontedEnding {
                     fronting,
