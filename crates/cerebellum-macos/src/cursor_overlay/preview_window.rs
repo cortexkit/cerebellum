@@ -29,8 +29,8 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSFont, NSFontWeightRegular,
     NSFontWeightSemibold, NSGraphicsContext, NSImage, NSLineBreakMode, NSTextAlignment,
     NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowSharingType,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -299,6 +299,11 @@ impl PreviewWindow {
         panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
         panel.setLevel(3); // NSFloatingWindowLevel, never the normal layer (0).
         panel.setIgnoresMouseEvents(true);
+        // The preview shows a window the person had covered, possibly another
+        // app's private content. Keep it out of screen sharing, recordings and
+        // screenshots, which would otherwise capture it with the rest of the
+        // display.
+        panel.setSharingType(NSWindowSharingType::None);
         panel.setHasShadow(true);
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));

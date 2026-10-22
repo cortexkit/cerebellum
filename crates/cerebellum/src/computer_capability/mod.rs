@@ -2674,6 +2674,7 @@ where
                     &grant,
                     settle,
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
+                    &mut element_actions::person_input_not_watched,
                 );
                 element_actions::add_diff_view(&mut finished, observed.as_ref(), &view);
                 finished

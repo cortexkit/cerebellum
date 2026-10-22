@@ -25,7 +25,7 @@ use crate::terminal_arbiter::{FrontingPurpose, RestoreCell, RestoreDecided};
 use cerebellum_computer::dispatch::{
     not_fronted_reason, run_fronting_press, FrontingBracketHost, FrontingPressHost, FrontingStop,
     HeartbeatObservation, HeartbeatProbe, PressPlan, PressPreRead, PressRunStop, RestoreClaim,
-    RestoreStatus, SeizeWatcher, SourcedInputEvent, UnitPosted,
+    RestoreStatus, SeizeWatcher, SettleEnd, SourcedInputEvent, UnitPosted,
 };
 use cerebellum_computer::platform::{FrontingSession, IdleReading, SequencePostFailure};
 use cerebellum_core::config::AppUse;
@@ -164,6 +164,9 @@ where
     change: Option<PersonChange>,
     press_replies: Vec<Option<Value>>,
     observed: Vec<Option<SessionRead>>,
+    /// A settle ended on the person's input, so the conversation's last-seen
+    /// marks must stay from before it.
+    person_input_in_settle: bool,
 }
 
 impl<R, T, S> FrontingBracketHost for FrontedPressHost<'_, R, T, S>
@@ -360,15 +363,35 @@ where
         self.press_replies[step] = Some(reply);
         done
     }
-    fn settle(&mut self, step: usize, bound_ms: u64) {
-        self.observed[step] = settle_and_observe_view(
-            self.source,
-            self.sessions,
-            self.conversation_key,
-            self.grant,
+    fn settle(
+        &mut self,
+        step: usize,
+        bound_ms: u64,
+        person_acted: &mut dyn FnMut(&mut Self) -> bool,
+    ) -> SettleEnd {
+        let (source, sessions, conversation_key, grant) =
+            (self.source, self.sessions, self.conversation_key, self.grant);
+        let expand_menus = self.expand_menus;
+        let mut acted = false;
+        let observed = settle_and_observe_view(
+            source,
+            sessions,
+            conversation_key,
+            grant,
             Duration::from_millis(bound_ms),
-            self.expand_menus,
+            expand_menus,
+            &mut || {
+                acted = acted || person_acted(self);
+                acted
+            },
         );
+        self.observed[step] = observed;
+        if acted {
+            self.person_input_in_settle = true;
+            SettleEnd::PersonInput
+        } else {
+            SettleEnd::Quiet
+        }
     }
     fn claim_restore(&mut self) -> RestoreClaim {
         let Some(cell) = self.cell.clone() else {
@@ -378,7 +401,10 @@ where
         // made; either way this run reports it.
         let decided = decide_with_restore_budget(&cell);
         self.decided = Some(decided);
-        if decided.restore == RestoreStatus::Restored {
+        // After a settle the person's input ended, the marks read now would
+        // include what they did in the application, so they are not taken
+        // as what the conversation was shown.
+        if decided.restore == RestoreStatus::Restored && !self.person_input_in_settle {
             absorb_own_front(
                 self.source,
                 self.sessions,
@@ -588,6 +614,7 @@ where
                 change: None,
                 press_replies: steps.iter().map(|_| None).collect(),
                 observed: steps.iter().map(|_| None).collect(),
+                person_input_in_settle: false,
             };
             let report = run_fronting_press(
                 &mut host,
