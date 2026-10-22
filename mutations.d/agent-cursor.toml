@@ -465,3 +465,89 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-fronting-needs-the-app-use-review"
+guards = "fronting outside the keystroke bracket (foreground one-way fronts, needs-front presses and chords under the app grant, the person-switch restore skip, held-input restore ordering) is admitted only when the app-use review is bound beside the takeover review"
+file = "crates/cerebellum/src/lib.rs"
+old = "    ) && release_attestation_bound(\n        \"app_use_fronting_review_revision\",\n        inputs.app_use_fronting_review_revision.as_deref(),\n    )"
+new = "    ) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::a_stand_in_app_use_review_admits_no_fronting_and_no_preview_capture",
+    "tests::each_attestation_combination_admits_exactly_its_fronting_paths",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn app_use_fronting_admitted("
+before = "\n}\n"
+
+[[control]]
+id = "preview-capture-needs-the-capture-review"
+guards = "the background-mode preview captures a covered window only when the capture review is bound beside the app-use review; otherwise it shows the application's icon"
+file = "crates/cerebellum/src/lib.rs"
+old = "    release_attestation_bound(\n        \"capture_review_revision\",\n        inputs.capture_review_revision.as_deref(),\n    ) && release_attestation_bound("
+new = "    release_attestation_bound( // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::each_attestation_combination_admits_exactly_its_fronting_paths",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn preview_capture_admitted("
+before = "\n}\n"
+
+[[control]]
+id = "app-use-review-stand-in-binds-nothing"
+guards = "a stand-in app-use review value such as \"placeholder\" or a blank string admits neither fronting outside the bracket nor preview capture, as the release gate reports it"
+file = "crates/cerebellum/src/lib.rs"
+old = "    matches!(pin_outcome(gate, value, None), ComputerGateOutcome::Pass)"
+new = "    let _ = gate; // NON-VACUITY BREAK\n    value.is_some()"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::a_stand_in_app_use_review_admits_no_fronting_and_no_preview_capture",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-review-is-reported-in-release-evidence"
+guards = "release evidence reports the app-use fronting review from the compiled release inputs, as it does every other external attestation"
+file = "crates/cerebellum/src/lib.rs"
+old = "        \"app_use_fronting_review_revision\" => inputs.app_use_fronting_review_revision.as_deref(),"
+new = "        \"app_use_fronting_review_revision\" => None, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::app_use_fronting_review_is_reported_and_gates_no_row",
+    "tests::struck_gates_remain_recorded_and_are_not_evaluated",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

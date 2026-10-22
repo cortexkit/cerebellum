@@ -23,6 +23,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
         app_state_review_revision: Some("fixture-app-state-review-v1".into()),
         element_addressed_review_revision: Some("fixture-element-addressed-review-v1".into()),
         takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review-v1".into()),
+        app_use_fronting_review_revision: Some("fixture-app-use-fronting-review-v1".into()),
         windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
         vocabulary_digests: VocabularyDigestInputs {
@@ -86,7 +87,7 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
 fn no_app_identity_reader_means_no_computer_advertisement_even_with_all_release_bindings() {
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 14]);
+    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 15]);
     assert_eq!(evidence.canonical_row_count, 12);
     assert!(
         evidence.advertised_capabilities.is_empty(),
@@ -461,7 +462,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 14],
+        vec![ComputerGateOutcome::Pass; 15],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -476,6 +477,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "app_state_review_revision",
         "element_addressed_review_revision",
         "takeover_dispatch_review_revision",
+        "app_use_fronting_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
@@ -496,6 +498,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "app_state_review_revision" => inputs.app_state_review_revision = None,
             "element_addressed_review_revision" => inputs.element_addressed_review_revision = None,
             "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision = None,
+            "app_use_fronting_review_revision" => inputs.app_use_fronting_review_revision = None,
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
             "vocabulary_source_lock_digest" => inputs.vocabulary_digests.source_lock_digest = None,
@@ -572,9 +575,12 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             }
             // No served row is reviewed under these any more, so withholding
             // one withholds nothing.
+            // The app-use review admits fronting and preview capture inside
+            // rows other reviews admit; it governs no row of its own.
             "capture_review_revision"
             | "semantic_actuation_review_revision"
-            | "windows_actuation_review_revision" => assert_eq!(
+            | "windows_actuation_review_revision"
+            | "app_use_fronting_review_revision" => assert_eq!(
                 admitted,
                 available_capabilities(&complete),
                 "{gate} governs no served row"

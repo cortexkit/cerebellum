@@ -245,6 +245,14 @@ pub struct ImmutableReleaseInputs {
     /// takeover pointer rows and the fronting bracket that brings a
     /// background application forward for keystrokes.
     pub takeover_dispatch_review_revision: Option<String>,
+    /// The review of background app use: bringing an application forward
+    /// outside the keystroke bracket (one-way fronting in foreground mode, and
+    /// fronting a press or a modifier chord under the app grant alone, with
+    /// its restore decision), and capturing a covered window's pixels for the
+    /// preview outside capture custody. It gates no capability row; together
+    /// with the takeover review it admits that fronting, and together with the
+    /// capture review it admits that capture.
+    pub app_use_fronting_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
 }
