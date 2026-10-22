@@ -1540,3 +1540,22 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-serve-action-boxed-where-built"
+guards = "the serve path boxes the action match it wraps in call-front tracking, so a real computer call still fits half a default thread stack on macOS"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "fronting::tracking_call_front(Box::pin(async {"
+new = "fronting::tracking_call_front((async { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_consent_wire_tests/stack_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

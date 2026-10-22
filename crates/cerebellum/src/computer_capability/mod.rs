@@ -981,67 +981,77 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(app_use::call_mode());
-                        let (mut reply, call_front) = fronting::tracking_call_front(async {
-                            match capability.0 {
-                                Served::ReadState => {
-                                    self.serve_read_state(arguments, context, make_backend)
+                        // Boxed where it is built: the match holds every
+                        // action's future, and wrapping it unboxed in the
+                        // call-front tracking would copy it into this block's
+                        // state several times over, on the stack of a thread
+                        // that polls a real call.
+                        let (mut reply, call_front) =
+                            fronting::tracking_call_front(Box::pin(async {
+                                match capability.0 {
+                                    Served::ReadState => {
+                                        self.serve_read_state(arguments, context, make_backend)
+                                            .await
+                                    }
+                                    Served::Wait => self.serve_wait(arguments, context).await,
+                                    Served::OpenApp => {
+                                        self.serve_open_app(arguments, context).await
+                                    }
+                                    Served::ListApps => {
+                                        self.serve_list_apps(arguments, context).await
+                                    }
+                                    Served::PressElement => {
+                                        self.serve_press_element(arguments, context).await
+                                    }
+                                    Served::PressPoint => {
+                                        self.serve_press_point(arguments, context).await
+                                    }
+                                    Served::WriteText => {
+                                        self.serve_write_text(arguments, context).await
+                                    }
+                                    Served::Type => synthetic_wire_envelope(
+                                        self.serve_synthetic(
+                                            ComputerCapability::Type,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await,
+                                    ),
+                                    Served::Keys => synthetic_wire_envelope(
+                                        self.serve_synthetic(
+                                            ComputerCapability::Keys,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await,
+                                    ),
+                                    Served::TakeoverMove => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverMove,
+                                            arguments,
+                                            context,
+                                        )
                                         .await
+                                    }
+                                    Served::TakeoverDrag => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverDrag,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await
+                                    }
+                                    Served::TakeoverScroll => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverScroll,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await
+                                    }
                                 }
-                                Served::Wait => self.serve_wait(arguments, context).await,
-                                Served::OpenApp => self.serve_open_app(arguments, context).await,
-                                Served::ListApps => self.serve_list_apps(arguments, context).await,
-                                Served::PressElement => {
-                                    self.serve_press_element(arguments, context).await
-                                }
-                                Served::PressPoint => {
-                                    self.serve_press_point(arguments, context).await
-                                }
-                                Served::WriteText => {
-                                    self.serve_write_text(arguments, context).await
-                                }
-                                Served::Type => synthetic_wire_envelope(
-                                    self.serve_synthetic(
-                                        ComputerCapability::Type,
-                                        arguments,
-                                        context,
-                                    )
-                                    .await,
-                                ),
-                                Served::Keys => synthetic_wire_envelope(
-                                    self.serve_synthetic(
-                                        ComputerCapability::Keys,
-                                        arguments,
-                                        context,
-                                    )
-                                    .await,
-                                ),
-                                Served::TakeoverMove => {
-                                    self.serve_takeover(
-                                        ComputerCapability::TakeoverMove,
-                                        arguments,
-                                        context,
-                                    )
-                                    .await
-                                }
-                                Served::TakeoverDrag => {
-                                    self.serve_takeover(
-                                        ComputerCapability::TakeoverDrag,
-                                        arguments,
-                                        context,
-                                    )
-                                    .await
-                                }
-                                Served::TakeoverScroll => {
-                                    self.serve_takeover(
-                                        ComputerCapability::TakeoverScroll,
-                                        arguments,
-                                        context,
-                                    )
-                                    .await
-                                }
-                            }
-                        })
-                        .await;
+                            }))
+                            .await;
                         if let Some(pending) = call_front.unrecorded {
                             self.journal_unrecorded_front(
                                 front_identity,
