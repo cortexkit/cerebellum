@@ -69,17 +69,19 @@ pub const NESTED_LOOSE_BYTES: usize = INLINE_BYTES;
 /// count once there are more than this many of them, outside a zoom.
 pub const REPEAT_THRESHOLD: usize = 3;
 
-/// A text filter that matches one text of a small row prints the whole row on
-/// one line (see `Tree::leaf_row`). A property line is a key and a value and a
-/// typical table row a handful of cells, so eight texts cover both, while a
-/// wider row is more likely a layout container whose other texts are
-/// unrelated to the match.
+/// The most text leaves a subtree may contain to print as one filtered row
+/// (see `Tree::leaf_row`). Leaves count across nested wrappers: a property
+/// line may wrap its key and value separately, and table cells may wrap their
+/// text. The smallest bounded ancestor with another word-bearing leaf gives
+/// the match context. Eight leaves cover both, while a wider subtree is more
+/// likely a layout container whose other texts are unrelated to the match.
 pub const ROW_LEAVES: usize = 8;
 
-/// The most bytes a row's joined texts may have to print as one line: about
-/// four lines of a terminal, enough for a key with a JSON string value or a
-/// row of short cells. A larger row prints only its matching text, as any
-/// other match does, so one long cell cannot flood a filtered reply.
+/// The most bytes a subtree's leaf texts, allowing a space per leaf, may
+/// have to print as one filtered row: about four lines of a terminal, enough
+/// for a key with a JSON string value or a row of short cells. A larger
+/// subtree keeps the matching text or smaller row, so one long cell cannot
+/// flood a filtered reply.
 pub const ROW_BYTES: usize = 300;
 
 /// Facts about one element the accessibility record alone does not carry,
@@ -784,26 +786,38 @@ impl<'a> Tree<'a> {
         role_match && text_match
     }
 
-    /// The texts of `node`'s children when they form one small row of plain
-    /// text: a property line in a key/value viewer (`event`,
-    /// `"boat_endpoint_withdrawn"`) or a short table row. A filter that
-    /// matches one of them prints them all, because a key without its value,
-    /// or one cell without the rest of its row, does not answer the search.
+    /// The leaf nodes and their texts when `node`'s subtree is small and plain
+    /// text only. Nested wrappers are allowed so a property line can wrap its
+    /// key and value separately, and table cells can wrap their text.
     ///
-    /// `None` when any child has children of its own, is a control or a text
-    /// field (whose ref or withheld value a joined line would lose), when
-    /// `node` is the page or a landmark (a list or a table is a region, not a
-    /// row), or when the row exceeds [`ROW_LEAVES`] or [`ROW_BYTES`].
-    fn leaf_row(&self, node: usize) -> Option<Vec<String>> {
-        let kids = &self.kids[node];
-        if node == 0 || self.is_landmark(node) || kids.len() < 2 || kids.len() > ROW_LEAVES {
+    /// `None` when the subtree contains a control or a text field (whose ref
+    /// or withheld value a joined line would lose), the page or a landmark
+    /// (a list or a table is a region, not a row), or more than [`ROW_LEAVES`]
+    /// leaves or [`ROW_BYTES`] bytes. A single leaf is allowed while searching
+    /// ancestors, but cannot supply another word-bearing leaf on its own.
+    fn leaf_row(&self, node: usize) -> Option<Vec<(usize, String)>> {
+        if node == 0 || self.is_landmark(node) {
             return None;
         }
+        let mut pending = vec![node];
         let mut texts = Vec::new();
         let mut bytes = 0;
-        for &kid in kids {
+        let mut leaves = 0;
+        while let Some(kid) = pending.pop() {
             let role = self.role(kid);
-            if !self.kids[kid].is_empty() || is_actionable(role) || is_text_field(role) {
+            if self.is_landmark(kid)
+                || is_actionable(role)
+                || is_text_field(role)
+                || is_value_control(role)
+            {
+                return None;
+            }
+            if !self.kids[kid].is_empty() {
+                pending.extend(self.kids[kid].iter().rev().copied());
+                continue;
+            }
+            leaves += 1;
+            if leaves > ROW_LEAVES {
                 return None;
             }
             let mut text = self.names[kid].clone();
@@ -820,9 +834,47 @@ impl<'a> Tree<'a> {
             if bytes > ROW_BYTES {
                 return None;
             }
-            texts.push(text);
+            texts.push((kid, text));
         }
         Some(texts)
+    }
+
+    /// Give each matching leaf its nearest bounded text-only ancestor with
+    /// another word-bearing leaf. Quotes and separators alone do not give a
+    /// key its value, and climbing farther would include unrelated properties.
+    fn collect_filter_rows(
+        &self,
+        node: usize,
+        filters: &Filters,
+        ancestors: &mut Vec<usize>,
+        rows: &mut HashMap<usize, String>,
+    ) {
+        if self.kids[node].is_empty() && self.matches(node, filters) {
+            for &ancestor in ancestors.iter().rev() {
+                let Some(texts) = self.leaf_row(ancestor) else {
+                    break;
+                };
+                if texts
+                    .iter()
+                    .any(|(leaf, text)| *leaf != node && text.chars().any(char::is_alphanumeric))
+                {
+                    rows.insert(
+                        ancestor,
+                        texts
+                            .into_iter()
+                            .map(|(_, text)| text)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    break;
+                }
+            }
+        }
+        ancestors.push(node);
+        for &kid in &self.kids[node] {
+            self.collect_filter_rows(kid, filters, ancestors, rows);
+        }
+        ancestors.pop();
     }
 
     /// Match only the label and the value the line can reveal. Walking the
@@ -834,19 +886,29 @@ impl<'a> Tree<'a> {
         filters: &Filters,
         out: &mut Vec<Line>,
     ) -> bool {
-        if let Some(texts) = filters.text.as_ref().and_then(|_| self.leaf_row(node)) {
-            if self.kids[node]
-                .iter()
-                .any(|&kid| self.matches(kid, filters))
-            {
-                let mut text = self
-                    .reference(node)
-                    .map(|reference| format!("{reference} "))
-                    .unwrap_or_default();
-                text.push_str(&texts.join(" "));
-                out.push(self.line(node, depth, text));
-                return true;
-            }
+        let mut rows = HashMap::new();
+        if filters.text.is_some() {
+            self.collect_filter_rows(node, filters, &mut Vec::new(), &mut rows);
+        }
+        self.filtered_lines_with_rows(node, depth, filters, &rows, out)
+    }
+
+    fn filtered_lines_with_rows(
+        &self,
+        node: usize,
+        depth: usize,
+        filters: &Filters,
+        rows: &HashMap<usize, String>,
+        out: &mut Vec<Line>,
+    ) -> bool {
+        if let Some(texts) = rows.get(&node) {
+            let mut text = self
+                .reference(node)
+                .map(|reference| format!("{reference} "))
+                .unwrap_or_default();
+            text.push_str(texts);
+            out.push(self.line(node, depth, text));
+            return true;
         }
         let line = self.element_text(node, self.name_chars(node));
         let matched = self.matches(node, filters);
@@ -857,8 +919,13 @@ impl<'a> Tree<'a> {
         }
         let mut below = false;
         for &kid in &self.kids[node] {
-            below |=
-                self.filtered_lines(kid, depth + usize::from(matched || labelled), filters, out);
+            below |= self.filtered_lines_with_rows(
+                kid,
+                depth + usize::from(matched || labelled),
+                filters,
+                rows,
+                out,
+            );
         }
         if !matched && !below {
             out.truncate(start);

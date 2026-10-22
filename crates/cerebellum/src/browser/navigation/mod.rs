@@ -7320,6 +7320,39 @@ mod tests {
     }
 
     #[test]
+    fn a_text_filter_match_in_nested_key_groups_prints_the_whole_property_line() {
+        let (observation, url) = fixture_observation(include_str!(
+            "../fixtures/observability_nested_property_page.json"
+        ));
+        let found = filtered_fixture(&observation, &url, "event", 65_536);
+        let reference = ref_line(&found.text, "' event ': 'boat_endpoint_withdrawn' ,")
+            .unwrap_or_else(|| panic!("{}", found.text));
+        assert!(found.printed_refs.contains(reference));
+        let property = observation
+            .records
+            .iter()
+            .find(|record| record.reference.as_deref() == Some(reference))
+            .unwrap();
+        assert_eq!(property.role, "generic");
+        assert_eq!(property.depth, 3, "the ref must name the property line");
+        assert!(!found.text.contains("outcome"), "{}", found.text);
+        assert!(!found.text.contains("requestId"), "{}", found.text);
+    }
+
+    #[test]
+    fn a_text_filter_match_in_a_property_value_prints_its_key_too() {
+        let (observation, url) = fixture_observation(include_str!(
+            "../fixtures/observability_nested_property_page.json"
+        ));
+        let found = filtered_fixture(&observation, &url, "boat", 65_536);
+        let reference = ref_line(&found.text, "' event ': 'boat_endpoint_withdrawn' ,")
+            .unwrap_or_else(|| panic!("{}", found.text));
+        assert!(found.printed_refs.contains(reference));
+        assert!(!found.text.contains("outcome"), "{}", found.text);
+        assert!(!found.text.contains("requestId"), "{}", found.text);
+    }
+
+    #[test]
     fn a_text_filter_match_in_a_table_cell_prints_its_whole_row() {
         let (observation, url) = fixture_observation(OBSERVABILITY);
         let found = filtered_fixture(&observation, &url, "POST /withdraw", 65_536);
