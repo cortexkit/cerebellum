@@ -538,6 +538,10 @@ async fn user_browser_writer_rejects_broad_or_worker_permanent_answers() {
                         channel: 1,
                         epoch: 1,
                     },
+                    inbound: Route {
+                        channel: 1,
+                        epoch: 1,
+                    },
                     cancel: CancelHandle::pending(),
                     connection: fixture.epoch,
                     action: "open_grant",

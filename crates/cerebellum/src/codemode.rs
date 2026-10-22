@@ -97,6 +97,16 @@ pub(crate) fn app(bundle: &str) {
     });
 }
 
+/// Name the site a held or refused codemode step is about, when the call's
+/// arguments did not (a user-browser read names a tab, not a site).
+pub(crate) fn origin(origin: &str) {
+    let _ = CALL_DETAIL.try_with(|detail| {
+        if let Some(detail) = detail.borrow_mut().as_mut() {
+            detail["origin"] = json!(origin);
+        }
+    });
+}
+
 pub(crate) fn legacy_run(facts: &AcceptedBindFacts) -> bool {
     facts.codemode_head.is_none()
         && (facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
@@ -268,8 +278,58 @@ impl ParentRefusal {
     }
 }
 
+/// The admitted head route a run borrows, re-resolved for this request, with
+/// the (channel, epoch) its bind holds. `Ok(None)` for a route that is not a
+/// run. Every request on a run route goes through this check, and every key a
+/// run's user-browser call uses comes from its result.
+pub(crate) fn live_head(
+    planes: &crate::Planes,
+    facts: &AcceptedBindFacts,
+) -> Result<Option<(crate::user_browser_bridge::Route, AcceptedBindFacts)>, ParentRefusal> {
+    if facts.codemode_head.is_none() {
+        return Ok(None);
+    }
+    let (route, head) = planes
+        .routes
+        .run_head_route(facts.scope.as_ref().expect("admitted run stamp"))?;
+    if head.identity.conversation_key != facts.identity.conversation_key
+        || head
+            .scope
+            .as_ref()
+            .is_some_and(|stamp| planes.scopes.is_superseded(stamp))
+    {
+        return Err(ParentRefusal::NoLiveHead);
+    }
+    Ok(Some((route, head)))
+}
+
+/// The route whose claims, snapshots, element refs and quarantine a request on
+/// (`channel`, `epoch`) uses in the person's own Chrome. A run acts as its
+/// head, so a tab the head claimed is the run's to use, and a tab the run
+/// claims stays with the head after the run's route closes. Any other route
+/// is its own key.
+pub(crate) fn user_browser_route(
+    planes: &crate::Planes,
+    channel: u16,
+    epoch: u32,
+) -> Result<crate::user_browser_bridge::Route, ParentRefusal> {
+    let own = crate::user_browser_bridge::Route { channel, epoch };
+    let Some(facts) = planes.routes.get(channel, epoch) else {
+        return Ok(own);
+    };
+    Ok(live_head(planes, &facts)?.map_or(own, |(head, _)| head))
+}
+
 impl RouteBindings {
     pub(crate) fn run_head(&self, run: &ScopeStamp) -> Result<AcceptedBindFacts, ParentRefusal> {
+        self.run_head_route(run).map(|(_, head)| head)
+    }
+
+    /// [`Self::run_head`], with the head route's (channel, epoch).
+    pub(crate) fn run_head_route(
+        &self,
+        run: &ScopeStamp,
+    ) -> Result<(crate::user_browser_bridge::Route, AcceptedBindFacts), ParentRefusal> {
         if run.parent_state != Some(ParentState::Linked) {
             return Err(ParentRefusal::NotLinked);
         }
@@ -301,10 +361,16 @@ impl RouteBindings {
         // A head may have both management and tool routes. Choose consistently;
         // they name the same head context, not whichever hash entry happens first.
         heads.sort_by_key(|(key, _)| **key);
-        let (_, head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
+        let ((channel, epoch), head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
         if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
             return Err(ParentRefusal::AgentMismatch);
         }
-        Ok((*head).clone())
+        Ok((
+            crate::user_browser_bridge::Route {
+                channel: *channel,
+                epoch: *epoch,
+            },
+            (*head).clone(),
+        ))
     }
 }

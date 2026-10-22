@@ -69,6 +69,10 @@ async fn user_browser_retains_the_authorizing_row_and_rechecks_it_before_plan_di
             channel: 1,
             epoch: 1,
         },
+        inbound: Route {
+            channel: 1,
+            epoch: 1,
+        },
         cancel: CancelHandle::pending(),
         connection: fixture.epoch,
         action: "navigate",
