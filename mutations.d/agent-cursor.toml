@@ -2259,3 +2259,174 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-helper-idle-cpu-limit"
+guards = "the app-use desk probe fails a helper that uses more than 10 ms of CPU across the idle window"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "    if delta_ns <= HELPER_IDLE_CPU_LIMIT_NS {"
+new = "    if delta_ns <= HELPER_IDLE_CPU_LIMIT_NS * 2 { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::the_helper_may_use_at_most_ten_milliseconds_while_idle",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-module-idle-cpu-tolerance"
+guards = "the app-use desk probe fails a module whose idle CPU time is more than 10% above the agent_cursor false baseline"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "    let allowed = u128::from(baseline_ns) * u128::from(100 + MODULE_IDLE_CPU_TOLERANCE_PERCENT);"
+new = "    let allowed = u128::from(baseline_ns) * u128::from(200 + MODULE_IDLE_CPU_TOLERANCE_PERCENT); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::the_module_may_use_at_most_ten_percent_above_the_baseline_while_idle",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-missing-counter-is-not-zero"
+guards = "the app-use desk probe fails, naming it, a preview counter absent from the health report instead of reading it as zero"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "            .as_u64()\n            .ok_or_else(|| format!(\"health counter {name} is missing from the report {when}\"))"
+new = "            .as_u64()\n            .or(Some(0)) // NON-VACUITY BREAK\n            .ok_or_else(|| format!(\"health counter {name} is missing from the report {when}\"))"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::an_idle_counter_must_be_reported_and_must_not_move",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-idle-counter-must-not-move"
+guards = "the app-use desk probe fails a preview capture or frame counter that moved during the idle window"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "    if after == before {"
+new = "    if after >= before { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::an_idle_counter_must_be_reported_and_must_not_move",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-person-keeps-the-front"
+guards = "the app-use desk probe fails any sample outside the needs-front action whose frontmost app is not the person's"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "        .find(|sample| !sample.needs_front && sample.front != Some(person))"
+new = "        .find(|sample| !sample.needs_front && sample.front.is_none()) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::the_person_keeps_the_front_except_during_the_one_needs_front_action",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-restore-is-observed"
+guards = "the app-use desk probe requires a frontmost sample after the needs-front action, so a restore is observed rather than assumed"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "    if last + 1 == samples.len() {"
+new = "    if false && last + 1 == samples.len() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::the_front_check_needs_samples_before_during_and_after_one_action",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-chord-restored"
+guards = "the app-use desk probe accepts the needs-front chord only when its reply reports the person's app restored"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "            Value::from(\"restored\"),"
+new = "            Value::from(\"skipped_person\"), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::the_chord_must_report_a_needs_front_front_that_was_restored",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-background-action-unfronted"
+guards = "the app-use desk probe fails a background-mode action other than the needs-front one whose reply says it fronted its app"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "        Some(fronting) if fronting[\"fronted\"] == false => Ok(()),"
+new = "        Some(fronting) if fronting.is_object() => Ok(()), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::a_background_action_completes_without_fronting",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-desk-probe-preview-is-preview-width"
+guards = "the app-use desk probe counts only the helper's preview-width windows as previews, never its narrow badge windows"
+file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+old = "                && (window.width - PREVIEW_WIDTH).abs() < 1.0"
+new = "                && window.width > 0.0 // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--example app_use_desk_probe"
+select = "expected"
+expect_red = [
+    "tests::only_the_helpers_visible_preview_width_windows_count_as_previews",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
