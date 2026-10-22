@@ -7,10 +7,15 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-mkdir -p "$root/target/scratch"
-scratch="$(mktemp -d "$root/target/scratch/mutations-test.XXXXXX")"
+scratch_root="${CARGO_TARGET_DIR:-$root/target}/scratch"
+real_mutate="${CARGO_TARGET_DIR:-$root/target}/tools/bin/ckdev-mutate"
+mkdir -p "$scratch_root"
+scratch="$(mktemp -d "$scratch_root/mutations-test.XXXXXX")"
+# Fixtures have their own install roots, independent of the caller's build cache.
+unset CARGO_TARGET_DIR
 trap 'rm -rf "$scratch"' EXIT
 failures=0
+checks=8
 
 pinned_version="0.12.3"
 pinned_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
@@ -142,7 +147,7 @@ scoped_invalid_row() {
   chmod +x "$repo/scripts/check-mutation-tree.sh"
   setup_private_pinned "$scratch/scoped" "$repo"
   cat >>"$repo/target/tools/bin/ckdev-mutate" <<'FAKE'
-if [ "$1" = check ] && [ "$2" = --catalogue ] && [ "$4" = --strict ]; then
+if [ "$1" = check ] && [ "$2" = --catalogue ]; then
   if grep -q 'planted-invalid' "$3"; then
     echo 'strict check refused planted-invalid' >&2
     exit 7
@@ -161,11 +166,14 @@ FAKE
 
 [[control]]
 id = "planted-invalid"
-file = "guard.rs"
-old = "before"
-new = "after"
+guards = "a malformed row is rejected after diff selection"
+file = "scripts/mutations.sh"
+old = "set -euo pipefail"
+new = "set -euo pipefail; :"
+test_file = "scripts/mutations.sh"
 runner = "command"
-command = ["true"]
+command = ["echo", "Ran 1 test", "{test}"]
+test_count_pattern = "Ran {count} test"
 expect_red = ["missing_test"]
 ROW
     CALL_LOG="$scratch/scoped/calls" ./scripts/mutations.sh --check-only --diff HEAD >"$scratch/scoped/out" 2>&1
@@ -180,8 +188,27 @@ ROW
     cat "$scratch/scoped/out"
     failures=$((failures + 1))
   fi
+  if [ -x "$real_mutate" ]; then
+    checks=$((checks + 1))
+    cp "$real_mutate" "$repo/target/tools/bin/ckdev-mutate"
+    (cd "$repo" && ./scripts/mutations.sh --check-only --diff HEAD) >"$scratch/scoped/real-out" 2>&1
+    status=$?
+    # This row deliberately lacks list_command. The real runner, not a schema
+    # imitation in the planner, must still reject it under --strict after selection.
+    if [ "$status" -eq 2 ] &&
+       grep -Fxq 'mutations: strict check selection: scoped 1' "$scratch/scoped/real-out" &&
+       grep -Fq 'command row has no list_command: planted-invalid' "$scratch/scoped/real-out"; then
+      echo 'ok scoped_real_strict_check_refuses_a_planted_invalid_row'
+    else
+      echo "FAIL scoped_real_strict_check_refuses_a_planted_invalid_row: exit $status, expected a strict schema refusal"
+      cat "$scratch/scoped/real-out"
+      failures=$((failures + 1))
+    fi
+  else
+    echo 'SKIP: real pinned strict-check fixture (private runner is not installed)'
+  fi
 }
 scoped_invalid_row
 
-echo "mutations wrapper tests: 8 checks, $failures failures"
+echo "mutations wrapper tests: $checks checks, $failures failures"
 [ "$failures" = 0 ]

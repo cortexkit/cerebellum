@@ -3,13 +3,17 @@
 set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
-mkdir -p "$repo_root/target/scratch"
-scratch="$(mktemp -d "$repo_root/target/scratch/fast-gate-test.XXXXXX")"
+scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
+mkdir -p "$scratch_root"
+scratch="$(mktemp -d "$scratch_root/fast-gate-test.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 checks=0
 
 check() {
+  if [ -n "${FAST_GATE_PHASE_CASE:-}" ] && [ "$1" != "$FAST_GATE_PHASE_CASE" ]; then
+    return
+  fi
   checks=$((checks + 1))
   if ( "$2" ) >"$scratch/output" 2>&1; then
     echo "SELF-TEST PASSED: $1"
@@ -84,9 +88,68 @@ readable_process_table() {
   [ "${#lib_test_options[@]}" -eq 0 ] && [ "${#not_verified[@]}" -eq 0 ]
 }
 
+linux_mode() {
+  uname() { echo Linux; }
+  require_part_host linux && ! require_part_host mac || return 1
+  base=fixture
+  replay_options=()
+  ck() { printf '%s\n' "$@" >"$scratch/argv"; }
+  run_linux_part
+  grep -Fxq linux "$scratch/argv" && grep -Fxq -- --part "$scratch/argv" &&
+    grep -Fxq fixture "$scratch/argv"
+}
+
+mac_mode() {
+  uname() { echo Darwin; }
+  require_part_host mac && ! require_part_host linux || return 1
+  lib_packages=(cerebellum cerebellum-core cerebellum-computer cerebellum-macos)
+  suites=(cerebellum-core:it cerebellum:it cerebellum-macos:preview_hide)
+  select_mac_plan
+  [ "${lib_packages[*]}" = 'cerebellum cerebellum-computer cerebellum-macos' ] || return 1
+  [ "${suites[*]}" = 'cerebellum:it cerebellum-macos:preview_hide' ] || return 1
+  lib_packages=(cerebellum-core)
+  suites=(cerebellum-core:it)
+  select_mac_plan
+  [ "${#lib_packages[@]}" -eq 0 ] && [ "${#suites[@]}" -eq 0 ] &&
+    catalogue_check_needed mac mutations.d/rows.toml &&
+    ! catalogue_check_needed linux mutations.d/rows.toml &&
+    ! catalogue_check_needed mac scripts/fast-gate.sh
+}
+
+combined_mode() {
+  uname() { echo Darwin; }
+  mutations=0
+  run_linux_part() { echo 'linux whole log'; return 200; }
+  run_mac_part() { echo 'mac whole log'; }
+  if run_combined_gate >"$scratch/combined" 2>&1; then return 1; fi
+  python3 - "$scratch/combined" <<'PY'
+from pathlib import Path
+import sys
+log = Path(sys.argv[1]).read_text()
+assert log.index('linux whole log') < log.index('mac whole log')
+assert '==> FAIL: Linux half (ck motor run) (exit 200)' in log
+assert '==> PASS: macOS half (local)' in log
+assert 'runon: "linux,8c"' in log
+assert 'FAST GATE FAILED:' in log
+PY
+}
+
+combined_skip() {
+  uname() { echo Darwin; }
+  mutations=0
+  run_linux_part() { echo linux; }
+  run_mac_part() { echo 'NOT VERIFIED: launch_recovery_clear (process table unreadable here)'; }
+  run_combined_gate >"$scratch/combined" 2>&1 || return 1
+  [ "$(tail -n 1 "$scratch/combined")" = 'FAST GATE PASSED: every selected phase that ran is green; see the NOT VERIFIED lines above' ]
+}
+
 check 'a failing concurrent phase still fails the gate' failing_concurrent_phase
 check 'source checks overlap serial work with whole, ordered logs' concurrent_order
 check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_process_table
 check 'a readable process table leaves library tests unchanged' readable_process_table
+check '--part linux selects the remote Linux lane' linux_mode
+check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
+check 'default mode collects both halves and reports a runner connection failure' combined_mode
+check 'default mode preserves NOT VERIFIED from the Mac half' combined_skip
 echo "fast-gate phase tests: $checks checks, $failures failures"
 [ "$failures" -eq 0 ]

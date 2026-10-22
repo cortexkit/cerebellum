@@ -8,11 +8,20 @@ cd "$repo_root"
 base="${FAST_GATE_BASE:-origin/main}"
 self_test=0
 mutations=0
+part=""
+usage() {
+  echo "usage: $0 [--base REF] [--part linux|mac] [--self-test] [--mutations]"
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
-      [ "$#" -ge 2 ] || { echo "usage: $0 [--base REF] [--self-test] [--mutations]" >&2; exit 2; }
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       base="$2"
+      shift 2
+      ;;
+    --part)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      case "$2" in linux|mac) part="$2" ;; *) usage >&2; exit 2 ;; esac
       shift 2
       ;;
     --self-test)
@@ -24,21 +33,27 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     -h|--help)
-      echo "usage: $0 [--base REF] [--self-test] [--mutations]"
+      usage
       exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
-      echo "usage: $0 [--base REF] [--self-test] [--mutations]" >&2
+      usage >&2
       exit 2
       ;;
   esac
 done
 
-./scripts/check-mutation-tree.sh
-
-metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
+if [ "$self_test" -eq 0 ]; then
+  if [ -z "$part" ]; then
+    run_combined_gate
+    exit $?
+  fi
+  require_part_host "$part"
+  echo "==> FAST GATE PART: $part"
+fi
+metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 
 plan_for_files() {
   FAST_GATE_METADATA="$metadata" FAST_GATE_FILES="$1" python3 - <<'PY'
@@ -155,12 +170,15 @@ desk_skip_reason() {
 
 if [ "$self_test" -eq 1 ]; then
   scripts/lib/fast-gate.test.sh
+  planner_python=""
   for python in python3 python3.14 python3.13 python3.12 python3.11; do
     if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
-      "$python" scripts/lib/mutation-check-plan.py --self-test
+      planner_python="$python"
       break
     fi
   done
+  [ -n "$planner_python" ] || { echo 'mutation check planner: Python 3.11+ is required' >&2; exit 2; }
+  "$planner_python" scripts/lib/mutation-check-plan.py --self-test
   scripts/mutations.test.sh
   planted_skip="test a_preview_test ... SKIPPED (the window's kind was checked and is right): the screen is locked, so no window is realised"
   if [ "$(printf '%s\n' "$planted_skip" | desk_skip_reason)" != "the screen is locked, so no window is realised" ] || \
@@ -263,6 +281,10 @@ while IFS='|' read -r kind first second; do
   esac
 done <<< "$plan"
 
+if [ "$part" = mac ]; then
+  select_mac_plan
+fi
+
 # Share the full gate's lock: Cargo test binaries and build artifacts are not
 # safe to drive from two gates against the same target directory at once.
 gate_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
@@ -298,7 +320,9 @@ trap release_lock EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
 
+if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
+start_static_phase "mutation tree: scripts/check-mutation-tree.sh" ./scripts/check-mutation-tree.sh
 # This proof builds format_versions, so it must not overlap another Cargo phase.
 run_serial_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 
@@ -310,7 +334,16 @@ if [ "${#packages[@]}" -gt 0 ]; then
   clippy_args+=(--all-targets --quiet -- -D warnings)
   run_serial_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings" cargo clippy "${clippy_args[@]}"
 else
-  echo "==> SKIP: package clippy (no changed file maps to a Cargo package)"
+  run_serial_phase "cargo clippy --locked --workspace --all-targets -- -D warnings" \
+    cargo clippy --locked --workspace --all-targets --quiet -- -D warnings
+fi
+
+# Match the full gate's default-target Windows checks; cross-host test targets
+# require a Windows C toolchain and are exercised in the Windows VM instead.
+for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+  run_serial_phase "cargo clippy --locked --workspace --target $target -- -D warnings" \
+    cargo clippy --locked --workspace --target "$target" --quiet -- -D warnings
+done
 fi
 
 if [ "${#lib_packages[@]}" -gt 0 ]; then
@@ -350,6 +383,7 @@ suite_will_run() {
   return 1
 }
 
+if [ "$part" = linux ]; then
 # The `it` target contains catalog/schema checks, a source scan enforcing that
 # only launch_nonce.rs reads the launch secret, and a scan that rejects shipped
 # code which writes runtime output to stdout or stderr. Run it even when the diff
@@ -398,14 +432,19 @@ else
   run_serial_phase "cargo test --locked -p cerebellum-core --lib journal" cargo test --locked -p cerebellum-core --lib journal
   echo "==> SKIP: remaining cerebellum-core --lib tests (the package was unchanged)"
 fi
+fi
 
 if [ "${#suites[@]}" -gt 0 ]; then
   for suite in "${suites[@]}"; do
-    if [ "$suite" = "cerebellum:it" ] || [ "$suite" = "cerebellum:format_floor" ]; then
+    if [ "$part" = linux ] && { [ "$suite" = "cerebellum:it" ] || [ "$suite" = "cerebellum:format_floor" ]; }; then
       continue
     fi
     package="${suite%%:*}"
     target="${suite#*:}"
+    if [ "$part" = linux ] && [ "$package" = cerebellum-macos ]; then
+      echo "==> SKIP: $suite (macOS-only; belongs to --part mac)"
+      continue
+    fi
     if is_desk_suite "$suite"; then
       log="$static_dir/desk-$package-$target.log"
       run_serial_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
@@ -437,13 +476,20 @@ if [ "${#all_suites[@]}" -gt 0 ]; then
   fi
 fi
 
-if [ "$mutations" -eq 1 ]; then
+if [ "$part" = mac ] && [ "$mutations" -eq 1 ]; then
   run_serial_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
+elif catalogue_check_needed "$part" "$changed_files"; then
+  # The pinned runner lists tests by compiling them, and some catalogue test
+  # names exist only on macOS. Run the full check here after the library tests.
+  run_serial_phase "mutation catalogue --strict check (a catalogue file changed)" ./scripts/mutations.sh --check-only
 else
-  # Include changed row definitions and rows anchored in changed source/tests.
-  # The pinned runner still parses and strictly checks every selected row.
-  run_serial_phase "mutation catalogue --strict check (changed or anchored rows)" ./scripts/mutations.sh --check-only --diff "$base"
+  echo "==> SKIP: mutation catalogue --strict check (Mac half only, when catalogue files changed)"
 fi
+
+# Runner upgrade switch point: once the pinned release supports --anchors-only
+# and --platform, run anchors locally first, then --platform linux / macos in
+# their halves. Require the two reports' union to cover every catalogue row
+# before replacing the full macOS check; 0.12.3 cannot report that coverage.
 
 # Source-check logs are replayed in launch order, never interleaved with Cargo.
 wait_static_phases

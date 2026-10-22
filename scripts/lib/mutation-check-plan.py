@@ -11,6 +11,11 @@ import unittest
 def select_rows(previous, current, changed):
     if previous.keys() != current.keys():
         return None
+    ids = [row.get("id") for doc in current.values() for row in doc.get("control", [])]
+    # Duplicate identities are catalogue-wide errors, even when one copy is
+    # unchanged. Let the runner diagnose them against the original catalogue.
+    if len(ids) != len(set(ids)):
+        return None
     selected = []
     for name, document in current.items():
         old = previous[name]
@@ -106,6 +111,10 @@ class SelectionTests(unittest.TestCase):
     def test_catalogue_shape_changes_require_full_check(self):
         self.assertIsNone(select_rows(self.previous, {}, set()))
         self.assertIsNone(select_rows(self.previous, {"rows.toml": dict(self.previous["rows.toml"], prebuild=[])}, set()))
+
+    def test_identical_duplicate_rows_require_full_check(self):
+        duplicate = {"rows.toml": {"control": [self.row, self.row]}}
+        self.assertIsNone(select_rows(self.previous, duplicate, set()))
 
     def test_planted_invalid_row_is_preserved_for_strict_check(self):
         invalid = dict(self.row, id="invalid", runner="command", command=["true"], expect_red=["missing_test"])

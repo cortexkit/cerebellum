@@ -57,8 +57,9 @@ if [ "$check_only" -eq 1 ] && [ -n "$only_mode" ]; then
 fi
 
 # Keep the check's scratch catalogue outside the installed tools and source tree.
-mkdir -p "$repo_root/target/scratch"
-tmpdir="$(mktemp -d "$repo_root/target/scratch/mutation-check.XXXXXX")"
+scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
+mkdir -p "$scratch_root"
+tmpdir="$(mktemp -d "$scratch_root/mutation-check.XXXXXX")"
 cleanup() {
   rm -rf "$tmpdir"
 }
@@ -86,7 +87,7 @@ if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
   esac
 fi
 
-# The runner lives in this checkout's own install root. ~/.cargo/bin is shared
+# The runner lives in this checkout's Cargo target directory. ~/.cargo/bin is shared
 # by every repository on the machine, so another repository installing a
 # different ckdev-mutate there would silently change, or block, this replay.
 # The script never looks on PATH or in ~/.cargo/bin, and never installs on its
@@ -95,7 +96,8 @@ fi
 # binary that happens to report the same semantic version.
 expected_version="0.12.3"
 expected_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
-tools_root="$repo_root/target/tools"
+tools_root="${CARGO_TARGET_DIR:-$repo_root/target}/tools"
+case "$tools_root" in /*) ;; *) tools_root="$repo_root/$tools_root" ;; esac
 mutate="$tools_root/bin/ckdev-mutate"
 refuse_runner() {
   echo "mutations: $1" >&2
