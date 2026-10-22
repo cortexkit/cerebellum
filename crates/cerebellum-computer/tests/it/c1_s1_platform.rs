@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v28.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v29.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -775,7 +775,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v26_from_v25(&generated, historical_revision(26).as_str().unwrap());
     let generated =
         vocabulary_mint::v27_from_v26(&generated, historical_revision(27).as_str().unwrap());
-    let generated = vocabulary_mint::v28_from_v27(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v28_from_v27(&generated, historical_revision(28).as_str().unwrap());
+    let generated = vocabulary_mint::v29_from_v28(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1628,7 +1630,7 @@ fn v27_only_adds_the_disabled_element_refusal_to_the_recreated_v26() {
     );
 }
 
-/// The shipped artifact with v28's additions taken back out: every row's
+/// v28 with its additions taken back out: every row's
 /// `config_invalid` outcome; each fronting row's `fronting`, `preview` and
 /// `fronting_bound_exceeded` fields and its `not_fronted` outcome, plus
 /// `restore_failed` where v27 lacked it; `open_app`'s
@@ -1637,7 +1639,7 @@ fn v27_only_adds_the_disabled_element_refusal_to_the_recreated_v26() {
 /// removes was there, so a v28 that stopped adding any of them is caught here
 /// as well as by the digest.
 fn recreated_v27() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v28();
     vocabulary["revision"] = historical_revision(27);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
@@ -1726,7 +1728,7 @@ fn v28_only_adds_app_use_and_fronting_replies_to_the_recreated_v27() {
 #[test]
 fn v28_changes_only_result_schemas() {
     let previous = recreated_v27();
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let current = recreated_v28();
     let previous_rows = previous["rows"].as_array().unwrap();
     let current_rows = current["rows"].as_array().unwrap();
     assert_eq!(previous_rows.len(), current_rows.len());
@@ -1748,6 +1750,81 @@ fn v28_changes_only_result_schemas() {
             .clone()
     };
     assert_eq!(image_fronting(&previous), image_fronting(&current));
+    let mut previous = previous;
+    let mut current = current;
+    previous.as_object_mut().unwrap().remove("rows");
+    current.as_object_mut().unwrap().remove("rows");
+    previous["revision"] = current["revision"].clone();
+    assert_eq!(
+        previous, current,
+        "a document field other than revision changed"
+    );
+}
+
+/// The shipped artifact with v29's one addition taken back out: the
+/// `target_not_read` reason at the end of each fronting row's
+/// `fronting.not_fronted_reason`. Each removal asserts the reason was there,
+/// so a v29 that stopped adding it to any fronting row is caught here as
+/// well as by the digest.
+fn recreated_v28() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(28);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        let properties = &mut row["result_schema"]["properties"];
+        if !vocabulary_mint::FRONTING_ROW_IDS.contains(&capability.as_str()) {
+            assert!(properties.get("fronting").is_none(), "{capability}");
+            continue;
+        }
+        let reasons = properties["fronting"]["properties"]["not_fronted_reason"]["enum"]
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(
+            reasons.pop().unwrap(),
+            vocabulary_mint::TARGET_NOT_READ,
+            "{capability}"
+        );
+    }
+    vocabulary
+}
+
+/// The recreated v28 is byte for byte the v28 that shipped: its digest is
+/// the one v28's mirrors and source lock carried.
+#[test]
+fn v29_only_adds_the_target_not_read_reason_to_the_recreated_v28() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v28()).unwrap()),
+        "8d94a0a6ea65d41080b8866ec788244d3d1f0ff425a8bd8d845d0a4abe4a0b65"
+    );
+}
+
+/// v29 changes nothing outside the rows' `result_schema`s, and inside them
+/// only the `fronting.not_fronted_reason` enum of the fronting rows. The
+/// advertised `computer_use` definition is built from each row's
+/// `request_schema`, so those keep their exact bytes.
+#[test]
+fn v29_changes_only_the_not_fronted_reasons() {
+    let previous = recreated_v28();
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let previous_rows = previous["rows"].as_array().unwrap();
+    let current_rows = current["rows"].as_array().unwrap();
+    assert_eq!(previous_rows.len(), current_rows.len());
+    for (before, after) in previous_rows.iter().zip(current_rows) {
+        let id = after["capability_id"].as_str().unwrap();
+        assert_eq!(
+            canonical_json_bytes(&before["request_schema"]).unwrap(),
+            canonical_json_bytes(&after["request_schema"]).unwrap(),
+            "{id} request_schema"
+        );
+        let mut before = before.clone();
+        let mut after = after.clone();
+        for row in [&mut before, &mut after] {
+            if let Some(fronting) = row["result_schema"]["properties"].get_mut("fronting") {
+                fronting["properties"]["not_fronted_reason"]["enum"] = json!([]);
+            }
+        }
+        assert_eq!(before, after, "{id} changed outside not_fronted_reason");
+    }
     let mut previous = previous;
     let mut current = current;
     previous.as_object_mut().unwrap().remove("rows");

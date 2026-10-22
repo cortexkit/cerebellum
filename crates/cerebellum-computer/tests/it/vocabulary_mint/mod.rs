@@ -2357,3 +2357,36 @@ pub fn v28_from_v27(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The `fronting.not_fronted_reason` v29 appends: an action that would send
+/// input to an application the conversation never read is not fronted,
+/// since the check that the person did not change the application since the
+/// agent last saw it has nothing to compare against.
+pub const TARGET_NOT_READ: &str = "target_not_read";
+
+/// Revision 29 gives a front stopped for a target the conversation never
+/// read its own `not_fronted_reason`, `target_not_read`, appended to the
+/// enum of every fronting row's `fronting.not_fronted_reason`. Before it,
+/// such a stop could only be reported as `observer_unavailable`, which says
+/// the person check failed and may be read as Input Monitoring being
+/// broken.
+///
+/// Only `result_schema`s change: no request schema, no row key and no other
+/// row field moves, so the advertised tool and `validate_row` do not change.
+pub fn v29_from_v28(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if !FRONTING_ROW_IDS.contains(&capability.as_str()) {
+            continue;
+        }
+        let reasons = row["result_schema"]["properties"]["fronting"]["properties"]
+            ["not_fronted_reason"]["enum"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("{capability} declares no not_fronted_reason"));
+        assert!(!reasons.contains(&json!(TARGET_NOT_READ)), "{capability}");
+        reasons.push(json!(TARGET_NOT_READ));
+    }
+    next
+}

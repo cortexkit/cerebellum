@@ -83,15 +83,17 @@ fn first_id_never_seen(rig: &Rig) -> String {
 }
 
 /// A reply that refused because the conversation never read the target:
-/// nothing fronted, the unreadable person check's reason, and a remedy
-/// asking for a read.
-fn assert_never_read(reply: &Value) {
+/// nothing fronted, the reason `target_not_read`, and a remedy asking for a
+/// read.
+fn assert_target_not_read(reply: &Value) {
     assert_eq!(reply["outcome"], "not_fronted", "{reply}");
-    assert_eq!(reply["remedy"], NEVER_READ_REMEDY, "{reply}");
+    assert_eq!(
+        reply["remedy"], "Read the app with read_state first, then retry.",
+        "{reply}"
+    );
     assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
     assert_eq!(
-        reply["fronting"]["not_fronted_reason"],
-        not_fronted_reason(FrontingStop::PersonCheckUnreadable).as_str(),
+        reply["fronting"]["not_fronted_reason"], "target_not_read",
         "{reply}"
     );
 }
@@ -499,7 +501,7 @@ async fn a_background_chord_to_an_app_never_read_fronts_nothing_until_it_is_read
     let reply = rig
         .call_under(&under_terminal(), "computer.keys", command_chord())
         .await;
-    assert_never_read(&reply);
+    assert_target_not_read(&reply);
     assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
     assert!(!rig.lock.held());
 
@@ -529,7 +531,7 @@ async fn foreground_input_to_an_app_never_read_fronts_nothing() {
         ),
     ] {
         let reply = rig.call_under(&under_terminal(), name, arguments).await;
-        assert_never_read(&reply);
+        assert_target_not_read(&reply);
         assert!(
             rig.screen.log().is_empty(),
             "{name}: {:?}",
@@ -557,7 +559,7 @@ async fn a_press_on_an_app_never_read_fronts_nothing() {
             json!({"element_id": send}),
         )
         .await;
-    assert_never_read(&reply);
+    assert_target_not_read(&reply);
 
     let rig = rig.with_mode(AppUse::Background);
     rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
@@ -569,7 +571,7 @@ async fn a_press_on_an_app_never_read_fronts_nothing() {
             json!({"element_id": send}),
         )
         .await;
-    assert_never_read(&reply);
+    assert_target_not_read(&reply);
     assert!(rig.desk.state().presses.is_empty());
     assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
     assert!(!rig.lock.held());
@@ -625,4 +627,34 @@ async fn a_live_session_wide_send_from_another_call_stops_every_front() {
         .await;
     assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
     assert_eq!(rig.screen.log(), ["front:4242", "post", "restore:100"]);
+}
+
+/// An observer that cannot be started, and a person check that cannot read
+/// what it compares, still report `observer_unavailable` for a target the
+/// conversation did read: `target_not_read` is only for a target never read.
+#[tokio::test]
+async fn an_unreadable_observer_or_person_check_still_reports_observer_unavailable() {
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    rig.screen.state().observer = false;
+    let reply = rig.read().await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "observer_unavailable",
+        "{reply}"
+    );
+    assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
+
+    // The person check under the lock reads which application is in front;
+    // here it cannot. The target was read first, so it has marks to check.
+    let rig = self::rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    let rig = rig.with_mode(AppUse::Foreground);
+    rig.desk.state().frontmost = None;
+    let reply = rig.read().await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "observer_unavailable",
+        "{reply}"
+    );
+    assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
 }

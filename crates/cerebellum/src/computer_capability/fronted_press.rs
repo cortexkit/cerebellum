@@ -18,9 +18,9 @@
 
 use super::*;
 use crate::computer_capability::fronting::{
-    absorb_own_front, decide_with_restore_budget, held_input_confirmed, never_read_reply,
-    not_fronted_reply, stop_ends_call, target_unchanged_since_seen, FrontCall, Fronting,
-    ObligationParts, PrepareStop, Purpose, FRONT_SEIZE_LATENCY_MS,
+    absorb_own_front, decide_with_restore_budget, held_input_confirmed, not_fronted_reply,
+    stop_ends_call, target_unchanged_since_seen, FrontCall, Fronting, ObligationParts, PrepareStop,
+    Purpose, FRONT_SEIZE_LATENCY_MS,
 };
 use crate::terminal_arbiter::{FrontingPurpose, RestoreCell, RestoreDecided};
 use cerebellum_computer::dispatch::{
@@ -164,7 +164,8 @@ where
     decided: Option<RestoreDecided>,
     change: Option<PersonChange>,
     /// Guard (1) stopped the front because the conversation never read the
-    /// application.
+    /// application. The run itself only knows the guard did not pass, and
+    /// reports `PersonCheckUnreadable`; this says which stop it was.
     never_read: bool,
     press_replies: Vec<Option<Value>>,
     observed: Vec<Option<SessionRead>>,
@@ -306,7 +307,7 @@ where
                 Some(true)
             }
             Err(stopped) => {
-                self.never_read = stopped.never_read;
+                self.never_read = stopped.stop == FrontingStop::TargetNotRead;
                 None
             }
         }
@@ -605,7 +606,7 @@ where
                 press_replies: steps.iter().map(|_| None).collect(),
                 observed: steps.iter().map(|_| None).collect(),
             };
-            let report = run_fronting_press(
+            let mut report = run_fronting_press(
                 &mut host,
                 &mut estimator,
                 PressPlan {
@@ -625,6 +626,14 @@ where
                 mut observed,
                 ..
             } = host;
+            if never_read
+                && report.stop
+                    == Some(PressRunStop::NotFronted(
+                        FrontingStop::PersonCheckUnreadable,
+                    ))
+            {
+                report.stop = Some(PressRunStop::NotFronted(FrontingStop::TargetNotRead));
+            }
             let mut fronting = match decided {
                 Some(decided) if decided.front_requested => Fronting::temporary(
                     mode,
@@ -684,11 +693,6 @@ where
                         if stop_ends_call(stop) =>
                     {
                         cancelled_before_dispatch_reply()
-                    }
-                    Some(PressRunStop::NotFronted(FrontingStop::PersonCheckUnreadable))
-                        if never_read =>
-                    {
-                        never_read_reply(fronting)
                     }
                     // In front or not, nothing was pressed at this step, and
                     // the reply says why the front was not used.

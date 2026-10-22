@@ -23,6 +23,10 @@ pub enum FrontingStop {
     PersonChangedTarget,
     /// The target-change guard could not read what it compares.
     PersonCheckUnreadable,
+    /// The action would send input to the target once it is in front, and
+    /// the conversation never read the target, so the target-change guard
+    /// has nothing to compare against.
+    TargetNotRead,
     /// No input observer could be started.
     ObserverUnavailable,
     /// The idle gate refused: unreadable, or the person was recently active.
@@ -103,11 +107,12 @@ pub enum NotFrontedReason {
     FrontingBusy,
     Unattended,
     FrontingUnavailable,
+    TargetNotRead,
 }
 
 impl NotFrontedReason {
     /// Every reason, in the order the reply vocabulary lists them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::HeldInputUnconfirmed,
         Self::PersonChangedTarget,
         Self::ObserverUnavailable,
@@ -118,6 +123,7 @@ impl NotFrontedReason {
         Self::FrontingBusy,
         Self::Unattended,
         Self::FrontingUnavailable,
+        Self::TargetNotRead,
     ];
 
     /// The wire value.
@@ -133,6 +139,7 @@ impl NotFrontedReason {
             Self::FrontingBusy => "fronting_busy",
             Self::Unattended => "unattended",
             Self::FrontingUnavailable => "fronting_unavailable",
+            Self::TargetNotRead => "target_not_read",
         }
     }
 
@@ -170,6 +177,7 @@ impl NotFrontedReason {
             Self::FrontingUnavailable => {
                 "this build cannot bring applications forward; the action ran without fronting"
             }
+            Self::TargetNotRead => "Read the app with read_state first, then retry.",
         }
     }
 }
@@ -179,6 +187,7 @@ pub fn not_fronted_reason(stop: FrontingStop) -> NotFrontedReason {
     match stop {
         FrontingStop::HeldInputUnconfirmed => NotFrontedReason::HeldInputUnconfirmed,
         FrontingStop::PersonChangedTarget => NotFrontedReason::PersonChangedTarget,
+        FrontingStop::TargetNotRead => NotFrontedReason::TargetNotRead,
         FrontingStop::PersonCheckUnreadable
         | FrontingStop::ObserverUnavailable
         | FrontingStop::IdleGateRefused(IdleGateRefusal::Unreadable(_))

@@ -388,9 +388,16 @@ pub(crate) fn not_fronted_reply(fronting: Fronting) -> Value {
     let reason = fronting
         .not_fronted_reason
         .unwrap_or(NotFrontedReason::FrontFailed);
+    // A target never read is answered with its remedy alone, which already
+    // says what to do in a sentence of its own.
+    let remedy = if reason == NotFrontedReason::TargetNotRead {
+        reason.remedy().to_owned()
+    } else {
+        format!("Nothing was done: {}.", reason.remedy())
+    };
     let mut reply = json!({
         "outcome": "not_fronted",
-        "remedy": format!("Nothing was done: {}.", reason.remedy()),
+        "remedy": remedy,
     });
     fronting.apply(&mut reply);
     reply
@@ -868,8 +875,6 @@ pub(crate) struct ForegroundFront {
     pub(crate) stop: Option<FrontingStop>,
     /// The change guard (1) found, when it stopped there.
     pub(crate) change: Option<cerebellum_computer::app_state::person::PersonChange>,
-    /// Guard (1) stopped because the conversation never read the target.
-    pub(crate) never_read: bool,
 }
 
 impl ForegroundFront {
@@ -878,7 +883,6 @@ impl ForegroundFront {
             fronting: Fronting::stopped(AppUse::Foreground, Purpose::ForegroundMode, stop),
             stop: Some(stop),
             change: None,
-            never_read: false,
         }
     }
 
@@ -898,9 +902,6 @@ impl ForegroundFront {
     pub(crate) fn refusal(&self, app_name: &str) -> Option<Value> {
         if !self.attempted_and_stopped() {
             return None;
-        }
-        if self.never_read {
-            return Some(never_read_reply(self.fronting));
         }
         let mut reply = match self.change {
             Some(change) => super::element_actions::state_changed_by_person_reply(app_name, change),
@@ -957,7 +958,6 @@ where
                 fronting: Fronting::untouched(AppUse::Foreground),
                 stop: None,
                 change: None,
-                never_read: false,
             });
         }
         let lock = match self.fronting_lock.take(call.cancel).await {
@@ -1023,18 +1023,15 @@ where
                     fronting,
                     stop: None,
                     change: None,
-                    never_read: false,
                 }
             }
             Ok(_) => ForegroundFront {
                 fronting: Fronting::untouched(AppUse::Foreground),
                 stop: None,
                 change: None,
-                never_read: false,
             },
             Err(prepared) => ForegroundFront {
                 change: prepared.change,
-                never_read: prepared.never_read,
                 ..ForegroundFront::stopped(prepared.stop)
             },
         })
@@ -1047,33 +1044,12 @@ pub(crate) struct PrepareStop {
     pub(crate) stop: FrontingStop,
     /// The change guard (1) found, when it stopped there.
     pub(crate) change: Option<cerebellum_computer::app_state::person::PersonChange>,
-    /// Guard (1) stopped because the conversation never read the target, so
-    /// there was nothing to check the person against. The reply then asks
-    /// for a read rather than giving the stop's own remedy.
-    pub(crate) never_read: bool,
 }
 
 impl From<FrontingStop> for PrepareStop {
     fn from(stop: FrontingStop) -> Self {
-        Self {
-            stop,
-            change: None,
-            never_read: false,
-        }
+        Self { stop, change: None }
     }
-}
-
-/// The remedy of a front refused because the conversation never read the
-/// application it would bring forward.
-pub(crate) const NEVER_READ_REMEDY: &str = "Read the app with read_state first, then retry.";
-
-/// The refusal of an action whose front stopped because the conversation
-/// never read the application. The reason stays the one an unreadable person
-/// check reports; only the remedy says what to do.
-pub(crate) fn never_read_reply(fronting: Fronting) -> Value {
-    let mut reply = not_fronted_reply(fronting);
-    reply["remedy"] = json!(NEVER_READ_REMEDY);
-    reply
 }
 
 /// Guard (1): the person has not changed the target since this conversation
@@ -1081,7 +1057,7 @@ pub(crate) fn never_read_reply(fronting: Fronting) -> Value {
 ///
 /// A conversation that was never shown the target has nothing to compare
 /// against. When `input_follows`, that stops the front with
-/// `PersonCheckUnreadable`: the front would hand the target input chosen
+/// `TargetNotRead`: the front would hand the target input chosen
 /// without ever looking at it, and the person check, which exists to catch a
 /// target that is not what the agent saw, cannot run. A front followed by no
 /// input (a read, `open_app`) goes ahead without one.
@@ -1093,11 +1069,7 @@ pub(crate) fn target_unchanged_since_seen(
     input_follows: bool,
 ) -> Result<(), PrepareStop> {
     if input_follows && sessions.last_seen(conversation_key, grant).is_none() {
-        return Err(PrepareStop {
-            stop: FrontingStop::PersonCheckUnreadable,
-            change: None,
-            never_read: true,
-        });
+        return Err(FrontingStop::TargetNotRead.into());
     }
     match super::element_actions::person_change_since_seen(
         source,
@@ -1109,7 +1081,6 @@ pub(crate) fn target_unchanged_since_seen(
         Ok(Some(change)) => Err(PrepareStop {
             stop: FrontingStop::PersonChangedTarget,
             change: Some(change),
-            never_read: false,
         }),
         Err(()) => Err(FrontingStop::PersonCheckUnreadable.into()),
     }

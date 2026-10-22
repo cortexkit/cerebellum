@@ -252,6 +252,7 @@ fn every_restore_value_and_reason_reaches_the_reply() {
         FrontingStop::FrontingLockTimedOut,
         FrontingStop::Unattended,
         FrontingStop::FrontingNotAdmitted,
+        FrontingStop::TargetNotRead,
     ];
     let mut seen = std::collections::BTreeSet::new();
     for stop in stops {

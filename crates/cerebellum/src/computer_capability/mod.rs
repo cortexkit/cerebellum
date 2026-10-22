@@ -2425,13 +2425,6 @@ where
                             &management.application_name(&grant),
                             change,
                         ),
-                        (None, stop) if prepared.never_read => {
-                            fronting::never_read_reply(fronting::Fronting::stopped(
-                                fronting_admission.mode,
-                                fronting::Purpose::NeedsFront,
-                                stop,
-                            ))
-                        }
                         // Served without a call arbiter, nothing can own the
                         // restore, so the chord is refused as in a build that
                         // cannot front.
