@@ -1579,7 +1579,7 @@ struct Routed {
 
 /// Serve `name` on a route as the call's worker. `prepare` runs first, in
 /// the worker, with the call's terminal arbiter. When `cancel_at` is given,
-/// the route is cancelled once it is told.
+/// the route is cancelled after that notification fires.
 async fn routed(
     rig: &Rig,
     name: &'static str,
@@ -1876,7 +1876,7 @@ async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Guard (0) across conversations and applications
+// Held input blocks every front, across conversations and applications
 // ---------------------------------------------------------------------------
 
 /// A press another conversation posted to another application, whose
@@ -1934,15 +1934,15 @@ async fn a_press_left_held_by_another_conversation_on_another_app_blocks_every_f
 
 /// A foreground read waiting for the fronting lock when its authorization
 /// ends reads nothing, captures nothing and records no seen marks. Revoking
-/// the app grant cancels the call where it waits; a dispatch gate closed with
-/// no cancel at all (the call's deadline, or authorization lost in a way only
-/// the gate sees) is caught the moment the lock is taken.
+/// the app grant cancels the call where it waits; a dispatch gate closed
+/// with no cancel at all (here, the call's deadline) is caught the moment the
+/// lock is taken.
 #[tokio::test(start_paused = true)]
 async fn lost_authorization_while_waiting_for_the_lock_reads_nothing() {
     let read = json!({"target": support::TARGET_BUNDLE_ID, "include_image": true});
     for revoke in [true, false] {
-        // A background read first, so the target has seen marks a guard
-        // would read and a fallback read would replace.
+        // A background read first gives the target a seen mark, so the
+        // assertions below can show it was neither read again nor replaced.
         let rig = rig(AppUse::Background, mail_desk()).await;
         rig.read().await;
         let marks_at = rig
@@ -1972,9 +1972,9 @@ async fn lost_authorization_while_waiting_for_the_lock_reads_nothing() {
             let revoked = store.revoke_matching(store.now_ms(), |_| true).unwrap();
             assert!(!revoked.is_empty(), "the app grant was revoked");
         } else {
-            // The dispatch gate closes with no cancel at all: the call's
-            // deadline, or lost authorization only the gate sees. It is
-            // caught the moment the lock is taken.
+            // The dispatch gate closes with no cancel at all, as when the
+            // call's deadline passes. It is caught the moment the lock is
+            // taken.
             terminal.stop(crate::TerminalCause::Deadline);
         }
         drop(held);
