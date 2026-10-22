@@ -611,7 +611,7 @@ impl CellHooks {
         }
     }
 
-    fn cell(&self) -> Option<Arc<RestoreCell>> {
+    pub(crate) fn cell(&self) -> Option<Arc<RestoreCell>> {
         self.state().cell.clone()
     }
 }
@@ -1011,4 +1011,40 @@ pub(crate) fn chord_fronting(mode: AppUse, end: &HookedEnd) -> Fronting {
         );
     }
     hooked_fronting(mode, Purpose::NeedsFront, end)
+}
+
+/// The actions that can bring their application to the front. `wait`,
+/// `list_apps` and the takeover pointer actions never do.
+pub(super) fn listed(served: super::Served) -> bool {
+    use super::Served;
+    match served {
+        Served::ReadState
+        | Served::PressElement
+        | Served::PressPoint
+        | Served::WriteText
+        | Served::Type
+        | Served::Keys
+        | Served::OpenApp => true,
+        Served::TakeoverMove
+        | Served::TakeoverDrag
+        | Served::TakeoverScroll
+        | Served::Wait
+        | Served::ListApps => false,
+    }
+}
+
+/// Whether a reply is one of an action that went through, as opposed to one
+/// that ended before the fronting decision (a queue, permission, consent or
+/// request refusal), which carries no `fronting`.
+pub(super) fn went_through(reply: &Value) -> bool {
+    matches!(
+        reply["outcome"].as_str(),
+        Some(
+            "completed"
+                | "delivery_unconfirmed"
+                | "launched"
+                | "already_running"
+                | "launched_no_window"
+        )
+    )
 }

@@ -152,6 +152,7 @@ where
             return json!({"outcome":"cancelled"});
         }
         let work = super::quarantine::CallWork::current();
+        let conversation_key = context.identity.conversation_key.clone();
         let token = {
             use cerebellum_computer::audit::{
                 ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
@@ -251,6 +252,36 @@ where
                 json!({"outcome":"launch_failed", "remedy":"LaunchServices could not open the application; list_apps before retrying because the application may still start"})
             }
         };
+        // Foreground mode brings the opened application to the front through
+        // the same one-way front and guards every action uses: once a running
+        // application is found, or a launch reports its first window. The
+        // launch itself never activates. A front that stops leaves the launch
+        // result standing and says why.
+        if let Ok(opened) = &opened {
+            if opened.already_running || opened.has_window {
+                if let Some(grant) = context.management.process_for_pid(opened.pid) {
+                    let front = self
+                        .front_for_foreground(super::fronting::FrontCall {
+                            grant: &grant,
+                            consent: &context.consent,
+                            cancel: &context.cancel,
+                            management: context.management,
+                            conversation_key: &conversation_key,
+                        })
+                        .await;
+                    if let Some(front) = front {
+                        if let (true, Some(change)) = (opened.already_running, front.change) {
+                            // Nothing was launched; the action was the front,
+                            // refused because the person changed the target.
+                            reply = super::element_actions::state_changed_by_person_reply(
+                                &app.name, change,
+                            );
+                        }
+                        front.fronting.apply(&mut reply);
+                    }
+                }
+            }
+        }
         if let (true, Some(key), Some(outcome)) = (
             attempted.load(Ordering::Acquire),
             history_key,
