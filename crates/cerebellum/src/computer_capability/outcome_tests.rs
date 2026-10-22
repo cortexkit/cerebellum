@@ -79,6 +79,8 @@ const COMMON_OUTCOMES: &[&str] = &[
     "dispatch_outcome_unknown",
     "target_busy",
     "blocking_capacity_exhausted",
+    "config_invalid",
+    "not_fronted",
 ];
 
 const BOUNDED_OUTCOMES: &[&str] = &[
@@ -279,6 +281,13 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         // refusal is reserved for the platform authentication path as well.
         json!({"outcome": "not_servable", "remedy": "this capability has no dispatch row; report it"}),
         json!({"outcome": "private_input_auth_failed"}),
+        // The config-file refusal and the fronting refusal have no builder
+        // yet, so these stand in for them until they do.
+        json!({"outcome": "config_invalid",
+            "remedy": "fix ~/.config/cortexkit/cerebellum.jsonc: computer_use.app_use must be \"background\" or \"foreground\""}),
+        json!({"outcome": "not_fronted", "remedy": "wait, then retry",
+            "fronting": {"mode": "foreground", "fronted": false, "purpose": "foreground_mode",
+                "restore": "not_needed", "not_fronted_reason": "person_active"}}),
     ]);
     // A target given by name that matches nobody, and one that matches two
     // different applications.
