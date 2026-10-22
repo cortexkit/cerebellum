@@ -331,24 +331,36 @@ pub(crate) fn user_browser_route(
     head_tools_route(&heads).ok_or(ParentRefusal::NoHeadToolsRoute)
 }
 
+/// One bound route of a run's head.
+struct HeadRoute {
+    route: crate::user_browser_bridge::Route,
+    /// When the route's bind was accepted; lower is older.
+    bound: u64,
+    facts: AcceptedBindFacts,
+}
+
 /// Which of a head's routes keeps its user-browser work: the route its own
-/// `browser_use` calls arrive on. Management routes never serve `browser_use`,
-/// so only a tools-surface route can hold the head's claims. With several,
-/// the lowest (channel, epoch) is chosen, so every call picks the same one.
-/// `heads` is sorted by (channel, epoch).
-fn head_tools_route(
-    heads: &[(crate::user_browser_bridge::Route, AcceptedBindFacts)],
-) -> Option<crate::user_browser_bridge::Route> {
+/// `browser_use` calls arrive on, where its claims and snapshots live.
+///
+/// Only a tools-surface route can be that route, since management routes never
+/// serve `browser_use`. Among tools routes the oldest-bound one is chosen.
+/// The route carrying the head's own browser calls is opened before any run
+/// starts and stays open, while other tools routes under the same head scope
+/// are newer: short-lived ones opened to read the catalog or answer a single
+/// request, or a replacement briefly overlapping an old route across a
+/// reconnect. Channel numbers say nothing about which is which.
+fn head_tools_route(heads: &[HeadRoute]) -> Option<crate::user_browser_bridge::Route> {
     heads
         .iter()
-        .find(|(_, head)| head.surface == crate::RouteSurface::Tools)
-        .map(|(route, _)| *route)
+        .filter(|head| head.facts.surface == crate::RouteSurface::Tools)
+        .min_by_key(|head| head.bound)
+        .map(|head| head.route)
 }
 
 impl RouteBindings {
     pub(crate) fn run_head(&self, run: &ScopeStamp) -> Result<AcceptedBindFacts, ParentRefusal> {
         let heads = self.head_routes(run)?;
-        let (_, head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
+        let head = &heads.first().ok_or(ParentRefusal::NoLiveHead)?.facts;
         if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
             return Err(ParentRefusal::AgentMismatch);
         }
@@ -357,10 +369,7 @@ impl RouteBindings {
 
     /// Every bound route of the run's linked, admitted head, of any surface,
     /// sorted by (channel, epoch).
-    fn head_routes(
-        &self,
-        run: &ScopeStamp,
-    ) -> Result<Vec<(crate::user_browser_bridge::Route, AcceptedBindFacts)>, ParentRefusal> {
+    fn head_routes(&self, run: &ScopeStamp) -> Result<Vec<HeadRoute>, ParentRefusal> {
         if run.parent_state != Some(ParentState::Linked) {
             return Err(ParentRefusal::NotLinked);
         }
@@ -388,16 +397,15 @@ impl RouteBindings {
                             == Some(facts.identity.agent_project_id.as_str())
                 })
             })
-            .map(|(&(channel, epoch), facts)| {
-                (
-                    crate::user_browser_bridge::Route { channel, epoch },
-                    facts.clone(),
-                )
+            .map(|(&(channel, epoch), facts)| HeadRoute {
+                route: crate::user_browser_bridge::Route { channel, epoch },
+                bound: self.bind_sequence(channel, epoch).unwrap_or(u64::MAX),
+                facts: facts.clone(),
             })
             .collect::<Vec<_>>();
         // A head may have both management and tool routes. Choose consistently;
         // they name the same head context, not whichever hash entry happens first.
-        heads.sort_by_key(|(route, _)| *route);
+        heads.sort_by_key(|head| head.route);
         Ok(heads)
     }
 }

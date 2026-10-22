@@ -466,9 +466,9 @@ fn set_surface(fixture: &Fixture, channel: u16, surface: crate::RouteSurface) {
     fixture.planes.routes.insert(channel, 1, facts);
 }
 
-#[tokio::test]
-async fn a_head_management_route_that_sorts_first_does_not_take_the_runs_chrome_work() {
-    let fixture = Fixture::new();
+/// The head's direct calls on `head_channel` claim and read a tab; the run must
+/// act on that tab, and a tab the run claims must be the head's on that route.
+async fn run_shares_the_heads_route(fixture: &Fixture, head_channel: u16) {
     fixture.state.lock().unwrap().tabs.insert(
         "handed2".into(),
         DoubleTab {
@@ -480,26 +480,23 @@ async fn a_head_management_route_that_sorts_first_does_not_take_the_runs_chrome_
             interaction: 1,
         },
     );
-    // The head's tools route is channel 2. Channel 1 becomes its management
-    // route, which sorts first among the head's routes.
-    set_surface(&fixture, 1, crate::RouteSurface::Management);
-    let tools = Route {
-        channel: 2,
+    let head = Route {
+        channel: head_channel,
         epoch: 1,
     };
-    let tab = fixture.claim(2).await;
-    let (read, cards) = fixture.snapshot(2, &tab, "allow_30m").await;
+    let tab = fixture.claim(head_channel).await;
+    let (read, cards) = fixture.snapshot(head_channel, &tab, "allow_30m").await;
     assert_eq!(read["outcome"], "ok", "{read}");
     assert_eq!(cards.len(), 1);
-    bind_run(&fixture, false).await;
+    bind_run(fixture, false).await;
 
     let run_read = fixture
-        .finish(start_run(&fixture, snapshot_args(&tab), None))
+        .finish(start_run(fixture, snapshot_args(&tab), None))
         .await;
     assert_eq!(structured(&run_read)["outcome"], "ok", "{run_read}");
     let claimed = fixture
         .finish(start_run(
-            &fixture,
+            fixture,
             json!({"browser":"user","action":"claim_tab","tab":"handed2"}),
             None,
         ))
@@ -514,11 +511,36 @@ async fn a_head_management_route_that_sorts_first_does_not_take_the_runs_chrome_
             .state()
             .claims
             .get(&run_tab),
-        Some(&tools)
+        Some(&head)
     );
-    let (head_read, cards) = fixture.snapshot(2, &run_tab, "allow_30m").await;
+    let (head_read, cards) = fixture
+        .snapshot(head_channel, &run_tab, "allow_30m")
+        .await;
     assert_eq!(head_read["outcome"], "ok", "{head_read}");
     assert!(cards.is_empty(), "{cards:?}");
+}
+
+#[tokio::test]
+async fn the_heads_oldest_bound_tools_route_keeps_its_chrome_work_over_a_newer_lower_channel() {
+    let fixture = Fixture::new();
+    // Rebind channel 1 so it is newer than channel 2 while keeping the lower
+    // channel number, as a short-lived tools route opened after the head's
+    // long-lived one would be.
+    let facts = fixture.planes.routes.remove(1, 1).unwrap();
+    fixture.planes.routes.insert(1, 1, facts);
+    assert!(
+        fixture.planes.routes.bind_sequence(2, 1) < fixture.planes.routes.bind_sequence(1, 1)
+    );
+    run_shares_the_heads_route(&fixture, 2).await;
+}
+
+#[tokio::test]
+async fn a_head_management_route_bound_first_does_not_take_the_runs_chrome_work() {
+    let fixture = Fixture::new();
+    // Channel 1, the head's oldest route, becomes a management route; its
+    // tools route is channel 2.
+    set_surface(&fixture, 1, crate::RouteSurface::Management);
+    run_shares_the_heads_route(&fixture, 2).await;
 }
 
 #[tokio::test]

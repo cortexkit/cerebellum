@@ -1296,6 +1296,16 @@ fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
 pub struct RouteBindings {
     inner: Arc<RwLock<HashMap<(u16, u32), AcceptedBindFacts>>>,
     removed: Arc<tokio::sync::Notify>,
+    /// When each bound route's bind was accepted, as a sequence number that
+    /// only grows. Re-recording an already-bound route's facts keeps its
+    /// place. Locked only while `inner` is held, in that order.
+    bind_order: Arc<std::sync::Mutex<BindOrder>>,
+}
+
+#[derive(Default)]
+struct BindOrder {
+    next: u64,
+    sequence: HashMap<(u16, u32), u64>,
 }
 
 impl RouteBindings {
@@ -1306,7 +1316,29 @@ impl RouteBindings {
     fn insert(&self, channel: u16, epoch: u32, facts: AcceptedBindFacts) {
         if let Ok(mut routes) = self.inner.write() {
             routes.insert((channel, epoch), facts);
+            let mut order = self
+                .bind_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = order.next;
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                order.sequence.entry((channel, epoch))
+            {
+                entry.insert(next);
+                order.next += 1;
+            }
         }
+    }
+
+    /// The order in which this route's bind was accepted among all routes
+    /// bound now or before; lower is older.
+    fn bind_sequence(&self, channel: u16, epoch: u32) -> Option<u64> {
+        self.bind_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sequence
+            .get(&(channel, epoch))
+            .copied()
     }
 
     fn get(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
@@ -1323,11 +1355,14 @@ impl RouteBindings {
     }
 
     fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
-        let facts = self
-            .inner
-            .write()
-            .ok()
-            .and_then(|mut routes| routes.remove(&(channel, epoch)));
+        let facts = self.inner.write().ok().and_then(|mut routes| {
+            self.bind_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sequence
+                .remove(&(channel, epoch));
+            routes.remove(&(channel, epoch))
+        });
         self.removed.notify_waiters();
         facts
     }
