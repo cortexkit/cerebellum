@@ -28,7 +28,7 @@ struct StepScript {
     /// The poll, counted from one, at which the element first reads enabled
     /// once fronted. `None`: it never does.
     enabled_on_poll: Option<usize>,
-    /// During the settle, this application comes to the front.
+    /// During the settle, the application with this pid comes to the front.
     switch_to_during_settle: Option<u32>,
     /// During the settle, the person presses a key or a button.
     hardware_input_during_settle: bool,

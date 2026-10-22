@@ -34,8 +34,9 @@ struct FakeDesk {
     front_requests: Vec<u32>,
     /// The newest hardware input the process-wide observer saw.
     hardware_input_ms: Option<u64>,
-    /// Once this unit is posted, this application comes to the front, with
-    /// hardware input when the flag is set.
+    /// `(unit, pid, input)`: once unit `unit` is posted, the application with
+    /// `pid` comes to the front, with hardware input recorded when `input` is
+    /// set.
     switch_after_unit: Option<(usize, u32, bool)>,
     /// Set by a fronted read; the next frontmost read then sees the person's
     /// switch to `THIRD`, with hardware input.

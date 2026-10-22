@@ -30,8 +30,8 @@
 //! A batch of presses fronts once, at the first step that needs it, keeps the
 //! lock through the rest of the run, and makes one restore decision after the
 //! last step's settle. Only that first fronted step waits for the badge to
-//! arrive, and no later step may wait on anything while the target is in
-//! front.
+//! arrive, and no later step may wait on consent, a lane or a person while
+//! the target is in front.
 //!
 //! Everything platform-specific is behind [`FrontingPressHost`], so the order
 //! and the bound are driven by a fake clock in tests.
