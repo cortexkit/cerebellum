@@ -271,3 +271,42 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "fronting-budget-reserves-lock-and-front-on-open-app"
+guards = "open_app's work budget, which sets the computer reply bound, reserves the wait for the fronting lock and for the app to come to the front"
+file = "crates/cerebellum/src/budgets.rs"
+old = "        (\"fronting_lock\", FRONTING_LOCK_WAIT_MS, 1),\n        (\"front\", FRONT_WAIT_MS, 1),\n        (\"launch\", OPEN_APP_LAUNCH_MS, 1),"
+new = "        (\"launch\", OPEN_APP_LAUNCH_MS, 1), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/budgets.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "budgets::tests::computer_phase_accounting_matches_each_path",
+    "budgets::tests::derived_tool_limits_equal_their_formulas",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "fronting-budget-reserves-a-restore-per-press"
+guards = "press_element's work budget reserves putting the previous app back once for every press in a batch"
+file = "crates/cerebellum/src/budgets.rs"
+old = "        (\"restore\", RESTORE_AX_MS, MAX_ELEMENT_PRESSES),"
+new = "        (\"restore\", RESTORE_AX_MS, 1), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/budgets.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "budgets::tests::computer_phase_accounting_matches_each_path",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
