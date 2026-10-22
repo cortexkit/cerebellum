@@ -394,6 +394,8 @@ export class Agent {
     if (hasInput && epoch !== state.plan.interaction_epoch) throw new Refusal("interaction_epoch_changed");
     await this.guard(state);
     const result = { tab: state.plan.tab, results, interaction_epoch: epoch, observer_available: covered, observer_continuity: this.epochs.record(state.tabId).continuity, connection_epoch: state.epoch };
+    const cause = this.epochs.record(state.tabId).cause;
+    if (cause) result.interaction_cause = cause;
     if (frameMappings) result.frame_mappings = frameMappings;
     if (this.popupFlags.delete(state.tabId)) result.popup_activated_briefly = true;
     return result;

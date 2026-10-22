@@ -8,6 +8,15 @@ const markUnavailable = record => {
   record.available = false;
 };
 
+// The trusted event types sentinel.js counts. Keep this list identical to its
+// `types` (a test compares them): a cause code names only one of these.
+export const OBSERVED_INPUT_EVENTS = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup", "beforeinput", "input", "wheel", "touchstart", "touchend"];
+const frameKind = frameId => frameId === 0 ? "main" : "subframe";
+// Why the interaction epoch last moved, as a short closed code returned with
+// the document state: `input.<event>.<main|subframe>` or `navigation.main`.
+// It names an event type and a frame kind, never page text or a URL.
+const inputCause = (kind, frameId) => OBSERVED_INPUT_EVENTS.includes(kind) ? `input.${kind}.${frameKind(frameId)}` : undefined;
+
 // Only group members are instrumented. The observer has no debugger dependency,
 // so human input while the per-action debugger is detached still invalidates refs.
 export class InteractionEpochs {
@@ -20,16 +29,27 @@ export class InteractionEpochs {
   }
 
   record(tabId) {
-    if (!this.records.has(tabId)) this.records.set(tabId, { epoch: 0, continuity: 0, documents: new Map(), actions: [], available: false, coverageLost: false, installAttempts: new Map(), navigationGeneration: 0, confirmedDocuments: new Map() });
+    if (!this.records.has(tabId)) this.records.set(tabId, { epoch: 0, continuity: 0, documents: new Map(), actions: [], available: false, coverageLost: false, installAttempts: new Map(), navigationGeneration: 0, confirmedDocuments: new Map(), cause: undefined });
     return this.records.get(tabId);
   }
 
-    bump(tabId) {
-    if (!this.tabs.tabs.has(tabId)) return;
+  // A navigation the agent did not start. Only the main frame counts: a
+  // person starts a main-frame navigation from the browser itself (address
+  // bar, back, reload) with no page input to observe. A child frame navigates
+  // by page script, by input inside a frame, or by the back button walking a
+  // frame's history. Input inside any live frame is already counted there,
+  // since every live frame runs the observer (a sample needs every frame to
+  // answer), and the child's new document changes continuity when it
+  // commits, which refuses saved input as observer_unavailable.
+  bump(tabId, frameId = 0) {
+    if (!this.tabs.tabs.has(tabId) || frameId !== 0) return;
     const record = this.record(tabId);
     // markUnavailable changes continuity, which input compares with its saved
     // read. Missing coverage must not also increment the interaction counter.
-    if (!record.coverageLost) record.epoch += 1;
+    if (!record.coverageLost) {
+      record.epoch += 1;
+      record.cause = "navigation.main";
+    }
   }
 
   forget(tabId) {
@@ -65,18 +85,23 @@ export class InteractionEpochs {
     }
     let sequence = sameDocument ? previous.sequence : 0;
     let increments = 0;
+    let cause;
     for (const event of observation.interactions) {
       if (!Number.isSafeInteger(event.sequence) || !Number.isFinite(event.at) || event.at > observation.observedAt) throw new Refusal("interaction_continuity_lost");
       if (event.sequence <= sequence) continue;
       if (event.sequence !== sequence + 1) throw new Refusal("interaction_continuity_lost");
       sequence = event.sequence;
-      if (!record.actions.some(action => event.at >= action.start && (action.end === null || event.at < action.end))) increments += 1;
+      if (!record.actions.some(action => event.at >= action.start && (action.end === null || event.at < action.end))) {
+        increments += 1;
+        cause = inputCause(event.kind, frameId);
+      }
     }
     // A truncated history cannot prove which side of attach/detach the missing
     // input belongs to. Fail closed instead of discounting unknown events.
     if (sequence !== observation.sequence) throw new Refusal("interaction_continuity_lost");
     if (!sameDocument) record.continuity += 1;
     record.epoch += increments;
+    if (increments) record.cause = cause;
     record.documents.set(frameId, { documentId: observation.documentId, sequence, observedAt: Math.max(sameDocument ? previous.observedAt : 0, observation.observedAt) });
   }
 

@@ -38,6 +38,19 @@ use crate::{AcceptedBindFacts, CancelHandle, Planes};
 pub(crate) const CONSENT_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_SNAPSHOTS: usize = 64;
 pub(crate) const NAVIGATION_READ_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a snapshot or screenshot waits for the page's interaction
+/// observer before refusing `observer_unavailable`. After a document commits,
+/// the extension injects its observer into the new document and into each
+/// child frame as that frame commits; a read sees the observer only once every
+/// live frame answers. That normally takes well under a second after a commit,
+/// so two seconds is ample, and a program, which cannot sleep, needs the read
+/// itself to wait rather than refuse at once. The wait spends the action's own
+/// work allowance: the action deadline still ends the call on time.
+const OBSERVER_WAIT: Duration = Duration::from_secs(2);
+/// The pause between document reads while waiting for the observer. Each read
+/// is a whole extension plan (a debugger attach and detach), so poll at a
+/// modest rate rather than back to back.
+const OBSERVER_POLL: Duration = Duration::from_millis(50);
 
 // A method the extension permits is not necessarily safe to call a read when
 // choosing a timeout reply. Use the separate fixed set so admitting a new
@@ -281,6 +294,8 @@ struct PlanReply {
     popup_activated_briefly: bool,
     #[serde(default)]
     frame_mappings: Vec<FrameMapping>,
+    #[serde(default)]
+    interaction_cause: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -627,7 +642,7 @@ fn refusal(reason: &str) -> Value {
 /// can keep running an old unpacked copy that reports the same `version`, and
 /// replies from such a copy must refuse with a reload remedy instead of
 /// failing to decode.
-pub(crate) const EXTENSION_REVISION: u64 = 1;
+pub(crate) const EXTENSION_REVISION: u64 = 2;
 
 const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
 const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
@@ -709,6 +724,69 @@ fn observer_unavailable() -> Value {
 
 fn read_again(input_dispatched: bool) -> Value {
     json!({"browser":"user", "outcome":"refused", "reason":"state_changed_by_person", "remedy":"read again", "input_dispatched":input_dispatched})
+}
+
+/// The trusted page events the extension's observer (`extension/sentinel.js`)
+/// counts as a person's input. A cause code names one of these.
+const OBSERVED_INPUT_EVENTS: [&str; 13] = [
+    "pointerdown",
+    "pointerup",
+    "mousedown",
+    "mouseup",
+    "click",
+    "dblclick",
+    "keydown",
+    "keyup",
+    "beforeinput",
+    "input",
+    "wheel",
+    "touchstart",
+    "touchend",
+];
+
+/// The extension's code for why a tab's interaction epoch last moved, kept
+/// only when it is in the extension's closed vocabulary:
+/// `input.<event>.<main|subframe>` for a person's input event in the main
+/// frame or a child frame, or `navigation.<main|subframe>` for a navigation
+/// the agent did not start. Any other string becomes `unrecognized`, so no
+/// page-supplied text can reach a reply.
+fn recognized_cause(code: Option<String>) -> Option<String> {
+    let code = code?;
+    let known = match code.split('.').collect::<Vec<_>>().as_slice() {
+        ["input", event, "main" | "subframe"] => OBSERVED_INPUT_EVENTS.contains(event),
+        ["navigation", "main" | "subframe"] => true,
+        _ => false,
+    };
+    Some(if known { code } else { "unrecognized".into() })
+}
+
+/// [`read_again`] when the tab's interaction epoch moved since the read,
+/// naming in `detail` the extension's code for the last thing that moved it
+/// (`unknown` when the extension gave none).
+fn epoch_moved(input_dispatched: bool, cause: Option<&str>) -> Value {
+    let mut reply = read_again(input_dispatched);
+    reply["detail"] = json!({"check":"interaction_epoch","cause":cause.unwrap_or("unknown")});
+    reply
+}
+
+/// [`read_again`] when the tab's committed document differs from the one the
+/// read saw, naming in `detail` which parts of its identity changed. Only
+/// booleans are reported, never the URLs or ids themselves.
+fn document_moved(
+    input_dispatched: bool,
+    before: &CommittedDocument,
+    after: &CommittedDocument,
+) -> Value {
+    let mut reply = read_again(input_dispatched);
+    reply["detail"] = json!({
+        "check":"committed_document",
+        "history_entry_changed":before.entry_id != after.entry_id,
+        "history_index_changed":before.current_index != after.current_index,
+        "history_length_changed":before.history.len() != after.history.len(),
+        "url_changed":before.url != after.url,
+        "loader_changed":before.loader_id != after.loader_id,
+    });
+    reply
 }
 
 fn invalid(field: &str, reason: &str) -> Value {
@@ -1046,6 +1124,7 @@ async fn invoke(
 struct Plan {
     results: Vec<Value>,
     interaction: u64,
+    interaction_cause: Option<String>,
     observer_available: bool,
     observer_continuity: u64,
     popup: bool,
@@ -1137,8 +1216,9 @@ async fn plan(
     {
         return Err(prior_input(observer_unavailable(), dispatched));
     }
+    let interaction_cause = recognized_cause(reply.interaction_cause);
     if !navigates && interaction.is_some_and(|expected| expected != reply.interaction_epoch) {
-        return Err(read_again(dispatched));
+        return Err(epoch_moved(dispatched, interaction_cause.as_deref()));
     }
     if results.len() != count {
         return Err(prior_input(
@@ -1149,6 +1229,7 @@ async fn plan(
     Ok(Plan {
         results,
         interaction: reply.interaction_epoch,
+        interaction_cause,
         observer_available: reply.observer_available,
         observer_continuity: reply.observer_continuity,
         popup: reply.popup_activated_briefly,
@@ -1201,6 +1282,7 @@ struct Document {
     committed: CommittedDocument,
     frames: Vec<FrameDocument>,
     interaction: u64,
+    interaction_cause: Option<String>,
     observer_available: bool,
     observer_continuity: u64,
     unreadable_frames: BTreeMap<String, FrameReadFailure>,
@@ -1249,6 +1331,7 @@ async fn document(
         committed,
         frames,
         interaction: plan.interaction,
+        interaction_cause: plan.interaction_cause,
         observer_available: plan.observer_available,
         observer_continuity: plan.observer_continuity,
         unreadable_frames,
@@ -2009,6 +2092,22 @@ impl Context<'_> {
         }
         unreachable!("the bounded document loop returns on its last attempt")
     }
+
+    /// Read `tab`'s document, waiting up to [`OBSERVER_WAIT`] for its
+    /// interaction observer when the first read finds none. The last read is
+    /// taken at the bound, so a caller refusing an unobserved result never
+    /// refuses before the bound has passed.
+    async fn observed_document(&self, tab: &str) -> Result<Document, Value> {
+        let bound = tokio::time::Instant::now() + OBSERVER_WAIT;
+        loop {
+            let observed = self.document(tab).await?;
+            let now = tokio::time::Instant::now();
+            if observed.observer_available || now >= bound {
+                return Ok(observed);
+            }
+            tokio::time::sleep(OBSERVER_POLL.min(bound - now)).await;
+        }
+    }
 }
 
 async fn serve_inner(
@@ -2252,7 +2351,17 @@ async fn serve_inner(
         return Ok(json!({"browser":"user","outcome":"ok","origin":site,"input_dispatched":false}));
     }
     let tab = args["tab"].as_str().expect("validated tab");
-    let current = context.document(tab).await?;
+    // A read issued just after a navigation can arrive before the new
+    // document's observer is installed. Wait for it, bounded, rather than
+    // refusing a read the caller cannot postpone. Input does not wait: it
+    // acts only under the observer its snapshot saw, and a reinstalled one
+    // can never match that. Navigation does not wait either, so an
+    // agent-created blank tab, which has no observer yet, navigates at once.
+    let current = if matches!(action, "snapshot" | "screenshot") {
+        context.observed_document(tab).await?
+    } else {
+        context.document(tab).await?
+    };
     let created_blank = action == "navigate"
         && current.committed.url == "about:blank"
         && target.state().unobserved_blank.contains(tab);
@@ -2388,11 +2497,46 @@ async fn navigate(
         reply["popup_activated_briefly"] = json!(true);
     }
     if args["read_page"] == true {
-        bind_observer_continuity(landed.observer_continuity);
-        let read = capture(context, tab, args, &landed, once, None).await?;
-        reply["read_page"] = read;
+        // The navigation has committed whatever happens to its read, so a
+        // read that cannot be taken is reported beside the committed outcome,
+        // never as a refusal of the navigation itself.
+        reply["read_page"] = match read_landed_page(context, tab, args, landed, once).await {
+            Ok(read) => read,
+            Err(mut refused) => {
+                if refused.get("remedy").is_none() {
+                    refused["remedy"] =
+                        json!("The page read is not available; take a snapshot of the tab.");
+                }
+                refused
+            }
+        };
     }
     Ok(reply)
+}
+
+/// Read the page a navigation landed on. The landing document's observer was
+/// confirmed before this read, but a page that is still committing child
+/// frames can replace it during the capture. Then wait for the observer once,
+/// bounded by [`OBSERVER_WAIT`], and read again if the tab still shows the
+/// same committed document, whose site the navigation already authorized.
+async fn read_landed_page(
+    context: &Context<'_>,
+    tab: &str,
+    args: &Value,
+    landed: Document,
+    once: &InvocationGrant,
+) -> Result<Value, Value> {
+    bind_observer_continuity(landed.observer_continuity);
+    let refused = match capture(context, tab, args, &landed, once, None).await {
+        Err(refused) if refused["reason"] == "observer_unavailable" => refused,
+        read => return read,
+    };
+    let again = context.observed_document(tab).await?;
+    if !again.observer_available || again.committed != landed.committed {
+        return Err(refused);
+    }
+    bind_observer_continuity(again.observer_continuity);
+    capture(context, tab, args, &again, once, None).await
 }
 
 fn baseline(context: &Context<'_>, tab: &str, document: &Document) -> Snapshot {
@@ -3642,8 +3786,18 @@ async fn input_document(
     {
         return Err(prior_input(observer_unavailable(), dispatched));
     }
-    if observed.interaction != snapshot.interaction || observed.committed != snapshot.document {
-        return Err(read_again(dispatched));
+    if observed.interaction != snapshot.interaction {
+        return Err(epoch_moved(
+            dispatched,
+            observed.interaction_cause.as_deref(),
+        ));
+    }
+    if observed.committed != snapshot.document {
+        return Err(document_moved(
+            dispatched,
+            &snapshot.document,
+            &observed.committed,
+        ));
     }
     Ok(observed)
 }

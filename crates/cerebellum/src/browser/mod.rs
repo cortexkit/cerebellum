@@ -5633,7 +5633,13 @@ pub(crate) fn validate_user_browser_result(
                     closed_object(json!({"extension_revision":{"anyOf":[integer_schema(),{"type":"null"}]},"required_revision":integer_schema()}), &["extension_revision","required_revision"]),
                     // A protocol_error refusal names the decoding step and,
                     // when known, the reply field and what was wrong with it.
-                    closed_object(json!({"step":string_schema(),"field":string_schema(),"problem":string_schema()}), &["step"])]}
+                    closed_object(json!({"step":string_schema(),"field":string_schema(),"problem":string_schema()}), &["step"]),
+                    // A state_changed_by_person refusal names which check
+                    // failed: the interaction epoch moved (with the
+                    // extension's code for why) or the committed document
+                    // differed (with booleans for which identity part).
+                    closed_object(json!({"check":enum_schema(&["interaction_epoch"]),"cause":string_schema()}), &["check","cause"]),
+                    closed_object(json!({"check":enum_schema(&["committed_document"]),"history_entry_changed":boolean_schema(),"history_index_changed":boolean_schema(),"history_length_changed":boolean_schema(),"url_changed":boolean_schema(),"loader_changed":boolean_schema()}), &["check","history_entry_changed","history_index_changed","history_length_changed","url_changed","loader_changed"])]}
             }),
             &["browser", "outcome"],
         )

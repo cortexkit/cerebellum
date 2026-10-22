@@ -85,7 +85,7 @@ export class BrowserEvents {
         return;
       }
       if (info.frameId === 0 && info.url && info.url !== "about:blank") this.agent.blankNavigations.delete(info.tabId);
-      this.epochs.bump(info.tabId);
+      this.epochs.bump(info.tabId, info.frameId);
     });
     this.chrome.webNavigation.onCommitted.addListener(info => {
       if (!this.tabs.tabs.has(info.tabId)) return;
