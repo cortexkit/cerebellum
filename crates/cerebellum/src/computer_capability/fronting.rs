@@ -250,6 +250,20 @@ impl Fronting {
         }
     }
 
+    /// Whether this says nothing beyond "background mode, nothing to do":
+    /// no front was made, attempted or refused. Such a call's reply and row
+    /// stay exactly as they were before fronting existed, since they are
+    /// most calls' replies and rows.
+    pub(crate) fn is_untouched_background(self) -> bool {
+        self == Self::untouched(AppUse::Background)
+    }
+
+    /// The record the action's row carries: `None` for an untouched
+    /// background call, whose row stays as it was.
+    pub(crate) fn row_record(self) -> Option<FrontingRecord> {
+        (!self.is_untouched_background()).then(|| self.record())
+    }
+
     /// The journal's text-free form of this, as the action's row records it.
     /// No preview is drawn for an action yet, so the frame count is zero.
     pub(crate) fn record(self) -> FrontingRecord {

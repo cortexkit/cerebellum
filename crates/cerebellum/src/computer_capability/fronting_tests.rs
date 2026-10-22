@@ -1288,10 +1288,9 @@ async fn a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_pres
         .call("computer.press_element", json!({"element_id": send}))
         .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
-    assert_eq!(
-        reply["fronting"],
-        json!({"mode":"background","fronted":false,"purpose":"none","restore":"not_needed"}),
-        "background mode with nothing fronted says so: {reply}"
+    assert!(
+        reply.get("fronting").is_none(),
+        "background mode with nothing fronted replies as before: {reply}"
     );
     assert!(started.elapsed() < Duration::from_millis(100));
     assert_eq!(rig.desk.state().presses, [10]);
@@ -1825,12 +1824,7 @@ async fn open_app_fronts_a_running_or_launched_app_only_in_foreground_mode() {
                 assert_eq!(rig.screen.log(), ["front:4242"], "{case}");
             }
             AppUse::Background => {
-                assert_eq!(
-                    reply["fronting"],
-                    json!({"mode":"background","fronted":false,"purpose":"none",
-                        "restore":"not_needed"}),
-                    "{case}"
-                );
+                assert!(reply.get("fronting").is_none(), "{case}");
                 assert!(rig.screen.log().is_empty(), "{case}");
             }
         }
@@ -2523,7 +2517,8 @@ async fn fronted_press_rows_record_how_the_front_ended() {
 }
 
 /// A foreground read's row records its one-way front under `fronting`, and
-/// an ordinary background press's row records that nothing was fronted.
+/// an ordinary background press, which had no reason to front, writes its
+/// row exactly as before, with no `fronting` member.
 #[tokio::test]
 async fn read_and_ordinary_press_rows_record_their_fronting() {
     use cerebellum_computer::audit::{FrontingRecordPurpose, FrontingRecordRestore};
@@ -2555,10 +2550,36 @@ async fn read_and_ordinary_press_rows_record_their_fronting() {
         .iter()
         .find(|row| row["outcome"] == "completed")
         .unwrap_or_else(|| panic!("no press row in {rows:?}"));
-    let record = row_fronting(pressed);
-    assert!(!record.fronted);
-    assert_eq!(record.purpose, FrontingRecordPurpose::None);
-    assert_eq!(record.restore, FrontingRecordRestore::NotNeeded);
+    assert!(
+        rows.iter().all(|row| row.get("fronting").is_none()),
+        "{rows:?}"
+    );
+}
+
+/// In foreground mode even a reply that ended before any front was tried
+/// says how the action used the front; the same reply in background mode,
+/// where nothing had a reason to front, carries no `fronting` at all.
+#[tokio::test]
+async fn only_foreground_mode_adds_fronting_to_a_reply_that_never_fronted() {
+    for mode in [AppUse::Foreground, AppUse::Background] {
+        let rig = rig(mode, mail_desk()).await;
+        let reply = rig
+            .call("computer.press_element", json!({"element_id": "e999"}))
+            .await;
+        assert_ne!(reply["outcome"], "completed", "{mode:?}: {reply}");
+        match mode {
+            AppUse::Foreground => assert_eq!(
+                reply["fronting"],
+                json!({"mode":"foreground","fronted":false,"purpose":"foreground_mode",
+                    "restore":"not_needed"}),
+                "{reply}"
+            ),
+            AppUse::Background => {
+                assert!(reply.get("fronting").is_none(), "{reply}");
+            }
+        }
+        assert!(rig.screen.log().is_empty(), "{:?}", rig.screen.log());
+    }
 }
 
 /// A foreground press fronts and then presses: its own row records the

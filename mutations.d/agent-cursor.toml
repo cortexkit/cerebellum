@@ -1369,10 +1369,10 @@ timeout_s = 900
 build_timeout_s = 1800
 
 [[control]]
-id = "app-use-journal-every-listed-reply-has-fronting"
-guards = "every reply of an action that can front carries fronting, including background replies that fronted nothing"
+id = "app-use-journal-foreground-replies-have-fronting"
+guards = "in foreground mode every reply of an action that can front carries fronting, even one that ended before a front was tried"
 file = "crates/cerebellum/src/computer_capability/mod.rs"
-old = "        if can_front(capability.0) {"
+old = "        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {"
 new = "        if false && can_front(capability.0) { // NON-VACUITY BREAK"
 edits = []
 test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
@@ -1381,8 +1381,47 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
+    "computer_capability::fronting_tests::only_foreground_mode_adds_fronting_to_a_reply_that_never_fronted",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-untouched-background-replies-keep-their-bytes"
+guards = "a background reply that fronted nothing carries no fronting, so the replies most calls get keep their exact bytes"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {"
+new = "        if can_front(capability.0) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
     "computer_capability::fronting_tests::a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_press",
+    "computer_capability::fronting_tests::only_foreground_mode_adds_fronting_to_a_reply_that_never_fronted",
     "computer_capability::fronting_tests::open_app_fronts_a_running_or_launched_app_only_in_foreground_mode",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-untouched-background-rows-keep-their-bytes"
+guards = "a background call that fronted nothing writes its journal row exactly as before, with no fronting member"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        (!self.is_untouched_background()).then(|| self.record())"
+new = "        Some(self.record()) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::read_and_ordinary_press_rows_record_their_fronting",
 ]
 only = false
 timeout_s = 900

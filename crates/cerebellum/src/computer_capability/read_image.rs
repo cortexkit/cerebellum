@@ -115,14 +115,12 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             .map_or(cerebellum_core::config::AppUse::Background, |fronting| {
                 fronting.mode
             });
-        evidence.borrow_mut().fronting_record = Some(
-            super::fronting::hooked_fronting(
-                mode,
-                super::fronting::Purpose::BringToFront,
-                &hooks.peek(),
-            )
-            .record(),
-        );
+        evidence.borrow_mut().fronting_record = super::fronting::hooked_fronting(
+            mode,
+            super::fronting::Purpose::BringToFront,
+            &hooks.peek(),
+        )
+        .row_record();
     }
     if matches!(report.restore, RestoreStatus::Failed { .. }) {
         return Err(ImageUnavailable::RestoreFailed);

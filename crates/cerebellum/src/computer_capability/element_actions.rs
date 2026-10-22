@@ -2102,7 +2102,9 @@ where
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
-            journal.set_fronting(fronting.record());
+            if let Some(record) = fronting.row_record() {
+                journal.set_fronting(record);
+            }
             let mut reply =
                 press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if gate.refused_for_end() {

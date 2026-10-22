@@ -1082,10 +1082,13 @@ where
                 object.insert("screen_lock_state".into(), json!("unknown"));
             }
         }
-        // Every reply of an action that can front says how it used the front
-        // of the screen, including the replies of actions that had no reason
-        // to front. Replies returned above, before the action ran, do not.
-        if can_front(capability.0) {
+        // In foreground mode every reply of an action that can front says how
+        // it used the front of the screen, including replies that ended
+        // before the front was tried. A background reply carries `fronting`
+        // only when a front was made, attempted or refused, so the replies
+        // of background calls that had no reason to front keep their bytes.
+        // Replies returned above, before the action ran, carry none.
+        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {
             if let Some(object) = reply.as_object_mut() {
                 object
                     .entry("fronting")
@@ -1783,7 +1786,7 @@ where
                         .requested
                         .then_some(cerebellum_computer::app_state::image::ImageDecision::Unknown),
                     fronting: None,
-                    fronting_record: image_plan.fronting.map(fronting::Fronting::record),
+                    fronting_record: image_plan.fronting.and_then(fronting::Fronting::row_record),
                 });
             let mut custody = AuditImageCustody {
                 audit: &audit,
@@ -2414,7 +2417,7 @@ where
                         None => record_foreground
                             .unwrap_or_else(|| fronting::Fronting::untouched(record_mode)),
                     };
-                    Some(fronting.record())
+                    fronting.row_record()
                 });
             let cancelled = || cancel.is_cancelled();
             let mut driver = make_driver();

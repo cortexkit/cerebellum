@@ -548,7 +548,9 @@ where
                 .and_then(|_| make_driver().fronting_session().ok());
             let (Some(parts), Some(session)) = (parts, session) else {
                 let journal = &mut journals[0];
-                journal.set_fronting(Fronting::untouched(mode).record());
+                if let Some(record) = Fronting::untouched(mode).row_record() {
+                    journal.set_fronting(record);
+                }
                 let reply = refuse_disabled(
                     source.as_ref(),
                     journal,
