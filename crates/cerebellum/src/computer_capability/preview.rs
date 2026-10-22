@@ -14,17 +14,20 @@
 //!   together, so the frame captured and the badge's position mapped into
 //!   the thumbnail always describe the same window.
 //! - When frames are captured. Capture happens here, in the module, which
-//!   holds Screen Recording; the helper only draws. One process-wide worker
-//!   thread captures for every agent, off the action path: no action waits
-//!   for it. At most one native capture request is outstanding at a time,
+//!   holds Screen Recording; the helper only draws. One process-wide preview
+//!   worker captures for every agent, off the action path, on two threads of
+//!   its own (one follows the schedule, one makes the native requests): no
+//!   action waits for it. At most one native capture request is outstanding at a time,
 //!   counting one whose wait ended without an answer; until it answers, no
 //!   other request is made, each agent's refreshes collapse into one for its
 //!   latest window, and every preview shows the application's icon. A frame
 //!   that answers late is sent only if its preview still shows that window
 //!   in the same generation. A hidden preview has no capture and no timer.
-//! - Without `preview_capture_admitted` (the capture review and the app-use
-//!   review both bound into this build) nothing is ever captured: previews
-//!   show the application's icon with `capture_refused`.
+//! - Without `preview_capture_admitted` (set only when this build carries
+//!   both the `capture_review_revision` and the
+//!   `app_use_fronting_review_revision` release attestations) nothing is
+//!   ever captured: previews show the application's icon with
+//!   `capture_refused`.
 //!
 //! These pixels leave the module outside capture custody. They are never
 //! model-visible, never retained and never journaled.
@@ -694,8 +697,9 @@ impl Shared {
     }
 }
 
-/// The process's one preview worker. The action path tells it what to
-/// show, hide and refresh, and never waits on it: each call takes a lock
+/// The process's one preview worker. The action path is meant to tell it
+/// what to show, hide and refresh (that wiring does not exist yet), and
+/// never waits on it: each call takes a lock
 /// that no capture is ever made under, sends at most one line without
 /// waiting, and returns.
 ///
@@ -749,7 +753,8 @@ impl PreviewWorker {
                     let answer = locked.schedule.answered(&job, result);
                     // Sent under the lock, so a hide that bumps the
                     // generation either comes first and stops the frame, or
-                    // comes after the frame is already on the pipe.
+                    // comes after the frame is already queued for the
+                    // helper.
                     for line in answer.lines {
                         answering.output.preview(line);
                     }
