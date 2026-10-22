@@ -267,6 +267,7 @@ where
                             cancel: &context.cancel,
                             management: context.management,
                             conversation_key: &conversation_key,
+                            input_follows: false,
                         })
                         .await;
                     // The launch's own row, reserved before the launch and

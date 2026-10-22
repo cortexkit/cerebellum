@@ -1709,6 +1709,7 @@ where
                 cancel: &cancel,
                 management,
                 conversation_key: &conversation_key,
+                input_follows: true,
             })
             .await;
         if let Some(mut refusal) =
@@ -1914,6 +1915,7 @@ where
                 cancel,
                 management,
                 conversation_key: &identity.conversation_key,
+                input_follows: true,
             })
             .await;
         if let Some(refusal) =

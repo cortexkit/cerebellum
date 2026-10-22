@@ -225,6 +225,44 @@ pub(crate) fn modifier_chord_refusal() -> Value {
     })
 }
 
+/// The refusal for a chord the operating system acts on outside the
+/// application, such as Spotlight or the application switcher, from a caller
+/// without the takeover grant. The app grant covers only what is done inside
+/// the application, so it is refused whether or not the application is in
+/// front, and the remedy names the grant that would admit it.
+pub(crate) fn system_chord_refusal() -> Value {
+    json!({
+        "outcome": "modifier_chord_needs_foreground",
+        "reason": "modifier_chord_needs_foreground",
+        "remedy": "this chord is a system shortcut that acts outside the application, which the \
+                   app grant does not cover, so nothing was posted. It needs the takeover \
+                   permission, control of your mouse and keyboard: ask for takeover and retry, \
+                   or use the equivalent accessibility action",
+    })
+}
+
+/// The reply for a keystroke whose route refused it, and whether the app
+/// grant's admission details are added to it.
+pub(crate) fn chord_refusal_reply(
+    refusal: super::fronting::ChordRefusal,
+    system_wide: bool,
+) -> (Value, bool) {
+    use super::fronting::ChordRefusal;
+    match refusal {
+        ChordRefusal::TakeoverNotForFlows => (
+            crate::computer_grants::ConsentRefusal::Unavailable {
+                reason: "takeover_not_for_flows",
+                remedy: "fronting keys requires an attended session",
+            }
+            .reply(None),
+            false,
+        ),
+        ChordRefusal::ModifierChordNeedsForeground if system_wide => (system_chord_refusal(), true),
+        ChordRefusal::ModifierChordNeedsForeground => (modifier_chord_refusal(), true),
+        ChordRefusal::KeystrokesNeedForeground => (needs_foreground_reply(), true),
+    }
+}
+
 /// The refusal for a background target in a build whose fronting bracket is
 /// not admitted. The remedy names only what this build can do.
 pub(crate) fn needs_foreground_reply() -> Value {

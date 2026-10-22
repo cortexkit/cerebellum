@@ -53,7 +53,7 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                 assert_eq!(without_takeover.may_front(), expected, "{case}");
 
                 // A Command chord to a background application.
-                let route = chord_route(without_takeover, false, true);
+                let route = chord_route(without_takeover, false, true, false);
                 let expected = match (attended, admitted) {
                     (false, _) => ChordRoute::Refuse(ChordRefusal::TakeoverNotForFlows),
                     (true, true) => ChordRoute::FrontWithAppGrant,
@@ -70,11 +70,11 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                 }
                 // Plain typing and a frontmost target never front.
                 assert_eq!(
-                    chord_route(without_takeover, false, false),
+                    chord_route(without_takeover, false, false, false),
                     ChordRoute::PerProcess
                 );
                 assert_eq!(
-                    chord_route(without_takeover, true, true),
+                    chord_route(without_takeover, true, true, false),
                     ChordRoute::PerProcess
                 );
 
@@ -102,15 +102,81 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
     }
     // A build without the app-use review keeps today's takeover rules.
     let held = admission(AppUse::Background, true, false, true);
-    assert_eq!(chord_route(held, false, true), ChordRoute::TakeoverBracket);
+    assert_eq!(
+        chord_route(held, false, true, false),
+        ChordRoute::TakeoverBracket
+    );
     let unreviewed = Admission {
         bracket_admitted: false,
         ..held
     };
     assert_eq!(
-        chord_route(unreviewed, false, true),
+        chord_route(unreviewed, false, true, false),
         ChordRoute::Refuse(ChordRefusal::KeystrokesNeedForeground)
     );
+}
+
+/// A system shortcut, which acts outside the application, takes the
+/// takeover route in every case: frontmost or not, and whether or not this
+/// build fronts under the app grant. A chord acting inside the application,
+/// destructive or not, keeps the app grant's route.
+#[test]
+fn system_wide_chords_take_the_takeover_route_and_in_app_chords_keep_the_app_grant() {
+    for mode in [AppUse::Foreground, AppUse::Background] {
+        for admitted in [true, false] {
+            for frontmost in [true, false] {
+                let case = format!("{mode:?} admitted={admitted} frontmost={frontmost}");
+                let without = admission(mode, true, admitted, false);
+                let held = admission(mode, true, admitted, true);
+                assert_eq!(
+                    chord_route(without, frontmost, true, true),
+                    ChordRoute::Refuse(ChordRefusal::ModifierChordNeedsForeground),
+                    "a system shortcut without takeover: {case}"
+                );
+                assert_eq!(
+                    chord_route(held, frontmost, true, true),
+                    ChordRoute::TakeoverBracket,
+                    "a system shortcut with takeover: {case}"
+                );
+                assert_eq!(
+                    chord_route(
+                        Admission {
+                            bracket_admitted: false,
+                            ..held
+                        },
+                        frontmost,
+                        true,
+                        true
+                    ),
+                    ChordRoute::Refuse(ChordRefusal::KeystrokesNeedForeground),
+                    "a system shortcut in a build without the takeover review: {case}"
+                );
+                assert_eq!(
+                    chord_route(
+                        admission(mode, false, admitted, true),
+                        frontmost,
+                        true,
+                        true
+                    ),
+                    ChordRoute::Refuse(ChordRefusal::TakeoverNotForFlows),
+                    "a system shortcut in an unattended session: {case}"
+                );
+                // An in-app chord, such as Command-Q, keeps today's route.
+                let in_app = if frontmost {
+                    ChordRoute::PerProcess
+                } else if admitted {
+                    ChordRoute::FrontWithAppGrant
+                } else {
+                    ChordRoute::Refuse(ChordRefusal::ModifierChordNeedsForeground)
+                };
+                assert_eq!(
+                    chord_route(without, frontmost, true, false),
+                    in_app,
+                    "{case}"
+                );
+            }
+        }
+    }
 }
 
 /// Each `fronting.restore` value and every reason the reply can carry
@@ -908,6 +974,19 @@ fn rig_with(
     desk: support::Desk,
     management: Arc<crate::management::ManagementPlane>,
 ) -> Rig {
+    rig_admitting(mode, desk, management, true, true)
+}
+
+/// A rig whose plane has the admissions a release build derives from its
+/// reviews: `app_use` admits fronting outside the keystroke bracket, and
+/// `bracket` admits that bracket.
+fn rig_admitting(
+    mode: AppUse,
+    desk: support::Desk,
+    management: Arc<crate::management::ManagementPlane>,
+    app_use: bool,
+    bracket: bool,
+) -> Rig {
     let screen = Screen::new(&desk);
     let lock = FrontingLock::isolated();
     let driver_screen = screen.clone();
@@ -922,8 +1001,8 @@ fn rig_with(
     .with_permission_liveness(support::live_permissions())
     .with_app_state_source(desk.source())
     .with_app_use(app_use_file(mode))
-    .with_app_use_fronting_admitted(true)
-    .with_fronting_bracket_admitted(true)
+    .with_app_use_fronting_admitted(app_use)
+    .with_fronting_bracket_admitted(bracket)
     .with_fronting_lock(lock.clone());
     Rig {
         plane: Arc::new(plane),
@@ -1307,6 +1386,7 @@ fn command_chord() -> Value {
 #[tokio::test]
 async fn a_background_command_chord_fronts_posts_and_restores() {
     let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
     let reply = rig
         .call_under(&under_terminal(), "computer.keys", command_chord())
         .await;
@@ -1330,6 +1410,7 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
 #[tokio::test]
 async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirmed() {
     let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
     rig.screen.state().post_unknown = true;
     let reply = rig
         .call_under(&under_terminal(), "computer.keys", command_chord())
@@ -1343,6 +1424,7 @@ async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirme
     assert!(!rig.lock.held());
 
     let rig = self::rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
     {
         let mut state = rig.screen.state();
         state.post_unknown = true;
@@ -1645,6 +1727,7 @@ impl Routed {
 /// keys down, cancel the route once the post has begun, and return the
 /// wire reply's body.
 async fn chord_cancelled_mid_post(rig: &Rig) -> Value {
+    rig.read().await;
     let posting = Arc::new(tokio::sync::Notify::new());
     rig.screen.state().posting = Some(Arc::clone(&posting));
     routed(
@@ -1890,8 +1973,10 @@ async fn a_press_left_held_by_another_conversation_on_another_app_blocks_every_f
     b.grant(&management, &other_app().bundle_identity).await;
     let rig = rig_with(AppUse::Background, support::focused_text_desk(), management);
 
-    // Conversation A's chord on its application X: the post fails with the
-    // keys possibly down, and the paired release never returns.
+    // Conversation A reads its application, then sends a chord to it: the
+    // post fails with the keys possibly down, and the paired release never
+    // returns.
+    rig.read().await;
     {
         let mut state = rig.screen.state();
         state.post_unknown = true;
@@ -2018,6 +2103,7 @@ async fn lost_authorization_while_waiting_for_the_lock_reads_nothing() {
 async fn the_deadline_passing_during_the_release_restores_only_after_it() {
     for confirmed in [true, false] {
         let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
         let finish_release = Arc::new(std::sync::atomic::AtomicBool::new(confirmed));
         {
             let mut state = rig.screen.state();
@@ -2066,6 +2152,7 @@ async fn the_deadline_passing_during_the_release_restores_only_after_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_racing_the_settle_makes_one_restore_after_the_release() {
     let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
     let releasing = Arc::new(tokio::sync::Notify::new());
     {
         let mut state = rig.screen.state();
@@ -2617,7 +2704,11 @@ async fn a_foreground_press_records_its_front_on_its_own_row() {
 #[tokio::test]
 async fn a_front_then_an_early_refusal_writes_its_own_fronted_row() {
     use cerebellum_computer::audit::FrontingRecordRestore;
-    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    // Read in background mode, which fronts nothing, so the keystrokes have
+    // something the conversation was shown to check the person against.
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    let rig = rig.with_mode(AppUse::Foreground);
     // The keystrokes are refused once the front is done, when the focused
     // element they would go to cannot be read.
     rig.desk.state().focus = support::DeskFocus::Unreadable;
@@ -2664,6 +2755,7 @@ async fn a_chord_row_records_its_front_and_decodes_with_the_older_type() {
         routes: cerebellum_computer::platform::input_route::InputRouteEvidence,
     }
     let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
     let reply = rig
         .call_under(&under_terminal(), "computer.keys", command_chord())
         .await;
@@ -2683,3 +2775,10 @@ async fn a_chord_row_records_its_front_and_decodes_with_the_older_type() {
     let older: BeforeFronting = serde_json::from_value(actuation.clone()).unwrap();
     assert_eq!(older.outcome, recorded.outcome);
 }
+
+// ---------------------------------------------------------------------------
+// Admission, the seen baseline and guard (0) against session-wide sends
+// ---------------------------------------------------------------------------
+
+#[path = "fronting_admission_tests.rs"]
+mod admission;

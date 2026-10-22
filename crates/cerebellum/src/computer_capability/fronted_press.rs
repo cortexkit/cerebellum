@@ -18,8 +18,9 @@
 
 use super::*;
 use crate::computer_capability::fronting::{
-    absorb_own_front, decide_with_restore_budget, held_input_confirmed, not_fronted_reply,
-    stop_ends_call, FrontCall, Fronting, ObligationParts, Purpose, FRONT_SEIZE_LATENCY_MS,
+    absorb_own_front, decide_with_restore_budget, held_input_confirmed, never_read_reply,
+    not_fronted_reply, stop_ends_call, target_unchanged_since_seen, FrontCall, Fronting,
+    ObligationParts, PrepareStop, Purpose, FRONT_SEIZE_LATENCY_MS,
 };
 use crate::terminal_arbiter::{FrontingPurpose, RestoreCell, RestoreDecided};
 use cerebellum_computer::dispatch::{
@@ -162,6 +163,9 @@ where
     cell: Option<Arc<RestoreCell>>,
     decided: Option<RestoreDecided>,
     change: Option<PersonChange>,
+    /// Guard (1) stopped the front because the conversation never read the
+    /// application.
+    never_read: bool,
     press_replies: Vec<Option<Value>>,
     observed: Vec<Option<SessionRead>>,
 }
@@ -283,18 +287,28 @@ where
         held_input_confirmed(self.held)
     }
     fn person_changed_target(&mut self) -> Option<bool> {
-        match person_change_since_seen(
+        // The press is input to the application once it is in front, so the
+        // front needs what the conversation was shown of it to check the
+        // person against.
+        match target_unchanged_since_seen(
             self.source,
             self.sessions,
             self.conversation_key,
             self.grant,
+            true,
         ) {
-            Ok(None) => Some(false),
-            Ok(Some(change)) => {
+            Ok(()) => Some(false),
+            Err(PrepareStop {
+                change: Some(change),
+                ..
+            }) => {
                 self.change = Some(change);
                 Some(true)
             }
-            Err(()) => None,
+            Err(stopped) => {
+                self.never_read = stopped.never_read;
+                None
+            }
         }
     }
     fn cancelled(&mut self) -> bool {
@@ -497,6 +511,7 @@ where
                     cancel,
                     management,
                     conversation_key: &identity.conversation_key,
+                    input_follows: true,
                 },
                 FrontingPurpose::NeedsFront,
                 false,
@@ -586,6 +601,7 @@ where
                 cell: None,
                 decided: None,
                 change: None,
+                never_read: false,
                 press_replies: steps.iter().map(|_| None).collect(),
                 observed: steps.iter().map(|_| None).collect(),
             };
@@ -604,6 +620,7 @@ where
                 mut journals,
                 decided,
                 change,
+                never_read,
                 press_replies,
                 mut observed,
                 ..
@@ -667,6 +684,11 @@ where
                         if stop_ends_call(stop) =>
                     {
                         cancelled_before_dispatch_reply()
+                    }
+                    Some(PressRunStop::NotFronted(FrontingStop::PersonCheckUnreadable))
+                        if never_read =>
+                    {
+                        never_read_reply(fronting)
                     }
                     // In front or not, nothing was pressed at this step, and
                     // the reply says why the front was not used.
