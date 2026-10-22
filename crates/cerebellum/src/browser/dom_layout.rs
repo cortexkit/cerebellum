@@ -22,6 +22,11 @@ use std::collections::BTreeSet;
 
 use super::state_text::{landmark_class, size_text, CHROME, CONTENT};
 
+/// Whether a role identifies content or chrome whose markup can be laid out separately.
+pub fn is_landmark(role: &str) -> bool {
+    landmark_class(role) != super::state_text::NEUTRAL
+}
+
 /// One landmark element and its own serialized markup, as the capture read it.
 #[derive(Debug, Clone, Copy)]
 pub struct DomLandmark<'a> {

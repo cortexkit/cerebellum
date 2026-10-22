@@ -231,6 +231,15 @@ plan; they are not new caller commands and do not extend that deadline.
 - `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText`
 - `Emulation.setFocusEmulationEnabled` (only `{enabled:true}`)
 
+`dom_full` snapshots use `DOM.getOuterHTML` with `backendNodeId` for both the
+document and its outermost content/chrome landmarks. Cerebellum uses the shared
+main-first layout when the markup exceeds `max_bytes` and retains the refs named
+in its cut/omission comments. A `dom_full` zoom reads that ref's outerHTML in the
+same verified frame session, under the same layout and byte limit; `ax` still
+refuses zoom. Markup within the limit, including frame separators, is unchanged.
+These reads need no additional CDP methods or extension revision: the contract
+remains revision 2.
+
 Everything else in caller plans refuses before attaching, including `Runtime.evaluate`, all
 `Browser.*`/`Target.*`, `Page.bringToFront`, downloads, arbitrary JavaScript and
 commands reaching another tab. The internal `Target.setAutoAttach` pin above is
