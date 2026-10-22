@@ -271,3 +271,158 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-skipped-restore-stops-later-chunks"
+guards = "a fronting bracket whose restore was skipped because the person switched to another application stops there, so no later chunk fronts the target over the person again"
+file = "crates/cerebellum-computer/src/dispatch/bracket/mod.rs"
+old = "        if let RestoreStatus::SkippedPerson { .. } = report.restore {"
+new = "        if let RestoreStatus::SkippedPerson { .. } = RestoreStatus::NotNeeded { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::a_skipped_restore_stops_the_bracket_so_no_later_chunk_fronts",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-restore-skip-needs-hardware-input"
+guards = "the restore after a temporary front is skipped only when another application is frontmost and hardware input was seen since the front; a switch the action caused with no hardware input is still restored"
+file = "crates/cerebellum-computer/src/dispatch/bracket/restore.rs"
+old = "        Some(now_front) if input_since_front && now_front != target && now_front != previous => {"
+new = "        Some(now_front) if now_front != target && now_front != previous => { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::the_restore_is_skipped_only_for_another_app_with_hardware_input",
+    "dispatch::bracket::tests::a_switch_with_no_hardware_input_is_restored",
+    "dispatch::bracket::press::tests::a_press_that_activates_a_third_app_without_hardware_input_is_restored",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-unknown-held-state-defers-the-restore"
+guards = "under app-use fronting admission, a bracket post failure that may have left a key held requests no restore of the previous application, and a release that stays unconfirmed reports the restore failed"
+file = "crates/cerebellum-computer/src/dispatch/bracket/mod.rs"
+old = "        if admitted\n            && matches!("
+new = "        if false // NON-VACUITY BREAK\n            && matches!("
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::an_admitted_post_failure_with_unknown_held_state_requests_no_restore",
+    "dispatch::bracket::tests::a_deferred_restore_with_an_unconfirmed_release_requests_nothing",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-fronted-read-forwards-hardware-input"
+guards = "a fronted read decides its restore on the host's hardware input snapshot rather than the no-input default, so a person's switch during the read is not undone"
+file = "crates/cerebellum-computer/src/dispatch/bracket/mod.rs"
+old = "            self.host.hardware_input_snapshot()"
+new = "            None // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::a_fronted_read_skips_the_restore_after_the_persons_switch",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-press-input-during-poll-stops-before-press"
+guards = "input that is not ours while a fronted press polls its element stops the run before any press intent, and the restore decision still runs"
+file = "crates/cerebellum-computer/src/dispatch/bracket/press.rs"
+old = "    observe_drained_events(&mut session.watcher, drained, our_pid, step);\n    if let Some(abort) = session.watcher.abort_decision() {\n        return Some(FrontingStop::from_abort(abort.reason));\n    }"
+new = "    observe_drained_events(&mut session.watcher, drained, our_pid, step); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/press/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::press::tests::input_during_the_poll_journals_no_press_and_still_runs_the_restore_decision",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-enabled-press-never-takes-the-fronting-lock"
+guards = "a background press on an element that reads enabled takes the ordinary press path and never waits on the fronting lock"
+file = "crates/cerebellum-computer/src/dispatch/bracket/press.rs"
+old = "        self.enabled == Some(false) && self.frontmost != Some(target_pid)"
+new = "        self.frontmost != Some(target_pid) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/press/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::press::tests::a_background_press_on_an_enabled_element_never_waits_on_the_fronting_lock",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-image-fronting-names-the-app-a-person-switched-to"
+guards = "a fronted image read whose restore was skipped for the person's own switch reports restored false and names the application now in front"
+file = "crates/cerebellum-computer/src/app_state/image.rs"
+old = "            RestoreStatus::SkippedPerson { now_front } => (false, now_front),"
+new = "            RestoreStatus::SkippedPerson { .. } => (false, None), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/app_state/image.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "app_state::image::tests::a_skipped_restore_is_not_restored_and_names_the_application_now_in_front",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-lock-timeout-is-fronting-busy"
+guards = "a fronting path that does not get the fronting lock in time is reported fronting_busy, not as another reason"
+file = "crates/cerebellum-computer/src/dispatch/bracket/reason.rs"
+old = "        FrontingStop::FrontingLockTimedOut => NotFrontedReason::FrontingBusy,"
+new = "        FrontingStop::FrontingLockTimedOut => NotFrontedReason::FrontingUnavailable, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::every_fronting_stop_maps_to_its_not_fronted_reason",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

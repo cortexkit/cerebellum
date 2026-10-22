@@ -3,11 +3,12 @@
 //! desktop.
 
 use super::*;
-use crate::dispatch::seize::{HeartbeatMarker, OBSERVED_DISPATCH_IDLE_MS};
+use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH_IDLE_MS};
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 const TARGET: u32 = 200;
 const PREVIOUS: u32 = 100;
+const THIRD: u32 = 300;
 const OUR_PID: i64 = 7;
 
 /// A desktop on a fake clock. A fronting request takes effect after
@@ -29,6 +30,16 @@ struct FakeDesk {
     fronted_intervals: Vec<u64>,
     /// Which application was frontmost when each unit was posted.
     frontmost_at_post: Vec<Option<u32>>,
+    /// Every fronting request, in order.
+    front_requests: Vec<u32>,
+    /// The newest hardware input the process-wide observer saw.
+    hardware_input_ms: Option<u64>,
+    /// Once this unit is posted, this application comes to the front, with
+    /// hardware input when the flag is set.
+    switch_after_unit: Option<(usize, u32, bool)>,
+    /// Set by a fronted read; the next frontmost read then sees the person's
+    /// switch to `THIRD`, with hardware input.
+    switch_after_read: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 
 impl FakeDesk {
@@ -46,6 +57,10 @@ impl FakeDesk {
             fronted_since: None,
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
+            front_requests: Vec::new(),
+            hardware_input_ms: None,
+            switch_after_unit: None,
+            switch_after_read: None,
         }
     }
 
@@ -81,9 +96,16 @@ impl FrontingBracketHost for FakeDesk {
         self.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
+        if let Some(read) = &self.switch_after_read {
+            if read.replace(false) {
+                self.set_frontmost(THIRD);
+                self.hardware_input_ms = Some(self.now);
+            }
+        }
         self.frontmost
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        self.front_requests.push(pid);
         if self.refuse_front_of == Some(pid) {
             return true;
         }
@@ -139,9 +161,23 @@ impl FrontingBracketHost for FakeDesk {
         self.frontmost_at_post.push(self.frontmost);
         self.posted.push(index);
         self.advance(self.unit_ms);
+        if let Some((after, pid, input)) = self.switch_after_unit {
+            if after == index {
+                self.set_frontmost(pid);
+                if input {
+                    self.hardware_input_ms = Some(self.now);
+                }
+            }
+        }
         Ok(UnitPosted {
             posts_returned: 2,
             generation_verifications: 4,
+        })
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        Some(HardwareInputSnapshot {
+            coverage_start_ms: 0,
+            last_input_ms: self.hardware_input_ms,
         })
     }
 }
@@ -386,4 +422,641 @@ fn a_post_failure_is_reported_with_what_it_left_held() {
     assert!(matches!(report.stop, Some(BracketStop::PostFailed(_))));
     assert_eq!(report.posts_returned, 1);
     assert_eq!(desk.0.frontmost, Some(PREVIOUS));
+}
+
+fn admitted() -> FrontingAdmission {
+    FrontingAdmission {
+        app_use_fronting_admitted: true,
+    }
+}
+
+fn run_admitted(desk: &mut FakeDesk, units: usize) -> BracketOutcome {
+    run_fronting_bracket_with(
+        desk,
+        &mut UserIdleEstimator::new(),
+        plan(units),
+        admitted(),
+        &|| false,
+    )
+}
+
+/// A desk whose unit posts fail, leaving `held_state` behind.
+struct FailingDesk {
+    desk: FakeDesk,
+    held_state: HeldStateDisposition,
+}
+
+impl FrontingBracketHost for FailingDesk {
+    type Tap = ();
+    fn now_ms(&mut self) -> u64 {
+        self.desk.now_ms()
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.desk.pause_ms(milliseconds)
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        self.desk.frontmost_pid()
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        self.desk.request_front(pid)
+    }
+    fn our_pid(&self) -> i64 {
+        OUR_PID
+    }
+    fn create_tap(&mut self) -> Option<()> {
+        Some(())
+    }
+    fn read_idle(&mut self) -> IdleReading {
+        self.desk.read_idle()
+    }
+    fn drain(&mut self, tap: &()) -> Vec<SourcedInputEvent> {
+        self.desk.drain(tap)
+    }
+    fn post_heartbeat(&mut self) -> HeartbeatProbe {
+        self.desk.post_heartbeat()
+    }
+    fn observe_heartbeat(
+        &mut self,
+        tap: &(),
+        probe: HeartbeatProbe,
+        watcher: &mut SeizeWatcher,
+    ) -> HeartbeatObservation {
+        self.desk.observe_heartbeat(tap, probe, watcher)
+    }
+    fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
+        Err(SequencePostFailure {
+            posts_returned: 1,
+            refusal: ProcessEventRefusal::Cancelled,
+            held_state: self.held_state,
+        })
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        self.desk.hardware_input_snapshot()
+    }
+}
+
+fn failing(held_state: HeldStateDisposition) -> FailingDesk {
+    FailingDesk {
+        desk: FakeDesk::new(),
+        held_state,
+    }
+}
+
+fn run_failing(desk: &mut FailingDesk, admission: FrontingAdmission) -> BracketOutcome {
+    run_fronting_bracket_with(
+        desk,
+        &mut UserIdleEstimator::new(),
+        plan(5),
+        admission,
+        &|| false,
+    )
+}
+
+/// A two-unit chord whose first chunk ended with the person switching to a
+/// third application by hand: the restore is skipped, and the bracket stops
+/// there, so the target is never fronted over the person a second time.
+#[test]
+fn a_skipped_restore_stops_the_bracket_so_no_later_chunk_fronts() {
+    let mut desk = FakeDesk::new();
+    // One 60 ms unit and its restore fill a 100 ms chunk, so each unit is
+    // its own chunk.
+    desk.unit_ms = 60;
+    desk.switch_after_unit = Some((0, THIRD, true));
+    let outcome = run_admitted(&mut desk, 2);
+    let report = &outcome.report;
+    assert_eq!(
+        report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET], "no second front, no restore");
+    assert_eq!(report.chunks, 1);
+    assert_eq!(report.units_posted, 1);
+    match report.stop {
+        Some(BracketStop::Aborted(abort)) => {
+            assert_eq!(abort.reason, AbortReason::UserSeizedControl);
+            assert_eq!(abort.stopped_action_index, 1);
+        }
+        ref other => panic!("expected the person's switch to stop the bracket, got {other:?}"),
+    }
+    assert!(outcome.person_input_during_fronting);
+    assert!(!report.held(100));
+    assert_eq!(desk.frontmost, Some(THIRD));
+}
+
+/// The same switch in a build without app-use fronting admission is put
+/// back, and the next chunk fronts again, exactly as before.
+#[test]
+fn without_admission_a_persons_switch_is_restored_as_before() {
+    let mut desk = FakeDesk::new();
+    desk.unit_ms = 60;
+    desk.switch_after_unit = Some((0, THIRD, true));
+    let report = run(&mut desk, 2);
+    assert_eq!(report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS, TARGET, PREVIOUS]);
+    assert_eq!(report.units_posted, 2);
+    assert_eq!(report.stop, None);
+}
+
+/// A third application the action itself brought forward, with no hardware
+/// input, is restored over.
+#[test]
+fn a_switch_with_no_hardware_input_is_restored() {
+    let mut desk = FakeDesk::new();
+    desk.switch_after_unit = Some((0, THIRD, false));
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert!(!outcome.person_input_during_fronting);
+}
+
+/// Hardware input while the target stays in front restores, and is
+/// disclosed.
+#[test]
+fn input_while_the_target_stays_in_front_restores_and_is_disclosed() {
+    let mut desk = FakeDesk::new();
+    desk.switch_after_unit = Some((0, TARGET, true));
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert!(outcome.person_input_during_fronting);
+}
+
+/// Under admission, a post failure that may have left a key held ends the
+/// bracket with no restore request: the previous application would receive
+/// the held key. The restore is handed to the caller, and until it runs the
+/// report names the target left in front.
+#[test]
+fn an_admitted_post_failure_with_unknown_held_state_requests_no_restore() {
+    let mut desk = failing(HeldStateDisposition::Unknown);
+    let outcome = run_failing(&mut desk, admitted());
+    assert!(matches!(
+        outcome.report.stop,
+        Some(BracketStop::PostFailed(_))
+    ));
+    assert_eq!(
+        desk.desk.front_requests,
+        [TARGET],
+        "no request_front(previous)"
+    );
+    assert_eq!(desk.desk.frontmost, Some(TARGET));
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::Failed {
+            left_in_front: Some(TARGET)
+        }
+    );
+    assert_eq!(
+        outcome.deferred_restore,
+        Some(DeferredRestore {
+            previous: PREVIOUS,
+            target: TARGET,
+            front_instant_ms: 0,
+        })
+    );
+}
+
+/// Once settling confirms the release, the deferred restore runs the
+/// restore decision and brings the previous application back.
+#[test]
+fn a_deferred_restore_runs_once_the_release_is_confirmed() {
+    let mut desk = failing(HeldStateDisposition::Unknown);
+    let mut outcome = run_failing(&mut desk, admitted());
+    finish_deferred_restore(&mut desk, &mut outcome, true, 100);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert_eq!(outcome.deferred_restore, None);
+    assert_eq!(desk.desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(desk.desk.frontmost, Some(PREVIOUS));
+}
+
+/// A release that stays unconfirmed requests no restore at all, and the
+/// restore is reported failed with the target named as left in front.
+#[test]
+fn a_deferred_restore_with_an_unconfirmed_release_requests_nothing() {
+    let mut desk = failing(HeldStateDisposition::Unknown);
+    let mut outcome = run_failing(&mut desk, admitted());
+    finish_deferred_restore(&mut desk, &mut outcome, false, 100);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::Failed {
+            left_in_front: Some(TARGET)
+        }
+    );
+    assert_eq!(outcome.deferred_restore, None);
+    assert_eq!(desk.desk.front_requests, [TARGET]);
+}
+
+/// A post failure whose sequence posted every release itself restores in
+/// the bracket, as it always did.
+#[test]
+fn an_admitted_post_failure_that_released_everything_restores_in_the_bracket() {
+    for held_state in [
+        HeldStateDisposition::NoneHeld,
+        HeldStateDisposition::Released { posts_returned: 1 },
+    ] {
+        let mut desk = failing(held_state);
+        let outcome = run_failing(&mut desk, admitted());
+        assert_eq!(
+            outcome.report.restore,
+            RestoreStatus::Restored,
+            "{held_state:?}"
+        );
+        assert_eq!(outcome.deferred_restore, None);
+        assert_eq!(desk.desk.front_requests, [TARGET, PREVIOUS]);
+    }
+}
+
+/// Without admission, even an unknown held state restores right away, which
+/// is today's order.
+#[test]
+fn without_admission_an_unknown_post_failure_restores_as_before() {
+    let mut desk = failing(HeldStateDisposition::Unknown);
+    let outcome = run_failing(&mut desk, FrontingAdmission::default());
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert_eq!(outcome.deferred_restore, None);
+    assert_eq!(desk.desk.front_requests, [TARGET, PREVIOUS]);
+}
+
+/// A fronted read decides its restore on the host's hardware input, not the
+/// default of none: the reading wrapper forwards the snapshot.
+#[test]
+fn a_fronted_read_skips_the_restore_after_the_persons_switch() {
+    let mut desk = FakeDesk::new();
+    let read_happened = std::rc::Rc::new(std::cell::Cell::new(false));
+    desk.switch_after_read = Some(read_happened.clone());
+    let outcome = run_fronting_read_with(
+        &mut desk,
+        &mut UserIdleEstimator::new(),
+        plan(1),
+        admitted(),
+        &|| false,
+        &mut || read_happened.set(true),
+    );
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
+}
+
+#[test]
+fn a_skipped_restore_is_not_held() {
+    let mut desk = FakeDesk::new();
+    desk.switch_after_unit = Some((0, THIRD, true));
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(outcome.report.stop, None, "every unit was posted");
+    assert!(matches!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson { .. }
+    ));
+    assert!(!outcome.report.held(100));
+}
+
+/// The skipped restore lives in memory only: it cannot be serialized, and
+/// no stored form decodes to it. The stored variants are unchanged.
+#[test]
+fn a_skipped_restore_is_never_serialized() {
+    assert!(serde_json::to_value(RestoreStatus::SkippedPerson {
+        now_front: Some(THIRD)
+    })
+    .is_err());
+    assert!(serde_json::from_value::<RestoreStatus>(serde_json::json!({
+        "restore": "skipped_person",
+        "now_front": 300
+    }))
+    .is_err());
+    for stored in [
+        RestoreStatus::NotNeeded,
+        RestoreStatus::Restored,
+        RestoreStatus::Failed {
+            left_in_front: Some(TARGET),
+        },
+    ] {
+        let value = serde_json::to_value(stored).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RestoreStatus>(value).unwrap(),
+            stored
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(RestoreStatus::Restored).unwrap(),
+        serde_json::json!({"restore": "restored"})
+    );
+}
+
+#[test]
+fn hardware_input_counts_only_after_the_front_and_only_under_coverage() {
+    let snapshot = |coverage_start_ms, last_input_ms| {
+        Some(HardwareInputSnapshot {
+            coverage_start_ms,
+            last_input_ms,
+        })
+    };
+    let front = 1_000;
+    let cases = [
+        (None, false, "no snapshot"),
+        (snapshot(0, None), false, "no input at all"),
+        (snapshot(0, Some(999)), false, "input before the front"),
+        (
+            snapshot(0, Some(1_000)),
+            false,
+            "input at the front instant",
+        ),
+        (snapshot(0, Some(1_001)), true, "input after the front"),
+        (
+            snapshot(1_000, Some(1_001)),
+            true,
+            "coverage from the front",
+        ),
+        (
+            snapshot(1_001, Some(1_500)),
+            false,
+            "coverage began after the front",
+        ),
+    ];
+    for (snapshot, expected, case) in cases {
+        assert_eq!(hardware_input_since(snapshot, front), expected, "{case}");
+    }
+}
+
+#[test]
+fn the_restore_is_skipped_only_for_another_app_with_hardware_input() {
+    let restore = |input| RestoreDecision::Restore {
+        person_input_during_fronting: input,
+    };
+    let cases = [
+        (
+            Some(THIRD),
+            true,
+            RestoreDecision::SkipPerson {
+                now_front: Some(THIRD),
+            },
+        ),
+        (Some(THIRD), false, restore(false)),
+        (Some(TARGET), true, restore(true)),
+        (Some(TARGET), false, restore(false)),
+        (Some(PREVIOUS), true, restore(true)),
+        (None, true, restore(true)),
+        (None, false, restore(false)),
+    ];
+    for (frontmost, input, expected) in cases {
+        assert_eq!(
+            decide_restore(PREVIOUS, TARGET, frontmost, input),
+            expected,
+            "frontmost {frontmost:?}, input {input}"
+        );
+    }
+}
+
+/// The restore decision a terminal cleanup runs, against the same desk.
+#[test]
+fn restore_after_front_requests_nothing_when_it_skips() {
+    let mut desk = FakeDesk::new();
+    desk.set_frontmost(THIRD);
+    desk.hardware_input_ms = Some(10);
+    let outcome = restore_after_front(&mut desk, PREVIOUS, TARGET, 5, RESTORE_WAIT_MS);
+    assert_eq!(
+        outcome.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert!(desk.front_requests.is_empty());
+
+    let mut desk = FakeDesk::new();
+    desk.set_frontmost(TARGET);
+    let outcome = restore_after_front(&mut desk, PREVIOUS, TARGET, 0, RESTORE_WAIT_MS);
+    assert_eq!(outcome.restore, RestoreStatus::Restored);
+    assert_eq!(desk.front_requests, [PREVIOUS]);
+
+    let mut desk = FakeDesk::new();
+    let outcome = restore_after_front(&mut desk, TARGET, TARGET, 0, RESTORE_WAIT_MS);
+    assert_eq!(outcome.restore, RestoreStatus::NotNeeded);
+    assert!(desk.front_requests.is_empty());
+}
+
+/// The front attempt moves only forward, and whoever takes it first decides.
+#[test]
+fn the_front_attempt_states_decide_what_cleanup_does() {
+    // Taken before any front: the worker may not front.
+    let mut attempt = FrontAttempt::new();
+    assert_eq!(attempt.state(), FrontAttemptState::NotStarted);
+    assert_eq!(attempt.take(), CleanupTake::PreventedFront);
+    assert!(!attempt.begin_dispatch(5));
+    assert_eq!(attempt.state(), FrontAttemptState::NotStarted);
+    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+
+    // Taken while the front is in flight: wait for it, then decide.
+    let mut attempt = FrontAttempt::new();
+    assert!(attempt.begin_dispatch(5));
+    assert_eq!(
+        attempt.state(),
+        FrontAttemptState::Dispatching {
+            front_instant_ms: 5
+        }
+    );
+    assert_eq!(attempt.decision_floor(), None);
+    assert_eq!(attempt.take(), CleanupTake::AwaitFrontAttempt);
+    attempt.attempt_returned();
+    assert_eq!(
+        attempt.state(),
+        FrontAttemptState::Dispatched {
+            front_instant_ms: 5
+        }
+    );
+    assert_eq!(attempt.decision_floor(), Some(5));
+    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+
+    // Taken after the front returned: decide at once, floored at the front.
+    let mut attempt = FrontAttempt::new();
+    assert!(attempt.begin_dispatch(7));
+    assert!(!attempt.begin_dispatch(9), "one front per obligation");
+    attempt.attempt_returned();
+    assert_eq!(
+        attempt.take(),
+        CleanupTake::Decide {
+            front_instant_ms: 7
+        }
+    );
+    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+}
+
+/// Every fronting stop maps to its reason, and every reason is reached.
+#[test]
+fn every_fronting_stop_maps_to_its_not_fronted_reason() {
+    use crate::platform::IdleUnreadable;
+    use std::collections::HashSet;
+    let below = IdleGateRefusal::BelowThreshold {
+        threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+        hid_idle_ms: 10,
+        user_idle_ms: 10,
+    };
+    let unreadable = IdleGateRefusal::Unreadable(IdleUnreadable::TableUnavailable);
+    let table = [
+        (
+            FrontingStop::HeldInputUnconfirmed,
+            NotFrontedReason::HeldInputUnconfirmed,
+        ),
+        (
+            FrontingStop::PersonChangedTarget,
+            NotFrontedReason::PersonChangedTarget,
+        ),
+        (
+            FrontingStop::PersonCheckUnreadable,
+            NotFrontedReason::ObserverUnavailable,
+        ),
+        (
+            FrontingStop::ObserverUnavailable,
+            NotFrontedReason::ObserverUnavailable,
+        ),
+        (
+            FrontingStop::IdleGateRefused(unreadable),
+            NotFrontedReason::ObserverUnavailable,
+        ),
+        (
+            FrontingStop::ObserverBlind,
+            NotFrontedReason::ObserverUnavailable,
+        ),
+        (
+            FrontingStop::InputMonitoringNotLive,
+            NotFrontedReason::ObserverUnavailable,
+        ),
+        (
+            FrontingStop::IdleGateRefused(below),
+            NotFrontedReason::PersonActive,
+        ),
+        (
+            FrontingStop::UserSeizedControl,
+            NotFrontedReason::PersonActive,
+        ),
+        (FrontingStop::FocusMoved, NotFrontedReason::PersonActive),
+        (
+            FrontingStop::PreviousUnknown,
+            NotFrontedReason::PreviousUnknown,
+        ),
+        (FrontingStop::FrontFailed, NotFrontedReason::FrontFailed),
+        (FrontingStop::BoundExceeded, NotFrontedReason::FrontFailed),
+        (FrontingStop::Cancelled, NotFrontedReason::Cancelled),
+        (
+            FrontingStop::DispatchGateClosed,
+            NotFrontedReason::Cancelled,
+        ),
+        (
+            FrontingStop::TerminalAlreadyChosen,
+            NotFrontedReason::Cancelled,
+        ),
+        (
+            FrontingStop::CleanupTookObligation,
+            NotFrontedReason::Cancelled,
+        ),
+        (
+            FrontingStop::FrontingLockTimedOut,
+            NotFrontedReason::FrontingBusy,
+        ),
+        (FrontingStop::Unattended, NotFrontedReason::Unattended),
+        (
+            FrontingStop::FrontingNotAdmitted,
+            NotFrontedReason::FrontingUnavailable,
+        ),
+    ];
+    for (stop, reason) in table {
+        assert_eq!(not_fronted_reason(stop), reason, "{stop:?}");
+    }
+    let reached: HashSet<_> = table.iter().map(|(_, reason)| *reason).collect();
+    assert_eq!(reached, NotFrontedReason::ALL.into_iter().collect());
+
+    // Only the target-change guard's own finding says the person used the
+    // target.
+    for (stop, reason) in table {
+        if reason == NotFrontedReason::PersonChangedTarget {
+            assert_eq!(stop, FrontingStop::PersonChangedTarget);
+        }
+    }
+    // Every reason has its own remedy, and its wire value is its serde name.
+    let remedies: HashSet<_> = NotFrontedReason::ALL.iter().map(|r| r.remedy()).collect();
+    assert_eq!(remedies.len(), NotFrontedReason::ALL.len());
+    for reason in NotFrontedReason::ALL {
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            serde_json::json!(reason.as_str())
+        );
+    }
+}
+
+#[test]
+fn observer_aborts_and_unfronted_bracket_stops_map_to_fronting_stops() {
+    let below = IdleGateRefusal::BelowThreshold {
+        threshold_ms: OBSERVED_DISPATCH_IDLE_MS,
+        hid_idle_ms: 10,
+        user_idle_ms: 10,
+    };
+    let aborts = [
+        (
+            AbortReason::UserSeizedControl,
+            FrontingStop::UserSeizedControl,
+        ),
+        (
+            AbortReason::ObserverUnavailable,
+            FrontingStop::ObserverUnavailable,
+        ),
+        (
+            AbortReason::SeizeLatencyBoundExceeded,
+            FrontingStop::ObserverBlind,
+        ),
+        (
+            AbortReason::IdleGateRefused(below),
+            FrontingStop::IdleGateRefused(below),
+        ),
+        (AbortReason::FocusMismatch, FrontingStop::FocusMoved),
+    ];
+    for (abort, stop) in aborts {
+        assert_eq!(FrontingStop::from_abort(abort), stop, "{abort:?}");
+    }
+    let decision = AbortDecision {
+        reason: AbortReason::FocusMismatch,
+        stopped_action_index: 0,
+        detection_latency_ms: None,
+        platform_delivery_latency_ms: None,
+        sourced_input_kind: None,
+        maximum_detection_latency_ms: 50,
+        queued_posts_cancelled: 0,
+    };
+    let stops = [
+        (
+            BracketStop::PreviousUnknown,
+            Some(FrontingStop::PreviousUnknown),
+        ),
+        (
+            BracketStop::ObserverUnavailable,
+            Some(FrontingStop::ObserverUnavailable),
+        ),
+        (BracketStop::FrontFailed, Some(FrontingStop::FrontFailed)),
+        (
+            BracketStop::BoundExceeded,
+            Some(FrontingStop::BoundExceeded),
+        ),
+        (
+            BracketStop::Aborted(decision),
+            Some(FrontingStop::FocusMoved),
+        ),
+        (BracketStop::Cancelled, Some(FrontingStop::Cancelled)),
+        (BracketStop::RestoreFailed, None),
+        (
+            BracketStop::PostFailed(SequencePostFailure {
+                posts_returned: 0,
+                refusal: ProcessEventRefusal::Cancelled,
+                held_state: HeldStateDisposition::NoneHeld,
+            }),
+            None,
+        ),
+    ];
+    for (bracket_stop, stop) in stops {
+        assert_eq!(
+            FrontingStop::from_bracket_stop(&bracket_stop),
+            stop,
+            "{bracket_stop:?}"
+        );
+    }
 }

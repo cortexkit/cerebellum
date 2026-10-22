@@ -104,17 +104,20 @@ pub struct ImageFronting {
 impl From<&crate::dispatch::BracketReport> for ImageFronting {
     fn from(report: &crate::dispatch::BracketReport) -> Self {
         use crate::dispatch::RestoreStatus;
+        // Every variant is named, so a new one cannot compile into a silent
+        // `left_in_front: None`. A restore skipped because the person
+        // switched applications is not a restore, and what they switched to
+        // is what was left in front.
+        let (restored, left_in_front) = match report.restore {
+            RestoreStatus::NotNeeded | RestoreStatus::Restored => (true, None),
+            RestoreStatus::Failed { left_in_front } => (false, left_in_front),
+            RestoreStatus::SkippedPerson { now_front } => (false, now_front),
+        };
         Self {
             previous_frontmost: report.previous_frontmost,
             attempted: report.chunks > 0,
-            restored: matches!(
-                report.restore,
-                RestoreStatus::Restored | RestoreStatus::NotNeeded
-            ),
-            left_in_front: match report.restore {
-                RestoreStatus::Failed { left_in_front } => left_in_front,
-                _ => None,
-            },
+            restored,
+            left_in_front,
             longest_fronted_interval_ms: report.longest_fronted_interval_ms,
         }
     }
@@ -347,4 +350,50 @@ pub fn release_through_custody<C: ImageCustody>(
         height_px,
         mapping,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageFronting;
+    use crate::dispatch::{BracketReport, RestoreStatus};
+
+    fn report(restore: RestoreStatus) -> BracketReport {
+        BracketReport {
+            previous_frontmost: Some(100),
+            chunks: 1,
+            units_posted: 1,
+            posts_returned: 0,
+            generation_verifications: 0,
+            longest_fronted_interval_ms: 40,
+            slowest_unit_ms: 0,
+            slowest_restore_ms: 0,
+            restore,
+            stop: None,
+        }
+    }
+
+    /// A restore skipped because the person switched to another application
+    /// is reported as not restored, naming that application as the one left
+    /// in front; the other outcomes keep their meaning.
+    #[test]
+    fn a_skipped_restore_is_not_restored_and_names_the_application_now_in_front() {
+        let skipped = ImageFronting::from(&report(RestoreStatus::SkippedPerson {
+            now_front: Some(300),
+        }));
+        assert!(!skipped.restored);
+        assert_eq!(skipped.left_in_front, Some(300));
+        assert!(skipped.attempted);
+
+        let failed = ImageFronting::from(&report(RestoreStatus::Failed {
+            left_in_front: Some(200),
+        }));
+        assert!(!failed.restored);
+        assert_eq!(failed.left_in_front, Some(200));
+
+        for restore in [RestoreStatus::Restored, RestoreStatus::NotNeeded] {
+            let fronting = ImageFronting::from(&report(restore));
+            assert!(fronting.restored);
+            assert_eq!(fronting.left_in_front, None);
+        }
+    }
 }

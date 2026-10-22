@@ -19,18 +19,35 @@
 //!
 //! Everything platform-specific is behind [`FrontingBracketHost`], so the
 //! ordering, the chunking and the bound are driven by a fake clock in tests.
+//!
+//! A build admitted to app-use fronting ([`FrontingAdmission`]) changes two
+//! things about how a bracket ends: the restore runs the shared restore
+//! decision ([`decide_restore`]), which leaves the person in an application
+//! they switched to themselves, and a post failure that may have left a key
+//! held defers the restore to the caller instead of putting the previous
+//! application back under a held modifier. Without admission a bracket
+//! behaves as it always has.
+
+mod press;
+mod reason;
+mod restore;
+
+pub use press::*;
+pub use reason::*;
+pub use restore::*;
 
 use std::cell::RefCell;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use super::seize::SourcedInputKind;
 use super::seize::{
     begin_observed_sequence, dispatch_observed_post_in_order, observe_drained_events,
     AbortDecision, AbortReason, HeartbeatObservation, HeartbeatProbe, ObservedPostRefusal,
     ObservedSequenceHooks, SeizeWatcher, SourcedInputEvent, UserIdleEstimator,
 };
-use crate::platform::{IdleReading, SequencePostFailure};
+use crate::platform::{HeldStateDisposition, IdleReading, SequencePostFailure};
 
 /// How often a fronting or restore request is checked for having taken
 /// effect, in milliseconds. Small against the bracket's bound, so the check
@@ -82,6 +99,13 @@ pub trait FrontingBracketHost {
     /// Post unit `index` to the target process, checking its generation
     /// before each post.
     fn post_unit(&mut self, index: usize) -> Result<UnitPosted, SequencePostFailure>;
+    /// The process-wide session observer's hardware input timestamps, on
+    /// this host's clock, for the restore decision. `None` when unavailable,
+    /// which the decision reads as no input seen, so the previous application
+    /// is restored as it always was.
+    fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        None
+    }
 }
 
 /// Whether the previous application is back in front.
@@ -95,6 +119,13 @@ pub enum RestoreStatus {
     /// It could not be put back. `left_in_front` is what was frontmost when
     /// the bracket gave up, when that could be read.
     Failed { left_in_front: Option<u32> },
+    /// Not put back, on purpose: the person switched to `now_front` with
+    /// hardware input while the target was in front, and is left there.
+    ///
+    /// In memory only. It is skipped by serde, so it can never be written to
+    /// storage (serializing it is an error) or read back from it.
+    #[serde(skip)]
+    SkippedPerson { now_front: Option<u32> },
 }
 
 /// Why a bracket stopped before posting every unit.
@@ -143,7 +174,8 @@ pub struct BracketReport {
 
 impl BracketReport {
     /// Whether every unit was posted inside the bound and the previous
-    /// application is back.
+    /// application is back. A skipped restore is not held: the previous
+    /// application is not back, even though nothing failed.
     pub fn held(&self, maximum_interval_ms: u64) -> bool {
         self.stop.is_none()
             && matches!(
@@ -161,6 +193,42 @@ pub struct BracketPlan {
     pub units: usize,
     pub maximum_interval_ms: u64,
     pub maximum_seize_detection_latency_ms: u32,
+}
+
+/// Which fronting rules this build is admitted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrontingAdmission {
+    /// The takeover review and the app-use review are both bound. Only then
+    /// does a bracket skip the restore after a person's own switch, and hold
+    /// the restore back after a post failure that may have left a key held.
+    pub app_use_fronting_admitted: bool,
+}
+
+/// A restore the bracket did not run because a key may still be held: no
+/// application is brought back while a chord's modifier may be down, since
+/// it would land on that application. The caller settles the held input and
+/// then runs [`finish_deferred_restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredRestore {
+    pub previous: u32,
+    pub target: u32,
+    /// When the front that is still to be undone was requested, on the
+    /// host's clock; the floor for hardware input in the restore decision.
+    pub front_instant_ms: u64,
+}
+
+/// What an admitted bracket did: the report, and the two facts only the
+/// admitted rules produce.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BracketOutcome {
+    pub report: BracketReport,
+    /// Hardware input arrived after a front, whether the previous application
+    /// was then restored or the restore was skipped.
+    pub person_input_during_fronting: bool,
+    /// Set when the restore waits on the held input being settled. Until
+    /// [`finish_deferred_restore`] runs, `report.restore` is `Failed` naming
+    /// what is in front, which is what the call reports if it never does.
+    pub deferred_restore: Option<DeferredRestore>,
 }
 
 /// Wait until `pid` is frontmost, for at most `budget_ms` from `since_ms`.
@@ -191,12 +259,46 @@ fn await_front<H: FrontingBracketHost>(
 /// the previous application; the cancel signal and the observer are consulted
 /// at every chunk boundary, and the observer again between units. Every stop
 /// after a front still restores.
+///
+/// This is the bracket without app-use fronting admission; see
+/// [`run_fronting_bracket_with`].
 pub fn run_fronting_bracket<H: FrontingBracketHost>(
     host: &mut H,
     estimator: &mut UserIdleEstimator,
     plan: BracketPlan,
     cancelled: &dyn Fn() -> bool,
 ) -> BracketReport {
+    run_fronting_bracket_with(
+        host,
+        estimator,
+        plan,
+        FrontingAdmission::default(),
+        cancelled,
+    )
+    .report
+}
+
+/// Run the bracket under `admission`.
+///
+/// Without app-use fronting admission this is exactly
+/// [`run_fronting_bracket`]. With it, each chunk's restore runs the shared
+/// restore decision: a restore skipped because the person switched to
+/// another application ends the bracket with a stop when units remain, so
+/// the target is not fronted over the person again. A post failure whose
+/// held state is `Unknown` ends the bracket without any restore request and
+/// hands the restore to the caller as [`BracketOutcome::deferred_restore`].
+pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
+    host: &mut H,
+    estimator: &mut UserIdleEstimator,
+    plan: BracketPlan,
+    admission: FrontingAdmission,
+    cancelled: &dyn Fn() -> bool,
+) -> BracketOutcome {
+    let unfronted = |report| BracketOutcome {
+        report,
+        person_input_during_fronting: false,
+        deferred_restore: None,
+    };
     let mut report = BracketReport {
         previous_frontmost: None,
         chunks: 0,
@@ -211,7 +313,7 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
-        return report;
+        return unfronted(report);
     };
     report.previous_frontmost = Some(previous);
 
@@ -240,7 +342,7 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
         Ok((Some(tap), _user_idle, probe)) => (tap, probe),
         Ok((None, _, _)) => {
             report.stop = Some(BracketStop::ObserverUnavailable);
-            return report;
+            return unfronted(report);
         }
         Err(refusal) => {
             if matches!(
@@ -253,7 +355,7 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
                 Some(abort) => BracketStop::Aborted(abort),
                 None => BracketStop::ObserverUnavailable,
             });
-            return report;
+            return unfronted(report);
         }
     };
     let heartbeat = host
@@ -262,9 +364,12 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
     if let Some(abort) = watcher.abort_decision() {
         estimator.clear_carry();
         report.stop = Some(BracketStop::Aborted(abort));
-        return report;
+        return unfronted(report);
     }
 
+    let admitted = admission.app_use_fronting_admitted;
+    let mut person_input = false;
+    let mut deferred_restore = None;
     let bound = plan.maximum_interval_ms;
     let mut next_unit = 0;
     while next_unit < plan.units {
@@ -290,10 +395,14 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
             restore(
                 &host,
                 &mut report,
-                previous,
-                plan.target_pid,
-                fronted_at,
-                bound,
+                Chunk {
+                    previous,
+                    target: plan.target_pid,
+                    fronted_at,
+                    bound,
+                },
+                admitted,
+                &mut person_input,
             );
             break;
         }
@@ -357,13 +466,45 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
             }
         }
 
+        // A key may still be down after this failure. Bringing the previous
+        // application back now would hand it the held modifier, so an
+        // admitted bracket stops here with the target in front and leaves
+        // the restore to the caller, which settles the held input first.
+        if admitted
+            && matches!(
+                &stop,
+                Some(BracketStop::PostFailed(failure))
+                    if failure.held_state == HeldStateDisposition::Unknown
+            )
+            && previous != plan.target_pid
+        {
+            let now = host.borrow_mut().now_ms();
+            report.longest_fronted_interval_ms = report
+                .longest_fronted_interval_ms
+                .max(now.saturating_sub(fronted_at));
+            report.restore = RestoreStatus::Failed {
+                left_in_front: host.borrow_mut().frontmost_pid(),
+            };
+            deferred_restore = Some(DeferredRestore {
+                previous,
+                target: plan.target_pid,
+                front_instant_ms: fronted_at,
+            });
+            report.stop = stop;
+            break;
+        }
+
         let interval = restore(
             &host,
             &mut report,
-            previous,
-            plan.target_pid,
-            fronted_at,
-            bound,
+            Chunk {
+                previous,
+                target: plan.target_pid,
+                fronted_at,
+                bound,
+            },
+            admitted,
+            &mut person_input,
         );
         if stop.is_some() {
             report.stop = stop;
@@ -372,6 +513,25 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
         if matches!(report.restore, RestoreStatus::Failed { .. }) {
             if next_unit < plan.units {
                 report.stop = Some(BracketStop::RestoreFailed);
+            }
+            break;
+        }
+        if let RestoreStatus::SkippedPerson { .. } = report.restore {
+            // The person switched to another application while the target
+            // was in front and was left there. Fronting the target again for
+            // the next chunk would pull them back out of it, so the bracket
+            // stops as it does for any input that is not ours.
+            if next_unit < plan.units {
+                report.stop = Some(BracketStop::Aborted(AbortDecision {
+                    reason: AbortReason::UserSeizedControl,
+                    stopped_action_index: next_unit,
+                    detection_latency_ms: None,
+                    platform_delivery_latency_ms: None,
+                    sourced_input_kind: Some(SourcedInputKind::Hardware),
+                    maximum_detection_latency_ms: plan.maximum_seize_detection_latency_ms,
+                    queued_posts_cancelled: u32::try_from(plan.units - next_unit)
+                        .unwrap_or(u32::MAX),
+                }));
             }
             break;
         }
@@ -395,7 +555,48 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
         }
         _ => {}
     }
-    report
+    BracketOutcome {
+        report,
+        person_input_during_fronting: person_input,
+        deferred_restore,
+    }
+}
+
+/// Finish a restore an admitted bracket deferred because a key may have been
+/// held. `released` says whether settling the held input confirmed every
+/// release. When it did, the restore decision runs as at any other chunk
+/// end, waiting at most `wait_ms`. When it did not, nothing is requested,
+/// since the previous application would receive the held key, and the
+/// restore is reported failed, naming what is in front.
+pub fn finish_deferred_restore<H: FrontingBracketHost>(
+    host: &mut H,
+    outcome: &mut BracketOutcome,
+    released: bool,
+    wait_ms: u64,
+) {
+    let Some(deferred) = outcome.deferred_restore.take() else {
+        return;
+    };
+    if !released {
+        outcome.report.restore = RestoreStatus::Failed {
+            left_in_front: host.frontmost_pid(),
+        };
+        return;
+    }
+    let restored = restore_after_front(
+        host,
+        deferred.previous,
+        deferred.target,
+        deferred.front_instant_ms,
+        wait_ms,
+    );
+    outcome.person_input_during_fronting |= restored.person_input_during_fronting;
+    outcome.report.longest_fronted_interval_ms = outcome.report.longest_fronted_interval_ms.max(
+        restored
+            .finished_at_ms
+            .saturating_sub(deferred.front_instant_ms),
+    );
+    outcome.report.restore = restored.restore;
 }
 
 /// Use the observed bracket for one read, without posting a key or pointer event.
@@ -403,10 +604,31 @@ pub fn run_fronting_bracket<H: FrontingBracketHost>(
 pub fn run_fronting_read<H: FrontingBracketHost>(
     host: &mut H,
     estimator: &mut UserIdleEstimator,
-    mut plan: BracketPlan,
+    plan: BracketPlan,
     cancelled: &dyn Fn() -> bool,
     read: &mut dyn FnMut(),
 ) -> BracketReport {
+    run_fronting_read_with(
+        host,
+        estimator,
+        plan,
+        FrontingAdmission::default(),
+        cancelled,
+        read,
+    )
+    .report
+}
+
+/// [`run_fronting_read`] under `admission`, with the same restore decision
+/// as [`run_fronting_bracket_with`].
+pub fn run_fronting_read_with<H: FrontingBracketHost>(
+    host: &mut H,
+    estimator: &mut UserIdleEstimator,
+    mut plan: BracketPlan,
+    admission: FrontingAdmission,
+    cancelled: &dyn Fn() -> bool,
+    read: &mut dyn FnMut(),
+) -> BracketOutcome {
     struct ReadingHost<'a, H> {
         host: &'a mut H,
         read: &'a mut dyn FnMut(),
@@ -452,21 +674,49 @@ pub fn run_fronting_read<H: FrontingBracketHost>(
             (self.read)();
             Ok(UnitPosted::default())
         }
+        // Forwarded, not left to the default: the default reports no input,
+        // which would restore over a person's own switch.
+        fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+            self.host.hardware_input_snapshot()
+        }
     }
     plan.units = 1;
-    run_fronting_bracket(&mut ReadingHost { host, read }, estimator, plan, cancelled)
+    run_fronting_bracket_with(
+        &mut ReadingHost { host, read },
+        estimator,
+        plan,
+        admission,
+        cancelled,
+    )
 }
 
-/// Put the previous application back and record how long the target was in
-/// front. Returns that interval.
-fn restore<H: FrontingBracketHost>(
-    host: &RefCell<&mut H>,
-    report: &mut BracketReport,
+/// One chunk's front, as its restore needs it.
+struct Chunk {
     previous: u32,
     target: u32,
     fronted_at: u64,
     bound: u64,
+}
+
+/// Put the previous application back and record how long the target was in
+/// front. Returns that interval.
+///
+/// When `admitted`, the shared restore decision runs first and may leave the
+/// person in an application they switched to; hardware input seen since the
+/// front is recorded in `person_input` either way.
+fn restore<H: FrontingBracketHost>(
+    host: &RefCell<&mut H>,
+    report: &mut BracketReport,
+    chunk: Chunk,
+    admitted: bool,
+    person_input: &mut bool,
 ) -> u64 {
+    let Chunk {
+        previous,
+        target,
+        fronted_at,
+        bound,
+    } = chunk;
     if previous == target {
         report.restore = RestoreStatus::NotNeeded;
         let now = host.borrow_mut().now_ms();
@@ -475,6 +725,25 @@ fn restore<H: FrontingBracketHost>(
         return interval;
     }
     let restore_at = host.borrow_mut().now_ms();
+    if admitted {
+        let outcome = restore_after_front(
+            &mut **host.borrow_mut(),
+            previous,
+            target,
+            fronted_at,
+            bound,
+        );
+        *person_input |= outcome.person_input_during_fronting;
+        if !matches!(outcome.restore, RestoreStatus::SkippedPerson { .. }) {
+            report.slowest_restore_ms = report
+                .slowest_restore_ms
+                .max(outcome.finished_at_ms.saturating_sub(restore_at));
+        }
+        let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
+        report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
+        report.restore = outcome.restore;
+        return interval;
+    }
     // A failed request is not given up on at once: the previous application
     // being left behind the target is the failure this exists to prevent, so
     // the whole bound is spent trying before it is reported.
