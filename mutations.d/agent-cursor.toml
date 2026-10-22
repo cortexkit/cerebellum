@@ -1559,3 +1559,253 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-frames-written-last"
+guards = "the agent-cursor writer writes every picture, preview, preview motion, hide and follow line queued before any pending preview frame"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        let next = waiting.pop_front().or_else(|| {\n            state\n                .frames\n                .lock()\n                .unwrap_or_else(std::sync::PoisonError::into_inner)\n                .pop_front()\n                .map(CursorLine::Frame)\n        });"
+new = "        let frame_first = state // NON-VACUITY BREAK\n            .frames\n            .lock()\n            .unwrap_or_else(std::sync::PoisonError::into_inner)\n            .pop_front()\n            .map(CursorLine::Frame);\n        let next = frame_first.or_else(|| waiting.pop_front());"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_consumer_stalled_mid_frame_gives_a_motion_that_is_not_synchronized",
+    "computer_capability::cursor::tests::a_picture_queued_behind_a_pending_frame_is_written_first",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-one-pending-frame-per-agent"
+guards = "at most one preview frame per agent waits for the agent-cursor pipe, and a newer frame replaces the older one"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "            *waiting = frame;\n            return true;"
+new = "            let _ = waiting; // NON-VACUITY BREAK\n            frames.push_back(frame);\n            return true;"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_consumer_stalled_mid_frame_gives_a_motion_that_is_not_synchronized",
+    "computer_capability::cursor::tests::a_picture_queued_behind_a_pending_frame_is_written_first",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-arrival-counts-from-the-write"
+guards = "an action's badge arrival is the line's write completion plus its serialized motion duration, not the moment the line was queued"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        let _ = decided.send(written.map(|at| at + sent.duration));"
+new = "        let _ = decided.send(written.map(|_| cap - ARRIVAL_CAP + sent.duration)); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_write_completing_at_1000_ms_is_not_synchronized_at_the_cap",
+    "computer_capability::cursor::tests::arrival_counts_from_the_write_not_the_queue",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-late-landing-is-not-synchronized"
+guards = "a badge whose landing falls after ARRIVAL_CAP lets the action go at the cap reported not_synchronized, never as a synchronized arrival"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "                    landing.is_some_and(|at| at > cap)"
+new = "                    landing.is_some_and(|at| at > cap + ARRIVAL_CAP) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_write_completing_at_1000_ms_is_not_synchronized_at_the_cap",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-unwritten-line-is-not-synchronized"
+guards = "an action whose badge line is still unwritten at ARRIVAL_CAP (a consumer stalled mid-frame) goes at the cap reported not_synchronized"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "                    self.queued.load(std::sync::atomic::Ordering::Acquire)"
+new = "                    false // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::a_consumer_stalled_mid_frame_gives_a_motion_that_is_not_synchronized",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-end-drops-the-waiting-frame"
+guards = "ending an agent's badge drops its preview frame still waiting for the pipe, so no frame follows its hide"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        self.frames().retain(|frame| frame.frame_agent != agent);"
+new = "        // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::an_end_drops_the_agents_waiting_frame",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-last-tip-keyed-by-space"
+guards = "the last-tip record is keyed by space, so a badge moving between the screen and a preview, or to another window's preview, appears anew"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "            .filter(|tip| tip.space == aim.space)"
+new = "            // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::the_last_tip_is_keyed_by_space",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-frames-never-restart-the-module-idle-clock"
+guards = "a preview frame is not an action: it never restarts the badge's idle clock in the module's last-tip record"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        let mut frames = self.frames();\n        if let Some(waiting) = frames"
+new = "        if let Some(tip) = self.drawn().tips.get_mut(&frame.frame_agent) { tip.sent = tokio::time::Instant::now(); } // NON-VACUITY BREAK\n        let mut frames = self.frames();\n        if let Some(waiting) = frames"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::cursor::tests::frames_never_restart_the_idle_clock",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-oversized-frame-dropped"
+guards = "a preview frame whose JPEG decodes to more than 160 KiB is invalid and never encoded onto the agent-cursor pipe"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "                .is_some_and(|len| (1..=MAX_FRAME_BYTES).contains(&len))"
+new = "                .is_some_and(|len| (1..=MAX_CURSOR_LINE).contains(&len)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::an_oversized_frame_is_dropped_and_the_largest_fits_one_line",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-frame-never-launches-the-helper"
+guards = "only a picture or a preview line may start the agent-cursor helper; a frame, preview motion, hide or follow never does"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "        matches!(self, Self::Picture(_) | Self::Preview(_))"
+new = "        matches!(self, Self::Picture(_) | Self::Preview(_) | Self::Frame(_)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::only_a_picture_or_a_preview_launches_the_helper",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-late-frame-after-hide-draws-nothing"
+guards = "the helper's preview gate takes an agent's preview away on a hide, so a frame or motion arriving after it draws nothing and revives nothing"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "                if let Some(gone) = self.shown.remove(&hide.agent) {"
+new = "                if let Some(gone) = self.shown.get(&hide.agent).filter(|_| false) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::a_frame_never_creates_a_preview_and_a_late_frame_after_hide_draws_nothing",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-frame-never-restarts-the-helper-idle-clock"
+guards = "in the helper's preview gate a frame never restarts the idle clock, so a preview that only receives frames idles out and a frame after the timeout draws nothing"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "                    shown.generation == frame.frame_generation && shown.window == frame.frame_window"
+new = "                    std::mem::replace(&mut shown.last_action, now) <= now && shown.generation == frame.frame_generation && shown.window == frame.frame_window // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::a_frame_after_the_idle_timeout_draws_nothing_and_never_restarts_the_clock",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-preview-label-is-required"
+guards = "a preview line's label is a required field (null for a read), so every line shape keeps a required field set no other shape shares"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "    #[serde(deserialize_with = \"Option::deserialize\")]\n    pub preview_label: Option<String>,"
+new = "    // NON-VACUITY BREAK\n    pub preview_label: Option<String>,"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::every_line_shape_decodes_as_itself_and_no_other",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

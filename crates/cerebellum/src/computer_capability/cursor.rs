@@ -903,8 +903,8 @@ impl Coordinator {
 
     /// Show an agent's preview, or point it at another window. It may start
     /// the helper.
-    // Only this module's tests call it so far; the background-mode preview
-    // calls it as it shows and retargets.
+    // Only this module's tests call it so far; it is meant for the code that
+    // shows and retargets the background-mode preview.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_preview(&self, preview: CursorPreview) -> bool {
         self.send_line(CursorLine::Preview(preview))
@@ -914,8 +914,8 @@ impl Coordinator {
     /// the helper, and it is not an action: the badge's idle clock is not
     /// restarted by it. At most one frame per agent waits for the pipe; a
     /// newer one replaces it. A frame over `MAX_FRAME_BYTES` is dropped.
-    // Only this module's tests call it so far; the background-mode preview's
-    // capture worker calls it with each frame.
+    // Only this module's tests call it so far; it is meant for the worker
+    // that captures the background-mode preview's frames.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_frame(&self, frame: CursorFrame) -> bool {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) || !frame.valid() {
@@ -966,8 +966,8 @@ impl Coordinator {
     /// preview, measured in the thumbnail's points (`thumbnail` is its width
     /// and height). A badge last drawn on the screen or in another window's
     /// preview appears with its entry.
-    // Only this module's tests call it so far; the background-mode preview
-    // calls it before each action.
+    // Only this module's tests call it so far; it is meant to be called
+    // before each background-mode action.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn schedule_preview_motion(
         &self,
