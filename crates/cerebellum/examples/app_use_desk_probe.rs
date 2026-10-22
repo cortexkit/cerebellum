@@ -39,15 +39,16 @@
 //!    report is a failure that names it, never a zero.
 //! 3. Baseline: the same run in a child process with the agent cursor off
 //!    (`agent_cursor: false`). The module's idle CPU time in phase 2 must be
-//!    within 10% of the baseline's.
+//!    no more than 10% above the baseline's.
 //!
 //! The scratch TextEdit is killed on every exit path: normal return, a failed
 //! check, a panic, and Ctrl-C. The helper ends with the plane. Nothing is
 //! saved. The process exits 0 when every check passes, 1 when one fails and
 //! 2 when the desk cannot be measured (`UNMEASURABLE`).
 
-// Other platforms only print a refusal; the verdict functions serve the
-// macOS desk module and the tests alone.
+// Other platforms do not run the desk probe: an unapproved run is refused
+// and an approved one reports `UNMEASURABLE: macOS desk required`. The
+// verdict functions serve the macOS desk module and the tests alone.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
@@ -260,8 +261,8 @@ struct ListedWindow {
 }
 
 /// How many of `windows` are the helper's preview windows, drawn so they can
-/// be seen. A preview is exactly the preview width; the helper's badge
-/// windows are far narrower.
+/// be seen. A preview's width is within 1 point of `PREVIEW_WIDTH`; the
+/// helper's badge windows are far narrower.
 fn visible_previews(windows: &[ListedWindow], helper: i32) -> usize {
     windows
         .iter()
@@ -425,8 +426,10 @@ mod desk {
         });
     }
 
-    /// Answers every question with the narrowest grant the card offers:
-    /// running this probe is the person's consent to what it does.
+    /// Answers each card with the first choice it offers in the probe's
+    /// order (30 minutes of the app, 30 minutes of the whole computer, one
+    /// call), and declines when none is offered: running this probe is the
+    /// person's consent to what it does.
     struct Allowing {
         desk: Arc<ConsentDesk>,
         guard: Arc<InFlightGuard>,
@@ -618,8 +621,9 @@ mod desk {
             (converted != 0).then_some(out)
         }
 
-        /// Every on-screen window's owner, size and opacity, or `None` when
-        /// the window server's list cannot be read.
+        /// The owner, size and opacity of each on-screen window whose owner
+        /// and size can be read (an unreadable opacity counts as opaque), or
+        /// `None` when the window server's list cannot be read.
         pub fn on_screen_windows() -> Option<Vec<ListedWindow>> {
             // SAFETY: returns one retained CFArray, or null.
             let list =
@@ -934,8 +938,10 @@ mod desk {
                 return 2;
             }
         };
-        // An unreviewed desk build: it admits the fronting the needs-front
-        // chord uses, which a release admits only with both reviews bound.
+        // This scratch plane admits the fronting the needs-front chord uses
+        // as an unreviewed desk build. A release build admits it only when
+        // both the takeover-dispatch review and the app-use fronting review
+        // are bound.
         let review = Some("app-use-desk-probe-unreviewed".to_string());
         let plane = ComputerPlane::<NativeCaptureBackend, _, _, _, _>::with_synthetic_driver_and_result_schema_enforcement(
             audit,
