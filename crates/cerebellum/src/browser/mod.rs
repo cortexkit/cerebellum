@@ -5,6 +5,7 @@
 //! Browser-specific state is kept behind a per-context lane so CDP operations
 //! and final verification cannot interleave across invocations.
 
+mod dom_layout;
 pub mod extraction;
 pub mod geometry;
 pub mod navigation;
@@ -2721,10 +2722,12 @@ impl BrowserPlane {
             optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
         let zoom = match object.get("zoom") {
             None => None,
-            // Zoom selects a subtree of the page text, which only the default
-            // view prints; the ax and dom_full views have no outline to narrow.
+            // Zoom selects one element: the default view prints its subtree
+            // and the dom_full view its outerHTML. The ax view is a flat dump
+            // with no element to narrow to.
             Some(Value::String(value))
-                if snapshot_store::valid_ref(value) && kind == SnapshotKind::Actionable =>
+                if snapshot_store::valid_ref(value)
+                    && matches!(kind, SnapshotKind::Actionable | SnapshotKind::DomFull) =>
             {
                 Some(value.clone())
             }
@@ -3263,9 +3266,51 @@ impl BrowserPlane {
                 (content, truncated, AX_SCHEMA, (0, 0))
             }
             SnapshotKind::DomFull => {
-                let (content, truncated) =
+                let (markup, _) =
                     snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), usize::MAX);
-                (content, truncated, DOM_SCHEMA, (0, 0))
+                // A zoom on an element that has left the page reads the whole
+                // page instead (the capture falls back the same way the
+                // default view does), and says so first.
+                let notice = match zoom {
+                    Some(requested)
+                        if zoom_target(context, requested, &refs, source_document.as_ref())?
+                            .is_none() =>
+                    {
+                        format!(
+                            "<!-- zoom {}: no such element on the page now; showing the whole page -->\n",
+                            state_text::cap_chars(state_text::one_line(requested), 16)
+                        )
+                    }
+                    _ => String::new(),
+                };
+                let notice = if notice.len() <= max_bytes {
+                    notice
+                } else {
+                    String::new()
+                };
+                // Landmarks in document order, each with the markup the
+                // capture read for it; only a dom_full capture reads any.
+                let landmarks: Vec<dom_layout::DomLandmark<'_>> = records
+                    .iter()
+                    .filter_map(|record| {
+                        let reference = record.reference.as_deref()?;
+                        Some(dom_layout::DomLandmark {
+                            role: &record.role,
+                            reference,
+                            markup: facts.get(reference)?.dom_markup.as_deref()?,
+                        })
+                    })
+                    .collect();
+                let layout = dom_layout::lay_out(&markup, &landmarks, max_bytes - notice.len());
+                // A ref stays usable only if the caller was shown it, which
+                // here means named by one of the layout's own comments.
+                refs.retain(|record| layout.named_refs.contains(&record.captured.reference));
+                (
+                    format!("{notice}{}", layout.text),
+                    layout.omitted_bytes > 0,
+                    DOM_SCHEMA,
+                    (layout.omitted_bytes, layout.omitted_lines),
+                )
             }
             SnapshotKind::Screenshot => {
                 return Err(BrowserError::InvalidRequest {
@@ -6877,6 +6922,489 @@ mod tests {
                 "wrong remedy for {event:?}"
             );
         }
+    }
+
+    /// One name per `BrowserError` variant. The match has no catch-all, so a
+    /// new variant does not compile until it is named here, and the guard
+    /// below then refuses to pass until `every_browser_error` samples it.
+    fn browser_error_variant(error: &BrowserError) -> &'static str {
+        match error {
+            BrowserError::InvalidRequest { .. } => "InvalidRequest",
+            BrowserError::NoSession => "NoSession",
+            BrowserError::BrowserLaunchPending => "BrowserLaunchPending",
+            BrowserError::HumanInControl { .. } => "HumanInControl",
+            BrowserError::StaleSnapshot { .. } => "StaleSnapshot",
+            BrowserError::PageChangedSinceSnapshot { .. } => "PageChangedSinceSnapshot",
+            BrowserError::RefNotFound { .. } => "RefNotFound",
+            BrowserError::RefAmbiguous { .. } => "RefAmbiguous",
+            BrowserError::ElementIntercepted => "ElementIntercepted",
+            BrowserError::Intercepted(_) => "Intercepted",
+            BrowserError::ClassificationUnavailable(_) => "ClassificationUnavailable",
+            BrowserError::OutsideViewportAfterScroll { .. } => "OutsideViewportAfterScroll",
+            BrowserError::PointOutsideViewport { .. } => "PointOutsideViewport",
+            BrowserError::InvalidCoordinates { .. } => "InvalidCoordinates",
+            BrowserError::ImageTooLarge { .. } => "ImageTooLarge",
+            BrowserError::AuthorizationDenied { .. } => "AuthorizationDenied",
+            BrowserError::AuthorizationOriginScope { .. } => "AuthorizationOriginScope",
+            BrowserError::AuthorizationNoGrantForAction { .. } => "AuthorizationNoGrantForAction",
+            BrowserError::AuthorizationSeverityInsufficient { .. } => {
+                "AuthorizationSeverityInsufficient"
+            }
+            BrowserError::HazardNotDisclosed { .. } => "HazardNotDisclosed",
+            BrowserError::SeverityBelowFloor { .. } => "SeverityBelowFloor",
+            BrowserError::NavigationPolicyRejected { .. } => "NavigationPolicyRejected",
+            BrowserError::NavigationFailed { .. } => "NavigationFailed",
+            BrowserError::PageNavigatedDuringRead { .. } => "PageNavigatedDuringRead",
+            BrowserError::NotSettled { .. } => "NotSettled",
+            BrowserError::NavigateNotReady { .. } => "NavigateNotReady",
+            BrowserError::TypeNotReady { .. } => "TypeNotReady",
+            BrowserError::CommandTimeout { .. } => "CommandTimeout",
+            BrowserError::CdpStepFailure { .. } => "CdpStepFailure",
+            BrowserError::BrowserCrashed => "BrowserCrashed",
+            BrowserError::Internal { .. } => "Internal",
+            BrowserError::SessionStateUnavailable => "SessionStateUnavailable",
+        }
+    }
+
+    const BROWSER_ERROR_VARIANTS: usize = 32;
+
+    /// A sample of every `BrowserError` variant, with one more sample for
+    /// each case `remedy` words differently (a reason code, a sent flag, a
+    /// classification cause or a severity a grant cannot reach).
+    fn every_browser_error() -> Vec<BrowserError> {
+        use crate::classification::ClassificationUnavailable as Cause;
+        let refusal = crate::browser_session::ViewportRefusal {
+            position: crate::browser_session::BrowserClickPosition {
+                x_css: 10.0,
+                y_css: 20.0,
+            },
+            viewport: crate::coordinate::InputRect {
+                x_input_css: 0.0,
+                y_input_css: 0.0,
+                width_input_css: 5.0,
+                height_input_css: 5.0,
+            },
+        };
+        let origin = || "https://example.test".to_string();
+        let mut errors = vec![
+            BrowserError::InvalidRequest {
+                field: "url".into(),
+                reason_code: "wrong_type",
+            },
+            BrowserError::InvalidRequest {
+                field: "path".into(),
+                reason_code: "path_abandons_custody",
+            },
+            BrowserError::InvalidRequest {
+                field: "text".into(),
+                reason_code: "credential_input_unsupported",
+            },
+            BrowserError::NoSession,
+            BrowserError::BrowserLaunchPending,
+            BrowserError::HumanInControl {
+                origin: origin(),
+                expires_in_ms: 1_000,
+            },
+            BrowserError::StaleSnapshot {
+                reason_code: "document_epoch_changed",
+            },
+            BrowserError::StaleSnapshot {
+                reason_code: "ref_from_older_snapshot",
+            },
+            BrowserError::PageChangedSinceSnapshot {
+                snapshot_origin: origin(),
+                live_origin: "https://elsewhere.test".into(),
+            },
+            BrowserError::RefNotFound {
+                reference: "e1".into(),
+            },
+            BrowserError::RefAmbiguous { candidate_count: 2 },
+            BrowserError::ElementIntercepted,
+            BrowserError::Intercepted(json!({"hit_role":"button","hit_name":"Cover"})),
+            BrowserError::OutsideViewportAfterScroll { refusal },
+            BrowserError::PointOutsideViewport { refusal },
+            BrowserError::ImageTooLarge {
+                bytes: 20,
+                bound_bytes: 10,
+            },
+            BrowserError::AuthorizationDenied { reason: "no_grant" },
+            BrowserError::AuthorizationOriginScope {
+                attempted_origin: origin(),
+                granted_origins: vec!["https://other.test".into()],
+                required: Severity::new(1, false, false),
+                required_hazards: Default::default(),
+            },
+            BrowserError::AuthorizationNoGrantForAction {
+                attempted_origin: origin(),
+                required: Severity::new(4, true, false),
+            },
+            BrowserError::AuthorizationSeverityInsufficient {
+                attempted_origin: origin(),
+                required: Severity::new(4, false, true),
+                granted_ceilings: vec![Severity::new(2, false, false)],
+            },
+            BrowserError::AuthorizationSeverityInsufficient {
+                attempted_origin: origin(),
+                required: Severity::new(5, false, false),
+                granted_ceilings: vec![Severity::new(4, false, false)],
+            },
+            BrowserError::HazardNotDisclosed {
+                missing: HazardClass::CredentialFormSubmit,
+                classification_unavailable: Some(Cause::NotCaptured),
+                attempted_origin: origin(),
+                required: Severity::new(4, true, false),
+                required_hazards: [HazardClass::CredentialFormSubmit].into(),
+            },
+            BrowserError::SeverityBelowFloor {
+                required: Severity::new(2, false, false),
+                classification_unavailable: None,
+            },
+            BrowserError::SeverityBelowFloor {
+                required: Severity::new(3, true, true),
+                classification_unavailable: Some(Cause::DomReadFailed),
+            },
+            BrowserError::NavigationPolicyRejected {
+                reason_code: "scheme_not_allowed",
+            },
+            BrowserError::NavigationFailed {
+                error_text: "net::ERR_NAME_NOT_RESOLVED".into(),
+            },
+            BrowserError::PageNavigatedDuringRead {
+                authorized_origin: origin(),
+                live_origin: "https://elsewhere.test".into(),
+            },
+            BrowserError::NotSettled {
+                url_final: Some("https://example.test/".into()),
+                lifecycle: vec!["load".into()],
+                inflight_count: 1,
+                deadline_ms: 1_000,
+            },
+            BrowserError::NavigateNotReady {
+                reason_code: "page_enable",
+                navigation_sent: false,
+            },
+            BrowserError::NavigateNotReady {
+                reason_code: "navigate_response",
+                navigation_sent: true,
+            },
+            BrowserError::TypeNotReady {
+                reason_code: "focus_unconfirmed",
+            },
+            BrowserError::CommandTimeout {
+                step: "DOM.getOuterHTML".into(),
+                command_sent: true,
+            },
+            BrowserError::CdpStepFailure {
+                step: "DOM.querySelector".into(),
+            },
+            BrowserError::BrowserCrashed,
+            BrowserError::Internal {
+                reason_code: JournalReasonCode::InternalFailure,
+            },
+            BrowserError::SessionStateUnavailable,
+        ];
+        for cause in [
+            Cause::NotCaptured,
+            Cause::TargetNotInDocument { backend_node_id: 7 },
+            Cause::DomReadFailed,
+        ] {
+            errors.push(BrowserError::ClassificationUnavailable(cause));
+        }
+        for reason in [
+            InvalidCoordinatesReason::PointOutOfBounds,
+            InvalidCoordinatesReason::NonFiniteMetadata,
+            InvalidCoordinatesReason::NonPositiveDimensions,
+            InvalidCoordinatesReason::ConversionFailure,
+            InvalidCoordinatesReason::ImageSizeMismatch,
+        ] {
+            errors.push(BrowserError::InvalidCoordinates { reason });
+        }
+        errors
+    }
+
+    /// The plain text the model reads for `reply`: every text part of its
+    /// content/v1 projection.
+    fn model_text(reply: &Value) -> String {
+        let encoded: Value =
+            serde_json::from_slice(&crate::tool_result::encode(reply.clone()).unwrap()).unwrap();
+        encoded["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `text` shows `value`, the reply's `detail.<name>`: on a
+    /// `detail.<name>:` line carrying every scalar inside it, or, for a
+    /// string, anywhere as written or as the words of a code
+    /// (`wrong_type` reads `wrong type`).
+    fn shows_detail(text: &str, name: &str, value: &Value) -> bool {
+        fn leaves(value: &Value, out: &mut Vec<Value>) {
+            match value {
+                Value::Object(members) => members.values().for_each(|v| leaves(v, out)),
+                Value::Array(items) => items.iter().for_each(|v| leaves(v, out)),
+                Value::Null => {}
+                scalar => out.push(scalar.clone()),
+            }
+        }
+        let prefix = format!("detail.{name}:");
+        if let Some(line) = text.lines().find(|line| line.starts_with(&prefix)) {
+            let mut scalars = Vec::new();
+            leaves(value, &mut scalars);
+            return scalars.iter().all(|scalar| match scalar {
+                Value::String(text) => line.contains(text.as_str()),
+                Value::Bool(flag) => {
+                    line.contains(&flag.to_string())
+                        || line.contains(if *flag { "yes" } else { "no" })
+                }
+                other => line.contains(&other.to_string()),
+            });
+        }
+        match value {
+            Value::String(shown) => {
+                text.contains(shown.as_str()) || text.contains(&shown.replace('_', " "))
+            }
+            _ => false,
+        }
+    }
+
+    /// A remedy that tells the model to use `detail.<name>` is only
+    /// followable if the plain text it reads carries that value: the
+    /// structured copy does not reach the model. This renders every browser
+    /// refusal and every computer refusal that carries a remedy as the
+    /// content/v1 text and checks each `detail.<name>` the text mentions.
+    #[tokio::test]
+    async fn every_detail_a_remedy_names_is_printed_with_its_value() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        let errors = every_browser_error();
+        let sampled: std::collections::BTreeSet<_> =
+            errors.iter().map(browser_error_variant).collect();
+        assert_eq!(
+            sampled.len(),
+            BROWSER_ERROR_VARIANTS,
+            "sample every BrowserError variant: {sampled:?}"
+        );
+        let mut replies = Vec::new();
+        for error in errors {
+            let name = format!("{error:?}");
+            replies.push((name, plane.result(&identity, Err(error)).await));
+        }
+        use crate::computer_grants::ConsentRefusal;
+        for refusal in [
+            ConsentRefusal::Pending {
+                ask_id: "ask-1".into(),
+            },
+            ConsentRefusal::Denied {
+                grant_kind: "app",
+                remembered: true,
+            },
+            ConsentRefusal::Denied {
+                grant_kind: "takeover",
+                remembered: false,
+            },
+            ConsentRefusal::GrantedNotExecuted,
+            ConsentRefusal::Unavailable {
+                reason: "agent_run",
+                remedy: "an agent run cannot ask a person",
+            },
+            ConsentRefusal::MissingFlowGrant {
+                detail: json!({"reason":"missing_flow_grant","grant":{"bundle_identity":"com.example.Editor"},"grant_label":"Editor"}),
+            },
+            ConsentRefusal::Draining,
+            ConsentRefusal::RouteClosed,
+            ConsentRefusal::Cancelled,
+            ConsentRefusal::QueueWaitExpired,
+        ] {
+            replies.push((
+                format!("{refusal:?}"),
+                refusal.reply(Some("com.example.Editor")),
+            ));
+        }
+        for reason in cerebellum_computer::dispatch::NotFrontedReason::ALL {
+            // The reply `not_fronted_reply` builds for this reason.
+            replies.push((
+                format!("{reason:?}"),
+                json!({
+                    "outcome": "not_fronted",
+                    "remedy": format!("Nothing was done: {}.", reason.remedy()),
+                    "fronting": {"mode": "foreground", "fronted": false,
+                        "not_fronted_reason": reason.as_str()},
+                }),
+            ));
+        }
+        let mut checked = 0;
+        for (name, reply) in replies {
+            if reply.get("remedy").is_none() {
+                continue;
+            }
+            let text = model_text(&reply);
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("detail.") {
+                rest = &rest[at + "detail.".len()..];
+                let field: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let value = &reply["detail"][&field];
+                assert!(
+                    !value.is_null(),
+                    "{name}: the text names detail.{field}, which the reply does not carry: {reply}"
+                );
+                assert!(
+                    shows_detail(&text, &field, value),
+                    "{name}: the text names detail.{field} without its value {value}:\n{text}"
+                );
+                checked += 1;
+            }
+        }
+        // The guard is vacuous if no remedy names a detail.
+        assert!(checked > 10, "only {checked} detail references checked");
+    }
+
+    /// The dashboard fixture as a dom_full capture reads it: the body markup,
+    /// and the page's landmarks with refs, backend identities and their own
+    /// markup.
+    fn dashboard_capture() -> (
+        Vec<AxRecord>,
+        Vec<crate::snapshot_store::RefRecord>,
+        HashMap<String, state_text::NodeFacts>,
+    ) {
+        let ref_record =
+            |reference: &str, role: &str, backend: u64| crate::snapshot_store::RefRecord {
+                frame_document: None,
+                captured: crate::snapshot_store::SnapshotRef::new(reference, role, "", backend)
+                    .unwrap(),
+                frame_path: vec!["frame".into()],
+                backend_identity: Some(
+                    crate::snapshot_store::BackendNodeIdentity::new("target", "frame", backend)
+                        .unwrap(),
+                ),
+                raw_role: None,
+                raw_name: None,
+                classification: Err(ClassificationUnavailable::NotCaptured),
+            };
+        let mut records = vec![AxRecord {
+            depth: 0,
+            role: "RootWebArea".into(),
+            name: "Workers Observability".into(),
+            value: None,
+            reference: Some("e1".into()),
+        }];
+        let mut refs = vec![ref_record("e1", "RootWebArea", 1)];
+        let mut facts = HashMap::new();
+        for (index, landmark) in dom_layout::tests::dashboard_landmarks().iter().enumerate() {
+            records.push(AxRecord {
+                depth: 1,
+                role: landmark.role.into(),
+                name: String::new(),
+                value: None,
+                reference: Some(landmark.reference.into()),
+            });
+            refs.push(ref_record(
+                landmark.reference,
+                landmark.role,
+                10 + index as u64,
+            ));
+            facts.insert(
+                landmark.reference.to_string(),
+                state_text::NodeFacts {
+                    dom_markup: Some(landmark.markup.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        (records, refs, facts)
+    }
+
+    #[tokio::test]
+    async fn dom_full_over_max_bytes_puts_main_first_and_its_marker_refs_stay_zoomable() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        plane.open_context(identity.clone()).await.unwrap();
+        let (records, refs, facts) = dashboard_capture();
+        let doc = CommittedDocument::new("https://dash.example/events", 1, "loader");
+        let (plane_ref, identity_ref, records_ref, facts_ref) =
+            (&plane, &identity, &records, &facts);
+        let retain = |max_bytes| {
+            let refs = refs.clone();
+            let doc = doc.clone();
+            async move {
+                plane_ref
+                    .retain_text_snapshot_inner(
+                        identity_ref,
+                        SnapshotKind::DomFull,
+                        records_ref,
+                        Some(dom_layout::tests::DASHBOARD),
+                        refs,
+                        facts_ref,
+                        None,
+                        &state_text::Filters::default(),
+                        max_bytes,
+                        false,
+                        false,
+                        Some(doc),
+                    )
+                    .await
+            }
+        };
+
+        // Within the limit the markup is returned exactly and names no ref.
+        let (exact, exact_refs) = retain(262_144).await.unwrap();
+        assert_eq!(
+            exact[state_text::STATE_TEXT_FIELD],
+            dom_layout::tests::DASHBOARD
+        );
+        assert_eq!(exact["truncated"], false);
+        assert_eq!(exact_refs, 0);
+
+        let (reply, ref_count) = retain(1_500).await.unwrap();
+        let text = reply[state_text::STATE_TEXT_FIELD].as_str().unwrap();
+        assert!(text.len() <= 1_500);
+        assert!(text.starts_with("<!-- main "), "{text}");
+        assert!(text.contains("\"boat_endpoint_withdrawn\""), "{text}");
+        assert_eq!(reply["truncated"], true);
+        assert!(reply["omitted"]["state_text_bytes"].as_u64().unwrap() > 0);
+        let marker = &text[text.find("<!-- navigation cut: ").expect(text)..];
+        let navigation = marker
+            .split("; zoom ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap();
+        assert!(ref_count >= 2, "{ref_count}");
+        let state = plane.state.lock().await;
+        let context = state.contexts.get(&identity.conversation_key).unwrap();
+        // The marker's ref is one a zoom accepts: shown, with its identity.
+        assert!(
+            context
+                .refs
+                .shown(navigation)
+                .is_some_and(|shown| shown.record.backend_identity.is_some()),
+            "{navigation} is not zoomable"
+        );
+    }
+
+    #[tokio::test]
+    async fn zoom_is_accepted_for_dom_full_and_still_refused_for_ax() {
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        plane.open_context(identity.clone()).await.unwrap();
+        let (plane_ref, identity_ref) = (&plane, &identity);
+        let snapshot = |args: Value| async move {
+            plane_ref
+                .dispatch(identity_ref, BrowserCapability::Snapshot, &args)
+                .await
+        };
+        let ax = snapshot(json!({"mode":"ax","zoom":"e1"})).await;
+        assert_eq!(ax["outcome"], "invalid_request", "{ax}");
+        assert_eq!(ax["detail"]["field"], "zoom", "{ax}");
+        let filtered = snapshot(json!({"mode":"dom_full","text_filter":"event"})).await;
+        assert_eq!(filtered["detail"]["field"], "text_filter", "{filtered}");
+        // Past argument parsing, the request fails only for want of a browser.
+        let dom = snapshot(json!({"mode":"dom_full","zoom":"e1"})).await;
+        assert_eq!(dom["outcome"], "no_session", "{dom}");
     }
 
     #[tokio::test]

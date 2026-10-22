@@ -339,30 +339,59 @@ fn detail_lines(detail: &Map<String, Value>, remedy: Option<&str>, lines: &mut V
         lines.push("Whether input is still held down is unknown.".into());
     }
     // A remedy that points at `detail.<name>` needs that value in front of
-    // the model, which cannot see the structured copy it names.
+    // the model, which cannot see the structured copy it names. The keys
+    // above are skipped only when their own line printed them: `step`
+    // prints only beside `dispatched`, and `reason_code` not beside a
+    // `reason` without a `field`.
+    let step_said = detail.get("dispatched").is_some_and(Value::is_boolean);
+    let code_said = text(detail, "field").is_some() || text(detail, "reason").is_none();
     let said = [
         "reason",
         "field",
-        "reason_code",
         "permission",
         "grant_label",
         "attempted_origin",
         "missing_hazard",
         "grant_request",
-        "step",
         "dispatched",
         "held_state",
     ];
     for (key, value) in detail {
         if said.contains(&key.as_str())
+            || (key == "step" && step_said)
+            || (key == "reason_code" && code_said)
             || !remedy.is_some_and(|remedy| remedy.contains(&format!("detail.{key}")))
         {
             continue;
         }
         if let Some(value) = scalar(value) {
             lines.push(format!("detail.{key}: {value}"));
+        } else if let Some(members) = value.as_object().and_then(object_members) {
+            lines.push(format!("detail.{key}: {members}."));
         }
     }
+}
+
+/// An object's scalar members as `name value` pairs in name order,
+/// `credential false; financial false; tier 2`, so a remedy that says to resubmit an object (a severity) can be
+/// followed from the text alone. Booleans print as `true` and `false`, the
+/// literals the resubmitted argument takes. A member that is itself an
+/// object, or an array holding one, is left to the structured copy. `None`
+/// when no member prints.
+fn object_members(object: &Map<String, Value>) -> Option<String> {
+    let members = object
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = match value {
+                Value::Bool(flag) => flag.to_string(),
+                Value::String(text) if text.is_empty() => "none".into(),
+                Value::Array(items) if items.is_empty() => "none".into(),
+                other => scalar(other)?,
+            };
+            Some(format!("{name} {value}"))
+        })
+        .collect::<Vec<_>>();
+    (!members.is_empty()).then(|| members.join("; "))
 }
 
 /// The `list_apps` view: running applications one per line with what a
@@ -773,5 +802,58 @@ fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String
     }
     if let Some(detail) = object.get("detail").and_then(Value::as_object) {
         detail_lines(detail, text(object, "remedy"), lines);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fact_lines(reply: Value) -> Vec<String> {
+        facts(reply.as_object().unwrap(), None)
+    }
+
+    #[test]
+    fn a_remedy_naming_an_object_detail_prints_its_members() {
+        let lines = fact_lines(json!({
+            "outcome": "invalid_request",
+            "remedy": "resubmit with detail.required as the severity; a grant must cover that severity for this target",
+            "detail": {
+                "field": "severity",
+                "reason_code": "severity_below_floor",
+                "required": {"tier": 2, "credential": false, "financial": false},
+            },
+        }));
+        assert!(
+            lines.contains(&"detail.required: credential false; financial false; tier 2.".into()),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_remedy_naming_a_step_prints_it_without_a_dispatched_flag() {
+        let lines = fact_lines(json!({
+            "outcome": "internal_error",
+            "remedy": "the CDP step in detail.step could not supply a valid response; if it persists, report detail.reason_code and detail.step",
+            "detail": {"reason_code": "cdp_failure", "step": "DOM.querySelector"},
+        }));
+        assert!(
+            lines.contains(&"detail.step: DOM.querySelector".into()),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_detail_the_remedy_does_not_name_stays_structured() {
+        let lines = fact_lines(json!({
+            "outcome": "authorization_denied",
+            "remedy": "retry the browser action",
+            "detail": {"required": {"tier": 2, "credential": false, "financial": false}},
+        }));
+        assert!(
+            !lines.iter().any(|line| line.contains("detail.required")),
+            "{lines:#?}"
+        );
     }
 }

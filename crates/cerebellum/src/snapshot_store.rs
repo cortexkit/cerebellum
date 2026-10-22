@@ -834,8 +834,9 @@ fn hex(bytes: &[u8]) -> String {
 ///   narrowed to the printed ones (`prior_cut` carries what that render cut);
 /// - the AX view is cut at a line boundary and keeps the refs its remaining
 ///   lines name;
-/// - the raw DOM view is cut at a character boundary and names no refs, so it
-///   keeps none.
+/// - the raw DOM view arrives already laid out within the bound (see
+///   `browser::dom_layout`) with its refs narrowed to the ones its comments
+///   name; anything still over the bound is cut at a character boundary.
 ///
 /// The reply's copy of the source URL is cut at [`MAX_SOURCE_ORIGIN_BYTES`];
 /// the retained snapshot keeps all of it for its action checks.
@@ -876,8 +877,7 @@ pub fn bounded_text_reply(
                 snapshot.refs_truncated = true;
             }
         }
-        SnapshotKind::DomFull => snapshot.refs.clear(),
-        SnapshotKind::Actionable | SnapshotKind::Screenshot => {}
+        SnapshotKind::DomFull | SnapshotKind::Actionable | SnapshotKind::Screenshot => {}
     }
     let source = utf8_safe_truncate(&snapshot.source_origin, MAX_SOURCE_ORIGIN_BYTES);
     serde_json::json!({

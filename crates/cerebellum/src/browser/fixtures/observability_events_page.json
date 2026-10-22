@@ -1,0 +1,342 @@
+{
+ "url": "https://dash.cloudflare.com/acct/workers/observability",
+ "tree": {
+  "role": "RootWebArea",
+  "name": "Workers Observability",
+  "tag": "html",
+  "children": [
+   {
+    "role": "banner",
+    "tag": "header",
+    "children": [
+     {
+      "role": "link",
+      "name": "Cloudflare",
+      "tag": "a",
+      "attrs": {
+       "href": "/"
+      }
+     }
+    ]
+   },
+   {
+    "role": "navigation",
+    "name": "Account",
+    "tag": "nav",
+    "children": [
+     {
+      "role": "link",
+      "name": "Worker service 00",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-00"
+      }
+     },
+     {
+      "role": "link",
+      "name": "Worker service 01",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-01"
+      }
+     },
+     {
+      "role": "link",
+      "name": "Worker service 02",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-02"
+      }
+     },
+     {
+      "role": "link",
+      "name": "Worker service 03",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-03"
+      }
+     },
+     {
+      "role": "link",
+      "name": "Worker service 04",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-04"
+      }
+     },
+     {
+      "role": "link",
+      "name": "Worker service 05",
+      "tag": "a",
+      "attrs": {
+       "href": "/workers/services/service-05"
+      }
+     }
+    ]
+   },
+   {
+    "role": "main",
+    "tag": "main",
+    "children": [
+     {
+      "role": "heading",
+      "name": "Invocations",
+      "tag": "h1"
+     },
+     {
+      "role": "table",
+      "name": "Invocations",
+      "tag": "table",
+      "children": [
+       {
+        "role": "row",
+        "tag": "tr",
+        "children": [
+         {
+          "role": "cell",
+          "name": "2025-01-02 10:00:01",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "2025-01-02 10:00:01"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "boat-router",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "boat-router"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "POST /withdraw",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "POST /withdraw"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "200",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "200"
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "row",
+        "tag": "tr",
+        "children": [
+         {
+          "role": "cell",
+          "name": "2025-01-02 10:00:02",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "2025-01-02 10:00:02"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "boat-router",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "boat-router"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "GET /status",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "GET /status"
+           }
+          ]
+         },
+         {
+          "role": "cell",
+          "name": "503",
+          "tag": "td",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "503"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "role": "generic",
+      "tag": "div",
+      "attrs": {
+       "class": "json-viewer"
+      },
+      "children": [
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "event"
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "\"boat_endpoint_withdrawn\""
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "outcome"
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "\"ok\""
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "scriptName"
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "span",
+          "children": [
+           {
+            "role": "StaticText",
+            "name": "\"boat-router\""
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "role": "generic",
+      "tag": "div",
+      "attrs": {
+       "class": "log-line"
+      },
+      "children": [
+       {
+        "role": "generic",
+        "tag": "span",
+        "children": [
+         {
+          "role": "StaticText",
+          "name": "message"
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "span",
+        "children": [
+         {
+          "role": "StaticText",
+          "name": "worker boat-router retried the endpoint withdrawal after the upstream closed the connection; withdrawn_queue_depth=412 pending_acks=97 region=weur colo=AMS shard=17 attempt=3 of 5; the next retry is scheduled with exponential backoff and jitter, and the request id is 8f2c4b7e-1d93-4a55-b0e2-77c1a9d4f310 for correlating with the gateway logs"
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "span",
+        "children": [
+         {
+          "role": "StaticText",
+          "name": "level"
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "span",
+        "children": [
+         {
+          "role": "StaticText",
+          "name": "\"warn\""
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}
