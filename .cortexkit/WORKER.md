@@ -6,10 +6,10 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 The fast gate has two halves, chosen from your diff:
 
-- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. Run it with your bash tool's `runon: "linux,8c"`: `bash scripts/fast-gate.sh --part linux`.
+- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,4c"`.
 - **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac`. It also runs the strict catalogue check when a `mutations.d/` file changed.
 
-Run both before you deliver, as two parallel tool calls, with the same `--base` if you pass one. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
+Run both before you deliver, as two parallel tool calls, with the same `--base` commit. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
 
 ## Some computer-plane tests run only on macOS
 
