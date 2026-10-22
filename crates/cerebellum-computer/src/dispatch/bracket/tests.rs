@@ -908,6 +908,7 @@ fn every_fronting_stop_maps_to_its_not_fronted_reason() {
             FrontingStop::PersonCheckUnreadable,
             NotFrontedReason::ObserverUnavailable,
         ),
+        (FrontingStop::TargetNotRead, NotFrontedReason::TargetNotRead),
         (
             FrontingStop::ObserverUnavailable,
             NotFrontedReason::ObserverUnavailable,

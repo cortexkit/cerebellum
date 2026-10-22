@@ -855,6 +855,12 @@ impl PreviewPlane {
         }
     }
 
+    /// Whether this preview may capture at all.
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn capture_admitted(&self) -> bool {
+        self.capture_admitted
+    }
+
     /// A preview that captures nothing: every preview shows the
     /// application's icon with `capture_refused`.
     pub(crate) fn without_capture() -> Self {

@@ -12667,6 +12667,30 @@ mod tests {
         }
     }
 
+    /// The computer plane a module builds takes its app-use fronting and
+    /// preview-capture admissions from the release inputs compiled into this
+    /// binary, and from nothing else. A test build is compiled without the
+    /// release attestations, so here both must come out unadmitted; a plane
+    /// wired to admit either regardless of its release fails here.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[tokio::test]
+    async fn the_built_plane_admits_fronting_and_preview_capture_only_as_its_release_does() {
+        let planes = Planes::new(Arc::new(HealthState::new()));
+        let plane = planes
+            .computer
+            .as_ref()
+            .unwrap_or_else(|_| panic!("an isolated module builds its computer plane"));
+        let inputs = compiled_release_inputs();
+        assert_eq!(
+            plane.admits_app_use_fronting(),
+            app_use_fronting_admitted(&inputs)
+        );
+        assert_eq!(
+            plane.admits_preview_capture(),
+            preview_capture_admitted(&inputs)
+        );
+    }
+
     /// The release gate itself holds the takeover rows to both reviews,
     /// whatever the declaration says. Each review is left unbound in turn
     /// through the attestation path while the declarations are taken as

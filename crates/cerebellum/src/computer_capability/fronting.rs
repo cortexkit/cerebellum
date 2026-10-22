@@ -95,11 +95,19 @@ impl FrontingLock {
     }
 }
 
-/// Guard (0): no press posted by an earlier call is still unconfirmed
-/// released. It never posts a release itself; a held key or button would
-/// land on whatever application this module brings forward.
+/// Guard (0): no press posted by an earlier call has a release that is
+/// still unconfirmed, and no send posted to the session as a whole is still
+/// in flight in any call. It never posts a release itself; a held key or button
+/// would land on whatever application this module brings forward.
+///
+/// A send in flight to one process keeps its keys in that process, so it
+/// does not stop a front. A session-wide send, such as a takeover drag
+/// holding the mouse button, goes to whatever is under the pointer or in
+/// front, and takeover pointer actions do not take the fronting lock: until
+/// it has returned, the application fronted here could receive its drop or
+/// button-up.
 pub(crate) fn held_input_confirmed(held: &super::held_input::HeldInput) -> bool {
-    matches!(held.pending_release(), Ok(None))
+    !held.global_send_outstanding() && matches!(held.pending_release(), Ok(None))
 }
 
 /// The reply's `fronting.purpose`.
@@ -380,9 +388,16 @@ pub(crate) fn not_fronted_reply(fronting: Fronting) -> Value {
     let reason = fronting
         .not_fronted_reason
         .unwrap_or(NotFrontedReason::FrontFailed);
+    // A target never read is answered with its remedy alone, which already
+    // says what to do in a sentence of its own.
+    let remedy = if reason == NotFrontedReason::TargetNotRead {
+        reason.remedy().to_owned()
+    } else {
+        format!("Nothing was done: {}.", reason.remedy())
+    };
     let mut reply = json!({
         "outcome": "not_fronted",
-        "remedy": format!("Nothing was done: {}.", reason.remedy()),
+        "remedy": remedy,
     });
     fronting.apply(&mut reply);
     reply
@@ -427,7 +442,9 @@ impl Admission {
 pub(crate) enum ChordRefusal {
     /// An unattended session never brings an application forward.
     TakeoverNotForFlows,
-    /// No takeover grant, and this build cannot front under the app grant.
+    /// No takeover grant, and either this build cannot front under the app
+    /// grant or the chord acts outside the application, which the app grant
+    /// does not cover.
     ModifierChordNeedsForeground,
     /// Takeover is held, but this build carries no review of the bracket.
     KeystrokesNeedForeground,
@@ -442,21 +459,44 @@ pub(crate) enum ChordRoute {
     /// A modifier chord to a background application, fronted for the chord
     /// under the app grant alone.
     FrontWithAppGrant,
-    /// Today's takeover bracket, for a build without the app-use review.
+    /// Today's takeover bracket: for a build without the app-use review, and
+    /// for a system-wide chord in any build.
     TakeoverBracket,
     Refuse(ChordRefusal),
 }
 
 /// The route of one keystroke action. `shortcut` is a chord holding Command,
 /// Control or Option, which background applications do not reliably
-/// receive.
-pub(crate) fn chord_route(admission: Admission, frontmost: bool, shortcut: bool) -> ChordRoute {
-    if frontmost || !shortcut {
+/// receive. `system_wide` is a chord the operating system acts on outside
+/// the application, such as Spotlight or the application switcher: the app
+/// grant covers only what is done inside the granted application, so such a
+/// chord takes the takeover route whether or not the application is in
+/// front.
+pub(crate) fn chord_route(
+    admission: Admission,
+    frontmost: bool,
+    shortcut: bool,
+    system_wide: bool,
+) -> ChordRoute {
+    if system_wide {
+        takeover_route(admission)
+    } else if frontmost || !shortcut {
         ChordRoute::PerProcess
     } else if !admission.attended {
         ChordRoute::Refuse(ChordRefusal::TakeoverNotForFlows)
     } else if admission.app_use_fronting_admitted {
         ChordRoute::FrontWithAppGrant
+    } else {
+        takeover_route(admission)
+    }
+}
+
+/// The takeover bracket, for a caller holding the takeover grant in an
+/// attended session of a build that carries the takeover review; otherwise
+/// the refusal naming what is missing.
+fn takeover_route(admission: Admission) -> ChordRoute {
+    if !admission.attended {
+        ChordRoute::Refuse(ChordRefusal::TakeoverNotForFlows)
     } else if !admission.takeover_held {
         ChordRoute::Refuse(ChordRefusal::ModifierChordNeedsForeground)
     } else if !admission.bracket_admitted {
@@ -811,13 +851,20 @@ pub(crate) fn boxed_hooks(hooks: &CellHooks) -> Box<dyn FrontedDispatchHooks> {
     Box::new(hooks.clone())
 }
 
-/// What a call asks of foreground mode's one-way front.
+/// What a call asks of a front: foreground mode's one-way front or a
+/// temporary one.
 pub(crate) struct FrontCall<'a> {
     pub(crate) grant: &'a ProcessGrant,
     pub(crate) consent: &'a crate::computer_grants::ConsentContext,
     pub(crate) cancel: &'a crate::CancelHandle,
     pub(crate) management: &'a crate::management::ManagementPlane,
     pub(crate) conversation_key: &'a str,
+    /// The action sends input to the application once it is in front: a
+    /// press, keys, typing or a write. Such a front needs something the
+    /// conversation was shown of the application to check the person
+    /// against; see [`target_unchanged_since_seen`]. A read and `open_app`
+    /// send no input.
+    pub(crate) input_follows: bool,
 }
 
 /// How foreground mode's one-way front ended.
@@ -930,25 +977,23 @@ where
         let sessions = call.management.app_state_sessions().clone();
         let conversation_key = call.conversation_key.to_owned();
         let grant = call.grant.clone();
+        let input_follows = call.input_follows;
         let make_driver = self.make_synthetic_driver.clone();
         let cancel = call.cancel.clone();
-        let fronted = tokio::task::spawn_blocking(move || {
+        let fronted = tokio::task::spawn_blocking(move || -> Result<OneWayFront, PrepareStop> {
             let _lock = lock;
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            match super::element_actions::person_change_since_seen(
+            target_unchanged_since_seen(
                 source.as_ref(),
                 &sessions,
                 &conversation_key,
                 &grant,
-            ) {
-                Ok(None) => {}
-                Ok(Some(change)) => return Err((FrontingStop::PersonChangedTarget, Some(change))),
-                Err(()) => return Err((FrontingStop::PersonCheckUnreadable, None)),
-            }
+                input_follows,
+            )?;
             let mut session = make_driver()
                 .fronting_session()
-                .map_err(|_| (FrontingStop::FrontingNotAdmitted, None))?;
+                .map_err(|_| PrepareStop::from(FrontingStop::FrontingNotAdmitted))?;
             let estimator = session.user_idle();
             let mut estimator = estimator
                 .lock()
@@ -962,14 +1007,14 @@ where
                     None
                 }
             })
-            .map_err(|stop| (stop, None))?;
+            .map_err(PrepareStop::from)?;
             if front.fronted {
                 absorb_own_front(source.as_ref(), &sessions, &conversation_key, &grant);
             }
             Ok(front)
         })
         .await
-        .unwrap_or(Err((FrontingStop::FrontFailed, None)));
+        .unwrap_or(Err(FrontingStop::FrontFailed.into()));
         Some(match fronted {
             Ok(front) if front.fronted => {
                 let fronting = Fronting::one_way(AppUse::Foreground);
@@ -985,9 +1030,9 @@ where
                 stop: None,
                 change: None,
             },
-            Err((stop, change)) => ForegroundFront {
-                change,
-                ..ForegroundFront::stopped(stop)
+            Err(prepared) => ForegroundFront {
+                change: prepared.change,
+                ..ForegroundFront::stopped(prepared.stop)
             },
         })
     }
@@ -1007,6 +1052,40 @@ impl From<FrontingStop> for PrepareStop {
     }
 }
 
+/// Guard (1): the person has not changed the target since this conversation
+/// was last shown it.
+///
+/// A conversation that was never shown the target has nothing to compare
+/// against. When `input_follows`, that stops the front with
+/// `TargetNotRead`: the front would hand the target input chosen
+/// without ever looking at it, and the person check, which exists to catch a
+/// target that is not what the agent saw, cannot run. A front followed by no
+/// input (a read, `open_app`) goes ahead without one.
+pub(crate) fn target_unchanged_since_seen(
+    source: &dyn AppStateSource,
+    sessions: &AppStateSessions,
+    conversation_key: &str,
+    grant: &ProcessGrant,
+    input_follows: bool,
+) -> Result<(), PrepareStop> {
+    if input_follows && sessions.last_seen(conversation_key, grant).is_none() {
+        return Err(FrontingStop::TargetNotRead.into());
+    }
+    match super::element_actions::person_change_since_seen(
+        source,
+        sessions,
+        conversation_key,
+        grant,
+    ) {
+        Ok(None) => Ok(()),
+        Ok(Some(change)) => Err(PrepareStop {
+            stop: FrontingStop::PersonChangedTarget,
+            change: Some(change),
+        }),
+        Err(()) => Err(FrontingStop::PersonCheckUnreadable.into()),
+    }
+}
+
 impl<B, R, T, S, D> super::ComputerPlane<B, R, T, S, D>
 where
     B: super::CaptureBackend + Send + 'static,
@@ -1022,6 +1101,10 @@ where
     /// A call served without an arbiter cannot hand its restore to anyone,
     /// so it does not front at all.
     ///
+    /// Every caller checks the fronting admission before it gets here. It is
+    /// checked again once the lock is held, so a caller that skipped its own
+    /// check still fronts nothing in a build or session that may not front.
+    ///
     /// With `guards` false, guards (0) and (1) are left to the caller, which
     /// runs them itself under the lock: the needs-front press does, in its
     /// fixed order.
@@ -1036,6 +1119,7 @@ where
             return Err(FrontingStop::FrontingNotAdmitted.into());
         };
         let lock = self.fronting_lock.take(call.cancel).await?;
+        self.fronting_admission(call.consent, false).may_front()?;
         if work.stopped() {
             return Err(FrontingStop::DispatchGateClosed.into());
         }
@@ -1059,27 +1143,19 @@ where
         let sessions = call.management.app_state_sessions().clone();
         let conversation_key = call.conversation_key.to_owned();
         let grant = call.grant.clone();
-        let changed = tokio::task::spawn_blocking(move || {
+        let input_follows = call.input_follows;
+        tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
-            super::element_actions::person_change_since_seen(
+            target_unchanged_since_seen(
                 source.as_ref(),
                 &sessions,
                 &conversation_key,
                 &grant,
+                input_follows,
             )
         })
         .await
-        .unwrap_or(Err(()));
-        match changed {
-            Ok(None) => {}
-            Ok(Some(change)) => {
-                return Err(PrepareStop {
-                    stop: FrontingStop::PersonChangedTarget,
-                    change: Some(change),
-                })
-            }
-            Err(()) => return Err(FrontingStop::PersonCheckUnreadable.into()),
-        }
+        .unwrap_or(Err(FrontingStop::PersonCheckUnreadable.into()))?;
         Ok(parts)
     }
 }

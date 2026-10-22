@@ -19,7 +19,8 @@
 use super::*;
 use crate::computer_capability::fronting::{
     absorb_own_front, decide_with_restore_budget, held_input_confirmed, not_fronted_reply,
-    stop_ends_call, FrontCall, Fronting, ObligationParts, Purpose, FRONT_SEIZE_LATENCY_MS,
+    stop_ends_call, target_unchanged_since_seen, FrontCall, Fronting, ObligationParts, PrepareStop,
+    Purpose, FRONT_SEIZE_LATENCY_MS,
 };
 use crate::terminal_arbiter::{FrontingPurpose, RestoreCell, RestoreDecided};
 use cerebellum_computer::dispatch::{
@@ -162,6 +163,10 @@ where
     cell: Option<Arc<RestoreCell>>,
     decided: Option<RestoreDecided>,
     change: Option<PersonChange>,
+    /// Guard (1) stopped the front because the conversation never read the
+    /// application. The run itself only knows the guard did not pass, and
+    /// reports `PersonCheckUnreadable`; this says which stop it was.
+    never_read: bool,
     press_replies: Vec<Option<Value>>,
     observed: Vec<Option<SessionRead>>,
     /// A settle ended on the person's input, so the conversation's last-seen
@@ -286,18 +291,28 @@ where
         held_input_confirmed(self.held)
     }
     fn person_changed_target(&mut self) -> Option<bool> {
-        match person_change_since_seen(
+        // The press is input to the application once it is in front, so the
+        // front needs what the conversation was shown of it to check the
+        // person against.
+        match target_unchanged_since_seen(
             self.source,
             self.sessions,
             self.conversation_key,
             self.grant,
+            true,
         ) {
-            Ok(None) => Some(false),
-            Ok(Some(change)) => {
+            Ok(()) => Some(false),
+            Err(PrepareStop {
+                change: Some(change),
+                ..
+            }) => {
                 self.change = Some(change);
                 Some(true)
             }
-            Err(()) => None,
+            Err(stopped) => {
+                self.never_read = stopped.stop == FrontingStop::TargetNotRead;
+                None
+            }
         }
     }
     fn cancelled(&mut self) -> bool {
@@ -527,6 +542,7 @@ where
                     cancel,
                     management,
                     conversation_key: &identity.conversation_key,
+                    input_follows: true,
                 },
                 FrontingPurpose::NeedsFront,
                 false,
@@ -616,11 +632,12 @@ where
                 cell: None,
                 decided: None,
                 change: None,
+                never_read: false,
                 press_replies: steps.iter().map(|_| None).collect(),
                 observed: steps.iter().map(|_| None).collect(),
                 person_input_in_settle: false,
             };
-            let report = run_fronting_press(
+            let mut report = run_fronting_press(
                 &mut host,
                 &mut estimator,
                 PressPlan {
@@ -635,10 +652,19 @@ where
                 mut journals,
                 decided,
                 change,
+                never_read,
                 press_replies,
                 mut observed,
                 ..
             } = host;
+            if never_read
+                && report.stop
+                    == Some(PressRunStop::NotFronted(
+                        FrontingStop::PersonCheckUnreadable,
+                    ))
+            {
+                report.stop = Some(PressRunStop::NotFronted(FrontingStop::TargetNotRead));
+            }
             let mut fronting = match decided {
                 Some(decided) if decided.front_requested => Fronting::temporary(
                     mode,

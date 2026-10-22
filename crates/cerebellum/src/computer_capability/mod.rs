@@ -77,9 +77,9 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
     cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
 }
 use cerebellum_computer::platform::{
-    blocked_chord, current_blocked_chord_platform, ActionKind, DispatchMode, EffectStatus,
-    HeldStateDisposition, PermissionLiveness, PlatformDriver, SyntheticAction, SyntheticKey,
-    SyntheticKeyModifiers, UnsupportedPlatformDriver,
+    blocked_chord, current_blocked_chord_platform, system_wide_chord, ActionKind, DispatchMode,
+    EffectStatus, HeldStateDisposition, PermissionLiveness, PlatformDriver, SyntheticAction,
+    SyntheticKey, SyntheticKeyModifiers, UnsupportedPlatformDriver,
 };
 use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::journal::JournalIdentity;
@@ -744,6 +744,18 @@ where
         self
     }
 
+    /// Whether this plane fronts outside the keystroke bracket, as built.
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn admits_app_use_fronting(&self) -> bool {
+        self.app_use_fronting_admitted
+    }
+
+    /// Whether this plane's preview may capture a covered window, as built.
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn admits_preview_capture(&self) -> bool {
+        self.preview.capture_admitted()
+    }
+
     /// Capture the background-mode preview's frames with the platform's own
     /// capture, when `admitted`: only a build whose release carries both the
     /// capture review and the app-use review (`preview_capture_admitted`).
@@ -1304,6 +1316,7 @@ where
                 cancel: &cancel,
                 management,
                 conversation_key: &identity.conversation_key,
+                input_follows: false,
             })
             .await;
         if let Some(stop) = foreground.and_then(|front| front.stop) {
@@ -1696,6 +1709,7 @@ where
                         cancel: &cancel,
                         management,
                         conversation_key: &conversation_key,
+                        input_follows: false,
                     },
                     crate::terminal_arbiter::FrontingPurpose::BringToFront,
                     true,
@@ -2162,6 +2176,35 @@ where
                 .reply(None),
             );
         }
+        // A system shortcut, such as Spotlight or the application switcher,
+        // acts outside the application, so the app grant does not admit it:
+        // it takes the takeover route whether or not the application is in
+        // front. A refusal on that route is answered here, before foreground
+        // mode fronts anything for a chord that would not be sent.
+        let system_wide = match &parsed.action {
+            SyntheticAction::KeyCombination { key, modifiers } => current_blocked_chord_platform()
+                .and_then(|platform| system_wide_chord(*modifiers, *key, platform))
+                .is_some(),
+            _ => false,
+        };
+        if system_wide {
+            let takeover_held = management.computer_grants().holds(
+                &consent.caller,
+                &crate::computer_grants::GrantNeed::Takeover,
+            );
+            if let fronting::ChordRoute::Refuse(refusal) = fronting::chord_route(
+                self.fronting_admission(&consent, takeover_held),
+                false,
+                true,
+                true,
+            ) {
+                let (mut reply, decorate) = keystrokes::chord_refusal_reply(refusal, true);
+                if decorate {
+                    admission.decorate(&mut reply);
+                }
+                return unposted(reply);
+            }
+        }
         // Foreground mode brings the application to the front before
         // anything else, the focus read and the badge included.
         let foreground = self
@@ -2171,6 +2214,7 @@ where
                 cancel: &cancel,
                 management,
                 conversation_key: &identity.conversation_key,
+                input_follows: true,
             })
             .await;
         if let Some(mut refusal) =
@@ -2231,29 +2275,19 @@ where
         let shortcut = matches!(&parsed.action,
             SyntheticAction::KeyCombination { modifiers, .. }
             if modifiers.command || modifiers.control || modifiers.option);
-        let route =
-            fronting::chord_route(fronting_admission, frontmost == Some(grant.pid), shortcut);
+        let route = fronting::chord_route(
+            fronting_admission,
+            frontmost == Some(grant.pid),
+            shortcut,
+            system_wide,
+        );
         // Focus may have moved while the focused element was read. Recheck
         // before choosing a delivery path that would front the target.
-        if route == fronting::ChordRoute::Refuse(fronting::ChordRefusal::TakeoverNotForFlows) {
-            return unposted(
-                ConsentRefusal::Unavailable {
-                    reason: "takeover_not_for_flows",
-                    remedy: "fronting keys requires an attended session",
-                }
-                .reply(None),
-            );
-        }
-        if route
-            == fronting::ChordRoute::Refuse(fronting::ChordRefusal::ModifierChordNeedsForeground)
-        {
-            let mut reply = keystrokes::modifier_chord_refusal();
-            admission.decorate(&mut reply);
-            return unposted(reply);
-        }
-        if route == fronting::ChordRoute::Refuse(fronting::ChordRefusal::KeystrokesNeedForeground) {
-            let mut reply = keystrokes::needs_foreground_reply();
-            admission.decorate(&mut reply);
+        if let fronting::ChordRoute::Refuse(refusal) = route {
+            let (mut reply, decorate) = keystrokes::chord_refusal_reply(refusal, system_wide);
+            if decorate {
+                admission.decorate(&mut reply);
+            }
             return unposted(reply);
         }
         let front_with_app_grant = route == fronting::ChordRoute::FrontWithAppGrant;
@@ -2377,6 +2411,7 @@ where
                         cancel: &cancel,
                         management,
                         conversation_key: &identity.conversation_key,
+                        input_follows: true,
                     },
                     crate::terminal_arbiter::FrontingPurpose::NeedsFront,
                     true,

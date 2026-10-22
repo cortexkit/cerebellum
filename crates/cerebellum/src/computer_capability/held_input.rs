@@ -150,6 +150,21 @@ impl HeldInput {
         !state.quarantined.is_empty() || state.outstanding.values().any(Outstanding::stuck)
     }
 
+    /// Whether a send posted to the session as a whole is still in flight in
+    /// some call: its keys or button may be down right now, and no process
+    /// exit releases them. Nothing here says it is stuck; it may return and
+    /// release on its own.
+    pub(crate) fn global_send_outstanding(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .outstanding
+            .values()
+            .any(|outstanding| {
+                outstanding.press.route == HeldRoute::Global && !outstanding.discharged
+            })
+    }
+
     /// The presses a later input call must release first. `Err` while a
     /// stuck worker's send is outstanding, and, when presses are quarantined,
     /// while any worker with a possibly-held send is alive: a release then
