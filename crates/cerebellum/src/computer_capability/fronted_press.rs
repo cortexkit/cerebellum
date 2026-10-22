@@ -45,8 +45,10 @@ pub(super) struct LaterSteps {
     /// task-locals naming the acting agent do not follow work onto the
     /// blocking thread that presses.
     badges: Vec<Option<super::super::cursor::Identity>>,
-    cursor: super::super::cursor::Coordinator,
-    source: Arc<dyn AppStateSource>,
+    /// Schedules each later step's badge as the call's first press did: in
+    /// background mode inside the preview, which the badge stays in while
+    /// the application is in front for the batch.
+    scheduler: super::super::preview_call::Badges,
     /// The runtime the badges' own work is spawned on.
     runtime: tokio::runtime::Handle,
     /// Whether the batch application's grant is held now, so a step can be
@@ -56,8 +58,7 @@ pub(super) struct LaterSteps {
 
 /// Gather what pressing `steps` while the application is in front needs.
 pub(super) fn later_steps(
-    cursor: &super::super::cursor::Coordinator,
-    source: &Arc<dyn AppStateSource>,
+    scheduler: &super::super::preview_call::Badges,
     management: &ManagementPlane,
     consent: &ConsentContext,
     grant: &ProcessGrant,
@@ -81,8 +82,7 @@ pub(super) fn later_steps(
             })
             .collect(),
         steps,
-        cursor: cursor.clone(),
-        source: source.clone(),
+        scheduler: scheduler.clone(),
         runtime: tokio::runtime::Handle::current(),
         admitted: Box::new(move || grants.holds(&caller, &need)),
     }
@@ -246,13 +246,16 @@ where
         if let Some(later) = self.later.as_mut() {
             if let Some(badge) = later.badges.get_mut(step - 1).and_then(Option::take) {
                 let _runtime = later.runtime.enter();
-                let _ = later.cursor.schedule(
+                let _ = later.scheduler.schedule(
                     badge,
                     cerebellum_computer::cursor::CursorKind::Press,
                     self.grant.clone(),
-                    later.source.clone(),
-                    Some(self.steps[step].handle.clone()),
+                    super::super::cursor::ReadAim {
+                        preferred: Some(self.steps[step].handle.clone()),
+                        focused: None,
+                    },
                     None,
+                    super::super::cursor::WindowChoice::Element,
                 );
             }
         }

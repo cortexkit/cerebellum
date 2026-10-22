@@ -497,6 +497,13 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// Whether `window` (a window element, as `cursor_window` returns one)
+    /// is minimized, read now. `None` when it cannot be read, which a caller
+    /// must treat as unknown: not known to be minimized.
+    fn window_minimized(&self, _window: &ElementHandle) -> Option<bool> {
+        None
+    }
+
     /// Ask the element to perform its press action.
     fn press(&self, _element: &ElementHandle) -> Result<(), ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)

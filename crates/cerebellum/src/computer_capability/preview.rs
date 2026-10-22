@@ -14,15 +14,22 @@
 //!   together, so the frame captured and the badge's position mapped into
 //!   the thumbnail always describe the same window.
 //! - When frames are captured. Capture happens here, in the module, which
-//!   holds Screen Recording; the helper only draws. One process-wide preview
-//!   worker captures for every agent, off the action path, on two threads of
-//!   its own (one follows the schedule, one makes the native requests): no
-//!   action waits for it. At most one native capture request is outstanding at a time,
+//!   holds Screen Recording; the helper only draws. One preview worker per
+//!   computer plane (a running module has one plane) captures for every
+//!   agent, off the action path, on two threads of its own (one follows the
+//!   schedule, one makes the native requests): no action waits for it. At
+//!   most one native capture request is outstanding at a time,
 //!   counting one whose wait ended without an answer; until it answers, no
 //!   other request is made, each agent's refreshes collapse into one for its
 //!   latest window, and every preview shows the application's icon. A frame
 //!   that answers late is sent only if its preview still shows that window
 //!   in the same generation. A hidden preview has no capture and no timer.
+//! - A preview whose agent has not acted for the badge's idle timeout is
+//!   taken for hidden, as the helper hides it then: its slot is free for the
+//!   next agent, and it is never refreshed again. Nothing times this; it is
+//!   noticed the next time an agent asks for a slot.
+//! - A minimized window shows the application's icon with `minimized`, and
+//!   nothing is captured of it.
 //! - Without `preview_capture_admitted` (set only when this build carries
 //!   both the `capture_review_revision` and the
 //!   `app_use_fronting_review_revision` release attestations) nothing is
@@ -32,18 +39,18 @@
 //! These pixels leave the module outside capture custody. They are never
 //! model-visible, never retained and never journaled.
 
-// The action path that shows, retargets and hides previews is not wired to
-// this module yet; until it is, only the tests below call into it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::source::{AppStateSource, ElementHandle};
 use cerebellum_computer::capture::{CaptureBackend, ScopedCaptureController};
-use cerebellum_computer::cursor::{CursorFrame, CursorPreview, PreviewFallback, PREVIEW_SLOTS};
+use cerebellum_computer::cursor::{
+    CursorFrame, CursorPreview, PreviewFallback, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, PREVIEW_SLOTS,
+};
 use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_computer::preview_layout::{thumbnail_size, PREVIEW_WIDTH};
 
 /// How long the worker waits for a native capture request to answer. A
 /// request still unanswered after this stays outstanding: no other request
@@ -52,11 +59,52 @@ pub(crate) const PREVIEW_CAPTURE_TIMEOUT_MS: u64 = 2_000;
 /// While an agent's action is in flight its preview is refreshed at most
 /// once in this many milliseconds: twice a second.
 pub(crate) const IN_FLIGHT_REFRESH_MS: u64 = 500;
-/// The thumbnail's width in points. Its height follows the window's shape.
-pub(crate) const THUMBNAIL_WIDTH_PT: f64 = 280.0;
-/// The thumbnail's tallest height in points. A taller window is letterboxed
-/// into this height, so its image is narrower than the thumbnail.
-pub(crate) const THUMBNAIL_MAX_HEIGHT_PT: f64 = 360.0;
+/// How long after its agent's last action a preview is gone: the helper
+/// fades the badge, and the preview with it, after this long.
+const PREVIEW_IDLE: Duration = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
+
+/// How much work the preview has done since the process started, for the
+/// module's health reply: capture requests made and frame lines written to
+/// the helper. Counts only, naming no agent, window or application, so a
+/// desk probe can tell an idle preview costs nothing. Plain atomics: reading
+/// them takes no lock the preview holds.
+#[derive(Debug, Default)]
+pub(crate) struct PreviewGauges {
+    capture_requests: AtomicU64,
+    frames_written: AtomicU64,
+}
+
+impl PreviewGauges {
+    pub(crate) const fn new() -> Self {
+        Self {
+            capture_requests: AtomicU64::new(0),
+            frames_written: AtomicU64::new(0),
+        }
+    }
+
+    /// Capture requests handed to the capture backend.
+    pub(crate) fn capture_requests(&self) -> u64 {
+        self.capture_requests.load(Ordering::Relaxed)
+    }
+
+    /// Frame lines written to the helper's pipe.
+    pub(crate) fn frames_written(&self) -> u64 {
+        self.frames_written.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn frame_written(&self) {
+        self.frames_written.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn capture_requested(&self) {
+        self.capture_requests.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The process's preview gauges, reported as `previewCaptureRequests` and
+/// `previewFramesWritten`. Tests that count exactly give their worker and
+/// cursor gauges of their own, since other tests capture in parallel.
+pub(crate) static PREVIEW_GAUGES: PreviewGauges = PreviewGauges::new();
 
 /// Which preview slot each agent holds, top-down from 0.
 ///
@@ -104,13 +152,22 @@ impl SlotLayout {
 pub(crate) struct PreviewWindow {
     pub(crate) id: u32,
     pub(crate) bounds: [f64; 4],
+    /// The window read as minimized, so there is nothing of it to capture
+    /// and the preview shows the application's icon. An unreadable answer
+    /// is not minimized: capture is tried, with all its own checks.
+    pub(crate) minimized: bool,
 }
 
 impl PreviewWindow {
     /// `None` unless the frame is finite and has an area.
     pub(crate) fn new(id: u32, bounds: [f64; 4]) -> Option<Self> {
-        (bounds.iter().all(|v| v.is_finite()) && bounds[2] > 0.0 && bounds[3] > 0.0)
-            .then_some(Self { id, bounds })
+        (bounds.iter().all(|v| v.is_finite()) && bounds[2] > 0.0 && bounds[3] > 0.0).then_some(
+            Self {
+                id,
+                bounds,
+                minimized: false,
+            },
+        )
     }
 
     /// The window's width and height, which give the thumbnail its shape.
@@ -118,20 +175,14 @@ impl PreviewWindow {
         [self.bounds[2], self.bounds[3]]
     }
 
-    /// The thumbnail's image size in points: `THUMBNAIL_WIDTH_PT` wide with
-    /// the window's shape, or for a tall window `THUMBNAIL_MAX_HEIGHT_PT`
-    /// tall and narrower.
+    /// The thumbnail's image size in points, exactly as the helper draws it
+    /// (`preview_layout::thumbnail_size`, the one definition both programs
+    /// compile): the badge's glides inside it are timed by their length in
+    /// these points, and its frames are captured at this size.
     pub(crate) fn thumbnail(&self) -> [f64; 2] {
-        let [width, height] = self.aspect();
-        let tall = THUMBNAIL_WIDTH_PT * height / width;
-        if tall <= THUMBNAIL_MAX_HEIGHT_PT {
-            [THUMBNAIL_WIDTH_PT, tall]
-        } else {
-            [
-                THUMBNAIL_MAX_HEIGHT_PT * width / height,
-                THUMBNAIL_MAX_HEIGHT_PT,
-            ]
-        }
+        // `new` admits only a finite shape with an area, which always has a
+        // layout; the fallback is never reached.
+        thumbnail_size(self.aspect()).unwrap_or([PREVIEW_WIDTH, PREVIEW_WIDTH])
     }
 
     /// The largest frame worth capturing, in pixels: the thumbnail's size in
@@ -186,8 +237,8 @@ pub(crate) enum PreviewWindowSource<'a> {
     /// focused: the addressed element's own window.
     Element(&'a ElementHandle),
     /// `keys` and `type`: the window of the application's focused element,
-    /// or with none its focused window.
-    Focused,
+    /// as the action already read it, or with none its focused window.
+    Focused(Option<&'a ElementHandle>),
     /// `read_state` with no element: the application's frontmost window,
     /// as the window server's front-to-back list names it
     /// (`frontmost_window_id`). `None` when it has none.
@@ -195,10 +246,11 @@ pub(crate) enum PreviewWindowSource<'a> {
 }
 
 /// The window an action's preview shows, as its id and bounds read together
-/// from that window's own accessibility element. `None` when it cannot be
-/// read, or when the frontmost window the list names is not the one the
-/// application reports, which leaves the preview where it was rather than
-/// pointing it at a window nobody asked for.
+/// from that window's own accessibility element, and whether it is
+/// minimized. `None` when it cannot be read, or when the frontmost window
+/// the list names is not the one the application reports, which leaves the
+/// preview where it was rather than pointing it at a window nobody asked
+/// for.
 pub(crate) fn preview_window(
     source: &dyn AppStateSource,
     target: &ProcessGrant,
@@ -208,17 +260,16 @@ pub(crate) fn preview_window(
         PreviewWindowSource::Element(element) => {
             (source.cursor_window(target, Some(element))?, None)
         }
-        PreviewWindowSource::Focused => {
-            let focused = source.focused_element(target).ok().flatten();
-            (source.cursor_window(target, focused.as_ref())?, None)
-        }
+        PreviewWindowSource::Focused(focused) => (source.cursor_window(target, focused)?, None),
         PreviewWindowSource::Frontmost(id) => (source.cursor_window(target, None)?, Some(id?)),
     };
     let id = source.element_window_number(&window)?;
     if expected.is_some_and(|expected| expected != id) {
         return None;
     }
-    PreviewWindow::new(id, source.cursor_frame(&window)?)
+    let mut read = PreviewWindow::new(id, source.cursor_frame(&window)?)?;
+    read.minimized = source.window_minimized(&window) == Some(true);
+    Some(read)
 }
 
 /// What an action asks the preview to show: one agent's preview of one
@@ -243,11 +294,15 @@ pub(crate) struct PreviewRequest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ShowOutcome {
     /// Shown in `slot`. `thumbnail` is the image's size in points, which the
-    /// badge's motion inside the preview is measured in.
+    /// badge's motion inside the preview is measured in. `icon` says the
+    /// preview shows the application's icon instead of a frame (capture not
+    /// admitted or refused, a capture stuck, or a minimized window): the
+    /// badge then makes no motion there and the action waits for nothing.
     Shown {
         slot: u8,
         generation: u64,
         thumbnail: [f64; 2],
+        icon: bool,
     },
     /// Every slot is held by another agent. This agent gets no preview, no
     /// badge and no arrival wait, and its reply says
@@ -263,6 +318,9 @@ enum IconCause {
     /// Another capture request has gone unanswered past its wait, so no
     /// capture can be made for anyone until it answers.
     Stalled,
+    /// The window is minimized: there is nothing to capture until a later
+    /// action finds it shown again.
+    Minimized,
 }
 
 /// One capture request: one agent's window, at the size its thumbnail
@@ -323,6 +381,10 @@ struct Shown {
     /// An action is in flight, so the preview refreshes on a timer.
     in_flight: bool,
     last_submit: Option<Instant>,
+    /// When its agent last showed it or started or settled an action. Past
+    /// `PREVIEW_IDLE` after this, with no action in flight, the helper has
+    /// faded it out, and it counts as hidden.
+    last_active: Instant,
 }
 
 impl Shown {
@@ -330,8 +392,11 @@ impl Shown {
     /// is no frame to show.
     fn shown_line(&self) -> CursorPreview {
         let mut line = self.line.clone();
-        if self.icon.is_some() {
-            line.preview_fallback = Some(PreviewFallback::CaptureRefused);
+        if let Some(icon) = self.icon {
+            line.preview_fallback = Some(match icon {
+                IconCause::Minimized => PreviewFallback::Minimized,
+                IconCause::Refused | IconCause::Stalled => PreviewFallback::CaptureRefused,
+            });
             line.preview_icon_path = self.icon_path.clone();
             if !line.valid() {
                 // An icon path the helper would refuse; the preview still
@@ -348,6 +413,12 @@ impl Shown {
 
     fn window(&self) -> u32 {
         self.line.preview_window
+    }
+
+    /// Whether the helper has faded it out by `now`: no action in flight and
+    /// none for `PREVIEW_IDLE`.
+    fn idle(&self, now: Instant) -> bool {
+        !self.in_flight && now.saturating_duration_since(self.last_active) >= PREVIEW_IDLE
     }
 }
 
@@ -388,12 +459,54 @@ impl Schedule {
         }
     }
 
+    /// Hold a slot for the agent before its window is read, so whether it
+    /// gets a preview is known at once: `None` when every slot is held by
+    /// another agent (`not_shown_capacity`). A preview gone idle by `now`
+    /// counts as hidden and frees its slot first.
+    pub(crate) fn reserve(&mut self, agent: &str, now: Instant) -> Option<u8> {
+        self.expire_idle(now);
+        self.slots.assign(agent)
+    }
+
+    /// Give back a slot `reserve` held for an agent whose preview was then
+    /// not shown after all (its window could not be read). A preview already
+    /// showing keeps its slot.
+    pub(crate) fn release_unshown(&mut self, agent: &str) {
+        if !self.shown.contains_key(agent) {
+            self.slots.release(agent);
+        }
+    }
+
+    /// Whether the agent's preview is showing at `now`.
+    pub(crate) fn is_shown(&self, agent: &str, now: Instant) -> bool {
+        self.shown.get(agent).is_some_and(|shown| !shown.idle(now))
+    }
+
+    /// Forget every preview the helper has faded out by `now`, freeing its
+    /// slot. A later action shows it anew, in a new generation.
+    fn expire_idle(&mut self, now: Instant) {
+        let idle: Vec<String> = self
+            .shown
+            .iter()
+            .filter(|(_, shown)| shown.idle(now))
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        for agent in idle {
+            self.hide(&agent);
+        }
+    }
+
     /// Show the agent's preview of `request.window`, or keep showing it with
     /// the new label. Another window or application is a retarget and gets
     /// a new generation, so a frame of the old window is never drawn into
     /// it. Returns the line to send, which is `None` only when no slot is
     /// free.
-    pub(crate) fn show(&mut self, request: PreviewRequest) -> (ShowOutcome, Option<CursorPreview>) {
+    pub(crate) fn show(
+        &mut self,
+        request: PreviewRequest,
+        now: Instant,
+    ) -> (ShowOutcome, Option<CursorPreview>) {
+        self.expire_idle(now);
         let Some(slot) = self.slots.assign(&request.agent) else {
             return (ShowOutcome::NotShownCapacity, None);
         };
@@ -408,12 +521,21 @@ impl Schedule {
                 self.generations
             }
         };
+        let minimized = request.window.minimized;
         let icon = if !self.capture_admitted {
             Some(IconCause::Refused)
         } else if self.outstanding.as_ref().is_some_and(|out| out.timed_out) {
             Some(IconCause::Stalled)
         } else {
+            // A minimized window shown again is captured again.
             same.and_then(|previous| previous.icon)
+                .filter(|icon| *icon != IconCause::Minimized)
+        };
+        // Nothing of a minimized window can be captured, whatever else holds.
+        let icon = if minimized {
+            Some(IconCause::Minimized)
+        } else {
+            icon
         };
         let shown = Shown {
             line: CursorPreview {
@@ -431,17 +553,20 @@ impl Schedule {
             target: request.target,
             max_px: request.window.capture_max_px(request.backing_scale),
             icon,
-            wants: self.capture_admitted,
+            wants: self.capture_admitted && !minimized,
             in_flight: previous.as_ref().is_some_and(|previous| previous.in_flight),
             last_submit: previous.as_ref().and_then(|previous| previous.last_submit),
+            last_active: now,
         };
         let line = shown.shown_line();
+        let icon = shown.icon.is_some();
         self.shown.insert(request.agent, shown);
         (
             ShowOutcome::Shown {
                 slot,
                 generation,
                 thumbnail: request.window.thumbnail(),
+                icon,
             },
             Some(line),
         )
@@ -457,22 +582,25 @@ impl Schedule {
 
     /// An action of the agent's has started: its preview refreshes at most
     /// twice a second until the action settles.
-    pub(crate) fn action_started(&mut self, agent: &str) {
+    pub(crate) fn action_started(&mut self, agent: &str, now: Instant) {
         if let Some(shown) = self.shown.get_mut(agent) {
             shown.in_flight = true;
+            shown.last_active = now;
         }
     }
 
     /// An action of the agent's has settled: its preview refreshes once.
-    pub(crate) fn action_settled(&mut self, agent: &str) {
+    pub(crate) fn action_settled(&mut self, agent: &str, now: Instant) {
         if let Some(shown) = self.shown.get_mut(agent) {
             shown.in_flight = false;
-            shown.wants = self.capture_admitted;
+            shown.wants = self.capture_admitted && shown.icon != Some(IconCause::Minimized);
+            shown.last_active = now;
         }
     }
 
     /// Whether a capture request is outstanding, answered or not past its
     /// wait.
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> bool {
         self.outstanding.is_some()
     }
@@ -505,6 +633,7 @@ impl Schedule {
         let chosen = self
             .shown
             .iter()
+            .filter(|(_, shown)| shown.icon != Some(IconCause::Minimized))
             .filter(|(_, shown)| {
                 shown.wants
                     || (shown.in_flight && shown.last_submit.is_none_or(|at| now >= at + refresh))
@@ -538,7 +667,7 @@ impl Schedule {
         step.wake_at = self
             .shown
             .values()
-            .filter(|shown| shown.in_flight)
+            .filter(|shown| shown.in_flight && shown.icon != Some(IconCause::Minimized))
             .filter_map(|shown| shown.last_submit.map(|at| at + refresh))
             .min();
         step
@@ -579,6 +708,10 @@ impl Schedule {
         else {
             return answer;
         };
+        if shown.icon == Some(IconCause::Minimized) {
+            // Asked for before the window was minimized: nothing to show.
+            return answer;
+        }
         let frame = result
             .ok()
             .map(|jpeg| {
@@ -668,6 +801,16 @@ where
     }
 }
 
+/// Captures nothing: what a plane built without a platform capture uses.
+/// Such a plane's capture is also never admitted, so this is never asked.
+pub(crate) struct NoPreviewCapture;
+
+impl PreviewCapturer for NoPreviewCapture {
+    fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
+        Err(PreviewRefused)
+    }
+}
+
 /// The platform's own capture, through a backend the preview worker builds
 /// for itself.
 // Tests capture through in-memory backends instead.
@@ -676,6 +819,81 @@ where
 pub(crate) fn native_preview_capture(
 ) -> BackendPreviewCapture<fn() -> super::NativeComputerCaptureBackend> {
     BackendPreviewCapture::new(super::native_capture_backend)
+}
+
+/// A computer plane's preview: how it captures, whether this build may
+/// capture at all (`preview_capture_admitted`), and its one worker, started
+/// the first time a background-mode action shows a preview. A plane whose
+/// agent cursor is off, or that only ever serves foreground mode, never
+/// starts it: no thread, no capture, no timer.
+pub(crate) struct PreviewPlane {
+    capturer: Arc<dyn PreviewCapturer>,
+    capture_admitted: bool,
+    frontmost: super::cursor::FrontmostWindow,
+    worker: std::sync::OnceLock<Arc<PreviewWorker>>,
+}
+
+impl PreviewPlane {
+    pub(crate) fn new(
+        capturer: Arc<dyn PreviewCapturer>,
+        capture_admitted: bool,
+        frontmost: super::cursor::FrontmostWindow,
+    ) -> Self {
+        Self {
+            capturer,
+            capture_admitted,
+            frontmost,
+            worker: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A preview that captures nothing: every preview shows the
+    /// application's icon with `capture_refused`.
+    pub(crate) fn without_capture() -> Self {
+        Self::new(
+            Arc::new(NoPreviewCapture),
+            false,
+            platform_frontmost_window(),
+        )
+    }
+
+    /// The worker, started now if it is not running, drawing through
+    /// `cursor` and told of each of its ends.
+    pub(crate) fn worker(&self, cursor: &super::cursor::Coordinator) -> Arc<PreviewWorker> {
+        self.worker
+            .get_or_init(|| {
+                let worker = Arc::new(PreviewWorker::spawn(
+                    Arc::new(cursor.clone()),
+                    self.capturer.clone(),
+                    self.capture_admitted,
+                ));
+                cursor.on_end(Arc::downgrade(&worker));
+                worker
+            })
+            .clone()
+    }
+
+    /// The worker if it was started.
+    pub(crate) fn running(&self) -> Option<&Arc<PreviewWorker>> {
+        self.worker.get()
+    }
+
+    pub(crate) fn frontmost(&self) -> super::cursor::FrontmostWindow {
+        self.frontmost.clone()
+    }
+}
+
+/// The window server's frontmost window of a process, as the platform
+/// reads it; nothing where there is no window server to ask.
+pub(crate) fn platform_frontmost_window() -> super::cursor::FrontmostWindow {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(|grant: &ProcessGrant| cerebellum_macos::frontmost_window_id(grant.pid))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(|_: &ProcessGrant| None)
+    }
 }
 
 struct Locked {
@@ -687,6 +905,7 @@ struct Shared {
     locked: Mutex<Locked>,
     changed: Condvar,
     output: Arc<dyn PreviewOutput>,
+    gauges: &'static PreviewGauges,
 }
 
 impl Shared {
@@ -697,9 +916,8 @@ impl Shared {
     }
 }
 
-/// The process's one preview worker. The action path is meant to tell it
-/// what to show, hide and refresh (that wiring does not exist yet), and
-/// never waits on it: each call takes a lock
+/// A computer plane's one preview worker. The action path tells it what to
+/// show, hide and refresh, and never waits on it: each call takes a lock
 /// that no capture is ever made under, sends at most one line without
 /// waiting, and returns.
 ///
@@ -723,6 +941,24 @@ impl PreviewWorker {
             capturer,
             capture_admitted,
             Duration::from_millis(PREVIEW_CAPTURE_TIMEOUT_MS),
+            &PREVIEW_GAUGES,
+        )
+    }
+
+    /// `spawn`, counting its capture requests in `gauges`.
+    #[cfg(test)]
+    pub(crate) fn spawn_counting(
+        output: Arc<dyn PreviewOutput>,
+        capturer: Arc<dyn PreviewCapturer>,
+        capture_admitted: bool,
+        gauges: &'static PreviewGauges,
+    ) -> Self {
+        Self::spawn_with(
+            output,
+            capturer,
+            capture_admitted,
+            Duration::from_millis(PREVIEW_CAPTURE_TIMEOUT_MS),
+            gauges,
         )
     }
 
@@ -731,6 +967,7 @@ impl PreviewWorker {
         capturer: Arc<dyn PreviewCapturer>,
         capture_admitted: bool,
         capture_timeout: Duration,
+        gauges: &'static PreviewGauges,
     ) -> Self {
         let shared = Arc::new(Shared {
             locked: Mutex::new(Locked {
@@ -739,6 +976,7 @@ impl PreviewWorker {
             }),
             changed: Condvar::new(),
             output,
+            gauges,
         });
         let (jobs, requests) = std::sync::mpsc::channel::<CaptureJob>();
         let answering = shared.clone();
@@ -748,6 +986,7 @@ impl PreviewWorker {
             .name("agent-preview-capture".into())
             .spawn(move || {
                 for job in requests {
+                    answering.gauges.capture_requested();
                     let result = capturer.capture(&job);
                     let mut locked = answering.lock();
                     let answer = locked.schedule.answered(&job, result);
@@ -772,10 +1011,25 @@ impl PreviewWorker {
         Self { shared }
     }
 
+    /// Hold a slot for the agent, as `Schedule::reserve` decides.
+    pub(crate) fn reserve(&self, agent: &str) -> Option<u8> {
+        self.shared.lock().schedule.reserve(agent, Instant::now())
+    }
+
+    /// Give back a slot held for a preview that was not shown.
+    pub(crate) fn release_unshown(&self, agent: &str) {
+        self.shared.lock().schedule.release_unshown(agent);
+    }
+
+    /// Whether the agent's preview is showing.
+    pub(crate) fn is_shown(&self, agent: &str) -> bool {
+        self.shared.lock().schedule.is_shown(agent, Instant::now())
+    }
+
     /// Show or retarget the agent's preview, as `Schedule::show` decides.
     pub(crate) fn show(&self, request: PreviewRequest) -> ShowOutcome {
         let mut locked = self.shared.lock();
-        let (outcome, line) = locked.schedule.show(request);
+        let (outcome, line) = locked.schedule.show(request, Instant::now());
         if let Some(line) = line {
             self.shared.output.preview(line);
         }
@@ -792,12 +1046,18 @@ impl PreviewWorker {
     }
 
     pub(crate) fn action_started(&self, agent: &str) {
-        self.shared.lock().schedule.action_started(agent);
+        self.shared
+            .lock()
+            .schedule
+            .action_started(agent, Instant::now());
         self.shared.changed.notify_all();
     }
 
     pub(crate) fn action_settled(&self, agent: &str) {
-        self.shared.lock().schedule.action_settled(agent);
+        self.shared
+            .lock()
+            .schedule
+            .action_settled(agent, Instant::now());
         self.shared.changed.notify_all();
     }
 
@@ -903,23 +1163,23 @@ mod tests {
     fn slots_fill_top_down_reuse_a_freed_slot_and_never_compact() {
         let mut schedule = admitted();
         for (agent, slot) in [("a", 0), ("b", 1), ("c", 2)] {
-            let (outcome, line) = schedule.show(request(agent, 10));
+            let (outcome, line) = schedule.show(request(agent, 10), Instant::now());
             assert_eq!(shown_slot(outcome), slot);
             assert_eq!(line.unwrap().preview_slot, slot);
         }
         assert!(schedule.hide("b"));
         // The agent below keeps its slot; the gap is not closed.
-        let (outcome, _) = schedule.show(request("c", 10));
+        let (outcome, _) = schedule.show(request("c", 10), Instant::now());
         assert_eq!(shown_slot(outcome), 2);
         // The next new agent takes the freed slot.
-        let (outcome, _) = schedule.show(request("d", 10));
+        let (outcome, _) = schedule.show(request("d", 10), Instant::now());
         assert_eq!(shown_slot(outcome), 1);
         // A slot freed at the top goes to the next new agent, not to one
         // already showing below it.
         assert!(schedule.hide("a"));
-        let (outcome, _) = schedule.show(request("d", 10));
+        let (outcome, _) = schedule.show(request("d", 10), Instant::now());
         assert_eq!(shown_slot(outcome), 1);
-        let (outcome, _) = schedule.show(request("e", 10));
+        let (outcome, _) = schedule.show(request("e", 10), Instant::now());
         assert_eq!(shown_slot(outcome), 0);
     }
 
@@ -928,13 +1188,13 @@ mod tests {
         let mut schedule = admitted();
         let now = Instant::now();
         for agent in ["a", "b", "c"] {
-            schedule.show(request(agent, 10));
+            schedule.show(request(agent, 10), Instant::now());
         }
-        let (outcome, line) = schedule.show(request("d", 10));
+        let (outcome, line) = schedule.show(request("d", 10), Instant::now());
         assert_eq!(outcome, ShowOutcome::NotShownCapacity);
         assert_eq!(line, None);
-        schedule.action_started("d");
-        schedule.action_settled("d");
+        schedule.action_started("d", Instant::now());
+        schedule.action_settled("d", Instant::now());
         let mut captured = Vec::new();
         let mut at = now;
         while let Some(job) = schedule.next(at).submit {
@@ -949,7 +1209,7 @@ mod tests {
     fn without_capture_admitted_every_preview_shows_its_icon_and_nothing_is_captured() {
         let mut schedule = Schedule::new(false, Duration::from_millis(PREVIEW_CAPTURE_TIMEOUT_MS));
         let now = Instant::now();
-        let (outcome, line) = schedule.show(request("a", 10));
+        let (outcome, line) = schedule.show(request("a", 10), Instant::now());
         assert_eq!(shown_slot(outcome), 0);
         let line = line.unwrap();
         assert!(icon(&line));
@@ -958,13 +1218,13 @@ mod tests {
             Some("/Applications/Mail.app")
         );
         assert!(line.valid());
-        schedule.action_started("a");
+        schedule.action_started("a", Instant::now());
         for later in [0, 500, 1_000, 5_000] {
             let step = schedule.next(now + Duration::from_millis(later));
             assert_eq!(step.submit, None, "captured at {later} ms");
             assert_eq!(step.wake_at, None, "a timer runs with nothing to capture");
         }
-        schedule.action_settled("a");
+        schedule.action_settled("a", Instant::now());
         assert_eq!(schedule.next(now).submit, None);
     }
 
@@ -972,8 +1232,8 @@ mod tests {
     fn a_hidden_preview_has_no_capture_and_no_timer() {
         let mut schedule = admitted();
         let now = Instant::now();
-        schedule.show(request("a", 10));
-        schedule.action_started("a");
+        schedule.show(request("a", 10), Instant::now());
+        schedule.action_started("a", Instant::now());
         let job = schedule.next(now).submit.expect("a first frame");
         schedule.answered(&job, Ok(jpeg()));
         let step = schedule.next(now + Duration::from_millis(40));
@@ -981,8 +1241,8 @@ mod tests {
         assert_eq!(step.wake_at, Some(now + Duration::from_millis(500)));
 
         assert!(schedule.hide("a"));
-        schedule.action_settled("a");
-        schedule.action_started("a");
+        schedule.action_settled("a", Instant::now());
+        schedule.action_started("a", Instant::now());
         for later in [40, 500, 1_000, 60_000] {
             let step = schedule.next(now + Duration::from_millis(later));
             assert_eq!(step.submit, None, "captured at {later} ms while hidden");
@@ -991,12 +1251,57 @@ mod tests {
         }
     }
 
+    /// The helper fades an agent's preview out once the agent has not
+    /// acted for the badge's idle timeout. The module then takes it for
+    /// hidden: its slot goes to the next new agent, nothing is captured or
+    /// timed for it, and its agent's next action shows it in a new
+    /// generation. No timer runs while waiting for that.
+    #[test]
+    fn an_idle_preview_frees_its_slot_and_is_never_refreshed() {
+        let mut schedule = admitted();
+        let now = Instant::now();
+        let mut first = 0;
+        for agent in ["a", "b", "c"] {
+            let (outcome, _) = schedule.show(request(agent, 10), now);
+            if let ShowOutcome::Shown { generation, .. } = outcome {
+                if agent == "a" {
+                    first = generation;
+                }
+            }
+            schedule.action_started(agent, now);
+            schedule.action_settled(agent, now);
+        }
+        while let Some(job) = schedule.next(now).submit {
+            schedule.answered(&job, Ok(jpeg()));
+        }
+        let step = schedule.next(now);
+        assert_eq!(step.wake_at, None, "a timer runs while waiting to idle");
+        // Just before the timeout every slot is still held.
+        let almost = now + PREVIEW_IDLE - Duration::from_millis(1);
+        assert_eq!(schedule.reserve("d", almost), None);
+        assert!(schedule.is_shown("a", almost));
+        // At it, every idle preview is gone: a new agent takes the top
+        // slot, and nothing more is captured for the idle ones.
+        let idle = now + PREVIEW_IDLE;
+        assert!(!schedule.is_shown("a", idle));
+        assert_eq!(schedule.reserve("d", idle), Some(0));
+        let step = schedule.next(idle);
+        assert_eq!(step.submit, None, "an idle preview was captured");
+        assert_eq!(step.wake_at, None, "an idle preview has a timer");
+        // The idle agent's next action shows its preview anew.
+        let (ShowOutcome::Shown { generation, .. }, _) = schedule.show(request("a", 10), idle)
+        else {
+            panic!("not shown");
+        };
+        assert!(generation > first);
+    }
+
     #[test]
     fn an_action_in_flight_refreshes_at_most_twice_a_second() {
         let mut schedule = admitted();
         let now = Instant::now();
-        schedule.show(request("a", 10));
-        schedule.action_started("a");
+        schedule.show(request("a", 10), Instant::now());
+        schedule.action_started("a", Instant::now());
         let mut submitted = Vec::new();
         for at in (0..=1_400).step_by(20) {
             let at = now + Duration::from_millis(at);
@@ -1007,7 +1312,7 @@ mod tests {
         }
         assert_eq!(submitted, [0, 500, 1_000]);
         // Settling asks for one more at once.
-        schedule.action_settled("a");
+        schedule.action_settled("a", Instant::now());
         let at = now + Duration::from_millis(1_420);
         let job = schedule.next(at).submit.expect("a refresh after settling");
         schedule.answered(&job, Ok(jpeg()));
@@ -1024,17 +1329,17 @@ mod tests {
     fn an_unanswered_request_blocks_every_other_and_refreshes_coalesce() {
         let mut schedule = admitted();
         let now = Instant::now();
-        schedule.show(request("a", 10));
+        schedule.show(request("a", 10), Instant::now());
         let first = schedule.next(now).submit.expect("a's first frame");
         assert_eq!(first.agent, "a");
-        schedule.show(request("b", 20));
+        schedule.show(request("b", 20), Instant::now());
         for _ in 0..3 {
-            schedule.action_started("a");
-            schedule.action_settled("a");
-            schedule.action_started("b");
-            schedule.action_settled("b");
+            schedule.action_started("a", Instant::now());
+            schedule.action_settled("a", Instant::now());
+            schedule.action_started("b", Instant::now());
+            schedule.action_settled("b", Instant::now());
         }
-        schedule.show(request("b", 21));
+        schedule.show(request("b", 21), Instant::now());
         let step = schedule.next(now + Duration::from_millis(1_999));
         assert_eq!(step.submit, None);
         assert_eq!(
@@ -1056,7 +1361,7 @@ mod tests {
             "a timer runs while waiting for the answer"
         );
         // A preview shown while the request is stuck shows its icon at once.
-        let (_, line) = schedule.show(request("c", 30));
+        let (_, line) = schedule.show(request("c", 30), Instant::now());
         assert!(icon(&line.unwrap()));
         for later in [2_500, 10_000, 600_000] {
             assert_eq!(
@@ -1089,7 +1394,7 @@ mod tests {
                 ..
             },
             _,
-        ) = schedule.show(request("a", 10))
+        ) = schedule.show(request("a", 10), Instant::now())
         else {
             panic!("not shown");
         };
@@ -1101,12 +1406,14 @@ mod tests {
                 generation: same, ..
             },
             _,
-        ) = schedule.show(request("a", 10))
+        ) = schedule.show(request("a", 10), Instant::now())
         else {
             panic!("not shown");
         };
         assert_eq!(same, first_generation);
-        let (ShowOutcome::Shown { generation, .. }, _) = schedule.show(request("a", 11)) else {
+        let (ShowOutcome::Shown { generation, .. }, _) =
+            schedule.show(request("a", 11), Instant::now())
+        else {
             panic!("not shown");
         };
         assert!(generation > first_generation);
@@ -1123,7 +1430,7 @@ mod tests {
         // Hidden and shown again on the same window: a new generation, and
         // a frame asked for before the hide is not drawn into it.
         let before_hide = {
-            schedule.action_settled("a");
+            schedule.action_settled("a", Instant::now());
             schedule.next(now).submit.unwrap()
         };
         schedule.hide("a");
@@ -1132,7 +1439,7 @@ mod tests {
                 generation: again, ..
             },
             _,
-        ) = schedule.show(request("a", 11))
+        ) = schedule.show(request("a", 11), Instant::now())
         else {
             panic!("not shown");
         };
@@ -1147,40 +1454,46 @@ mod tests {
     fn a_failed_capture_sends_no_frame_and_shows_the_icon_once() {
         let mut schedule = admitted();
         let now = Instant::now();
-        let (_, line) = schedule.show(request("a", 10));
+        let (_, line) = schedule.show(request("a", 10), Instant::now());
         assert!(!icon(&line.unwrap()));
         let job = schedule.next(now).submit.unwrap();
         let answer = schedule.answered(&job, Err(PreviewRefused));
         assert_eq!(answer.frame, None);
         assert_eq!(answer.lines.len(), 1);
         assert!(icon(&answer.lines[0]));
-        schedule.action_settled("a");
+        schedule.action_settled("a", Instant::now());
         let job = schedule.next(now).submit.unwrap();
         assert_eq!(
             schedule.answered(&job, Err(PreviewRefused)),
             Answer::default()
         );
         // A frame that would not fit its line is a failed capture too.
-        schedule.action_settled("a");
+        schedule.action_settled("a", Instant::now());
         let job = schedule.next(now).submit.unwrap();
         let oversized = PreviewJpeg {
             size: [4, 3],
             jpeg: vec![1; cerebellum_computer::cursor::MAX_FRAME_BYTES + 1],
         };
         assert_eq!(schedule.answered(&job, Ok(oversized)).frame, None);
-        schedule.action_settled("a");
+        schedule.action_settled("a", Instant::now());
         let job = schedule.next(now).submit.unwrap();
         assert!(schedule.answered(&job, Ok(jpeg())).frame.is_some());
     }
 
     #[test]
-    fn the_thumbnail_is_280_wide_and_letterboxed_at_360_tall() {
+    fn the_thumbnail_is_the_helpers_own_letterboxed_thumbnail() {
+        // The helper's thumbnail: the 280-point preview less its insets,
+        // and at most as tall as a 360-point preview leaves room for under
+        // its caption. The module measures glides and sizes captures in
+        // exactly these points.
         let wide = PreviewWindow::new(1, [0.0, 0.0, 1920.0, 1080.0]).unwrap();
-        assert_eq!(wide.thumbnail(), [280.0, 157.5]);
-        assert_eq!(wide.capture_max_px(2.0), [560, 315]);
+        assert_eq!(wide.thumbnail(), [268.0, 150.75]);
+        assert_eq!(Some(wide.thumbnail()), thumbnail_size([1920.0, 1080.0]));
+        assert_eq!(wide.capture_max_px(2.0), [536, 302]);
         let tall = PreviewWindow::new(1, [0.0, 0.0, 600.0, 1200.0]).unwrap();
-        assert_eq!(tall.thumbnail(), [180.0, 360.0]);
-        assert_eq!(tall.capture_max_px(2.0), [360, 720]);
+        assert_eq!(tall.thumbnail(), [157.0, 314.0]);
+        assert_eq!(Some(tall.thumbnail()), thumbnail_size([600.0, 1200.0]));
+        assert_eq!(tall.capture_max_px(2.0), [314, 628]);
         assert_eq!(PreviewWindow::new(1, [0.0, 0.0, 0.0, 10.0]), None);
     }
 
@@ -1272,7 +1585,13 @@ mod tests {
             .expect("the element's window");
         assert_eq!(window.id, 11);
         assert_eq!(window.bounds, [200.0, 100.0, 800.0, 600.0]);
-        let focused = preview_window(&source, &target, PreviewWindowSource::Focused).unwrap();
+        let focus = source.focused_element(&target).unwrap();
+        let focused = preview_window(
+            &source,
+            &target,
+            PreviewWindowSource::Focused(focus.as_ref()),
+        )
+        .unwrap();
         assert_eq!(focused, window);
         let first = element(1);
         let front = preview_window(&source, &target, PreviewWindowSource::Element(&first)).unwrap();
@@ -1295,15 +1614,17 @@ mod tests {
         let mut schedule = admitted();
         let mut shown = request("a", 0);
         shown.window = window;
-        let (ShowOutcome::Shown { thumbnail, .. }, Some(line)) = schedule.show(shown) else {
+        let (ShowOutcome::Shown { thumbnail, .. }, Some(line)) =
+            schedule.show(shown, Instant::now())
+        else {
             panic!("not shown");
         };
         assert_eq!(line.preview_window, 11);
         assert_eq!(line.preview_aspect, [800.0, 600.0]);
-        assert_eq!(thumbnail, [280.0, 210.0]);
+        assert_eq!(thumbnail, [268.0, 201.0]);
         let job = schedule.next(Instant::now()).submit.unwrap();
         assert_eq!(job.window, 11);
-        assert_eq!(job.max_px, [560, 420]);
+        assert_eq!(job.max_px, [536, 402]);
         let frame = source.cursor_frame(&second).unwrap();
         assert_eq!(
             window.visible_target(frame),
@@ -1375,7 +1696,7 @@ mod tests {
         });
         for capture in [&reused as &dyn PreviewCapturer, &not_live] {
             let mut schedule = admitted();
-            schedule.show(request("a", 11));
+            schedule.show(request("a", 11), Instant::now());
             let job = schedule.next(Instant::now()).submit.unwrap();
             let result = capture.capture(&job);
             assert_eq!(result, Err(PreviewRefused));
@@ -1480,7 +1801,13 @@ mod tests {
     fn an_unanswered_capture_then_hide_then_late_answer_sends_no_frame() {
         let output = Arc::new(Recorder::default());
         let held = Arc::new(Held::default());
-        let worker = PreviewWorker::spawn_with(output.clone(), held.clone(), true, SHORT_WAIT);
+        let worker = PreviewWorker::spawn_with(
+            output.clone(),
+            held.clone(),
+            true,
+            SHORT_WAIT,
+            &PREVIEW_GAUGES,
+        );
         worker.show(request("a", 10));
         wait_for("the first request", || held.calls() == 1);
         for _ in 0..5 {
@@ -1503,7 +1830,13 @@ mod tests {
     fn another_agents_action_during_an_outstanding_capture_shows_its_icon_and_is_not_held() {
         let output = Arc::new(Recorder::default());
         let held = Arc::new(Held::default());
-        let worker = PreviewWorker::spawn_with(output.clone(), held.clone(), true, SHORT_WAIT);
+        let worker = PreviewWorker::spawn_with(
+            output.clone(),
+            held.clone(),
+            true,
+            SHORT_WAIT,
+            &PREVIEW_GAUGES,
+        );
         worker.show(request("a", 10));
         wait_for("a's request", || held.calls() == 1);
         wait_for("a's icon after the wait ended", || output.icon_shown("a"));

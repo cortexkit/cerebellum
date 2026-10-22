@@ -741,6 +741,16 @@ pub struct DeskState {
     /// The window-server number of the window each element sits in. An
     /// element missing here is one whose window cannot be established.
     pub element_windows: std::collections::HashMap<u64, u32>,
+    /// The window element (a token) each element sits in, as a badge's
+    /// window read finds it; `cursor_frames` gives its frame and
+    /// `element_windows` its window-server number. An element missing here
+    /// has no window to show.
+    pub cursor_windows: std::collections::HashMap<u64, u64>,
+    /// The window element the application reports as focused, for a badge
+    /// with no element.
+    pub focused_cursor_window: Option<u64>,
+    /// Window elements that read as minimized.
+    pub minimized_windows: std::collections::HashSet<u64>,
     /// The topmost on-screen window at any point, unless
     /// `topmost_windows_at` names another one there; `None` when the window
     /// list does not settle it.
@@ -798,6 +808,9 @@ impl Desk {
             system_wide_hit: None,
             system_wide_hits_at: Vec::new(),
             element_windows: std::collections::HashMap::new(),
+            cursor_windows: std::collections::HashMap::new(),
+            focused_cursor_window: None,
+            minimized_windows: std::collections::HashSet::new(),
             topmost_window: None,
             topmost_windows_at: Vec::new(),
             presses: Vec::new(),
@@ -1034,6 +1047,24 @@ impl AppStateSource for Desk {
     fn element_window_number(&self, element: &ElementHandle) -> Option<u32> {
         let token = token_of(element)?;
         self.state().element_windows.get(&token).copied()
+    }
+
+    fn cursor_window(
+        &self,
+        _target: &ProcessGrant,
+        element: Option<&ElementHandle>,
+    ) -> Option<ElementHandle> {
+        let state = self.state();
+        match element {
+            Some(element) => state.cursor_windows.get(&token_of(element)?).copied(),
+            None => state.focused_cursor_window,
+        }
+        .map(fixture_handle)
+    }
+
+    fn window_minimized(&self, window: &ElementHandle) -> Option<bool> {
+        let token = token_of(window)?;
+        Some(self.state().minimized_windows.contains(&token))
     }
 
     fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {

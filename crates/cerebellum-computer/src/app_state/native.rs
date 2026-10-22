@@ -178,6 +178,10 @@ impl AppStateSource for MacAppStateSource {
         window.map(handle)
     }
 
+    fn window_minimized(&self, window: &ElementHandle) -> Option<bool> {
+        cerebellum_macos::window_minimized(retained(window).ok()?)
+    }
+
     fn watch_cursor_window(
         &self,
         window: &ElementHandle,

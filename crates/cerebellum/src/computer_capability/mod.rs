@@ -109,6 +109,23 @@ mod open_app_tests;
 mod permission_tests;
 mod permissions;
 mod preview;
+mod preview_call;
+
+/// Capture requests the background-mode preview has made since the process
+/// started, for the health reply.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn preview_capture_requests() -> u64 {
+    preview::PREVIEW_GAUGES.capture_requests()
+}
+
+/// Frame lines the background-mode preview has written to the agent-cursor
+/// helper since the process started, for the health reply.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn preview_frames_written() -> u64 {
+    preview::PREVIEW_GAUGES.frames_written()
+}
+#[cfg(test)]
+mod preview_wire_tests;
 mod quarantine;
 pub(crate) use quarantine::park_clock;
 #[cfg(test)]
@@ -557,6 +574,9 @@ where
     /// counts as this module's whichever conversation asked for it.
     own_input: Arc<OwnInputLedger>,
     cursor: cursor::Coordinator,
+    /// The background-mode preview: how its frames are captured, whether
+    /// this build may capture them, and its worker once one is needed.
+    preview: Arc<preview::PreviewPlane>,
     /// The config file's `computer_use.app_use`, checked as each call
     /// arrives. The only setting whose edits are acted on while the module
     /// runs. No file is read until module startup calls
@@ -669,6 +689,7 @@ where
             fronting_lock: fronting::FrontingLock::process_wide(),
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),
+            preview: Arc::new(preview::PreviewPlane::without_capture()),
             app_use: app_use::LiveAppUse::without_file(),
             #[cfg(test)]
             app_use_seen_for_test: StdMutex::new(Vec::new()),
@@ -721,6 +742,38 @@ where
     pub fn with_app_use_fronting_admitted(mut self, admitted: bool) -> Self {
         self.app_use_fronting_admitted = admitted;
         self
+    }
+
+    /// Capture the background-mode preview's frames with the platform's own
+    /// capture, when `admitted`: only a build whose release carries both the
+    /// capture review and the app-use review (`preview_capture_admitted`).
+    /// Without it every preview shows the application's icon.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn with_native_preview_capture(mut self, admitted: bool) -> Self {
+        self.preview = Arc::new(preview::PreviewPlane::new(
+            Arc::new(preview::native_preview_capture()),
+            admitted,
+            preview::platform_frontmost_window(),
+        ));
+        self
+    }
+
+    /// Show previews through `preview` instead of the plane's default.
+    #[cfg(test)]
+    pub(crate) fn with_preview(mut self, preview: preview::PreviewPlane) -> Self {
+        self.preview = Arc::new(preview);
+        self
+    }
+
+    /// The badges of the call this task serves, in the application named
+    /// `app`.
+    fn badges(&self, app: String) -> preview_call::Badges {
+        preview_call::Badges::for_call(
+            self.cursor.clone(),
+            self.app_state_source.clone(),
+            self.preview.clone(),
+            app,
+        )
     }
 
     /// Take fronting turns on `lock` instead of the process-wide one, so
@@ -968,6 +1021,7 @@ where
         let grant_cancel = context.cancel.clone();
         let front_identity = context.identity.clone();
         let matched_app = Arc::new(std::sync::Mutex::new(None));
+        let preview_call = Arc::new(preview_call::PreviewCall::default());
         // Capability work holds the app-consent wait and eventual platform
         // call. Keep that future on the heap before the grant watcher adds
         // polling and cancellation-cleanup frames around it.
@@ -987,7 +1041,9 @@ where
                         // call-front tracking would copy it into this block's
                         // state several times over, on the stack of a thread
                         // that polls a real call.
-                        let (mut reply, call_front) =
+                        // The call's badges report into `preview_call`.
+                        let (mut reply, call_front) = preview_call::scope(
+                            preview_call.clone(),
                             fronting::tracking_call_front(Box::pin(async {
                                 match capability.0 {
                                     Served::ReadState => {
@@ -1051,8 +1107,9 @@ where
                                         .await
                                     }
                                 }
-                            }))
-                            .await;
+                            })),
+                        )
+                        .await;
                         if let Some(pending) = call_front.unrecorded {
                             self.journal_unrecorded_front(
                                 front_identity,
@@ -1085,6 +1142,20 @@ where
         if let (Some(name), Some(object)) = (matched_app, reply.as_object_mut()) {
             object.insert("matched_app".into(), json!(name));
         }
+        // The background-mode preview did not track this action: three other
+        // agents' previews were showing, or the action went ahead of its
+        // badge at the cap. Only the actions that show a preview say so.
+        if let (Some(value), Some(object)) = (
+            can_front(capability.0)
+                .then(|| preview_call.reply_value())
+                .flatten(),
+            reply.as_object_mut(),
+        ) {
+            object.insert("preview".into(), json!(value));
+        }
+        // The call is done with the preview: once its badges' work lets go
+        // too, the preview refreshes once more and waits.
+        drop(preview_call);
         // The call went ahead without knowing whether the screen was locked.
         // Said on the reply so an empty tree or a missing element is not
         // taken for an application that has nothing there.
@@ -1502,18 +1573,26 @@ where
         } else {
             None
         };
-        self.cursor.schedule_with_fallback(
+        let app_name = management.application_name(&grant);
+        // A read of one element (a zoom or a single filter match) previews
+        // that element's window; any other read previews the application's
+        // frontmost window.
+        let window = if zoomed.is_some() || filtered.is_some() {
+            cursor::WindowChoice::Element
+        } else {
+            cursor::WindowChoice::Frontmost
+        };
+        self.badges(app_name.clone()).schedule(
             cursor::Identity::current(identity.agent_project_id.clone()),
             cerebellum_computer::cursor::CursorKind::Reading,
             grant.clone(),
-            self.app_state_source.clone(),
             cursor::ReadAim {
                 preferred: read_cursor_target(zoomed, filtered, focused.clone()),
                 focused,
             },
             None,
+            window,
         );
-        let app_name = management.application_name(&grant);
         let mut rendered = render_state(
             &StateHeader {
                 app_name: &app_name,
@@ -1896,13 +1975,19 @@ where
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let predicate = parsed.predicate;
-            self.cursor.schedule(
+            // A wait reads the application as `read_state` does, so in
+            // background mode its badge rests in the preview, not on a
+            // screen where the window may be covered.
+            self.badges(management.application_name(&grant)).schedule(
                 cursor::Identity::current(identity.agent_project_id.clone()),
                 cerebellum_computer::cursor::CursorKind::Reading,
                 grant.clone(),
-                self.app_state_source.clone(),
+                cursor::ReadAim {
+                    preferred: None,
+                    focused: None,
+                },
                 None,
-                None,
+                cursor::WindowChoice::Frontmost,
             );
             let timeout_ms = parsed.timeout_ms;
             let work = quarantine::CallWork::current();
@@ -2105,7 +2190,9 @@ where
                 return unposted(reply);
             }
         };
-        let arrival = self.cursor.schedule(
+        // The preview shows the focused element's window, or with none the
+        // application's focused window.
+        let arrival = self.badges(management.application_name(&grant)).schedule(
             cursor::Identity::current(identity.agent_project_id.clone()),
             if capability == ComputerCapability::Type {
                 cerebellum_computer::cursor::CursorKind::Type
@@ -2113,9 +2200,12 @@ where
                 cerebellum_computer::cursor::CursorKind::Keys
             },
             grant.clone(),
-            self.app_state_source.clone(),
-            focus.as_ref().map(|focus| focus.handle.clone()),
+            cursor::ReadAim {
+                preferred: focus.as_ref().map(|focus| focus.handle.clone()),
+                focused: None,
+            },
             None,
+            cursor::WindowChoice::Element,
         );
 
         // Only shortcut modifiers need the front. Plain typing stays inside

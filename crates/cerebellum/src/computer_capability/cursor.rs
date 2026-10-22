@@ -17,6 +17,11 @@ use cerebellum_computer::cursor::{
 use cerebellum_computer::platform::ProcessGrant;
 use tokio::sync::{mpsc, oneshot};
 
+use super::preview::{
+    preview_window, PreviewGauges, PreviewRequest, PreviewWindow, PreviewWindowSource,
+    PreviewWorker, ShowOutcome, PREVIEW_GAUGES,
+};
+use super::preview_call::PreviewCall;
 use crate::terminal_arbiter::TerminalArbiter;
 
 const READ_BUDGET: Duration = Duration::from_millis(50);
@@ -71,6 +76,14 @@ const PENDING_FRAME_CAP: usize = 8;
 /// Told when a line's write to the helper completed, or `None` when it was
 /// not written.
 type WriteNote = oneshot::Sender<Option<tokio::time::Instant>>;
+/// How a scheduled picture answers the action waiting for it: the channel
+/// its arrival is told on, the flag set once its line is queued for a
+/// writer, and the cap past which nothing is waited for.
+type Decision = (
+    oneshot::Sender<Option<tokio::time::Instant>>,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::time::Instant,
+);
 /// The lines actions wait for, by agent and serial.
 type AwaitedWrites = HashMap<(String, u64), WriteNote>;
 
@@ -105,6 +118,11 @@ pub(crate) struct Identity {
 }
 
 impl Identity {
+    /// The agent the badge is drawn for.
+    pub(crate) fn badge(&self) -> &str {
+        &self.badge
+    }
+
     pub(crate) fn current(fallback: String) -> Self {
         let avatar_agent = ACTING_AGENT.try_with(Clone::clone).ok().flatten();
         Self {
@@ -284,6 +302,12 @@ struct State {
     /// Stands in for the system's Reduce Motion setting in tests.
     #[cfg(test)]
     reduce_motion_for_test: std::sync::Mutex<Option<bool>>,
+    /// The preview workers drawing through this cursor, told of every end
+    /// so an ended agent's preview stops being captured or timed.
+    preview_ends: std::sync::Mutex<Vec<std::sync::Weak<PreviewWorker>>>,
+    /// Where written frame lines are counted; the process's gauges unless a
+    /// test counts its own.
+    gauges: OnceLock<&'static PreviewGauges>,
 }
 
 /// One badge following its window: when the person moves or resizes the
@@ -316,6 +340,66 @@ struct Follow {
 pub(crate) struct ReadAim {
     pub(crate) preferred: Option<ElementHandle>,
     pub(crate) focused: Option<ElementHandle>,
+}
+
+/// Pixels per point the preview's frames are captured at. The module does
+/// not read the display's scale; a Retina display's 2 is assumed, which on a
+/// standard display only captures a sharper frame than it can show.
+const PREVIEW_BACKING_SCALE: f64 = 2.0;
+
+/// Which window a background-mode action's preview shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowChoice {
+    /// The window of the element the badge aims at (the addressed element of
+    /// a press or a write, the focused element of `keys` and `type`), or,
+    /// with no element, the application's focused window.
+    Element,
+    /// `read_state` without an element: the application's frontmost window
+    /// in the window server's front-to-back list.
+    Frontmost,
+}
+
+/// Reads the window server's frontmost window of a process, by id.
+pub(crate) type FrontmostWindow = Arc<dyn Fn(&ProcessGrant) -> Option<u32> + Send + Sync>;
+
+/// What a background-mode badge needs beyond an on-screen one.
+pub(crate) struct PreviewAim {
+    pub(crate) worker: Arc<PreviewWorker>,
+    pub(crate) window: WindowChoice,
+    /// The application's name, shown on the preview.
+    pub(crate) app: String,
+    pub(crate) frontmost: FrontmostWindow,
+    /// The call the badge belongs to, whose reply says when the preview did
+    /// not track the action.
+    pub(crate) call: Option<Arc<PreviewCall>>,
+}
+
+/// What the background read found.
+enum BackgroundRead {
+    /// A window to show in the preview, and where the badge goes in it.
+    Preview(PreviewAimed),
+    /// No window could be read; the on-screen picture, if any.
+    Screen(Option<(CursorEvent, Option<ElementHandle>)>),
+}
+
+/// The window a preview shows and where its badge goes, read in one step.
+struct PreviewAimed {
+    window: PreviewWindow,
+    /// The badge's tip and the element's visible centre, both as positions
+    /// in the window from 0 to 1; `None` for no motion.
+    to: Option<([f64; 2], [f64; 2])>,
+    label: Option<String>,
+}
+
+/// Whose preview `draw_in_preview` draws, and for which action.
+struct PreviewDraw {
+    agent: String,
+    serial: u64,
+    kind: CursorKind,
+    grant: ProcessGrant,
+    app: String,
+    worker: Arc<PreviewWorker>,
+    call: Option<Arc<PreviewCall>>,
 }
 
 #[derive(Clone, Default)]
@@ -385,6 +469,24 @@ impl Coordinator {
                     .spawn(move || transport(state, rx));
             }
         }
+    }
+
+    /// Whether anything is drawn: the agent cursor is on (`agent_cursor` in
+    /// the config) and not shut down.
+    pub(crate) fn enabled(&self) -> bool {
+        self.0.sender.get().is_some() && !self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tell `worker` of every end from now on: it hides the agent's preview
+    /// before the hide line goes out.
+    pub(crate) fn on_end(&self, worker: std::sync::Weak<PreviewWorker>) {
+        let mut ends = self
+            .0
+            .preview_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ends.retain(|end| end.strong_count() > 0);
+        ends.push(worker);
     }
 
     /// No lock, await, backpressure, journal, or call-record writer on this path.
@@ -484,6 +586,22 @@ impl Coordinator {
             agent.to_owned(),
             self.0.serial.load(std::sync::atomic::Ordering::SeqCst),
         );
+        // The preview goes with the badge: nothing more is captured or timed
+        // for it, and a later action shows it in a new generation. Hidden
+        // while the record is held, so a preview about to be shown for an
+        // action scheduled before this end either is shown first and hidden
+        // here, or sees the end and is not shown.
+        let ends: Vec<_> = self
+            .0
+            .preview_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for worker in ends {
+            worker.hide(agent);
+        }
         // The helper takes the badge off the screen, so the agent's next
         // picture is a new appearance.
         drawn.tips.remove(agent);
@@ -903,9 +1021,6 @@ impl Coordinator {
 
     /// Show an agent's preview, or point it at another window. It may start
     /// the helper.
-    // Only this module's tests call it so far; it is meant for the code that
-    // shows and retargets the background-mode preview.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_preview(&self, preview: CursorPreview) -> bool {
         self.send_line(CursorLine::Preview(preview))
     }
@@ -914,9 +1029,6 @@ impl Coordinator {
     /// the helper, and it is not an action: the badge's idle clock is not
     /// restarted by it. At most one frame per agent waits for the pipe; a
     /// newer one replaces it. A frame over `MAX_FRAME_BYTES` is dropped.
-    // Only this module's tests call it so far; it is meant for the worker
-    // that captures the background-mode preview's frames.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn send_frame(&self, frame: CursorFrame) -> bool {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) || !frame.valid() {
             return false;
@@ -966,18 +1078,13 @@ impl Coordinator {
     /// preview, measured in the thumbnail's points (`thumbnail` is its width
     /// and height). A badge last drawn on the screen or in another window's
     /// preview appears with its entry.
-    // Only this module's tests call it so far; it is meant to be called
-    // before each background-mode action.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn schedule_preview_motion(
         &self,
-        mut motion: CursorPreviewMotion,
+        motion: CursorPreviewMotion,
         thumbnail: [f64; 2],
     ) -> Arrival {
-        if self.0.sender.get().is_none()
-            || self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
-            || !thumbnail.iter().all(|v| v.is_finite() && *v > 0.0)
-        {
+        if !self.enabled() || !thumbnail.iter().all(|v| v.is_finite() && *v > 0.0) {
             return Arrival::none();
         }
         let serial = self
@@ -988,37 +1095,8 @@ impl Coordinator {
         let scheduled = tokio::time::Instant::now();
         let agent = motion.pmotion_agent.clone();
         let queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sent = {
-            let mut drawn = self.drawn();
-            let (chosen, tip) = drawn.aim(
-                &Aim {
-                    agent: &agent,
-                    serial,
-                    space: Space::Preview {
-                        window: motion.pmotion_window,
-                    },
-                    to: motion.pmotion_to,
-                    resting: false,
-                    scale: thumbnail,
-                },
-                scheduled,
-                self.reduce_motion(),
-            );
-            motion.pmotion_serial = serial;
-            motion.pmotion_motion = chosen;
-            let waits = !self
-                .0
-                .helper_down
-                .load(std::sync::atomic::Ordering::Acquire);
-            let sent = self.send_awaited(CursorLine::PreviewMotion(motion), &agent, serial, waits);
-            if sent.is_some() {
-                drawn.keep(&agent, tip);
-            }
-            sent.flatten().map(|written| Sent {
-                duration: Duration::from_secs_f64(chosen.duration_ms / 1000.0),
-                written,
-            })
-        };
+        let sent =
+            self.send_preview_motion(&mut self.drawn(), motion, thumbnail, serial, scheduled);
         let (decided, decision) = oneshot::channel();
         tokio::spawn(
             self.clone()
@@ -1033,12 +1111,293 @@ impl Coordinator {
                 agent,
                 serial,
             }),
+            preview_call: None,
         }
+    }
+
+    /// Choose the motion for `motion` from where its badge last was, put
+    /// the line on the pipe and record where the badge now is. Answers how
+    /// an action waits for it, or `None` when nothing will be drawn.
+    fn send_preview_motion(
+        &self,
+        drawn: &mut Drawn,
+        mut motion: CursorPreviewMotion,
+        thumbnail: [f64; 2],
+        serial: u64,
+        now: tokio::time::Instant,
+    ) -> Option<Sent> {
+        let agent = motion.pmotion_agent.clone();
+        let (chosen, tip) = drawn.aim(
+            &Aim {
+                agent: &agent,
+                serial,
+                space: Space::Preview {
+                    window: motion.pmotion_window,
+                },
+                to: motion.pmotion_to,
+                resting: false,
+                scale: thumbnail,
+            },
+            now,
+            self.reduce_motion(),
+        );
+        motion.pmotion_serial = serial;
+        motion.pmotion_motion = chosen;
+        let waits = !self
+            .0
+            .helper_down
+            .load(std::sync::atomic::Ordering::Acquire);
+        let sent = self.send_awaited(CursorLine::PreviewMotion(motion), &agent, serial, waits);
+        if sent.is_some() {
+            drawn.keep(&agent, tip);
+        }
+        sent.flatten().map(|written| Sent {
+            duration: Duration::from_secs_f64(chosen.duration_ms / 1000.0),
+            written,
+        })
+    }
+
+    /// Schedule a background-mode action's badge inside its agent's preview.
+    ///
+    /// The agent's preview slot is taken first, so a fourth agent learns at
+    /// once that it gets no preview: it then gets no badge and no arrival
+    /// wait, and its call's reply says `preview: "not_shown_capacity"`.
+    /// Otherwise, within the same read budget as an on-screen picture, the
+    /// window the action addresses is read (`preview_window`, one read for
+    /// its id and bounds), the preview is shown or retargeted to it, and the
+    /// badge moves inside it to the addressed element's visible centre (or
+    /// the exact point) as a `PreviewMotion` line, which the action waits
+    /// for as it would for a picture. A preview showing the application's
+    /// icon, an element with no geometry in that window, or a read that
+    /// finds nothing makes no motion and no wait.
+    ///
+    /// When no window can be read at all and the agent has no preview
+    /// showing, nothing could be shown in a preview, so the badge is drawn
+    /// on the screen exactly as `schedule_with_fallback` draws it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn schedule_in_preview(
+        &self,
+        identity: Identity,
+        kind: CursorKind,
+        grant: ProcessGrant,
+        source: Arc<dyn AppStateSource>,
+        aim: ReadAim,
+        point: Option<[f64; 2]>,
+        preview: PreviewAim,
+    ) -> Arrival {
+        if !self.enabled() {
+            return Arrival::none();
+        }
+        let agent = identity.badge.clone();
+        if preview.worker.reserve(&agent).is_none() {
+            if let Some(call) = &preview.call {
+                call.note_not_shown_capacity();
+            }
+            return Arrival::none();
+        }
+        // Numbered before it is recorded: an end that lands in between then
+        // counts this badge as scheduled before it, and drops it.
+        let serial = self
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.record(&identity);
+        self.refresh_reduce_motion();
+        let (decided, decision) = oneshot::channel();
+        let arrival = Arrival {
+            decision: Some(decision),
+            scheduled: tokio::time::Instant::now(),
+            queued: Arc::default(),
+            watch: Some(BadgeWatch {
+                cursor: self.clone(),
+                agent: agent.clone(),
+                serial,
+            }),
+            preview_call: preview.call.clone(),
+        };
+        let decision = (
+            decided,
+            arrival.queued.clone(),
+            arrival.scheduled + ARRIVAL_CAP,
+        );
+        let cursor = self.clone();
+        tokio::spawn(async move {
+            let avatar_agent = identity.avatar_agent;
+            let (read_source, read_grant, read_agent) =
+                (source.clone(), grant.clone(), agent.clone());
+            let frontmost = preview.frontmost.clone();
+            let choice = preview.window;
+            let read = tokio::task::spawn_blocking(move || {
+                background_read(
+                    read_source.as_ref(),
+                    &read_grant,
+                    kind,
+                    aim,
+                    point,
+                    choice,
+                    frontmost.as_ref(),
+                    read_agent,
+                    serial,
+                )
+            });
+            match tokio::time::timeout(READ_BUDGET, read).await {
+                Ok(Ok(BackgroundRead::Preview(aimed))) => {
+                    cursor
+                        .draw_in_preview(
+                            aimed,
+                            PreviewDraw {
+                                agent,
+                                serial,
+                                kind,
+                                grant,
+                                app: preview.app,
+                                worker: preview.worker,
+                                call: preview.call,
+                            },
+                            avatar_agent,
+                            decision,
+                        )
+                        .await;
+                }
+                Ok(Ok(BackgroundRead::Screen(read))) => {
+                    preview.worker.release_unshown(&agent);
+                    if let Some((event, followed_element)) = read {
+                        cursor
+                            .draw_on_screen(
+                                event,
+                                followed_element,
+                                grant,
+                                source,
+                                avatar_agent,
+                                decision,
+                            )
+                            .await;
+                    }
+                }
+                // A read that fails or runs out of time drops `decided`:
+                // nothing is drawn and nothing is waited for.
+                _ => preview.worker.release_unshown(&agent),
+            }
+        });
+        arrival
+    }
+
+    /// Show the agent's preview of the window read for its action and move
+    /// its badge there, then answer the action waiting for it.
+    async fn draw_in_preview(
+        &self,
+        aimed: PreviewAimed,
+        draw: PreviewDraw,
+        avatar_agent: Option<String>,
+        (decided, queued, cap): Decision,
+    ) {
+        let PreviewDraw {
+            agent,
+            serial,
+            kind,
+            grant,
+            app,
+            worker,
+            call,
+        } = draw;
+        let now = tokio::time::Instant::now();
+        let sent = {
+            // Held across the show, the same record `end` hides previews
+            // under: an end either comes first and is seen here, or comes
+            // after and hides the preview shown here.
+            let mut drawn = self.drawn();
+            if drawn
+                .ended_at
+                .get(&agent)
+                .is_some_and(|ended| serial < *ended)
+            {
+                drop(drawn);
+                worker.release_unshown(&agent);
+                return;
+            }
+            let outcome = worker.show(PreviewRequest {
+                agent: agent.clone(),
+                target: grant,
+                window: aimed.window,
+                app,
+                icon_path: None,
+                label: aimed.label,
+                backing_scale: PREVIEW_BACKING_SCALE,
+            });
+            match outcome {
+                ShowOutcome::NotShownCapacity => {
+                    if let Some(call) = &call {
+                        call.note_not_shown_capacity();
+                    }
+                    None
+                }
+                ShowOutcome::Shown {
+                    generation,
+                    thumbnail,
+                    icon,
+                    ..
+                } => {
+                    if let Some(call) = &call {
+                        call.showing(&worker, &agent);
+                    }
+                    match aimed.to.filter(|_| !icon) {
+                        Some((to, target)) => self.send_preview_motion(
+                            &mut drawn,
+                            CursorPreviewMotion {
+                                pmotion_agent: agent.clone(),
+                                pmotion_serial: serial,
+                                pmotion_generation: generation,
+                                pmotion_window: aimed.window.id,
+                                pmotion_kind: kind,
+                                pmotion_to: to,
+                                pmotion_target: target,
+                                // Chosen as the line is sent.
+                                pmotion_motion: PictureMotion::still(),
+                            },
+                            thumbnail,
+                            serial,
+                            now,
+                        ),
+                        None => None,
+                    }
+                }
+            }
+        };
+        let drew = sent.is_some();
+        tokio::spawn(self.clone().decide(decided, sent, queued, cap));
+        #[cfg(target_os = "macos")]
+        if drew {
+            self.send_avatar(
+                avatar_agent,
+                CursorEvent {
+                    initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
+                    agent,
+                    // Ignored for a badge inside a preview.
+                    to: [0.0, 0.0],
+                    target: None,
+                    resting: true,
+                    label: None,
+                    kind,
+                    serial,
+                    avatar_rgba: None,
+                    avatar_update: false,
+                    avatar_tint: None,
+                    motion: PictureMotion::still(),
+                },
+            )
+            .await;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (drew, avatar_agent);
     }
 
     /// The whole optional read has a deadline. A slow AX reply may still finish
     /// on its blocking thread, but it can never emit a late picture or hold an
     /// action. Do not change a retained AX element's timeout: dispatch shares it.
+    ///
+    /// Actions schedule their badges through `preview_call::Badges`, which
+    /// picks the screen or the preview; this draws on the screen alone.
+    #[cfg(test)]
     pub(crate) fn schedule(
         &self,
         identity: Identity,
@@ -1098,116 +1457,97 @@ impl Coordinator {
                 agent: identity.badge.clone(),
                 serial,
             }),
+            preview_call: None,
         };
         let (queued, cap) = (arrival.queued.clone(), arrival.scheduled + ARRIVAL_CAP);
-        let source_for_follow = source.clone();
-        let read_grant = grant.clone();
         tokio::spawn(async move {
             let agent = identity.badge;
-            #[cfg(not(target_os = "macos"))]
-            let _ = identity.avatar_agent;
+            let avatar_agent = identity.avatar_agent;
+            let (read_source, read_grant) = (source.clone(), grant.clone());
             let read = tokio::task::spawn_blocking(move || {
-                let mut aimed_handle = aim.preferred;
-                let (title, secure, mut frame) = match aimed_handle.as_ref() {
-                    Some(handle) => {
-                        // A read's picture has no label, so it reads no title.
-                        let (title, secure) = if kind == CursorKind::Reading {
-                            (None, false)
-                        } else {
-                            source.cursor_label(handle).unwrap_or((None, true))
-                        };
-                        (title, secure, source.cursor_frame(handle))
-                    }
-                    None => (None, false, None),
-                };
-                if kind == CursorKind::Reading && frame.is_none() {
-                    if let Some(fallback) = aim.focused {
-                        let already_focused = aimed_handle
-                            .as_ref()
-                            .is_some_and(|current| current.same_element(fallback.as_ref()));
-                        if !already_focused {
-                            aimed_handle = Some(fallback);
-                            frame = aimed_handle
-                                .as_ref()
-                                .and_then(|element| source.cursor_frame(element));
-                        }
-                    }
-                }
-                // Element actions without an exact point aim at the frame's
-                // visible centre, never its origin. Only reads may appear with
-                // nothing to aim at; a press or a write with no geometry shows
-                // no picture rather than a misleading one.
-                if point.is_none()
-                    && frame.is_none()
-                    && matches!(kind, CursorKind::Press | CursorKind::Write)
-                {
-                    return None;
-                }
-                let to = source.visible_cursor_point(&read_grant, point, frame)?;
-                Some((
-                    CursorEvent {
-                        initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
-                        agent,
-                        to,
-                        target: frame,
-                        resting: point.is_none() && frame.is_none(),
-                        label: label(kind, title.as_deref(), secure),
-                        kind,
-                        serial,
-                        avatar_rgba: None,
-                        avatar_update: false,
-                        avatar_tint: None,
-                        // Chosen when the picture is sent, from where the badge is then.
-                        motion: PictureMotion::still(),
-                    },
-                    aimed_handle,
-                ))
+                screen_read(
+                    read_source.as_ref(),
+                    &read_grant,
+                    kind,
+                    aim,
+                    point,
+                    agent,
+                    serial,
+                )
             });
             // A read that fails or runs out of time drops `decided`, which
             // tells a waiting action that no badge will be drawn.
             if let Ok(Ok(Some((event, followed_element)))) =
                 tokio::time::timeout(READ_BUDGET, read).await
             {
-                // A badge for an agent whose avatar colour is already known
-                // starts in that colour rather than the neutral one.
-                #[cfg(target_os = "macos")]
-                let event = {
-                    let mut event = event;
-                    if let (Some(agent), Some(avatars)) =
-                        (identity.avatar_agent.as_deref(), cursor.0.avatars.get())
-                    {
-                        event.avatar_tint = avatars.known_tint(agent).flatten();
-                    }
-                    event
-                };
-                // Its own task: the wait for the write must not hold up the
-                // window watch or the avatar below.
-                let sent = cursor.send_unless_ended(event.clone());
-                tokio::spawn(cursor.clone().decide(decided, sent, queued, cap));
-                // Off the read's deadline: following the window is a nicety
-                // that must never hold up or drop the picture itself.
-                let follower = cursor.clone();
-                let followed = event.clone();
-                let (grant, source, handle) = (grant, source_for_follow, followed_element);
-                let _ = tokio::task::spawn_blocking(move || {
-                    follower.follow(&followed, &grant, &source, handle)
-                })
-                .await;
-                #[cfg(target_os = "macos")]
-                if let (Some(agent), Some(avatars)) =
-                    (identity.avatar_agent, cursor.0.avatars.get())
-                {
-                    if let Some(rendered) = avatars.fetch_and_render(&agent).await {
-                        let mut update = event;
-                        update.avatar_rgba = Some(rendered.pixels);
-                        update.avatar_tint = rendered.tint;
-                        update.avatar_update = true;
-                        cursor.send(update);
-                    }
-                }
+                cursor
+                    .draw_on_screen(
+                        event,
+                        followed_element,
+                        grant,
+                        source,
+                        avatar_agent,
+                        (decided, queued, cap),
+                    )
+                    .await;
             }
         });
         arrival
+    }
+
+    /// Send an on-screen picture whose geometry was read, answer the action
+    /// waiting for it through `decided`, then follow its window and bring in
+    /// the agent's avatar.
+    async fn draw_on_screen(
+        &self,
+        event: CursorEvent,
+        followed_element: Option<ElementHandle>,
+        grant: ProcessGrant,
+        source: Arc<dyn AppStateSource>,
+        avatar_agent: Option<String>,
+        (decided, queued, cap): Decision,
+    ) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = &avatar_agent;
+        // A badge for an agent whose avatar colour is already known
+        // starts in that colour rather than the neutral one.
+        #[cfg(target_os = "macos")]
+        let event = {
+            let mut event = event;
+            if let (Some(agent), Some(avatars)) = (avatar_agent.as_deref(), self.0.avatars.get()) {
+                event.avatar_tint = avatars.known_tint(agent).flatten();
+            }
+            event
+        };
+        // Its own task: the wait for the write must not hold up the
+        // window watch or the avatar below.
+        let sent = self.send_unless_ended(event.clone());
+        tokio::spawn(self.clone().decide(decided, sent, queued, cap));
+        // Off the read's deadline: following the window is a nicety
+        // that must never hold up or drop the picture itself.
+        let follower = self.clone();
+        let followed = event.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            follower.follow(&followed, &grant, &source, followed_element)
+        })
+        .await;
+        #[cfg(target_os = "macos")]
+        self.send_avatar(avatar_agent, event).await;
+    }
+
+    /// Fetch the agent's avatar and send it as an update to `event`'s badge,
+    /// which shows it in whichever space the badge is drawn.
+    #[cfg(target_os = "macos")]
+    async fn send_avatar(&self, avatar_agent: Option<String>, event: CursorEvent) {
+        if let (Some(agent), Some(avatars)) = (avatar_agent, self.0.avatars.get()) {
+            if let Some(rendered) = avatars.fetch_and_render(&agent).await {
+                let mut update = event;
+                update.avatar_rgba = Some(rendered.pixels);
+                update.avatar_tint = rendered.tint;
+                update.avatar_update = true;
+                self.send(update);
+            }
+        }
     }
 
     /// Signal before browser teardown starts. Reaping and any blocked pipe write
@@ -1273,6 +1613,10 @@ pub(crate) struct Arrival {
     /// its way, so the action goes ahead unsynchronized.
     queued: Arc<std::sync::atomic::AtomicBool>,
     watch: Option<BadgeWatch>,
+    /// For a badge inside the background-mode preview, the call it belongs
+    /// to: a wait that reaches the cap ahead of the badge says so there, and
+    /// the reply carries `preview: "not_synchronized"`.
+    preview_call: Option<Arc<PreviewCall>>,
 }
 
 /// Whether an action went ahead together with its badge.
@@ -1361,6 +1705,7 @@ impl Arrival {
             scheduled: tokio::time::Instant::now(),
             queued: Arc::default(),
             watch: None,
+            preview_call: None,
         }
     }
 
@@ -1435,6 +1780,9 @@ impl Arrival {
                     landing.is_some_and(|at| at > cap)
                 };
                 return if late {
+                    if let Some(call) = &self.preview_call {
+                        call.note_not_synchronized();
+                    }
                     (
                         Landing::Arrived { drawn: true },
                         ArrivalSync::NotSynchronized,
@@ -1471,6 +1819,7 @@ impl Arrival {
             scheduled: tokio::time::Instant::now(),
             queued: Arc::default(),
             watch: None,
+            preview_call: None,
         }
     }
 }
@@ -1499,6 +1848,128 @@ impl Coordinator {
     pub(crate) fn draw_for_test(&self, identity: &Identity) {
         self.record(identity);
     }
+}
+
+/// The geometry read for an on-screen picture, on a blocking thread: the
+/// picture to send and the element it was aimed at, or `None` when nothing
+/// should be drawn.
+fn screen_read(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
+    kind: CursorKind,
+    aim: ReadAim,
+    point: Option<[f64; 2]>,
+    agent: String,
+    serial: u64,
+) -> Option<(CursorEvent, Option<ElementHandle>)> {
+    let mut aimed_handle = aim.preferred;
+    let (title, secure, mut frame) = match aimed_handle.as_ref() {
+        Some(handle) => {
+            // A read's picture has no label, so it reads no title.
+            let (title, secure) = if kind == CursorKind::Reading {
+                (None, false)
+            } else {
+                source.cursor_label(handle).unwrap_or((None, true))
+            };
+            (title, secure, source.cursor_frame(handle))
+        }
+        None => (None, false, None),
+    };
+    if kind == CursorKind::Reading && frame.is_none() {
+        if let Some(fallback) = aim.focused {
+            let already_focused = aimed_handle
+                .as_ref()
+                .is_some_and(|current| current.same_element(fallback.as_ref()));
+            if !already_focused {
+                aimed_handle = Some(fallback);
+                frame = aimed_handle
+                    .as_ref()
+                    .and_then(|element| source.cursor_frame(element));
+            }
+        }
+    }
+    // Element actions without an exact point aim at the frame's
+    // visible centre, never its origin. Only reads may appear with
+    // nothing to aim at; a press or a write with no geometry shows
+    // no picture rather than a misleading one.
+    if point.is_none() && frame.is_none() && matches!(kind, CursorKind::Press | CursorKind::Write) {
+        return None;
+    }
+    let to = source.visible_cursor_point(grant, point, frame)?;
+    Some((
+        CursorEvent {
+            initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
+            agent,
+            to,
+            target: frame,
+            resting: point.is_none() && frame.is_none(),
+            label: label(kind, title.as_deref(), secure),
+            kind,
+            serial,
+            avatar_rgba: None,
+            avatar_update: false,
+            avatar_tint: None,
+            // Chosen when the picture is sent, from where the badge is then.
+            motion: PictureMotion::still(),
+        },
+        aimed_handle,
+    ))
+}
+
+/// The geometry read for a background-mode badge, on a blocking thread.
+///
+/// The preview's window is read first, as one id and its bounds
+/// (`preview_window`), and the badge is placed relative to that same window:
+/// an element action's element, the focused element for `keys` and `type`,
+/// and for a read its element (or the focused one) when it lies in the
+/// window. An exact point (a press on an image point) is where the tip goes.
+/// A press or a write with no geometry in the window makes no motion. With
+/// no window at all, the on-screen picture is read instead.
+#[allow(clippy::too_many_arguments)]
+fn background_read(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
+    kind: CursorKind,
+    aim: ReadAim,
+    point: Option<[f64; 2]>,
+    choice: WindowChoice,
+    frontmost: &(dyn Fn(&ProcessGrant) -> Option<u32> + Send + Sync),
+    agent: String,
+    serial: u64,
+) -> BackgroundRead {
+    let which = match (choice, aim.preferred.as_ref()) {
+        (WindowChoice::Element, Some(element)) => PreviewWindowSource::Element(element),
+        (WindowChoice::Element, None) => PreviewWindowSource::Focused(None),
+        (WindowChoice::Frontmost, _) => PreviewWindowSource::Frontmost(frontmost(grant)),
+    };
+    let Some(window) = preview_window(source, grant, which) else {
+        return BackgroundRead::Screen(screen_read(source, grant, kind, aim, point, agent, serial));
+    };
+    let mut frame = aim
+        .preferred
+        .as_ref()
+        .and_then(|element| source.cursor_frame(element));
+    if kind == CursorKind::Reading && frame.is_none() {
+        frame = aim
+            .focused
+            .as_ref()
+            .and_then(|element| source.cursor_frame(element));
+    }
+    let label = match (kind, aim.preferred.as_ref()) {
+        // A read's badge has no label, so it reads no title.
+        (CursorKind::Reading, _) => None,
+        (_, Some(element)) => {
+            let (title, secure) = source.cursor_label(element).unwrap_or((None, true));
+            label(kind, title.as_deref(), secure)
+        }
+        (_, None) => label(kind, None, false),
+    };
+    let target = frame.and_then(|frame| window.visible_target(frame));
+    let to = match point.and_then(|point| window.relative(point)) {
+        Some(tip) => Some((tip, target.unwrap_or(tip))),
+        None => target.map(|target| (target, target)),
+    };
+    BackgroundRead::Preview(PreviewAimed { window, to, label })
 }
 
 /// The platform's Reduce Motion reader; the full animation where there is
@@ -1568,6 +2039,14 @@ fn write_lines(
         };
         let written = deliver(&line);
         let at = tokio::time::Instant::now();
+        if written && matches!(line, CursorLine::Frame(_)) {
+            state
+                .gauges
+                .get()
+                .copied()
+                .unwrap_or(&PREVIEW_GAUGES)
+                .frame_written();
+        }
         state.settle(&line, written.then_some(at));
     }
 }
@@ -1688,6 +2167,13 @@ impl Coordinator {
             write_lines(&state, &mut rx, deliver);
         });
         result
+    }
+
+    /// Count written frame lines in `gauges` instead of the process's.
+    #[cfg(test)]
+    pub(crate) fn counting_frames_in(self, gauges: &'static PreviewGauges) -> Self {
+        let _ = self.0.gauges.set(gauges);
+        self
     }
 
     /// How many awaited lines the writer has settled so far.
@@ -1868,6 +2354,7 @@ mod tests {
             scheduled: start,
             queued: Arc::default(),
             watch: None,
+            preview_call: None,
         }
         .wait(
             start + Duration::from_secs(10),

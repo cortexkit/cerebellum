@@ -2259,3 +2259,215 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-fourth-agent-reply-says-not-shown-capacity"
+guards = "a fourth agent's background action gets no preview, no badge and no wait, and its reply says preview: not_shown_capacity"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        if preview.worker.reserve(&agent).is_none() {\n            if let Some(call) = &preview.call {\n                call.note_not_shown_capacity();"
+new = "        if preview.worker.reserve(&agent).is_none() {\n            if let Some(call) = &preview.call {\n                let _ = call; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::previews_stack_for_three_agents_and_a_fourth_gets_not_shown_capacity",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-element-action-shows-the-elements-window"
+guards = "an element action's preview shows the addressed element's own window, so an action in a covered application's second window retargets the preview there"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        (WindowChoice::Element, Some(element)) => PreviewWindowSource::Element(element),"
+new = "        (WindowChoice::Element, Some(_)) => PreviewWindowSource::Focused(None), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
+    "computer_capability::preview_wire_tests::an_action_in_a_covered_apps_second_window_retargets_the_preview_there",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-cap-reply-says-not-synchronized"
+guards = "an action whose preview badge did not arrive by the cap goes ahead and its reply says preview: not_synchronized"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "                        call.note_not_synchronized();"
+new = "                        let _ = call; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_stalled_badge_write_replies_not_synchronized_at_the_cap",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-icon-means-no-motion-and-no-wait"
+guards = "a preview showing the application's icon (capture not admitted, or a minimized window) makes no badge motion and no arrival wait"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "                    match aimed.to.filter(|_| !icon) {"
+new = "                    match aimed.to { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
+    "computer_capability::preview_wire_tests::an_unadmitted_build_captures_nothing_and_shows_the_icon",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-minimized-window-reads-minimized"
+guards = "a minimized target window is read as minimized and its preview shows the minimized fallback with no capture"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "    read.minimized = source.window_minimized(&window) == Some(true);"
+new = "    read.minimized = false; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::a_minimized_window_shows_the_minimized_fallback",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-nothing-with-the-agent-cursor-off"
+guards = "with agent_cursor false a background action starts no preview worker, draws nothing and waits for nothing"
+file = "crates/cerebellum/src/computer_capability/preview_call.rs"
+old = "        if !self.cursor.enabled() {\n            return Arrival::none();\n        }\n        if !self.background {"
+new = "        if false { // NON-VACUITY BREAK\n            return Arrival::none();\n        }\n        if !self.background {"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::with_the_agent_cursor_off_there_is_no_preview_badge_or_wait",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-every-end-hides-the-preview"
+guards = "every end of an agent (turn end, Cancel, route close) hides its preview in the worker before the hide line, so nothing more is captured for it"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "        for worker in ends {\n            worker.hide(agent);\n        }"
+new = "        for worker in ends {\n            let _ = worker; // NON-VACUITY BREAK\n        }"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::previews_stack_for_three_agents_and_a_fourth_gets_not_shown_capacity",
+    "computer_capability::preview_wire_tests::the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreground",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-switch-to-foreground-hides-it"
+guards = "a foreground action of an agent whose preview is showing hides the preview and draws the badge on the screen again"
+file = "crates/cerebellum/src/computer_capability/preview_call.rs"
+old = "                self.cursor.end(identity.badge());"
+new = "                let _ = identity.badge(); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreground",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-idle-frees-its-slot"
+guards = "a preview idle past the badge's idle timeout counts as hidden: its slot is freed and it is never refreshed"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        for agent in idle {\n            self.hide(&agent);\n        }"
+new = "        for agent in idle {\n            let _ = agent; // NON-VACUITY BREAK\n        }"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::an_idle_preview_frees_its_slot_and_is_never_refreshed",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-gauge-counts-capture-requests"
+guards = "the previewCaptureRequests health gauge counts every capture request the preview worker makes"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "                    answering.gauges.capture_requested();"
+new = "                    // NON-VACUITY BREAK: capture requests not counted"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::one_refresh_moves_each_preview_gauge_by_one_and_a_hidden_preview_neither",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-gauge-counts-frames-written"
+guards = "the previewFramesWritten health gauge counts every frame line written to the helper"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "                .frame_written();"
+new = "                .frames_written(); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::one_refresh_moves_each_preview_gauge_by_one_and_a_hidden_preview_neither",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
