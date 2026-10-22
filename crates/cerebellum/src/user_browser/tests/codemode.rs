@@ -361,6 +361,9 @@ async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
         Some("run-hang"),
     );
     until(|| fixture.state.lock().unwrap().plan_count == 1).await;
+    // The hanging plan would also be cancelled when its action deadline
+    // passes. Freeze the clock so only the withdrawal can cancel it here.
+    tokio::time::pause();
     let (writer, mut replies) = mpsc::channel(4);
     let withdraw = Frame::build(
         FrameType::Request,
@@ -375,6 +378,7 @@ async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
     crate::handle_frame_for_test(withdraw, &writer, &fixture.planes)
         .await
         .unwrap();
+    until_frozen(|| fixture.state.lock().unwrap().cancels == 1).await;
     let answer = tokio::time::timeout(HANG_GUARD, replies.recv())
         .await
         .unwrap()
@@ -383,7 +387,20 @@ async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
     assert_eq!(answer["answer"], "already_started", "{answer}");
     let reply = fixture.finish(started).await;
     assert_eq!(reply["code"], "cancelled", "{reply}");
-    until(|| fixture.state.lock().unwrap().cancels == 1).await;
+}
+
+/// Wait for `check` on a paused clock without letting it move: this loop never
+/// leaves the runtime idle, so the clock never auto-advances and no timer can
+/// fire meanwhile. The real-clock bound is only a hang guard.
+async fn until_frozen(mut check: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !check() {
+        assert!(
+            started.elapsed() < HANG_GUARD,
+            "the step was not reached while the clock was frozen"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
