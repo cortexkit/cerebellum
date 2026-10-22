@@ -34,6 +34,14 @@ name = "cursor_hide"
 path = "tests/cursor_hide.rs"
 harness = false
 
+# No standard harness, for the same reason: it shows a background-mode
+# preview window, checks what kind of window it is, and checks that hiding it
+# takes the window off the screen.
+[[test]]
+name = "preview_hide"
+path = "tests/preview_hide.rs"
+harness = false
+
 # No standard harness, for the same reason: it drives the agent cursor's own
 # loop on the main thread and measures the frames it draws.
 [[test]]
@@ -60,7 +68,7 @@ objc2-screen-capture-kit = "=0.3.2"
 objc2-foundation = "=0.3.2"
 block2 = "=0.6.2"
 objc2 = "=0.6.2"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSPanel", "NSScreen", "NSColor", "NSTextField", "NSControl", "NSView", "NSWorkspace", "NSEvent", "NSResponder", "NSBezierPath", "NSGraphics", "NSFont", "NSAccessibility", "NSRunningApplication", "NSWindowRestoration", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSShadow", "NSGraphicsContext", "NSParagraphStyle", "NSFontDescriptor", "NSText", "NSAppearance", "objc2-core-foundation"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSPanel", "NSScreen", "NSColor", "NSTextField", "NSControl", "NSView", "NSWorkspace", "NSEvent", "NSResponder", "NSBezierPath", "NSGraphics", "NSFont", "NSAccessibility", "NSRunningApplication", "NSWindowRestoration", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSShadow", "NSGraphicsContext", "NSParagraphStyle", "NSFontDescriptor", "NSText", "NSAppearance", "NSVisualEffectView", "objc2-core-foundation"] }
 objc2-core-foundation = "=0.3.2"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

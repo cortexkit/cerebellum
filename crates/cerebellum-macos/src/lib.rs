@@ -83,15 +83,32 @@ mod cursor_schedule;
 #[allow(dead_code)]
 #[path = "../../cerebellum-computer/src/cursor_timeline.rs"]
 mod cursor_timeline;
+// Where the background-mode preview sits and where a window point lands in
+// it, shared with the module through one source file in the same way: the
+// module times the badge's glides inside a preview with the thumbnail sizes
+// the helper draws.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
+#[path = "../../cerebellum-computer/src/preview_layout.rs"]
+mod preview_layout;
+// The preview's lifetime and line rules are host-neutral, so their tests run
+// on every host; the window that draws them is macOS only. Off macOS only the
+// tests use it, and the line fields only the drawing reads would read as dead
+// code.
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod preview_schedule;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
-    probe_cursor_hide, probe_cursor_motion, reduce_motion, render_cursor_gallery_png,
-    run_agent_cursor, CursorMotion, GalleryShot, HideProbe, MotionProbe, OverlayAccent,
-    OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, PictureTiming, ProbePass,
-    AVATAR_PIXELS,
+    probe_cursor_hide, probe_cursor_motion, probe_preview_hide, reduce_motion,
+    render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot, HideProbe, MotionProbe,
+    OverlayAccent, OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, PictureTiming,
+    PreviewHideProbe, ProbePass, AVATAR_PIXELS,
 };
+#[cfg(target_os = "macos")]
+pub use preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, PreviewFallback};
 #[cfg(target_os = "macos")]
 mod peer_attestation;
 #[cfg(target_os = "macos")]

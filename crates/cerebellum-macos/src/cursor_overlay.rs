@@ -19,10 +19,16 @@ use crate::cursor_geometry::{
     POINTER_CORNER,
 };
 use crate::cursor_schedule::{
-    begin_picture, entry_frame, ActivityChange, ActivityGate, Appearance, BadgeMotion, ColourFade,
-    Colours, CursorSchedule, EntryFrame, PictureAim, PictureNeed, PictureStep, Wait,
+    begin_picture, entry_frame, sooner_wait, ActivityChange, ActivityGate, Appearance, BadgeMotion,
+    ColourFade, Colours, CursorSchedule, EntryFrame, PictureAim, PictureNeed, PictureStep, Wait,
 };
 pub use crate::cursor_schedule::{CursorMotion, PictureTiming};
+use crate::preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, Previews};
+
+// The preview's window: a child module, so it draws the badge and its chip
+// with the same private drawing code as the badge's own panel.
+mod preview_window;
+use preview_window::{primary_visible_area, PreviewWindow};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -117,6 +123,14 @@ pub enum OverlayMessage {
         serial: u64,
         offset: [f64; 2],
     },
+    /// Show or retarget one agent's background-mode preview. It takes the
+    /// agent's badge off the real screen: in background mode the badge moves
+    /// inside the preview.
+    Preview(Box<OverlayPreview>),
+    /// A captured frame of the window an agent's preview shows.
+    Frame(Box<OverlayFrame>),
+    /// The badge's motion inside an agent's preview.
+    PreviewMotion(Box<OverlayPreviewMotion>),
 }
 
 define_class!(
@@ -320,7 +334,38 @@ fn draw_badge(scene: &Scene, avatar: Option<&NSImage>) {
     let (chip_centre, chip_diameter) = chip_at(entry.chip);
     // The rim and ring keep their proportion to the chip as it grows.
     let chip_scale = scale * chip_diameter / CHIP_DIAMETER;
-    let centre = at(chip_centre);
+    draw_chip(at(chip_centre), chip_scale, accent, avatar);
+
+    // The pointer grows about the tip as it comes in, so the tip stays put.
+    let pointer_scale = scale * entry.pointer_scale();
+    let rotation = scene.rotation;
+    let at = |p: [f64; 2]| {
+        let p = turn_point(p, rotation);
+        NSPoint::new(tip[0] + p[0] * pointer_scale, tip[1] - p[1] * pointer_scale)
+    };
+    with_group_alpha(entry.pointer * scene.pointer_alpha, || {
+        let pointer = pointer_path(at, pointer_scale);
+        pointer.setLineJoinStyle(NSLineJoinStyle::Round);
+        pointer.setLineWidth(OUTLINE * 2.0 * pointer_scale);
+        // The white outline (half of the stroke, outside the fill) and the
+        // shadow are drawn together, then the coloured body on top without a
+        // shadow.
+        with_shadow(4.0, 0.45, || {
+            NSColor::whiteColor().setFill();
+            NSColor::whiteColor().setStroke();
+            pointer.fill();
+            pointer.stroke();
+        });
+        accent_color(accent, 1.0).setFill();
+        pointer.fill();
+    });
+}
+
+/// The avatar chip with its centre at `centre`, at `chip_scale` times its
+/// resting size: the white rim, the avatar (or the plain accent, under the
+/// initial's text field) and the accent ring. The badge draws it behind its
+/// pointer; a preview also draws one beside the application's name.
+fn draw_chip(centre: NSPoint, chip_scale: f64, accent: [f64; 3], avatar: Option<&NSImage>) {
     let diameter = CHIP_DIAMETER * chip_scale;
     let chip = oval(centre, diameter);
     // The white rim, just outside the chip's edge, carries the shadow: it
@@ -357,30 +402,6 @@ fn draw_badge(scene: &Scene, avatar: Option<&NSImage>) {
     ring.setLineWidth(CHIP_RING * chip_scale);
     accent_color(accent, 1.0).setStroke();
     ring.stroke();
-
-    // The pointer grows about the tip as it comes in, so the tip stays put.
-    let pointer_scale = scale * entry.pointer_scale();
-    let rotation = scene.rotation;
-    let at = |p: [f64; 2]| {
-        let p = turn_point(p, rotation);
-        NSPoint::new(tip[0] + p[0] * pointer_scale, tip[1] - p[1] * pointer_scale)
-    };
-    with_group_alpha(entry.pointer * scene.pointer_alpha, || {
-        let pointer = pointer_path(at, pointer_scale);
-        pointer.setLineJoinStyle(NSLineJoinStyle::Round);
-        pointer.setLineWidth(OUTLINE * 2.0 * pointer_scale);
-        // The white outline (half of the stroke, outside the fill) and the
-        // shadow are drawn together, then the coloured body on top without a
-        // shadow.
-        with_shadow(4.0, 0.45, || {
-            NSColor::whiteColor().setFill();
-            NSColor::whiteColor().setStroke();
-            pointer.fill();
-            pointer.stroke();
-        });
-        accent_color(accent, 1.0).setFill();
-        pointer.fill();
-    });
 }
 
 fn draw_pill(label: NSRect, fill: [f64; 3]) {
@@ -496,29 +517,7 @@ impl Fields {
     }
 
     fn set_avatar(&self, pixels: Option<&[u8]>) {
-        const SIDE: usize = AVATAR_PIXELS;
-        let image = pixels.and_then(|pixels| {
-            if pixels.len() != SIDE * SIDE * 4 { return None; }
-            // SAFETY: AppKit allocates a SIDE x SIDE, four-channel premultiplied
-            // RGBA bitmap. Its buffer of exactly `pixels.len()` bytes is filled
-            // before the image is used.
-            unsafe {
-                let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
-                    NSBitmapImageRep::alloc(), std::ptr::null_mut(), SIDE as isize, SIDE as isize,
-                    8, 4, true, false, NSDeviceRGBColorSpace, NSBitmapFormat::empty(),
-                    (SIDE * 4) as isize, 32)?;
-                let data = rep.bitmapData();
-                if data.is_null() { return None; }
-                std::ptr::copy_nonoverlapping(pixels.as_ptr(), data, pixels.len());
-                // The image is the resting chip's size; AppKit scales the
-                // 64-pixel raster into the avatar's circle when it draws.
-                let size = NSSize::new(CHIP_DIAMETER, CHIP_DIAMETER);
-                rep.setSize(size);
-                let image = NSImage::initWithSize(NSImage::alloc(), size);
-                image.addRepresentation(&rep);
-                Some(image)
-            }
-        });
+        let image = pixels.and_then(avatar_image);
         self.initial.setHidden(image.is_some());
         *self.badge.ivars().image.borrow_mut() = image;
         self.badge.setNeedsDisplay(true);
@@ -584,6 +583,37 @@ impl Fields {
     }
 }
 
+/// The avatar as an image the chip draws, from the module's
+/// `AVATAR_PIXELS`-square, four-channel premultiplied RGBA raster; `None` for
+/// a raster of any other size.
+fn avatar_image(pixels: &[u8]) -> Option<Retained<NSImage>> {
+    const SIDE: usize = AVATAR_PIXELS;
+    if pixels.len() != SIDE * SIDE * 4 {
+        return None;
+    }
+    // SAFETY: AppKit allocates a SIDE x SIDE, four-channel premultiplied
+    // RGBA bitmap. Its buffer of exactly `pixels.len()` bytes is filled
+    // before the image is used.
+    unsafe {
+        let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(), std::ptr::null_mut(), SIDE as isize, SIDE as isize,
+            8, 4, true, false, NSDeviceRGBColorSpace, NSBitmapFormat::empty(),
+            (SIDE * 4) as isize, 32)?;
+        let data = rep.bitmapData();
+        if data.is_null() {
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), data, pixels.len());
+        // The image is the resting chip's size; AppKit scales the
+        // 64-pixel raster into the avatar's circle when it draws.
+        let size = NSSize::new(CHIP_DIAMETER, CHIP_DIAMETER);
+        rep.setSize(size);
+        let image = NSImage::initWithSize(NSImage::alloc(), size);
+        image.addRepresentation(&rep);
+        Some(image)
+    }
+}
+
 /// A rectangle given relative to the tip, in the panel view's coordinates.
 fn view_rect(panel: Rect, relative: Rect) -> NSRect {
     let [x, y] = view_point(panel, [relative.x, relative.bottom()]);
@@ -634,10 +664,19 @@ fn read_displays(mtm: MainThreadMarker) -> (Vec<Display>, f64) {
     (displays, primary_height)
 }
 
+/// Who an agent's badge is drawn as.
+struct BadgeIdentity {
+    initial: char,
+    accent: Option<OverlayAccent>,
+    avatar: Option<Retained<NSImage>>,
+}
+
 struct Picture {
     panel: Retained<CursorPanel>,
     fields: Fields,
     serial: u64,
+    /// The agent's initial, shown on the chip until its avatar arrives.
+    initial: char,
     /// Whether it has appeared yet, and its entry while it is appearing.
     appearance: Appearance,
     /// Where it is, where it is going, and what its pointer is doing.
@@ -704,6 +743,7 @@ impl Picture {
             panel,
             fields,
             serial: 0,
+            initial: ' ',
             appearance: Appearance::default(),
             motion: BadgeMotion::new(Instant::now()),
             accent: None,
@@ -746,6 +786,7 @@ impl Picture {
 
     fn update(&mut self, mtm: MainThreadMarker, event: OverlayEvent, now: Instant) {
         self.serial = event.serial;
+        self.initial = event.initial;
         self.fields.set_avatar(event.avatar_rgba.as_deref());
         self.fields.set_initial(event.initial);
         (self.displays, self.primary_height) = read_displays(mtm);
@@ -896,6 +937,16 @@ impl Picture {
         }
     }
 
+    /// Who this badge is drawn as: what a preview taking the badge off the
+    /// screen carries on, so the agent looks the same inside it.
+    fn identity(&self) -> BadgeIdentity {
+        BadgeIdentity {
+            initial: self.initial,
+            accent: self.accent,
+            avatar: self.fields.badge.ivars().image.borrow().clone(),
+        }
+    }
+
     /// Take the picture off the screen for good, now. Hidden means the window
     /// is gone, not merely transparent or waiting to be ordered out.
     fn remove(&mut self) {
@@ -1028,6 +1079,98 @@ fn window_listed_on_screen(number: isize) -> bool {
     })
 }
 
+/// What the window server and AppKit reported about one background-mode
+/// preview's window around its hide, for the macOS test that checks the
+/// window's kind and that a hidden preview is really gone.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreviewHideProbe {
+    /// The window server listed the preview's window as on screen once shown.
+    pub listed_while_shown: bool,
+    /// It still listed the window right after the hide, before the run loop
+    /// turned again.
+    pub listed_after_hide: bool,
+    /// AppKit still called the window visible after the hide.
+    pub visible_after_hide: bool,
+    pub can_become_key: bool,
+    pub can_become_main: bool,
+    /// Clicks fall through it to the window underneath.
+    pub ignores_mouse: bool,
+    /// Its style mask includes `NonactivatingPanel`, so showing it does not
+    /// activate the helper.
+    pub non_activating: bool,
+    /// It floats above normal windows (whose level is 0).
+    pub level: isize,
+    /// Its frosted pane is the system's Liquid Glass view.
+    pub liquid_glass: bool,
+    /// This macOS has a Liquid Glass view at all (macOS 26 and later).
+    pub liquid_glass_available: bool,
+}
+
+/// Show one preview through the helper's own preview code, then hide it
+/// through the same `hide` the helper uses for an agent's end, and read the
+/// window server's on-screen list on both sides. Must run on the main
+/// thread. The preview is shown fully transparent, so nothing appears on the
+/// desk.
+#[doc(hidden)]
+pub fn probe_preview_hide() -> Result<PreviewHideProbe, String> {
+    const AGENT: &str = "preview-probe";
+    let mtm = MainThreadMarker::new().ok_or("the preview probe must run on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+    let mut previews = Previews::<PreviewWindow>::new();
+    let shown = previews.on_preview(
+        OverlayPreview {
+            agent: AGENT.into(),
+            generation: 1,
+            slot: 0,
+            window: 1,
+            app: "Preview probe".into(),
+            aspect: [1600.0, 1000.0],
+            label: Some("Pressing Send".into()),
+            fallback: None,
+            icon_path: None,
+        },
+        primary_visible_area(mtm),
+        Instant::now(),
+        || {
+            let mut window = PreviewWindow::new(mtm);
+            // Transparent before it is first ordered in.
+            crate::preview_schedule::PreviewSurface::draw(&mut window, None, 0.0);
+            window
+        },
+    );
+    if !shown {
+        return Err("no display is readable, so the preview has no place".into());
+    }
+    commit_window_changes(mtm);
+    let facts = previews
+        .surface_for_update(AGENT)
+        .map(|window| window.facts())
+        .ok_or("the shown preview is missing")?;
+    let panel = &facts.panel;
+    let number = panel.windowNumber();
+    let listed_while_shown = window_listed_on_screen(number);
+    previews.hide(AGENT);
+    // Read at once, with no run-loop turn in between, as for the badge.
+    let listed_after_hide = window_listed_on_screen(number);
+    Ok(PreviewHideProbe {
+        listed_while_shown,
+        listed_after_hide,
+        visible_after_hide: panel.isVisible(),
+        can_become_key: panel.canBecomeKeyWindow(),
+        can_become_main: panel.canBecomeMainWindow(),
+        ignores_mouse: panel.ignoresMouseEvents(),
+        non_activating: panel
+            .styleMask()
+            .contains(NSWindowStyleMask::NonactivatingPanel),
+        level: panel.level(),
+        liquid_glass: facts.liquid_glass,
+        liquid_glass_available: objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
+    })
+}
+
 /// Whether the person has asked macOS to reduce motion. Only the module reads
 /// it: it chooses each picture's motion and sends that, Reduce Motion or not,
 /// on the picture line, so the helper never reads the setting itself. The
@@ -1106,6 +1249,7 @@ fn run_cursor_loop(
     app.disableRelaunchOnLogin();
     app.finishLaunching();
     let mut pictures = CursorSchedule::<Picture>::new();
+    let mut previews = Previews::<PreviewWindow>::new();
     let mut activity = AnimationActivity {
         gate: ActivityGate::default(),
         token: None,
@@ -1119,7 +1263,42 @@ fn run_cursor_loop(
             for _ in 0..32 {
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
                     Ok(OverlayMessage::Hide { agent }) => {
+                        // The agent's badge and its preview go together.
                         pictures.end(&agent, |picture, _| picture.remove());
+                        previews.hide(&agent);
+                    }
+                    Ok(OverlayMessage::Preview(preview)) => {
+                        let agent = preview.agent.clone();
+                        let shown = previews.on_preview(
+                            *preview,
+                            primary_visible_area(mtm),
+                            Instant::now(),
+                            || PreviewWindow::new(mtm),
+                        );
+                        if shown {
+                            // In background mode the badge moves inside the
+                            // preview; the one on the real screen would point
+                            // at whatever window covers the app. The agent
+                            // keeps its look there.
+                            let mut identity = None;
+                            pictures.end(&agent, |picture, _| {
+                                identity = Some(picture.identity());
+                                picture.remove();
+                            });
+                            if let (Some(identity), Some(window)) =
+                                (identity, previews.surface_for_update(&agent))
+                            {
+                                window.set_identity(mtm, identity);
+                            }
+                        }
+                    }
+                    Ok(OverlayMessage::Frame(frame)) => {
+                        // Never creates or revives a preview, and never
+                        // restarts its idle clock.
+                        previews.on_frame(*frame);
+                    }
+                    Ok(OverlayMessage::PreviewMotion(motion)) => {
+                        previews.on_motion(*motion, Instant::now());
                     }
                     Ok(OverlayMessage::Follow {
                         agent,
@@ -1137,6 +1316,18 @@ fn run_cursor_loop(
                             continue;
                         }
                         if event.avatar_update {
+                            // The agent's look, wherever its badge is: on
+                            // the screen, or inside its preview.
+                            if let Some(window) = previews.surface_for_update(&event.agent) {
+                                window.set_identity(
+                                    mtm,
+                                    BadgeIdentity {
+                                        initial: event.initial,
+                                        accent: Some(event.accent),
+                                        avatar: event.avatar_rgba.as_deref().and_then(avatar_image),
+                                    },
+                                );
+                            }
                             if let Some(picture) = pictures.picture_for_update(&event.agent) {
                                 if picture.serial == event.serial {
                                     picture.fields.set_avatar(event.avatar_rgba.as_deref());
@@ -1167,6 +1358,7 @@ fn run_cursor_loop(
                     PictureNeed::Rest
                 }
             });
+            let wait = sooner_wait(wait, previews.advance(now, &motion));
             activity.before_wait(wait);
             if let Some(probe) = probe.as_deref_mut() {
                 let tip = pictures

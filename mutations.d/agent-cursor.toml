@@ -1830,3 +1830,156 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-hide-removes-the-preview"
+guards = "hiding an agent's preview in the helper takes its window away at once, after which nothing about it is drawn and the helper's loop asks for no frames and no timer"
+file = "crates/cerebellum-macos/src/preview_schedule.rs"
+old = "        self.schedule.end(agent, |live, _| live.surface.remove());"
+new = "        let _ = agent; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/preview_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_schedule::tests::a_hidden_preview_draws_nothing_and_asks_for_no_frames_and_no_timer",
+    "preview_schedule::tests::previews_stack_in_their_slots_and_a_taken_slot_gives_way",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-stale-frame-dropped"
+guards = "the helper draws a preview frame only into the agent's preview of the same generation and window"
+file = "crates/cerebellum-macos/src/preview_schedule.rs"
+old = "        if live.generation != frame.generation || live.window != frame.window {"
+new = "        if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/preview_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_schedule::tests::stale_generations_and_other_windows_are_dropped",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-stale-motion-dropped"
+guards = "the helper moves the badge inside a preview only for a motion of the same generation and window as the preview it shows"
+file = "crates/cerebellum-macos/src/preview_schedule.rs"
+old = "            .filter(|live| live.generation == motion.generation && live.window == motion.window)"
+new = "            .filter(|_| true) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/preview_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_schedule::tests::stale_generations_and_other_windows_are_dropped",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-motion-follows-the-line"
+guards = "the badge inside a preview animates exactly the motion serialized on its preview-motion line and lands when that line says"
+file = "crates/cerebellum-macos/src/preview_schedule.rs"
+old = "                timing: motion.motion,"
+new = "                timing: PictureTiming { duration_ms: 300.0, ..motion.motion }, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/preview_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_schedule::tests::the_badge_lands_in_the_preview_when_the_motion_line_says",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-motion-restarts-idle-clock"
+guards = "a preview motion is an action and restarts the preview's idle clock in the helper, where a frame does not"
+file = "crates/cerebellum-macos/src/preview_schedule.rs"
+old = "        let (Some(to), Some(live)) = (to, self.schedule.touch(&motion.agent, now)) else {"
+new = "        let (Some(to), Some(live)) = (to, self.schedule.picture_for_update(&motion.agent)) else { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/preview_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_schedule::tests::a_motion_is_an_action_and_restarts_the_idle_clock",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-loop-waits-for-the-sooner-need"
+guards = "the helper's loop asks for frames when either the badges or the previews need them, and blocks with no timer when neither shows anything"
+file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+old = "        (Wait::Frame(x), _) | (_, Wait::Frame(x)) => Wait::Frame(x),"
+new = "        (Wait::Frame(_), _) | (_, Wait::Frame(_)) => Wait::Event, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/src/cursor_schedule.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor_schedule::tests::two_schedules_wait_for_the_sooner_need_and_block_untimed_when_both_are_empty",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-letterboxed-at-360"
+guards = "a preview is 280 points wide and at most 360 tall: a window too tall for that is letterboxed at its own shape"
+file = "crates/cerebellum-computer/src/preview_layout.rs"
+old = "    let (thumb_width, thumb_height) = if natural <= tallest {"
+new = "    let (thumb_width, thumb_height) = if true { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/preview_layout.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_layout::tests::a_tall_window_is_letterboxed_so_the_preview_is_at_most_360_points",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-preview-slots-top-right"
+guards = "preview slots stack down from the top-right corner of the screen, below the menu bar"
+file = "crates/cerebellum-computer/src/preview_layout.rs"
+old = "        visible.right() - PREVIEW_MARGIN - PREVIEW_WIDTH,"
+new = "        visible.x + PREVIEW_MARGIN, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/preview_layout.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "preview_layout::tests::slots_stack_down_from_the_top_right_below_the_menu_bar_and_never_overlap",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

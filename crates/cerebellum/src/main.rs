@@ -38,7 +38,7 @@ fn agent_cursor() {}
 #[cfg(target_os = "macos")]
 fn agent_cursor() {
     use cerebellum_computer::cursor::{
-        accents, pill_colour, CursorKind, CursorLine, MAX_CURSOR_LINE,
+        accents, pill_colour, CursorKind, CursorLine, PreviewFallback, PreviewGate, MAX_CURSOR_LINE,
     };
     use std::io::{BufRead, Read};
     // The module renders avatars at one size and the helper draws exactly that
@@ -50,6 +50,17 @@ fn agent_cursor() {
     std::thread::spawn(move || {
         let input = std::io::stdin();
         let mut input = input.lock();
+        // Decides which preview lines are drawn: none from an older
+        // generation, no frame or motion for a preview that is hidden or has
+        // idled out, and no frame ever restarting a preview's idle clock.
+        let mut gate = PreviewGate::default();
+        // The module's chosen motion, passed through as it is.
+        let timing =
+            |motion: cerebellum_computer::cursor::PictureMotion| cerebellum_macos::PictureTiming {
+                entry: motion.style == cerebellum_computer::cursor::MotionStyle::Entry,
+                duration_ms: motion.duration_ms,
+                reduce_motion: motion.reduce_motion,
+            };
         loop {
             let mut line = Vec::new();
             if !matches!(
@@ -65,7 +76,7 @@ fn agent_cursor() {
             let Ok(line) = serde_json::from_slice::<CursorLine>(&line) else {
                 continue;
             };
-            if !line.valid() {
+            if !line.valid() || !gate.admit(&line, std::time::Instant::now()) {
                 continue;
             }
             let message = match line {
@@ -124,20 +135,66 @@ fn agent_cursor() {
                             serial: event.serial,
                             avatar_rgba: event.avatar_rgba,
                             avatar_update: event.avatar_update,
-                            // The module's chosen motion, passed through as it is.
-                            motion: cerebellum_macos::PictureTiming {
-                                entry: event.motion.style
-                                    == cerebellum_computer::cursor::MotionStyle::Entry,
-                                duration_ms: event.motion.duration_ms,
-                                reduce_motion: event.motion.reduce_motion,
-                            },
+                            motion: timing(event.motion),
                         },
                     ))
                 }
-                // This helper does not draw the background-mode preview yet,
-                // so its lines are read and dropped.
-                CursorLine::Preview(_) | CursorLine::Frame(_) | CursorLine::PreviewMotion(_) => {
-                    continue
+                // Waited for rather than dropped, as a hide is: a lost preview
+                // line leaves the agent with no preview, and so no badge, until
+                // it moves to another window.
+                CursorLine::Preview(preview) => {
+                    let message = cerebellum_macos::OverlayMessage::Preview(Box::new(
+                        cerebellum_macos::OverlayPreview {
+                            agent: preview.preview_agent,
+                            generation: preview.preview_generation,
+                            slot: preview.preview_slot,
+                            window: preview.preview_window,
+                            app: preview.preview_app,
+                            aspect: preview.preview_aspect,
+                            label: preview.preview_label,
+                            fallback: preview.preview_fallback.map(|fallback| match fallback {
+                                PreviewFallback::Minimized => {
+                                    cerebellum_macos::PreviewFallback::Minimized
+                                }
+                                PreviewFallback::CaptureRefused => {
+                                    cerebellum_macos::PreviewFallback::CaptureRefused
+                                }
+                            }),
+                            icon_path: preview.preview_icon_path,
+                        },
+                    ));
+                    if sender.send(message).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // Dropped on a full queue, as a picture is: the next frame
+                // shows the window anyway.
+                CursorLine::Frame(frame) => {
+                    let Some(jpeg) = frame.jpeg() else {
+                        continue;
+                    };
+                    cerebellum_macos::OverlayMessage::Frame(Box::new(
+                        cerebellum_macos::OverlayFrame {
+                            agent: frame.frame_agent,
+                            generation: frame.frame_generation,
+                            window: frame.frame_window,
+                            size: [frame.frame_w, frame.frame_h],
+                            jpeg,
+                        },
+                    ))
+                }
+                CursorLine::PreviewMotion(motion) => {
+                    cerebellum_macos::OverlayMessage::PreviewMotion(Box::new(
+                        cerebellum_macos::OverlayPreviewMotion {
+                            agent: motion.pmotion_agent,
+                            generation: motion.pmotion_generation,
+                            window: motion.pmotion_window,
+                            press: motion.pmotion_kind == CursorKind::Press,
+                            to: motion.pmotion_to,
+                            motion: timing(motion.pmotion_motion),
+                        },
+                    ))
                 }
             };
             let _ = sender.try_send(message);

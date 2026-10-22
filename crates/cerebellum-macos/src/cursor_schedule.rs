@@ -824,6 +824,24 @@ impl<P> CursorSchedule<P> {
         self.pictures.get_mut(agent).map(|live| &mut live.picture)
     }
 
+    /// Restart the idle clock of a picture that is already live, as an event
+    /// does, but never create one: a line that only acts on a shown picture
+    /// must not bring back one that is gone.
+    pub(crate) fn touch(&mut self, agent: &str, now: Instant) -> Option<&mut P> {
+        let live = self.pictures.get_mut(agent)?;
+        live.started = now;
+        Some(&mut live.picture)
+    }
+
+    /// The first agent, with its live picture, that `matches` answers true
+    /// for, if any.
+    pub(crate) fn find(&self, matches: impl Fn(&str, &P) -> bool) -> Option<String> {
+        self.pictures
+            .iter()
+            .find(|(agent, live)| matches(agent, &live.picture))
+            .map(|(agent, _)| agent.clone())
+    }
+
     /// The agent is done: hide its picture now, with no fade, and release it.
     /// A later event from the same agent creates a fresh picture.
     pub(crate) fn end(&mut self, agent: &str, apply: impl FnOnce(&mut P, PictureStep)) {
@@ -881,11 +899,39 @@ impl<P> CursorSchedule<P> {
     }
 }
 
+/// One wait for the helper's loop from two schedules' waits: frames if either
+/// needs them, else the earlier of their timed wake-ups, else none at all. Two
+/// schedules with nothing on screen still block with no timer.
+pub(crate) fn sooner_wait(a: Wait, b: Wait) -> Wait {
+    match (a, b) {
+        (Wait::Frame(x), Wait::Frame(y)) => Wait::Frame(x.min(y)),
+        (Wait::Frame(x), _) | (_, Wait::Frame(x)) => Wait::Frame(x),
+        (Wait::Timed(x), Wait::Timed(y)) => Wait::Timed(x.min(y)),
+        (Wait::Timed(x), Wait::Event) | (Wait::Event, Wait::Timed(x)) => Wait::Timed(x),
+        (Wait::Event, Wait::Event) => Wait::Event,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn two_schedules_wait_for_the_sooner_need_and_block_untimed_when_both_are_empty() {
+        let (frame, soon, late) = (FRAME_INTERVAL, SECOND, SECOND * 9);
+        assert_eq!(sooner_wait(Wait::Event, Wait::Event), Wait::Event);
+        for (a, b, both) in [
+            (Wait::Event, Wait::Timed(late), Wait::Timed(late)),
+            (Wait::Timed(soon), Wait::Timed(late), Wait::Timed(soon)),
+            (Wait::Timed(soon), Wait::Frame(frame), Wait::Frame(frame)),
+            (Wait::Event, Wait::Frame(frame), Wait::Frame(frame)),
+        ] {
+            assert_eq!(sooner_wait(a, b), both, "{a:?} and {b:?}");
+            assert_eq!(sooner_wait(b, a), both, "{b:?} and {a:?}");
+        }
+    }
 
     fn ms(duration: Duration) -> f64 {
         duration.as_secs_f64() * 1000.0
