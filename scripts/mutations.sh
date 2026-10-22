@@ -12,6 +12,7 @@ narrow=1
 full=1
 only_mode=""
 check_only=0
+diff_given=0
 usage() {
   echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only]"
 }
@@ -20,6 +21,7 @@ while [ "$#" -gt 0 ]; do
     --diff)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       base="$2"
+      diff_given=1
       shift 2
       ;;
     --narrow-only)
@@ -52,6 +54,36 @@ done
 if [ "$check_only" -eq 1 ] && [ -n "$only_mode" ]; then
   echo "--check-only replays nothing, so it takes no replay mode" >&2
   exit 2
+fi
+
+# Keep the check's scratch catalogue outside the installed tools and source tree.
+mkdir -p "$repo_root/target/scratch"
+tmpdir="$(mktemp -d "$repo_root/target/scratch/mutation-check.XXXXXX")"
+cleanup() {
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP QUIT
+export TMPDIR="$tmpdir"
+catalogue=mutations.d
+if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
+  planner_python=""
+  for python in python3 python3.14 python3.13 python3.12 python3.11; do
+    if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
+      planner_python="$python"
+      break
+    fi
+  done
+  [ -n "$planner_python" ] || { echo 'mutation check planner: Python 3.11+ is required' >&2; exit 2; }
+  selection="$("$planner_python" scripts/lib/mutation-check-plan.py "$base" "$tmpdir/selected.toml")"
+  echo "mutations: strict check selection: $selection"
+  case "$selection" in
+    'scoped 0') echo "mutations: no changed or anchored catalogue rows"; exit 0 ;;
+    scoped*) catalogue="$tmpdir/selected.toml" ;;
+    full) ;;
+    *) echo "mutations: invalid check plan: $selection" >&2; exit 2 ;;
+  esac
 fi
 
 # The runner lives in this checkout's own install root. ~/.cargo/bin is shared
@@ -107,16 +139,7 @@ if [ ! -d mutations.d ]; then
   exit 2
 fi
 
-# Keep temporary test-run files on the same worktree filesystem, not in a shared
-# system temp directory where another build can collide with them.
-tmpdir="$(mktemp -d "$repo_root/.ckdev-mutate.XXXXXX")"
-cleanup() {
-  rm -rf "$tmpdir"
-}
-trap cleanup EXIT INT TERM HUP QUIT
-export TMPDIR="$tmpdir"
-
-"$mutate" check --catalogue mutations.d --strict
+"$mutate" check --catalogue "$catalogue" --strict
 
 # Validating the catalogue alone is what a landing gate needs when a change
 # touches it: a row the runner refuses under --strict stops every later replay,

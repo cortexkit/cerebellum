@@ -7,10 +7,8 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# macOS's TMPDIR ends in a slash, so the joined path holds "//". mutations.sh
-# prints its root as `pwd` spells it, with single slashes, so spell the scratch
-# root the same way or the refusal cases never find the path they expect.
-scratch="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/mutations-test.XXXXXX")" && pwd)"
+mkdir -p "$root/target/scratch"
+scratch="$(mktemp -d "$root/target/scratch/mutations-test.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 
@@ -135,4 +133,55 @@ run_case private_without_install_record_refuses 2 setup_private_unrecorded
 run_case check_only_validates_without_replaying 0 setup_private_pinned --check-only
 run_case check_only_still_refuses_a_missing_private_runner 2 setup_private_missing --check-only
 
+scoped_invalid_row() {
+  local repo="$scratch/scoped/repo" status
+  mkdir -p "$repo/scripts/lib" "$repo/mutations.d"
+  cp "$root/scripts/mutations.sh" "$repo/scripts/"
+  cp "$root/scripts/lib/mutation-check-plan.py" "$repo/scripts/lib/"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/check-mutation-tree.sh"
+  chmod +x "$repo/scripts/check-mutation-tree.sh"
+  setup_private_pinned "$scratch/scoped" "$repo"
+  cat >>"$repo/target/tools/bin/ckdev-mutate" <<'FAKE'
+if [ "$1" = check ] && [ "$2" = --catalogue ] && [ "$4" = --strict ]; then
+  if grep -q 'planted-invalid' "$3"; then
+    echo 'strict check refused planted-invalid' >&2
+    exit 7
+  fi
+fi
+FAKE
+  (
+    cd "$repo" || exit 1
+    git init -q
+    git config user.email fast-gate-test@example.invalid
+    git config user.name fast-gate-test
+    printf '[[control]]\nid = "unchanged"\nfile = "guard.rs"\nold = "before"\nnew = "after"\n' >mutations.d/rows.toml
+    git add mutations.d
+    git commit -qm fixture
+    cat >>mutations.d/rows.toml <<'ROW'
+
+[[control]]
+id = "planted-invalid"
+file = "guard.rs"
+old = "before"
+new = "after"
+runner = "command"
+command = ["true"]
+expect_red = ["missing_test"]
+ROW
+    CALL_LOG="$scratch/scoped/calls" ./scripts/mutations.sh --check-only --diff HEAD >"$scratch/scoped/out" 2>&1
+  )
+  status=$?
+  if [ "$status" -eq 7 ] &&
+     grep -Fxq 'mutations: strict check selection: scoped 1' "$scratch/scoped/out" &&
+     grep -Fxq 'strict check refused planted-invalid' "$scratch/scoped/out"; then
+    echo 'ok scoped_check_refuses_a_planted_invalid_row'
+  else
+    echo "FAIL scoped_check_refuses_a_planted_invalid_row: exit $status, expected 7 and a scoped refusal"
+    cat "$scratch/scoped/out"
+    failures=$((failures + 1))
+  fi
+}
+scoped_invalid_row
+
+echo "mutations wrapper tests: 8 checks, $failures failures"
 [ "$failures" = 0 ]

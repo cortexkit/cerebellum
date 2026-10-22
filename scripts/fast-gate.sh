@@ -38,6 +38,7 @@ done
 ./scripts/check-mutation-tree.sh
 
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
+source "$repo_root/scripts/lib/fast-gate-phases.sh"
 
 plan_for_files() {
   FAST_GATE_METADATA="$metadata" FAST_GATE_FILES="$1" python3 - <<'PY'
@@ -153,6 +154,14 @@ desk_skip_reason() {
 }
 
 if [ "$self_test" -eq 1 ]; then
+  scripts/lib/fast-gate.test.sh
+  for python in python3 python3.14 python3.13 python3.12 python3.11; do
+    if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
+      "$python" scripts/lib/mutation-check-plan.py --self-test
+      break
+    fi
+  done
+  scripts/mutations.test.sh
   planted_skip="test a_preview_test ... SKIPPED (the window's kind was checked and is right): the screen is locked, so no window is realised"
   if [ "$(printf '%s\n' "$planted_skip" | desk_skip_reason)" != "the screen is locked, so no window is realised" ] || \
      [ "$(printf 'test a_preview_test ... SKIPPED: no display is readable\n' | desk_skip_reason)" != "no display is readable" ]; then
@@ -231,7 +240,7 @@ if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
 fi
 changed_files="$(
   {
-    git diff --name-only --diff-filter=ACMR "$base"
+    git diff --name-only --no-renames "$base"
     git ls-files --others --exclude-standard
   } | sort -u
 )"
@@ -269,61 +278,37 @@ printf '%s\n' "$$" > "$gate_lock/holder"
 static_dir="$(mktemp -d "$gate_target_dir/fast-gate.XXXXXX")"
 static_pids=()
 static_logs=()
+phase_failed=0
+not_verified=()
+lib_test_options=()
+for package in "${lib_packages[@]-}"; do
+  if [ "$package" = cerebellum ]; then
+    configure_lib_tests
+  fi
+done
 release_lock() {
+  local pid
+  for pid in "${static_pids[@]+${static_pids[@]}}"; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   rm -rf "$static_dir" "$gate_lock"
 }
-trap release_lock EXIT INT TERM HUP QUIT
-
-run_phase() {
-  local label="$1"
-  shift
-  local started=$SECONDS
-  echo "==> RUN: $label"
-  if "$@"; then
-    echo "==> PASS: $label ($((SECONDS - started))s)"
-  else
-    local status=$?
-    echo "==> FAIL: $label (exit $status)" >&2
-    return "$status"
-  fi
-}
-
-start_static_phase() {
-  local label="$1"
-  shift
-  local log="$static_dir/${#static_pids[@]}.log"
-  static_logs+=("$log")
-  ( run_phase "$label" "$@" ) >"$log" 2>&1 &
-  static_pids+=("$!")
-}
-
-wait_static_phases() {
-  local failed=0 index
-  for index in "${!static_pids[@]}"; do
-    if wait "${static_pids[$index]}"; then
-      :
-    else
-      failed=1
-    fi
-    cat "${static_logs[$index]}"
-  done
-  if [ "$failed" -ne 0 ]; then
-    echo "FAST GATE FAILED: one or more independent source checks failed" >&2
-    return 1
-  fi
-}
+trap release_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP QUIT
 
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
-start_static_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
-wait_static_phases
+# This proof builds format_versions, so it must not overlap another Cargo phase.
+run_serial_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 
-run_phase "cargo fmt --all -- --check" cargo fmt --all -- --check
+run_serial_phase "cargo fmt --all -- --check" cargo fmt --all -- --check
 
 if [ "${#packages[@]}" -gt 0 ]; then
   clippy_args=(--locked)
   for package in "${packages[@]}"; do clippy_args+=(-p "$package"); done
   clippy_args+=(--all-targets --quiet -- -D warnings)
-  run_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings" cargo clippy "${clippy_args[@]}"
+  run_serial_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings" cargo clippy "${clippy_args[@]}"
 else
   echo "==> SKIP: package clippy (no changed file maps to a Cargo package)"
 fi
@@ -331,14 +316,11 @@ fi
 if [ "${#lib_packages[@]}" -gt 0 ]; then
   test_args=(--locked)
   for package in "${lib_packages[@]}"; do test_args+=(-p "$package"); done
-  test_args+=(--lib)
-  run_phase "cargo test --locked ${lib_packages[*]} --lib" cargo test "${test_args[@]}"
+  test_args+=(--lib "${lib_test_options[@]+${lib_test_options[@]}}")
+  run_serial_phase "cargo test --locked ${lib_packages[*]} --lib" cargo test "${test_args[@]}"
 else
   echo "==> SKIP: touched-package --lib tests (no changed package with a library target)"
 fi
-
-# Desk tests that skipped, each as "<target> skipped (<reason>)".
-not_verified=()
 
 is_desk_suite() {
   local wanted="$1" suite
@@ -373,20 +355,20 @@ suite_will_run() {
 # code which writes runtime output to stdout or stderr. Run it even when the diff
 # is elsewhere; if the touched-suite plan includes it, avoid scheduling it twice.
 if suite_will_run "cerebellum:it"; then
-  run_phase "cargo test --locked -p cerebellum --test it (changed suite)" cargo test --locked -p cerebellum --test it
+  run_serial_phase "cargo test --locked -p cerebellum --test it (changed suite)" cargo test --locked -p cerebellum --test it
   echo "==> RUN COVERAGE: mandatory catalog, launch-secret, and zero-prints checks are included in touched suite cerebellum:it"
 else
-  run_phase "cargo test --locked -p cerebellum --test it tool_catalog::" cargo test --locked -p cerebellum --test it tool_catalog::
-  run_phase "cargo test --locked -p cerebellum --test it one_launch_nonce_reader::" cargo test --locked -p cerebellum --test it one_launch_nonce_reader::
-  run_phase "cargo test --locked -p cerebellum --test it no_runtime_output::" cargo test --locked -p cerebellum --test it no_runtime_output::
+  run_serial_phase "cargo test --locked -p cerebellum --test it tool_catalog::" cargo test --locked -p cerebellum --test it tool_catalog::
+  run_serial_phase "cargo test --locked -p cerebellum --test it one_launch_nonce_reader::" cargo test --locked -p cerebellum --test it one_launch_nonce_reader::
+  run_serial_phase "cargo test --locked -p cerebellum --test it no_runtime_output::" cargo test --locked -p cerebellum --test it no_runtime_output::
   echo "==> SKIP: remaining tests in cerebellum:it (no source/module path changed; the mandatory modules above ran)"
 fi
 
 if suite_will_run "cerebellum:format_floor"; then
-  run_phase "cargo test --locked -p cerebellum --test format_floor (changed suite)" cargo test --locked -p cerebellum --test format_floor
+  run_serial_phase "cargo test --locked -p cerebellum --test format_floor (changed suite)" cargo test --locked -p cerebellum --test format_floor
   echo "==> RUN COVERAGE: mandatory format_floor integration tests are included in touched suite cerebellum:format_floor"
 else
-  run_phase "cargo test --locked -p cerebellum --test format_floor" cargo test --locked -p cerebellum --test format_floor
+  run_serial_phase "cargo test --locked -p cerebellum --test format_floor" cargo test --locked -p cerebellum --test format_floor
 fi
 
 # If cerebellum was not touched, run its schema-contract tests and the frozen
@@ -399,8 +381,8 @@ done
 if [ "$cerebellum_touched" -eq 1 ]; then
   echo "==> RUN COVERAGE: mandatory flat-tools fingerprint tests are included in cerebellum --lib tests"
 else
-  run_phase "cargo test --locked -p cerebellum --lib flat_tools" cargo test --locked -p cerebellum --lib flat_tools
-  run_phase "cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes" cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes
+  run_serial_phase "cargo test --locked -p cerebellum --lib flat_tools" cargo test --locked -p cerebellum --lib flat_tools
+  run_serial_phase "cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes" cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes
   echo "==> SKIP: remaining cerebellum --lib tests (the package was unchanged)"
 fi
 # If cerebellum-core was not touched, the format_floor and journal filters below
@@ -412,8 +394,8 @@ done
 if [ "$core_touched" -eq 1 ]; then
   echo "==> RUN COVERAGE: format-floor and journal-format unit tests are included in touched cerebellum-core --lib tests"
 else
-  run_phase "cargo test --locked -p cerebellum-core --lib format_floor" cargo test --locked -p cerebellum-core --lib format_floor
-  run_phase "cargo test --locked -p cerebellum-core --lib journal" cargo test --locked -p cerebellum-core --lib journal
+  run_serial_phase "cargo test --locked -p cerebellum-core --lib format_floor" cargo test --locked -p cerebellum-core --lib format_floor
+  run_serial_phase "cargo test --locked -p cerebellum-core --lib journal" cargo test --locked -p cerebellum-core --lib journal
   echo "==> SKIP: remaining cerebellum-core --lib tests (the package was unchanged)"
 fi
 
@@ -426,7 +408,7 @@ if [ "${#suites[@]}" -gt 0 ]; then
     target="${suite#*:}"
     if is_desk_suite "$suite"; then
       log="$static_dir/desk-$package-$target.log"
-      run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
+      run_serial_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
         run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p "$package" --test "$target"
       reason="$(desk_skip_reason < "$log")"
       if [ "$(uname -s)" != Darwin ]; then
@@ -437,7 +419,7 @@ if [ "${#suites[@]}" -gt 0 ]; then
         not_verified+=("$target skipped ($reason)")
       fi
     else
-      run_phase "cargo test --locked -p $package --test $target" cargo test --locked -p "$package" --test "$target"
+      run_serial_phase "cargo test --locked -p $package --test $target" cargo test --locked -p "$package" --test "$target"
     fi
   done
 fi
@@ -456,20 +438,13 @@ if [ "${#all_suites[@]}" -gt 0 ]; then
 fi
 
 if [ "$mutations" -eq 1 ]; then
-  run_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
-elif grep -q '^mutations\.d/' <<< "$changed_files"; then
-  # A catalogue row the runner refuses under --strict would stop every later
-  # replay, and the anchor check above does not parse rows that strictly.
-  run_phase "mutation catalogue --strict check (a catalogue file changed)" ./scripts/mutations.sh --check-only
+  run_serial_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
 else
-  echo "==> SKIP: mutation catalogue --strict check (no catalogue file changed)"
+  # Include changed row definitions and rows anchored in changed source/tests.
+  # The pinned runner still parses and strictly checks every selected row.
+  run_serial_phase "mutation catalogue --strict check (changed or anchored rows)" ./scripts/mutations.sh --check-only --diff "$base"
 fi
 
-if [ "${#not_verified[@]}" -eq 0 ]; then
-  echo "FAST GATE PASSED: all selected phases are green"
-else
-  for item in "${not_verified[@]}"; do
-    echo "NOT VERIFIED: $item"
-  done
-  echo "FAST GATE PASSED: every selected phase that ran is green; see the NOT VERIFIED lines above"
-fi
+# Source-check logs are replayed in launch order, never interleaved with Cargo.
+wait_static_phases
+finish_gate
