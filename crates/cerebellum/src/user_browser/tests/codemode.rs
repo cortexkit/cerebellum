@@ -170,6 +170,18 @@ async fn a_run_acts_on_the_tab_its_head_claimed() {
         1,
         "the run reads under the head's site grant"
     );
+    let status = fixture
+        .finish(start_run(
+            &fixture,
+            json!({"browser":"user","action":"status"}),
+            None,
+        ))
+        .await;
+    assert_eq!(
+        structured(&status)["tabs"],
+        json!([{"tab":tab,"claim":"claimed_by_this_route","interaction_epoch":1}]),
+        "{status}"
+    );
 }
 
 #[tokio::test]
@@ -209,10 +221,14 @@ async fn a_run_route_goodbye_leaves_the_heads_claims_and_snapshots_untouched() {
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     let snapshot_id = snapshot["snapshot_id"].as_str().unwrap().to_owned();
     bind_run(&fixture, false).await;
-    let read = fixture
-        .finish(start_run(&fixture, snapshot_args(&tab), None))
+    let status = fixture
+        .finish(start_run(
+            &fixture,
+            json!({"browser":"user","action":"status"}),
+            None,
+        ))
         .await;
-    assert_eq!(structured(&read)["outcome"], "ok", "{read}");
+    assert_eq!(structured(&status)["outcome"], "ok", "{status}");
     goodbye(&fixture, RUN).await;
     {
         let state = fixture.planes.user_browser.target().state();
@@ -236,8 +252,8 @@ async fn a_run_route_goodbye_leaves_the_heads_claims_and_snapshots_untouched() {
 async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_card() {
     let script = ScriptedCingulate::new().accept_execution_reports();
     let fixture = Fixture::scripted(&script);
-    let tab = fixture.claim(1).await;
     bind_run(&fixture, true).await;
+    let open = json!({"browser":"user","action":"open_tab","url":"https://example.com/start"});
     script
         .then(
             wire::CONSENT_REQUEST,
@@ -249,8 +265,9 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
                 json!({"elicitation_id":"el_site_run","state":"pending","detached":true}),
             ),
         );
+    let tabs = fixture.state.lock().unwrap().tabs.len();
     let held = fixture
-        .finish(start_run(&fixture, snapshot_args(&tab), Some("run-read")))
+        .finish(start_run(&fixture, open.clone(), Some("run-open")))
         .await;
     assert_eq!(held["held"]["reason"], "consent", "{held}");
     assert_eq!(held["held"]["detail"]["ask_id"], "el_site_run", "{held}");
@@ -265,10 +282,14 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
         assert_eq!(scope.scope_ref, "card-tests");
     }
     assert!(fixture.planes.calls.has_pending_consents());
-    assert!(fixture.state.lock().unwrap().captures.is_empty());
+    assert_eq!(
+        fixture.state.lock().unwrap().tabs.len(),
+        tabs,
+        "a held card opens no tab"
+    );
 
     // The person approves. The run's next call reads that answer, which
-    // stores the site grant, and then reads the page under it.
+    // stores the site grant, and then opens and loads the page under it.
     script
         .then(
             wire::CONSENT_ANSWERS,
@@ -276,14 +297,15 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
         )
         .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
     let retry = fixture
-        .finish(start_run(
-            &fixture,
-            snapshot_args(&tab),
-            Some("run-read-retry"),
-        ))
+        .finish(start_run(&fixture, open, Some("run-open-retry")))
         .await;
     assert!(retry.get("held").is_none(), "{retry}");
     assert_eq!(structured(&retry)["outcome"], "ok", "{retry}");
+    let opened = structured(&retry)["tab"].as_str().unwrap();
+    assert_eq!(
+        fixture.state.lock().unwrap().tabs[opened].url,
+        "https://example.com/start"
+    );
     assert_eq!(
         script
             .methods()
@@ -298,9 +320,34 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
 
 #[tokio::test]
 async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
-    let fixture = Fixture::new();
-    let tab = fixture.claim(1).await;
-    fixture.snapshot(1, &tab, "allow_30m").await;
+    // The head's standing site grant lets the run's open_tab reach its
+    // first page read without a card.
+    let store = Arc::new(crate::agent_grants::AgentGrants::in_memory(Some(
+        "test-machine".into(),
+    )));
+    let now = store.now_ms();
+    store
+        .upsert(
+            crate::agent_grants::AgentGrant {
+                id: String::new(),
+                holder: crate::agent_grants::GrantHolder::Head {
+                    agent_id: "test-project".into(),
+                },
+                subject: crate::agent_grants::GrantSubject::Origin("https://example.com".into()),
+                browser_target: Some(crate::agent_grants::BrowserTarget::UserBrowser),
+                machine_uuid: "test-machine".into(),
+                granted_at_ms: now,
+                expires_at_ms: Some(now + 1_800_000),
+                card_ref: Some("card".into()),
+                max_level: 3,
+                hazards: vec![],
+                team_id: None,
+                designated_requirement: None,
+            },
+            now,
+        )
+        .unwrap();
+    let fixture = Fixture::with_agent_grants(None, Some(store));
     bind_run(&fixture, false).await;
     {
         let mut state = fixture.state.lock().unwrap();
@@ -308,7 +355,11 @@ async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
         state.cancels = 0;
         state.hang_action = Some("cdp");
     }
-    let started = start_run(&fixture, snapshot_args(&tab), Some("run-hang"));
+    let started = start_run(
+        &fixture,
+        json!({"browser":"user","action":"open_tab","url":"https://example.com/start"}),
+        Some("run-hang"),
+    );
     until(|| fixture.state.lock().unwrap().plan_count == 1).await;
     let (writer, mut replies) = mpsc::channel(4);
     let withdraw = Frame::build(
@@ -351,7 +402,8 @@ async fn a_run_is_held_back_by_a_quarantine_on_its_heads_tab() {
         .execution(HEAD, "click", &args, budget);
     stuck.begin(true);
     stuck.finish(false);
-    // The head itself is refused, and so is its run, as a direct call is.
+    // The head's own call on that tab is refused, and the run's call is
+    // refused the same way.
     for (channel, corr) in [(HEAD.channel, 901), (RUN, 902)] {
         let frame = Frame::build(
             FrameType::Request,
