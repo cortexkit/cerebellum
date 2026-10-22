@@ -1495,6 +1495,25 @@ pub trait PlatformDriver {
     ) -> Result<crate::dispatch::BracketReport, DriverError> {
         Err(DriverError::Unsupported("fronted image read"))
     }
+    /// Open a session for bringing an application to the front outside the
+    /// keystroke bracket: a one-way front in foreground mode, or the front of
+    /// a press that only works with its application in front. The session
+    /// reads and requests the front, and watches session input for the idle
+    /// gate and the observer heartbeat. The default refuses, so a platform
+    /// without it fronts nothing and its replies say `fronting_unavailable`.
+    fn fronting_session(&mut self) -> Result<Box<dyn FrontingSession>, DriverError> {
+        Err(DriverError::Unsupported("app-use fronting session"))
+    }
+    /// Run the next [`Self::dispatch_fronted`] or [`Self::read_fronted`]
+    /// under app-use fronting admission, with `hooks` owning its front
+    /// attempt and its one restore decision (see [`run_hooked_fronted`]).
+    /// `false` when this platform cannot, in which case the hooks are
+    /// dropped unused and the caller must not front through this driver. The
+    /// default refuses.
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        drop(hooks);
+        false
+    }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
     fn fronting_snapshot(&mut self, target: &ProcessGrant)
         -> Result<FrontingSnapshot, DriverError>;
@@ -1534,6 +1553,359 @@ pub trait PlatformDriver {
         }
         Ok(Duration::from_millis(milliseconds))
     }
+}
+
+/// The platform side of a restore after a temporary front: the frontmost
+/// read, the front request and a clock, plus the session observer's hardware
+/// input timestamps for the restore decision. It is `Send`, so the call's
+/// terminal cleanup can run the decision on another thread when the worker
+/// that fronted is stuck or gone. Its clock is the clock of the session or
+/// bracket it came from, so a front instant read there can be compared with
+/// it.
+pub trait FrontingRestoreHost: Send {
+    fn now_ms(&mut self) -> u64;
+    fn pause_ms(&mut self, milliseconds: u64);
+    fn frontmost_pid(&mut self) -> Option<u32>;
+    fn request_front(&mut self, pid: u32) -> bool;
+    /// `None` when unavailable, which the decision reads as no input seen.
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
+}
+
+/// A fronting host that can hand out a [`FrontingRestoreHost`] on its own
+/// clock.
+pub trait RestoreHostSource {
+    fn restore_host(&self) -> Box<dyn FrontingRestoreHost>;
+}
+
+/// One fronting outside the keystroke bracket, as the platform provides it:
+/// the same reads, requests and session observation the bracket uses, with
+/// the observer's tap held inside. Built and used on one blocking thread, so
+/// it need not be `Send`; [`FrontingSession::restore_host`] is.
+pub trait FrontingSession {
+    /// Milliseconds on the session's clock.
+    fn now_ms(&mut self) -> u64;
+    fn pause_ms(&mut self, milliseconds: u64);
+    fn frontmost_pid(&mut self) -> Option<u32>;
+    fn request_front(&mut self, pid: u32) -> bool;
+    fn our_pid(&self) -> i64;
+    /// Start watching session input. `false` when no observer can be
+    /// started, which is how Input Monitoring that is not live shows.
+    fn open_observer(&mut self) -> bool;
+    fn read_idle(&mut self) -> IdleReading;
+    /// Input the observer saw since it was last drained.
+    fn drain(&mut self) -> Vec<crate::dispatch::SourcedInputEvent>;
+    fn post_heartbeat(&mut self) -> crate::dispatch::HeartbeatProbe;
+    fn observe_heartbeat(
+        &mut self,
+        probe: crate::dispatch::HeartbeatProbe,
+        watcher: &mut crate::dispatch::SeizeWatcher,
+    ) -> crate::dispatch::HeartbeatObservation;
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
+    /// A restore host on this session's clock.
+    fn restore_host(&self) -> Box<dyn FrontingRestoreHost>;
+    /// The idle estimator the platform's other observed sequences share, so
+    /// the idle gate reads the same carried history whichever path asks.
+    fn user_idle(&self) -> std::sync::Arc<std::sync::Mutex<crate::dispatch::UserIdleEstimator>>;
+}
+
+/// A [`FrontingSession`] as the host the bracket's shared functions run
+/// against. Its tap lives inside the session, so the bracket's tap is `()`.
+/// A session posts no input of its own, so `post_unit` posts nothing.
+impl crate::dispatch::FrontingBracketHost for Box<dyn FrontingSession> {
+    type Tap = ();
+
+    fn now_ms(&mut self) -> u64 {
+        (**self).now_ms()
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        (**self).pause_ms(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        (**self).frontmost_pid()
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        (**self).request_front(pid)
+    }
+    fn our_pid(&self) -> i64 {
+        (**self).our_pid()
+    }
+    fn create_tap(&mut self) -> Option<()> {
+        (**self).open_observer().then_some(())
+    }
+    fn read_idle(&mut self) -> IdleReading {
+        (**self).read_idle()
+    }
+    fn drain(&mut self, _tap: &()) -> Vec<crate::dispatch::SourcedInputEvent> {
+        (**self).drain()
+    }
+    fn post_heartbeat(&mut self) -> crate::dispatch::HeartbeatProbe {
+        (**self).post_heartbeat()
+    }
+    fn observe_heartbeat(
+        &mut self,
+        _tap: &(),
+        probe: crate::dispatch::HeartbeatProbe,
+        watcher: &mut crate::dispatch::SeizeWatcher,
+    ) -> crate::dispatch::HeartbeatObservation {
+        (**self).observe_heartbeat(probe, watcher)
+    }
+    fn post_unit(
+        &mut self,
+        _index: usize,
+    ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
+        Ok(crate::dispatch::UnitPosted::default())
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
+        (**self).hardware_input_snapshot()
+    }
+}
+
+/// One restore decision's result, as the hooks report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookedRestore {
+    pub restore: crate::dispatch::RestoreStatus,
+    pub person_input_during_fronting: bool,
+}
+
+/// What the caller of an admitted fronted dispatch owns around it: the
+/// registration of the restore obligation before the first front request,
+/// the front attempt's start and return, and the one restore decision, which
+/// the caller shares with its terminal cleanup so it runs exactly once.
+pub trait FrontedDispatchHooks: Send {
+    /// Register the restore obligation for a front of `target` over
+    /// `previous`, read with the fronting lock held. `host` is on the
+    /// bracket's clock. `false` when the call's terminal reply is already
+    /// chosen: nothing may be fronted.
+    fn register(&mut self, previous: u32, target: u32, host: Box<dyn FrontingRestoreHost>) -> bool;
+    /// The front request is about to be made at `front_instant_ms` on the
+    /// bracket's clock. `false` when cleanup already took the obligation.
+    fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
+    /// The front request and its wait returned.
+    fn front_attempt_returned(&mut self);
+    /// Run, or await, the one restore decision.
+    fn decide_restore(&mut self) -> HookedRestore;
+    /// The bracket ended with `outcome`, whose restore is already the hooked
+    /// decision. A `deferred_restore` in it is still owed: the caller settles
+    /// the held input first.
+    fn finished(&mut self, outcome: &crate::dispatch::BracketOutcome);
+}
+
+/// Where the hooked host is with the obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registration {
+    NotYet,
+    /// The terminal was already chosen; nothing was fronted.
+    Refused,
+    /// Registered; `prevented` when cleanup took it before the front.
+    Registered {
+        prevented: bool,
+    },
+}
+
+/// The bracket's host with the restore routed through the hooks: the real
+/// host fronts the target, and only the hooks' decision ever asks for the
+/// previous application back, so the decision runs once whichever of the
+/// worker or terminal cleanup gets there first.
+struct HookedHost<'a, H> {
+    inner: &'a mut H,
+    hooks: &'a mut dyn FrontedDispatchHooks,
+    target: u32,
+    /// The first frontmost read, which is the bracket's read of the
+    /// application to put back.
+    previous: Option<Option<u32>>,
+    registration: Registration,
+    dispatching: bool,
+    decided: Option<HookedRestore>,
+}
+
+impl<H: crate::dispatch::FrontingBracketHost> HookedHost<'_, H> {
+    fn returned(&mut self) {
+        if self.dispatching {
+            self.dispatching = false;
+            self.hooks.front_attempt_returned();
+        }
+    }
+}
+
+impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
+    crate::dispatch::FrontingBracketHost for HookedHost<'_, H>
+{
+    type Tap = H::Tap;
+
+    fn now_ms(&mut self) -> u64 {
+        self.inner.now_ms()
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.inner.pause_ms(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        let frontmost = self.inner.frontmost_pid();
+        if self.previous.is_none() {
+            self.previous = Some(frontmost);
+        }
+        frontmost
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        if pid == self.target {
+            if self.registration != Registration::NotYet {
+                // One temporary front per call: a later chunk is not
+                // fronted again under the same obligation.
+                return false;
+            }
+            let Some(Some(previous)) = self.previous else {
+                return false;
+            };
+            if !self
+                .hooks
+                .register(previous, self.target, self.inner.restore_host())
+            {
+                self.registration = Registration::Refused;
+                return false;
+            }
+            let front_instant_ms = self.inner.now_ms();
+            if !self.hooks.begin_front_attempt(front_instant_ms) {
+                self.registration = Registration::Registered { prevented: true };
+                return false;
+            }
+            self.registration = Registration::Registered { prevented: false };
+            self.dispatching = true;
+            let requested = self.inner.request_front(pid);
+            if !requested {
+                self.returned();
+            }
+            return requested;
+        }
+        // The bracket asks for the previous application back: the hooks'
+        // decision does that, or decides not to. Nothing was fronted when
+        // registration was refused, so there is nothing to ask for.
+        self.returned();
+        if matches!(self.registration, Registration::Registered { .. }) && self.decided.is_none() {
+            self.decided = Some(self.hooks.decide_restore());
+        }
+        true
+    }
+    fn our_pid(&self) -> i64 {
+        self.inner.our_pid()
+    }
+    fn create_tap(&mut self) -> Option<Self::Tap> {
+        self.returned();
+        self.inner.create_tap()
+    }
+    fn read_idle(&mut self) -> IdleReading {
+        self.returned();
+        self.inner.read_idle()
+    }
+    fn drain(&mut self, tap: &Self::Tap) -> Vec<crate::dispatch::SourcedInputEvent> {
+        self.returned();
+        self.inner.drain(tap)
+    }
+    fn post_heartbeat(&mut self) -> crate::dispatch::HeartbeatProbe {
+        self.returned();
+        self.inner.post_heartbeat()
+    }
+    fn observe_heartbeat(
+        &mut self,
+        tap: &Self::Tap,
+        probe: crate::dispatch::HeartbeatProbe,
+        watcher: &mut crate::dispatch::SeizeWatcher,
+    ) -> crate::dispatch::HeartbeatObservation {
+        self.returned();
+        self.inner.observe_heartbeat(tap, probe, watcher)
+    }
+    fn post_unit(
+        &mut self,
+        index: usize,
+    ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
+        self.returned();
+        self.inner.post_unit(index)
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
+        self.returned();
+        self.inner.hardware_input_snapshot()
+    }
+}
+
+/// Run a fronted dispatch (`read` is `None`) or a fronted image read under
+/// app-use fronting admission, with `hooks` owning the restore obligation.
+///
+/// The bracket runs as it does for any admitted caller, with two changes the
+/// hooks make: the obligation is registered, and the front attempt started,
+/// immediately before the one front request, so terminal cleanup that took
+/// it first prevents the front; and the previous application is asked back
+/// only by the hooks' restore decision, never by the bracket itself. The
+/// returned outcome's restore is that decision. A post failure that may have
+/// left a key held runs no decision: the outcome's `deferred_restore` is
+/// left for the caller, which settles the held input first.
+///
+/// A registration refused, or a front cleanup prevented, ends the bracket as
+/// cancelled with nothing restored, since nothing was fronted.
+pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>(
+    host: &mut H,
+    estimator: &mut crate::dispatch::UserIdleEstimator,
+    plan: crate::dispatch::BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    hooks: &mut dyn FrontedDispatchHooks,
+    read: Option<&mut dyn FnMut()>,
+) -> crate::dispatch::BracketOutcome {
+    use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
+    let admission = FrontingAdmission {
+        app_use_fronting_admitted: true,
+    };
+    let mut hooked = HookedHost {
+        inner: host,
+        hooks,
+        target: plan.target_pid,
+        previous: None,
+        registration: Registration::NotYet,
+        dispatching: false,
+        decided: None,
+    };
+    let mut outcome = match read {
+        None => crate::dispatch::run_fronting_bracket_with(
+            &mut hooked,
+            estimator,
+            plan,
+            admission,
+            cancelled,
+        ),
+        Some(read) => crate::dispatch::run_fronting_read_with(
+            &mut hooked,
+            estimator,
+            plan,
+            admission,
+            cancelled,
+            read,
+        ),
+    };
+    hooked.returned();
+    match hooked.registration {
+        Registration::NotYet => {}
+        Registration::Refused | Registration::Registered { prevented: true } => {
+            if let Registration::Registered { .. } = hooked.registration {
+                if hooked.decided.is_none() {
+                    hooked.decided = Some(hooked.hooks.decide_restore());
+                }
+            }
+            outcome.report.restore = RestoreStatus::NotNeeded;
+            outcome.report.stop = Some(BracketStop::Cancelled);
+            outcome.deferred_restore = None;
+        }
+        Registration::Registered { prevented: false } => {
+            if outcome.deferred_restore.is_none() {
+                let decided = match hooked.decided {
+                    Some(decided) => decided,
+                    // The bracket made no restore request: it left the
+                    // person where they switched to, or stopped without
+                    // reaching its restore. The hooks decide either way.
+                    None => hooked.hooks.decide_restore(),
+                };
+                outcome.report.restore = decided.restore;
+                outcome.person_input_during_fronting |= decided.person_input_during_fronting;
+            }
+        }
+    }
+    hooked.hooks.finished(&outcome);
+    outcome
 }
 
 /// A driver that performs nothing, for constructions that never legitimately
@@ -1927,5 +2299,258 @@ mod tests {
             .collect();
 
         assert_eq!(advertised, vec!["computer.wait"]);
+    }
+}
+
+#[cfg(test)]
+mod hooked_fronted_tests {
+    //! The hooked bracket on a fake desk: the hooks own the one front
+    //! attempt and the one restore decision, and the bracket itself never
+    //! asks for the previous application back.
+
+    use super::*;
+    use crate::dispatch::{
+        BracketPlan, BracketStop, FrontingBracketHost, HardwareInputSnapshot, HeartbeatMarker,
+        HeartbeatObservation, HeartbeatProbe, RestoreStatus, SeizeWatcher, SourcedInputEvent,
+        UnitPosted, UserIdleEstimator, OBSERVED_DISPATCH_IDLE_MS,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const PREVIOUS: u32 = 100;
+    const TARGET: u32 = 200;
+    const OUR_PID: i64 = 7;
+
+    #[derive(Default)]
+    struct Screen {
+        now: u64,
+        frontmost: Option<u32>,
+        /// Every front request, with who made it: the bracket's host or the
+        /// restore host the hooks were given.
+        requests: Vec<(&'static str, u32)>,
+        /// Hook calls, in order.
+        hooks: Vec<&'static str>,
+        fail_post_holding_keys: bool,
+    }
+
+    type Shared = Arc<Mutex<Screen>>;
+
+    struct Desk(Shared);
+
+    struct Restorer(Shared);
+
+    impl FrontingRestoreHost for Restorer {
+        fn now_ms(&mut self) -> u64 {
+            self.0.lock().unwrap().now
+        }
+        fn pause_ms(&mut self, milliseconds: u64) {
+            self.0.lock().unwrap().now += milliseconds;
+        }
+        fn frontmost_pid(&mut self) -> Option<u32> {
+            self.0.lock().unwrap().frontmost
+        }
+        fn request_front(&mut self, pid: u32) -> bool {
+            let mut screen = self.0.lock().unwrap();
+            screen.requests.push(("restore_host", pid));
+            screen.frontmost = Some(pid);
+            true
+        }
+        fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+            None
+        }
+    }
+
+    impl RestoreHostSource for Desk {
+        fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
+            Box::new(Restorer(Arc::clone(&self.0)))
+        }
+    }
+
+    impl FrontingBracketHost for Desk {
+        type Tap = ();
+        fn now_ms(&mut self) -> u64 {
+            self.0.lock().unwrap().now
+        }
+        fn pause_ms(&mut self, milliseconds: u64) {
+            self.0.lock().unwrap().now += milliseconds;
+        }
+        fn frontmost_pid(&mut self) -> Option<u32> {
+            self.0.lock().unwrap().frontmost
+        }
+        fn request_front(&mut self, pid: u32) -> bool {
+            let mut screen = self.0.lock().unwrap();
+            screen.requests.push(("bracket", pid));
+            screen.frontmost = Some(pid);
+            true
+        }
+        fn our_pid(&self) -> i64 {
+            OUR_PID
+        }
+        fn create_tap(&mut self) -> Option<()> {
+            Some(())
+        }
+        fn read_idle(&mut self) -> IdleReading {
+            IdleReading::Milliseconds(OBSERVED_DISPATCH_IDLE_MS + 500)
+        }
+        fn drain(&mut self, _tap: &()) -> Vec<SourcedInputEvent> {
+            Vec::new()
+        }
+        fn post_heartbeat(&mut self) -> HeartbeatProbe {
+            HeartbeatProbe {
+                marker: HeartbeatMarker::new(1),
+                posted_at_ms: self.now_ms(),
+                our_pid: OUR_PID,
+            }
+        }
+        fn observe_heartbeat(
+            &mut self,
+            _tap: &(),
+            probe: HeartbeatProbe,
+            _watcher: &mut SeizeWatcher,
+        ) -> HeartbeatObservation {
+            HeartbeatObservation::Seen {
+                marker: probe.marker,
+                source_unix_process_id: OUR_PID,
+                observed_at_ms: probe.posted_at_ms,
+            }
+        }
+        fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
+            if self.0.lock().unwrap().fail_post_holding_keys {
+                return Err(SequencePostFailure {
+                    posts_returned: 1,
+                    refusal: ProcessEventRefusal::Cancelled,
+                    held_state: HeldStateDisposition::Unknown,
+                });
+            }
+            Ok(UnitPosted {
+                posts_returned: 2,
+                generation_verifications: 4,
+            })
+        }
+    }
+
+    /// Hooks whose decision puts the previous application back through the
+    /// restore host they were given, as the call's restore cell does.
+    struct Hooks {
+        screen: Shared,
+        register: bool,
+        begin: bool,
+        host: Option<Box<dyn FrontingRestoreHost>>,
+        previous: Option<u32>,
+    }
+
+    impl FrontedDispatchHooks for Hooks {
+        fn register(
+            &mut self,
+            previous: u32,
+            target: u32,
+            host: Box<dyn FrontingRestoreHost>,
+        ) -> bool {
+            assert_eq!(target, TARGET);
+            self.screen.lock().unwrap().hooks.push("register");
+            self.previous = Some(previous);
+            self.host = Some(host);
+            self.register
+        }
+        fn begin_front_attempt(&mut self, _front_instant_ms: u64) -> bool {
+            self.screen.lock().unwrap().hooks.push("begin");
+            self.begin
+        }
+        fn front_attempt_returned(&mut self) {
+            self.screen.lock().unwrap().hooks.push("returned");
+        }
+        fn decide_restore(&mut self) -> HookedRestore {
+            self.screen.lock().unwrap().hooks.push("decide");
+            if !self.begin {
+                return HookedRestore {
+                    restore: RestoreStatus::NotNeeded,
+                    person_input_during_fronting: false,
+                };
+            }
+            let host = self.host.as_mut().unwrap();
+            host.request_front(self.previous.unwrap());
+            HookedRestore {
+                restore: RestoreStatus::Restored,
+                person_input_during_fronting: false,
+            }
+        }
+        fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {
+            self.screen.lock().unwrap().hooks.push("finished");
+        }
+    }
+
+    fn run(register: bool, begin: bool, fail: bool) -> (crate::dispatch::BracketOutcome, Shared) {
+        let screen: Shared = Arc::new(Mutex::new(Screen {
+            frontmost: Some(PREVIOUS),
+            fail_post_holding_keys: fail,
+            ..Screen::default()
+        }));
+        let mut hooks = Hooks {
+            screen: Arc::clone(&screen),
+            register,
+            begin,
+            host: None,
+            previous: None,
+        };
+        let outcome = run_hooked_fronted(
+            &mut Desk(Arc::clone(&screen)),
+            &mut UserIdleEstimator::new(),
+            BracketPlan {
+                target_pid: TARGET,
+                units: 1,
+                maximum_interval_ms: 100,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            &|| false,
+            &mut hooks,
+            None,
+        );
+        (outcome, screen)
+    }
+
+    #[test]
+    fn the_previous_application_is_asked_back_only_by_the_hooked_decision() {
+        let (outcome, screen) = run(true, true, false);
+        let screen = screen.lock().unwrap();
+        assert_eq!(
+            screen.requests,
+            [("bracket", TARGET), ("restore_host", PREVIOUS)]
+        );
+        assert_eq!(
+            screen.hooks,
+            ["register", "begin", "returned", "decide", "finished"]
+        );
+        assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+        assert_eq!(outcome.report.stop, None);
+        assert_eq!(outcome.report.units_posted, 1);
+    }
+
+    #[test]
+    fn a_post_failure_with_keys_possibly_held_leaves_the_decision_to_the_caller() {
+        let (outcome, screen) = run(true, true, true);
+        let screen = screen.lock().unwrap();
+        assert_eq!(screen.requests, [("bracket", TARGET)], "no restore request");
+        assert!(!screen.hooks.contains(&"decide"), "{:?}", screen.hooks);
+        assert!(outcome.deferred_restore.is_some());
+    }
+
+    #[test]
+    fn cleanup_that_took_the_obligation_first_prevents_the_front() {
+        let (outcome, screen) = run(true, false, false);
+        let screen = screen.lock().unwrap();
+        assert!(screen.requests.is_empty(), "{:?}", screen.requests);
+        assert_eq!(screen.hooks, ["register", "begin", "decide", "finished"]);
+        assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
+        assert_eq!(outcome.report.stop, Some(BracketStop::Cancelled));
+        assert_eq!(outcome.report.units_posted, 0);
+    }
+
+    #[test]
+    fn a_refused_registration_fronts_nothing_and_decides_nothing() {
+        let (outcome, screen) = run(false, true, false);
+        let screen = screen.lock().unwrap();
+        assert!(screen.requests.is_empty(), "{:?}", screen.requests);
+        assert_eq!(screen.hooks, ["register", "finished"]);
+        assert_eq!(outcome.report.stop, Some(BracketStop::Cancelled));
+        assert_eq!(outcome.report.units_posted, 0);
     }
 }
