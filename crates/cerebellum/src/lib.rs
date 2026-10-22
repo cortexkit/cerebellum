@@ -1298,7 +1298,8 @@ pub struct RouteBindings {
     removed: Arc<tokio::sync::Notify>,
     /// When each bound route's bind was accepted, as a sequence number that
     /// only grows. Re-recording an already-bound route's facts keeps its
-    /// place. Locked only while `inner` is held, in that order.
+    /// place. Writers lock `inner` before this; `bind_sequence` locks this
+    /// alone or while `inner` is held, never the other way round.
     bind_order: Arc<std::sync::Mutex<BindOrder>>,
 }
 

@@ -513,9 +513,7 @@ async fn run_shares_the_heads_route(fixture: &Fixture, head_channel: u16) {
             .get(&run_tab),
         Some(&head)
     );
-    let (head_read, cards) = fixture
-        .snapshot(head_channel, &run_tab, "allow_30m")
-        .await;
+    let (head_read, cards) = fixture.snapshot(head_channel, &run_tab, "allow_30m").await;
     assert_eq!(head_read["outcome"], "ok", "{head_read}");
     assert!(cards.is_empty(), "{cards:?}");
 }
@@ -528,9 +526,7 @@ async fn the_heads_oldest_bound_tools_route_keeps_its_chrome_work_over_a_newer_l
     // long-lived one would be.
     let facts = fixture.planes.routes.remove(1, 1).unwrap();
     fixture.planes.routes.insert(1, 1, facts);
-    assert!(
-        fixture.planes.routes.bind_sequence(2, 1) < fixture.planes.routes.bind_sequence(1, 1)
-    );
+    assert!(fixture.planes.routes.bind_sequence(2, 1) < fixture.planes.routes.bind_sequence(1, 1));
     run_shares_the_heads_route(&fixture, 2).await;
 }
 
