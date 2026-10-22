@@ -1280,8 +1280,8 @@ fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// as the takeover review's bracket does, but under rules that review never
 /// covered, so both the takeover review and the app-use review must bind.
 /// The vocabulary digests play no part.
-// The computer plane reads this at construction once it carries the flag;
-// until then only the tests below call it.
+// Only the tests below call this predicate for now: the computer plane does
+// not yet carry an app-use fronting flag to set from it at construction.
 #[cfg_attr(not(test), allow(dead_code))]
 fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
@@ -1298,8 +1298,8 @@ fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// the app-use review, whose scope names this exception, must bind. Without
 /// it the preview shows the application's icon instead of a frame. The
 /// vocabulary digests play no part.
-// The computer plane reads this at construction once it carries the flag;
-// until then only the tests below call it.
+// Only the tests below call this predicate for now: the computer plane does
+// not yet carry a preview capture flag to set from it at construction.
 #[cfg_attr(not(test), allow(dead_code))]
 fn preview_capture_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
@@ -12490,7 +12490,9 @@ mod tests {
     fn each_attestation_combination_admits_exactly_its_fronting_paths() {
         // (takeover, capture, app use) bound ->
         // (app-use fronting paths, takeover bracket paths, preview capture)
-        let table: [((bool, bool, bool), (bool, bool, bool)); 8] = [
+        type Reviews = (bool, bool, bool);
+        type Admissions = (bool, bool, bool);
+        let table: [(Reviews, Admissions); 8] = [
             ((false, false, false), (false, false, false)),
             ((true, false, false), (false, true, false)),
             ((false, true, false), (false, false, false)),

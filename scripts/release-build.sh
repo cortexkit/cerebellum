@@ -233,10 +233,11 @@ export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-revie
 #   - preview capture: the background-mode preview's capture of a covered
 #     window's pixels, outside capture custody.
 # It gates no capability row. With the takeover review it admits that
-# fronting; with the capture review it admits preview capture. Without it,
-# foreground mode acts without fronting, a press on a disabled element refuses
-# element_disabled, chords keep the takeover bracket, and the preview shows the
-# application's icon. Left UNSET: its review does not exist yet.
+# fronting; with the capture review it admits preview capture. Once the module
+# consults it, a build without it acts in foreground mode without fronting,
+# refuses a press on a disabled element with element_disabled, keeps the
+# takeover bracket for chords, and shows the application's icon in the preview.
+# Left UNSET: its review does not exist yet.
 
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
