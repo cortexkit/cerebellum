@@ -34,7 +34,7 @@ use cerebellum_computer::app_state::source::{
 };
 use cerebellum_computer::audit::{
     AccessibilityReadScope, ActuationElementIdentity, ActuationIntent, AuditToken,
-    ComputerCapability, ComputerPlaneDescriptor, ObservationState,
+    ComputerCapability, ComputerPlaneDescriptor, FrontingRecord, ObservationState,
 };
 use cerebellum_computer::dispatch::MutationGate;
 use cerebellum_computer::grounding::ContainmentRung;
@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use super::cursor::{Arrival, BadgeWatch, Landing};
 use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
+use cerebellum_core::config::AppUse;
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
 
@@ -574,6 +575,14 @@ where
     grant: &'a ProcessGrant,
     pending: Option<(DispatchCommitmentToken, String)>,
     recorded: bool,
+    /// How the action used the front of the screen, written under
+    /// `fronting` in the rows this journal finalizes or rejects.
+    fronting: Option<FrontingRecord>,
+    /// A refusal held back until [`ElementJournal::finish`], for a press made
+    /// while its application was brought forward: the row then records how
+    /// that front ended, which is known only after the restore decision.
+    held_refusal: Option<(String, String)>,
+    hold_refusals: bool,
 }
 
 impl<'a, R, T, S> ElementJournal<'a, R, T, S>
@@ -595,21 +604,47 @@ where
             grant,
             pending: None,
             recorded: false,
+            fronting: None,
+            held_refusal: None,
+            hold_refusals: false,
         }
+    }
+
+    /// Record `fronting` on the rows written from now on.
+    pub(crate) fn set_fronting(&mut self, fronting: FrontingRecord) {
+        self.fronting = Some(fronting);
+    }
+
+    /// Hold a refusal back until `finish`, so its row carries the fronting
+    /// set by then.
+    pub(crate) fn hold_refusals(&mut self) {
+        self.hold_refusals = true;
+    }
+
+    fn with_fronting(&self, mut row: Value) -> Vec<u8> {
+        if let Some(fronting) = &self.fronting {
+            row["fronting"] = json!(fronting);
+        }
+        row.to_string().into_bytes()
     }
 
     /// Record a refusal decided after the element was found, before anything
     /// was sent to it.
     fn refused(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
         self.recorded = true;
+        if self.hold_refusals {
+            self.held_refusal = Some((role.to_owned(), outcome.to_owned()));
+            return Ok(());
+        }
+        self.write_refusal(role, outcome)
+    }
+
+    fn write_refusal(&mut self, role: &str, outcome: &str) -> Result<(), ()> {
+        let material = self.with_fronting(
+            json!({"outcome": outcome, "role": role, "grant_identity": self.grant}),
+        );
         self.audit
-            .reject(
-                self.identity.clone(),
-                descriptor(self.capability),
-                json!({"outcome": outcome, "role": role, "grant_identity": self.grant})
-                    .to_string()
-                    .into_bytes(),
-            )
+            .reject(self.identity.clone(), descriptor(self.capability), material)
             .map_err(|_| ())
     }
 
@@ -668,13 +703,12 @@ where
     }
 
     fn finish(&mut self) -> Result<(), ()> {
-        if let Some((token, outcome)) = self.pending.take() {
+        if let Some((role, outcome)) = self.held_refusal.take() {
+            self.write_refusal(&role, &outcome)
+        } else if let Some((token, outcome)) = self.pending.take() {
+            let result = self.with_fronting(json!({"outcome": outcome}));
             self.audit
-                .finalize_dispatched(
-                    token,
-                    json!({"outcome": outcome}).to_string().into_bytes(),
-                    Vec::new(),
-                )
+                .finalize_dispatched(token, result, Vec::new())
                 .map_err(|_| ())
         } else if !self.recorded
             && cerebellum_computer::audit::AccessibilityReadScope::current().is_some()
@@ -1279,8 +1313,15 @@ where
         };
         if !parsed.batch {
             return self
-                .serve_press_single(&parsed.element_ids[0], parsed.target, parsed.view, context)
-                .await;
+                .serve_press_single(
+                    &parsed.element_ids[0],
+                    parsed.target,
+                    parsed.view,
+                    context,
+                    Vec::new(),
+                )
+                .await
+                .into_reply();
         }
         let sessions = context.management.app_state_sessions();
         let conversation = &context.identity.conversation_key;
@@ -1308,8 +1349,14 @@ where
         let mut reply = json!({"outcome":"completed"});
         let mut acted = false;
         let mut unreadable = false;
+        // A batch brings its application forward at most once: the step that
+        // needs it fronts, presses the rest of the batch with the application
+        // in front, and makes one restore decision after the last of them.
+        let mut batch_ending = None;
         let work = super::quarantine::CallWork::current();
-        for (index, id) in parsed.element_ids.iter().enumerate() {
+        let mut index = 0;
+        'steps: while index < parsed.element_ids.len() {
+            let id = &parsed.element_ids[index];
             // Once the call has been answered, no later step starts: not its
             // press, and not the reads that would precede it.
             if index > 0 && work.stopped() {
@@ -1333,25 +1380,46 @@ where
                 }
                 _ => false,
             };
-            reply = if different_app {
-                target_mismatch_reply("batch application")
+            let done = if different_app {
+                PressDone::alone(target_mismatch_reply("batch application"))
             } else {
+                let later = grant.as_ref().map_or_else(Vec::new, |first| {
+                    same_application_steps(
+                        sessions,
+                        conversation,
+                        first,
+                        &parsed.element_ids[index + 1..],
+                    )
+                });
                 self.serve_press_single(
                     id,
                     parsed.target.clone(),
                     super::StateView::default(),
                     context.clone(),
+                    later,
                 )
                 .await
             };
-            let success = reply["outcome"] == "completed";
-            acted |= success;
-            unreadable |= success && reply[STATE_TEXT_FIELD] == DIFF_UNREADABLE;
-            steps.push(json!({"step":index + 1, "element_id":id, "outcome":reply["outcome"]}));
-            if !success {
-                reply["stopped_at"] = json!(index + 1);
-                break;
+            if done.ending.is_some() {
+                batch_ending = done.ending;
             }
+            for (offset, step_reply) in std::iter::once(done.reply).chain(done.later).enumerate() {
+                let step = index + offset;
+                reply = step_reply;
+                let success = reply["outcome"] == "completed";
+                acted |= success;
+                unreadable |= success && reply[STATE_TEXT_FIELD] == DIFF_UNREADABLE;
+                steps.push(json!({
+                    "step": step + 1,
+                    "element_id": parsed.element_ids[step],
+                    "outcome": reply["outcome"],
+                }));
+                if !success {
+                    reply["stopped_at"] = json!(step + 1);
+                    break 'steps;
+                }
+            }
+            index = steps.len();
         }
         if acted {
             if unreadable {
@@ -1370,6 +1438,9 @@ where
             }
         }
         reply["steps"] = json!(steps);
+        if let Some(ending) = &batch_ending {
+            ending.apply(&mut reply);
+        }
         reply
     }
 
@@ -1379,7 +1450,8 @@ where
         target: Option<String>,
         view: super::StateView,
         context: super::ServeContext<'_, C>,
-    ) -> Value {
+        later: Vec<PressStep>,
+    ) -> PressDone {
         let element_id = element_id.to_owned();
         let super::ServeContext {
             cancel,
@@ -1399,17 +1471,17 @@ where
                     process_generation,
                 } => (handle, bundle_identity, pid, process_generation),
                 cerebellum_computer::app_state::session::ElementResolution::Refusing => {
-                    return blocked_menu_item_reply()
+                    return PressDone::alone(blocked_menu_item_reply())
                 }
                 cerebellum_computer::app_state::session::ElementResolution::Stale => {
-                    return stale_element_reply()
+                    return PressDone::alone(stale_element_reply())
                 }
                 cerebellum_computer::app_state::session::ElementResolution::PreviousRun => {
-                    return previous_run_reply()
+                    return PressDone::alone(previous_run_reply())
                 }
             };
         if let Some(refusal) = self.check_target(target, &bundle_identity, pid).await {
-            return refusal;
+            return PressDone::alone(refusal);
         }
         let (grant, admission) = match admit_session_app(
             management,
@@ -1423,20 +1495,20 @@ where
         .await
         {
             SessionAdmission::Admitted(grant, admission) => (grant, admission),
-            SessionAdmission::Gone => return stale_element_reply(),
-            SessionAdmission::Refused(reply) => return reply,
+            SessionAdmission::Gone => return PressDone::alone(stale_element_reply()),
+            SessionAdmission::Refused(reply) => return PressDone::alone(reply),
         };
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
-            return locked;
+            return PressDone::alone(locked);
         }
         if let Some(mut refusal) = self
             .refuse_if_person_changed(management, &conversation_key, &grant)
             .await
         {
             admission.decorate(&mut refusal);
-            return refusal;
+            return PressDone::alone(refusal);
         }
-        let mut reply = self
+        let mut done = self
             .press_and_diff(
                 PressCall {
                     identity,
@@ -1449,10 +1521,11 @@ where
                 grant,
                 PressTarget::Element { element_id, handle },
                 view,
+                later,
             )
             .await;
-        admission.decorate(&mut reply);
-        reply
+        admission.decorate(&mut done.reply);
+        done
     }
 
     /// `computer.press_point`: press whatever element of the image's own
@@ -1549,8 +1622,10 @@ where
                     application_name,
                 },
                 view,
+                Vec::new(),
             )
-            .await;
+            .await
+            .into_reply();
         admission.decorate(&mut reply);
         reply
     }
@@ -1664,6 +1739,8 @@ where
         }
         let gate = BadgeGate::new(work.gate(), watch);
         let audit = AuditToken::new(self.audit.clone(), gate.clone());
+        // The write's own row records any front this call made.
+        super::fronting::action_row_started();
         let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, None);
@@ -1812,7 +1889,8 @@ where
         grant: ProcessGrant,
         target: PressTarget,
         view: super::StateView,
-    ) -> Value {
+        later: Vec<PressStep>,
+    ) -> PressDone {
         let PressCall {
             identity,
             management,
@@ -1823,7 +1901,7 @@ where
         } = call;
         let work = super::quarantine::CallWork::current();
         if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
-            return busy;
+            return PressDone::alone(busy);
         }
         let foreground = self
             .front_for_foreground(super::fronting::FrontCall {
@@ -1837,7 +1915,7 @@ where
         if let Some(refusal) =
             foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
         {
-            return refusal;
+            return PressDone::alone(refusal);
         }
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
@@ -1900,17 +1978,22 @@ where
                 .unwrap_or_else(|_| Err(audit_unavailable_reply(false)));
                 match found {
                     Ok((id, handle, reads)) => (id, handle, Some([point.0, point.1]), reads),
-                    Err(reply) => return reply,
+                    Err(reply) => {
+                        super::fronting::action_row_started();
+                        return PressDone::alone(reply);
+                    }
                 }
             }
         };
         // A press can bring its application forward only when the element
-        // reads disabled while the application is in the background. The
-        // pre-read is one blocking hop, before any lock, and is journaled as
-        // an accessibility read; no `element_disabled` refusal is recorded
-        // for it.
+        // reads disabled while the application is in the background, and
+        // only in background mode: foreground mode has already brought it
+        // forward. The pre-read is one blocking hop, before any lock, and is
+        // journaled as an accessibility read; no `element_disabled` refusal
+        // is recorded for it.
         let mut needs_front = false;
-        if self.fronting_admission(consent, false).may_front().is_ok() {
+        let admission = self.fronting_admission(consent, false);
+        if admission.mode == AppUse::Background && admission.may_front().is_ok() {
             let mut audit = AuditToken::new(self.audit.clone(), work.gate());
             let (source, read_grant, identity, work, handle) = (
                 source.clone(),
@@ -1936,7 +2019,7 @@ where
             .unwrap_or_else(|_| Err(audit_unavailable_reply(false)));
             match pre_read {
                 Ok(pre_read) => needs_front = pre_read.needs_front(grant.pid),
-                Err(reply) => return reply,
+                Err(reply) => return PressDone::alone(reply),
             }
         }
         let arrival = self.cursor.schedule(
@@ -1954,12 +2037,13 @@ where
         {
             let reply = held.reply();
             if point.is_none() {
-                return reply;
+                return PressDone::alone(reply);
             }
             // The hit test read the application; journal that read, as a
-            // refused hit test does.
+            // refused hit test does. That row is this action's own.
+            super::fronting::action_row_started();
             let mut audit = AuditToken::new(self.audit.clone(), work.gate());
-            return tokio::task::spawn_blocking(move || {
+            return PressDone::alone(tokio::task::spawn_blocking(move || {
                 let _ax = work.bound_ax();
                 let _scope = AccessibilityReadScope::new(grant.pid, reads);
                 if audit
@@ -1971,10 +2055,21 @@ where
                 reply
             })
             .await
-            .unwrap_or_else(|_| audit_unavailable_reply(false));
+            .unwrap_or_else(|_| audit_unavailable_reply(false)));
         }
         let gate = BadgeGate::new(work.gate(), watch);
+        // The press's own row records any front this call made.
+        super::fronting::action_row_started();
         if needs_front {
+            let later = (!later.is_empty()).then(|| fronted_press::later_steps(
+                &self.cursor,
+                &source,
+                management,
+                consent,
+                &grant,
+                &identity.agent_project_id,
+                later,
+            ));
             return self
                 .press_fronted(FrontedPress {
                     identity,
@@ -1991,14 +2086,20 @@ where
                     work,
                     settle,
                     view,
+                    later,
                 })
                 .await;
         }
         let audit = AuditToken::new(self.audit.clone(), gate.clone());
+        let fronting = foreground.map_or_else(
+            || super::fronting::Fronting::untouched(admission.mode),
+            |front| front.fronting,
+        );
         let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
+            journal.set_fronting(fronting.record());
             let mut reply =
                 press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if gate.refused_for_end() {
@@ -2029,13 +2130,75 @@ where
         if let Some(front) = foreground {
             front.fronting.apply(&mut reply);
         }
-        reply
+        PressDone::alone(reply)
     }
 }
 
 #[path = "fronted_press.rs"]
 mod fronted_press;
-use fronted_press::FrontedPress;
+use fronted_press::{FrontedEnding, FrontedPress, PressStep};
+
+/// What one press ended with, or, when the press brought its application
+/// forward in a batch, what that fronted run of the batch's presses did.
+struct PressDone {
+    reply: Value,
+    /// The replies of the later batch steps the fronted run attempted, in
+    /// order; empty for a press that ran alone.
+    later: Vec<Value>,
+    /// How the fronted run ended. It belongs on the reply that ends the
+    /// action: the press's own for a single press, the batch's for a batch.
+    ending: Option<FrontedEnding>,
+}
+
+impl PressDone {
+    fn alone(reply: Value) -> Self {
+        Self {
+            reply,
+            later: Vec::new(),
+            ending: None,
+        }
+    }
+
+    /// The reply of a press that is the whole action.
+    fn into_reply(self) -> Value {
+        let mut reply = self.reply;
+        if let Some(ending) = &self.ending {
+            ending.apply(&mut reply);
+        }
+        reply
+    }
+}
+
+/// The later steps of a batch that a fronted run may press: the ids after the
+/// current one, up to the first that does not name a live element of the
+/// batch's application. That one is left to the batch, which refuses it at
+/// its own step once the run is over.
+fn same_application_steps(
+    sessions: &AppStateSessions,
+    conversation_key: &str,
+    first: &ProcessGrant,
+    ids: &[String],
+) -> Vec<PressStep> {
+    ids.iter()
+        .map_while(|id| match sessions.resolve(conversation_key, id) {
+            cerebellum_computer::app_state::session::ElementResolution::Live {
+                handle,
+                bundle_identity,
+                pid,
+                process_generation,
+            } if bundle_identity == first.bundle_identity
+                && pid == first.pid
+                && process_generation == first.process_generation_evidence =>
+            {
+                Some(PressStep {
+                    element_id: id.clone(),
+                    handle,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {

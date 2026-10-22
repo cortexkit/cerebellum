@@ -1289,9 +1289,10 @@ async fn a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_pres
         .call("computer.press_element", json!({"element_id": send}))
         .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
-    assert!(
-        reply.get("fronting").is_none(),
-        "background mode with nothing fronted replies as before: {reply}"
+    assert_eq!(
+        reply["fronting"],
+        json!({"mode":"background","fronted":false,"purpose":"none","restore":"not_needed"}),
+        "background mode with nothing fronted says so: {reply}"
     );
     assert!(started.elapsed() < Duration::from_millis(100));
     assert_eq!(rig.desk.state().presses, [10]);
@@ -1825,7 +1826,12 @@ async fn open_app_fronts_a_running_or_launched_app_only_in_foreground_mode() {
                 assert_eq!(rig.screen.log(), ["front:4242"], "{case}");
             }
             AppUse::Background => {
-                assert!(reply.get("fronting").is_none(), "{case}");
+                assert_eq!(
+                    reply["fronting"],
+                    json!({"mode":"background","fronted":false,"purpose":"none",
+                        "restore":"not_needed"}),
+                    "{case}"
+                );
                 assert!(rig.screen.log().is_empty(), "{case}");
             }
         }

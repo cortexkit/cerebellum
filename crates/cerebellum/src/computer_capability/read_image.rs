@@ -27,6 +27,8 @@ pub(super) struct ImageReadPlan {
     /// Set when the read fronts under the fronting lock and the call's
     /// restore obligation; the driver then runs its bracket through them.
     pub hooks: Option<super::fronting::CellHooks>,
+    /// What the read's row records of the front, as known before the image.
+    pub fronting: Option<super::fronting::Fronting>,
 }
 
 pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
@@ -105,6 +107,23 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     after_fronting();
     let report = bracket.map_err(|_| ImageUnavailable::FrontingUnavailable)?;
     evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
+    if let Some(hooks) = &plan.hooks {
+        // The bracket ran the call's restore decision through the hooks, so
+        // the row can say how the front ended before it is finalized.
+        let mode = plan
+            .fronting
+            .map_or(cerebellum_core::config::AppUse::Background, |fronting| {
+                fronting.mode
+            });
+        evidence.borrow_mut().fronting_record = Some(
+            super::fronting::hooked_fronting(
+                mode,
+                super::fronting::Purpose::BringToFront,
+                &hooks.peek(),
+            )
+            .record(),
+        );
+    }
     if matches!(report.restore, RestoreStatus::Failed { .. }) {
         return Err(ImageUnavailable::RestoreFailed);
     }

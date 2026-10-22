@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 use cerebellum_computer::app_state::person::SeenMarks;
 use cerebellum_computer::app_state::session::AppStateSessions;
 use cerebellum_computer::app_state::source::AppStateSource;
+use cerebellum_computer::audit::{
+    FrontingRecord, FrontingRecordMode, FrontingRecordPurpose, FrontingRecordRestore,
+};
 use cerebellum_computer::dispatch::{
     begin_observed_sequence, heartbeat_liveness, not_fronted_reason, AbortReason, BracketOutcome,
     DeferredRestore, FrontingBracketHost, FrontingStop, NotFrontedReason, ObservedPostRefusal,
@@ -246,6 +249,102 @@ impl Fronting {
             object.insert("fronting".into(), self.to_value());
         }
     }
+
+    /// The journal's text-free form of this, as the action's row records it.
+    /// No preview is drawn for an action yet, so the frame count is zero.
+    pub(crate) fn record(self) -> FrontingRecord {
+        FrontingRecord {
+            mode: match self.mode {
+                AppUse::Foreground => FrontingRecordMode::Foreground,
+                AppUse::Background => FrontingRecordMode::Background,
+            },
+            fronted: self.fronted,
+            purpose: match self.purpose {
+                Purpose::ForegroundMode => FrontingRecordPurpose::ForegroundMode,
+                Purpose::NeedsFront => FrontingRecordPurpose::NeedsFront,
+                Purpose::BringToFront => FrontingRecordPurpose::BringToFront,
+                Purpose::None => FrontingRecordPurpose::None,
+            },
+            restore: match self.restore {
+                Restore::NotNeeded => FrontingRecordRestore::NotNeeded,
+                Restore::LeftInFront => FrontingRecordRestore::LeftInFront,
+                Restore::Restored => FrontingRecordRestore::Restored,
+                Restore::SkippedPerson => FrontingRecordRestore::SkippedPerson,
+                Restore::Failed => FrontingRecordRestore::Failed,
+            },
+            not_fronted_reason: self.not_fronted_reason,
+            person_input_during_fronting: self.person_input_during_fronting,
+            preview_frames: 0,
+        }
+    }
+}
+
+/// A foreground one-way front this call made whose action has not yet
+/// written a journal row of its own.
+#[derive(Clone)]
+pub(crate) struct PendingFrontRow {
+    pub(crate) grant: ProcessGrant,
+    pub(crate) fronting: Fronting,
+}
+
+/// The call's [`PendingFrontRow`], shared between the action and the code
+/// that serves it.
+pub(crate) type CallFront = Arc<StdMutex<Option<PendingFrontRow>>>;
+
+tokio::task_local! {
+    static CALL_FRONT: CallFront;
+}
+
+/// Run `action` with a fresh [`CallFront`], returned with its reply so the
+/// caller can journal a front that no row of the action recorded.
+pub(crate) async fn tracking_call_front<F: std::future::Future>(
+    action: F,
+) -> (F::Output, Option<PendingFrontRow>) {
+    let cell = CallFront::default();
+    let output = CALL_FRONT.scope(Arc::clone(&cell), action).await;
+    let pending = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    (output, pending)
+}
+
+/// Remember that this call brought `grant` to the front one way. Until the
+/// action writes a row of its own, the front is journaled by the code that
+/// serves the call, so a front followed by an early refusal is never
+/// unrecorded. Outside a tracked call this does nothing.
+fn note_one_way_front(grant: &ProcessGrant, fronting: Fronting) {
+    let _ = CALL_FRONT.try_with(|cell| {
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingFrontRow {
+            grant: grant.clone(),
+            fronting,
+        });
+    });
+}
+
+/// The action is about to write its own row, which records the front, so
+/// the call need not journal it separately. Call it on the async side, before
+/// the blocking work that writes the row.
+pub(crate) fn action_row_started() {
+    let _ = CALL_FRONT.try_with(|cell| {
+        cell.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    });
+}
+
+/// The rejected row for a front no row of the action recorded: outcome
+/// `fronted`, the front's record and the grant, and nothing else.
+pub(crate) fn fronted_row_material(pending: &PendingFrontRow) -> Vec<u8> {
+    json!({
+        "outcome": "fronted",
+        "fronting": pending.fronting.record(),
+        "grant_identity": pending.grant,
+    })
+    .to_string()
+    .into_bytes()
 }
 
 /// The refusal of an action that needed its application in front when
@@ -614,6 +713,18 @@ impl CellHooks {
     pub(crate) fn cell(&self) -> Option<Arc<RestoreCell>> {
         self.state().cell.clone()
     }
+
+    /// What the hooks hold now, without releasing an unregistered lock as
+    /// [`CellHooks::end`] does: for a row finalized while the call still runs.
+    pub(crate) fn peek(&self) -> HookedEnd {
+        let state = self.state();
+        HookedEnd {
+            cell: state.cell.clone(),
+            refused: state.refused,
+            decided: state.decided,
+            finished: state.finished,
+        }
+    }
 }
 
 impl FrontedDispatchHooks for CellHooks {
@@ -833,11 +944,15 @@ where
         .await
         .unwrap_or(Err((FrontingStop::FrontFailed, None)));
         Some(match fronted {
-            Ok(front) if front.fronted => ForegroundFront {
-                fronting: Fronting::one_way(AppUse::Foreground),
-                stop: None,
-                change: None,
-            },
+            Ok(front) if front.fronted => {
+                let fronting = Fronting::one_way(AppUse::Foreground);
+                note_one_way_front(call.grant, fronting);
+                ForegroundFront {
+                    fronting,
+                    stop: None,
+                    change: None,
+                }
+            }
             Ok(_) => ForegroundFront {
                 fronting: Fronting::untouched(AppUse::Foreground),
                 stop: None,
@@ -1011,4 +1126,22 @@ pub(crate) fn chord_fronting(mode: AppUse, end: &HookedEnd) -> Fronting {
         );
     }
     hooked_fronting(mode, Purpose::NeedsFront, end)
+}
+
+/// The `fronting` a chord's journal row records when the dispatcher
+/// finalizes it, which is before any deferred restore runs. A bracket whose
+/// post may have left a key held defers its restore until the release is
+/// confirmed; at the moment the row is written the target is still in front
+/// and nothing has been decided, so the row records it left in front rather
+/// than guessing whether the restore will fail. Every other end is recorded
+/// as the reply reports it.
+pub(crate) fn keystroke_row_fronting(mode: AppUse, end: &HookedEnd) -> Fronting {
+    let deferred = end.finished.is_some_and(|(deferred, _)| deferred.is_some());
+    if end.cell.is_some() && end.decided.is_none() && deferred {
+        return Fronting {
+            restore: Restore::LeftInFront,
+            ..chord_fronting(mode, end)
+        };
+    }
+    chord_fronting(mode, end)
 }
