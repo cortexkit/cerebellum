@@ -1,4 +1,6 @@
-//! Browser launches in tests must go through the headless assertion and audit.
+//! Rejects test code that spawns a browser outside the reviewed paths. On
+//! macOS, unit-test spawns through the test helper are checked for headless
+//! mode and recorded.
 
 use super::disclaimed_binary_paths::{tokens, Token, TokenKind};
 use super::support::source_scan;
@@ -127,8 +129,10 @@ fn violations(path: &str, source: &str) -> Vec<String> {
             "MacOsProcessLauncher" | "LinuxProcessLauncher"
         ) && at(1) == Some("::")
             && at(2) == Some("new");
-        // Unit tests use the platform launcher's cfg(test) headless seam.
-        // Integration tests link the shipped library, where that seam is absent.
+        // On macOS, unit tests reach the platform launcher's cfg(test) spawn
+        // helper, which checks for headless mode. Integration tests link the
+        // shipped library, where that helper is absent, so they must not
+        // construct a platform launcher at all.
         if platform_launcher && !path.starts_with("cerebellum/src/") {
             found.push(format!(
                 "{}: platform launcher bypasses the test seam",

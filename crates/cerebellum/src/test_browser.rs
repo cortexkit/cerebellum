@@ -1,7 +1,8 @@
-//! Unit-test browser launches run headless, so no browser window appears on the
-//! person's screen. Headless Chrome on macOS still checks in as a foreground app
-//! and shows in the Dock while it runs, so keep real-browser tests opt-in
-//! (`#[ignore]`) rather than part of an ordinary test run.
+//! On macOS, unit-test browser launches through this helper must use
+//! `--headless=new`, so Chrome opens no window on the person's screen. Headless
+//! Chrome still checks in as a foreground app and shows in the Dock while it
+//! runs, so keep real-browser tests opt-in (`#[ignore]`) rather than part of an
+//! ordinary test run.
 
 use std::ffi::OsString;
 
