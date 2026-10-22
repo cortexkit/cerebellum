@@ -1021,10 +1021,11 @@ mod arbiter_egress_tests {
         }
     }
 
-    /// Every terminal body passes each fronting row's result schema, as it
-    /// is and as it reads after a front: carrying `fronting`, and with a
-    /// failed restore turning the outcome into `restore_failed` while the
-    /// body's `detail` and `effect_status` are kept.
+    /// Every terminal body is checked against each fronting row's result
+    /// schema, as it is and as it reads after a front: carrying `fronting`,
+    /// and with a failed restore turning the outcome into `restore_failed`
+    /// while the body's `detail` and `effect_status` are kept. Apart from the
+    /// keystroke-row exception below, each must pass.
     ///
     /// The keystroke rows require `containment_rung`, `effect_status` and
     /// `target_fronted` on every reply. This arbiter's own bodies never carry

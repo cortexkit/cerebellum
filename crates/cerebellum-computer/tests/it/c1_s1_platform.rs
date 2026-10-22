@@ -1718,7 +1718,8 @@ fn v28_only_adds_app_use_and_fronting_replies_to_the_recreated_v27() {
     );
 }
 
-/// v28 changes nothing outside the rows' `result_schema`s. The advertised
+/// Within the rows, v28 changes only `result_schema`s; the document's
+/// `revision` is the one other value that moves. The advertised
 /// `computer_use` definition is built from each row's `request_schema`, so
 /// those must keep their exact bytes, and every other row field is what
 /// `validate_row` checks, so it must not move either.
