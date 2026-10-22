@@ -165,6 +165,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "avatar-svg",
+ "base64",
  "cerebellum-bridge-protocol",
  "cerebellum-computer",
  "cerebellum-core",

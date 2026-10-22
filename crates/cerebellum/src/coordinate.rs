@@ -6,6 +6,7 @@
 //! validation and mapping here makes it possible for the adapter to reject bad
 //! screenshot metadata before it retains clickable state or dispatches input.
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -868,93 +869,16 @@ pub fn validate_canonical_png(
 
 /// Encode bytes using the exact canonical base64 representation accepted above.
 pub fn encode_base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        output.push(ALPHABET[(a >> 2) as usize] as char);
-        output.push(ALPHABET[((a & 0x03) << 4 | (b >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(ALPHABET[((b & 0x0f) << 2 | (c >> 6)) as usize] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(ALPHABET[(c & 0x3f) as usize] as char);
-        } else {
-            output.push('=');
-        }
-    }
-    output
+    STANDARD.encode(bytes)
 }
 
 fn decode_canonical_base64(input: &str) -> Option<Vec<u8>> {
-    if !input.len().is_multiple_of(4) {
-        return None;
-    }
-    let bytes = input.as_bytes();
-    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
-    if padding > 2 || (padding > 0 && bytes.len() < 4) {
-        return None;
-    }
-    if bytes[..bytes.len().saturating_sub(padding)]
-        .iter()
-        .any(|byte| decode_base64_char(*byte).is_none())
-    {
-        return None;
-    }
-    if bytes[bytes.len().saturating_sub(padding)..]
-        .iter()
-        .any(|byte| *byte != b'=')
-    {
-        return None;
-    }
-
-    let mut output = Vec::with_capacity(bytes.len() / 4 * 3 - padding);
-    for (index, quartet) in bytes.as_chunks::<4>().0.iter().enumerate() {
-        let last = index + 1 == bytes.len() / 4;
-        let a = decode_base64_char(quartet[0])?;
-        let b = decode_base64_char(quartet[1])?;
-        let c = if quartet[2] == b'=' {
-            if !last || quartet[3] != b'=' {
-                return None;
-            }
-            0
-        } else {
-            decode_base64_char(quartet[2])?
-        };
-        let d = if quartet[3] == b'=' {
-            if !last {
-                return None;
-            }
-            0
-        } else {
-            decode_base64_char(quartet[3])?
-        };
-        output.push((a << 2) | (b >> 4));
-        if quartet[2] != b'=' {
-            output.push((b << 4) | (c >> 2));
-        }
-        if quartet[3] != b'=' {
-            output.push((c << 6) | d);
-        }
-    }
-    // Re-encoding catches omitted padding and non-zero unused bits, both of
-    // which otherwise decode to the same bytes but are not canonical RFC 4648.
-    (encode_base64(&output) == input).then_some(output)
-}
-
-fn decode_base64_char(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
+    STANDARD
+        .decode(input)
+        .ok()
+        // Keep decoding restricted to the same padded canonical form as the
+        // encoder, even if the engine's acceptance rules become more permissive.
+        .filter(|bytes| STANDARD.encode(bytes) == input)
 }
 
 fn validate_png_bytes(bytes: &[u8]) -> Result<(u32, u32), ()> {
@@ -1201,19 +1125,50 @@ mod tests {
         let mut bytes = Vec::new();
         let encoded = PNG.as_bytes();
         for quartet in encoded.chunks(4) {
-            let values = quartet
-                .iter()
-                .map(|byte| decode_base64_char(*byte).unwrap_or(0))
-                .collect::<Vec<_>>();
-            bytes.push((values[0] << 2) | (values[1] >> 4));
-            if quartet[2] != b'=' {
-                bytes.push((values[1] << 4) | (values[2] >> 2));
-            }
-            if quartet[3] != b'=' {
-                bytes.push((values[2] << 6) | values[3]);
-            }
+            bytes.extend(decode_canonical_base64(std::str::from_utf8(quartet).unwrap()).unwrap());
         }
         bytes
+    }
+
+    #[test]
+    fn base64_encoding_uses_canonical_standard_padding() {
+        let binary = (0u8..=u8::MAX).collect::<Vec<_>>();
+        for (bytes, expected) in [
+            (&b""[..], ""),
+            (&b"f"[..], "Zg=="),
+            (&b"fo"[..], "Zm8="),
+            (&b"foo"[..], "Zm9v"),
+            (
+                binary.as_slice(),
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+            ),
+        ] {
+            assert_eq!(encode_base64(bytes), expected);
+            assert_eq!(decode_canonical_base64(expected).as_deref(), Some(bytes));
+        }
+    }
+
+    #[test]
+    fn base64_decoder_rejects_noncanonical_or_invalid_inputs() {
+        for input in [
+            "Zg",       // omitted padding
+            "Zm8",      // omitted padding
+            "Zg===",    // too much padding
+            "=Zg=",     // padding before data
+            "Z=g=",     // padding inside data
+            "Zg=",      // incomplete quartet
+            "Zg==AAAA", // padding before the final quartet
+            "Zh==",     // Last data character has bits set where double padding requires zeroes
+            "Zm9=",     // Last data character has bits set where single padding requires zeroes
+            "Zg==\n",   // whitespace
+            "Zg= ",     // whitespace replaces the second required padding character
+            "Z g=",     // whitespace inside data
+            "-_8=",     // URL-safe alphabet
+            "Zg**",     // invalid alphabet characters
+            "A",        // impossible encoded length
+        ] {
+            assert_eq!(decode_canonical_base64(input), None, "accepted {input:?}");
+        }
     }
 
     #[test]
