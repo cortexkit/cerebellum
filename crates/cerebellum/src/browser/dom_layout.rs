@@ -6,10 +6,10 @@
 //! of a large page is mostly chrome. When the markup does not fit, it is laid
 //! out in the outline's reading order instead: the main-content landmarks
 //! first, then everything outside the landmarks, then the chrome landmarks
-//! (navigation, header, sidebar, footer, search). Each part starts with a
-//! comment naming it, and each part that is cut or left out is marked by a
-//! comment with its size and, when one element holds it, the ref a `zoom`
-//! reads it through:
+//! (navigation, header, sidebar, footer, search). When the markup has such
+//! landmarks, each laid-out part starts with a comment naming it. Every part
+//! that is cut or left out, landmarks or not, is marked by a comment with its
+//! size and, when one element holds it, the ref a `zoom` reads it through:
 //!
 //! ```text
 //! <!-- navigation omitted: 41.0 KB; zoom e12 -->

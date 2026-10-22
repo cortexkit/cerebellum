@@ -137,3 +137,76 @@ before = """
 
 }
 """
+
+[[control]]
+id = "dom-full-over-limit-lays-out-main-first"
+guards = "dom_full markup over max_bytes is laid out main content first with omitted parts marked, not cut as a source-order prefix"
+file = "crates/cerebellum/src/browser/dom_layout.rs"
+old = "let located = locate(markup, landmarks);"
+new = "let located = Vec::new();"
+edits = []
+test_file = "crates/cerebellum/src/browser/dom_layout.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::dom_layout::tests::a_main_larger_than_max_bytes_is_cut_with_a_marker_naming_its_ref",
+  "browser::dom_layout::tests::over_max_bytes_main_content_comes_first_and_cut_chrome_is_marked",
+  "browser::tests::dom_full_over_max_bytes_puts_main_first_and_its_marker_refs_stay_zoomable",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn lay_out("
+before = "fn cut_point("
+
+[[control]]
+id = "text-filter-prints-a-small-row-whole"
+guards = "a text_filter match inside a small row of texts (a property line, a table row) prints the whole row on one line"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "if node == 0 || self.is_landmark(node)"
+new = "if true || node == 0 || self.is_landmark(node)"
+edits = []
+test_file = "crates/cerebellum/src/browser/navigation/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::navigation::tests::a_text_filter_match_in_a_property_line_prints_the_key_with_its_value",
+  "browser::navigation::tests::a_text_filter_match_in_a_table_cell_prints_its_whole_row",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn leaf_row("
+before = "fn filtered_lines("
+
+[[control]]
+id = "remedy-named-object-detail-is-printed"
+guards = "a remedy that names an object-valued detail (SeverityBelowFloor's detail.required) prints that object's members in the plain text"
+file = "crates/cerebellum/src/tool_result/plain.rs"
+old = "value.as_object().and_then(object_members)"
+new = "None::<String>"
+edits = []
+test_file = "crates/cerebellum/src/browser/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::tests::every_detail_a_remedy_names_is_printed_with_its_value",
+  "tool_result::plain::tests::a_remedy_naming_an_object_detail_prints_its_members",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn detail_lines("
+before = "fn object_members("
