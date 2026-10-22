@@ -1280,9 +1280,10 @@ fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// as the takeover review's bracket does, but under rules that review never
 /// covered, so both the takeover review and the app-use review must bind.
 /// The vocabulary digests play no part.
-// Only the tests below call this predicate for now: the computer plane does
-// not yet carry an app-use fronting flag to set from it at construction.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
         "takeover_dispatch_review_revision",
@@ -3359,6 +3360,11 @@ impl Planes {
                     // The fronting bracket is served only by a build carrying
                     // its review; without it a background target is refused.
                     .with_fronting_bracket_admitted(fronting_bracket_admitted(
+                        &compiled_release_inputs(),
+                    ))
+                    // Fronting outside that bracket needs the app-use review
+                    // as well; without it every such front is unavailable.
+                    .with_app_use_fronting_admitted(app_use_fronting_admitted(
                         &compiled_release_inputs(),
                     )),
                 )

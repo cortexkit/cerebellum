@@ -24,6 +24,9 @@ pub(super) struct ImageReadPlan {
     /// The call's dispatch gate. Fronting the target is a mutation, so it
     /// must still be open immediately before the bracket.
     pub gate: Option<std::sync::Arc<dyn cerebellum_computer::dispatch::MutationGate>>,
+    /// Set when the read fronts under the fronting lock and the call's
+    /// restore obligation; the driver then runs its bracket through them.
+    pub hooks: Option<super::fronting::CellHooks>,
 }
 
 pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
@@ -65,6 +68,11 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     let gate = plan.gate.as_deref();
     if gate.is_some_and(|gate| !gate.begin_mutation()) {
         return Err(ImageUnavailable::FrontingUnavailable);
+    }
+    if let Some(hooks) = &plan.hooks {
+        if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
+            return Err(ImageUnavailable::FrontingUnavailable);
+        }
     }
     let bracket = driver.read_fronted(
         grant,

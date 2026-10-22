@@ -1206,6 +1206,7 @@ pub(crate) fn target_mismatch_reply(target: &str) -> Value {
 struct PressCall<'a> {
     identity: JournalIdentity,
     management: &'a ManagementPlane,
+    consent: &'a ConsentContext,
     cancel: &'a CancelHandle,
     sessions: Arc<AppStateSessions>,
     capability: ComputerCapability,
@@ -1440,6 +1441,7 @@ where
                 PressCall {
                     identity,
                     management,
+                    consent: &consent,
                     cancel: &cancel,
                     sessions,
                     capability: ComputerCapability::PressElement,
@@ -1535,6 +1537,7 @@ where
                 PressCall {
                     identity,
                     management,
+                    consent: &consent,
                     cancel: &cancel,
                     sessions,
                     capability: ComputerCapability::PressPoint,
@@ -1625,6 +1628,21 @@ where
             admission.decorate(&mut busy);
             return busy;
         }
+        let foreground = self
+            .front_for_foreground(super::fronting::FrontCall {
+                grant: &grant,
+                consent: &consent,
+                cancel: &cancel,
+                management,
+                conversation_key: &conversation_key,
+            })
+            .await;
+        if let Some(mut refusal) =
+            foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
+        {
+            admission.decorate(&mut refusal);
+            return refusal;
+        }
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
         let arrival = self.cursor.schedule(
@@ -1685,6 +1703,9 @@ where
         })
         .await
         .unwrap_or_else(|_| audit_unavailable_reply(true));
+        if let Some(front) = foreground {
+            front.fronting.apply(&mut reply);
+        }
         admission.decorate(&mut reply);
         reply
     }
@@ -1795,6 +1816,7 @@ where
         let PressCall {
             identity,
             management,
+            consent,
             cancel,
             sessions,
             capability,
@@ -1802,6 +1824,20 @@ where
         let work = super::quarantine::CallWork::current();
         if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
             return busy;
+        }
+        let foreground = self
+            .front_for_foreground(super::fronting::FrontCall {
+                grant: &grant,
+                consent,
+                cancel,
+                management,
+                conversation_key: &identity.conversation_key,
+            })
+            .await;
+        if let Some(refusal) =
+            foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
+        {
+            return refusal;
         }
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
@@ -1868,6 +1904,41 @@ where
                 }
             }
         };
+        // A press can bring its application forward only when the element
+        // reads disabled while the application is in the background. The
+        // pre-read is one blocking hop, before any lock, and is journaled as
+        // an accessibility read; no `element_disabled` refusal is recorded
+        // for it.
+        let mut needs_front = false;
+        if self.fronting_admission(consent, false).may_front().is_ok() {
+            let mut audit = AuditToken::new(self.audit.clone(), work.gate());
+            let (source, read_grant, identity, work, handle) = (
+                source.clone(),
+                grant.clone(),
+                identity.clone(),
+                work.clone(),
+                handle.clone(),
+            );
+            let pre_read = tokio::task::spawn_blocking(move || {
+                let _ax = work.bound_ax();
+                let grant = read_grant;
+                let _scope = AccessibilityReadScope::new(grant.pid, None);
+                let pre_read = cerebellum_computer::dispatch::PressPreRead {
+                    enabled: source.element_enabled(&handle),
+                    frontmost: source.frontmost_pid(),
+                };
+                audit
+                    .record_accessibility_read(identity, capability, &grant, || ())
+                    .map(|_| pre_read)
+                    .map_err(|_| audit_unavailable_reply(false))
+            })
+            .await
+            .unwrap_or_else(|_| Err(audit_unavailable_reply(false)));
+            match pre_read {
+                Ok(pre_read) => needs_front = pre_read.needs_front(grant.pid),
+                Err(reply) => return reply,
+            }
+        }
         let arrival = self.cursor.schedule(
             cursor_identity,
             cerebellum_computer::cursor::CursorKind::Press,
@@ -1903,8 +1974,28 @@ where
             .unwrap_or_else(|_| audit_unavailable_reply(false));
         }
         let gate = BadgeGate::new(work.gate(), watch);
+        if needs_front {
+            return self
+                .press_fronted(FrontedPress {
+                    identity,
+                    management,
+                    consent,
+                    cancel,
+                    sessions,
+                    capability,
+                    grant,
+                    element_id,
+                    handle,
+                    reads,
+                    gate,
+                    work,
+                    settle,
+                    view,
+                })
+                .await;
+        }
         let audit = AuditToken::new(self.audit.clone(), gate.clone());
-        tokio::task::spawn_blocking(move || {
+        let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
@@ -1934,9 +2025,17 @@ where
             reply
         })
         .await
-        .unwrap_or_else(|_| audit_unavailable_reply(true))
+        .unwrap_or_else(|_| audit_unavailable_reply(true));
+        if let Some(front) = foreground {
+            front.fronting.apply(&mut reply);
+        }
+        reply
     }
 }
+
+#[path = "fronted_press.rs"]
+mod fronted_press;
+use fronted_press::FrontedPress;
 
 #[cfg(test)]
 mod tests {
