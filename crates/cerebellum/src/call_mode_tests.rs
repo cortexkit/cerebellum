@@ -397,8 +397,10 @@ async fn legacy_run_without_call_mode_keeps_no_ask_policy() {
     assert!(consent.cards().is_empty());
 }
 
+/// A run reaches the user-browser plane (here it finds no extension), while a
+/// codemode route with no admitted head still cannot: it has no head to act as.
 #[tokio::test]
-async fn codemode_user_browser_is_unsupported_but_coordinate_actions_are_not() {
+async fn codemode_run_reaches_the_user_browser_and_coordinate_actions_are_not_refused() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
     bind_head(&planes).await;
     exchange(
@@ -417,11 +419,11 @@ async fn codemode_user_browser_is_unsupported_but_coordinate_actions_are_not() {
     )
     .await;
     let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(reply["code"], "call_mode_unsupported");
     assert_eq!(
-        reply["detail"],
-        json!({"tool":"browser_use","mode":"codemode","action":"snapshot"})
+        reply["structuredContent"]["reason"], "not_connected",
+        "{reply}"
     );
+    assert_ne!(reply["code"], "call_mode_unsupported", "{reply}");
     for (tool, action) in [
         ("browser_use", "click_point"),
         ("computer_use", "press_point"),
@@ -437,6 +439,28 @@ async fn codemode_user_browser_is_unsupported_but_coordinate_actions_are_not() {
         assert_ne!(reply["code"], "call_mode_unsupported", "{reply}");
         assert_ne!(reply["errorCode"], "call_mode_unsupported", "{reply}");
     }
+    let mut headless = run_bind(run_stamp());
+    if let ModuleControlRequest::RouteBind {
+        route_channel,
+        principal,
+        ..
+    } = &mut headless
+    {
+        *route_channel = 11;
+        *principal = session_caller_principal_for_test();
+    }
+    exchange(&planes, 0, 5, serde_json::to_value(headless).unwrap()).await;
+    assert!(planes.routes.get(11, 3).unwrap().codemode_head.is_none());
+    let reply = exchange(
+        &planes,
+        11,
+        6,
+        json!({"name":"browser_use","arguments":{
+        "browser":"user","action":"snapshot","tab":"tab-1"}}),
+    )
+    .await;
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["code"], "call_mode_unsupported", "{reply}");
 }
 
 #[tokio::test]

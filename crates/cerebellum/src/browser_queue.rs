@@ -238,16 +238,16 @@ fn user_quarantine(frame: &Frame, planes: &Planes) -> Option<Quarantined> {
     if let Some(connection) = planes.user_browser.connected_epoch() {
         planes.user_browser.target().synchronize(connection);
     }
+    // A run's user-browser work is recorded under its head's route, so its
+    // quarantine is read there too. A run whose head is gone is refused when
+    // it is served, with that refusal.
+    let route =
+        crate::codemode::user_browser_route(planes, frame.header.channel, frame.header.epoch)
+            .ok()?;
     planes
         .user_browser
         .target()
-        .quarantine(
-            crate::user_browser_bridge::Route {
-                channel: frame.header.channel,
-                epoch: frame.header.epoch,
-            },
-            args["tab"].as_str(),
-        )
+        .quarantine(route, args["tab"].as_str())
         .map(Quarantined::Refuse)
 }
 

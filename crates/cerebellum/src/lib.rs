@@ -1296,6 +1296,17 @@ fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
 pub struct RouteBindings {
     inner: Arc<RwLock<HashMap<(u16, u32), AcceptedBindFacts>>>,
     removed: Arc<tokio::sync::Notify>,
+    /// When each bound route's bind was accepted, as a sequence number that
+    /// only grows. Re-recording an already-bound route's facts keeps its
+    /// place. Writers lock `inner` before this; `bind_sequence` locks this
+    /// alone or while `inner` is held, never the other way round.
+    bind_order: Arc<std::sync::Mutex<BindOrder>>,
+}
+
+#[derive(Default)]
+struct BindOrder {
+    next: u64,
+    sequence: HashMap<(u16, u32), u64>,
 }
 
 impl RouteBindings {
@@ -1306,7 +1317,29 @@ impl RouteBindings {
     fn insert(&self, channel: u16, epoch: u32, facts: AcceptedBindFacts) {
         if let Ok(mut routes) = self.inner.write() {
             routes.insert((channel, epoch), facts);
+            let mut order = self
+                .bind_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = order.next;
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                order.sequence.entry((channel, epoch))
+            {
+                entry.insert(next);
+                order.next += 1;
+            }
         }
+    }
+
+    /// The order in which this route's bind was accepted among all routes
+    /// bound now or before; lower is older.
+    fn bind_sequence(&self, channel: u16, epoch: u32) -> Option<u64> {
+        self.bind_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sequence
+            .get(&(channel, epoch))
+            .copied()
     }
 
     fn get(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
@@ -1323,11 +1356,14 @@ impl RouteBindings {
     }
 
     fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
-        let facts = self
-            .inner
-            .write()
-            .ok()
-            .and_then(|mut routes| routes.remove(&(channel, epoch)));
+        let facts = self.inner.write().ok().and_then(|mut routes| {
+            self.bind_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sequence
+                .remove(&(channel, epoch));
+            routes.remove(&(channel, epoch))
+        });
         self.removed.notify_waiters();
         facts
     }
@@ -3368,6 +3404,10 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            // Keyed by the closing route itself. A run's user-browser work is
+            // keyed by its head route, so a run's goodbye releases none of the
+            // head's claims or snapshots; the run's in-flight calls end through
+            // `cancel_route` below.
             planes.user_browser.goodbye(user_browser_bridge::Route {
                 channel: frame.header.channel,
                 epoch: frame.header.epoch,
@@ -3619,35 +3659,17 @@ async fn handle_route_request(
         )
         .await;
     };
-    if facts.codemode_head.is_some() {
-        let resolved = planes
-            .routes
-            .run_head(facts.scope.as_ref().expect("admitted run stamp"));
-        let refusal = match resolved {
-            Err(refusal) => Some(refusal),
-            Ok(head)
-                if head.identity.conversation_key != facts.identity.conversation_key
-                    || head
-                        .scope
-                        .as_ref()
-                        .is_some_and(|stamp| planes.scopes.is_superseded(stamp)) =>
-            {
-                Some(codemode::ParentRefusal::NoLiveHead)
-            }
-            Ok(_) => None,
-        };
-        if let Some(refusal) = refusal {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                refusal.code(),
-                refusal.message(),
-            )
-            .await;
-        }
+    if let Err(refusal) = codemode::live_head(planes, &facts) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            refusal.code(),
+            refusal.message(),
+        )
+        .await;
     }
     if let Some(method) = permissions::refused_method(&frame, &facts) {
         return send_route_error(writer, ver, channel, epoch, corr, "principal_denied",
@@ -3680,13 +3702,17 @@ async fn handle_route_request(
     if facts.surface == RouteSurface::Tools {
         if let Ok(request) = serde_json::from_slice::<Value>(&frame.body) {
             if let Some(name) = request.get("name").and_then(Value::as_str) {
+                // A run (admitted head) acts in the person's Chrome as its head
+                // does. A codemode route with no admitted head has no head to
+                // act as, so it still cannot.
                 if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
+                    && facts.codemode_head.is_none()
                     && name == flat_tools::BROWSER_USE
                     && request["arguments"]["browser"] == "user"
                 {
                     return tool_provider::send_error(ErrorBody {
                         code: "call_mode_unsupported".into(),
-                        message: "codemode does not support the user-browser plane".into(),
+                        message: "a codemode route without an admitted head run cannot use the user-browser plane".into(),
                         detail: Some(json!({"tool":name,"mode":"codemode","action":request["arguments"]["action"]})),
                     }, (ver, channel, epoch, corr), writer).await;
                 }
@@ -6999,11 +7025,31 @@ async fn handle_tool_request_inner(
             }
         }
         call.commit_point_follows();
+        // Claims, snapshots, refs and the extension's own route bookkeeping
+        // are keyed by the route resolved here: the head's for a run, so a
+        // run acts on its head's tabs and its claims outlive the run's route.
+        // Cancellation and consent liveness stay on the inbound route.
+        let browser_route = match codemode::user_browser_route(planes, channel, epoch) {
+            Ok(route) => route,
+            Err(refusal) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    refusal.code(),
+                    refusal.message(),
+                )
+                .await
+            }
+        };
         let result = user_browser::serve(
             planes,
             &accepted_facts,
             writer,
             (channel, epoch, corr),
+            browser_route,
             action,
             arguments,
         )
