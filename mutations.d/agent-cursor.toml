@@ -2722,3 +2722,233 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-observer-instants-on-the-host-clock"
+guards = "the process-wide observer's newest hardware input is placed on the fronting host's own millisecond clock, so the restore decision compares it with the front instant"
+file = "crates/cerebellum-computer/src/dispatch/bracket/restore.rs"
+old = "            last_input_ms: last_input.map(millis),"
+new = "            last_input_ms: last_input.map(|_| 0), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::tests::observer_instants_map_onto_the_host_clock",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-reports-the-release-before-the-restore"
+guards = "on the terminal path a held key is released before the restore, and the reply reports the release it ran beside the restore"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "                    body[\"detail\"][\"held_state\"] = json!(held.name());"
+new = "                    body[\"detail\"][\"held_state\"] = json!(HeldState::Unknown.name()); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::held_input_is_released_before_the_restore_and_both_are_reported",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-cancel-stops-the-fronting-lock-wait"
+guards = "a cancel while a call waits for the process-wide fronting lock stops the wait at once instead of after the lock's limit"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "            () = cancel.cancelled() => Err(FrontingStop::Cancelled),"
+new = "            () = cancel.cancelled(), if false => Err(FrontingStop::Cancelled), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_cancel_while_waiting_for_the_lock_stops_at_once",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-4k-frame-is-scaled-under-the-limit"
+guards = "a 4K window's preview is scaled to the preview's size before it is encoded, so its frame fits a frame line"
+file = "crates/cerebellum-computer/src/capture/mod.rs"
+old = "            max_px,"
+new = "            [max_px[0] * 8, max_px[1] * 8], // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/capture/mod.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "capture::tests::a_4k_window_preview_frame_stays_under_the_frame_limit",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-panel-is-kept-out-of-screen-capture"
+guards = "the background-mode preview's panel, which shows a window the person had covered, is kept out of screen sharing, recordings and screenshots"
+file = "crates/cerebellum-macos/src/cursor_overlay/preview_window.rs"
+old = "        panel.setSharingType(NSWindowSharingType::None);"
+new = "        panel.setSharingType(NSWindowSharingType::ReadOnly); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-macos/tests/preview_hide.rs"
+runner = "cargo"
+package = "cerebellum-macos"
+target = "--test preview_hide"
+select = "expected"
+expect_red = [
+    "a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-press-settle-drains-the-watcher"
+guards = "a fronted press's settle drains the seize watcher before every wait, so the person's input ends it"
+file = "crates/cerebellum-computer/src/dispatch/bracket/press.rs"
+old = "                session.watcher.abort_decision().is_some()"
+new = "                false // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/press/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::press::tests::input_during_a_batch_settle_stops_the_next_step_and_restores_at_once",
+    "dispatch::bracket::press::tests::input_during_the_settle_ends_it_early_and_restores_at_once",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-press-settle-input-restores-at-once"
+guards = "a fronted press's settle ended by the person's input goes straight to the restore decision: no later step begins, and the input is reported"
+file = "crates/cerebellum-computer/src/dispatch/bracket/press.rs"
+old = "            if ended == SettleEnd::PersonInput {"
+new = "            if false && ended == SettleEnd::PersonInput { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/press/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::press::tests::input_during_a_batch_settle_stops_the_next_step_and_restores_at_once",
+    "dispatch::bracket::press::tests::input_during_the_settle_ends_it_early_and_restores_at_once",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-press-quiet-settle-runs-to-its-bound"
+guards = "a fronted press's settle with no input from the person runs to its bound; the watch never ends it on its own"
+file = "crates/cerebellum-computer/src/dispatch/bracket/press.rs"
+old = "                session.watcher.abort_decision().is_some()"
+new = "                true // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/dispatch/bracket/press/tests.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "dispatch::bracket::press::tests::a_quiet_settle_runs_to_its_bound",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-settle-honours-the-person-check"
+guards = "the application settle after an action asks its person check before every read and ends once the person acted"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "        let interrupted = person_acted();"
+new = "        let interrupted = false && person_acted(); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-fronted-press-settle-watches-the-person"
+guards = "the fronted press's real settle passes the press run's watch on the person into the application settle"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "                acted = acted || person_acted(self);"
+new = "                acted = acted || (false && person_acted(self)); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-settle-ended-by-the-person-keeps-the-seen-marks"
+guards = "a settle the person's input ended does not record the application as seen after their input, so the next person check still sees it"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "        let seen = (!interrupted).then(|| SeenMarks::read(source, grant));"
+new = "        let seen = Some(SeenMarks::read(source, grant)); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-restore-after-person-settle-keeps-the-seen-marks"
+guards = "after a settle the person's input ended, the restore does not record the application as seen after their input"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "        if decided.restore == RestoreStatus::Restored && !self.person_input_in_settle {"
+new = "        if decided.restore == RestoreStatus::Restored { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

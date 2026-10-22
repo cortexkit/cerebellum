@@ -369,8 +369,12 @@ where
         bound_ms: u64,
         person_acted: &mut dyn FnMut(&mut Self) -> bool,
     ) -> SettleEnd {
-        let (source, sessions, conversation_key, grant) =
-            (self.source, self.sessions, self.conversation_key, self.grant);
+        let (source, sessions, conversation_key, grant) = (
+            self.source,
+            self.sessions,
+            self.conversation_key,
+            self.grant,
+        );
         let expand_menus = self.expand_menus;
         let mut acted = false;
         let observed = settle_and_observe_view(

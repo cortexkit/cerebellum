@@ -362,7 +362,8 @@ struct ScreenState {
     /// The release logs `released` when it returns, after staying in flight
     /// a little longer, so a restore made before it returned shows up in
     /// the log ahead of it.
-    log_release_end: bool,    /// The person presses a key, which the run's own observer drains at its
+    log_release_end: bool,
+    /// The person presses a key, which the run's own observer drains at its
     /// next check.
     person_key_pending: bool,
 }
@@ -2735,6 +2736,10 @@ async fn input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen()
         .await;
     assert_eq!(again["outcome"], "state_changed_by_person", "{again}");
     assert_eq!(again["reason"], "focus_changed", "{again}");
-    assert_eq!(rig.desk.state().presses, [10], "the second press sent nothing");
+    assert_eq!(
+        rig.desk.state().presses,
+        [10],
+        "the second press sent nothing"
+    );
     assert!(!rig.lock.held());
 }
