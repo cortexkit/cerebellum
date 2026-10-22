@@ -1117,10 +1117,10 @@ pub(crate) fn adopt(
 /// final read becomes the baseline and the conversation's last-seen focus.
 ///
 /// `person_acted` is asked before every read. Once it answers `true`, the
-/// settle ends after one last read, which still becomes the baseline for the
-/// reply's diff but not the last-seen focus: marks read after the person's
-/// input would hide that input from the next person check. Callers with
-/// nothing to watch pass [`person_input_not_watched`].
+/// settle ends after one last read. If that read succeeds, it becomes the
+/// baseline for the reply's diff but not the last-seen focus: marks read
+/// after the person's input would hide that input from the next person
+/// check. Callers with nothing to watch pass [`person_input_not_watched`].
 pub(crate) fn settle_and_observe_view(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
