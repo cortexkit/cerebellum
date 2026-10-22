@@ -35,6 +35,28 @@ pub struct HardwareInputSnapshot {
     pub last_input_ms: Option<u64>,
 }
 
+impl HardwareInputSnapshot {
+    /// The observer's own readings, when its gap-free coverage began and its
+    /// newest hardware input, put on a host clock that counts milliseconds
+    /// from `origin`. An instant before `origin` reads as 0: the observer is
+    /// process-wide and usually began long before the host, and an input that
+    /// old is before any front the host makes, so it cannot read as input
+    /// since that front.
+    pub fn from_instants(
+        origin: std::time::Instant,
+        coverage_start: std::time::Instant,
+        last_input: Option<std::time::Instant>,
+    ) -> Self {
+        let millis = |at: std::time::Instant| {
+            u64::try_from(at.saturating_duration_since(origin).as_millis()).unwrap_or(u64::MAX)
+        };
+        Self {
+            coverage_start_ms: millis(coverage_start),
+            last_input_ms: last_input.map(millis),
+        }
+    }
+}
+
 /// Whether hardware input arrived strictly after `front_instant_ms`.
 ///
 /// An unavailable snapshot, or one whose coverage began after the front,

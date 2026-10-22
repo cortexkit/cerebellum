@@ -1061,3 +1061,40 @@ fn observer_aborts_and_unfronted_bracket_stops_map_to_fronting_stops() {
         );
     }
 }
+
+/// The macOS host turns the process-wide observer's instants into a snapshot on
+/// its own millisecond clock. An input from before the host existed reads as 0,
+/// so it never counts as input since a front; one after the front does.
+#[test]
+fn observer_instants_map_onto_the_host_clock() {
+    use std::time::{Duration, Instant};
+    let before_host = Instant::now();
+    let origin = before_host + Duration::from_millis(10);
+
+    let snapshot = HardwareInputSnapshot::from_instants(
+        origin,
+        before_host,
+        Some(origin + Duration::from_millis(250)),
+    );
+    assert_eq!(
+        snapshot,
+        HardwareInputSnapshot {
+            coverage_start_ms: 0,
+            last_input_ms: Some(250),
+        }
+    );
+    assert!(hardware_input_since(Some(snapshot), 100));
+    assert!(!hardware_input_since(Some(snapshot), 250));
+
+    let old_input = HardwareInputSnapshot::from_instants(origin, before_host, Some(before_host));
+    assert_eq!(old_input.last_input_ms, Some(0));
+    assert!(!hardware_input_since(Some(old_input), 0));
+
+    // Coverage that began after the front cannot speak for the time between.
+    let late_coverage = HardwareInputSnapshot::from_instants(
+        origin,
+        origin + Duration::from_millis(400),
+        Some(origin + Duration::from_millis(500)),
+    );
+    assert!(!hardware_input_since(Some(late_coverage), 100));
+}

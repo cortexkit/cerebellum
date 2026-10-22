@@ -457,6 +457,16 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         self.heartbeat.post().0
     }
 
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
+        let (coverage_start, last_input) =
+            cerebellum_macos::SessionEventTap::hardware_input_snapshot()?;
+        Some(crate::dispatch::HardwareInputSnapshot::from_instants(
+            self.started,
+            coverage_start,
+            last_input,
+        ))
+    }
+
     fn observe_heartbeat(
         &mut self,
         tap: &Self::Tap,
