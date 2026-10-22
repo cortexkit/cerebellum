@@ -340,8 +340,11 @@ impl Rig {
         self.captures.0.load(Ordering::SeqCst)
     }
 
-    /// Wait until the preview worker has made `count` captures.
-    fn until_captured(&self, count: usize) {
+    /// Wait until the preview worker has made `count` captures. Yields to
+    /// the runtime between polls: the refresh that leads to a capture can be
+    /// reported from a task of this test's own single-thread runtime, which a
+    /// blocking wait would never let run.
+    async fn until_captured(&self, count: usize) {
         let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         while self.captures() < count {
             assert!(
@@ -350,6 +353,7 @@ impl Rig {
                 self.captures()
             );
             std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
         }
     }
 
@@ -623,7 +627,7 @@ async fn a_minimized_window_shows_the_minimized_fallback() {
     let mut rig = rig(AppUse::Background, true, true).await;
     rig.desk.state().minimized_windows.insert(BEHIND.0);
     let tree = rig.read().await;
-    rig.until_captured(1);
+    rig.until_captured(1).await;
     let start = tokio::time::Instant::now();
     let reply = rig
         .call(
@@ -689,7 +693,7 @@ async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreg
     ACTING_SESSION
         .scope(Some(session.clone()), rig.read())
         .await;
-    rig.until_captured(1);
+    rig.until_captured(1).await;
     assert!(rig.shown(&me));
     assert!(rig
         .plane
@@ -1010,7 +1014,7 @@ async fn a_cancel_frame_hides_the_preview_its_call_showed() {
     .await
     .unwrap();
     read.recv().await.unwrap();
-    rig.until_captured(1);
+    rig.until_captured(1).await;
     // A correlation nobody is running cancels nothing.
     crate::handle_frame(
         wire_frame(subc_protocol::FrameType::Cancel, 7, 1, 99),
@@ -1054,7 +1058,7 @@ async fn a_goodbye_frame_hides_the_previews_its_route_showed() {
     .await
     .unwrap();
     read.recv().await.unwrap();
-    rig.until_captured(1);
+    rig.until_captured(1).await;
     crate::handle_frame(
         wire_frame(subc_protocol::FrameType::Goodbye, 7, 2, 0),
         &tx,
