@@ -366,6 +366,65 @@ async fn a_cancel_while_waiting_for_the_lock_stops_at_once() {
 // from, and every front and restore request is logged in order.
 // ---------------------------------------------------------------------------
 
+#[tokio::test(start_paused = true)]
+async fn a_global_drag_starting_after_guard_zero_waits_until_the_front_finishes() {
+    use super::held_input::{HeldInput, HeldPress};
+    let lock = FrontingLock::isolated();
+    let cancel = crate::CancelHandle::pending();
+    let held = Arc::new(HeldInput::default());
+    let screen = Screen::new(&mail_desk());
+    let front = lock.take(&cancel).await.unwrap();
+    assert!(held_input_confirmed(&held), "guard zero passed");
+
+    let drag = SyntheticAction::drag_pointer(
+        cerebellum_computer::platform::SyntheticPoint { x: 1.0, y: 1.0 },
+        cerebellum_computer::platform::SyntheticPoint { x: 2.0, y: 2.0 },
+    );
+    let send = held.begin_global_send(
+        HeldPress::global(&other_app(), &drag).unwrap(),
+        Some(under_terminal()),
+        &lock,
+        &cancel,
+    );
+    tokio::pin!(send);
+    // Poll registration in the gap after guard zero, before request_front.
+    tokio::select! {
+        biased;
+        _ = &mut send => panic!("global drag registered between guard zero and the front"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert!(!held.global_send_outstanding());
+    FakeSession(screen.clone()).request_front(4242);
+    assert_eq!(screen.log(), ["front:4242"]);
+    drop(front);
+    let ticket = send.await.unwrap();
+    assert!(held.global_send_outstanding());
+    assert!(
+        lock.held(),
+        "the send retains the exclusion until discharge"
+    );
+    assert!(!held_input_confirmed(&held));
+    ticket.settle(HeldStateDisposition::NoneHeld, |_| false);
+    assert!(!lock.held());
+    assert!(held_input_confirmed(&held));
+
+    let unknown = held
+        .begin_global_send(
+            HeldPress::global(&other_app(), &drag).unwrap(),
+            None,
+            &lock,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    drop(unknown);
+    assert!(
+        lock.held(),
+        "an unknown global release retains the exclusion in quarantine"
+    );
+    assert!(!held_input_confirmed(&held));
+}
+
 #[allow(dead_code)]
 mod support {
     use crate as cerebellum;
@@ -2843,3 +2902,104 @@ async fn input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen()
 
 #[path = "fronting_admission_tests.rs"]
 mod admission;
+
+#[tokio::test(start_paused = true)]
+async fn person_input_requests_restore_before_a_slow_settle_read() {
+    use cerebellum_computer::app_state::source::ElementHandle;
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, ElementActionError, RawAppState, ReadBounds, WindowMark,
+    };
+
+    struct SlowSettleSource {
+        desk: support::Desk,
+        screen: Screen,
+        input_at: Arc<StdMutex<Option<u64>>>,
+    }
+    impl AppStateSource for SlowSettleSource {
+        fn read_app_state(
+            &self,
+            target: &ProcessGrant,
+            bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            if self.input_at.lock().unwrap().is_some() {
+                let mut state = self.screen.state();
+                state.log.push("slow_read".into());
+                // The fake screen clock is paused between host operations.
+                // An AX read after input would hold it for four seconds.
+                state.now += 4_000;
+            }
+            self.desk.read_app_state(target, bounds)
+        }
+        fn element_facts(&self, e: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+            self.desk.element_facts(e)
+        }
+        fn element_enabled(&self, e: &ElementHandle) -> Option<bool> {
+            self.desk.element_enabled(e)
+        }
+        fn press(&self, e: &ElementHandle) -> Result<(), ElementActionError> {
+            self.desk.press(e)
+        }
+        fn focused_element(
+            &self,
+            g: &ProcessGrant,
+        ) -> Result<Option<ElementHandle>, ElementActionError> {
+            self.desk.focused_element(g)
+        }
+        fn focused_window(
+            &self,
+            g: &ProcessGrant,
+        ) -> Result<Option<WindowMark>, ElementActionError> {
+            self.desk.focused_window(g)
+        }
+        fn frontmost_pid(&self) -> Option<u32> {
+            self.desk.frontmost_pid()
+        }
+        fn hardware_input(
+            &self,
+            g: &ProcessGrant,
+        ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
+            self.desk.hardware_input(g)
+        }
+        fn time_since_last_input(&self) -> Option<Duration> {
+            self.desk.time_since_last_input()
+        }
+    }
+    let mut rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let input_at = Arc::new(StdMutex::new(None));
+    Arc::get_mut(&mut rig.plane)
+        .expect("no call is running")
+        .app_state_source = Arc::new(SlowSettleSource {
+        desk: rig.desk.clone(),
+        screen: rig.screen.clone(),
+        input_at: input_at.clone(),
+    });
+    let (screen, stamp) = (rig.screen.clone(), input_at.clone());
+    rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+        let mut state = screen.state();
+        state.person_key_pending = true;
+        state.last_input_ms = Some(state.now + 1);
+        state.now += 2;
+        *stamp.lock().unwrap() = Some(state.now);
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "restore:100"],
+        "restore must precede any slow final AX read"
+    );
+    let elapsed = rig.screen.state().now - input_at.lock().unwrap().unwrap();
+    assert!(
+        elapsed <= 50,
+        "person input to restore took {elapsed} ms, beyond one settle poll"
+    );
+}

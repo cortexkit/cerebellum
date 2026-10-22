@@ -1117,10 +1117,10 @@ pub(crate) fn adopt(
 /// final read becomes the baseline and the conversation's last-seen focus.
 ///
 /// `person_acted` is asked before every read. Once it answers `true`, the
-/// settle ends after one last read. If that read succeeds, it becomes the
-/// baseline for the reply's diff but not the last-seen focus: marks read
-/// after the person's input would hide that input from the next person
-/// check. Callers with nothing to watch pass [`person_input_not_watched`].
+/// settle returns without another read, letting the caller restore at once.
+/// There is no final diff after interruption: even a bounded AX read would
+/// delay the restore and could absorb the person's input into the baseline.
+/// Callers with nothing to watch pass [`person_input_not_watched`].
 pub(crate) fn settle_and_observe_view(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
@@ -1133,29 +1133,39 @@ pub(crate) fn settle_and_observe_view(
     let deadline = Instant::now() + bound;
     loop {
         let interrupted = person_acted();
-        let seen = (!interrupted).then(|| SeenMarks::read(source, grant));
-        let raw = if expand_menus {
-            source.read_app_state_expanding_menus(grant, ReadBounds::default())
-        } else {
-            source.read_app_state(grant, ReadBounds::default())
+        if interrupted {
+            return None;
+        }
+        let poll_deadline = (Instant::now() + SETTLE_POLL).min(deadline);
+        let seen = SeenMarks::read(source, grant);
+        // A poll must not inherit the ordinary four-second AX read budget
+        // while the target is temporarily in front.
+        let bounds = ReadBounds {
+            timeout: poll_deadline.saturating_duration_since(Instant::now()),
+            ..ReadBounds::default()
         };
+        let raw = if expand_menus {
+            source.read_app_state_expanding_menus(grant, bounds)
+        } else {
+            source.read_app_state(grant, bounds)
+        };
+        if person_acted() {
+            return None;
+        }
         match raw {
             Ok(read) => {
-                if interrupted
-                    || Instant::now() >= deadline
+                if Instant::now() >= deadline
                     || sessions.differs_from_baseline(conversation_key, grant, &read)
                 {
                     let observed = sessions.observe(conversation_key, grant, &read);
-                    if let Some(seen) = seen {
-                        sessions.remember_seen(conversation_key, grant, seen);
-                    }
+                    sessions.remember_seen(conversation_key, grant, seen);
                     return Some(observed);
                 }
             }
             // Nothing could be read, so nothing is known about what changed.
             Err(_) => return None,
         }
-        std::thread::sleep(SETTLE_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        std::thread::sleep(poll_deadline.saturating_duration_since(Instant::now()));
     }
 }
 

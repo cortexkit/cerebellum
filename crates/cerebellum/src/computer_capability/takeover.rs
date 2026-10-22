@@ -668,7 +668,27 @@ where
         {
             return refusal_reply(&DispatchError::AuditUnavailable);
         }
-        let ticket = self.track_held_input(held_press, &work);
+        let ticket = if let Some(press) = held_press {
+            let ticket = match self
+                .held_input
+                .begin_global_send(press, work.terminal.clone(), &self.fronting_lock, &cancel)
+                .await
+            {
+                Ok(ticket) => ticket,
+                Err(_) => return super::held_input::held_input_unconfirmed_reply("takeover"),
+            };
+            if let Some(terminal) = &work.terminal {
+                let outcome = ticket.outcome();
+                let permit = work.permits().and_then(|permits| permits.take_release());
+                terminal.set_release(async move {
+                    let _permit = permit;
+                    outcome.await
+                });
+            }
+            Some(ticket)
+        } else {
+            None
+        };
 
         // Posting blocks for as long as the sequence takes. Run it off the
         // runtime so a cancel frame can still be read and set the signal.

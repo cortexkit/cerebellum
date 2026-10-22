@@ -102,10 +102,10 @@ mod macos;
 mod preview_schedule;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
-    probe_cursor_hide, probe_cursor_motion, probe_preview_hide, reduce_motion,
-    render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot, HideProbe, MotionProbe,
-    OverlayAccent, OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, PictureTiming,
-    PreviewHideProbe, ProbePass, AVATAR_PIXELS,
+    probe_cursor_hide, probe_cursor_motion, probe_overlay_capture_exclusion, probe_preview_hide,
+    reduce_motion, render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot,
+    HideProbe, MotionProbe, OverlayAccent, OverlayColours, OverlayEvent, OverlayGesture,
+    OverlayMessage, PictureTiming, PreviewHideProbe, ProbePass, AVATAR_PIXELS,
 };
 #[cfg(target_os = "macos")]
 pub use preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, PreviewFallback};

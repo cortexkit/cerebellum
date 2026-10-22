@@ -2924,10 +2924,10 @@ build_timeout_s = 1800
 
 [[control]]
 id = "app-use-settle-ended-by-the-person-keeps-the-seen-marks"
-guards = "a settle the person's input ended does not record the application as seen after their input, so the next person check still sees it"
+guards = "a settle the person's input ended returns before a final AX read, preserving the seen baseline and requesting restore without the read's delay"
 file = "crates/cerebellum/src/computer_capability/element_actions.rs"
-old = "        let seen = (!interrupted).then(|| SeenMarks::read(source, grant));"
-new = "        let seen = Some(SeenMarks::read(source, grant)); // NON-VACUITY BREAK"
+old = "        if interrupted {\n            return None;\n        }"
+new = "        if false && interrupted { // NON-VACUITY BREAK\n            return None;\n        }"
 edits = []
 test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
 runner = "cargo"
@@ -2935,7 +2935,7 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+    "computer_capability::fronting_tests::person_input_requests_restore_before_a_slow_settle_read",
 ]
 only = false
 timeout_s = 600
