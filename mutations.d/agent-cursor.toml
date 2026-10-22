@@ -2999,3 +2999,82 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "target-not-read-has-its-own-reason"
+guards = "a front stopped because the conversation never read its target reports not_fronted_reason target_not_read, never observer_unavailable"
+file = "crates/cerebellum-computer/src/dispatch/bracket/reason.rs"
+old = "        FrontingStop::TargetNotRead => NotFrontedReason::TargetNotRead,"
+new = "        FrontingStop::TargetNotRead => NotFrontedReason::ObserverUnavailable, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_background_chord_to_an_app_never_read_fronts_nothing_until_it_is_read",
+    "computer_capability::fronting_tests::admission::a_press_on_an_app_never_read_fronts_nothing",
+    "computer_capability::fronting_tests::admission::foreground_input_to_an_app_never_read_fronts_nothing",
+    "computer_capability::fronting_tests::every_restore_value_and_reason_reaches_the_reply",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "an-unreadable-person-check-keeps-observer-unavailable"
+guards = "a person check that cannot read what it compares still reports observer_unavailable, not target_not_read"
+file = "crates/cerebellum-computer/src/dispatch/bracket/reason.rs"
+old = "        FrontingStop::TargetNotRead => NotFrontedReason::TargetNotRead,"
+new = "        FrontingStop::TargetNotRead => NotFrontedReason::TargetNotRead,\n        FrontingStop::PersonCheckUnreadable => NotFrontedReason::TargetNotRead, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::an_unreadable_observer_or_person_check_still_reports_observer_unavailable",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "an-unreadable-person-check-is-not-taken-for-a-target-not-read"
+guards = "guard (1) stops an unreadable person check as PersonCheckUnreadable, keeping TargetNotRead for a target never read"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        Err(()) => Err(FrontingStop::PersonCheckUnreadable.into()),"
+new = "        Err(()) => Err(FrontingStop::TargetNotRead.into()), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::an_unreadable_observer_or_person_check_still_reports_observer_unavailable",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "a-needs-front-press-reports-target-not-read"
+guards = "a needs-front press stopped because the conversation never read its target reports target_not_read, not the unreadable person check the press run reports"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "                report.stop = Some(PressRunStop::NotFronted(FrontingStop::TargetNotRead));"
+new = "                // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_press_on_an_app_never_read_fronts_nothing",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
