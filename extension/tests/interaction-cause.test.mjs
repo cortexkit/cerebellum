@@ -8,8 +8,9 @@ import { OBSERVED_INPUT_EVENTS } from "../epochs.mjs";
 // These model one agent `type` into a field whose page reacts to focus. The
 // agent's first plan focuses the field; its debugger then detaches, and the
 // page's own reaction lands between that plan and the agent's next one. Each
-// reaction must surface with its own cause code, so a refusal on a real page
-// says which signal moved the interaction epoch.
+// reaction must surface distinctly: a counted one with its own cause code, an
+// uncounted child-frame navigation as lost observation, so a refusal on a real
+// page says which signal stopped the type.
 const focusEmulation = { method: "Emulation.setFocusEmulationEnabled", params: { enabled: true } };
 const focus = { method: "DOM.focus", params: { backendNodeId: 4 } };
 const insert = { method: "Input.insertText", params: { text: "x" } };

@@ -747,9 +747,10 @@ const OBSERVED_INPUT_EVENTS: [&str; 13] = [
 /// The extension's code for why a tab's interaction epoch last moved, kept
 /// only when it is in the extension's closed vocabulary:
 /// `input.<event>.<main|subframe>` for a person's input event in the main
-/// frame or a child frame, or `navigation.<main|subframe>` for a navigation
-/// the agent did not start. Any other string becomes `unrecognized`, so no
-/// page-supplied text can reach a reply.
+/// frame or a child frame, or `navigation.main` for a main-frame navigation
+/// the agent did not start. `navigation.subframe` is also accepted, though
+/// the extension no longer counts child-frame navigations. Any other string
+/// becomes `unrecognized`, so no page-supplied text can reach a reply.
 fn recognized_cause(code: Option<String>) -> Option<String> {
     let code = code?;
     let known = match code.split('.').collect::<Vec<_>>().as_slice() {

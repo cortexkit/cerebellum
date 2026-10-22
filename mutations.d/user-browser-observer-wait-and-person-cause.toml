@@ -1,0 +1,153 @@
+
+[[control]]
+id = "user-browser-read-refuses-observer-only-at-the-bound"
+guards = "a snapshot whose observer never arrives refuses observer_unavailable only after the full observer wait"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "if observed.observer_available || now >= bound {"
+new = "if observed.observer_available || now + OBSERVER_WAIT / 4 >= bound {"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::snapshot_refuses_an_observer_that_never_arrives_only_at_the_bound"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn observed_document(&self, tab: &str) -> Result<Document, Value> {"
+before = "async fn serve_inner("
+
+
+[[control]]
+id = "user-browser-read-polls-for-a-late-observer"
+guards = "a snapshot keeps reading the document until a late observer arrives"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "tokio::time::sleep(OBSERVER_POLL.min(bound - now)).await;"
+new = "tokio::time::sleep(bound - now).await;"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::snapshot_waits_for_an_observer_that_arrives_late"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn observed_document(&self, tab: &str) -> Result<Document, Value> {"
+before = "async fn serve_inner("
+
+
+[[control]]
+id = "user-browser-committed-navigation-never-refused-by-its-read"
+guards = "a committed navigation whose read_page fails reports the committed outcome with the read's refusal nested"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "reply[\"read_page\"] = match read_landed_page(context, tab, args, landed, once).await {"
+new = "reply[\"read_page\"] = match Ok::<Value, Value>(read_landed_page(context, tab, args, landed, once).await?) {"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::a_committed_navigation_whose_page_read_fails_reports_the_navigation"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "if args[\"read_page\"] == true {"
+before = "async fn read_landed_page("
+
+
+[[control]]
+id = "user-browser-navigation-read-waits-for-a-replaced-observer"
+guards = "a navigation's page read that loses the observer mid-capture waits for it and reads again"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "Err(refused) if refused[\"reason\"] == \"observer_unavailable\" => refused,"
+new = "Err(refused) if refused[\"reason\"] == \"never\" => refused,"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::a_navigation_page_read_waits_for_an_observer_lost_during_the_capture"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn read_landed_page("
+before = "fn baseline("
+
+
+[[control]]
+id = "user-browser-person-refusal-names-the-epoch-cause"
+guards = "a state_changed_by_person refusal names the extension's code for what moved the interaction epoch"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "observed.interaction_cause.as_deref(),"
+new = "None,"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/person_check.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::person_check::each_page_reaction_to_focus_names_its_own_cause"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn input_document("
+before = "async fn verify_input("
+
+
+[[control]]
+id = "user-browser-person-refusal-names-the-changed-document-part"
+guards = "a state_changed_by_person refusal says whether the committed URL changed, separately from the history entry"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "\"url_changed\":before.url != after.url,"
+new = "\"url_changed\":before.entry_id != after.entry_id,"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/person_check.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::person_check::each_page_reaction_to_focus_names_its_own_cause"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn document_moved("
+before = "/// An unanswered user-browser site card chooses `deny`."
+
+
+[[control]]
+id = "user-browser-cause-codes-stay-in-the-observed-vocabulary"
+guards = "only cause codes naming an event type the extension observes pass into a reply"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "[\"input\", event, \"main\" | \"subframe\"] => OBSERVED_INPUT_EVENTS.contains(event),"
+new = "[\"input\", _event, \"main\" | \"subframe\"] => true,"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/person_check.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::person_check::only_the_extensions_closed_cause_vocabulary_reaches_a_reply"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn recognized_cause(code: Option<String>) -> Option<String> {"
+before = "fn epoch_moved("
