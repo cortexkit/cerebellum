@@ -551,3 +551,60 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-v28-mint-adds-config-invalid"
+guards = "the shipped computer action vocabulary v28 is exactly what the v28 mint step produces from v27, including config_invalid on every row"
+file = "crates/cerebellum-computer/tests/it/vocabulary_mint/mod.rs"
+old = "        choices.push(json!(\"config_invalid\"));\n"
+new = "        // NON-VACUITY BREAK\n"
+edits = []
+test_file = "crates/cerebellum-computer/tests/it/c1_s1_platform.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--test it"
+select = "expected"
+expect_red = [
+    "c1_s1_platform::the_minted_artifact_is_the_generator_output_from_v12",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-v28-press-declares-left-in-front-app"
+guards = "a press whose restore failed, naming the application left in front in bundle_identity, passes press_element's frozen result schema under withholding"
+file = "crates/cerebellum-computer/resources/computer_action_vocabulary-v28.json"
+old = '"bundle_identity":{"description":"The application left in front, present on restore_failed when it is the target.","type":"string"}'
+new = '"bundle_identity NON-VACUITY BREAK":{"description":"The application left in front, present on restore_failed when it is the target.","type":"string"}'
+edits = []
+test_file = "crates/cerebellum-computer/src/platform/vocabulary.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "platform::vocabulary::tests::a_press_whose_restore_failed_passes",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-v28-terminal-body-restore-failed"
+guards = "every terminal body of a fronting action, including one whose failed restore turns it into restore_failed, passes that action's frozen result schema"
+file = "crates/cerebellum-computer/resources/computer_action_vocabulary-v28.json"
+old = '"config_invalid","not_fronted","restore_failed","state_changed_by_person"]'
+new = '"config_invalid","not_fronted","state_changed_by_person","NON-VACUITY BREAK"]'
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::arbiter_egress_tests::terminal_shapes_pass_frozen_schemas_in_every_named_phase",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

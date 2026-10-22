@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v27";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v28";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v27.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v28.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "54aff871c6fcc4c18b5dfd3ebe272ab86c3724f5264a763a29ef63fe454cb2df";
+    "8d94a0a6ea65d41080b8866ec788244d3d1f0ff425a8bd8d845d0a4abe4a0b65";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1172,6 +1172,269 @@ mod tests {
                 "computer.nope".into(),
             ))
         );
+    }
+
+    /// The rows whose action can bring its application to the front.
+    const FRONTING_ROWS: [&str; 7] = [
+        "computer.read_state",
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+        "computer.type",
+        "computer.keys",
+        "computer.open_app",
+    ];
+
+    /// What withholding mode would object to in `reply`: it withholds any
+    /// reply `validate_capability_result` rejects, so an empty list means the
+    /// reply reaches the caller.
+    fn withheld(capability_id: &str, reply: &Value) -> Vec<CapabilityResultViolation> {
+        match validate_capability_result(capability_id, reply) {
+            Ok(()) => Vec::new(),
+            Err(CapabilityResultValidationError::ReplyViolations { violations, .. }) => violations,
+            Err(error) => panic!("{capability_id}: {error}"),
+        }
+    }
+
+    /// A keystroke row requires its envelope on every reply, refusals
+    /// included; a refusal made before any post call carries these values.
+    fn with_keystroke_envelope(capability_id: &str, mut reply: Value) -> Value {
+        if matches!(capability_id, "computer.type" | "computer.keys") {
+            let object = reply.as_object_mut().unwrap();
+            object.insert("containment_rung".into(), "global_none".into());
+            object.insert("target_fronted".into(), false.into());
+            object.insert("effect_status".into(), "not_dispatched".into());
+            object.insert("posts_returned".into(), 0.into());
+        }
+        reply
+    }
+
+    fn artifact_row_ids() -> Vec<String> {
+        let vocabulary: Value =
+            serde_json::from_slice(COMPUTER_ACTION_VOCABULARY_ARTIFACT).unwrap();
+        vocabulary["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["capability_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_config_invalid_refusal_passes_on_every_row() {
+        let ids = artifact_row_ids();
+        assert_eq!(ids.len(), 12);
+        for id in &ids {
+            let reply = with_keystroke_envelope(
+                id,
+                serde_json::json!({
+                    "outcome": "config_invalid",
+                    "remedy": "fix ~/.config/cortexkit/cerebellum.jsonc: computer_use.app_use must be \"background\" or \"foreground\"",
+                }),
+            );
+            assert_eq!(withheld(id, &reply), Vec::new(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_press_whose_restore_failed_passes() {
+        for id in ["computer.press_element", "computer.press_point"] {
+            let reply = serde_json::json!({
+                "outcome": "restore_failed",
+                "effect_status": "effect_observed",
+                "remedy": "Mail was left in front; switch back to the application you were using",
+                "bundle_identity": "com.apple.mail",
+                "fronting": {
+                    "mode": "background",
+                    "fronted": true,
+                    "purpose": "needs_front",
+                    "restore": "failed",
+                },
+            });
+            assert_eq!(withheld(id, &reply), Vec::new(), "{id}");
+        }
+    }
+
+    /// A call stopped after its application was fronted for an image keeps
+    /// the terminal body's `detail` and `effect_status` when its restore
+    /// fails.
+    #[test]
+    fn a_terminal_read_whose_restore_failed_passes() {
+        let reply = serde_json::json!({
+            "outcome": "restore_failed",
+            "effect_status": "effect_indeterminate",
+            "detail": {
+                "reason": "cancelled",
+                "dispatched": true,
+                "step": "dispatch",
+                "held_state": "none_held",
+            },
+            "remedy": "Mail was left in front; switch back to the application you were using",
+            "fronting": {
+                "mode": "background",
+                "fronted": true,
+                "purpose": "bring_to_front",
+                "restore": "failed",
+            },
+        });
+        assert_eq!(withheld("computer.read_state", &reply), Vec::new());
+    }
+
+    #[test]
+    fn a_foreground_open_app_refused_for_a_person_change_passes() {
+        let reply = serde_json::json!({
+            "outcome": "state_changed_by_person",
+            "reason": "focus_changed",
+            "remedy": "call read_state, then act on what it shows",
+            "fronting": {
+                "mode": "foreground",
+                "fronted": false,
+                "purpose": "foreground_mode",
+                "restore": "not_needed",
+                "not_fronted_reason": "person_changed_target",
+            },
+        });
+        assert_eq!(withheld("computer.open_app", &reply), Vec::new());
+    }
+
+    /// Every value the `fronting` object, `preview` and
+    /// `fronting_bound_exceeded` can take is declared on every fronting row.
+    #[test]
+    fn every_fronting_value_passes_on_every_fronting_row() {
+        let reasons = [
+            "held_input_unconfirmed",
+            "person_changed_target",
+            "observer_unavailable",
+            "person_active",
+            "previous_unknown",
+            "front_failed",
+            "cancelled",
+            "fronting_busy",
+            "unattended",
+            "fronting_unavailable",
+        ];
+        let restores = [
+            "not_needed",
+            "left_in_front",
+            "restored",
+            "skipped_person",
+            "failed",
+        ];
+        for id in FRONTING_ROWS {
+            // Each row's word for an action that went through.
+            let success = match id {
+                "computer.keys" => "delivery_unconfirmed",
+                "computer.open_app" => "already_running",
+                _ => "completed",
+            };
+            for reason in reasons {
+                let reply = with_keystroke_envelope(
+                    id,
+                    serde_json::json!({
+                        "outcome": "not_fronted",
+                        "remedy": "wait, then retry",
+                        "fronting": {
+                            "mode": "foreground",
+                            "fronted": false,
+                            "purpose": "foreground_mode",
+                            "restore": "not_needed",
+                            "not_fronted_reason": reason,
+                        },
+                    }),
+                );
+                assert_eq!(withheld(id, &reply), Vec::new(), "{id} {reason}");
+            }
+            for (restore, (purpose, mode)) in restores.into_iter().zip([
+                ("none", "background"),
+                ("foreground_mode", "foreground"),
+                ("needs_front", "background"),
+                ("bring_to_front", "background"),
+                ("needs_front", "background"),
+            ]) {
+                for preview in ["not_synchronized", "not_shown_capacity"] {
+                    let reply = with_keystroke_envelope(
+                        id,
+                        serde_json::json!({
+                            "outcome": success,
+                            "preview": preview,
+                            "fronting_bound_exceeded": true,
+                            "fronting": {
+                                "mode": mode,
+                                "fronted": restore != "not_needed",
+                                "purpose": purpose,
+                                "restore": restore,
+                                "person_input_during_fronting": true,
+                            },
+                        }),
+                    );
+                    assert_eq!(withheld(id, &reply), Vec::new(), "{id} {restore} {preview}");
+                }
+            }
+        }
+    }
+
+    /// The `fronting` object is closed, requires its four facts, accepts only
+    /// its listed reasons, and is declared only on the rows that can front.
+    #[test]
+    fn the_fronting_object_is_closed_and_only_on_fronting_rows() {
+        let fronting = serde_json::json!({
+            "mode": "background",
+            "fronted": true,
+            "purpose": "needs_front",
+            "restore": "restored",
+        });
+        let reply = |fronting: Value| serde_json::json!({"outcome": "restore_failed", "fronting": fronting});
+        let mut extra = fronting.clone();
+        extra["left_in_front"] = 42.into();
+        assert_eq!(
+            withheld("computer.read_state", &reply(extra)),
+            vec![CapabilityResultViolation::UndeclaredProperty {
+                path: "$.fronting.left_in_front".into(),
+            }]
+        );
+        let mut missing = fronting.clone();
+        missing.as_object_mut().unwrap().remove("restore");
+        assert_eq!(
+            withheld("computer.read_state", &reply(missing)),
+            vec![CapabilityResultViolation::MissingRequiredProperty {
+                path: "$.fronting".into(),
+                property: "restore".into(),
+            }]
+        );
+        let mut unknown = fronting.clone();
+        unknown["not_fronted_reason"] = "person_busy".into();
+        assert_eq!(
+            withheld("computer.read_state", &reply(unknown)),
+            vec![CapabilityResultViolation::EnumMismatch {
+                path: "$.fronting.not_fronted_reason".into(),
+            }]
+        );
+        for id in artifact_row_ids() {
+            if FRONTING_ROWS.contains(&id.as_str()) {
+                continue;
+            }
+            let reply = serde_json::json!({
+                "outcome": "config_invalid",
+                "fronting": fronting,
+                "preview": "not_synchronized",
+                "fronting_bound_exceeded": false,
+            });
+            assert_eq!(
+                withheld(&id, &reply),
+                vec![
+                    CapabilityResultViolation::UndeclaredProperty {
+                        path: "$.fronting".into(),
+                    },
+                    CapabilityResultViolation::UndeclaredProperty {
+                        path: "$.fronting_bound_exceeded".into(),
+                    },
+                    CapabilityResultViolation::UndeclaredProperty {
+                        path: "$.preview".into(),
+                    },
+                ],
+                "{id}"
+            );
+        }
     }
 
     #[test]

@@ -989,6 +989,7 @@ mod arbiter_egress_tests {
                 &body(&deadline),
             )
             .unwrap();
+            fronting_terminal_bodies_pass(&body(&deadline));
             for cause in [
                 TerminalCause::Deadline,
                 TerminalCause::Cancelled,
@@ -1015,6 +1016,64 @@ mod arbiter_egress_tests {
                     &reply,
                 )
                 .unwrap();
+                fronting_terminal_bodies_pass(&reply);
+            }
+        }
+    }
+
+    /// Every terminal body is checked against each fronting row's result
+    /// schema, as it is and as it reads after a front: carrying `fronting`,
+    /// and with a failed restore turning the outcome into `restore_failed`
+    /// while the body's `detail` and `effect_status` are kept. Apart from the
+    /// keystroke-row exception below, each must pass.
+    ///
+    /// The keystroke rows require `containment_rung`, `effect_status` and
+    /// `target_fronted` on every reply. This arbiter's own bodies never carry
+    /// the first and last, and its deadline body carries no `effect_status`,
+    /// so on those rows the only violations allowed are those required
+    /// fields the body lacks. The result-schema validator accepts no `anyOf`,
+    /// so a keystroke row cannot declare a separate terminal shape.
+    fn fronting_terminal_bodies_pass(terminal: &Value) {
+        use computer::platform::vocabulary::{
+            validate_capability_result, CapabilityResultValidationError, CapabilityResultViolation,
+        };
+        let mut fronted = terminal.clone();
+        fronted["fronting"] = json!({"mode":"background", "fronted":true,
+            "purpose":"needs_front", "restore":"restored"});
+        let mut restore_failed = fronted.clone();
+        restore_failed["fronting"]["restore"] = json!("failed");
+        restore_failed["outcome"] = json!("restore_failed");
+        restore_failed["remedy"] =
+            json!("Mail was left in front; switch back to the application you were using");
+        for capability in [
+            "computer.read_state",
+            "computer.press_element",
+            "computer.press_point",
+            "computer.write_text",
+            "computer.type",
+            "computer.keys",
+            "computer.open_app",
+        ] {
+            let keystroke_row = matches!(capability, "computer.type" | "computer.keys");
+            for reply in [terminal, &fronted, &restore_failed] {
+                let allowed: Vec<_> = ["containment_rung", "effect_status", "target_fronted"]
+                    .into_iter()
+                    .filter(|property| keystroke_row && reply.get(property).is_none())
+                    .map(
+                        |property| CapabilityResultViolation::MissingRequiredProperty {
+                            path: "$".into(),
+                            property: property.into(),
+                        },
+                    )
+                    .collect();
+                let violations = match validate_capability_result(capability, reply) {
+                    Ok(()) => Vec::new(),
+                    Err(CapabilityResultValidationError::ReplyViolations {
+                        violations, ..
+                    }) => violations,
+                    Err(error) => panic!("{capability}: {error}"),
+                };
+                assert_eq!(violations, allowed, "{capability}: {reply}");
             }
         }
     }

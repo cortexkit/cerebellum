@@ -2193,3 +2193,167 @@ pub fn v27_from_v26(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The rows whose action can bring its application to the front: in
+/// foreground mode before every action, and in background mode only for an
+/// action that cannot work with the application behind another one.
+/// `wait` and `list_apps` never front, and the three `takeover_*` rows keep
+/// their own takeover grant, so none of those five is listed.
+pub const FRONTING_ROW_IDS: [&str; 7] = [
+    "computer.read_state",
+    "computer.press_element",
+    "computer.press_point",
+    "computer.write_text",
+    "computer.type",
+    "computer.keys",
+    "computer.open_app",
+];
+
+/// What v28 appends to every row's outcome description, separated from the
+/// existing text by one space.
+pub const CONFIG_INVALID_DESCRIPTION: &str = "config_invalid means cerebellum's user config file no longer parses, so nothing was done; remedy names the file and the parse error, and every computer_use action answers this until the file is fixed.";
+
+/// What v28 appends to each fronting row's outcome description, after
+/// `CONFIG_INVALID_DESCRIPTION` and one space.
+pub const FRONTING_OUTCOMES_DESCRIPTION: &str = "not_fronted means the action needed its application in front and it could not be brought there, so nothing was done; fronting.not_fronted_reason says why. restore_failed means the application that was in front before could not be put back; remedy names the application left in front, and detail and effect_status say what the action itself did.";
+
+/// Why an action that should have fronted its application did not. Each
+/// stop of the fronting path maps to exactly one of these; only
+/// `person_changed_target` says the person used the target application.
+pub const NOT_FRONTED_REASONS: [&str; 10] = [
+    "held_input_unconfirmed",
+    "person_changed_target",
+    "observer_unavailable",
+    "person_active",
+    "previous_unknown",
+    "front_failed",
+    "cancelled",
+    "fronting_busy",
+    "unattended",
+    "fronting_unavailable",
+];
+
+/// The `fronting` object every fronting row's reply can carry. It is closed
+/// like every other nested result object, and only the four facts every
+/// fronting decision has are required inside it.
+pub fn v28_fronting_field() -> Value {
+    let mut properties = Map::new();
+    properties.insert(
+        "mode".into(),
+        json!({"type":"string","enum":["foreground", "background"],
+            "description":"The app_use setting this action ran under."}),
+    );
+    properties.insert(
+        "fronted".into(),
+        json!({"type":"boolean",
+            "description":"Whether this action brought its application to the front."}),
+    );
+    properties.insert(
+        "purpose".into(),
+        json!({"type":"string","enum":["foreground_mode", "needs_front", "bring_to_front", "none"],
+            "description":"Why fronting was attempted: the foreground setting, an action that only works with the application in front, a bring_to_front image read, or none."}),
+    );
+    properties.insert(
+        "restore".into(),
+        json!({"type":"string","enum":["not_needed", "left_in_front", "restored", "skipped_person", "failed"],
+            "description":"What happened to the application that was in front before. skipped_person means the person switched to another application during the action, so it was not switched back; failed also answers restore_failed."}),
+    );
+    properties.insert(
+        "not_fronted_reason".into(),
+        json!({"type":"string","enum":NOT_FRONTED_REASONS,
+            "description":"Why fronting stopped, present only when it did."}),
+    );
+    properties.insert(
+        "person_input_during_fronting".into(),
+        json!({"type":"boolean",
+            "description":"True when the person pressed a key, clicked or scrolled while the application was in front for this action."}),
+    );
+    let mut fronting = closed(properties, &["mode", "fronted", "purpose", "restore"]);
+    fronting["description"] = json!("How this action used the front of the screen. Absent from replies that ended before the fronting decision, such as queued, permission, screen-locked and terminal replies without a front.");
+    fronting
+}
+
+/// `preview` names a reply whose background-mode preview could not follow the
+/// action: shown out of step with it, or not shown because three previews
+/// were already on screen.
+pub fn v28_preview_field() -> Value {
+    json!({"type":"string","enum":["not_synchronized", "not_shown_capacity"],
+        "description":"Present only when the background preview did not track this action: not_synchronized means the action went ahead before the agent badge arrived in the preview; not_shown_capacity means three agents' previews were already showing, so this one was not shown."})
+}
+
+/// `fronting_bound_exceeded` marks an action that took effect although its
+/// application stayed in front longer than the fronting bound allows.
+pub fn v28_fronting_bound_exceeded_field() -> Value {
+    json!({"type":"boolean",
+        "description":"True when the action took effect but its application stayed in front longer than the fronting bound; the result is still returned."})
+}
+
+/// `press_element`'s `bundle_identity` names the application a failed
+/// restore left in front, when that application is the target.
+pub fn v28_press_element_bundle_identity_field() -> Value {
+    string_field("The application left in front, present on restore_failed when it is the target.")
+}
+
+/// Revision 28 lets the `app_use` setting and fronting speak in replies.
+///
+/// Every row can answer `config_invalid`, because a live edit that breaks
+/// the config file refuses every `computer_use` action until it is fixed.
+/// Each fronting row gains the closed `fronting` object, `preview`,
+/// `fronting_bound_exceeded` and the outcome `not_fronted`, none of them
+/// required, since replies that end before fronting is decided do not
+/// carry them. A fronting row whose outcomes lack `restore_failed` gains it,
+/// because a temporarily fronted action can end with the previous
+/// application not put back. `open_app` gains `state_changed_by_person`,
+/// because fronting a running application checks the person first;
+/// `press_element` gains `bundle_identity` for the application a failed
+/// restore left in front. `read_state`'s `image_fronting` is unchanged.
+///
+/// Only `result_schema`s change: no request schema, no row key and no other
+/// row field moves, so the advertised tool and `validate_row` do not change.
+pub fn v28_from_v27(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        let fronting_row = FRONTING_ROW_IDS.contains(&capability.as_str());
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        let outcome = &mut properties["outcome"];
+        let choices = outcome["enum"].as_array_mut().unwrap();
+        choices.push(json!("config_invalid"));
+        let mut addition = CONFIG_INVALID_DESCRIPTION.to_string();
+        if fronting_row {
+            choices.push(json!("not_fronted"));
+            if !choices.contains(&json!("restore_failed")) {
+                choices.push(json!("restore_failed"));
+            }
+            if capability == "computer.open_app"
+                && !choices.contains(&json!("state_changed_by_person"))
+            {
+                choices.push(json!("state_changed_by_person"));
+            }
+            addition = format!("{addition} {FRONTING_OUTCOMES_DESCRIPTION}");
+        }
+        let description = outcome["description"].as_str().unwrap();
+        outcome["description"] = json!(format!("{description} {addition}"));
+        if fronting_row {
+            properties.insert("fronting".into(), v28_fronting_field());
+            properties.insert("preview".into(), v28_preview_field());
+            properties.insert(
+                "fronting_bound_exceeded".into(),
+                v28_fronting_bound_exceeded_field(),
+            );
+        }
+        if capability == "computer.press_element" {
+            assert!(
+                properties
+                    .insert(
+                        "bundle_identity".into(),
+                        v28_press_element_bundle_identity_field()
+                    )
+                    .is_none(),
+                "press_element already declared bundle_identity"
+            );
+        }
+    }
+    next
+}
