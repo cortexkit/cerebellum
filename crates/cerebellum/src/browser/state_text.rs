@@ -69,6 +69,19 @@ pub const NESTED_LOOSE_BYTES: usize = INLINE_BYTES;
 /// count once there are more than this many of them, outside a zoom.
 pub const REPEAT_THRESHOLD: usize = 3;
 
+/// A text filter that matches one text of a small row prints the whole row on
+/// one line (see `Tree::leaf_row`). A property line is a key and a value and a
+/// typical table row a handful of cells, so eight texts cover both, while a
+/// wider row is more likely a layout container whose other texts are
+/// unrelated to the match.
+pub const ROW_LEAVES: usize = 8;
+
+/// The most bytes a row's joined texts may have to print as one line: about
+/// four lines of a terminal, enough for a key with a JSON string value or a
+/// row of short cells. A larger row prints only its matching text, as any
+/// other match does, so one long cell cannot flood a filtered reply.
+pub const ROW_BYTES: usize = 300;
+
 /// Facts about one element the accessibility record alone does not carry,
 /// keyed by the element's ref.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +98,11 @@ pub struct NodeFacts {
     pub credential: Option<bool>,
     /// The field's placeholder text, which is a hint and never the value.
     pub placeholder: Option<String>,
+    /// The element's own serialized markup (its outerHTML). Only a
+    /// `dom_full` capture reads it, and only for the outermost content and
+    /// chrome landmarks (see [`landmark_class`]), so markup larger than the
+    /// caller's `max_bytes` can be laid out main content first.
+    pub dom_markup: Option<String>,
 }
 
 /// Which element a zoom asked for and which element of this capture it is.
@@ -305,14 +323,14 @@ fn is_value_control(role: &str) -> bool {
     )
 }
 
-const CONTENT: u8 = 0;
-const NEUTRAL: u8 = 1;
-const CHROME: u8 = 2;
+pub(super) const CONTENT: u8 = 0;
+pub(super) const NEUTRAL: u8 = 1;
+pub(super) const CHROME: u8 = 2;
 
 /// Which landmarks hold the page's content and which its chrome (navigation,
 /// header, sidebar, footer). When `max_bytes` forces lines out, content lines
 /// are kept first, and the outline lists content first.
-fn landmark_class(role: &str) -> u8 {
+pub(super) fn landmark_class(role: &str) -> u8 {
     match role {
         "main" | "feed" | "article" | "dialog" | "alertdialog" => CONTENT,
         "banner" | "navigation" | "complementary" | "contentinfo" | "search" => CHROME,
@@ -393,7 +411,7 @@ pub fn resolve_href(href: &str, page_url: &str) -> String {
     format!("{directory}{href}")
 }
 
-fn size_text(bytes: usize) -> String {
+pub(super) fn size_text(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else {
@@ -743,15 +761,9 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Match only the label and the value the line can reveal. Walking the
-    /// collapsed tree keeps inner editors from becoming a secret-value oracle.
-    fn filtered_lines(
-        &self,
-        node: usize,
-        depth: usize,
-        filters: &Filters,
-        out: &mut Vec<Line>,
-    ) -> bool {
+    /// Whether `node` itself satisfies the filters. Only the label and the
+    /// value the line can reveal are matched.
+    fn matches(&self, node: usize, filters: &Filters) -> bool {
         let role = self.role(node);
         let role_match = filters.roles.is_empty()
             || filters.roles.iter().any(|wanted| {
@@ -762,7 +774,6 @@ impl<'a> Tree<'a> {
                     .eq_ignore_ascii_case(role)
                     || wanted.eq_ignore_ascii_case(display_role(role))
             });
-        let line = self.element_text(node, self.name_chars(node));
         let text_match = filters.text.as_ref().is_none_or(|wanted| {
             let wanted = wanted.to_lowercase();
             self.names[node].to_lowercase().contains(&wanted)
@@ -770,7 +781,75 @@ impl<'a> Tree<'a> {
                     .shown_value(node)
                     .is_some_and(|value| value.to_lowercase().contains(&wanted))
         });
-        let matched = role_match && text_match;
+        role_match && text_match
+    }
+
+    /// The texts of `node`'s children when they form one small row of plain
+    /// text: a property line in a key/value viewer (`event`,
+    /// `"boat_endpoint_withdrawn"`) or a short table row. A filter that
+    /// matches one of them prints them all, because a key without its value,
+    /// or one cell without the rest of its row, does not answer the search.
+    ///
+    /// `None` when any child has children of its own, is a control or a text
+    /// field (whose ref or withheld value a joined line would lose), when
+    /// `node` is the page or a landmark (a list or a table is a region, not a
+    /// row), or when the row exceeds [`ROW_LEAVES`] or [`ROW_BYTES`].
+    fn leaf_row(&self, node: usize) -> Option<Vec<String>> {
+        let kids = &self.kids[node];
+        if node == 0 || self.is_landmark(node) || kids.len() < 2 || kids.len() > ROW_LEAVES {
+            return None;
+        }
+        let mut texts = Vec::new();
+        let mut bytes = 0;
+        for &kid in kids {
+            let role = self.role(kid);
+            if !self.kids[kid].is_empty() || is_actionable(role) || is_text_field(role) {
+                return None;
+            }
+            let mut text = self.names[kid].clone();
+            if let Some(value) = self.shown_value(kid).filter(|value| !value.is_empty()) {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&value);
+            }
+            if text.is_empty() {
+                continue;
+            }
+            bytes += text.len() + 1;
+            if bytes > ROW_BYTES {
+                return None;
+            }
+            texts.push(text);
+        }
+        Some(texts)
+    }
+
+    /// Match only the label and the value the line can reveal. Walking the
+    /// collapsed tree keeps inner editors from becoming a secret-value oracle.
+    fn filtered_lines(
+        &self,
+        node: usize,
+        depth: usize,
+        filters: &Filters,
+        out: &mut Vec<Line>,
+    ) -> bool {
+        if let Some(texts) = filters.text.as_ref().and_then(|_| self.leaf_row(node)) {
+            if self.kids[node]
+                .iter()
+                .any(|&kid| self.matches(kid, filters))
+            {
+                let mut text = self
+                    .reference(node)
+                    .map(|reference| format!("{reference} "))
+                    .unwrap_or_default();
+                text.push_str(&texts.join(" "));
+                out.push(self.line(node, depth, text));
+                return true;
+            }
+        }
+        let line = self.element_text(node, self.name_chars(node));
+        let matched = self.matches(node, filters);
         let labelled = !self.names[node].is_empty();
         let start = out.len();
         if matched || labelled {

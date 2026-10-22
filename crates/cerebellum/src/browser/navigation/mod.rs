@@ -2155,7 +2155,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         .unwrap()
                         .clone(),
                 ),
-                Some(attachment.session_id),
+                Some(attachment.session_id.clone()),
                 deadline,
                 None,
                 clock,
@@ -2164,11 +2164,78 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 required_result_string(&outer_html, "outerHTML")
                     .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
             );
+            self.read_landmark_markup(&mut observation, &attachment.session_id, deadline, clock);
         }
 
         timings.body_ms = body_started.elapsed().as_millis();
         self.last_snapshot_timings = Some(timings);
         Ok(observation)
+    }
+
+    /// Read the outerHTML of each outermost content and chrome landmark into
+    /// its facts, so a dom_full reply over its `max_bytes` can put the main
+    /// content first (see `browser::dom_layout`). The AX nodes map to DOM
+    /// nodes through their backend node ids.
+    ///
+    /// This is best effort: the body markup is already read, and a landmark
+    /// whose markup is missing only stays where the source order puts it, so
+    /// the first failed read ends the pass instead of failing the snapshot.
+    fn read_landmark_markup<C: NavigationClock>(
+        &mut self,
+        observation: &mut BrowserSnapshotObservation,
+        session_id: &str,
+        deadline: Instant,
+        clock: &mut C,
+    ) {
+        let landmarks = dom_landmark_nodes(observation);
+        if landmarks.is_empty() {
+            return;
+        }
+        let backend_ids: Vec<u64> = landmarks.iter().map(|(_, id)| *id).collect();
+        let Ok(pushed) = self.command(
+            "DOM.pushNodesByBackendIdsToFrontend",
+            Some(
+                serde_json::json!({ "backendNodeIds": backend_ids })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            Some(session_id.to_string()),
+            deadline,
+            None,
+            clock,
+        ) else {
+            return;
+        };
+        let node_ids: Vec<u64> = pushed
+            .get("nodeIds")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().map(|id| id.as_u64().unwrap_or(0)).collect())
+            .unwrap_or_default();
+        for ((reference, _), node_id) in landmarks.into_iter().zip(node_ids) {
+            if node_id == 0 {
+                continue;
+            }
+            let Ok(reply) = self.command(
+                "DOM.getOuterHTML",
+                Some(
+                    serde_json::json!({ "nodeId": node_id })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                Some(session_id.to_string()),
+                deadline,
+                None,
+                clock,
+            ) else {
+                return;
+            };
+            let Ok(markup) = required_result_string(&reply, "outerHTML") else {
+                return;
+            };
+            observation.facts.entry(reference).or_default().dom_markup = Some(markup);
+        }
     }
 
     fn load_in_background_tab_with_clock<C: NavigationClock>(
@@ -4525,6 +4592,55 @@ where
         refs_truncated,
         facts,
     })
+}
+
+/// How many landmarks a dom_full capture reads the markup of. Pages have a
+/// handful of outermost landmarks (a header, a navigation, a main, a
+/// footer); a feed of articles outside any main can have hundreds, each one
+/// more CDP round trip, and past this many the rest stay in source order.
+const MAX_DOM_LANDMARKS: usize = 16;
+
+/// The capture ref and backend node id of each outermost content or chrome
+/// landmark, in document order. The first record is skipped: it is the page
+/// itself, or the zoomed element whose markup is already the whole reply.
+/// A landmark inside another selected one is skipped too, since the outer
+/// one's markup already holds it.
+fn dom_landmark_nodes(observation: &BrowserSnapshotObservation) -> Vec<(String, u64)> {
+    use crate::browser::state_text::{landmark_class, NEUTRAL};
+    let backend: HashMap<&str, u64> = observation
+        .refs
+        .iter()
+        .filter_map(|reference| {
+            Some((
+                reference.captured.reference.as_str(),
+                reference.backend_identity.as_ref()?.backend_node_id,
+            ))
+        })
+        .collect();
+    let mut selected = Vec::new();
+    let mut inside: Option<i64> = None;
+    for record in observation.records.iter().skip(1) {
+        if inside.is_some_and(|depth| record.depth > depth) {
+            continue;
+        }
+        inside = None;
+        if landmark_class(&record.role) == NEUTRAL {
+            continue;
+        }
+        let Some((reference, id)) = record
+            .reference
+            .as_deref()
+            .and_then(|reference| Some((reference, *backend.get(reference)?)))
+        else {
+            continue;
+        };
+        selected.push((reference.to_string(), id));
+        inside = Some(record.depth);
+        if selected.len() == MAX_DOM_LANDMARKS {
+            break;
+        }
+    }
+    selected
 }
 
 fn snapshot_step_deadline(deadline: Instant, subtree: bool, now: Instant) -> Instant {
@@ -7159,6 +7275,90 @@ mod tests {
             .unwrap()
     }
 
+    /// A dashboard whose events list has a table of invocations, one event
+    /// expanded into a JSON property viewer (key and value as sibling
+    /// texts), and one log line too large to count as a row.
+    const OBSERVABILITY: &str = include_str!("../fixtures/observability_events_page.json");
+
+    fn filtered_fixture(
+        observation: &BrowserSnapshotObservation,
+        url: &str,
+        text: &str,
+        max_bytes: usize,
+    ) -> state_text::RenderedState {
+        state_text::render(&state_text::RenderInput {
+            filters: &state_text::Filters {
+                text: Some(text.into()),
+                roles: Vec::new(),
+            },
+            records: &observation.records,
+            facts: &observation.facts,
+            page_url: url,
+            snapshot_id: "0123456789abcdef0123456789abcdef",
+            zoom: None,
+            max_bytes,
+        })
+    }
+
+    /// The line, trimmed, that is `<ref> <rest>`, and that ref.
+    fn ref_line<'a>(text: &'a str, rest: &str) -> Option<&'a str> {
+        text.lines().find_map(|line| {
+            let (reference, tail) = line.trim_start().split_once(' ')?;
+            (tail == rest && reference.starts_with('e')).then_some(reference)
+        })
+    }
+
+    #[test]
+    fn a_text_filter_match_in_a_property_line_prints_the_key_with_its_value() {
+        let (observation, url) = fixture_observation(OBSERVABILITY);
+        let found = filtered_fixture(&observation, &url, "event", 65_536);
+        let reference = ref_line(&found.text, "event \"boat_endpoint_withdrawn\"")
+            .unwrap_or_else(|| panic!("{}", found.text));
+        assert!(found.printed_refs.contains(reference));
+        // Only the matching property line, not its siblings.
+        assert!(!found.text.contains("outcome"), "{}", found.text);
+    }
+
+    #[test]
+    fn a_text_filter_match_in_a_table_cell_prints_its_whole_row() {
+        let (observation, url) = fixture_observation(OBSERVABILITY);
+        let found = filtered_fixture(&observation, &url, "POST /withdraw", 65_536);
+        assert!(
+            ref_line(
+                &found.text,
+                "2025-01-02 10:00:01 boat-router POST /withdraw 200"
+            )
+            .is_some(),
+            "{}",
+            found.text
+        );
+        assert!(!found.text.contains("503"), "{}", found.text);
+    }
+
+    #[test]
+    fn a_text_filter_match_in_a_large_row_prints_only_the_match() {
+        let (observation, url) = fixture_observation(OBSERVABILITY);
+        let found = filtered_fixture(&observation, &url, "withdrawn_queue_depth", 65_536);
+        let matched = found
+            .text
+            .lines()
+            .filter(|line| line.contains("withdrawn_queue_depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(matched.len(), 1, "{}", found.text);
+        assert!(
+            matched[0].trim_start().split(' ').nth(1) == Some("text"),
+            "{}",
+            found.text
+        );
+        assert!(!found.text.contains("\"warn\""), "{}", found.text);
+        assert!(!found.text.contains("message"), "{}", found.text);
+
+        let none = filtered_fixture(&observation, &url, "no-such-text", 65_536);
+        assert!(none.text.contains("No matches"), "{}", none.text);
+        let tight = filtered_fixture(&observation, &url, "event", 80);
+        assert!(tight.text.len() <= 80, "{}", tight.text);
+    }
+
     #[test]
     fn x_like_outline_and_zoom_match_their_golden_text() {
         let (observation, url) = fixture_observation(X_LIKE);
@@ -7561,6 +7761,72 @@ mod tests {
             json!({"nodeId":42,"selector":"body"})
         );
         assert_eq!(driver.pipe.writes[5]["params"], json!({"nodeId":43}));
+    }
+
+    /// A dom_full capture also reads the outerHTML of each outermost content
+    /// and chrome landmark, mapped from its AX node through its backend node
+    /// id, so an over-limit reply can put the main content first. A landmark
+    /// inside another (an article in main) is held by the outer one's markup
+    /// and is not read again.
+    #[test]
+    fn dom_full_reads_the_markup_of_each_outermost_landmark() {
+        let body = "<body><nav><a>Home</a></nav><main><article>Post</article></main></body>";
+        let frames = [
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Landmarks", &["nav","main"], 10, Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("nav","navigation","", &[], 11, None),
+                ax_node("main","main","", &["article"], 12, None)
+            ]}}),
+            json!({"id":4,"sessionId":"session-own","result":{"nodes":[
+                ax_node("article","article","Post", &[], 13, None)
+            ]}}),
+            json!({"id":5,"sessionId":"session-own","result":{"root":{"nodeId":42}}}),
+            json!({"id":6,"sessionId":"session-own","result":{"nodeIds":[42]}}),
+            json!({"id":7,"sessionId":"session-own","result":{"nodeId":43}}),
+            json!({"id":8,"sessionId":"session-own","result":{"outerHTML":body}}),
+            json!({"id":9,"sessionId":"session-own","result":{"nodeIds":[51,52]}}),
+            json!({"id":10,"sessionId":"session-own","result":{"outerHTML":"<nav><a>Home</a></nav>"}}),
+            json!({"id":11,"sessionId":"session-own","result":{"outerHTML":"<main><article>Post</article></main>"}}),
+        ];
+        let mut driver = attached_driver(frames);
+        let observation = driver
+            .snapshot_for_test(
+                "route-own",
+                SnapshotKind::DomFull,
+                1_000,
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+
+        assert_eq!(observation.dom_text.as_deref(), Some(body));
+        let markup = |role: &str| {
+            let reference = ref_of(&observation, role, None);
+            observation
+                .facts
+                .get(&reference)
+                .and_then(|facts| facts.dom_markup.clone())
+        };
+        assert_eq!(
+            markup("navigation").as_deref(),
+            Some("<nav><a>Home</a></nav>")
+        );
+        assert_eq!(
+            markup("main").as_deref(),
+            Some("<main><article>Post</article></main>")
+        );
+        assert_eq!(markup("article"), None);
+        assert_eq!(
+            driver.pipe.writes[8]["method"],
+            "DOM.pushNodesByBackendIdsToFrontend"
+        );
+        assert_eq!(
+            driver.pipe.writes[8]["params"],
+            json!({"backendNodeIds":[11,12]})
+        );
+        assert_eq!(driver.pipe.writes[9]["params"], json!({"nodeId":51}));
+        assert_eq!(driver.pipe.writes[10]["params"], json!({"nodeId":52}));
+        assert_eq!(driver.pipe.writes.len(), 11);
     }
 
     #[test]
