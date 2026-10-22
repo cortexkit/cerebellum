@@ -132,6 +132,423 @@ impl HeldState {
 
 type ReleaseJob = std::pin::Pin<Box<dyn std::future::Future<Output = HeldState> + Send>>;
 
+/// What a call's restore obligation needs from the platform to put the
+/// previous application back: the frontmost read, the front request and a
+/// clock to wait on, plus the session observer's hardware input timestamps
+/// for the restore decision. It is built when the obligation is registered,
+/// and is `Send`, so terminal cleanup can run it on a blocking thread when
+/// the worker that fronted is stuck or gone.
+///
+/// Its clock must be the one the worker reads the front instant from, since
+/// the decision compares the two.
+pub trait RestoreHost: Send {
+    /// Milliseconds on the host's clock.
+    fn now_ms(&mut self) -> u64;
+    /// Wait before checking the front again.
+    fn pause_ms(&mut self, milliseconds: u64);
+    /// The frontmost application's pid, or `None` when it cannot be read.
+    fn frontmost_pid(&mut self) -> Option<u32>;
+    /// Ask the application `pid` runs to become frontmost. `false` when the
+    /// request itself was refused.
+    fn request_front(&mut self, pid: u32) -> bool;
+    /// The process-wide session observer's hardware input timestamps, on
+    /// this host's clock. `None` when unavailable, which the decision reads
+    /// as no input seen.
+    fn hardware_input_snapshot(
+        &mut self,
+    ) -> Option<crate::computer::dispatch::HardwareInputSnapshot>;
+}
+
+/// The process-wide fronting lock, as a held guard. Dropping it releases the
+/// lock, which happens exactly once: when the restore decision completes, or
+/// when the obligation is refused at registration.
+pub type FrontingLockGuard = Box<dyn Send + 'static>;
+
+/// The `fronting.mode` a reply reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontingMode {
+    Foreground,
+    Background,
+}
+
+impl FrontingMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// The `fronting.purpose` of a temporary front, which is the only kind of
+/// front that owes a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontingPurpose {
+    /// An action that only works with its application in front.
+    NeedsFront,
+    /// A `bring_to_front` image read.
+    BringToFront,
+}
+
+impl FrontingPurpose {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NeedsFront => "needs_front",
+            Self::BringToFront => "bring_to_front",
+        }
+    }
+}
+
+/// A promise to put the previous application back after a temporary front,
+/// handed to the call's [`TerminalArbiter`] before the first front request so
+/// that terminal cleanup can keep it if the worker does not.
+pub struct RestoreObligation {
+    /// The application that was frontmost before, read with the fronting
+    /// lock held.
+    pub previous_pid: u32,
+    /// The application about to be fronted.
+    pub target_pid: u32,
+    /// The target's display name, used in a failed restore's remedy when
+    /// the target is the application left in front.
+    pub target_name: String,
+    pub mode: FrontingMode,
+    pub purpose: FrontingPurpose,
+    /// Held until the restore decision completes.
+    pub lock: FrontingLockGuard,
+    pub host: Box<dyn RestoreHost>,
+}
+
+/// Registration was refused because the call's terminal reply is already
+/// chosen. The obligation was dropped, which released its fronting lock;
+/// the worker must not front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreRegistrationRefused;
+
+impl RestoreRegistrationRefused {
+    /// The fronting stop the worker reports, which replies `cancelled`.
+    pub fn stop(self) -> crate::computer::dispatch::FrontingStop {
+        crate::computer::dispatch::FrontingStop::TerminalAlreadyChosen
+    }
+}
+
+/// The result of a restore obligation's one restore decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreDecided {
+    pub restore: crate::computer::dispatch::RestoreStatus,
+    /// Hardware input arrived after the front.
+    pub person_input_during_fronting: bool,
+    /// A front request was made. `false` when cleanup took the obligation
+    /// before the worker fronted, so the worker never did.
+    pub front_requested: bool,
+}
+
+/// A backstop on how long a side that did not take the obligation waits for
+/// the other side's decision, in real milliseconds. That decision is itself
+/// bounded by the front wait and the restore wait; this only keeps a waiter
+/// from blocking forever if the deciding side never returns.
+const DECISION_AWAIT_MS: u64 =
+    2 * (crate::computer::dispatch::FRONT_WAIT_MS + crate::computer::dispatch::RESTORE_WAIT_MS);
+
+/// A registered restore obligation, shared by the worker that fronts and the
+/// call's terminal cleanup. Its front-attempt state changes only under its
+/// own lock, and it runs the restore decision exactly once: whichever side
+/// calls [`RestoreCell::decide`] first runs it, and the other waits up to
+/// `DECISION_AWAIT_MS` for that result, reporting the restore failed if none
+/// arrives. The fronting lock is released when the decision completes.
+pub struct RestoreCell {
+    previous_pid: u32,
+    target_pid: u32,
+    target_name: String,
+    mode: FrontingMode,
+    purpose: FrontingPurpose,
+    inner: std::sync::Mutex<RestoreCellInner>,
+    changed: std::sync::Condvar,
+}
+
+struct RestoreCellInner {
+    attempt: crate::computer::dispatch::FrontAttempt,
+    host: Option<Box<dyn RestoreHost>>,
+    lock: Option<FrontingLockGuard>,
+    decided: Option<RestoreDecided>,
+}
+
+impl RestoreCell {
+    fn new(obligation: RestoreObligation) -> Self {
+        Self {
+            previous_pid: obligation.previous_pid,
+            target_pid: obligation.target_pid,
+            target_name: obligation.target_name,
+            mode: obligation.mode,
+            purpose: obligation.purpose,
+            inner: std::sync::Mutex::new(RestoreCellInner {
+                attempt: crate::computer::dispatch::FrontAttempt::new(),
+                host: Some(obligation.host),
+                lock: Some(obligation.lock),
+                decided: None,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, RestoreCellInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn target_pid(&self) -> u32 {
+        self.target_pid
+    }
+
+    /// The worker is about to request the front at `front_instant_ms`, on
+    /// the restore host's clock. `false` when cleanup already took the
+    /// obligation: the worker must not front.
+    pub fn begin_front_attempt(&self, front_instant_ms: u64) -> bool {
+        self.inner().attempt.begin_dispatch(front_instant_ms)
+    }
+
+    /// The front request and its wait returned. A cleanup that took the
+    /// obligation meanwhile is waiting for this.
+    pub fn front_attempt_returned(&self) {
+        self.inner().attempt.attempt_returned();
+        self.changed.notify_all();
+    }
+
+    /// The decision, once it has completed.
+    pub fn decided(&self) -> Option<RestoreDecided> {
+        self.inner().decided
+    }
+
+    /// Run the restore decision, or wait for the side that took the
+    /// obligation first to finish it. Blocking: it reads the front, may
+    /// request the previous application and waits for it.
+    pub fn decide(&self) -> RestoreDecided {
+        use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
+        let mut inner = self.inner();
+        let front_instant_ms = match inner.attempt.take() {
+            CleanupTake::AlreadyTaken => return self.await_decision(inner),
+            CleanupTake::PreventedFront => {
+                return self.complete(
+                    inner,
+                    RestoreDecided {
+                        restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
+                        person_input_during_fronting: false,
+                        front_requested: false,
+                    },
+                );
+            }
+            CleanupTake::Decide { front_instant_ms } => front_instant_ms,
+            CleanupTake::AwaitFrontAttempt => {
+                // The front request is in flight. Its wait is bounded by the
+                // front wait; deciding before it returns could restore
+                // under a front that lands afterwards.
+                let (waited, _) = self
+                    .changed
+                    .wait_timeout_while(
+                        inner,
+                        Duration::from_millis(crate::computer::dispatch::FRONT_WAIT_MS),
+                        |inner| inner.attempt.decision_floor().is_none(),
+                    )
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner = waited;
+                match inner.attempt.state() {
+                    FrontAttemptState::Dispatching { front_instant_ms }
+                    | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
+                    FrontAttemptState::NotStarted => {
+                        unreachable!("a front attempt never moves back to not started")
+                    }
+                }
+            }
+        };
+        let host = inner.host.take();
+        drop(inner);
+        let outcome = match host {
+            Some(mut host) => {
+                let outcome = crate::computer::dispatch::restore_after_front(
+                    &mut RestoreDecisionHost(host.as_mut()),
+                    self.previous_pid,
+                    self.target_pid,
+                    front_instant_ms,
+                    crate::computer::dispatch::RESTORE_WAIT_MS,
+                );
+                RestoreDecided {
+                    restore: outcome.restore,
+                    person_input_during_fronting: outcome.person_input_during_fronting,
+                    front_requested: true,
+                }
+            }
+            None => self.failed(),
+        };
+        self.complete(self.inner(), outcome)
+    }
+
+    /// Take the obligation without requesting any restore, because a key or
+    /// button may still be held and restoring would deliver it to the
+    /// previous application. A front that may have happened is reported
+    /// failed, naming the target left in front; one that cleanup prevented
+    /// is `not_needed`. `None` when the other side already took the
+    /// obligation, whose decision must then be awaited.
+    fn forgo(&self) -> Option<RestoreDecided> {
+        use crate::computer::dispatch::CleanupTake;
+        let mut inner = self.inner();
+        let decided = match inner.attempt.take() {
+            CleanupTake::AlreadyTaken => return None,
+            CleanupTake::PreventedFront => RestoreDecided {
+                restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
+                person_input_during_fronting: false,
+                front_requested: false,
+            },
+            CleanupTake::AwaitFrontAttempt | CleanupTake::Decide { .. } => self.failed(),
+        };
+        inner.host.take();
+        Some(self.complete(inner, decided))
+    }
+
+    /// A restore reported failed with the target named as left in front.
+    fn failed(&self) -> RestoreDecided {
+        RestoreDecided {
+            restore: crate::computer::dispatch::RestoreStatus::Failed {
+                left_in_front: Some(self.target_pid),
+            },
+            person_input_during_fronting: false,
+            front_requested: true,
+        }
+    }
+
+    fn await_decision(&self, inner: std::sync::MutexGuard<'_, RestoreCellInner>) -> RestoreDecided {
+        let (inner, _) = self
+            .changed
+            .wait_timeout_while(inner, Duration::from_millis(DECISION_AWAIT_MS), |inner| {
+                inner.decided.is_none()
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.decided.unwrap_or_else(|| self.failed())
+    }
+
+    /// Record the decision, wake any waiter, then release the fronting lock.
+    fn complete(
+        &self,
+        mut inner: std::sync::MutexGuard<'_, RestoreCellInner>,
+        decided: RestoreDecided,
+    ) -> RestoreDecided {
+        inner.decided = Some(decided);
+        let lock = inner.lock.take();
+        drop(inner);
+        self.changed.notify_all();
+        drop(lock);
+        decided
+    }
+
+    /// Write the decision into a terminal reply body: `fronting.restore`, and
+    /// for a failed restore the outcome `restore_failed`, which outranks every
+    /// other outcome, with a remedy naming the application left in front.
+    /// The body's `detail` and `effect_status` are kept.
+    fn disclose(&self, body: &mut Value, decided: RestoreDecided) {
+        use crate::computer::dispatch::RestoreStatus;
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        let fronting = object.entry("fronting").or_insert_with(|| {
+            let mut fronting = json!({
+                "mode": self.mode.name(),
+                "fronted": decided.front_requested,
+                "purpose": self.purpose.name(),
+            });
+            if !decided.front_requested {
+                // Cleanup took the obligation before the front was
+                // dispatched, which the stop table names `cancelled`.
+                fronting["not_fronted_reason"] = json!("cancelled");
+            }
+            fronting
+        });
+        let Some(fronting) = fronting.as_object_mut() else {
+            return;
+        };
+        let restore = match decided.restore {
+            RestoreStatus::NotNeeded => "not_needed",
+            RestoreStatus::Restored => "restored",
+            RestoreStatus::SkippedPerson { .. } => "skipped_person",
+            RestoreStatus::Failed { .. } => "failed",
+        };
+        fronting.insert("restore".into(), json!(restore));
+        if decided.person_input_during_fronting {
+            fronting.insert("person_input_during_fronting".into(), json!(true));
+        }
+        if let RestoreStatus::Failed { left_in_front } = decided.restore {
+            object.insert("outcome".into(), json!("restore_failed"));
+            let remedy = if left_in_front == Some(self.target_pid) {
+                format!(
+                    "{} was left in front; switch back to the application you were using",
+                    self.target_name
+                )
+            } else {
+                "the application that was in front before could not be put back; switch back to the application you were using".to_owned()
+            };
+            object.insert("remedy".into(), json!(remedy));
+        }
+    }
+}
+
+/// Presents a [`RestoreHost`] as the bracket host the shared restore
+/// decision runs against. The decision reads the front and the hardware input
+/// timestamps, may request the previous application, and waits; it creates
+/// no input tap and posts no input, so those methods are never reached.
+struct RestoreDecisionHost<'a>(&'a mut dyn RestoreHost);
+
+impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> {
+    type Tap = ();
+
+    fn now_ms(&mut self) -> u64 {
+        self.0.now_ms()
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.0.pause_ms(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        self.0.frontmost_pid()
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        self.0.request_front(pid)
+    }
+    fn our_pid(&self) -> i64 {
+        i64::from(std::process::id())
+    }
+    fn create_tap(&mut self) -> Option<()> {
+        None
+    }
+    fn read_idle(&mut self) -> crate::computer::platform::IdleReading {
+        crate::computer::platform::IdleReading::Unreadable(
+            crate::computer::platform::IdleUnreadable::TableUnavailable,
+        )
+    }
+    fn drain(&mut self, _tap: &()) -> Vec<crate::computer::dispatch::SourcedInputEvent> {
+        Vec::new()
+    }
+    fn post_heartbeat(&mut self) -> crate::computer::dispatch::HeartbeatProbe {
+        unreachable!("the restore decision posts no heartbeat")
+    }
+    fn observe_heartbeat(
+        &mut self,
+        _tap: &(),
+        _probe: crate::computer::dispatch::HeartbeatProbe,
+        _watcher: &mut crate::computer::dispatch::SeizeWatcher,
+    ) -> crate::computer::dispatch::HeartbeatObservation {
+        crate::computer::dispatch::HeartbeatObservation::Missed
+    }
+    fn post_unit(
+        &mut self,
+        _index: usize,
+    ) -> Result<crate::computer::dispatch::UnitPosted, crate::computer::platform::SequencePostFailure>
+    {
+        unreachable!("the restore decision posts no input")
+    }
+    fn hardware_input_snapshot(
+        &mut self,
+    ) -> Option<crate::computer::dispatch::HardwareInputSnapshot> {
+        self.0.hardware_input_snapshot()
+    }
+}
+
 pub(crate) struct TerminalState {
     pub(crate) chosen: Option<Frame>,
     pub(crate) cause: Option<TerminalCause>,
@@ -139,6 +556,10 @@ pub(crate) struct TerminalState {
     reply_finalized: bool,
     step: CallStep,
     release: Option<ReleaseJob>,
+    /// A temporary front's restore obligation. Kept apart from `release`, so
+    /// a chord holding Command owes both; `held_state` is derived from
+    /// `release` alone.
+    restore: Option<Arc<RestoreCell>>,
     pub(crate) settlement: Option<PendingSettlement>,
     /// Run once, under this state's lock, at the moment the terminal is
     /// chosen, then dropped. They hold this lock while they run, so each must
@@ -185,6 +606,7 @@ impl TerminalArbiter {
                 reply_finalized: false,
                 step: CallStep::Admission,
                 release: None,
+                restore: None,
                 settlement: None,
                 on_terminal: Vec::new(),
             }),
@@ -317,6 +739,34 @@ impl TerminalArbiter {
         if state.chosen.is_none() {
             state.release = Some(Box::pin(release));
         }
+    }
+
+    /// Register the restore obligation of a temporary front, before its
+    /// first front request. Independent of [`Self::set_release`]: a call may
+    /// owe both, and terminal cleanup releases held input first.
+    ///
+    /// Refused when the terminal reply is already chosen: the obligation is
+    /// dropped, releasing its fronting lock, and the worker must not front.
+    /// A call fronts once, so a second registration is refused too while the
+    /// first one's decision has not completed.
+    pub fn register_restore(
+        &self,
+        obligation: RestoreObligation,
+    ) -> Result<Arc<RestoreCell>, RestoreRegistrationRefused> {
+        let mut state = self.state.lock().unwrap();
+        if state.chosen.is_some()
+            || state
+                .restore
+                .as_ref()
+                .is_some_and(|cell| cell.decided().is_none())
+        {
+            drop(state);
+            drop(obligation);
+            return Err(RestoreRegistrationRefused);
+        }
+        let cell = Arc::new(RestoreCell::new(obligation));
+        state.restore = Some(Arc::clone(&cell));
+        Ok(cell)
     }
 
     fn choose(&self, result: Option<Frame>, cause: TerminalCause) -> bool {
@@ -517,20 +967,22 @@ pub(crate) async fn run_arbitrated_route(
             },
         }
     }
-    let (chosen, release, pending) = {
+    let (chosen, release, restore, pending) = {
         let mut state = terminal.state.lock().unwrap();
         (
             state.chosen.clone(),
             state.release.take(),
+            state.restore.take(),
             state.settlement.take(),
         )
     };
     if let Some(mut chosen) = chosen {
-        if release.is_none() && !finished {
-            // When no held-input release is needed, use its RELEASE_BUDGET_MS
-            // allowance for cooperative cancellation cleanup, so the call can
-            // end its consent wait before the caller receives the refusal. A
-            // stuck worker is detached after the same bounded window.
+        if release.is_none() && restore.is_none() && !finished {
+            // When no held-input release or restore is needed, use their
+            // RELEASE_BUDGET_MS allowance for cooperative cancellation
+            // cleanup, so the call can end its consent wait before the caller
+            // receives the refusal. A stuck worker is detached after the same
+            // bounded window.
             let cleanup = async {
                 loop {
                     tokio::select! {
@@ -560,44 +1012,49 @@ pub(crate) async fn run_arbitrated_route(
                 chosen = reply.clone();
             }
         }
+        // Held-input release first, then the restore, within one shared
+        // RELEASE_BUDGET_MS: restoring while a key may still be held would
+        // deliver it to the previous application.
+        let suffix_end =
+            tokio::time::Instant::now() + Duration::from_millis(budgets::RELEASE_BUDGET_MS);
+        let mut held = None;
         if let Some(release) = release {
             let health = Arc::clone(&planes.health);
             let mut release_job = tokio::spawn(release);
-            let held = match tokio::time::timeout(
-                Duration::from_millis(budgets::RELEASE_BUDGET_MS),
-                &mut release_job,
-            )
-            .await
-            {
-                Ok(Ok(held)) => held,
-                Ok(Err(_)) => HeldState::Unknown,
-                Err(_) => {
-                    let detached = health.enter_detached_worker();
-                    tokio::spawn(async move {
-                        let _detached = detached;
-                        let _ = release_job.await;
-                    });
-                    HeldState::Unknown
+            held = Some(
+                match tokio::time::timeout_at(suffix_end, &mut release_job).await {
+                    Ok(Ok(held)) => held,
+                    Ok(Err(_)) => HeldState::Unknown,
+                    Err(_) => {
+                        let detached = health.enter_detached_worker();
+                        tokio::spawn(async move {
+                            let _detached = detached;
+                            let _ = release_job.await;
+                        });
+                        HeldState::Unknown
+                    }
+                },
+            );
+        }
+        let decided = match &restore {
+            Some(cell) => Some(finish_restore(Arc::clone(cell), held, suffix_end, &planes).await),
+            None => None,
+        };
+        if let Some(held) = held {
+            chosen = rebuild_body(chosen, |body| {
+                if body["outcome"] == "dispatch_outcome_unknown" {
+                    body["detail"]["held_state"] = json!(held.name());
                 }
-            };
-            let mut body: Value = serde_json::from_slice(&chosen.body).unwrap_or(Value::Null);
-            if body["outcome"] == "dispatch_outcome_unknown" {
-                body["detail"]["held_state"] = json!(held.name());
-                chosen.body = serde_json::to_vec(&body).expect("terminal body serializes");
-                // Rebuild below so the wire body length agrees with the update.
-                chosen = Frame::build_with_version(
-                    chosen.header.ver,
-                    chosen.header.ty,
-                    chosen.header.flags,
-                    chosen.header.channel,
-                    chosen.header.epoch,
-                    chosen.header.corr,
-                    chosen.body,
-                )
-                .expect("terminal frame fits");
+            });
+        }
+        // Consent learns what the action itself did, before a failed restore
+        // replaces the outcome naming it.
+        terminal.finish_consent(&chosen);
+        if let (Some(cell), Some(decided)) = (&restore, decided) {
+            if chosen.header.ty == FrameType::Response {
+                chosen = rebuild_body(chosen, |body| cell.disclose(body, decided));
             }
         }
-        terminal.finish_consent(&chosen);
         if serde_json::from_slice::<Value>(&chosen.body)
             .ok()
             .is_some_and(|body| body["outcome"] == "route_closed")
@@ -625,13 +1082,26 @@ pub(crate) async fn run_arbitrated_route(
         } else {
             let _ = tokio::time::timeout_at(connection_end, send(&writer, chosen)).await;
         }
-    } else if let Some(mut pending) = pending {
-        if let Some(ticket) = pending.ticket.take() {
-            let calls = Arc::clone(&planes.calls);
-            settle_call_record(&planes, move || {
-                calls.settle_unknown(ticket, wall_clock_ms())
-            })
-            .await;
+    } else {
+        if let Some(cell) = restore {
+            // The worker ended without a terminal reply. Nobody else can run
+            // its restore decision now, and an undecided obligation would
+            // keep the fronting lock, so run it detached.
+            let detached = planes.health.enter_detached_worker();
+            let decision = tokio::task::spawn_blocking(move || cell.decide());
+            tokio::spawn(async move {
+                let _detached = detached;
+                let _ = decision.await;
+            });
+        }
+        if let Some(mut pending) = pending {
+            if let Some(ticket) = pending.ticket.take() {
+                let calls = Arc::clone(&planes.calls);
+                settle_call_record(&planes, move || {
+                    calls.settle_unknown(ticket, wall_clock_ms())
+                })
+                .await;
+            }
         }
     }
     execution.lock().unwrap().take();
@@ -655,6 +1125,67 @@ pub(crate) async fn run_arbitrated_route(
             }
         }
     });
+}
+
+/// Terminal cleanup's half of a restore obligation, after held-input release.
+///
+/// When that release was not confirmed and cleanup takes the obligation, no
+/// restore is requested at all: a front that may have happened is reported
+/// failed, naming the target left in front, while the unconfirmed press
+/// stays in the held-input quarantine; a front cleanup prevented is
+/// `not_needed`. Otherwise the restore decision runs on a blocking thread,
+/// or the worker's decision is awaited if the worker took the obligation
+/// first, until `end`. A decision unfinished by then is reported failed and
+/// keeps running detached.
+async fn finish_restore(
+    cell: Arc<RestoreCell>,
+    held: Option<HeldState>,
+    end: tokio::time::Instant,
+    planes: &Planes,
+) -> RestoreDecided {
+    if matches!(held, Some(HeldState::Unknown)) {
+        if let Some(decided) = cell.forgo() {
+            return decided;
+        }
+    }
+    let decider = Arc::clone(&cell);
+    let mut decision = tokio::task::spawn_blocking(move || decider.decide());
+    match tokio::time::timeout_at(end, &mut decision).await {
+        Ok(Ok(decided)) => decided,
+        Ok(Err(_)) => cell.failed(),
+        Err(_) => {
+            let detached = planes.health.enter_detached_worker();
+            tokio::spawn(async move {
+                let _detached = detached;
+                let _ = decision.await;
+            });
+            cell.failed()
+        }
+    }
+}
+
+/// Apply `update` to a JSON reply body and rebuild the frame, so the wire
+/// body length agrees with the update. A body that does not parse, or that
+/// `update` leaves unchanged, keeps its original bytes.
+fn rebuild_body(frame: Frame, update: impl FnOnce(&mut Value)) -> Frame {
+    let Ok(original) = serde_json::from_slice::<Value>(&frame.body) else {
+        return frame;
+    };
+    let mut body = original.clone();
+    update(&mut body);
+    if body == original {
+        return frame;
+    }
+    Frame::build_with_version(
+        frame.header.ver,
+        frame.header.ty,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        serde_json::to_vec(&body).expect("terminal body serializes"),
+    )
+    .expect("terminal frame fits")
 }
 
 #[cfg(test)]
@@ -1613,5 +2144,700 @@ mod terminal_suffix_tests {
             tokio::task::yield_now().await;
         }
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod restore_slot_tests {
+    use super::*;
+    use crate::computer::dispatch::{
+        not_fronted_reason, HardwareInputSnapshot, NotFrontedReason, RestoreStatus,
+    };
+    use crate::{handle_frame, management, PROTOCOL_VERSION};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Mutex;
+
+    const PREVIOUS: u32 = 10;
+    const TARGET: u32 = 20;
+    const THIRD: u32 = 30;
+
+    /// The screen a fake restore host sees: a clock that only moves when the
+    /// decision pauses, the frontmost application, and every request.
+    struct Screen {
+        now: u64,
+        frontmost: Option<u32>,
+        /// Whether a front request brings its application forward.
+        comes_forward: bool,
+        snapshot: Option<HardwareInputSnapshot>,
+        requests: Vec<u32>,
+        /// Release and restore steps in the order they happened.
+        log: Vec<&'static str>,
+    }
+
+    type SharedScreen = Arc<Mutex<Screen>>;
+
+    fn screen(comes_forward: bool) -> SharedScreen {
+        Arc::new(Mutex::new(Screen {
+            now: 0,
+            frontmost: Some(TARGET),
+            comes_forward,
+            snapshot: None,
+            requests: Vec::new(),
+            log: Vec::new(),
+        }))
+    }
+
+    struct FakeHost(SharedScreen);
+
+    impl RestoreHost for FakeHost {
+        fn now_ms(&mut self) -> u64 {
+            self.0.lock().unwrap().now
+        }
+        fn pause_ms(&mut self, milliseconds: u64) {
+            self.0.lock().unwrap().now += milliseconds;
+        }
+        fn frontmost_pid(&mut self) -> Option<u32> {
+            self.0.lock().unwrap().frontmost
+        }
+        fn request_front(&mut self, pid: u32) -> bool {
+            let mut screen = self.0.lock().unwrap();
+            screen.requests.push(pid);
+            screen.log.push("restore");
+            if screen.comes_forward {
+                screen.frontmost = Some(pid);
+            }
+            true
+        }
+        fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+            self.0.lock().unwrap().snapshot
+        }
+    }
+
+    /// Stands in for the fronting lock's guard; counts its releases.
+    struct CountedLock(Arc<AtomicUsize>);
+
+    impl Drop for CountedLock {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, SeqCst);
+        }
+    }
+
+    fn obligation(screen: &SharedScreen, releases: &Arc<AtomicUsize>) -> RestoreObligation {
+        RestoreObligation {
+            previous_pid: PREVIOUS,
+            target_pid: TARGET,
+            target_name: "Mail".into(),
+            mode: FrontingMode::Background,
+            purpose: FrontingPurpose::NeedsFront,
+            lock: Box::new(CountedLock(Arc::clone(releases))),
+            host: Box::new(FakeHost(Arc::clone(screen))),
+        }
+    }
+
+    fn request() -> Frame {
+        Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            control_flags(),
+            1,
+            1,
+            1,
+            serde_json::to_vec(&json!({
+                "method":management::OPEN_TARGET,"params":{"bundle_identity":"com.example.Nothing"}
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn cancel() -> Frame {
+        Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Cancel,
+            control_flags(),
+            1,
+            1,
+            1,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn body(terminal: &TerminalArbiter) -> Value {
+        serde_json::from_slice(&terminal.state.lock().unwrap().chosen.as_ref().unwrap().body)
+            .unwrap()
+    }
+
+    /// Plays a worker's in-flight front request returning, with the target
+    /// now in front, once cleanup has taken the obligation. It returns a
+    /// moment later, or at once if a restore is requested first, so a
+    /// cleanup that wrongly decided without waiting for the front has its
+    /// restore logged before `front_returned`.
+    fn return_front_after_take(cell: &RestoreCell, shared: &SharedScreen) {
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while !cell.inner().attempt.taken() && std::time::Instant::now() < give_up {
+            std::thread::yield_now();
+        }
+        let returns_at = std::time::Instant::now() + Duration::from_millis(50);
+        while shared.lock().unwrap().requests.is_empty() && std::time::Instant::now() < returns_at {
+            std::thread::yield_now();
+        }
+        {
+            let mut screen = shared.lock().unwrap();
+            screen.log.push("front_returned");
+            screen.frontmost = Some(TARGET);
+        }
+        cell.front_attempt_returned();
+    }
+
+    #[test]
+    fn restore_slot_is_separate_from_release_and_held_state_follows_release_only() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let restore_only = TerminalArbiter::new(request());
+        assert!(restore_only.gate.begin_mutation());
+        restore_only
+            .register_restore(obligation(&screen(true), &releases))
+            .unwrap();
+        restore_only.stop(TerminalCause::Cancelled);
+        assert_eq!(body(&restore_only)["outcome"], "dispatch_outcome_unknown");
+        assert_eq!(
+            body(&restore_only)["detail"]["held_state"],
+            "none_held",
+            "a restore obligation alone holds no input"
+        );
+
+        let both = TerminalArbiter::new(request());
+        assert!(both.gate.begin_mutation());
+        both.set_release(async { HeldState::Released });
+        both.register_restore(obligation(&screen(true), &releases))
+            .unwrap();
+        {
+            let state = both.state.lock().unwrap();
+            assert!(state.release.is_some() && state.restore.is_some());
+        }
+        both.stop(TerminalCause::Cancelled);
+        assert_eq!(body(&both)["detail"]["held_state"], "unknown");
+        let state = both.state.lock().unwrap();
+        assert!(
+            state.release.is_some() && state.restore.is_some(),
+            "a chord holding Command keeps both obligations"
+        );
+    }
+
+    #[test]
+    fn registration_after_a_chosen_terminal_is_refused_as_cancelled_and_frees_the_lock() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        let terminal = TerminalArbiter::new(request());
+        assert!(terminal.stop(TerminalCause::Cancelled));
+        let refused = terminal
+            .register_restore(obligation(&shared, &releases))
+            .err()
+            .expect("a chosen terminal refuses the obligation");
+        assert_eq!(
+            not_fronted_reason(refused.stop()),
+            NotFrontedReason::Cancelled
+        );
+        assert_eq!(releases.load(SeqCst), 1, "the refused lock was released");
+        assert!(terminal.state.lock().unwrap().restore.is_none());
+        assert!(shared.lock().unwrap().requests.is_empty());
+    }
+
+    #[test]
+    fn a_second_registration_waits_for_the_first_decision() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        let terminal = TerminalArbiter::new(request());
+        let first = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(terminal
+            .register_restore(obligation(&shared, &releases))
+            .is_err());
+        first.decide();
+        assert!(terminal
+            .register_restore(obligation(&shared, &releases))
+            .is_ok());
+    }
+
+    #[test]
+    fn the_cell_runs_the_restore_decision_exactly_once() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(0));
+        cell.front_attempt_returned();
+        let (worker, cleanup) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| cell.decide());
+            let cleanup = scope.spawn(|| cell.decide());
+            (worker.join().unwrap(), cleanup.join().unwrap())
+        });
+        assert_eq!(worker, cleanup, "both sides see the one decision");
+        assert_eq!(worker.restore, RestoreStatus::Restored);
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1, "the lock was released once");
+        assert_eq!(cell.decide(), worker);
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+    }
+
+    #[test]
+    fn cleanup_before_the_front_prevents_it_and_reports_not_needed() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        let decided = cell.decide();
+        assert_eq!(decided.restore, RestoreStatus::NotNeeded);
+        assert!(!decided.front_requested);
+        assert_eq!(releases.load(SeqCst), 1);
+        assert!(
+            !cell.begin_front_attempt(5),
+            "a worker resuming after cleanup does not front"
+        );
+        assert_eq!(cell.decide(), decided);
+        assert!(shared.lock().unwrap().requests.is_empty());
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn cleanup_during_a_front_request_waits_for_it_then_decides_once() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        shared.lock().unwrap().frontmost = Some(PREVIOUS);
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(0));
+        let decided = std::thread::scope(|scope| {
+            let cleanup = scope.spawn(|| cell.decide());
+            return_front_after_take(&cell, &shared);
+            cleanup.join().unwrap()
+        });
+        assert_eq!(decided.restore, RestoreStatus::Restored);
+        let screen = shared.lock().unwrap();
+        assert_eq!(screen.log, ["front_returned", "restore"]);
+        assert_eq!(screen.requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn a_person_switch_with_input_skips_the_restore() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        {
+            let mut screen = shared.lock().unwrap();
+            screen.frontmost = Some(THIRD);
+            screen.snapshot = Some(HardwareInputSnapshot {
+                coverage_start_ms: 0,
+                last_input_ms: Some(5),
+            });
+        }
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(1));
+        cell.front_attempt_returned();
+        let decided = cell.decide();
+        assert_eq!(
+            decided.restore,
+            RestoreStatus::SkippedPerson {
+                now_front: Some(THIRD)
+            }
+        );
+        assert!(decided.person_input_during_fronting);
+        assert!(shared.lock().unwrap().requests.is_empty());
+        let mut body = json!({"outcome":"completed"});
+        cell.disclose(&mut body, decided);
+        assert_eq!(body["outcome"], "completed", "skipped_person is no failure");
+        assert_eq!(body["fronting"]["restore"], "skipped_person");
+        assert_eq!(body["fronting"]["person_input_during_fronting"], true);
+    }
+
+    #[test]
+    fn a_failed_restore_becomes_restore_failed_keeping_detail_and_effect_status() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&screen(false), &releases))
+            .unwrap();
+        let failed = RestoreDecided {
+            restore: RestoreStatus::Failed {
+                left_in_front: Some(TARGET),
+            },
+            person_input_during_fronting: false,
+            front_requested: true,
+        };
+        for outcome in [
+            "completed",
+            "dispatch_outcome_unknown",
+            "action_deadline_exceeded",
+        ] {
+            let mut body = json!({"outcome":outcome, "effect_status":"effect_indeterminate",
+                "detail":{"reason":"cancelled","dispatched":true,"step":"dispatch",
+                    "held_state":"none_held"},
+                "remedy":"read the state before retrying"});
+            cell.disclose(&mut body, failed);
+            assert_eq!(body["outcome"], "restore_failed", "outranks {outcome}");
+            assert_eq!(body["effect_status"], "effect_indeterminate");
+            assert_eq!(body["detail"]["reason"], "cancelled");
+            assert_eq!(body["fronting"]["restore"], "failed");
+            assert_eq!(body["fronting"]["fronted"], true);
+            assert!(body["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("Mail was left"));
+            crate::computer::platform::vocabulary::validate_capability_result(
+                "computer.press_element",
+                &body,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Run one route whose worker is `worker`, then cancel it once the worker
+    /// signals, and return the wire reply's body. On the paused clock, the
+    /// reply comes within the one RELEASE_BUDGET_MS that release and restore
+    /// share.
+    async fn cancelled_route<F>(
+        worker: impl FnOnce(Arc<TerminalArbiter>) -> F + Send + 'static,
+    ) -> Value
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut planes = crate::tests::management_bound_planes(1, 1);
+        let (ready, started) = tokio::sync::oneshot::channel::<()>();
+        let input = Mutex::new(Some((worker, ready)));
+        planes.route_test_handler = Some(Arc::new(move || {
+            let (worker, ready) = input.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let terminal = TerminalArbiter::current().unwrap();
+                terminal.set_step(CallStep::Dispatch);
+                assert!(terminal.gate.begin_mutation());
+                let work = worker(terminal);
+                let _ = ready.send(());
+                work.await;
+            })
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(request(), &tx, &planes).await.unwrap();
+        started.await.unwrap();
+        let cancelled_at = tokio::time::Instant::now();
+        handle_frame(cancel(), &tx, &planes).await.unwrap();
+        let reply = rx.recv().await.unwrap();
+        assert!(
+            cancelled_at.elapsed() <= Duration::from_millis(budgets::RELEASE_BUDGET_MS),
+            "release and restore share one RELEASE_BUDGET_MS"
+        );
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    /// A worker that registers the obligation, fronts the target, and then
+    /// stays blocked until the route is cancelled.
+    fn fronted_worker(
+        shared: SharedScreen,
+        releases: Arc<AtomicUsize>,
+        release: Option<ReleaseJob>,
+    ) -> impl FnOnce(
+        Arc<TerminalArbiter>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+           + Send
+           + 'static {
+        move |terminal| {
+            if let Some(release) = release {
+                terminal.set_release(release);
+            }
+            let cell = terminal
+                .register_restore(obligation(&shared, &releases))
+                .unwrap();
+            assert!(cell.begin_front_attempt(0));
+            cell.front_attempt_returned();
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_after_a_front_restores_and_reports_it_in_the_terminal_body() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let reply = cancelled_route(fronted_worker(
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            None,
+        ))
+        .await;
+        assert_eq!(reply["outcome"], "dispatch_outcome_unknown");
+        assert_eq!(reply["detail"]["held_state"], "none_held");
+        assert_eq!(reply["fronting"]["restore"], "restored");
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_after_a_front_with_the_restore_failing_replies_restore_failed() {
+        let shared = screen(false);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let reply = cancelled_route(fronted_worker(
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            None,
+        ))
+        .await;
+        assert_eq!(reply["outcome"], "restore_failed");
+        assert_eq!(reply["effect_status"], "effect_indeterminate");
+        assert_eq!(reply["detail"]["reason"], "cancelled");
+        assert_eq!(reply["fronting"]["restore"], "failed");
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_input_is_released_before_the_restore_and_both_are_reported() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let log = Arc::clone(&shared);
+        let release: ReleaseJob = Box::pin(async move {
+            log.lock().unwrap().log.push("release");
+            HeldState::Released
+        });
+        let reply = cancelled_route(fronted_worker(
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            Some(release),
+        ))
+        .await;
+        assert_eq!(shared.lock().unwrap().log, ["release", "restore"]);
+        assert_eq!(reply["detail"]["held_state"], "released");
+        assert_eq!(reply["fronting"]["restore"], "restored");
+        assert_eq!(reply["outcome"], "dispatch_outcome_unknown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_release_requests_no_restore_and_replies_restore_failed() {
+        let unknown: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(async { HeldState::Unknown });
+        let stalled: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(std::future::pending());
+        for release in [unknown, stalled] {
+            let shared = screen(true);
+            let releases = Arc::new(AtomicUsize::new(0));
+            let reply = cancelled_route(fronted_worker(
+                Arc::clone(&shared),
+                Arc::clone(&releases),
+                Some(release(Arc::clone(&shared))),
+            ))
+            .await;
+            assert!(
+                shared.lock().unwrap().requests.is_empty(),
+                "no restore is requested while a key may be held"
+            );
+            assert_eq!(reply["outcome"], "restore_failed");
+            assert_eq!(reply["detail"]["held_state"], "unknown");
+            assert_eq!(reply["fronting"]["restore"], "failed");
+            assert!(reply["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("Mail was left"));
+            assert_eq!(releases.load(SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_before_the_front_leaves_a_resumed_worker_unfronted() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let (resume, resumed) = tokio::sync::oneshot::channel::<()>();
+        let (fronted, front_answer) = tokio::sync::oneshot::channel::<bool>();
+        let host_screen = Arc::clone(&shared);
+        let lock_releases = Arc::clone(&releases);
+        let reply = cancelled_route(move |terminal: Arc<TerminalArbiter>| {
+            let cell = terminal
+                .register_restore(obligation(&host_screen, &lock_releases))
+                .unwrap();
+            async move {
+                let _ = resumed.await;
+                let _ = fronted.send(cell.begin_front_attempt(0));
+            }
+        })
+        .await;
+        assert_eq!(reply["fronting"]["restore"], "not_needed");
+        assert_eq!(reply["fronting"]["fronted"], false);
+        assert_eq!(reply["fronting"]["not_fronted_reason"], "cancelled");
+        resume.send(()).unwrap();
+        assert!(
+            !front_answer.await.unwrap(),
+            "the resumed worker never fronts"
+        );
+        assert!(shared.lock().unwrap().requests.is_empty());
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_a_front_request_waits_for_it_then_decides_once() {
+        let shared = screen(true);
+        shared.lock().unwrap().frontmost = Some(PREVIOUS);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let hop_screen = Arc::clone(&shared);
+        let lock_releases = Arc::clone(&releases);
+        let reply = cancelled_route(move |terminal: Arc<TerminalArbiter>| {
+            let cell = terminal
+                .register_restore(obligation(&hop_screen, &lock_releases))
+                .unwrap();
+            assert!(cell.begin_front_attempt(0));
+            // The worker's front request runs in its own blocking hop.
+            std::thread::spawn(move || return_front_after_take(&cell, &hop_screen));
+            std::future::pending::<()>()
+        })
+        .await;
+        assert_eq!(reply["fronting"]["restore"], "restored");
+        assert_eq!(reply["fronting"]["fronted"], true);
+        let screen = shared.lock().unwrap();
+        assert_eq!(screen.log, ["front_returned", "restore"]);
+        assert_eq!(screen.requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_unfinished_at_the_budget_is_reported_failed_and_runs_on_detached() {
+        /// A host whose restore request blocks its thread until the test lets
+        /// it go, or for a few real seconds at most.
+        struct StuckHost {
+            inner: FakeHost,
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl RestoreHost for StuckHost {
+            fn now_ms(&mut self) -> u64 {
+                self.inner.now_ms()
+            }
+            fn pause_ms(&mut self, milliseconds: u64) {
+                self.inner.pause_ms(milliseconds);
+            }
+            fn frontmost_pid(&mut self) -> Option<u32> {
+                self.inner.frontmost_pid()
+            }
+            fn request_front(&mut self, pid: u32) -> bool {
+                let _ = self.started.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                self.inner.request_front(pid)
+            }
+            fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+                self.inner.hardware_input_snapshot()
+            }
+        }
+
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let (started, decision_started) = std::sync::mpsc::channel();
+        let (let_go, release) = std::sync::mpsc::channel();
+        let mut planes = crate::tests::management_bound_planes(1, 1);
+        let input = Mutex::new(Some((
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            started,
+            release,
+        )));
+        let (ready, worker_started) = tokio::sync::oneshot::channel::<()>();
+        let ready = Mutex::new(Some(ready));
+        planes.route_test_handler = Some(Arc::new(move || {
+            let (shared, releases, started, release) = input.lock().unwrap().take().unwrap();
+            let ready = ready.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let terminal = TerminalArbiter::current().unwrap();
+                terminal.set_step(CallStep::Dispatch);
+                assert!(terminal.gate.begin_mutation());
+                let mut obligation = obligation(&shared, &releases);
+                obligation.host = Box::new(StuckHost {
+                    inner: FakeHost(shared),
+                    started,
+                    release,
+                });
+                let cell = terminal.register_restore(obligation).unwrap();
+                assert!(cell.begin_front_attempt(0));
+                cell.front_attempt_returned();
+                let _ = ready.send(());
+                std::future::pending::<()>().await;
+            })
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(request(), &tx, &planes).await.unwrap();
+        worker_started.await.unwrap();
+        handle_frame(cancel(), &tx, &planes).await.unwrap();
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while decision_started.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the decision never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The decision is blocked in its restore request; let the shared
+        // budget run out under it.
+        tokio::time::advance(Duration::from_millis(budgets::RELEASE_BUDGET_MS)).await;
+        let reply = rx.recv().await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply["outcome"], "restore_failed");
+        assert_eq!(reply["fronting"]["restore"], "failed");
+        // The decision keeps running detached: once let go, it completes
+        // its restore request and releases the fronting lock.
+        let_go.send(()).unwrap();
+        while releases.load(SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the detached decision never ended"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_decision_reaches_its_own_reply_with_one_restore_request() {
+        let mut planes = crate::tests::management_bound_planes(1, 1);
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let input = Mutex::new(Some((Arc::clone(&shared), Arc::clone(&releases))));
+        planes.route_test_handler = Some(Arc::new(move || {
+            let (shared, releases) = input.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let terminal = TerminalArbiter::current().unwrap();
+                terminal.set_step(CallStep::Dispatch);
+                assert!(terminal.gate.begin_mutation());
+                let cell = terminal
+                    .register_restore(obligation(&shared, &releases))
+                    .unwrap();
+                assert!(cell.begin_front_attempt(0));
+                cell.front_attempt_returned();
+                assert_eq!(cell.decide().restore, RestoreStatus::Restored);
+                let ok = Frame::build_with_version(
+                    PROTOCOL_VERSION,
+                    FrameType::Response,
+                    control_flags(),
+                    1,
+                    1,
+                    1,
+                    br#"{"outcome":"ok"}"#.to_vec(),
+                )
+                .unwrap();
+                assert!(terminal.complete(ok));
+                std::future::pending::<()>().await;
+            })
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(request(), &tx, &planes).await.unwrap();
+        let reply = rx.recv().await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply["outcome"], "ok");
+        assert_eq!(
+            reply["fronting"],
+            json!({"mode":"background","fronted":true,"purpose":"needs_front",
+                "restore":"restored"})
+        );
+        assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+        assert_eq!(releases.load(SeqCst), 1);
     }
 }
