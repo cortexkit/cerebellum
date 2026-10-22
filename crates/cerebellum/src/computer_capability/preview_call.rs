@@ -109,6 +109,8 @@ pub(crate) struct Badges {
     pub(crate) cursor: Coordinator,
     pub(crate) source: Arc<dyn AppStateSource>,
     pub(crate) preview: Arc<PreviewPlane>,
+    /// Background previews share the app-use-fronting review gate.
+    pub(crate) app_use_fronting_admitted: bool,
     /// The call runs in background mode.
     pub(crate) background: bool,
     /// The application's name, shown on the preview.
@@ -122,12 +124,14 @@ impl Badges {
         cursor: Coordinator,
         source: Arc<dyn AppStateSource>,
         preview: Arc<PreviewPlane>,
+        app_use_fronting_admitted: bool,
         app: String,
     ) -> Self {
         Self {
             cursor,
             source,
             preview,
+            app_use_fronting_admitted,
             background: super::app_use::call_mode()
                 .unwrap_or(cerebellum_core::config::AppUse::Background)
                 == cerebellum_core::config::AppUse::Background,
@@ -159,13 +163,15 @@ impl Badges {
             return Arrival::none();
         }
         if !self.background {
-            if self
+            let preview_is_shown = self
                 .preview
                 .running()
-                .is_some_and(|worker| worker.is_shown(identity.badge()))
-            {
+                .is_some_and(|worker| worker.is_shown(identity.badge()));
+            if preview_is_shown {
                 self.cursor.end(identity.badge());
             }
+        }
+        if !self.background || !self.app_use_fronting_admitted {
             return self.cursor.schedule_with_fallback(
                 identity,
                 kind,
