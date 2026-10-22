@@ -26,3 +26,8 @@ target/
 # Finder metadata. One was committed at the root for a month before the
 # fleet gitignore census found it; the rule keeps the next one out.
 .DS_Store
+
+# Python writes bytecode caches next to the gate's helper scripts; they are
+# never source, and an untracked cache made the gate's "generated files
+# untouched by the build" phase fail on a fresh checkout.
+__pycache__/
