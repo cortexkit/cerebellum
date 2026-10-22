@@ -37,6 +37,19 @@ pub const DRAG_OBSERVE_MS: u64 = 2_000;
 pub const SCROLL_OBSERVE_MS: u64 = 500;
 pub const FRONTING_READ_MS: u64 = 300;
 pub const FRONTING_BRACKET_MS: u64 = 100;
+// Bringing the target app to the front, for an action that needs it there.
+// Only one call fronts an app at a time, process-wide; a caller waits this
+// long for that lock, then stops with `fronting_busy`.
+pub const FRONTING_LOCK_WAIT_MS: u64 = 1_000;
+// The longest an action waits for its target to come to the front, whether it
+// stays there (foreground mode) or is put back afterwards.
+pub const FRONT_WAIT_MS: u64 = 300;
+// A press on an element that is disabled while its app is in the background
+// fronts the app, then polls the element for this long until it is enabled.
+pub const ENABLE_POLL_MS: u64 = 500;
+// Putting the previously frontmost app back has its own accessibility budget,
+// so a call whose work time has run out can still restore.
+pub const RESTORE_AX_MS: u64 = 300;
 pub const SYNTHETIC_POST_PHASE_MS: u64 = 5_000;
 pub const CAPTURE_IMAGE_MS: u64 = 2_000;
 pub const INVENTORY_MS: u64 = 2_000;
@@ -154,6 +167,8 @@ budget!(
     "read_state",
     [
         ("preflight", PREFLIGHT_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("tree", AX_TREE_PHASE_MS, 1),
         ("shell_retry", SHELL_RETRY_PHASE_MS, 1),
@@ -181,6 +196,8 @@ budget!(
         ("preflight", PREFLIGHT_MS, 1),
         ("inventory", INVENTORY_MS, 1),
         ("url_scheme", TARGET_CHECK_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
         ("launch", OPEN_APP_LAUNCH_MS, 1),
         ("ready_read", AX_STEP_MS, 1),
         ("journal", STORE_MS, 2),
@@ -195,14 +212,24 @@ budget!(
         ("journal", STORE_MS, 1),
     ]
 );
+// Actions that may bring their target app to the front reserve the fronting
+// lock wait and the front wait once per call. A press also reserves, for each
+// press, the read that decides whether the element needs its app in front,
+// the poll for the element to become enabled there, and putting the
+// previously frontmost app back.
 budget!(
     COMPUTER_PRESS_ELEMENT,
     "press_element",
     [
         ("preflight", PREFLIGHT_MS, 1),
+        ("needs_front_read", AX_STEP_MS, MAX_ELEMENT_PRESSES),
         ("cursor_arrival", CURSOR_ARRIVAL_MS, MAX_ELEMENT_PRESSES),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
+        ("enable_poll", ENABLE_POLL_MS, MAX_ELEMENT_PRESSES),
         ("press", AX_STEP_MS, MAX_ELEMENT_PRESSES),
         ("settle", COMPUTER_SETTLE_MS, MAX_ELEMENT_PRESSES),
+        ("restore", RESTORE_AX_MS, MAX_ELEMENT_PRESSES),
         ("observe", COMPUTER_OBSERVE_MS, MAX_ELEMENT_PRESSES),
         ("journal", STORE_MS, MAX_ELEMENT_PRESSES),
     ]
@@ -213,9 +240,14 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("hit_test", AX_STEP_MS, 1),
+        ("needs_front_read", AX_STEP_MS, 1),
         ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
+        ("enable_poll", ENABLE_POLL_MS, 1),
         ("press", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
+        ("restore", RESTORE_AX_MS, 1),
         ("observe", COMPUTER_OBSERVE_MS, 1),
         ("journal", STORE_MS, 1),
     ]
@@ -227,6 +259,8 @@ budget!(
         ("preflight", PREFLIGHT_MS, 1),
         ("target", AX_STEP_MS, 1),
         ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
         ("write", AX_STEP_MS, 1),
         ("read_back", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
@@ -241,6 +275,8 @@ budget!(
         ("preflight", PREFLIGHT_MS, 1),
         ("security", AX_STEP_MS, 1),
         ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -256,6 +292,8 @@ budget!(
     [
         ("preflight", PREFLIGHT_MS, 1),
         ("cursor_arrival", CURSOR_ARRIVAL_MS, 1),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("front", FRONT_WAIT_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
         ("post", SYNTHETIC_POST_PHASE_MS, 1),
@@ -900,9 +938,10 @@ const fn reply_max_ms(queue_ms: u64, park_ms: u64, work_ms: u64) -> u64 {
 }
 
 // Both tool sums are admission + queue + park + work + release + settle + egress.
-// computer_use: 6,000 + 275,000 + 120,000 + 142,000 + 6,000 + 6,000
-// + 130,001 = 685,001 ms. open_app's 120,000-ms launch ceiling dominates
-// work and queue. Egress reserves 130,001 ms to write the current writer batch
+// computer_use: 6,000 + 276,300 + 120,000 + 143,300 + 6,000 + 6,000
+// + 130,001 = 687,601 ms. open_app's 120,000-ms launch ceiling dominates
+// work and queue; its 143,300 ms of work includes waiting up to 1,000 ms for
+// the fronting lock and 300 ms for the app to come to the front. Egress reserves 130,001 ms to write the current writer batch
 // plus the queued channel buffer at EGRESS_MIN_BYTES_PER_S, and flush twice.
 pub const COMPUTER_REPLY_MAX_MS: u64 = reply_max_ms(
     COMPUTER_QUEUE_WAIT_LIMIT_MS,
@@ -1055,6 +1094,8 @@ mod tests {
             (
                 COMPUTER_READ_STATE,
                 PREFLIGHT_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + 2 * AX_STEP_MS
                     + SHELL_RETRY_PHASE_MS
                     + AX_MENU_PHASE_MS
@@ -1072,6 +1113,8 @@ mod tests {
                 PREFLIGHT_MS
                     + INVENTORY_MS
                     + TARGET_CHECK_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + OPEN_APP_LAUNCH_MS
                     + AX_STEP_MS
                     + 2 * STORE_MS,
@@ -1080,10 +1123,14 @@ mod tests {
             (
                 COMPUTER_PRESS_ELEMENT,
                 PREFLIGHT_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + MAX_ELEMENT_PRESSES
-                        * (CURSOR_ARRIVAL_MS
-                            + AX_STEP_MS
+                        * (2 * AX_STEP_MS
+                            + CURSOR_ARRIVAL_MS
+                            + ENABLE_POLL_MS
                             + COMPUTER_SETTLE_MS
+                            + RESTORE_AX_MS
                             + COMPUTER_OBSERVE_MS
                             + STORE_MS),
             ),
@@ -1091,8 +1138,12 @@ mod tests {
                 COMPUTER_PRESS_POINT,
                 PREFLIGHT_MS
                     + CURSOR_ARRIVAL_MS
-                    + 2 * AX_STEP_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
+                    + 3 * AX_STEP_MS
+                    + ENABLE_POLL_MS
                     + COMPUTER_SETTLE_MS
+                    + RESTORE_AX_MS
                     + COMPUTER_OBSERVE_MS
                     + STORE_MS,
             ),
@@ -1100,6 +1151,8 @@ mod tests {
                 COMPUTER_WRITE_TEXT,
                 PREFLIGHT_MS
                     + CURSOR_ARRIVAL_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + 3 * AX_STEP_MS
                     + COMPUTER_SETTLE_MS
                     + COMPUTER_OBSERVE_MS
@@ -1109,6 +1162,8 @@ mod tests {
                 COMPUTER_TYPE,
                 PREFLIGHT_MS
                     + CURSOR_ARRIVAL_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + 3 * AX_STEP_MS
                     + FRONTING_BRACKET_MS
                     + SYNTHETIC_POST_PHASE_MS
@@ -1120,6 +1175,8 @@ mod tests {
                 COMPUTER_KEYS,
                 PREFLIGHT_MS
                     + CURSOR_ARRIVAL_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + FRONT_WAIT_MS
                     + FRONTING_BRACKET_MS
                     + AX_STEP_MS
                     + SYNTHETIC_POST_PHASE_MS
@@ -1364,7 +1421,10 @@ mod tests {
             );
             assert_eq!(envelope, CALL_RECORD_BEGIN_MS + queue + park + work);
         }
-        assert_eq!(COMPUTER_REPLY_MAX_MS, 685_001);
+        assert_eq!(COMPUTER_MAX_WORK_MS, 143_300);
+        assert_eq!(COMPUTER_QUEUE_WAIT_LIMIT_MS, 276_300);
+        assert_eq!(COMPUTER_REPLY_MAX_MS, 687_601);
+        assert_eq!(COMPUTER_ENVELOPE_MS, 545_600);
         assert_eq!(BROWSER_REPLY_MAX_MS, 1_139_001);
     }
 
