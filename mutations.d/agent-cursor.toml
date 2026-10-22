@@ -2722,3 +2722,280 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "system-shortcuts-take-the-takeover-route"
+guards = "a system shortcut such as Command-Space acts outside the application, so it takes the takeover route even to a frontmost application: refused without takeover, run in the takeover bracket with it"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "    if system_wide {\n        takeover_route(admission)"
+new = "    if system_wide && false { // NON-VACUITY BREAK\n        takeover_route(admission)"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_system_shortcut_takes_the_takeover_route_even_to_a_frontmost_app",
+    "computer_capability::fronting_tests::system_wide_chords_take_the_takeover_route_and_in_app_chords_keep_the_app_grant",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "in-app-chords-keep-the-app-grant"
+guards = "a chord acting only inside the application, such as Command-Q, is not a system shortcut and stays under the app grant"
+file = "crates/cerebellum-computer/src/platform/blocked_chord.rs"
+old = "pub const SYSTEM_WIDE_CHORDS: &[SystemWideChord] = &[\n"
+new = "pub const SYSTEM_WIDE_CHORDS: &[SystemWideChord] = &[\n    macos(&[\"command\", \"q\"], COMMAND, SyntheticKey::Q, \"Quit\"), // NON-VACUITY BREAK\n"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_command_q_to_a_background_app_keeps_the_app_grant_route",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "needs-front-pre-read-needs-app-use-admission"
+guards = "without the app-use review a press on a button disabled in the background makes no needs-front pre-read and writes only its own row"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "if admission.mode == AppUse::Background && admission.may_front().is_ok() {"
+new = "if admission.mode == AppUse::Background && true { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::without_the_review_a_disabled_background_press_skips_the_needs_front_pre_read",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "bring-to-front-read-takes-the-lock-only-with-app-use-admission"
+guards = "without the app-use review a bring_to_front read under takeover runs today's bracket and never takes the fronting lock"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "            && self.app_use_fronting_admitted;"
+new = "            && true; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::without_either_review_a_bring_to_front_read_requests_no_front",
+    "computer_capability::fronting_tests::admission::without_the_review_a_bring_to_front_read_runs_the_bracket_without_the_lock",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "foreground-front-needs-app-use-admission"
+guards = "without the app-use review no foreground-mode action requests a front: reads, presses, chords, typing, writes and open_app go ahead unfronted"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        if let Err(stop) = admission.may_front() {\n            return Some(ForegroundFront::stopped(stop));"
+new = "        if let Err(stop) = Ok::<(), FrontingStop>(()) { // NON-VACUITY BREAK\n            return Some(ForegroundFront::stopped(stop));"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::without_the_review_a_foreground_press_chord_or_open_app_requests_no_front",
+    "computer_capability::fronting_tests::admission::without_the_review_a_foreground_read_requests_no_front",
+    "computer_capability::fronting_tests::admission::without_the_review_foreground_typing_and_writes_request_no_front",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "chord-front-under-the-app-grant-needs-app-use-admission"
+guards = "without the app-use review a modifier chord to a background application is never routed to a front under the app grant, so it never waits on the fronting lock"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "    } else if admission.app_use_fronting_admitted {\n        ChordRoute::FrontWithAppGrant"
+new = "    } else if true { // NON-VACUITY BREAK\n        ChordRoute::FrontWithAppGrant"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::without_the_review_a_background_chord_is_refused_without_waiting_on_the_lock",
+    "computer_capability::fronting_tests::admission::without_the_review_a_foreground_press_chord_or_open_app_requests_no_front",
+    "computer_capability::fronting_tests::mode_attendance_and_admission_decide_takeover_chords_and_fronting",
+    "computer_capability::fronting_tests::system_wide_chords_take_the_takeover_route_and_in_app_chords_keep_the_app_grant",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "the-plane-takes-app-use-fronting-from-its-release"
+guards = "the computer plane a module builds admits fronting outside the bracket only as the release inputs compiled into it do"
+file = "crates/cerebellum/src/lib.rs"
+old = "                    .with_app_use_fronting_admitted(app_use_fronting_admitted(\n                        &compiled_release_inputs(),\n                    ))"
+new = "                    .with_app_use_fronting_admitted(true) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::the_built_plane_admits_fronting_and_preview_capture_only_as_its_release_does",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "the-plane-takes-preview-capture-from-its-release"
+guards = "the computer plane a module builds admits preview capture only as the release inputs compiled into it do"
+file = "crates/cerebellum/src/lib.rs"
+old = "                    .with_native_preview_capture(preview_capture_admitted(\n                        &compiled_release_inputs(),\n                    )),"
+new = "                    .with_native_preview_capture(true), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::the_built_plane_admits_fronting_and_preview_capture_only_as_its_release_does",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "a-temporary-front-checks-its-own-admission"
+guards = "a temporary front checks the fronting admission itself once it holds the lock, so a caller that skipped its own check still fronts nothing"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        self.fronting_admission(call.consent, false).may_front()?;\n"
+new = "        // NON-VACUITY BREAK\n"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_temporary_front_is_never_prepared_where_fronting_is_not_admitted",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "input-fronts-need-a-seen-baseline"
+guards = "a chord, keys, typing, a write or a foreground press does not front an application the conversation never read; it stops with a remedy asking for a read"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "    if input_follows && sessions.last_seen(conversation_key, grant).is_none() {"
+new = "    if false && input_follows && sessions.last_seen(conversation_key, grant).is_none() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_background_chord_to_an_app_never_read_fronts_nothing_until_it_is_read",
+    "computer_capability::fronting_tests::admission::a_press_on_an_app_never_read_fronts_nothing",
+    "computer_capability::fronting_tests::admission::foreground_input_to_an_app_never_read_fronts_nothing",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "needs-front-press-needs-a-seen-baseline"
+guards = "a press on a button disabled in the background does not front an application the conversation was never shown"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "            self.grant,\n            true,\n        ) {"
+new = "            self.grant,\n            false, // NON-VACUITY BREAK\n        ) {"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_press_on_an_app_never_read_fronts_nothing",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "a-foreground-read-fronts-without-a-seen-baseline"
+guards = "a foreground read sends no input, so it fronts its application without a seen baseline"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "                conversation_key: &identity.conversation_key,\n                input_follows: false,"
+new = "                conversation_key: &identity.conversation_key,\n                input_follows: true, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_foreground_read_falls_back_unfronted_while_the_person_is_active",
+    "computer_capability::fronting_tests::a_foreground_read_fronts_its_application_one_way",
+    "computer_capability::fronting_tests::read_and_ordinary_press_rows_record_their_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "open-app-fronts-without-a-seen-baseline"
+guards = "open_app sends no input, so in foreground mode it fronts the application without a seen baseline"
+file = "crates/cerebellum/src/computer_capability/open_app.rs"
+old = "                            input_follows: false,"
+new = "                            input_follows: true, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::open_app_fronts_a_running_or_launched_app_only_in_foreground_mode",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "guard-zero-counts-live-session-wide-sends"
+guards = "guard (0) refuses every front while a session-wide send, such as a takeover drag holding the mouse button, is still in flight in any call"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "    !held.global_send_outstanding() && matches!(held.pending_release(), Ok(None))"
+new = "    matches!(held.pending_release(), Ok(None)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_admission_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::admission::a_live_session_wide_send_from_another_call_stops_every_front",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
