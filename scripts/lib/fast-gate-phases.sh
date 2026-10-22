@@ -54,8 +54,19 @@ catalogue_check_needed() {
 }
 
 run_linux_part() {
-  ck motor run --vcpus 8 --cwd "$repo_root" -- \
-    ./scripts/fast-gate.sh --part linux --base "$base" "${replay_options[@]+${replay_options[@]}}"
+  # Exit 200 means the build server refused the job before starting it (for
+  # example when it is full): nothing ran, so asking again is safe. Any other
+  # exit, including ck's own codes for a lost or timed-out job, is the verdict.
+  local attempt status
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    ck motor run --vcpus 8 --timeout 1800 --cwd "$repo_root" -- \
+      ./scripts/fast-gate.sh --part linux --base "$base" "${replay_options[@]+${replay_options[@]}}"
+    status=$?
+    [ "$status" -eq 200 ] || return "$status"
+    echo "==> Linux half refused before it started (attempt $attempt of 12); asking again in 15 s"
+    sleep 15
+  done
+  return 200
 }
 
 run_mac_part() {
