@@ -78,6 +78,8 @@ pub mod scope_watch;
 pub mod snapshot_store;
 mod terminal_arbiter;
 #[cfg(test)]
+mod test_browser;
+#[cfg(test)]
 mod test_support;
 mod tool_provider;
 mod tool_result;

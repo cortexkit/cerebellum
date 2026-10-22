@@ -57,6 +57,22 @@ pub fn shipped_lines(source: &str) -> Vec<(usize, String)> {
     kept
 }
 
+/// Test-only items, with shipped text blanked and line numbers preserved.
+/// Browser launch scans must inspect these items rather than discard them.
+pub fn test_source(source: &str) -> String {
+    let original: Vec<char> = source.chars().collect();
+    let code = code_only(&original);
+    let mut selected = vec![false; code.len()];
+    for (start, end) in test_items(&code) {
+        selected[start..end].fill(true);
+    }
+    original
+        .iter()
+        .enumerate()
+        .map(|(index, &c)| if selected[index] || c == '\n' { c } else { ' ' })
+        .collect()
+}
+
 /// The source files among `files` that are out-of-line test modules: each file
 /// a `#[cfg(test)] mod name;` declaration loads (`name.rs` or `name/mod.rs`
 /// beside the declaring module), and every file beneath that module's

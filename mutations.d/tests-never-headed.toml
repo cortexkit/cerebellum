@@ -1,0 +1,33 @@
+[[control]]
+id = "tests-never-headed-runtime-guard"
+guards = "the test browser helper panics before spawning a browser without new headless mode"
+file = "crates/cerebellum/src/test_browser.rs"
+old = "    assert_headless(arguments);"
+new = "    // NON-VACUITY BREAK: bypass the pre-spawn headless assertion"
+edits = []
+test_file = "crates/cerebellum/src/test_browser.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["test_browser::a_headed_launch_panics_before_the_platform_spawn"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "tests-never-headed-source-fence"
+guards = "a real browser test cannot bypass the shared headless assertion and spawn audit"
+file = "crates/cerebellum/src/browser_launch_readiness.rs"
+old = "        let probe = crate::test_browser::spawn_barred("
+new = "        let probe = cerebellum_macos::spawn_barred( // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/tests/it/tests_never_headed.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["tests_never_headed::test_browser_spawns_cannot_bypass_the_headless_helper"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
