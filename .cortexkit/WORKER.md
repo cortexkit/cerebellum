@@ -2,6 +2,10 @@
 
 Read this before you change code here. Each rule comes from a defect a worker shipped.
 
+## Gates
+
+Before you deliver, run `bash scripts/fast-gate.sh` on this Mac. It chooses what to run from your diff, and takes 2 to 6 minutes. It always runs fmt, clippy, the changed crates' tests and the protective checks. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
+
 ## The computer plane runs only on macOS and Windows
 
 `crates/cerebellum/src/computer_capability/` and the platform crates compile only on macOS and Windows. The Linux build server never runs their tests.
