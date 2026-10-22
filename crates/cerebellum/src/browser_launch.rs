@@ -2265,7 +2265,11 @@ impl BarredProcessLauncher for MacOsProcessLauncher {
         &mut self,
         request: &AttestedLaunchRequest,
     ) -> Result<Self::Process, PlatformLaunchError> {
-        cerebellum_macos::spawn_barred(
+        #[cfg(test)]
+        let spawn = crate::test_browser::spawn_for_test;
+        #[cfg(not(test))]
+        let spawn = cerebellum_macos::spawn_barred;
+        spawn(
             &request.executable,
             &request.arguments,
             &request.environment,

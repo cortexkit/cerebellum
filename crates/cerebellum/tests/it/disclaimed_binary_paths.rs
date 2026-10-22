@@ -6,20 +6,20 @@ mod support;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
-enum TokenKind {
+pub(super) enum TokenKind {
     Identifier,
     Literal,
     Punctuation,
 }
 
 #[derive(Debug)]
-struct Token {
-    text: String,
-    kind: TokenKind,
-    line: usize,
+pub(super) struct Token {
+    pub(super) text: String,
+    pub(super) kind: TokenKind,
+    pub(super) line: usize,
 }
 
-fn tokens(source: &str) -> Vec<Token> {
+pub(super) fn tokens(source: &str) -> Vec<Token> {
     let chars: Vec<char> = source.chars().collect();
     let mut found = Vec::new();
     let mut index = 0;

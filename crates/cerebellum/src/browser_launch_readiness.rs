@@ -1485,13 +1485,14 @@ mod live_chrome_test {
             return;
         }
 
-        let profile = std::env::temp_dir().join(format!(
+        let profile = PathBuf::from("/tmp").join(format!(
             "cerebellum-real-chrome-handshake-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&profile).expect("create real Chrome profile");
         let arguments = vec![
+            OsString::from("--headless=new"),
             OsString::from("--remote-debugging-pipe"),
             OsString::from("--no-first-run"),
             OsString::from("--no-default-browser-check"),
@@ -1502,7 +1503,7 @@ mod live_chrome_test {
             UnixStream::pair().expect("probe command pipe");
         let (_probe_response_parent, probe_response_child) =
             UnixStream::pair().expect("probe response pipe");
-        let probe = cerebellum_macos::spawn_barred(
+        let probe = crate::test_browser::spawn_barred(
             &chrome,
             &arguments,
             &[],
