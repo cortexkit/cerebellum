@@ -2550,6 +2550,7 @@ async fn read_and_ordinary_press_rows_record_their_fronting() {
         .iter()
         .find(|row| row["outcome"] == "completed")
         .unwrap_or_else(|| panic!("no press row in {rows:?}"));
+    assert!(pressed.get("fronting").is_none(), "{pressed}");
     assert!(
         rows.iter().all(|row| row.get("fronting").is_none()),
         "{rows:?}"
