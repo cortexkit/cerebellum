@@ -97,6 +97,16 @@ pub(crate) fn app(bundle: &str) {
     });
 }
 
+/// Name the site a held or refused codemode step is about, when the call's
+/// arguments did not (a user-browser read names a tab, not a site).
+pub(crate) fn origin(origin: &str) {
+    let _ = CALL_DETAIL.try_with(|detail| {
+        if let Some(detail) = detail.borrow_mut().as_mut() {
+            detail["origin"] = json!(origin);
+        }
+    });
+}
+
 pub(crate) fn legacy_run(facts: &AcceptedBindFacts) -> bool {
     facts.codemode_head.is_none()
         && (facts.call_mode == subc_protocol::call_mode::CallMode::Codemode
@@ -246,13 +256,16 @@ pub(crate) enum ParentRefusal {
     NotLinked,
     NoLiveHead,
     AgentMismatch,
+    /// The head is live, but none of its routes serves tools, so there is no
+    /// route its user-browser claims and snapshots could be kept under.
+    NoHeadToolsRoute,
 }
 
 impl ParentRefusal {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::NotLinked => "run_parent_not_linked",
-            Self::NoLiveHead => "run_parent_unavailable",
+            Self::NoLiveHead | Self::NoHeadToolsRoute => "run_parent_unavailable",
             Self::AgentMismatch => "run_agent_mismatch",
         }
     }
@@ -264,12 +277,99 @@ impl ParentRefusal {
                 "the parent has no live admitted cerebellum head route at that epoch"
             }
             Self::AgentMismatch => "the run agent differs from the admitted head route's agent",
+            Self::NoHeadToolsRoute => {
+                "the agent has no open tool route to keep its work in the person's Chrome under"
+            }
         }
     }
 }
 
+/// The admitted head a run borrows, re-resolved for this request. `Ok(None)`
+/// for a route that is not a run. Every request on a run route goes through
+/// this check.
+pub(crate) fn live_head(
+    planes: &crate::Planes,
+    facts: &AcceptedBindFacts,
+) -> Result<Option<AcceptedBindFacts>, ParentRefusal> {
+    if facts.codemode_head.is_none() {
+        return Ok(None);
+    }
+    let head = planes
+        .routes
+        .run_head(facts.scope.as_ref().expect("admitted run stamp"))?;
+    if head.identity.conversation_key != facts.identity.conversation_key
+        || head
+            .scope
+            .as_ref()
+            .is_some_and(|stamp| planes.scopes.is_superseded(stamp))
+    {
+        return Err(ParentRefusal::NoLiveHead);
+    }
+    Ok(Some(head))
+}
+
+/// The route whose claims, snapshots, element refs and quarantine a request on
+/// (`channel`, `epoch`) uses in the person's own Chrome. A run acts as its
+/// head, so a tab the head claimed is the run's to use, and a tab the run
+/// claims stays with the head after the run's route closes. Any other route
+/// is its own key.
+pub(crate) fn user_browser_route(
+    planes: &crate::Planes,
+    channel: u16,
+    epoch: u32,
+) -> Result<crate::user_browser_bridge::Route, ParentRefusal> {
+    let own = crate::user_browser_bridge::Route { channel, epoch };
+    let Some(facts) = planes.routes.get(channel, epoch) else {
+        return Ok(own);
+    };
+    if live_head(planes, &facts)?.is_none() {
+        return Ok(own);
+    }
+    let heads = planes
+        .routes
+        .head_routes(facts.scope.as_ref().expect("admitted run stamp"))?;
+    head_tools_route(&heads).ok_or(ParentRefusal::NoHeadToolsRoute)
+}
+
+/// One bound route of a run's head.
+struct HeadRoute {
+    route: crate::user_browser_bridge::Route,
+    /// When the route's bind was accepted; lower is older.
+    bound: u64,
+    facts: AcceptedBindFacts,
+}
+
+/// Which of a head's routes keeps its user-browser work: the route its own
+/// `browser_use` calls arrive on, where its claims and snapshots live.
+///
+/// Only a tools-surface route can be that route, since management routes never
+/// serve `browser_use`. Among tools routes the oldest-bound one is chosen.
+/// The route carrying the head's own browser calls is opened before any run
+/// starts and stays open, while other tools routes under the same head scope
+/// are newer: short-lived ones opened to read the catalog or answer a single
+/// request, or a replacement briefly overlapping an old route across a
+/// reconnect. Channel numbers say nothing about which is which.
+fn head_tools_route(heads: &[HeadRoute]) -> Option<crate::user_browser_bridge::Route> {
+    heads
+        .iter()
+        .filter(|head| head.facts.surface == crate::RouteSurface::Tools)
+        .min_by_key(|head| head.bound)
+        .map(|head| head.route)
+}
+
 impl RouteBindings {
     pub(crate) fn run_head(&self, run: &ScopeStamp) -> Result<AcceptedBindFacts, ParentRefusal> {
+        let heads = self.head_routes(run)?;
+        let head = &heads.first().ok_or(ParentRefusal::NoLiveHead)?.facts;
+        if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
+            return Err(ParentRefusal::AgentMismatch);
+        }
+        Ok(head.clone())
+    }
+
+    /// Every bound route of the run's linked, admitted head, of any surface,
+    /// sorted by (channel, epoch).
+    fn head_routes(&self, run: &ScopeStamp) -> Result<Vec<HeadRoute>, ParentRefusal> {
         if run.parent_state != Some(ParentState::Linked) {
             return Err(ParentRefusal::NotLinked);
         }
@@ -297,14 +397,15 @@ impl RouteBindings {
                             == Some(facts.identity.agent_project_id.as_str())
                 })
             })
+            .map(|(&(channel, epoch), facts)| HeadRoute {
+                route: crate::user_browser_bridge::Route { channel, epoch },
+                bound: self.bind_sequence(channel, epoch).unwrap_or(u64::MAX),
+                facts: facts.clone(),
+            })
             .collect::<Vec<_>>();
         // A head may have both management and tool routes. Choose consistently;
         // they name the same head context, not whichever hash entry happens first.
-        heads.sort_by_key(|(key, _)| **key);
-        let (_, head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
-        if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
-            return Err(ParentRefusal::AgentMismatch);
-        }
-        Ok((*head).clone())
+        heads.sort_by_key(|head| head.route);
+        Ok(heads)
     }
 }

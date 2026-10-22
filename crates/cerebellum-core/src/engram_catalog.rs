@@ -255,7 +255,7 @@ mod tests {
     /// the audit trail from backups. Restoring it onto another Mac stays an
     /// explicit operator action.
     #[test]
-    fn the_catalog_declares_every_tree_with_browser_excluded_and_journal_portable() {
+    fn the_catalog_declares_every_tree_with_profiles_excluded_and_journal_portable() {
         let descriptor = parsed();
         let by_path: Vec<_> = descriptor
             .entries

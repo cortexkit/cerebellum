@@ -1335,11 +1335,16 @@ fn collect_frames(
     Ok(())
 }
 
+/// `request` is the inbound call (channel, epoch, corr): its cancellation and
+/// its consent liveness. `route` keys this call's claims, snapshots, refs,
+/// quarantine and extension bookkeeping; for a codemode run it is the head's
+/// route (see `codemode::user_browser_route`).
 pub(crate) async fn serve(
     planes: &Planes,
     facts: &AcceptedBindFacts,
     writer: &mpsc::Sender<Frame>,
     request: (u16, u32, u64),
+    route: Route,
     action: &str,
     args: &Value,
 ) -> Value {
@@ -1353,21 +1358,16 @@ pub(crate) async fn serve(
     if let Some(connection) = planes.user_browser.connected_epoch() {
         planes.user_browser.target().synchronize(connection);
     }
-    let execution = planes.user_browser.target().execution(
-        Route {
-            channel: request.0,
-            epoch: request.1,
-        },
-        action,
-        args,
-        budget,
-    );
+    let execution = planes
+        .user_browser
+        .target()
+        .execution(route, action, args, budget);
     let result = EXECUTION_PERMITS.scope(Arc::new(permits),
         EXECUTION.scope(Arc::clone(&execution), POPUP_SEEN.scope(Cell::new(false), async {
             tokio::select! {
                 biased;
                 _ = execution.expired() => None,
-                reply = serve_scoped(planes, facts, writer, request, action, args) => Some(reply),
+                reply = serve_scoped(planes, facts, writer, request, route, action, args) => Some(reply),
             }
         })),
     ).await;
@@ -1384,12 +1384,13 @@ async fn serve_scoped(
     facts: &AcceptedBindFacts,
     writer: &mpsc::Sender<Frame>,
     request: (u16, u32, u64),
+    route: Route,
     action: &str,
     args: &Value,
 ) -> Value {
     let mut reply = match validate(action, args) {
         Err(reply) => reply,
-        Ok(()) => serve_inner(planes, facts, writer, request, action, args)
+        Ok(()) => serve_inner(planes, facts, writer, request, route, action, args)
             .await
             .unwrap_or_else(|reply| reply),
     };
@@ -1629,7 +1630,11 @@ impl InvocationGrant {
 struct Context<'a> {
     planes: &'a Planes,
     facts: &'a AcceptedBindFacts,
+    /// The key of every claim, snapshot and extension message of this call.
     route: Route,
+    /// The route the call arrived on. A codemode run's `route` is its head's,
+    /// but raising a card needs the inbound call's own route to be live.
+    inbound: Route,
     cancel: CancelHandle,
     connection: u64,
     action: &'a str,
@@ -1755,8 +1760,8 @@ impl Context<'_> {
         let live = crate::browser_consent::live(
             self.facts,
             self.planes,
-            self.route.channel,
-            self.route.epoch,
+            self.inbound.channel,
+            self.inbound.epoch,
         )
         .map_err(|ending| consent_unavailable(&ending))?;
         let mut session = self
@@ -1805,8 +1810,25 @@ impl Context<'_> {
         // abandoned one and withdraws it while this call raises or waits on
         // it.
         let _holding = SiteCardHold::enter(&self.planes.user_browser_cards, &subject);
+        // A codemode run never waits on the card: it joins a matching card that
+        // is already open, or raises a new one detached, and replies pending at
+        // once. When the route reads held replies, the call's durable
+        // obligation must exist before any other call's drain can read and
+        // acknowledge the answer, so card creation and that preparation are
+        // serialized with the session's drains.
+        let codemode = crate::codemode::active();
+        let serialization = self.planes.consent.settlement_lock(live.session());
+        let settlement = if crate::codemode::accepts_held() {
+            Some(serialization.lock().await)
+        } else {
+            None
+        };
         let ask_id = match self.planes.consent.open_card_for(live.session(), &subject) {
             Some(card) => card.elicitation_id,
+            None if codemode => session
+                .raise_detached(card, &subject)
+                .await
+                .map_err(|ending| consent_unavailable(&ending))?,
             None => session
                 .raise(card, &subject)
                 .await
@@ -1828,6 +1850,20 @@ impl Context<'_> {
                 },
             )
             .map_err(|_| refusal("grant_storage_unavailable"))?;
+        if codemode {
+            // The retained grant above is what the session drain mints when
+            // the person approves, so the run's retry finds it and asks again
+            // for nothing.
+            crate::codemode::prepare_consent(&ask_id, CardKind::UserBrowserSite)
+                .await
+                .map_err(|ending| consent_unavailable(&ending))?;
+            crate::codemode::origin(origin);
+            let mut pending = crate::cingulate_client::desk::pending_reply(&ask_id);
+            pending["browser"] = json!("user");
+            pending["input_dispatched"] = json!(false);
+            return Err(pending);
+        }
+        drop(settlement);
         let mut drain = self.planes.drain_signal.subscribe();
         let cancel = &self.cancel;
         let cancelled = async move {
@@ -1980,13 +2016,10 @@ async fn serve_inner(
     facts: &AcceptedBindFacts,
     _writer: &mpsc::Sender<Frame>,
     request: (u16, u32, u64),
+    route: Route,
     action: &str,
     args: &Value,
 ) -> Result<Value, Value> {
-    let route = Route {
-        channel: request.0,
-        epoch: request.1,
-    };
     let bridge = &planes.user_browser;
     let target = bridge.target();
     if matches!(
@@ -2050,6 +2083,10 @@ async fn serve_inner(
         planes,
         facts,
         route,
+        inbound: Route {
+            channel: request.0,
+            epoch: request.1,
+        },
         cancel,
         connection,
         action,

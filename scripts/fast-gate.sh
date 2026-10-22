@@ -100,15 +100,22 @@ for package in packages:
             mapped.update(target["name"] for target in test_targets)
         selected_suites.update((package["name"], suite) for suite in mapped)
 
-# cerebellum's `it` target holds the source scans over its shipped code: the
-# single launch-secret reader, zero runtime prints, declared launch-path outcome
-# words, the one lease clock, private file writes and more. Each reads files
-# under src/, so a change there can break one while no test file changed. A
-# hand-picked subset of modules misses whichever scan reads the changed file, so
-# run the whole target whenever the package is selected. It takes about 15 s
-# once built, and the gate builds it either way.
-if "cerebellum" in selected_packages:
-    selected_suites.add(("cerebellum", "it"))
+# Each crate's consolidated `it` target holds the source scans over that crate's
+# shipped code. cerebellum's covers the single launch-secret reader, zero
+# runtime prints, declared launch-path outcome words, the one lease clock,
+# private file writes and more; cerebellum-core's keeps the crate free of plane
+# identifiers. Each scan reads files under src/, so a change there can break one
+# while no test file changed, and a hand-picked subset of modules misses
+# whichever scan reads the changed file. So whenever a package is selected, run
+# its whole `it` target. cerebellum's takes about 15 s once built, and the gate
+# builds it either way.
+for name in selected_packages:
+    package = next(package for package in packages if package["name"] == name)
+    if any(
+        target["name"] == "it" and "test" in target["kind"]
+        for target in package["targets"]
+    ):
+        selected_suites.add((name, "it"))
 
 for name in sorted(selected_packages):
     print(f"P|{name}")
@@ -166,6 +173,15 @@ if [ "$self_test" -eq 1 ]; then
     exit 1
   fi
   echo "SELF-TEST PASSED: a cerebellum src change runs every source scan in suite it"
+
+  # The same holds for every crate with an `it` target: cerebellum-core's keeps
+  # the crate free of plane identifiers, and once missed a test renamed in src/.
+  core_scan_plan="$(plan_for_files 'crates/cerebellum-core/src/engram_catalog.rs')"
+  if ! printf '%s\n' "$core_scan_plan" | grep -Fxq 'T|cerebellum-core|it'; then
+    echo "SELF-TEST FAILED: a cerebellum-core src change did not select its it target" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a cerebellum-core src change runs its it target"
 
   # The control: a change outside cerebellum must not schedule cerebellum's `it`
   # target, which shows the rule above follows package selection and is not a

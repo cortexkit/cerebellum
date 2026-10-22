@@ -136,6 +136,8 @@ struct DoubleState {
     human_during_card: bool,
     plan_count: usize,
     attaches: usize,
+    /// Cancels the extension received for an attached or dispatched command.
+    cancels: usize,
     hang_plan: Option<usize>,
     hang_method: Option<&'static str>,
     hang_action: Option<&'static str>,
@@ -459,6 +461,7 @@ impl Fixture {
                         release_double(&mut worker_state.lock().unwrap(), route)
                     }
                     MessageBody::Cancel => {
+                        worker_state.lock().unwrap().cancels += 1;
                         if worker_state.lock().unwrap().ignore_cancel {
                             continue;
                         }
@@ -2810,6 +2813,7 @@ mod permission_cards;
 mod worker;
 
 mod agent_enforcement;
+mod codemode;
 
 #[tokio::test]
 async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card() {
