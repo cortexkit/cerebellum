@@ -1810,11 +1810,12 @@ impl Context<'_> {
         // abandoned one and withdraws it while this call raises or waits on
         // it.
         let _holding = SiteCardHold::enter(&self.planes.user_browser_cards, &subject);
-        // A codemode run never waits on the card: it raises it detached and
-        // replies pending at once. When the route reads held replies, the
-        // call's durable obligation must exist before any other call's drain
-        // can read and acknowledge the answer, so card creation and that
-        // preparation are serialized with the session's drains.
+        // A codemode run never waits on the card: it joins a matching card that
+        // is already open, or raises a new one detached, and replies pending at
+        // once. When the route reads held replies, the call's durable
+        // obligation must exist before any other call's drain can read and
+        // acknowledge the answer, so card creation and that preparation are
+        // serialized with the session's drains.
         let codemode = crate::codemode::active();
         let serialization = self.planes.consent.settlement_lock(live.session());
         let settlement = if crate::codemode::accepts_held() {
