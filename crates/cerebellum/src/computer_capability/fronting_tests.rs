@@ -839,6 +839,19 @@ async fn rig(mode: AppUse, desk: support::Desk) -> Rig {
 }
 
 impl Rig {
+    /// The same plane, desk and screen, with the config file now saying
+    /// `mode`.
+    fn with_mode(self, mode: AppUse) -> Self {
+        let plane = Arc::try_unwrap(self.plane)
+            .ok()
+            .expect("no other handle on the plane")
+            .with_app_use(app_use_file(mode));
+        Self {
+            plane: Arc::new(plane),
+            ..self
+        }
+    }
+
     async fn serve(&self, name: &str, arguments: Value, cancel: crate::CancelHandle) -> Value {
         let clock = cerebellum_core::clock::FakeClock::new();
         self.plane
@@ -999,15 +1012,7 @@ async fn an_unconfirmed_release_keeps_every_fronting_path_from_fronting() {
         "held_input_unconfirmed"
     );
 
-    let rig = Rig {
-        plane: Arc::new(
-            Arc::try_unwrap(rig.plane)
-                .ok()
-                .unwrap()
-                .with_app_use(app_use_file(AppUse::Background)),
-        ),
-        ..rig
-    };
+    let rig = rig.with_mode(AppUse::Background);
     let send = rig.send_id().await;
     rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
     let reply = rig
@@ -1079,15 +1084,7 @@ async fn a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_pres
         Duration::from_millis(crate::budgets::FRONTING_LOCK_WAIT_MS)
     );
 
-    let rig = Rig {
-        plane: Arc::new(
-            Arc::try_unwrap(rig.plane)
-                .ok()
-                .unwrap()
-                .with_app_use(app_use_file(AppUse::Background)),
-        ),
-        ..rig
-    };
+    let rig = rig.with_mode(AppUse::Background);
     let send = rig.send_id().await;
     let started = tokio::time::Instant::now();
     let reply = rig
@@ -1437,4 +1434,28 @@ async fn under_cancel_an_unconfirmed_release_requests_no_restore() {
         .unwrap()
         .contains("was left in front"));
     assert!(!rig.lock.held(), "terminal cleanup released the lock");
+}
+
+/// This module's own front is written into what the agent was shown at the
+/// moment it is seen. Input the person made in another application before
+/// the front then does not refuse a later action on the target, even when
+/// the action that fronted it was refused before it could record anything.
+#[tokio::test]
+async fn input_before_a_foreground_front_does_not_refuse_the_next_action() {
+    let rig = rig(AppUse::Background, support::focused_text_desk()).await;
+    rig.read().await;
+    assert!(rig.screen.log().is_empty());
+    rig.desk.state().input.push((0, std::time::Instant::now()));
+    let rig = rig.with_mode(AppUse::Foreground);
+    let typing = json!({"target": support::TARGET_BUNDLE_ID, "text": "hi"});
+
+    rig.desk.state().elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    let reply = rig.call("computer.type", typing.clone()).await;
+    assert_eq!(reply["outcome"], "secure_field_refused", "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242"]);
+
+    rig.desk.state().elements.get_mut(&2).unwrap().facts.subrole = None;
+    let reply = rig.call("computer.type", typing).await;
+    assert_ne!(reply["outcome"], "state_changed_by_person", "{reply}");
+    assert_eq!(reply["fronting"]["purpose"], "foreground_mode", "{reply}");
 }
