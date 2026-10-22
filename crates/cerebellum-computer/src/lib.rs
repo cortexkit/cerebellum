@@ -12,6 +12,7 @@ mod cursor_timeline;
 pub mod dispatch;
 pub mod grounding;
 pub mod platform;
+pub mod preview_layout;
 
 pub use audit::{ComputerJournalCodec, ComputerPlaneDescriptor, TypedCaptureDispatch};
 pub use capture_custody::{

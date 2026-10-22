@@ -18,7 +18,7 @@ pub const MAX_CURSOR_LINE: usize = 256 * 1024;
 /// larger frame is dropped rather than sent or drawn.
 pub const MAX_FRAME_BYTES: usize = 160 * 1024;
 /// The preview slots, top-down: at most this many agents show a preview.
-pub const PREVIEW_SLOTS: u8 = 3;
+pub use crate::preview_layout::PREVIEW_SLOTS;
 /// The longest application name a preview line carries, in characters.
 const MAX_APP_NAME_CHARS: usize = 128;
 /// The longest icon path a preview line carries, in bytes.
