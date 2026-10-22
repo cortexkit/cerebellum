@@ -126,7 +126,8 @@ impl LiveAppUse {
     }
 
     /// Read the person's config file, `config_path()`, from the next call on.
-    /// Whatever was read before is forgotten, so that call parses the file.
+    /// The cached result is cleared, so the next call parses the file if there
+    /// is a config path and the file exists.
     pub(crate) fn read_config_file(&self) {
         let mut state = self.lock();
         state.path = cerebellum_core::config::config_path();
