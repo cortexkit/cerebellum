@@ -12,6 +12,8 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 ## Mutation proofs
 
+- Put new catalogue rows in a new file named for your change (`mutations.d/<topic>.toml`), not in a shared file such as `agent-cursor.toml`. Parallel workers appending to one file conflict at every merge. Edit an existing row only when your change moves its anchor or renames its test, and say so.
+- Before you deliver, run `bash scripts/mutations.sh --check-only`. The strict check refuses a row whose expected test no longer exists, which the anchor checker alone misses.
 - Prefer `scripts/mutations.sh` to replay catalogue rows with the pinned runner.
 - When you run a test by hand under a mutation, never pipe the command through `grep`, `head` or `tail` without `set -o pipefail`. The pipe hides cargo's exit status.
 - Print the mutated line in the same command that runs the test, so the output proves the job saw the mutation. Read the result of that run, not of a later clean run.
