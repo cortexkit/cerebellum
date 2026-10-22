@@ -1556,6 +1556,7 @@ select = "expected"
 expect_red = [
     "computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack",
 ]
+signal_is_catch = "unboxing the serve path's action future makes a computer call overflow half a default thread stack, and Rust reports a stack overflow by aborting the test binary with SIGABRT rather than failing the test"
 only = false
 timeout_s = 900
 build_timeout_s = 1800

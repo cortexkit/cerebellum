@@ -415,8 +415,44 @@ else
 fi
 
 # Phase 4: compile + all tests (lib, bins, integration).
-run_phase "cargo test --locked --workspace --quiet" \
-  cargo test --locked --workspace --quiet
+#
+# The desk suites (harness-less tests that open AppKit windows on the main
+# thread) are skipped here by name and run on their own below. A desk suite
+# that cannot check what it promises, for example because the screen is
+# locked, prints "test NAME ... SKIPPED...: reason" and exits 2, so a run
+# without a display never reads as a pass. Only for those suites does the gate
+# set CEREBELLUM_DESK_TEST_SKIP_OK=1, which turns that exit into 0; it reads
+# the reason back from the output and names it before the verdict, so a skip
+# never turns the gate red and is never silent either.
+preview_hide_test=a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen
+run_phase "cargo test --locked --workspace --quiet -- --skip $preview_hide_test" \
+  cargo test --locked --workspace --quiet -- --skip "$preview_hide_test"
+
+desk_skip_reason() {
+  sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
+}
+# Run a command with its standard output also copied to a log, keeping the
+# command's own exit status.
+run_teed() {
+  local log="$1"
+  shift
+  "$@" | tee "$log"
+  return "${PIPESTATUS[0]}"
+}
+desk_skips=()
+desk_log="$parallel_phase_dir/desk-preview_hide.log"
+run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test preview_hide" \
+  run_teed "$desk_log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test preview_hide
+if [ "$(uname -s)" != Darwin ]; then
+  # Off macOS the target builds to an empty program that prints nothing.
+  desk_reason="AppKit exists only on macOS, so no preview panel was shown"
+else
+  desk_reason="$(desk_skip_reason < "$desk_log")"
+fi
+if [ -n "$desk_reason" ]; then
+  desk_skips+=("preview_hide skipped ($desk_reason)")
+  not_verified="$not_verified; preview_hide skipped ($desk_reason)"
+fi
 
 # Phase 5: the identity-resolution observer seam is feature-gated so production
 # builds emit no observer code. A plain `cargo test` therefore skips the
@@ -486,6 +522,11 @@ run_phase "generated files untouched by the build" \
 # green one, and the one-line verdict is where a reader decides whether they are
 # done, so it names what this host did not check rather than rounding it away.
 # The "GATE PASSED" prefix is unchanged: callers match on it.
+if [ "${#desk_skips[@]}" -gt 0 ]; then
+  for item in "${desk_skips[@]}"; do
+    echo "NOT VERIFIED: $item"
+  done
+fi
 if [ -z "$not_verified" ]; then
   echo "GATE PASSED: all phases green"
 else

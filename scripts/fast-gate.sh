@@ -429,6 +429,10 @@ if [ "${#suites[@]}" -gt 0 ]; then
       run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
         run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p "$package" --test "$target"
       reason="$(desk_skip_reason < "$log")"
+      if [ "$(uname -s)" != Darwin ]; then
+        # Off macOS the target builds to an empty program that prints nothing.
+        reason="AppKit exists only on macOS, so no preview panel was shown"
+      fi
       if [ -n "$reason" ]; then
         not_verified+=("$target skipped ($reason)")
       fi
