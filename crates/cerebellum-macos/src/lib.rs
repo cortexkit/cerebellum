@@ -163,8 +163,8 @@ pub use ax_actions::{
     cursor_element_frame, cursor_element_label, cursor_element_window, cursor_focused_window,
     element_at_position, element_enabled, element_facts, element_selected_range,
     element_text_value, element_window_number, focused_element, focused_window, press_element,
-    request_frontmost, write_element_text, AxElementActionError, AxElementFacts, AxHitScope,
-    AxTextAttribute,
+    request_frontmost, window_minimized, write_element_text, AxElementActionError, AxElementFacts,
+    AxHitScope, AxTextAttribute,
 };
 #[cfg(target_os = "macos")]
 pub use manual_accessibility::prepare_manual_accessibility;
@@ -204,10 +204,10 @@ pub use launch::{
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_window, encode_png, enumerate_windows, establish_window_server_connection,
-    frontmost_process_id, hardware_uuid, is_off_main_thread, post_event_at_hid_tap_for_measurement,
-    post_event_globally, post_event_to_pid, process_owner, process_start_time,
-    process_start_time_micros, responsible_process, running_applications,
+    application_bundle_path, capture_window, encode_png, enumerate_windows,
+    establish_window_server_connection, frontmost_process_id, hardware_uuid, is_off_main_thread,
+    post_event_at_hid_tap_for_measurement, post_event_globally, post_event_to_pid, process_owner,
+    process_start_time, process_start_time_micros, responsible_process, running_applications,
     screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect,
     CgEventPostCall, OwnedCgEvent, ProcessOwner, ProcessStartTime, RawCapture, RawWindow,
     RunningApplication,

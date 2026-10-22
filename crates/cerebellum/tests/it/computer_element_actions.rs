@@ -1760,7 +1760,8 @@ async fn cursor_every_action_reply_is_byte_identical_on_off_and_dead_transport()
             desk.state().focus = support::computer::DeskFocus::Element(12);
             desk.state().application_hit = Some((10, Some(grant().pid)));
             desk.state().element_windows.insert(10, 77);
-            let base = plane(&desk);
+            // Foreground mode: the on-screen badge is what is checked here.
+            let base = plane(&desk).with_foreground_app_use_for_test();
             let state = serve(
                 &base,
                 &management,
@@ -1859,9 +1860,11 @@ async fn cursor_planted_label_reaches_pipe_but_not_journal_or_call_records() {
     desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
     desk.state().elements.get_mut(&10).unwrap().facts.title = Some(PLANT.into());
     let storage = InMemoryJournalStorage::new();
+    // Foreground mode: the on-screen badge's label is what is checked here.
     let base: Plane = ComputerPlane::new(support::computer::audit_with_storage(storage.clone()))
         .with_permission_liveness(support::computer::live_permissions())
-        .with_app_state_source(desk.source());
+        .with_app_state_source(desk.source())
+        .with_foreground_app_use_for_test();
     let management = granted_management().await;
     let read = serve(
         &base,

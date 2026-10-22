@@ -1719,13 +1719,18 @@ where
         }
         let source = self.app_state_source.clone();
         let settle = settle_bound(ComputerCapability::WriteText);
-        let arrival = self.cursor.schedule(
+        // The preview shows the addressed element's own window, whether or
+        // not it is the focused one.
+        let arrival = self.badges(management.application_name(&grant)).schedule(
             super::cursor::Identity::current(identity.agent_project_id.clone()),
             cerebellum_computer::cursor::CursorKind::Write,
             grant.clone(),
-            self.app_state_source.clone(),
-            Some(handle.clone()),
+            super::cursor::ReadAim {
+                preferred: Some(handle.clone()),
+                focused: None,
+            },
             None,
+            super::cursor::WindowChoice::Element,
         );
         let watch = arrival.watch();
         if let Err(held) = self
@@ -2021,13 +2026,19 @@ where
                 Err(reply) => return PressDone::alone(reply),
             }
         }
-        let arrival = self.cursor.schedule(
+        // The preview shows the pressed element's own window: for a point
+        // press, the element found under the point.
+        let badges = self.badges(management.application_name(&grant));
+        let arrival = badges.schedule(
             cursor_identity,
             cerebellum_computer::cursor::CursorKind::Press,
             grant.clone(),
-            source.clone(),
-            Some(handle.clone()),
+            super::cursor::ReadAim {
+                preferred: Some(handle.clone()),
+                focused: None,
+            },
             point,
+            super::cursor::WindowChoice::Element,
         );
         let watch = arrival.watch();
         if let Err(held) = self
@@ -2064,8 +2075,7 @@ where
         if needs_front {
             let later = (!later.is_empty()).then(|| {
                 fronted_press::later_steps(
-                    &self.cursor,
-                    &source,
+                    &badges,
                     management,
                     consent,
                     &grant,

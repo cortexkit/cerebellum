@@ -134,8 +134,11 @@ impl cerebellum::computer_capability::image_freshness::ImageFreshnessSource for 
     }
 }
 
+/// A plane in foreground mode: these tests are about the on-screen badge,
+/// which background mode (the default) never draws.
 fn plane(desk: &Desk) -> Plane {
     ComputerPlane::with_result_schema_enforcement(audit(), ResultSchemaEnforcement::Withhold)
+        .with_foreground_app_use_for_test()
         .with_permission_liveness(live_permissions())
         .with_app_state_source(desk.source())
         .with_image_freshness_source(Arc::new(VisibleFixture))

@@ -436,6 +436,19 @@ pub fn element_enabled(element: &AxRetainedElement) -> Option<bool> {
         .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
 }
 
+/// The window's live `AXMinimized`. `None` when it cannot be read or is not
+/// a Boolean, which a caller must treat as unknown: not known to be
+/// minimized. This is a read: nothing in the application is prepared or
+/// changed.
+pub fn window_minimized(window: &AxRetainedElement) -> Option<bool> {
+    require_trust().ok()?;
+    let pointer = window.as_ptr();
+    bound_messages(pointer);
+    copy(pointer, "AXMinimized")
+        .ok()?
+        .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
+}
+
 /// Ask the element to perform `AXPress`. The pointer is never touched: this
 /// is a message to the application, which runs the element's own handler.
 pub fn press_element(element: &AxRetainedElement) -> Result<(), AxElementActionError> {

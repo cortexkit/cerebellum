@@ -1299,9 +1299,10 @@ fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// the app-use review, whose scope names this exception, must bind. Without
 /// it the preview shows the application's icon instead of a frame. The
 /// vocabulary digests play no part.
-// Only the tests below call this predicate for now: the computer plane does
-// not yet carry a preview capture flag to set from it at construction.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 fn preview_capture_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
         "capture_review_revision",
@@ -3365,6 +3366,13 @@ impl Planes {
                     // Fronting outside that bracket needs the app-use review
                     // as well; without it every such front is unavailable.
                     .with_app_use_fronting_admitted(app_use_fronting_admitted(
+                        &compiled_release_inputs(),
+                    ))
+                    // The plane's one preview worker captures with the
+                    // platform's capture, and only when the capture review
+                    // and the app-use review both bind; otherwise every
+                    // preview shows the application's icon.
+                    .with_native_preview_capture(preview_capture_admitted(
                         &compiled_release_inputs(),
                     )),
                 )
@@ -8370,6 +8378,10 @@ fn record_engram_catalog_write() {
 ///   whose owner-only mode could not be enforced at startup;
 /// - `engramCatalogWriteFailures`, the number of startup attempts to write the
 ///   backup catalog (`engram-catalog.json`) that failed;
+/// - on macOS, `previewCaptureRequests` and `previewFramesWritten`, how many
+///   capture requests the background-mode preview has made and how many frame
+///   lines it has written to the agent-cursor helper since the process
+///   started, so an idle preview can be seen to cost nothing;
 /// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
 ///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
 ///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
@@ -8407,6 +8419,14 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
             metrics.insert(
                 "cursorAvatarReadRefusals".into(),
                 json!(computer_capability::cursor::avatar::read_refusals()),
+            );
+            metrics.insert(
+                "previewCaptureRequests".into(),
+                json!(computer_capability::preview_capture_requests()),
+            );
+            metrics.insert(
+                "previewFramesWritten".into(),
+                json!(computer_capability::preview_frames_written()),
             );
         }
         metrics.insert(

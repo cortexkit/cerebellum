@@ -2077,7 +2077,10 @@ async fn cursor_successful_type_and_keys_replies_and_posts_are_identical_when_pi
             let desk = focused_text_desk();
             desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
             desk.state().cursor_visible = true;
-            let base = plane_with(&shared).with_app_state_source(desk.source());
+            // Foreground mode: the on-screen badge is what is checked here.
+            let base = plane_with(&shared)
+                .with_app_state_source(desk.source())
+                .with_foreground_app_use_for_test();
             serve(
                 &base,
                 "computer.read_state",
@@ -2141,8 +2144,10 @@ async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
     desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
     desk.state().cursor_visible = true;
     let (cursor, mut pictures) = Coordinator::channel();
+    // Foreground mode: the on-screen badge is what is checked here.
     let plane = plane_with(&shared)
         .with_app_state_source(desk.source())
+        .with_foreground_app_use_for_test()
         .with_cursor(cursor);
     serve(
         &plane,
