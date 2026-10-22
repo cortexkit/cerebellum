@@ -608,3 +608,190 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-held-state-follows-release-only"
+guards = "a call's terminal body derives held_state from its held-input release alone, so a call that owes only a restore reports none_held"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = '"held_state":if state.release.is_some() { "unknown" } else { "none_held" }},'
+new = '"held_state":if state.release.is_some() || state.restore.is_some() { "unknown" } else { "none_held" }}, // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::restore_slot_is_separate_from_release_and_held_state_follows_release_only",
+    "terminal_arbiter::restore_slot_tests::cancel_after_a_front_restores_and_reports_it_in_the_terminal_body",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-registration-refused-after-terminal"
+guards = "a restore obligation registered after the call's terminal reply is chosen is refused, its fronting lock released, and the worker reports cancelled instead of fronting"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "        if state.chosen.is_some()\n            || state\n"
+new = "        if false // NON-VACUITY BREAK\n            || state\n"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::registration_after_a_chosen_terminal_is_refused_as_cancelled_and_frees_the_lock",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-restore-decision-runs-once"
+guards = "a restore obligation runs its restore decision exactly once: the side that takes it second waits, for a bounded time, for the first side's result instead of deciding again"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "            CleanupTake::AlreadyTaken => return self.await_decision(inner),"
+new = "            CleanupTake::AlreadyTaken => 0, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::the_cell_runs_the_restore_decision_exactly_once",
+    "terminal_arbiter::restore_slot_tests::cleanup_before_the_front_prevents_it_and_reports_not_needed",
+    "terminal_arbiter::restore_slot_tests::a_worker_decision_reaches_its_own_reply_with_one_restore_request",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-lock-released-when-decided"
+guards = "the fronting lock a restore obligation holds is released when its restore decision completes, whichever side ran it"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "        drop(lock);\n        decided\n"
+new = "        std::mem::forget(lock); // NON-VACUITY BREAK\n        decided\n"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::a_restore_unfinished_at_the_budget_is_reported_failed_and_runs_on_detached",
+    "terminal_arbiter::restore_slot_tests::a_worker_decision_reaches_its_own_reply_with_one_restore_request",
+    "terminal_arbiter::restore_slot_tests::an_unconfirmed_release_requests_no_restore_and_replies_restore_failed",
+    "terminal_arbiter::restore_slot_tests::cancel_after_a_front_restores_and_reports_it_in_the_terminal_body",
+    "terminal_arbiter::restore_slot_tests::cancel_after_a_front_with_the_restore_failing_replies_restore_failed",
+    "terminal_arbiter::restore_slot_tests::cancel_during_a_front_request_waits_for_it_then_decides_once",
+    "terminal_arbiter::restore_slot_tests::cleanup_before_the_front_leaves_a_resumed_worker_unfronted",
+    "terminal_arbiter::restore_slot_tests::cleanup_before_the_front_prevents_it_and_reports_not_needed",
+    "terminal_arbiter::restore_slot_tests::cleanup_during_a_front_request_waits_for_it_then_decides_once",
+    "terminal_arbiter::restore_slot_tests::the_cell_runs_the_restore_decision_exactly_once",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-cleanup-waits-for-inflight-front"
+guards = "terminal cleanup that takes a restore obligation while its front request is in flight waits, at most the front wait, for that request to return before it decides"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "                        |inner| inner.attempt.decision_floor().is_none(),"
+new = "                        |_| false, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::cleanup_during_a_front_request_waits_for_it_then_decides_once",
+    "terminal_arbiter::restore_slot_tests::cancel_during_a_front_request_waits_for_it_then_decides_once",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-unconfirmed-release-requests-no-restore"
+guards = "when terminal cleanup takes a restore obligation after a held-input release that was not confirmed, it requests no restore and reports a front that may have happened as a failed restore naming the target left in front"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "    if matches!(held, Some(HeldState::Unknown)) {"
+new = "    if held.is_some() && false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::an_unconfirmed_release_requests_no_restore_and_replies_restore_failed",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-restore-failed-outranks-outcome"
+guards = "a failed restore replaces the terminal body's outcome with restore_failed while keeping its detail and effect_status"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "            object.insert(\"outcome\".into(), json!(\"restore_failed\"));"
+new = "            // NON-VACUITY BREAK: the outcome is left as it was"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::a_failed_restore_becomes_restore_failed_keeping_detail_and_effect_status",
+    "terminal_arbiter::restore_slot_tests::a_restore_unfinished_at_the_budget_is_reported_failed_and_runs_on_detached",
+    "terminal_arbiter::restore_slot_tests::cancel_after_a_front_with_the_restore_failing_replies_restore_failed",
+    "terminal_arbiter::restore_slot_tests::an_unconfirmed_release_requests_no_restore_and_replies_restore_failed",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-body-rebuilt-for-every-outcome"
+guards = "the chosen terminal body gains fronting.restore whatever its outcome, not only when it is dispatch_outcome_unknown"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "            if chosen.header.ty == FrameType::Response {"
+new = "            if chosen.header.ty == FrameType::Response && String::from_utf8_lossy(&chosen.body).contains(\"dispatch_outcome_unknown\") { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::a_worker_decision_reaches_its_own_reply_with_one_restore_request",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-terminal-decision-runs-on-the-blocking-pool"
+guards = "terminal cleanup runs the blocking restore decision through spawn_blocking, so a decision stuck in its restore request cannot stall the route: the reply still comes at the end of the shared budget, reporting the restore failed, while the decision continues detached"
+file = "crates/cerebellum/src/terminal_arbiter.rs"
+old = "    let mut decision = tokio::task::spawn_blocking(move || decider.decide());"
+new = "    let mut decision = tokio::spawn(async move { decider.decide() }); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/terminal_arbiter.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "terminal_arbiter::restore_slot_tests::a_restore_unfinished_at_the_budget_is_reported_failed_and_runs_on_detached",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
