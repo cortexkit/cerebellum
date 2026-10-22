@@ -256,13 +256,16 @@ pub(crate) enum ParentRefusal {
     NotLinked,
     NoLiveHead,
     AgentMismatch,
+    /// The head is live, but none of its routes serves tools, so there is no
+    /// route its user-browser claims and snapshots could be kept under.
+    NoHeadToolsRoute,
 }
 
 impl ParentRefusal {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::NotLinked => "run_parent_not_linked",
-            Self::NoLiveHead => "run_parent_unavailable",
+            Self::NoLiveHead | Self::NoHeadToolsRoute => "run_parent_unavailable",
             Self::AgentMismatch => "run_agent_mismatch",
         }
     }
@@ -274,24 +277,26 @@ impl ParentRefusal {
                 "the parent has no live admitted cerebellum head route at that epoch"
             }
             Self::AgentMismatch => "the run agent differs from the admitted head route's agent",
+            Self::NoHeadToolsRoute => {
+                "the agent has no open tool route to keep its work in the person's Chrome under"
+            }
         }
     }
 }
 
-/// The admitted head route a run borrows, re-resolved for this request, with
-/// the (channel, epoch) its bind holds. `Ok(None)` for a route that is not a
-/// run. Every request on a run route goes through this check, and every key a
-/// run's user-browser call uses comes from its result.
+/// The admitted head a run borrows, re-resolved for this request. `Ok(None)`
+/// for a route that is not a run. Every request on a run route goes through
+/// this check.
 pub(crate) fn live_head(
     planes: &crate::Planes,
     facts: &AcceptedBindFacts,
-) -> Result<Option<(crate::user_browser_bridge::Route, AcceptedBindFacts)>, ParentRefusal> {
+) -> Result<Option<AcceptedBindFacts>, ParentRefusal> {
     if facts.codemode_head.is_none() {
         return Ok(None);
     }
-    let (route, head) = planes
+    let head = planes
         .routes
-        .run_head_route(facts.scope.as_ref().expect("admitted run stamp"))?;
+        .run_head(facts.scope.as_ref().expect("admitted run stamp"))?;
     if head.identity.conversation_key != facts.identity.conversation_key
         || head
             .scope
@@ -300,7 +305,7 @@ pub(crate) fn live_head(
     {
         return Err(ParentRefusal::NoLiveHead);
     }
-    Ok(Some((route, head)))
+    Ok(Some(head))
 }
 
 /// The route whose claims, snapshots, element refs and quarantine a request on
@@ -317,19 +322,45 @@ pub(crate) fn user_browser_route(
     let Some(facts) = planes.routes.get(channel, epoch) else {
         return Ok(own);
     };
-    Ok(live_head(planes, &facts)?.map_or(own, |(head, _)| head))
+    if live_head(planes, &facts)?.is_none() {
+        return Ok(own);
+    }
+    let heads = planes
+        .routes
+        .head_routes(facts.scope.as_ref().expect("admitted run stamp"))?;
+    head_tools_route(&heads).ok_or(ParentRefusal::NoHeadToolsRoute)
+}
+
+/// Which of a head's routes keeps its user-browser work: the route its own
+/// `browser_use` calls arrive on. Management routes never serve `browser_use`,
+/// so only a tools-surface route can hold the head's claims. With several,
+/// the lowest (channel, epoch) is chosen, so every call picks the same one.
+/// `heads` is sorted by (channel, epoch).
+fn head_tools_route(
+    heads: &[(crate::user_browser_bridge::Route, AcceptedBindFacts)],
+) -> Option<crate::user_browser_bridge::Route> {
+    heads
+        .iter()
+        .find(|(_, head)| head.surface == crate::RouteSurface::Tools)
+        .map(|(route, _)| *route)
 }
 
 impl RouteBindings {
     pub(crate) fn run_head(&self, run: &ScopeStamp) -> Result<AcceptedBindFacts, ParentRefusal> {
-        self.run_head_route(run).map(|(_, head)| head)
+        let heads = self.head_routes(run)?;
+        let (_, head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
+        if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
+            return Err(ParentRefusal::AgentMismatch);
+        }
+        Ok(head.clone())
     }
 
-    /// [`Self::run_head`], with the head route's (channel, epoch).
-    pub(crate) fn run_head_route(
+    /// Every bound route of the run's linked, admitted head, of any surface,
+    /// sorted by (channel, epoch).
+    fn head_routes(
         &self,
         run: &ScopeStamp,
-    ) -> Result<(crate::user_browser_bridge::Route, AcceptedBindFacts), ParentRefusal> {
+    ) -> Result<Vec<(crate::user_browser_bridge::Route, AcceptedBindFacts)>, ParentRefusal> {
         if run.parent_state != Some(ParentState::Linked) {
             return Err(ParentRefusal::NotLinked);
         }
@@ -357,20 +388,16 @@ impl RouteBindings {
                             == Some(facts.identity.agent_project_id.as_str())
                 })
             })
+            .map(|(&(channel, epoch), facts)| {
+                (
+                    crate::user_browser_bridge::Route { channel, epoch },
+                    facts.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         // A head may have both management and tool routes. Choose consistently;
         // they name the same head context, not whichever hash entry happens first.
-        heads.sort_by_key(|(key, _)| **key);
-        let ((channel, epoch), head) = heads.first().ok_or(ParentRefusal::NoLiveHead)?;
-        if run.attributes.agent_id.as_deref() != Some(head.identity.agent_project_id.as_str()) {
-            return Err(ParentRefusal::AgentMismatch);
-        }
-        Ok((
-            crate::user_browser_bridge::Route {
-                channel: *channel,
-                epoch: *epoch,
-            },
-            (*head).clone(),
-        ))
+        heads.sort_by_key(|(route, _)| *route);
+        Ok(heads)
     }
 }

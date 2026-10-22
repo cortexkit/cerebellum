@@ -318,10 +318,10 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
     assert!(!fixture.planes.calls.has_pending_consents());
 }
 
-#[tokio::test]
-async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
-    // The head's standing site grant lets the run's open_tab reach its
-    // first page read without a card.
+/// A fixture whose head already holds a standing site grant for
+/// https://example.com in the person's Chrome, so a run's reads there need
+/// no card.
+fn granted_fixture() -> Fixture {
     let store = Arc::new(crate::agent_grants::AgentGrants::in_memory(Some(
         "test-machine".into(),
     )));
@@ -347,7 +347,14 @@ async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
             now,
         )
         .unwrap();
-    let fixture = Fixture::with_agent_grants(None, Some(store));
+    Fixture::with_agent_grants(None, Some(store))
+}
+
+#[tokio::test]
+async fn withdrawing_a_run_call_cancels_its_in_flight_extension_plan() {
+    // The head's standing site grant lets the run's open_tab reach its
+    // first page read without a card.
+    let fixture = granted_fixture();
     bind_run(&fixture, false).await;
     {
         let mut state = fixture.state.lock().unwrap();
@@ -450,4 +457,164 @@ async fn a_run_is_held_back_by_a_quarantine_on_its_heads_tab() {
             "channel {channel} was not held back by the head's quarantine"
         );
     }
+}
+
+/// Make the fixture's head route on `channel` a management-surface route.
+fn set_surface(fixture: &Fixture, channel: u16, surface: crate::RouteSurface) {
+    let mut facts = fixture.planes.routes.get(channel, 1).unwrap();
+    facts.surface = surface;
+    fixture.planes.routes.insert(channel, 1, facts);
+}
+
+#[tokio::test]
+async fn a_head_management_route_that_sorts_first_does_not_take_the_runs_chrome_work() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().tabs.insert(
+        "handed2".into(),
+        DoubleTab {
+            owner: None,
+            handed: true,
+            group: true,
+            url: "https://example.com/".into(),
+            loader: 1,
+            interaction: 1,
+        },
+    );
+    // The head's tools route is channel 2. Channel 1 becomes its management
+    // route, which sorts first among the head's routes.
+    set_surface(&fixture, 1, crate::RouteSurface::Management);
+    let tools = Route {
+        channel: 2,
+        epoch: 1,
+    };
+    let tab = fixture.claim(2).await;
+    let (read, cards) = fixture.snapshot(2, &tab, "allow_30m").await;
+    assert_eq!(read["outcome"], "ok", "{read}");
+    assert_eq!(cards.len(), 1);
+    bind_run(&fixture, false).await;
+
+    let run_read = fixture
+        .finish(start_run(&fixture, snapshot_args(&tab), None))
+        .await;
+    assert_eq!(structured(&run_read)["outcome"], "ok", "{run_read}");
+    let claimed = fixture
+        .finish(start_run(
+            &fixture,
+            json!({"browser":"user","action":"claim_tab","tab":"handed2"}),
+            None,
+        ))
+        .await;
+    assert_eq!(structured(&claimed)["outcome"], "ok", "{claimed}");
+    let run_tab = structured(&claimed)["tab"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&run_tab),
+        Some(&tools)
+    );
+    let (head_read, cards) = fixture.snapshot(2, &run_tab, "allow_30m").await;
+    assert_eq!(head_read["outcome"], "ok", "{head_read}");
+    assert!(cards.is_empty(), "{cards:?}");
+}
+
+#[tokio::test]
+async fn a_run_whose_head_has_no_tools_route_is_refused_before_the_extension() {
+    let fixture = Fixture::new();
+    set_surface(&fixture, 1, crate::RouteSurface::Management);
+    set_surface(&fixture, 2, crate::RouteSurface::Management);
+    bind_run(&fixture, false).await;
+    let reply = fixture
+        .finish(start_run(
+            &fixture,
+            json!({"browser":"user","action":"status"}),
+            None,
+        ))
+        .await;
+    assert_eq!(reply["code"], "run_parent_unavailable", "{reply}");
+    assert!(
+        reply["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no open tool route")),
+        "{reply}"
+    );
+    let state = fixture.state.lock().unwrap();
+    assert!(state.commands.is_empty(), "{:?}", state.commands);
+    assert_eq!(state.attaches, 0);
+}
+
+#[tokio::test]
+async fn a_run_route_goodbye_cancels_its_hanging_plan_and_keeps_the_heads_claims() {
+    let fixture = granted_fixture();
+    let tab = fixture.claim(1).await;
+    bind_run(&fixture, false).await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.plan_count = 0;
+        state.cancels = 0;
+        state.hang_action = Some("cdp");
+    }
+    let mut started = start_run(&fixture, snapshot_args(&tab), None);
+    until(|| fixture.state.lock().unwrap().plan_count == 1).await;
+    // As in the withdraw test: with the clock frozen, the plan's action
+    // deadline cannot be what cancels it.
+    tokio::time::pause();
+    goodbye(&fixture, RUN).await;
+    until_frozen(|| fixture.state.lock().unwrap().cancels == 1).await;
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&HEAD)
+    );
+    tokio::time::timeout(HANG_GUARD, &mut started.task)
+        .await
+        .expect("the run's call ends when its route closes")
+        .unwrap();
+    assert!(
+        started.replies.try_recv().is_err(),
+        "a closed route got a reply"
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_the_held_reader_gets_held_unsupported_for_a_site_card() {
+    let script = ScriptedCingulate::new();
+    let fixture = Fixture::scripted(&script);
+    let tab = fixture.claim(1).await;
+    bind_run(&fixture, false).await;
+    script
+        .then(
+            wire::CONSENT_REQUEST,
+            Reply::Result(json!({"elicitation_id":"el_site_old"})),
+        )
+        .then(
+            wire::CONSENT_DETACH,
+            Reply::Result(
+                json!({"elicitation_id":"el_site_old","state":"pending","detached":true}),
+            ),
+        );
+    let reply = fixture
+        .finish(start_run(&fixture, snapshot_args(&tab), Some("old-key")))
+        .await;
+    assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
+    assert_eq!(reply["isError"], true);
+    assert!(reply.get("held").is_none(), "{reply}");
+    let detail = &structured(&reply)["detail"];
+    assert_eq!(detail["step"], "consent", "{reply}");
+    assert_eq!(detail["origin"], "https://example.com", "{reply}");
+    assert_eq!(detail["ask_id"], "el_site_old", "{reply}");
+    assert!(!fixture.planes.calls.has_pending_consents());
+    assert_eq!(
+        script.methods(),
+        [wire::CONSENT_REQUEST, wire::CONSENT_DETACH]
+    );
+    assert!(fixture.state.lock().unwrap().captures.is_empty());
 }

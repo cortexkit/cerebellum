@@ -1633,7 +1633,7 @@ struct Context<'a> {
     /// The key of every claim, snapshot and extension message of this call.
     route: Route,
     /// The route the call arrived on. A codemode run's `route` is its head's,
-    /// but a card it raises lives only as long as the run's own route.
+    /// but raising a card needs the inbound call's own route to be live.
     inbound: Route,
     cancel: CancelHandle,
     connection: u64,
