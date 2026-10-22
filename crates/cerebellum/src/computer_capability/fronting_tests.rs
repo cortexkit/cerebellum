@@ -1387,7 +1387,10 @@ async fn chord_cancelled_mid_post(rig: &Rig) -> Value {
     crate::handle_frame(route_request(), &tx, &planes)
         .await
         .unwrap();
-    posted.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), posted)
+        .await
+        .expect("the chord's post never began")
+        .unwrap();
     crate::handle_frame(route_cancel(), &tx, &planes)
         .await
         .unwrap();
@@ -1458,4 +1461,43 @@ async fn input_before_a_foreground_front_does_not_refuse_the_next_action() {
     let reply = rig.call("computer.type", typing).await;
     assert_ne!(reply["outcome"], "state_changed_by_person", "{reply}");
     assert_eq!(reply["fronting"]["purpose"], "foreground_mode", "{reply}");
+}
+
+/// Guard (1): a change the person made to the target since the last read
+/// leaves a foreground read unfronted, saying so; that read records what it
+/// showed, so the next read fronts.
+#[tokio::test]
+async fn a_changed_target_falls_back_once_and_the_next_read_fronts() {
+    let rig = rig(AppUse::Background, support::focused_text_desk()).await;
+    rig.read().await;
+    rig.desk.state().focus = support::DeskFocus::Nothing;
+    let rig = rig.with_mode(AppUse::Foreground);
+    let reply = rig.read().await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"],
+        "person_changed_target"
+    );
+    assert!(rig.screen.log().is_empty());
+    let reply = rig.read().await;
+    assert_eq!(reply["fronting"]["fronted"], true, "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242"]);
+}
+
+/// A foreground action other than a read does not go ahead unfronted when
+/// its front stopped: it refuses `not_fronted` with the reason, having done
+/// nothing.
+#[tokio::test]
+async fn a_foreground_press_whose_front_stopped_refuses_not_fronted() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    let rig = rig.with_mode(AppUse::Foreground);
+    rig.screen.state().idle_ms = 200;
+    let reply = rig
+        .call("computer.press_element", json!({"element_id": send}))
+        .await;
+    assert_eq!(reply["outcome"], "not_fronted", "{reply}");
+    assert_eq!(reply["fronting"]["not_fronted_reason"], "person_active");
+    assert!(rig.desk.state().presses.is_empty());
+    assert!(rig.screen.log().is_empty());
 }
