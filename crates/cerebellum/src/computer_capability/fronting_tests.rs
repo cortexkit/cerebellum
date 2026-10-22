@@ -358,6 +358,10 @@ struct ScreenState {
     release_until_stopped: Option<Arc<crate::TerminalArbiter>>,
     /// The release, once begun, stays in flight until this is set.
     release_until: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The release logs `released` when it returns, after staying in flight
+    /// a little longer, so a restore made before it returned shows up in
+    /// the log ahead of it.
+    log_release_end: bool,
 }
 
 #[derive(Clone)]
@@ -386,6 +390,7 @@ impl Screen {
                 release_ends_call: None,
                 release_until_stopped: None,
                 release_until: None,
+                log_release_end: false,
             })),
             desk: desk.clone(),
         }
@@ -685,6 +690,10 @@ impl PlatformDriver for FakeDriver {
             {
                 std::thread::yield_now();
             }
+        }
+        if self.screen.state().log_release_end {
+            std::thread::sleep(Duration::from_millis(100));
+            self.screen.state().log.push("released".into());
         }
         if ok {
             Ok(2)
@@ -1931,56 +1940,71 @@ async fn a_press_left_held_by_another_conversation_on_another_app_blocks_every_f
 #[tokio::test(start_paused = true)]
 async fn lost_authorization_while_waiting_for_the_lock_reads_nothing() {
     let read = json!({"target": support::TARGET_BUNDLE_ID, "include_image": true});
-
-    // The app grant is revoked.
-    let rig = rig(AppUse::Foreground, mail_desk()).await;
-    let held = rig
-        .lock
-        .take(&crate::CancelHandle::pending())
-        .await
-        .unwrap();
-    let terminal = under_terminal();
-    let call = {
-        let (rig, terminal, read) = (rig.clone(), Arc::clone(&terminal), read.clone());
-        tokio::spawn(async move { rig.call_under(&terminal, "computer.read_state", read).await })
-    };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let store = rig.management.computer_grants().agent_grants();
-    let revoked = store.revoke_matching(store.now_ms(), |_| true).unwrap();
-    assert!(!revoked.is_empty(), "the app grant was revoked");
-    let reply = call.await.unwrap();
-    drop(held);
-    assert_ne!(reply["outcome"], "completed", "{reply}");
-    assert!(reply.get("image").is_none() && reply.get("image_unavailable").is_none());
-    assert_eq!(rig.desk.state().focus_reads, 0, "no accessibility read");
-    assert!(!rig.seen_marks_recorded());
-    assert!(rig.screen.log().is_empty());
-
-    // The dispatch gate closes, with no cancel, while the lock is held.
-    let rig = self::rig(AppUse::Foreground, mail_desk()).await;
-    let held = rig
-        .lock
-        .take(&crate::CancelHandle::pending())
-        .await
-        .unwrap();
-    let terminal = under_terminal();
-    let call = {
-        let (rig, terminal, read) = (rig.clone(), Arc::clone(&terminal), read.clone());
-        tokio::spawn(async move { rig.call_under(&terminal, "computer.read_state", read).await })
-    };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    terminal.stop(crate::TerminalCause::Deadline);
-    drop(held);
-    let reply = call.await.unwrap();
-    assert_ne!(reply["outcome"], "completed", "{reply}");
-    assert_eq!(
-        reply["fronting"]["not_fronted_reason"], "cancelled",
-        "{reply}"
-    );
-    assert!(reply.get("image").is_none() && reply.get("image_unavailable").is_none());
-    assert_eq!(rig.desk.state().focus_reads, 0, "no accessibility read");
-    assert!(!rig.seen_marks_recorded());
-    assert!(rig.screen.log().is_empty());
+    for revoke in [true, false] {
+        // A background read first, so the target has seen marks a guard
+        // would read and a fallback read would replace.
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        let marks_at = rig
+            .management
+            .app_state_sessions()
+            .last_seen(&support::identity().conversation_key, &support::grant())
+            .unwrap()
+            .at;
+        let rig = rig.with_mode(AppUse::Foreground);
+        let reads = rig.desk.state().focus_reads;
+        let held = rig
+            .lock
+            .take(&crate::CancelHandle::pending())
+            .await
+            .unwrap();
+        let terminal = under_terminal();
+        let call = {
+            let (rig, terminal, read) = (rig.clone(), Arc::clone(&terminal), read.clone());
+            tokio::spawn(
+                async move { rig.call_under(&terminal, "computer.read_state", read).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if revoke {
+            // Revoking the app grant cancels the call where it waits.
+            let store = rig.management.computer_grants().agent_grants();
+            let revoked = store.revoke_matching(store.now_ms(), |_| true).unwrap();
+            assert!(!revoked.is_empty(), "the app grant was revoked");
+        } else {
+            // The dispatch gate closes with no cancel at all: the call's
+            // deadline, or lost authorization only the gate sees. It is
+            // caught the moment the lock is taken.
+            terminal.stop(crate::TerminalCause::Deadline);
+        }
+        drop(held);
+        let reply = call.await.unwrap();
+        let case = format!("revoke={revoke}: {reply}");
+        assert_ne!(reply["outcome"], "completed", "{case}");
+        assert_eq!(
+            reply["fronting"]["not_fronted_reason"], "cancelled",
+            "{case}"
+        );
+        assert!(
+            reply.get("image").is_none() && reply.get("image_unavailable").is_none(),
+            "no capture: {case}"
+        );
+        assert_eq!(
+            rig.desk.state().focus_reads,
+            reads,
+            "no accessibility read: {case}"
+        );
+        assert_eq!(
+            rig.management
+                .app_state_sessions()
+                .last_seen(&support::identity().conversation_key, &support::grant())
+                .unwrap()
+                .at,
+            marks_at,
+            "no seen-mark update: {case}"
+        );
+        assert!(rig.screen.log().is_empty(), "{case}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,6 +2072,7 @@ async fn a_cancel_racing_the_settle_makes_one_restore_after_the_release() {
         let mut state = rig.screen.state();
         state.post_unknown = true;
         state.releasing = Some(Arc::clone(&releasing));
+        state.log_release_end = true;
     }
     let mut routed = routed(
         &rig,
@@ -2060,7 +2085,7 @@ async fn a_cancel_racing_the_settle_makes_one_restore_after_the_release() {
     routed.worker_finished_silently().await;
     assert_eq!(
         rig.screen.log(),
-        ["front:4242", "post", "release", "restore:100"],
+        ["front:4242", "post", "release", "released", "restore:100"],
         "{}",
         routed.reply
     );
