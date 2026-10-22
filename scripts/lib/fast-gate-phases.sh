@@ -19,7 +19,11 @@ select_mac_plan() {
   # These binaries contain platform-gated tests that Linux cannot execute.
   # Keep the original diff scope; script-only changes need no native rebuild.
   local package suite
-  local mac_libs=() mac_suites=()
+  local mac_packages=() mac_libs=() mac_suites=()
+  for package in "${packages[@]+${packages[@]}}"; do
+    if mac_package "$package"; then mac_packages+=("$package"); fi
+  done
+  packages=("${mac_packages[@]+${mac_packages[@]}}")
   for package in "${lib_packages[@]+${lib_packages[@]}}"; do
     if mac_package "$package"; then
       mac_libs+=("$package")
@@ -30,6 +34,19 @@ select_mac_plan() {
     if mac_package "${suite%%:*}"; then mac_suites+=("$suite"); fi
   done
   suites=("${mac_suites[@]+${mac_suites[@]}}")
+}
+
+run_mac_clippy() {
+  if [ "${#packages[@]}" -eq 0 ]; then
+    echo '==> SKIP: macOS clippy (no touched macOS package)'
+    return 0
+  fi
+  local package
+  local args=(--locked)
+  for package in "${packages[@]}"; do args+=(-p "$package"); done
+  args+=(--all-targets -- -D warnings)
+  run_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings (macOS)" \
+    cargo clippy "${args[@]}"
 }
 
 catalogue_check_needed() {
@@ -47,6 +64,7 @@ run_mac_part() {
 
 run_combined_gate() (
   require_part_host mac || exit $?
+  base="$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "${base}^{commit}")" || exit 2
   local scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
   mkdir -p "$scratch_root"
   static_dir="$(mktemp -d "$scratch_root/fast-gate-parts.XXXXXX")"
@@ -69,7 +87,11 @@ run_combined_gate() (
   trap 'exit 143' TERM HUP QUIT
   start_static_phase 'Linux half (ck motor run)' run_linux_part
   start_static_phase 'macOS half (local)' run_mac_part
+  local part_logs=("${static_logs[@]}")
   wait_static_phases
+  if ! python3 "$repo_root/scripts/lib/fast-gate-fingerprint.py" --compare "${part_logs[@]}"; then
+    phase_failed=1
+  fi
   if [ "$phase_failed" -ne 0 ]; then
     echo 'fast gate: both halves are required. In a worker sandbox, run scripts/fast-gate.sh --part linux with bash runon: "linux,8c", and scripts/fast-gate.sh --part mac locally (with the same --base).' >&2
   fi

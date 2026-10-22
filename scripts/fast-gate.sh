@@ -52,6 +52,7 @@ if [ "$self_test" -eq 0 ]; then
   fi
   require_part_host "$part"
   echo "==> FAST GATE PART: $part"
+  python3 "$repo_root/scripts/lib/fast-gate-fingerprint.py" "$base"
 fi
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 
@@ -170,6 +171,7 @@ desk_skip_reason() {
 
 if [ "$self_test" -eq 1 ]; then
   scripts/lib/fast-gate.test.sh
+  python3 scripts/lib/fast-gate-fingerprint.py --self-test
   planner_python=""
   for python in python3 python3.14 python3.13 python3.12 python3.11; do
     if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
@@ -344,6 +346,12 @@ for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
   run_serial_phase "cargo clippy --locked --workspace --target $target -- -D warnings" \
     cargo clippy --locked --workspace --target "$target" --quiet -- -D warnings
 done
+fi
+
+if [ "$part" = mac ] && ! run_mac_clippy; then
+  phase_failed=1
+  finish_gate
+  exit 1
 fi
 
 if [ "${#lib_packages[@]}" -gt 0 ]; then
