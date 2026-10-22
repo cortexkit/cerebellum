@@ -93,6 +93,9 @@ use tokio::sync::Mutex;
 mod app_use;
 pub mod cursor;
 mod element_actions;
+mod fronting;
+#[cfg(test)]
+mod fronting_tests;
 pub mod image_freshness;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
@@ -518,6 +521,15 @@ where
     /// it such keystrokes are refused, and the refusal names only what the
     /// build can do instead.
     fronting_bracket_admitted: bool,
+    /// Whether this build's release carries both the takeover review and the
+    /// app-use review, which alone admit fronting outside the keystroke
+    /// bracket: foreground mode's one-way front, fronting a disabled press or
+    /// a modifier chord under the app grant alone, and the restore rules that
+    /// go with them. Without it the plane behaves as it did before app use.
+    app_use_fronting_admitted: bool,
+    /// The process-wide fronting lock every fronting path takes, after the
+    /// call's app lane, so two calls never front applications over each other.
+    fronting_lock: fronting::FrontingLock,
     /// Records when this module posted input, so an action's check for the
     /// person's use of an application does not mistake this module's own
     /// posts for the person's. One ledger for every conversation: a post
@@ -632,6 +644,8 @@ where
             ),
             make_synthetic_driver,
             fronting_bracket_admitted: false,
+            app_use_fronting_admitted: false,
+            fronting_lock: fronting::FrontingLock::process_wide(),
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),
             app_use: app_use::LiveAppUse::without_file(),
@@ -677,6 +691,22 @@ where
     /// that mechanism sets this; without it such keystrokes are refused.
     pub fn with_fronting_bracket_admitted(mut self, admitted: bool) -> Self {
         self.fronting_bracket_admitted = admitted;
+        self
+    }
+
+    /// Admit fronting outside the keystroke bracket. Only a build whose
+    /// release carries both the takeover review and the app-use review sets
+    /// this.
+    pub fn with_app_use_fronting_admitted(mut self, admitted: bool) -> Self {
+        self.app_use_fronting_admitted = admitted;
+        self
+    }
+
+    /// Take fronting turns on `lock` instead of the process-wide one, so
+    /// tests that run side by side do not queue behind each other's fronts.
+    #[cfg(test)]
+    pub(crate) fn with_fronting_lock(mut self, lock: fronting::FrontingLock) -> Self {
+        self.fronting_lock = lock;
         self
     }
 
@@ -1079,14 +1109,47 @@ where
             admission.decorate(&mut busy);
             return busy;
         }
-        let takeover = !consent.unattended
+        // Foreground mode brings the application to the front before it is
+        // read. A front that stops for a reason the person or the platform
+        // caused falls back to an unfronted read; one that stops because the
+        // call is ending reads nothing at all.
+        let foreground = self
+            .front_for_foreground(fronting::FrontCall {
+                grant: &grant,
+                consent: &consent,
+                cancel: &cancel,
+                management,
+                conversation_key: &identity.conversation_key,
+            })
+            .await;
+        if let Some(stop) = foreground.and_then(|front| front.stop) {
+            if fronting::stop_ends_call(stop) {
+                let mut reply = if stop == cerebellum_computer::dispatch::FrontingStop::Cancelled {
+                    json!({"outcome": "cancelled"})
+                } else {
+                    quarantine::stopped_before_dispatch_reply()
+                };
+                if let Some(front) = foreground {
+                    front.fronting.apply(&mut reply);
+                }
+                admission.decorate(&mut reply);
+                return reply;
+            }
+        }
+        let takeover_held = !consent.unattended
             && parsed.include_image
             && parsed.bring_to_front
             && management.computer_grants().retain_held(
                 &consent.caller,
                 &crate::computer_grants::GrantNeed::Takeover,
             );
-        if parsed.include_image && parsed.bring_to_front && takeover {
+        let fronting_admission = self.fronting_admission(&consent, takeover_held);
+        let (bring_to_front, takeover) = fronting::image_fronting(
+            fronting_admission,
+            parsed.bring_to_front,
+            foreground.is_some_and(|front| front.fronting.fronted),
+        );
+        if parsed.include_image && bring_to_front && takeover {
             if let Some(mut refusal) = self
                 .refuse_if_person_changed(management, &identity.conversation_key, &grant)
                 .await
@@ -1412,6 +1475,48 @@ where
             .permissions
             .state(cerebellum_computer::platform::PermissionService::ScreenRecording)
             == PermissionLiveness::Live;
+        // A background `bring_to_front` read under held takeover fronts the
+        // application for the capture. A build admitted to app-use fronting
+        // runs it under the fronting lock and the call's restore obligation.
+        let mut image_hooks = None;
+        let mut image_fronting = None;
+        let bring_to_front_now = parsed.include_image
+            && bring_to_front
+            && takeover
+            && image_permission_live
+            && fronting_admission.mode == cerebellum_core::config::AppUse::Background
+            && self.app_use_fronting_admitted;
+        if bring_to_front_now {
+            match self
+                .prepare_temporary_front(
+                    fronting::FrontCall {
+                        grant: &grant,
+                        consent: &consent,
+                        cancel: &cancel,
+                        management,
+                        conversation_key: &conversation_key,
+                    },
+                    crate::terminal_arbiter::FrontingPurpose::BringToFront,
+                    true,
+                )
+                .await
+            {
+                Ok(parts) => image_hooks = Some(fronting::CellHooks::new(parts)),
+                Err(prepared) => {
+                    if let Some(change) = prepared.change {
+                        let mut refusal =
+                            element_actions::state_changed_by_person_reply(&app_name, change);
+                        admission.decorate(&mut refusal);
+                        return refusal;
+                    }
+                    image_fronting = Some(fronting::Fronting::stopped(
+                        fronting_admission.mode,
+                        fronting::Purpose::BringToFront,
+                        prepared.stop,
+                    ));
+                }
+            }
+        }
         match self
             .journal_state_read(
                 identity,
@@ -1421,12 +1526,13 @@ where
                 (parsed.include_image && image_permission_live).then(|| make_backend(&grant)),
                 ImageReadPlan {
                     requested: parsed.include_image,
-                    bring_to_front: parsed.bring_to_front,
+                    bring_to_front,
                     takeover,
-                    bracket_admitted: self.fronting_bracket_admitted,
+                    bracket_admitted: self.fronting_bracket_admitted && image_fronting.is_none(),
                     cancel: Some(cancel),
                     now_ms,
                     gate: None,
+                    hooks: image_hooks.clone(),
                 },
             )
             .await
@@ -1489,6 +1595,32 @@ where
         }
         // The conversation is shown this state now, so whatever the person
         // did before it is no longer a change the agent has not seen.
+        let mut seen = seen;
+        if let Some(hooks) = &image_hooks {
+            let end = hooks.end();
+            let fronted = fronting::hooked_fronting(
+                fronting_admission.mode,
+                fronting::Purpose::BringToFront,
+                &end,
+            );
+            if fronted.fronted {
+                // The front and the restore moved the target's focus and
+                // window; what the agent is shown is the state after both.
+                let source = self.app_state_source.clone();
+                let marks_grant = grant.clone();
+                seen = tokio::task::spawn_blocking(move || {
+                    SeenMarks::read(source.as_ref(), &marks_grant)
+                })
+                .await
+                .ok()
+                .or(seen);
+            }
+            image_fronting = Some(fronted);
+        }
+        let fronting = image_fronting.or(foreground.map(|front| front.fronting));
+        if let Some(fronting) = fronting {
+            fronting.apply(&mut reply);
+        }
         if let Some(seen) = seen {
             sessions.remember_seen(&conversation_key, &grant, seen);
         }
@@ -1805,6 +1937,23 @@ where
                 .reply(None),
             );
         }
+        // Foreground mode brings the application to the front before
+        // anything else, the focus read and the badge included.
+        let foreground = self
+            .front_for_foreground(fronting::FrontCall {
+                grant: &grant,
+                consent: &consent,
+                cancel: &cancel,
+                management,
+                conversation_key: &identity.conversation_key,
+            })
+            .await;
+        if let Some(mut refusal) =
+            foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
+        {
+            admission.decorate(&mut refusal);
+            return unposted(refusal);
+        }
         // Before anything is posted or fronted: the target's own focused
         // element must be readable and must not be a secure field. Asked of
         // the target rather than of the frontmost application, because the
@@ -1839,22 +1988,24 @@ where
             None,
         );
 
-        // Only shortcut modifiers need the fronting bracket. Plain typing
-        // stays inside the target process without taking the person's focus.
+        // Only shortcut modifiers need the front. Plain typing stays inside
+        // the target process without taking the person's focus.
         let capability_id = capability.capability_id();
         let frontmost = self.app_state_source.frontmost_pid();
         let mut bracket_bound = None;
-        let delivery = keystrokes::key_delivery(
-            &parsed.action,
-            frontmost == Some(grant.pid),
-            management.computer_grants().holds(
-                &consent.caller,
-                &crate::computer_grants::GrantNeed::Takeover,
-            ),
+        let takeover_held = management.computer_grants().holds(
+            &consent.caller,
+            &crate::computer_grants::GrantNeed::Takeover,
         );
+        let fronting_admission = self.fronting_admission(&consent, takeover_held);
+        let shortcut = matches!(&parsed.action,
+            SyntheticAction::KeyCombination { modifiers, .. }
+            if modifiers.command || modifiers.control || modifiers.option);
+        let route =
+            fronting::chord_route(fronting_admission, frontmost == Some(grant.pid), shortcut);
         // Focus may have moved while the focused element was read. Recheck
-        // before choosing a delivery path that would require takeover.
-        if consent.unattended && delivery != keystrokes::KeyDelivery::PerProcess {
+        // before choosing a delivery path that would front the target.
+        if route == fronting::ChordRoute::Refuse(fronting::ChordRefusal::TakeoverNotForFlows) {
             return unposted(
                 ConsentRefusal::Unavailable {
                     reason: "takeover_not_for_flows",
@@ -1863,17 +2014,29 @@ where
                 .reply(None),
             );
         }
-        if delivery == keystrokes::KeyDelivery::Refuse {
+        if route
+            == fronting::ChordRoute::Refuse(fronting::ChordRefusal::ModifierChordNeedsForeground)
+        {
             let mut reply = keystrokes::modifier_chord_refusal();
             admission.decorate(&mut reply);
             return unposted(reply);
         }
-        if delivery == keystrokes::KeyDelivery::BringForward {
-            if !self.fronting_bracket_admitted {
-                let mut reply = keystrokes::needs_foreground_reply();
-                admission.decorate(&mut reply);
-                return unposted(reply);
-            }
+        if route == fronting::ChordRoute::Refuse(fronting::ChordRefusal::KeystrokesNeedForeground) {
+            let mut reply = keystrokes::needs_foreground_reply();
+            admission.decorate(&mut reply);
+            return unposted(reply);
+        }
+        let front_with_app_grant = route == fronting::ChordRoute::FrontWithAppGrant;
+        if front_with_app_grant {
+            bracket_bound = Some(
+                cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
+                    capability_id,
+                    "maximum_fronting_bracket_interval_ms",
+                )
+                .unwrap_or(100),
+            );
+        }
+        if route == fronting::ChordRoute::TakeoverBracket {
             match management
                 .computer_grants()
                 .require(
@@ -1967,6 +2130,53 @@ where
             };
             admission.decorate(&mut reply);
             return unposted(reply);
+        }
+
+        // A modifier chord to a background application, fronted under the
+        // app grant alone: after the badge has arrived, the fronting lock,
+        // guard (0) and guard (1), and the call's restore obligation. The
+        // bracket then runs the idle gate, registers the obligation and
+        // fronts.
+        let mut chord_hooks = None;
+        if front_with_app_grant {
+            match self
+                .prepare_temporary_front(
+                    fronting::FrontCall {
+                        grant: &grant,
+                        consent: &consent,
+                        cancel: &cancel,
+                        management,
+                        conversation_key: &identity.conversation_key,
+                    },
+                    crate::terminal_arbiter::FrontingPurpose::NeedsFront,
+                    true,
+                )
+                .await
+            {
+                Ok(parts) => chord_hooks = Some(fronting::CellHooks::new(parts)),
+                Err(prepared) => {
+                    let mut reply = match (prepared.change, prepared.stop) {
+                        (Some(change), _) => element_actions::state_changed_by_person_reply(
+                            &management.application_name(&grant),
+                            change,
+                        ),
+                        // Served without a call arbiter, nothing can own the
+                        // restore, so the chord is refused as in a build that
+                        // cannot front.
+                        (
+                            None,
+                            cerebellum_computer::dispatch::FrontingStop::FrontingNotAdmitted,
+                        ) => keystrokes::needs_foreground_reply(),
+                        (None, stop) => fronting::not_fronted_reply(fronting::Fronting::stopped(
+                            fronting_admission.mode,
+                            fronting::Purpose::NeedsFront,
+                            stop,
+                        )),
+                    };
+                    admission.decorate(&mut reply);
+                    return unposted(reply);
+                }
+            }
         }
 
         // Every served capability has a dispatch row; a missing one is a table
@@ -2070,20 +2280,33 @@ where
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
         let dispatch_work = work.clone();
-        let (dispatched, bracket) = tokio::task::spawn_blocking(move || {
+        let driver_hooks = chord_hooks.clone();
+        let (dispatched, bracket, hooked) = tokio::task::spawn_blocking(move || {
             let _ax = dispatch_work.bound_ax();
             let cancelled = || cancel.is_cancelled();
-            let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
+            let mut driver = make_driver();
+            if let Some(hooks) = &driver_hooks {
+                // A platform that cannot run the hooked bracket refuses the
+                // fronted dispatch, so nothing is fronted without the hooks.
+                driver.accept_fronted_dispatch_hooks(fronting::boxed_hooks(hooks));
+            }
+            let mut dispatcher = Dispatcher::new(driver, &cancelled);
             let posting =
                 own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
             dispatch_work.publish_posting(&own_input, &posting);
             let dispatched = dispatcher.dispatch(&mut token, identity, request);
             own_input.end_posting(posting);
-            settle_held_input(ticket, &dispatched, make_driver.as_ref());
-            (dispatched, dispatcher.last_bracket().cloned())
+            // Released first; only then may the previous application come
+            // back, since a key still held would land on it.
+            let held = settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            let mut bracket = dispatcher.last_bracket().cloned();
+            let hooked = driver_hooks
+                .as_ref()
+                .map(|hooks| fronting::finish_after_release(hooks, held, bracket.as_mut()));
+            (dispatched, bracket, hooked)
         })
         .await
-        .unwrap_or((Err(DispatchError::Platform), None));
+        .unwrap_or((Err(DispatchError::Platform), None, None));
         let mut reply = match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
@@ -2162,6 +2385,12 @@ where
             }));
         }
 
+        // How this action used the front of the screen: a chord's temporary
+        // front, or foreground mode's one-way front.
+        let fronting = match &hooked {
+            Some(end) => Some(fronting::chord_fronting(fronting_admission.mode, end)),
+            None => foreground.map(|front| front.fronting),
+        };
         let posted = matches!(
             reply["outcome"].as_str(),
             Some("delivery_unconfirmed" | "restore_failed")
@@ -2204,6 +2433,9 @@ where
             })
             .await
             .unwrap_or_else(|_| json!({"outcome": "delivery_unconfirmed"}));
+        }
+        if let Some(fronting) = fronting {
+            fronting.apply(&mut reply);
         }
         admission.decorate(&mut reply);
         reply
@@ -3463,12 +3695,12 @@ fn settle_held_input<T, D: PlatformDriver>(
     ticket: Option<held_input::SendTicket>,
     dispatched: &Result<T, DispatchError>,
     make_driver: &(dyn Fn() -> D + Send + Sync),
-) {
-    if let Some(ticket) = ticket {
+) -> Option<crate::HeldState> {
+    ticket.map(|ticket| {
         ticket.settle(held_input::disposition_of(dispatched), |press| {
             held_input::release_one(press, &mut make_driver())
-        });
-    }
+        })
+    })
 }
 
 fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {

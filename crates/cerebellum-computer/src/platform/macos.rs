@@ -124,6 +124,8 @@ pub struct MacOs26PlatformDriver {
     /// drag is refused as not_idle on the age of the move's own last post.
     /// Measured on the VM: user_idle == hid_idle on every second action.
     user_idle: Arc<Mutex<UserIdleEstimator>>,
+    /// Set for one fronted dispatch or read admitted to app-use fronting.
+    fronted_hooks: FrontedHookSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,6 +492,163 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
             posts_returned: report.posts_returned,
             generation_verifications: report.generation_verifications,
         })
+    }
+}
+
+/// The restore half of a front on this Mac, on the clock of the bracket or
+/// session it came from: the window list's frontmost application, fronting
+/// through accessibility, and the process-wide session observer's hardware
+/// input timestamps. It holds nothing but that clock's origin, so it is
+/// `Send` and can run on a cleanup thread.
+struct MacRestoreHost {
+    started: Instant,
+}
+
+impl FrontingRestoreHost for MacRestoreHost {
+    fn now_ms(&mut self) -> u64 {
+        elapsed_millis(self.started)
+    }
+
+    fn pause_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    fn request_front(&mut self, pid: u32) -> bool {
+        cerebellum_macos::request_frontmost(pid).is_ok()
+    }
+
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
+        let (coverage_start, last_input) =
+            cerebellum_macos::SessionEventTap::hardware_input_snapshot()?;
+        Some(crate::dispatch::HardwareInputSnapshot::from_instants(
+            self.started,
+            coverage_start,
+            last_input,
+        ))
+    }
+}
+
+impl RestoreHostSource for MacBracketHost {
+    fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
+        Box::new(MacRestoreHost {
+            started: self.started,
+        })
+    }
+}
+
+/// A front outside the keystroke bracket on this Mac. Its reads, requests,
+/// tap and heartbeat are the bracket's own; the tap is opened only when the
+/// idle gate asks for it, so a session that never reaches the gate watches
+/// nothing.
+struct MacFrontingSession {
+    started: Instant,
+    observation: Option<(cerebellum_macos::SessionEventTap, HeartbeatPoster)>,
+    user_idle: Arc<Mutex<UserIdleEstimator>>,
+}
+
+impl FrontingSession for MacFrontingSession {
+    fn now_ms(&mut self) -> u64 {
+        elapsed_millis(self.started)
+    }
+
+    fn pause_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    fn request_front(&mut self, pid: u32) -> bool {
+        cerebellum_macos::request_frontmost(pid).is_ok()
+    }
+
+    fn our_pid(&self) -> i64 {
+        i64::from(std::process::id())
+    }
+
+    fn open_observer(&mut self) -> bool {
+        if self.observation.is_none() {
+            self.observation = open_session_observation(self.started).ok();
+        }
+        self.observation.is_some()
+    }
+
+    fn read_idle(&mut self) -> IdleReading {
+        read_hid_idle()
+    }
+
+    fn drain(&mut self) -> Vec<SourcedInputEvent> {
+        match &self.observation {
+            Some((tap, _)) => sourced_from_tap(tap),
+            None => Vec::new(),
+        }
+    }
+
+    fn post_heartbeat(&mut self) -> HeartbeatProbe {
+        match &mut self.observation {
+            Some((_, heartbeat)) => heartbeat.post().0,
+            // Reached only when no observer opened, which the caller already
+            // reads as unavailable; a probe that names no marker posts nothing.
+            None => HeartbeatProbe {
+                marker: HeartbeatMarker::new(0),
+                posted_at_ms: elapsed_millis(self.started),
+                our_pid: self.our_pid(),
+            },
+        }
+    }
+
+    fn observe_heartbeat(
+        &mut self,
+        probe: HeartbeatProbe,
+        watcher: &mut SeizeWatcher,
+    ) -> HeartbeatObservation {
+        match &self.observation {
+            Some((tap, _)) => heartbeat_observation(tap, watcher, probe, self.started),
+            None => HeartbeatObservation::Missed,
+        }
+    }
+
+    fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
+        MacRestoreHost {
+            started: self.started,
+        }
+        .hardware_input_snapshot()
+    }
+
+    fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
+        Box::new(MacRestoreHost {
+            started: self.started,
+        })
+    }
+
+    fn user_idle(&self) -> Arc<Mutex<UserIdleEstimator>> {
+        Arc::clone(&self.user_idle)
+    }
+}
+
+/// Hooks handed to the driver for its next fronted dispatch or read. A clone
+/// of the driver starts without them: they own one call's restore
+/// obligation, which no copy may run twice.
+#[derive(Default)]
+struct FrontedHookSlot(Option<Box<dyn FrontedDispatchHooks>>);
+
+impl Clone for FrontedHookSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Debug for FrontedHookSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("FrontedHookSlot")
+            .field(&self.0.is_some())
+            .finish()
     }
 }
 
@@ -1081,6 +1240,7 @@ impl MacOs26PlatformDriver {
             takeover_dispatch_review_revision: None,
             input_route_evidence: Default::default(),
             user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
+            fronted_hooks: FrontedHookSlot::default(),
         }
     }
 
@@ -1486,8 +1646,22 @@ impl PlatformDriver for MacOs26PlatformDriver {
             .user_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let report =
-            crate::dispatch::run_fronting_bracket(&mut host, &mut user_idle, plan, cancelled);
+        let report = match self.fronted_hooks.0.take() {
+            Some(mut hooks) => {
+                crate::platform::run_hooked_fronted(
+                    &mut host,
+                    &mut user_idle,
+                    plan,
+                    cancelled,
+                    hooks.as_mut(),
+                    None,
+                )
+                .report
+            }
+            None => {
+                crate::dispatch::run_fronting_bracket(&mut host, &mut user_idle, plan, cancelled)
+            }
+        };
         self.input_route_evidence = host.transport.evidence;
         Ok(report)
     }
@@ -1535,23 +1709,60 @@ impl PlatformDriver for MacOs26PlatformDriver {
             transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
         };
         let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(crate::dispatch::run_fronting_read(
-            &mut host,
-            &mut user_idle,
-            crate::dispatch::BracketPlan {
-                target_pid: target.pid,
-                units: 1,
-                maximum_interval_ms,
-                maximum_seize_detection_latency_ms: 50,
-            },
-            cancelled,
-            &mut || {
-                // Fronting can take time; never capture a replacement process.
-                if cerebellum_macos::process_start_time_micros(target.pid) == Some(generation) {
-                    read();
-                }
-            },
-        ))
+        let plan = crate::dispatch::BracketPlan {
+            target_pid: target.pid,
+            units: 1,
+            maximum_interval_ms,
+            maximum_seize_detection_latency_ms: 50,
+        };
+        let mut guarded_read = || {
+            // Fronting can take time; never capture a replacement process.
+            if cerebellum_macos::process_start_time_micros(target.pid) == Some(generation) {
+                read();
+            }
+        };
+        Ok(match self.fronted_hooks.0.take() {
+            Some(mut hooks) => {
+                crate::platform::run_hooked_fronted(
+                    &mut host,
+                    &mut user_idle,
+                    plan,
+                    cancelled,
+                    hooks.as_mut(),
+                    Some(&mut guarded_read),
+                )
+                .report
+            }
+            None => crate::dispatch::run_fronting_read(
+                &mut host,
+                &mut user_idle,
+                plan,
+                cancelled,
+                &mut guarded_read,
+            ),
+        })
+    }
+    fn fronting_session(&mut self) -> Result<Box<dyn FrontingSession>, DriverError> {
+        // The same review that admits the keystroke bracket: a front can take
+        // the person's keystrokes whichever path asks for it.
+        if self
+            .takeover_dispatch_review_revision
+            .as_deref()
+            .is_none_or(|revision| revision.trim().is_empty())
+        {
+            return Err(DriverError::StartupRefused(
+                "takeover_dispatch_review_revision is not bound",
+            ));
+        }
+        Ok(Box::new(MacFrontingSession {
+            started: Instant::now(),
+            observation: None,
+            user_idle: Arc::clone(&self.user_idle),
+        }))
+    }
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        self.fronted_hooks.0 = Some(hooks);
+        true
     }
     fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
         request.target.validate()?;
