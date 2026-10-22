@@ -7,12 +7,15 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# macOS's TMPDIR ends in a slash, so the joined path holds "//". mutations.sh
-# prints its root as `pwd` spells it, with single slashes, so spell the scratch
-# root the same way or the refusal cases never find the path they expect.
-scratch="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/mutations-test.XXXXXX")" && pwd)"
+scratch_root="${CARGO_TARGET_DIR:-$root/target}/scratch"
+real_mutate="${CARGO_TARGET_DIR:-$root/target}/tools/bin/ckdev-mutate"
+mkdir -p "$scratch_root"
+scratch="$(mktemp -d "$scratch_root/mutations-test.XXXXXX")"
+# Fixtures have their own install roots, independent of the caller's build cache.
+unset CARGO_TARGET_DIR
 trap 'rm -rf "$scratch"' EXIT
 failures=0
+checks=8
 
 pinned_version="0.12.3"
 pinned_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
@@ -135,4 +138,77 @@ run_case private_without_install_record_refuses 2 setup_private_unrecorded
 run_case check_only_validates_without_replaying 0 setup_private_pinned --check-only
 run_case check_only_still_refuses_a_missing_private_runner 2 setup_private_missing --check-only
 
+scoped_invalid_row() {
+  local repo="$scratch/scoped/repo" status
+  mkdir -p "$repo/scripts/lib" "$repo/mutations.d"
+  cp "$root/scripts/mutations.sh" "$repo/scripts/"
+  cp "$root/scripts/lib/mutation-check-plan.py" "$repo/scripts/lib/"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/check-mutation-tree.sh"
+  chmod +x "$repo/scripts/check-mutation-tree.sh"
+  setup_private_pinned "$scratch/scoped" "$repo"
+  cat >>"$repo/target/tools/bin/ckdev-mutate" <<'FAKE'
+if [ "$1" = check ] && [ "$2" = --catalogue ]; then
+  if grep -q 'planted-invalid' "$3"; then
+    echo 'strict check refused planted-invalid' >&2
+    exit 7
+  fi
+fi
+FAKE
+  (
+    cd "$repo" || exit 1
+    git init -q
+    git config user.email fast-gate-test@example.invalid
+    git config user.name fast-gate-test
+    printf '[[control]]\nid = "unchanged"\nfile = "guard.rs"\nold = "before"\nnew = "after"\n' >mutations.d/rows.toml
+    git add mutations.d
+    git commit -qm fixture
+    cat >>mutations.d/rows.toml <<'ROW'
+
+[[control]]
+id = "planted-invalid"
+guards = "a malformed row is rejected after diff selection"
+file = "scripts/mutations.sh"
+old = "set -euo pipefail"
+new = "set -euo pipefail; :"
+test_file = "scripts/mutations.sh"
+runner = "command"
+command = ["echo", "Ran 1 test", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["missing_test"]
+ROW
+    CALL_LOG="$scratch/scoped/calls" ./scripts/mutations.sh --check-only --diff HEAD >"$scratch/scoped/out" 2>&1
+  )
+  status=$?
+  if [ "$status" -eq 7 ] &&
+     grep -Fxq 'mutations: strict check selection: scoped 1' "$scratch/scoped/out" &&
+     grep -Fxq 'strict check refused planted-invalid' "$scratch/scoped/out"; then
+    echo 'ok scoped_check_refuses_a_planted_invalid_row'
+  else
+    echo "FAIL scoped_check_refuses_a_planted_invalid_row: exit $status, expected 7 and a scoped refusal"
+    cat "$scratch/scoped/out"
+    failures=$((failures + 1))
+  fi
+  if [ -x "$real_mutate" ]; then
+    checks=$((checks + 1))
+    cp "$real_mutate" "$repo/target/tools/bin/ckdev-mutate"
+    (cd "$repo" && ./scripts/mutations.sh --check-only --diff HEAD) >"$scratch/scoped/real-out" 2>&1
+    status=$?
+    # This row deliberately lacks list_command. The real runner, not a schema
+    # imitation in the planner, must still reject it under --strict after selection.
+    if [ "$status" -eq 2 ] &&
+       grep -Fxq 'mutations: strict check selection: scoped 1' "$scratch/scoped/real-out" &&
+       grep -Fq 'command row has no list_command: planted-invalid' "$scratch/scoped/real-out"; then
+      echo 'ok scoped_real_strict_check_refuses_a_planted_invalid_row'
+    else
+      echo "FAIL scoped_real_strict_check_refuses_a_planted_invalid_row: exit $status, expected a strict schema refusal"
+      cat "$scratch/scoped/real-out"
+      failures=$((failures + 1))
+    fi
+  else
+    echo 'SKIP: real pinned strict-check fixture (private runner is not installed)'
+  fi
+}
+scoped_invalid_row
+
+echo "mutations wrapper tests: $checks checks, $failures failures"
 [ "$failures" = 0 ]
