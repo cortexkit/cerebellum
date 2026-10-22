@@ -1637,7 +1637,7 @@ impl Routed {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             self.rx.try_recv().is_err(),
-            "the worker's late reply was sent"
+            "the route sent a frame after its one reply"
         );
     }
 }
@@ -2142,8 +2142,10 @@ async fn press_cancelled_while_blocked(switch: bool, input: bool) -> (Rig, Route
 
 /// A cancel while the worker is blocked in the press of a needs-front press:
 /// terminal cleanup makes the one restore request. When the press returns
-/// later, the worker neither fronts again nor restores again, and nothing it
-/// replies is sent.
+/// later, the worker neither fronts again nor restores again, and the route
+/// sends nothing after its one reply. (The worker here returns its reply to
+/// the test harness rather than to the route, so this checks the route's
+/// side only.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_blocked_in_the_press_restores_once() {
     let (rig, mut routed) = press_cancelled_while_blocked(false, false).await;
