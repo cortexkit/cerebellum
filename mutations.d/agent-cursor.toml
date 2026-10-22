@@ -1809,3 +1809,24 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-pipe-frame-base64-padded"
+guards = "a preview frame's JPEG goes on the pipe as standard, padded base64 from the base64 crate"
+file = "crates/cerebellum-computer/src/cursor.rs"
+old = "    base64::engine::general_purpose::STANDARD.encode(bytes)"
+new = "    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/cursor.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "cursor::tests::an_oversized_frame_is_dropped_and_the_largest_fits_one_line",
+    "cursor::tests::every_line_shape_decodes_as_itself_and_no_other",
+    "cursor::tests::frame_base64_is_standard_and_padded",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

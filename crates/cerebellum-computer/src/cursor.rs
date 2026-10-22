@@ -1,5 +1,6 @@
 //! Ephemeral cursor pictures, not input events. No request body belongs here.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// The avatar raster's side in pixels. The avatar is drawn 31 points across
@@ -324,8 +325,11 @@ impl CursorFrame {
     pub fn valid(&self) -> bool {
         self.frame_w > 0
             && self.frame_h > 0
+            // Measured from the text's length first, so an oversized frame is
+            // refused without being decoded.
             && base64_decoded_len(&self.frame_jpeg)
                 .is_some_and(|len| (1..=MAX_FRAME_BYTES).contains(&len))
+            && self.jpeg().is_some()
     }
 
     /// The JPEG's bytes, or `None` when the base64 is malformed.
@@ -363,72 +367,31 @@ impl CursorPreviewMotion {
     }
 }
 
-const BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
+/// A frame's JPEG as standard, padded base64.
 fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let word = chunk.iter().enumerate().fold(0u32, |word, (at, byte)| {
-            word | u32::from(*byte) << (16 - 8 * at)
-        });
-        for at in 0..4 {
-            if at <= chunk.len() {
-                out.push(BASE64_ALPHABET[(word >> (18 - 6 * at)) as usize & 63] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// The value of one base64 character, or `None` for any other byte.
-fn base64_value(byte: u8) -> Option<u32> {
-    BASE64_ALPHABET
-        .iter()
-        .position(|c| *c == byte)
-        .map(|at| at as u32)
-}
-
-/// How many bytes `text` decodes to, without decoding it, or `None` when it
-/// is not padded standard base64.
+/// How many bytes padded base64 `text` decodes to, worked out from its
+/// length and padding alone, or `None` when its length or padding is not
+/// that of padded base64. Its characters are checked only by decoding.
 fn base64_decoded_len(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let padding = bytes.iter().rev().take_while(|c| **c == b'=').count();
-    if padding > 2 {
-        return None;
-    }
-    let body = &bytes[..bytes.len() - padding];
-    if !body
-        .iter()
-        .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
-    {
-        return None;
-    }
-    Some(bytes.len() / 4 * 3 - padding)
+    (padding <= 2).then(|| bytes.len() / 4 * 3 - padding)
 }
 
+/// Decode a frame's JPEG, or `None` when `text` is not standard, padded
+/// base64.
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let len = base64_decoded_len(text)?;
-    let mut out = Vec::with_capacity(len);
-    for chunk in text.as_bytes().chunks(4) {
-        let mut word = 0u32;
-        let mut present = 0;
-        for (at, byte) in chunk.iter().enumerate() {
-            if *byte != b'=' {
-                word |= base64_value(*byte)? << (18 - 6 * at);
-                present += 1;
-            }
-        }
-        for at in 0..present - 1 {
-            out.push((word >> (16 - 8 * at)) as u8);
-        }
-    }
-    (out.len() == len).then_some(out)
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    (bytes.len() == len).then_some(bytes)
 }
 
 /// The farthest a followed element may be reported to have moved, in points:
@@ -1799,6 +1762,10 @@ mod tests {
             assert_eq!(base64_encode(bytes), text);
             assert_eq!(base64_decoded_len(text), Some(bytes.len()));
             assert_eq!(base64_decode(text).as_deref(), Some(bytes));
+        }
+        // Unpadded, URL-safe or malformed text is refused.
+        for text in ["Zg", "Zm8", "-_8=", "Zm9v!A==", "Z==="] {
+            assert_eq!(base64_decode(text), None, "{text:?}");
         }
     }
 
