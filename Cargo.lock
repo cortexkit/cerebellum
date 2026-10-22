@@ -209,6 +209,7 @@ dependencies = [
 name = "cerebellum-computer"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cerebellum-core",
  "cerebellum-macos",
  "cerebellum-windows",
