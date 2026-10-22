@@ -1272,3 +1272,290 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-batch-fronts-once"
+guards = "a batch whose steps each need the front brings the application forward once and makes one restore decision after its last press"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "            let later = (!later.is_empty()).then(|| {"
+new = "            let later = (false && !later.is_empty()).then(|| { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_batch_fronts_once_and_restores_once_after_its_last_press",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-batch-step-never-waits-in-front"
+guards = "a later batch step whose admission would ask the person stops the fronted run with stopped_at instead of waiting with the application in front"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "        self.later.as_ref().is_some_and(|later| (later.admitted)())"
+new = "        self.later.is_some() // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_batch_step_that_would_wait_stops_the_run_and_still_restores",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-frontmost-press-takes-no-lock"
+guards = "a press on an element disabled while its application is already frontmost takes the ordinary path and never waits on the fronting lock"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "                Ok(pre_read) => needs_front = pre_read.needs_front(grant.pid),"
+new = "                Ok(pre_read) => needs_front = pre_read.enabled == Some(false), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_disabled_press_on_a_frontmost_app_never_waits_on_the_lock",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-press-restore-names-target"
+guards = "a failed press restore discloses the bundle identity of the target left in front, among only the press rows' declared fields"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "            reply[\"bundle_identity\"] = json!(grant.bundle_identity);"
+new = "            let _ = &grant.bundle_identity; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_failed_press_restore_discloses_only_the_press_fields",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-press-bound-exceeded"
+guards = "a fronted press that took effect after its front outlasted the bound is returned with fronting_bound_exceeded rather than silently"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "        if self.bound_exceeded && reply[\"outcome\"] == \"completed\" {"
+new = "        if false && self.bound_exceeded && reply[\"outcome\"] == \"completed\" { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_press_that_took_effect_past_the_bound_says_so",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-foreground-replies-have-fronting"
+guards = "in foreground mode every reply of an action that can front carries fronting, even one that ended before a front was tried"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {"
+new = "        if false && can_front(capability.0) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::only_foreground_mode_adds_fronting_to_a_reply_that_never_fronted",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-untouched-background-replies-keep-their-bytes"
+guards = "a background reply that fronted nothing carries no fronting, so the replies most calls get keep their exact bytes"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {"
+new = "        if can_front(capability.0) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_press",
+    "computer_capability::fronting_tests::only_foreground_mode_adds_fronting_to_a_reply_that_never_fronted",
+    "computer_capability::fronting_tests::open_app_fronts_a_running_or_launched_app_only_in_foreground_mode",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-untouched-background-rows-keep-their-bytes"
+guards = "a background call that fronted nothing writes its journal row exactly as before, with no fronting member"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        (!self.is_untouched_background()).then(|| self.record())"
+new = "        Some(self.record()) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::read_and_ordinary_press_rows_record_their_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-press-rows-carry-fronting"
+guards = "the rows of a fronted press record under fronting how its front ended"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "                journal.set_fronting(fronting.record());\n                journaled &= journal.finish().is_ok();"
+new = "                journaled &= journal.finish().is_ok(); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::fronted_press_rows_record_how_the_front_ended",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-press-refusal-waits-for-restore"
+guards = "a refusal made while the application is fronted is journaled after the restore decision, so its row records how the front ended"
+file = "crates/cerebellum/src/computer_capability/fronted_press.rs"
+old = "                    journal.hold_refusals();"
+new = "                    // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::fronted_press_rows_record_how_the_front_ended",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-read-row-carries-fronting"
+guards = "the state read's row records the read's fronting in its open result"
+file = "crates/cerebellum-computer/src/app_state/mod.rs"
+old = "            result[\"fronting\"] = serde_json::json!(record);"
+new = "            let _ = record; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::read_and_ordinary_press_rows_record_their_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-actuation-row-carries-fronting"
+guards = "a keystroke actuation row records the action's fronting through the worker's fronting record scope"
+file = "crates/cerebellum-computer/src/audit/mod.rs"
+old = "            fronting: FrontingRecordScope::current(),"
+new = "            fronting: None, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_chord_row_records_its_front_and_decodes_with_the_older_type",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-early-refusal-fronted-row"
+guards = "a foreground one-way front followed by a refusal before the action wrote a row is journaled on its own rejected row with outcome fronted"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "                note_one_way_front(call.grant, fronting);"
+new = "                let _ = call.grant; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_front_then_an_early_refusal_writes_its_own_fronted_row",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-own-row-replaces-fronted-row"
+guards = "an action whose own row records its one-way front writes no separate fronted row"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "        // The press's own row records any front this call made.\n        super::fronting::action_row_started();"
+new = "        // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_foreground_press_records_its_front_on_its_own_row",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-journal-serve-action-boxed-where-built"
+guards = "the serve path boxes the action match it wraps in call-front tracking, so a real computer call still fits half a default thread stack on macOS"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "fronting::tracking_call_front(Box::pin(async {"
+new = "fronting::tracking_call_front((async { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_consent_wire_tests/stack_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

@@ -3,11 +3,18 @@
 //!
 //! Some applications disable window buttons (Mail's Send among them) while
 //! they are not frontmost. Such a press brings the application forward for
-//! that press alone and then runs the call's one restore decision, in the
-//! fixed order of [`run_fronting_press`]: the pre-read and the badge were
-//! already done on the async side, then the fronting lock, the guards, the
-//! restore obligation, the front, the enabled poll, the press, the settle and
-//! the restore decision.
+//! that press and then runs the call's one restore decision, in the fixed
+//! order of [`run_fronting_press`]: the pre-read and the badge were already
+//! done on the async side, then the fronting lock, the guards, the restore
+//! obligation, the front, the enabled poll, the press, the settle and the
+//! restore decision.
+//!
+//! A press that is one step of a batch takes the rest of the batch with it:
+//! the application is brought forward once, the later steps are pressed while
+//! it stays in front, each without waiting for its badge, and one restore
+//! decision follows the last step's settle. A later step whose admission
+//! would have to ask the person stops the run there instead of waiting with
+//! the application in front.
 
 use super::*;
 use crate::computer_capability::fronting::{
@@ -22,6 +29,89 @@ use cerebellum_computer::dispatch::{
 };
 use cerebellum_computer::platform::{FrontingSession, IdleReading, SequencePostFailure};
 use cerebellum_core::config::AppUse;
+
+/// One press of a run: the element, by the id the conversation was shown
+/// and its handle.
+pub(super) struct PressStep {
+    pub(super) element_id: String,
+    pub(super) handle: ElementHandle,
+}
+
+/// What the later steps of a batch need, gathered on the async side, to be
+/// pressed while their application is in front.
+pub(super) struct LaterSteps {
+    steps: Vec<PressStep>,
+    /// One badge identity per later step. Captured here because the
+    /// task-locals naming the acting agent do not follow work onto the
+    /// blocking thread that presses.
+    badges: Vec<Option<super::super::cursor::Identity>>,
+    cursor: super::super::cursor::Coordinator,
+    source: Arc<dyn AppStateSource>,
+    /// The runtime the badges' own work is spawned on.
+    runtime: tokio::runtime::Handle,
+    /// Whether the batch application's grant is held now, so a step can be
+    /// admitted without asking the person anything.
+    admitted: Box<dyn Fn() -> bool + Send>,
+}
+
+/// Gather what pressing `steps` while the application is in front needs.
+pub(super) fn later_steps(
+    cursor: &super::super::cursor::Coordinator,
+    source: &Arc<dyn AppStateSource>,
+    management: &ManagementPlane,
+    consent: &ConsentContext,
+    grant: &ProcessGrant,
+    agent_project_id: &str,
+    steps: Vec<PressStep>,
+) -> LaterSteps {
+    let grants = management.computer_grants().clone();
+    let caller = consent.caller.clone();
+    let need = management.app_need(
+        &grant.bundle_identity,
+        grant,
+        management.application_name(grant),
+    );
+    LaterSteps {
+        badges: steps
+            .iter()
+            .map(|_| {
+                Some(super::super::cursor::Identity::current(
+                    agent_project_id.to_owned(),
+                ))
+            })
+            .collect(),
+        steps,
+        cursor: cursor.clone(),
+        source: source.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        admitted: Box::new(move || grants.holds(&caller, &need)),
+    }
+}
+
+/// How a fronted run ended, for the reply that ends the action: whether the
+/// front outlasted its bound, what fronting reports, and the fields a failed
+/// restore puts on the reply.
+pub(super) struct FrontedEnding {
+    fronting: Fronting,
+    bound_exceeded: bool,
+    restore_failed: Option<serde_json::Map<String, Value>>,
+}
+
+impl FrontedEnding {
+    pub(super) fn apply(&self, reply: &mut Value) {
+        // A press that took effect is returned even when the front outlasted
+        // its bound, saying so, rather than refused.
+        if self.bound_exceeded && reply["outcome"] == "completed" {
+            reply["fronting_bound_exceeded"] = json!(true);
+        }
+        if let (Some(fields), Some(object)) = (&self.restore_failed, reply.as_object_mut()) {
+            for (name, value) in fields {
+                object.insert(name.clone(), value.clone());
+            }
+        }
+        self.fronting.apply(reply);
+    }
+}
 
 /// What [`ComputerPlane::press_fronted`] presses, and for whom.
 pub(super) struct FrontedPress<'a> {
@@ -40,11 +130,15 @@ pub(super) struct FrontedPress<'a> {
     pub(super) work: super::super::quarantine::CallWork,
     pub(super) settle: Duration,
     pub(super) view: super::super::StateView,
+    /// The batch's later steps, pressed in this run once the application is
+    /// in front; `None` for a press alone.
+    pub(super) later: Option<LaterSteps>,
 }
 
 /// The platform and the call, as the press run sees them from its blocking
-/// thread.
-struct FrontedPressHost<'a, 'j, R, T, S>
+/// thread. Step 0 is the press that needed the front; any later steps are a
+/// batch's.
+struct FrontedPressHost<'a, R, T, S>
 where
     R: Redactor,
     T: SeverityTaxonomy,
@@ -55,22 +149,24 @@ where
     sessions: &'a AppStateSessions,
     conversation_key: &'a str,
     grant: &'a ProcessGrant,
-    element_id: &'a str,
-    handle: &'a ElementHandle,
-    journal: &'a mut ElementJournal<'j, R, T, S>,
+    steps: &'a [PressStep],
+    /// One journal per step, each finished only after the restore decision
+    /// so its row records how the front ended.
+    journals: Vec<ElementJournal<'a, R, T, S>>,
     held: &'a super::super::held_input::HeldInput,
     cancel: &'a CancelHandle,
     gate: &'a BadgeGate,
     expand_menus: bool,
+    later: Option<LaterSteps>,
     parts: Option<ObligationParts>,
     cell: Option<Arc<RestoreCell>>,
     decided: Option<RestoreDecided>,
     change: Option<PersonChange>,
-    press_reply: Option<Value>,
-    observed: Option<SessionRead>,
+    press_replies: Vec<Option<Value>>,
+    observed: Vec<Option<SessionRead>>,
 }
 
-impl<R, T, S> FrontingBracketHost for FrontedPressHost<'_, '_, R, T, S>
+impl<R, T, S> FrontingBracketHost for FrontedPressHost<'_, R, T, S>
 where
     R: Redactor,
     T: SeverityTaxonomy,
@@ -124,23 +220,57 @@ where
     }
 }
 
-impl<R, T, S> FrontingPressHost for FrontedPressHost<'_, '_, R, T, S>
+impl<R, T, S> FrontingPressHost for FrontedPressHost<'_, R, T, S>
 where
     R: Redactor,
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
     fn pre_read(&mut self, _step: usize) -> PressPreRead {
-        // The async side already read it disabled with the application in
-        // the background, which is why this run exists.
+        // The async side already read the first step disabled with the
+        // application in the background, which is why this run exists; the
+        // run fronts at that step, so no later step is pre-read.
         PressPreRead {
             enabled: Some(false),
             frontmost: None,
         }
     }
-    fn hold_for_badge(&mut self, _step: usize, _wait_for_arrival: bool) -> bool {
-        // Held on the async side, with its own person check, before the lock.
-        true
+    fn hold_for_badge(&mut self, step: usize, _wait_for_arrival: bool) -> bool {
+        if step == 0 {
+            // Held on the async side, with its own person check, before the
+            // lock.
+            return true;
+        }
+        // A later step's badge glides while the step goes ahead; nothing
+        // waits for it with the application in front.
+        if let Some(later) = self.later.as_mut() {
+            if let Some(badge) = later.badges.get_mut(step - 1).and_then(Option::take) {
+                let _runtime = later.runtime.enter();
+                let _ = later.cursor.schedule(
+                    badge,
+                    cerebellum_computer::cursor::CursorKind::Press,
+                    self.grant.clone(),
+                    later.source.clone(),
+                    Some(self.steps[step].handle.clone()),
+                    None,
+                );
+            }
+        }
+        // The person check every press makes before it is sent. The marks
+        // it compares against were taken when the previous step settled.
+        match person_change_since_seen(
+            self.source,
+            self.sessions,
+            self.conversation_key,
+            self.grant,
+        ) {
+            Ok(None) => true,
+            Ok(Some(change)) => {
+                self.change = Some(change);
+                false
+            }
+            Err(()) => false,
+        }
     }
     fn take_fronting_lock(&mut self, _wait_ms: u64) -> bool {
         // Taken on the async side, after the call's app lane.
@@ -202,30 +332,33 @@ where
         }
     }
     fn admit_fronted_step(&mut self, _step: usize) -> bool {
-        // One press per run: a later step never waits while the target is in
-        // front, because there is none.
-        false
+        // Every step of a batch is in the application whose lane the call
+        // holds, so only the grant could make a step wait: admitted when it
+        // is held now, and otherwise the run stops rather than ask the
+        // person with the application in front.
+        self.later.as_ref().is_some_and(|later| (later.admitted)())
     }
-    fn element_enabled(&mut self, _step: usize) -> Option<bool> {
-        self.source.element_enabled(self.handle)
+    fn element_enabled(&mut self, step: usize) -> Option<bool> {
+        self.source.element_enabled(&self.steps[step].handle)
     }
-    fn press(&mut self, _step: usize) -> bool {
+    fn press(&mut self, step: usize) -> bool {
+        let pressed = &self.steps[step];
         let mut reply = press_blocking(
             self.source,
-            self.journal,
+            &mut self.journals[step],
             self.grant,
-            self.element_id,
-            self.handle,
+            &pressed.element_id,
+            &pressed.handle,
         );
         if self.gate.refused_for_end() {
             reply = cancelled_before_dispatch_reply();
         }
-        let pressed = reply["outcome"] == "completed";
-        self.press_reply = Some(reply);
-        pressed
+        let done = reply["outcome"] == "completed";
+        self.press_replies[step] = Some(reply);
+        done
     }
-    fn settle(&mut self, _step: usize, bound_ms: u64) {
-        self.observed = settle_and_observe_view(
+    fn settle(&mut self, step: usize, bound_ms: u64) {
+        self.observed[step] = settle_and_observe_view(
             self.source,
             self.sessions,
             self.conversation_key,
@@ -282,10 +415,21 @@ where
     )
 }
 
-/// Replace a press reply with `restore_failed` when the previous application
-/// could not be put back. Only fields the press rows declare are written: the
-/// outcome, a remedy naming what was left in front, and the bundle identity
-/// when that is the target.
+/// The refusal of a batch step that would have had to ask the person while
+/// the application was in front.
+fn step_needs_wait_reply() -> Value {
+    json!({
+        "outcome": "consent_unavailable",
+        "remedy": "this step would have had to ask the person while the application was in \
+                   front, so it was not pressed and the batch stopped here; the previous \
+                   application was put back. Press the remaining elements in a new call",
+    })
+}
+
+/// The fields that replace a press reply's when the previous application
+/// could not be put back. Only fields the press rows declare are written:
+/// the outcome, a remedy naming what was left in front, and the bundle
+/// identity when that is the target.
 fn disclose_failed_press_restore(
     reply: &mut Value,
     restore: RestoreStatus,
@@ -319,8 +463,9 @@ where
     D: cerebellum_computer::platform::PlatformDriver + 'static,
 {
     /// Press an element that reads disabled while its application is in
-    /// the background, bringing the application forward for the press.
-    pub(super) async fn press_fronted(&self, press: FrontedPress<'_>) -> Value {
+    /// the background, bringing the application forward for the press and,
+    /// in a batch, for the batch's later steps.
+    pub(super) async fn press_fronted(&self, press: FrontedPress<'_>) -> PressDone {
         let FrontedPress {
             identity,
             management,
@@ -336,6 +481,7 @@ where
             work,
             settle,
             view,
+            later,
         } = press;
         let mode = super::super::app_use::call_mode().unwrap_or(AppUse::Background);
         let app_name = management.application_name(&grant);
@@ -353,19 +499,19 @@ where
                 false,
             )
             .await;
-        let audit = AuditToken::new(self.audit.clone(), gate.clone());
+        let audit = self.audit.clone();
         let parts = match parts {
             Ok(parts) => Some(parts),
             Err(prepared) => {
                 if prepared.stop != FrontingStop::FrontingNotAdmitted {
                     let fronting = Fronting::stopped(mode, Purpose::NeedsFront, prepared.stop);
-                    return if stop_ends_call(prepared.stop) {
+                    return PressDone::alone(if stop_ends_call(prepared.stop) {
                         let mut reply = cancelled_before_dispatch_reply();
                         fronting.apply(&mut reply);
                         reply
                     } else {
                         not_fronted_reply(fronting)
-                    };
+                    });
                 }
                 // Nothing can own the restore, so the press is refused as in
                 // a build that cannot front.
@@ -379,14 +525,40 @@ where
         tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
-            let mut journal = ElementJournal::new(audit, identity, capability, &grant);
+            let mut later = later;
+            let mut steps = vec![PressStep { element_id, handle }];
+            if let Some(later) = later.as_mut() {
+                steps.append(&mut later.steps);
+            }
+            let mut journals: Vec<_> = steps
+                .iter()
+                .map(|_| {
+                    let mut journal = ElementJournal::new(
+                        AuditToken::new(audit.clone(), gate.clone()),
+                        identity.clone(),
+                        capability,
+                        &grant,
+                    );
+                    journal.hold_refusals();
+                    journal
+                })
+                .collect();
             let session = parts
                 .as_ref()
                 .and_then(|_| make_driver().fronting_session().ok());
             let (Some(parts), Some(session)) = (parts, session) else {
-                let reply = refuse_disabled(source.as_ref(), &mut journal, &element_id, &handle);
+                let journal = &mut journals[0];
+                if let Some(record) = Fronting::untouched(mode).row_record() {
+                    journal.set_fronting(record);
+                }
+                let reply = refuse_disabled(
+                    source.as_ref(),
+                    journal,
+                    &steps[0].element_id,
+                    &steps[0].handle,
+                );
                 let _ = journal.finish();
-                return reply;
+                return PressDone::alone(reply);
             };
             let estimator = session.user_idle();
             let mut estimator = estimator
@@ -400,39 +572,40 @@ where
                 sessions: &sessions,
                 conversation_key: &conversation_key,
                 grant: &grant,
-                element_id: &element_id,
-                handle: &handle,
-                journal: &mut journal,
+                steps: &steps,
+                journals,
                 held: &held,
                 cancel: &cancel,
                 gate: &gate,
                 expand_menus,
+                later,
                 parts: Some(parts),
                 cell: None,
                 decided: None,
                 change: None,
-                press_reply: None,
-                observed: None,
+                press_replies: steps.iter().map(|_| None).collect(),
+                observed: steps.iter().map(|_| None).collect(),
             };
             let report = run_fronting_press(
                 &mut host,
                 &mut estimator,
                 PressPlan {
                     target_pid: grant.pid,
-                    steps: 1,
+                    steps: steps.len(),
                     settle_bound_ms: u64::try_from(settle.as_millis()).unwrap_or(u64::MAX),
                     maximum_seize_detection_latency_ms: FRONT_SEIZE_LATENCY_MS,
                 },
             );
             drop(estimator);
             let FrontedPressHost {
+                mut journals,
                 decided,
                 change,
-                press_reply,
-                observed,
+                press_replies,
+                mut observed,
                 ..
             } = host;
-            let fronting = match decided {
+            let mut fronting = match decided {
                 Some(decided) if decided.front_requested => Fronting::temporary(
                     mode,
                     Purpose::NeedsFront,
@@ -449,49 +622,6 @@ where
                     ..Fronting::untouched(mode)
                 },
             };
-            let mut reply = match report.stop {
-                None | Some(PressRunStop::PressFailed) | Some(PressRunStop::StepNeedsWait) => {
-                    let mut reply = press_reply.unwrap_or_else(|| audit_unavailable_reply(false));
-                    if reply["outcome"] == "completed" {
-                        add_diff_view(&mut reply, observed.as_ref(), &view);
-                        if report.fronting_bound_exceeded {
-                            reply["fronting_bound_exceeded"] = json!(true);
-                        }
-                    }
-                    reply
-                }
-                Some(PressRunStop::ElementDisabled) => {
-                    refuse_disabled(source.as_ref(), &mut journal, &element_id, &handle)
-                }
-                Some(PressRunStop::NotFronted(FrontingStop::PersonChangedTarget)) => match change {
-                    Some(change) => state_changed_by_person_reply(&app_name, change),
-                    None => not_fronted_reply(Fronting::stopped(
-                        mode,
-                        Purpose::NeedsFront,
-                        FrontingStop::PersonChangedTarget,
-                    )),
-                },
-                Some(PressRunStop::NotFronted(stop) | PressRunStop::Interrupted(stop))
-                    if stop_ends_call(stop) =>
-                {
-                    cancelled_before_dispatch_reply()
-                }
-                Some(PressRunStop::NotFronted(stop)) => {
-                    not_fronted_reply(Fronting::stopped(mode, Purpose::NeedsFront, stop))
-                }
-                Some(PressRunStop::Interrupted(stop)) => {
-                    // In front, then stopped before the press: nothing was
-                    // pressed, and the reply says why the front was not used.
-                    not_fronted_reply(Fronting {
-                        not_fronted_reason: Some(not_fronted_reason(stop)),
-                        ..fronting
-                    })
-                }
-            };
-            if journal.finish().is_err() {
-                return audit_unavailable_reply(report.steps_pressed > 0);
-            }
-            let mut fronting = fronting;
             if let Some(PressRunStop::Interrupted(stop) | PressRunStop::NotFronted(stop)) =
                 report.stop
             {
@@ -501,13 +631,86 @@ where
                     fronting.not_fronted_reason = Some(not_fronted_reason(stop));
                 }
             }
-            if let Some(decided) = decided {
-                disclose_failed_press_restore(&mut reply, decided.restore, &grant, &app_name);
+            // Every step up to the one the run stopped at was attempted; each
+            // gets its own reply, the batch's steps in order.
+            let attempted = report.stopped_at.map_or(steps.len(), |step| step + 1);
+            let default_view = super::super::StateView::default();
+            let mut replies = Vec::with_capacity(attempted);
+            for (step, pressed) in press_replies.into_iter().enumerate().take(attempted) {
+                let step_view = if step == 0 { &view } else { &default_view };
+                let stop = report.stop.filter(|_| report.stopped_at == Some(step));
+                let reply = match stop {
+                    None | Some(PressRunStop::PressFailed) => {
+                        let mut reply = pressed.unwrap_or_else(|| audit_unavailable_reply(false));
+                        if reply["outcome"] == "completed" {
+                            add_diff_view(&mut reply, observed[step].take().as_ref(), step_view);
+                        }
+                        reply
+                    }
+                    Some(PressRunStop::StepNeedsWait) => step_needs_wait_reply(),
+                    Some(PressRunStop::ElementDisabled) => refuse_disabled(
+                        source.as_ref(),
+                        &mut journals[step],
+                        &steps[step].element_id,
+                        &steps[step].handle,
+                    ),
+                    Some(
+                        PressRunStop::NotFronted(FrontingStop::PersonChangedTarget)
+                        | PressRunStop::Interrupted(FrontingStop::PersonChangedTarget),
+                    ) if change.is_some() => {
+                        state_changed_by_person_reply(&app_name, change.expect("checked above"))
+                    }
+                    Some(PressRunStop::NotFronted(stop) | PressRunStop::Interrupted(stop))
+                        if stop_ends_call(stop) =>
+                    {
+                        cancelled_before_dispatch_reply()
+                    }
+                    // In front or not, nothing was pressed at this step, and
+                    // the reply says why the front was not used.
+                    Some(PressRunStop::NotFronted(_) | PressRunStop::Interrupted(_)) => {
+                        not_fronted_reply(fronting)
+                    }
+                };
+                replies.push(reply);
             }
-            fronting.apply(&mut reply);
-            reply
+            // The rows are written now that the restore decision is made, so
+            // each records how the front ended.
+            let mut journaled = true;
+            for journal in &mut journals {
+                journal.set_fronting(fronting.record());
+                journaled &= journal.finish().is_ok();
+            }
+            if !journaled {
+                if let Some(last) = replies.last_mut() {
+                    *last = audit_unavailable_reply(report.steps_pressed > 0);
+                }
+            }
+            let mut restore_failed = json!({});
+            if let Some(decided) = decided {
+                disclose_failed_press_restore(
+                    &mut restore_failed,
+                    decided.restore,
+                    &grant,
+                    &app_name,
+                );
+            }
+            let mut replies = replies.into_iter();
+            PressDone {
+                reply: replies
+                    .next()
+                    .unwrap_or_else(|| audit_unavailable_reply(false)),
+                later: replies.collect(),
+                ending: Some(FrontedEnding {
+                    fronting,
+                    bound_exceeded: report.fronting_bound_exceeded,
+                    restore_failed: restore_failed
+                        .as_object()
+                        .filter(|fields| !fields.is_empty())
+                        .cloned(),
+                }),
+            }
         })
         .await
-        .unwrap_or_else(|_| audit_unavailable_reply(true))
+        .unwrap_or_else(|_| PressDone::alone(audit_unavailable_reply(true)))
     }
 }

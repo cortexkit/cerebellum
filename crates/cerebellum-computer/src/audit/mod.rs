@@ -936,6 +936,107 @@ pub struct RecordedActuationOutcome {
     pub outcome: ActuationOutcome,
     #[serde(flatten, default)]
     pub routes: crate::platform::input_route::InputRouteEvidence,
+    /// How the keystrokes' action used the front of the screen, when the
+    /// worker that dispatched them said so through a [`FrontingRecordScope`].
+    /// Absent from older entries and from actions that do not front.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fronting: Option<FrontingRecord>,
+}
+
+/// The setting an action ran under, as a journal row records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontingRecordMode {
+    Foreground,
+    Background,
+}
+
+/// Why an action tried to bring its application to the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontingRecordPurpose {
+    ForegroundMode,
+    NeedsFront,
+    BringToFront,
+    None,
+}
+
+/// What became of the application that was in front before the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontingRecordRestore {
+    NotNeeded,
+    LeftInFront,
+    Restored,
+    SkippedPerson,
+    Failed,
+}
+
+/// The text-free journal form of an action reply's `fronting` object, plus
+/// how many preview frames were drawn for the action.
+///
+/// It is written into rows whose result is open JSON (the state read's
+/// result, the element press rows and [`RecordedActuationOutcome`]), so it
+/// needs no codec or entry-format change: a reader that does not know the
+/// `fronting` member skips it. For the same reason it accepts members it does
+/// not know, and every optional member is left out when it has nothing to
+/// say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontingRecord {
+    pub mode: FrontingRecordMode,
+    pub fronted: bool,
+    pub purpose: FrontingRecordPurpose,
+    pub restore: FrontingRecordRestore,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_fronted_reason: Option<crate::dispatch::NotFrontedReason>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub person_input_during_fronting: bool,
+    /// Preview frames written for the action. Only the count is journaled,
+    /// never the pixels.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub preview_frames: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+thread_local! {
+    static FRONTING_RECORD: std::cell::RefCell<Option<FrontingRecordSource>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+type FrontingRecordSource = Box<dyn Fn() -> Option<FrontingRecord>>;
+
+/// Tells the actuation rows finalized on this thread how the action used the
+/// front of the screen. The keystroke worker installs one around its dispatch,
+/// because the dispatcher, not the worker, finalizes the row; the source is
+/// asked at the moment the row is finalized, so a front and restore that the
+/// dispatch itself ran are already decided. Construct and drop on the same
+/// blocking thread as the dispatch.
+pub struct FrontingRecordScope {
+    previous: Option<FrontingRecordSource>,
+}
+
+impl FrontingRecordScope {
+    pub fn new(source: impl Fn() -> Option<FrontingRecord> + 'static) -> Self {
+        let previous = FRONTING_RECORD.with(|slot| slot.replace(Some(Box::new(source))));
+        Self { previous }
+    }
+
+    /// What the innermost scope on this thread says now, if any.
+    pub fn current() -> Option<FrontingRecord> {
+        FRONTING_RECORD.with(|slot| slot.borrow().as_ref().and_then(|source| source()))
+    }
+}
+
+impl Drop for FrontingRecordScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        FRONTING_RECORD.with(|slot| {
+            slot.replace(previous);
+        });
+    }
 }
 
 /// Adapter-owned gate used when building capability advertisements.
@@ -1661,6 +1762,7 @@ where
         let bytes = serde_json::to_vec(&RecordedActuationOutcome {
             outcome: outcome.clone(),
             routes: routes.clone(),
+            fronting: FrontingRecordScope::current(),
         })
         .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?;
         self.finalize_dispatched(token, bytes, Vec::new())

@@ -348,6 +348,26 @@ enum Served {
     OpenApp,
 }
 
+/// Whether an action can bring its application to the front, so its replies
+/// carry `fronting`. `wait`, `list_apps` and the takeover pointer actions
+/// never front.
+fn can_front(served: Served) -> bool {
+    match served {
+        Served::ReadState
+        | Served::PressElement
+        | Served::PressPoint
+        | Served::WriteText
+        | Served::Type
+        | Served::Keys
+        | Served::OpenApp => true,
+        Served::TakeoverMove
+        | Served::TakeoverDrag
+        | Served::TakeoverScroll
+        | Served::Wait
+        | Served::ListApps => false,
+    }
+}
+
 impl Servable {
     pub fn capability(self) -> ComputerCapability {
         match self.0 {
@@ -945,6 +965,7 @@ where
             return self.finish_reply(capability.capability(), reply);
         }
         let grant_cancel = context.cancel.clone();
+        let front_identity = context.identity.clone();
         let matched_app = Arc::new(std::sync::Mutex::new(None));
         // Capability work holds the app-consent wait and eventual platform
         // call. Keep that future on the heap before the grant watcher adds
@@ -960,52 +981,95 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(app_use::call_mode());
-                        match capability.0 {
-                            Served::ReadState => {
-                                self.serve_read_state(arguments, context, make_backend)
-                                    .await
-                            }
-                            Served::Wait => self.serve_wait(arguments, context).await,
-                            Served::OpenApp => self.serve_open_app(arguments, context).await,
-                            Served::ListApps => self.serve_list_apps(arguments, context).await,
-                            Served::PressElement => {
-                                self.serve_press_element(arguments, context).await
-                            }
-                            Served::PressPoint => self.serve_press_point(arguments, context).await,
-                            Served::WriteText => self.serve_write_text(arguments, context).await,
-                            Served::Type => synthetic_wire_envelope(
-                                self.serve_synthetic(ComputerCapability::Type, arguments, context)
-                                    .await,
-                            ),
-                            Served::Keys => synthetic_wire_envelope(
-                                self.serve_synthetic(ComputerCapability::Keys, arguments, context)
-                                    .await,
-                            ),
-                            Served::TakeoverMove => {
-                                self.serve_takeover(
-                                    ComputerCapability::TakeoverMove,
-                                    arguments,
-                                    context,
-                                )
-                                .await
-                            }
-                            Served::TakeoverDrag => {
-                                self.serve_takeover(
-                                    ComputerCapability::TakeoverDrag,
-                                    arguments,
-                                    context,
-                                )
-                                .await
-                            }
-                            Served::TakeoverScroll => {
-                                self.serve_takeover(
-                                    ComputerCapability::TakeoverScroll,
-                                    arguments,
-                                    context,
-                                )
-                                .await
-                            }
+                        // Boxed where it is built: the match holds every
+                        // action's future, and wrapping it unboxed in the
+                        // call-front tracking would copy it into this block's
+                        // state several times over, on the stack of a thread
+                        // that polls a real call.
+                        let (mut reply, call_front) =
+                            fronting::tracking_call_front(Box::pin(async {
+                                match capability.0 {
+                                    Served::ReadState => {
+                                        self.serve_read_state(arguments, context, make_backend)
+                                            .await
+                                    }
+                                    Served::Wait => self.serve_wait(arguments, context).await,
+                                    Served::OpenApp => {
+                                        self.serve_open_app(arguments, context).await
+                                    }
+                                    Served::ListApps => {
+                                        self.serve_list_apps(arguments, context).await
+                                    }
+                                    Served::PressElement => {
+                                        self.serve_press_element(arguments, context).await
+                                    }
+                                    Served::PressPoint => {
+                                        self.serve_press_point(arguments, context).await
+                                    }
+                                    Served::WriteText => {
+                                        self.serve_write_text(arguments, context).await
+                                    }
+                                    Served::Type => synthetic_wire_envelope(
+                                        self.serve_synthetic(
+                                            ComputerCapability::Type,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await,
+                                    ),
+                                    Served::Keys => synthetic_wire_envelope(
+                                        self.serve_synthetic(
+                                            ComputerCapability::Keys,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await,
+                                    ),
+                                    Served::TakeoverMove => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverMove,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await
+                                    }
+                                    Served::TakeoverDrag => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverDrag,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await
+                                    }
+                                    Served::TakeoverScroll => {
+                                        self.serve_takeover(
+                                            ComputerCapability::TakeoverScroll,
+                                            arguments,
+                                            context,
+                                        )
+                                        .await
+                                    }
+                                }
+                            }))
+                            .await;
+                        if let Some(pending) = call_front.unrecorded {
+                            self.journal_unrecorded_front(
+                                front_identity,
+                                capability.capability(),
+                                pending,
+                            )
+                            .await;
                         }
+                        // A reply that returned early, after its one-way
+                        // front, reports that front.
+                        if let (Some(fronting), Some(object)) =
+                            (call_front.fronting, reply.as_object_mut())
+                        {
+                            object
+                                .entry("fronting")
+                                .or_insert_with(|| fronting.to_value());
+                        }
+                        reply
                     }))),
                 ),
             )
@@ -1028,7 +1092,45 @@ where
                 object.insert("screen_lock_state".into(), json!("unknown"));
             }
         }
+        // In foreground mode every reply of an action that can front says how
+        // it used the front of the screen, including replies that ended
+        // before the front was tried. A background reply carries `fronting`
+        // only when a front was made, attempted or refused, so the replies
+        // of background calls that had no reason to front keep their bytes.
+        // Replies returned above, before the action ran, carry none.
+        if app_use == cerebellum_core::config::AppUse::Foreground && can_front(capability.0) {
+            if let Some(object) = reply.as_object_mut() {
+                object
+                    .entry("fronting")
+                    .or_insert_with(|| fronting::Fronting::untouched(app_use).to_value());
+            }
+        }
         self.finish_reply(capability.capability(), reply)
+    }
+
+    /// Journal a foreground front whose action ended before writing a row of
+    /// its own, as a rejected row with outcome `fronted`, through the same
+    /// reject path an element refusal takes. The reply is left as it is: the
+    /// front already happened, and nothing else was done.
+    async fn journal_unrecorded_front(
+        &self,
+        identity: JournalIdentity,
+        capability: ComputerCapability,
+        pending: fronting::PendingFrontRow,
+    ) {
+        let mut audit = AuditToken::new(self.audit.clone(), quarantine::CallWork::current().gate());
+        let _ = tokio::task::spawn_blocking(move || {
+            audit.reject(
+                identity,
+                cerebellum_computer::audit::ComputerPlaneDescriptor::new(
+                    capability,
+                    cerebellum_computer::grounding::ContainmentRung::GlobalNone,
+                    cerebellum_computer::audit::ObservationState::HumanUnobserved,
+                ),
+                fronting::fronted_row_material(&pending),
+            )
+        })
+        .await;
     }
 
     /// Whether the screen is locked now, read fresh from the platform driver.
@@ -1305,6 +1407,15 @@ where
                         None,
                         ImageReadPlan {
                             requested: parsed.include_image,
+                            fronting: Some(foreground.map_or_else(
+                                || {
+                                    fronting::Fronting::untouched(
+                                        app_use::call_mode()
+                                            .unwrap_or(cerebellum_core::config::AppUse::Background),
+                                    )
+                                },
+                                |front| front.fronting,
+                            )),
                             ..Default::default()
                         },
                     )
@@ -1517,6 +1628,20 @@ where
                 }
             }
         }
+        // What the read's row records of the front, as far as it is known
+        // before the image: a bring_to_front bracket run through the hooks
+        // replaces it with its own outcome once the bracket returns.
+        let planned_fronting = match (&image_hooks, image_fronting) {
+            (Some(_), _) => fronting::Fronting {
+                purpose: fronting::Purpose::BringToFront,
+                ..fronting::Fronting::untouched(fronting_admission.mode)
+            },
+            (None, Some(stopped)) => stopped,
+            (None, None) => foreground.map_or_else(
+                || fronting::Fronting::untouched(fronting_admission.mode),
+                |front| front.fronting,
+            ),
+        };
         match self
             .journal_state_read(
                 identity,
@@ -1533,6 +1658,7 @@ where
                     now_ms,
                     gate: None,
                     hooks: image_hooks.clone(),
+                    fronting: Some(planned_fronting),
                 },
             )
             .await
@@ -1656,6 +1782,8 @@ where
         let work = quarantine::CallWork::current();
         let mut image_plan = image_plan;
         image_plan.gate = Some(work.gate());
+        // The read's own row records any front this call made.
+        fronting::action_row_started();
         tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
@@ -1668,6 +1796,7 @@ where
                         .requested
                         .then_some(cerebellum_computer::app_state::image::ImageDecision::Unknown),
                     fronting: None,
+                    fronting_record: image_plan.fronting.and_then(fronting::Fronting::row_record),
                 });
             let mut custody = AuditImageCustody {
                 audit: &audit,
@@ -2261,6 +2390,8 @@ where
         // Also refuses once the badge was ended after it was scheduled.
         let badge_gate = element_actions::BadgeGate::new(work.gate(), watch);
         let mut token = AuditToken::new(self.audit.clone(), badge_gate.clone());
+        // The keystrokes' own row, reserved next, records any front.
+        fronting::action_row_started();
         if cerebellum_computer::dispatch::reserve_actuation_ahead(
             &mut token,
             identity.clone(),
@@ -2281,8 +2412,23 @@ where
         let input_source = self.app_state_source.clone();
         let dispatch_work = work.clone();
         let driver_hooks = chord_hooks.clone();
+        let record_hooks = chord_hooks.clone();
+        let record_mode = fronting_admission.mode;
+        let record_foreground = foreground.map(|front| front.fronting);
         let (dispatched, bracket, hooked) = tokio::task::spawn_blocking(move || {
             let _ax = dispatch_work.bound_ax();
+            // The dispatcher finalizes the keystrokes' row; this says how the
+            // action used the front at that moment, once the bracket's own
+            // restore decision, if it made one, is known.
+            let _fronting_record =
+                cerebellum_computer::audit::FrontingRecordScope::new(move || {
+                    let fronting = match &record_hooks {
+                        Some(hooks) => fronting::keystroke_row_fronting(record_mode, &hooks.peek()),
+                        None => record_foreground
+                            .unwrap_or_else(|| fronting::Fronting::untouched(record_mode)),
+                    };
+                    fronting.row_record()
+                });
             let cancelled = || cancel.is_cancelled();
             let mut driver = make_driver();
             if let Some(hooks) = &driver_hooks {

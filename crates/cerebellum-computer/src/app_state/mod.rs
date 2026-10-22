@@ -46,6 +46,10 @@ where
 pub struct ImageReadEvidence {
     pub decision: Option<image::ImageDecision>,
     pub fronting: Option<image::ImageFronting>,
+    /// How the read used the front of the screen, written under `fronting`
+    /// in the row's open result. Unlike `fronting` above, which describes
+    /// only an image bracket, this is the read's whole reply-level record.
+    pub fronting_record: Option<crate::audit::FrontingRecord>,
 }
 
 /// Only counts and process identity cross the journal boundary; tree strings
@@ -160,6 +164,9 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
             result["image_fronting"] = serde_json::json!(fronting);
             result["longest_fronted_interval_ms"] =
                 serde_json::json!(fronting.longest_fronted_interval_ms);
+        }
+        if let Some(record) = &evidence.fronting_record {
+            result["fronting"] = serde_json::json!(record);
         }
         lock_audit(self.audit)
             .finalize_dispatched(

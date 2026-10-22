@@ -269,6 +269,9 @@ where
                             conversation_key: &conversation_key,
                         })
                         .await;
+                    // The launch's own row, reserved before the launch and
+                    // finalized below, records the outcome after this front.
+                    super::fronting::action_row_started();
                     if let Some(front) = front {
                         if let (true, Some(change)) = (opened.already_running, front.change) {
                             // Nothing was launched; the action was the front,
