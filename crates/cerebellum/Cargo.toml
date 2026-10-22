@@ -41,6 +41,7 @@ name = "cerebellum"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 cortexkit-resource-busy = { workspace = true }
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 cortexkit-paths = "=0.1.2"
