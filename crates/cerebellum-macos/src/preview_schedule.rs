@@ -645,8 +645,8 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        for slot in 0..3 {
-            assert_eq!(Some(origins[slot]), slot_origin(SCREEN, slot as u8));
+        for (slot, origin) in origins.iter().enumerate() {
+            assert_eq!(Some(*origin), slot_origin(SCREEN, slot as u8));
         }
         assert!(
             !h.preview("d", 1, 3, WINDOW, start),

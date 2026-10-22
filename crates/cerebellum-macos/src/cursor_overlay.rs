@@ -1096,7 +1096,8 @@ pub struct PreviewHideProbe {
     pub can_become_main: bool,
     /// Clicks fall through it to the window underneath.
     pub ignores_mouse: bool,
-    /// Showing it never activates the helper.
+    /// Its style mask includes `NonactivatingPanel`, so showing it does not
+    /// activate the helper.
     pub non_activating: bool,
     /// It floats above normal windows (whose level is 0).
     pub level: isize,

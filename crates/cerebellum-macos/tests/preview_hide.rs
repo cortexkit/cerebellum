@@ -50,8 +50,8 @@ fn main() {
     {
         return;
     }
-    // A locked screen realises no window, so the window server never lists
-    // one and the hide cannot be checked; the window's kind still can.
+    // If a locked screen keeps the shown preview out of the window server's
+    // on-screen list, the hide cannot be checked; the window's kind still can.
     let locked = cerebellum_macos::screen_is_locked() == Some(true);
     let probe = match cerebellum_macos::probe_preview_hide() {
         Ok(probe) => probe,

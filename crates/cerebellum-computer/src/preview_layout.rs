@@ -8,7 +8,9 @@
 //! module, and `cerebellum-macos` (the helper's crate, which cannot depend on
 //! `cerebellum-computer`) includes it by path, as it does `cursor_timeline.rs`.
 //! Keep it free of `use crate::...` and of dependencies, so it compiles the
-//! same in either crate. It is plain arithmetic in global top-down points.
+//! same in either crate. It is plain arithmetic in top-down points: slot
+//! origins are global screen points, while a layout's rectangles and a mapped
+//! thumbnail point are relative to the preview's own top-left corner.
 
 /// How many previews show at once, one per agent, stacked top-down from the
 /// top-right corner of the screen.
@@ -96,7 +98,9 @@ pub struct PreviewLayout {
 
 /// The preview for a window of `aspect` (its width and height, any unit),
 /// at most `max_height` tall (never more than `PREVIEW_MAX_HEIGHT`), or
-/// `None` for a malformed shape.
+/// `None` for a malformed shape. On a screen so short that `max_height`
+/// leaves less than a 40-point thumbnail, the thumbnail keeps that minimum
+/// and the preview is taller than `max_height`.
 pub fn preview_layout(aspect: [f64; 2], max_height: f64) -> Option<PreviewLayout> {
     let [width, height] = aspect;
     if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
@@ -148,10 +152,11 @@ pub fn thumbnail_size(aspect: [f64; 2]) -> Option<[f64; 2]> {
         .map(|layout| [layout.thumbnail.width, layout.thumbnail.height])
 }
 
-/// The tallest a preview is on a screen whose usable area (below the menu
-/// bar, beside the Dock) is `visible_height` tall: `PREVIEW_MAX_HEIGHT`, or
-/// less when that many full-height previews would not fit one above the
-/// other.
+/// The height each preview slot allows on a screen whose usable area (below
+/// the menu bar, beside the Dock) is `visible_height` tall:
+/// `PREVIEW_MAX_HEIGHT`, or less when that many full-height previews would
+/// not fit one above the other. On a very short screen a preview can still
+/// be taller than this, to keep its minimum thumbnail height.
 pub fn slot_max_height(visible_height: f64) -> f64 {
     let slots = f64::from(PREVIEW_SLOTS);
     let fits = (visible_height - 2.0 * PREVIEW_MARGIN - (slots - 1.0) * PREVIEW_GAP) / slots;
