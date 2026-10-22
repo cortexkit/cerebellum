@@ -95,3 +95,37 @@ async fn a_navigation_page_read_waits_for_an_observer_lost_during_the_capture() 
     );
     assert_eq!(fixture.state.lock().unwrap().observer_unavailable_reads, 0);
 }
+
+#[tokio::test]
+async fn a_committed_navigation_without_an_observer_is_reported_not_refused() {
+    for read_page in [false, true] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        fixture.state.lock().unwrap().observer_lost_on_navigate = true;
+        let mut args = navigate_and_read(&tab);
+        args["read_page"] = json!(read_page);
+        let (reply, cards) = fixture.call(1, args, "allow_30m").await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert!(reply.get("reason").is_none(), "{reply}");
+        assert_eq!(reply["observer_available"], false, "{reply}");
+        assert_eq!(
+            reply["remedy"],
+            "The page changed; take a snapshot before acting."
+        );
+        assert_eq!(reply["tab"], tab.as_str());
+        assert!(reply["interaction_epoch"].is_u64(), "{reply}");
+        assert_eq!(cards.len(), 1);
+        if read_page {
+            assert_eq!(reply["read_page"]["outcome"], "refused", "{reply}");
+            assert_eq!(
+                reply["read_page"]["reason"], "observer_unavailable",
+                "{reply}"
+            );
+        } else {
+            assert!(reply.get("read_page").is_none(), "{reply}");
+        }
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.tabs[&tab].url, "https://example.com/go");
+        assert!(state.captures.is_empty());
+    }
+}

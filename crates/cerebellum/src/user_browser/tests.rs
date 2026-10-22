@@ -134,6 +134,9 @@ struct DoubleState {
     /// the next this many plans report it unavailable, as when a page commits
     /// a child frame during a capture.
     observer_loss_on_capture: usize,
+    /// When set, `Page.navigate` commits its document but the observer never
+    /// arrives on it.
+    observer_lost_on_navigate: bool,
     /// The extension's code for why the interaction epoch last moved.
     interaction_cause: Option<&'static str>,
     /// What the page does in reaction to the agent's `DOM.focus`, applied
@@ -878,6 +881,9 @@ fn execute(
                     .clone()
                     .unwrap_or_else(|| command["params"]["url"].as_str().unwrap().into());
                 tab.loader += 1;
+                if state.observer_lost_on_navigate {
+                    state.observer_unavailable = true;
+                }
                 json!({"frameId":"main","loaderId":format!("l{}",tab.loader)})
             }
             "Accessibility.getFullAXTree" => {

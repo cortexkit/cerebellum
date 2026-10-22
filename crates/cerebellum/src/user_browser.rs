@@ -2473,8 +2473,11 @@ async fn navigate(
             }
             let limit = observer_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
+            // The landing document has committed, so the navigation took
+            // effect. A missing observer withholds only the page read and the
+            // input baseline, never the navigation's own outcome.
             if tokio::time::Instant::now() >= *limit {
-                return Err(observer_unavailable());
+                break landed;
             }
         }
     };
@@ -2496,6 +2499,16 @@ async fn navigate(
         json!("Read the page before acting; only its committed document was confirmed.");
     if navigation.popup {
         reply["popup_activated_briefly"] = json!(true);
+    }
+    if !landed.observer_available {
+        // Without an observer the landed page cannot be read, and its
+        // interaction epoch cannot authorize input until a snapshot finds one.
+        reply["observer_available"] = json!(false);
+        reply["remedy"] = json!("The page changed; take a snapshot before acting.");
+        if args["read_page"] == true {
+            reply["read_page"] = observer_unavailable();
+        }
+        return Ok(reply);
     }
     if args["read_page"] == true {
         // The navigation has committed whatever happens to its read, so a

@@ -61,7 +61,7 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [control.scope]
-after = "if args[\"read_page\"] == true {"
+after = "// The navigation has committed whatever happens to its read, so a"
 before = "async fn read_landed_page("
 
 
@@ -151,3 +151,25 @@ build_timeout_s = 1800
 [control.scope]
 after = "fn recognized_cause(code: Option<String>) -> Option<String> {"
 before = "fn epoch_moved("
+
+
+[[control]]
+id = "user-browser-committed-navigation-never-refused-for-its-observer"
+guards = "a navigation whose landing document committed replies ok with observer_available false when no observer arrives"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "                break landed;\n            }\n        }\n    };"
+new = "                return Err(observer_unavailable());\n            }\n        }\n    };"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::a_committed_navigation_without_an_observer_is_reported_not_refused"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "// effect. A missing observer withholds only the page read and the"
+before = "let landing = origin(&landed.committed.url)?;"
