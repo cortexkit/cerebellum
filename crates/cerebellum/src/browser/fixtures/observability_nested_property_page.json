@@ -1,0 +1,64 @@
+{
+  "url": "https://dash.cloudflare.com/acct/workers/observability",
+  "tree": {
+    "role": "RootWebArea",
+    "name": "Workers Observability",
+    "tag": "html",
+    "children": [
+      {
+        "role": "main",
+        "tag": "main",
+        "children": [
+          {
+            "role": "generic",
+            "tag": "div",
+            "children": [
+              { "role": "StaticText", "name": "{" },
+              {
+                "role": "generic",
+                "tag": "div",
+                "children": [
+                  {
+                    "role": "generic",
+                    "tag": "span",
+                    "children": [
+                      { "role": "StaticText", "name": "'" },
+                      { "role": "StaticText", "name": "event" },
+                      { "role": "StaticText", "name": "':" }
+                    ]
+                  },
+                  {
+                    "role": "generic",
+                    "tag": "span",
+                    "children": [
+                      { "role": "StaticText", "name": "'boat_endpoint_withdrawn'" }
+                    ]
+                  },
+                  { "role": "StaticText", "name": "," }
+                ]
+              },
+              {
+                "role": "generic",
+                "tag": "div",
+                "children": [
+                  { "role": "StaticText", "name": "'outcome':" },
+                  { "role": "StaticText", "name": "'ok'" },
+                  { "role": "StaticText", "name": "," }
+                ]
+              },
+              {
+                "role": "generic",
+                "tag": "div",
+                "children": [
+                  { "role": "StaticText", "name": "'requestId':" },
+                  { "role": "StaticText", "name": "'request-123'" }
+                ]
+              },
+              { "role": "StaticText", "name": "}" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

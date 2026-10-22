@@ -1,0 +1,22 @@
+[[control]]
+id = "text-filter-walks-past-the-key-group"
+guards = "a text_filter match skips punctuation-only key groups to find the nearest bounded text-only ancestor with another word-bearing leaf"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "for &ancestor in ancestors.iter().rev() {"
+new = "for &ancestor in ancestors.iter().rev().take(1) { // NON-VACUITY BREAK: stop at the first parent"
+edits = []
+test_file = "crates/cerebellum/src/browser/navigation/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::navigation::tests::a_text_filter_match_in_nested_key_groups_prints_the_whole_property_line",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn collect_filter_rows("
+before = "fn filtered_lines("
