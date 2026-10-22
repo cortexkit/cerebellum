@@ -284,6 +284,68 @@ pub struct SingleWindowCapture {
     pub frame: VisionWindowFrame,
 }
 
+/// One window captured for an agent's background-mode preview: scaled to
+/// fit the thumbnail's pixel size and encoded as JPEG. Never model-visible
+/// and never retained: it goes to the agent-cursor helper and nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewWindowFrame {
+    /// The window as enumerated: the exact one asked for, with its verified
+    /// owner.
+    pub window: EnumeratedWindow,
+    /// The JPEG's size in pixels.
+    pub width_px: u32,
+    pub height_px: u32,
+    pub jpeg: Vec<u8>,
+}
+
+/// The size a `width` by `height` capture is scaled to so that it fits
+/// within `max_px` (width, height) with its shape kept. It is never
+/// enlarged, and each side is at least one pixel. `None` when the capture or
+/// the limit has no area.
+pub fn preview_scaled_size(width: u32, height: u32, max_px: [u32; 2]) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 || max_px[0] == 0 || max_px[1] == 0 {
+        return None;
+    }
+    let scale = (f64::from(max_px[0]) / f64::from(width))
+        .min(f64::from(max_px[1]) / f64::from(height))
+        .min(1.0);
+    let side = |length: u32, limit: u32| {
+        ((f64::from(length) * scale).round() as u32).clamp(1, limit.min(length))
+    };
+    Some((side(width, max_px[0]), side(height, max_px[1])))
+}
+
+/// Scale raw BGRA pixels to `width_px` by `height_px` and encode them as
+/// JPEG with the system encoder, where there is one.
+#[cfg(target_os = "macos")]
+fn encode_preview_bgra(
+    pending: &PendingVisionWindowFrame,
+    bgra: &[u8],
+    width_px: u32,
+    height_px: u32,
+) -> Result<Vec<u8>, BackendError> {
+    cerebellum_macos::encode_scaled_jpeg(
+        bgra,
+        pending.frame.captured_width_px as usize,
+        pending.frame.captured_height_px as usize,
+        width_px as usize,
+        height_px as usize,
+    )
+    .map_err(BackendError::Capture)
+}
+
+/// No other platform has an encoder for raw pixels; its backends capture
+/// nothing for a preview anyway.
+#[cfg(not(target_os = "macos"))]
+fn encode_preview_bgra(
+    _pending: &PendingVisionWindowFrame,
+    _bgra: &[u8],
+    _width_px: u32,
+    _height_px: u32,
+) -> Result<Vec<u8>, BackendError> {
+    Err(BackendError::UnsupportedOnPlatform)
+}
+
 /// Why a single-window capture produced no image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SingleWindowCaptureError {
@@ -521,6 +583,20 @@ pub trait CaptureBackend {
         }
         Ok(pending.frame)
     }
+    /// Scale a captured frame to exactly `width_px` by `height_px` and encode
+    /// it as JPEG, for the background-mode preview. Raw pixels go through
+    /// the system encoder; a prepared synthetic fixture is returned as it is.
+    fn encode_window_for_preview(
+        &mut self,
+        pending: &PendingVisionWindowFrame,
+        width_px: u32,
+        height_px: u32,
+    ) -> Result<Vec<u8>, BackendError> {
+        match &pending.bgra {
+            Some(bgra) => encode_preview_bgra(pending, bgra, width_px, height_px),
+            None => Ok(pending.frame.jpeg.clone()),
+        }
+    }
     /// Begin teardown without waiting for the native stream to stop.
     fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError>;
     /// Poll teardown using elapsed monotonic time; this operation must not wait.
@@ -739,10 +815,82 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         Ok(())
     }
 
-    fn select_vision_window(
+    /// Capture exactly the window `window_id` for an agent's background-mode
+    /// preview, scaled to fit `max_px` (the thumbnail's width and height in
+    /// pixels) and encoded as JPEG.
+    ///
+    /// The window is named by the caller, not chosen as the frontmost one:
+    /// the preview shows the window the agent acts in, which is often behind
+    /// another of the same application's windows. It must still be among the
+    /// target's verified enumerated windows, Screen Recording must be live
+    /// now, and the owner is checked again on the capture itself, as for a
+    /// vision capture. Any failed check returns an error and no pixels.
+    ///
+    /// A frame that encodes larger than a preview frame line may carry is
+    /// encoded once more at half the size, and refused if still too large.
+    pub fn capture_window_for_preview(
         &mut self,
         now_ms: u64,
-    ) -> Result<(EnumeratedWindow, WindowCaptureRequest), SingleWindowCaptureError> {
+        window_id: &str,
+        max_px: [u32; 2],
+    ) -> Result<PreviewWindowFrame, SingleWindowCaptureError> {
+        self.ready_for_single_window(now_ms)?;
+        let window = self
+            .windows
+            .iter()
+            .find(|window| window.window_id == window_id)
+            .cloned()
+            .ok_or(SingleWindowCaptureError::NoWindow)?;
+        let request = WindowCaptureRequest {
+            target: self.target.clone(),
+            filter: DesktopIndependentWindowFilter::new(window.window_id.clone()),
+            captured_at_ms: now_ms,
+            region: None,
+        };
+        let pending = self
+            .backend
+            .capture_window_unencoded_for_vision(&request)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        self.verify_vision_owner(&pending.frame)?;
+        let (mut width_px, mut height_px) = preview_scaled_size(
+            pending.frame.captured_width_px,
+            pending.frame.captured_height_px,
+            max_px,
+        )
+        .ok_or(SingleWindowCaptureError::Capture(
+            CaptureError::CaptureScopeUnavailable,
+        ))?;
+        let mut jpeg = Vec::new();
+        for attempt in 0..2 {
+            if attempt > 0 {
+                width_px = (width_px / 2).max(1);
+                height_px = (height_px / 2).max(1);
+            }
+            jpeg = self
+                .backend
+                .encode_window_for_preview(&pending, width_px, height_px)
+                .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+            if jpeg.len() <= crate::cursor::MAX_FRAME_BYTES {
+                break;
+            }
+        }
+        if jpeg.is_empty() || jpeg.len() > crate::cursor::MAX_FRAME_BYTES {
+            return Err(SingleWindowCaptureError::Capture(CaptureError::Backend(
+                "the preview frame does not fit a frame line".into(),
+            )));
+        }
+        self.state = CaptureSessionState::Active;
+        Ok(PreviewWindowFrame {
+            window,
+            width_px,
+            height_px,
+            jpeg,
+        })
+    }
+
+    /// Live permission, no revocation under way, and a current window list:
+    /// what any capture of one window needs before it picks the window.
+    fn ready_for_single_window(&mut self, now_ms: u64) -> Result<(), SingleWindowCaptureError> {
         self.ensure_capture_permission(now_ms)
             .map_err(SingleWindowCaptureError::Capture)?;
         if matches!(
@@ -757,6 +905,14 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         }
         self.refresh_if_needed(now_ms)
             .map_err(SingleWindowCaptureError::Capture)?;
+        Ok(())
+    }
+
+    fn select_vision_window(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<(EnumeratedWindow, WindowCaptureRequest), SingleWindowCaptureError> {
+        self.ready_for_single_window(now_ms)?;
         let frontmost = self
             .backend
             .frontmost_window_id(&self.target)
@@ -1350,6 +1506,247 @@ mod tests {
                 CaptureError::PermissionUnavailable
             ))
         ));
+    }
+
+    /// The preview captures the window it names, even while another of the
+    /// target's windows is in front, and the backend is asked for that
+    /// window alone, without the cursor.
+    #[test]
+    fn a_preview_captures_the_named_window_not_the_frontmost_one() {
+        let owner = target();
+        let mut backend = InMemoryCaptureBackend::default();
+        backend.set_windows(vec![window("10", &owner, true), window("11", &owner, true)]);
+        backend.set_vision_frame("10", 800, 600, vec![0xFF, 0xD8, 10]);
+        backend.set_vision_frame("11", 3840, 2160, vec![0xFF, 0xD8, 11]);
+        backend.set_frontmost_window(Some("10".into()));
+        let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
+        let frame = controller
+            .capture_window_for_preview(5, "11", [560, 720])
+            .unwrap();
+        assert_eq!(frame.window.window_id, "11");
+        assert_eq!(frame.jpeg, vec![0xFF, 0xD8, 11]);
+        assert_eq!((frame.width_px, frame.height_px), (560, 315));
+        let requests = controller.backend().window_requests();
+        let requested: Vec<&str> = requests
+            .iter()
+            .map(|request| request.filter.window_id.as_str())
+            .collect();
+        assert_eq!(requested, ["11"]);
+        assert!(!requests[0].filter.include_cursor);
+    }
+
+    /// No pixels without live Screen Recording, for a window whose owner
+    /// did not verify, or for a window id that another process owns by the
+    /// time it is captured.
+    #[test]
+    fn a_preview_capture_refuses_without_live_permission_or_a_verified_owner() {
+        let owner = target();
+        let stranger = ProcessGrant {
+            pid: 77,
+            ..target()
+        };
+        let mut backend = InMemoryCaptureBackend::default();
+        backend.set_windows(vec![
+            window("11", &owner, true),
+            window("12", &owner, false),
+        ]);
+        backend.set_vision_frame("11", 800, 600, vec![0xFF, 0xD8]);
+        backend.set_vision_frame("12", 800, 600, vec![0xFF, 0xD8]);
+        backend.set_permission_liveness(PermissionLiveness::Unavailable);
+        let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
+        assert_eq!(
+            controller.capture_window_for_preview(1, "11", [560, 720]),
+            Err(SingleWindowCaptureError::Capture(
+                CaptureError::PermissionUnavailable
+            ))
+        );
+        assert!(controller.backend().window_requests().is_empty());
+
+        controller
+            .backend_mut()
+            .set_permission_liveness(PermissionLiveness::Live);
+        assert_eq!(
+            controller.capture_window_for_preview(2, "12", [560, 720]),
+            Err(SingleWindowCaptureError::NoWindow),
+            "a window whose owner did not verify was captured"
+        );
+        assert!(controller.backend().window_requests().is_empty());
+        assert!(controller
+            .capture_window_for_preview(3, "11", [560, 720])
+            .is_ok());
+
+        // The id is reused by another process after the list was read.
+        controller
+            .backend_mut()
+            .set_windows(vec![window("11", &stranger, true)]);
+        assert_eq!(
+            controller.capture_window_for_preview(4, "11", [560, 720]),
+            Err(SingleWindowCaptureError::Capture(
+                CaptureError::CaptureScopeUnavailable
+            ))
+        );
+    }
+
+    /// A frame larger than a preview frame line carries is refused, never
+    /// handed on to be dropped by the pipe.
+    #[test]
+    fn a_preview_frame_too_large_for_a_frame_line_is_refused() {
+        let owner = target();
+        let mut backend = InMemoryCaptureBackend::default();
+        backend.set_windows(vec![window("11", &owner, true), window("12", &owner, true)]);
+        backend.set_vision_frame("11", 800, 600, vec![1; crate::cursor::MAX_FRAME_BYTES + 1]);
+        backend.set_vision_frame("12", 800, 600, vec![1; crate::cursor::MAX_FRAME_BYTES]);
+        let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
+        assert!(matches!(
+            controller.capture_window_for_preview(1, "11", [560, 720]),
+            Err(SingleWindowCaptureError::Capture(CaptureError::Backend(_)))
+        ));
+        assert!(controller
+            .capture_window_for_preview(2, "12", [560, 720])
+            .is_ok());
+    }
+
+    #[test]
+    fn a_preview_is_scaled_to_fit_the_thumbnail_and_never_enlarged() {
+        assert_eq!(
+            preview_scaled_size(3840, 2160, [560, 720]),
+            Some((560, 315))
+        );
+        assert_eq!(
+            preview_scaled_size(1000, 3000, [560, 720]),
+            Some((240, 720))
+        );
+        assert_eq!(preview_scaled_size(300, 200, [560, 720]), Some((300, 200)));
+        assert_eq!(preview_scaled_size(0, 200, [560, 720]), None);
+        assert_eq!(preview_scaled_size(300, 200, [0, 720]), None);
+    }
+
+    /// A backend whose capture hands back raw pixels, as the native one does,
+    /// so the preview's scaling and the system encoder are what is measured.
+    #[cfg(target_os = "macos")]
+    struct RawPixels {
+        windows: InMemoryCaptureBackend,
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CaptureBackend for RawPixels {
+        fn screen_recording_liveness(&self) -> PermissionLiveness {
+            self.windows.screen_recording_liveness()
+        }
+        fn enumerate_windows(
+            &mut self,
+            target: &ProcessGrant,
+        ) -> Result<Vec<EnumeratedWindow>, BackendError> {
+            self.windows.enumerate_windows(target)
+        }
+        fn poll_window_change(
+            &mut self,
+            target: &ProcessGrant,
+        ) -> Result<Option<WindowChange>, BackendError> {
+            self.windows.poll_window_change(target)
+        }
+        fn capture_window(
+            &mut self,
+            request: &WindowCaptureRequest,
+        ) -> Result<WindowCaptureFrame, BackendError> {
+            self.windows.capture_window(request)
+        }
+        fn capture_window_unencoded_for_vision(
+            &mut self,
+            request: &WindowCaptureRequest,
+        ) -> Result<PendingVisionWindowFrame, BackendError> {
+            Ok(PendingVisionWindowFrame {
+                frame: VisionWindowFrame {
+                    owner_identity: request.target.clone(),
+                    owner_identity_verified: true,
+                    captured_width_px: self.width,
+                    captured_height_px: self.height,
+                    jpeg: Vec::new(),
+                    captured_at_ms: request.captured_at_ms,
+                },
+                bgra: Some(self.bgra.clone()),
+            })
+        }
+        fn capture_display(
+            &mut self,
+            request: &BroadDisplayCaptureRequest,
+        ) -> Result<CaptureArtifact, BackendError> {
+            self.windows.capture_display(request)
+        }
+        fn begin_teardown(&mut self) -> Result<BackendTeardownProgress, BackendError> {
+            self.windows.begin_teardown()
+        }
+        fn poll_teardown(
+            &mut self,
+            elapsed_ms: u64,
+        ) -> Result<BackendTeardownProgress, BackendError> {
+            self.windows.poll_teardown(elapsed_ms)
+        }
+    }
+
+    /// A 4K window's preview, encoded by the system encoder at the
+    /// thumbnail's size on a Retina display, fits a frame line. The pixels
+    /// look like an application window: lines of text-like runs on a light
+    /// background beside a photo-like block of noise, which JPEG compresses
+    /// worst.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_4k_window_preview_frame_stays_under_the_frame_limit() {
+        let (width, height) = (3840u32, 2160u32);
+        let mut seed = 0x2545_f491_u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let random = noise();
+                let pixel = if x >= width / 2 && y < height / 2 {
+                    [random as u8, (random >> 8) as u8, (random >> 16) as u8, 255]
+                } else if y % 24 >= 6 && y % 24 < 18 && (x / 7 + y / 24) % 5 != 0 {
+                    let ink = if random % 3 == 0 { 30 } else { 235 };
+                    [ink, ink, ink, 255]
+                } else {
+                    let shade = 240 - (y * 20 / height) as u8;
+                    [shade, shade, shade, 255]
+                };
+                bgra.extend_from_slice(&pixel);
+            }
+        }
+        let owner = target();
+        let mut windows = InMemoryCaptureBackend::default();
+        windows.set_windows(vec![window("11", &owner, true)]);
+        let backend = RawPixels {
+            windows,
+            width,
+            height,
+            bgra,
+        };
+        let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
+        let frame = controller
+            .capture_window_for_preview(1, "11", [560, 720])
+            .unwrap();
+        assert!(
+            frame.jpeg.len() <= crate::cursor::MAX_FRAME_BYTES,
+            "{} bytes",
+            frame.jpeg.len()
+        );
+        assert_eq!(&frame.jpeg[..2], &[0xFF, 0xD8]);
+        assert!(frame.width_px <= 560 && frame.height_px <= 315);
+        let line = crate::cursor::CursorFrame::new(
+            "agent",
+            1,
+            11,
+            [frame.width_px, frame.height_px],
+            &frame.jpeg,
+        );
+        assert!(line.valid());
     }
 
     #[test]

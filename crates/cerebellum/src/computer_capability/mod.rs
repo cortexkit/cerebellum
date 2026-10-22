@@ -108,6 +108,7 @@ mod open_app_tests;
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
+mod preview;
 mod quarantine;
 pub(crate) use quarantine::park_clock;
 #[cfg(test)]
