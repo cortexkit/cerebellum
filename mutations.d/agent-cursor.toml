@@ -933,3 +933,185 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-fronting-lock-limit"
+guards = "a fronting path waits for the process-wide fronting lock at most FRONTING_LOCK_WAIT_MS, then stops fronting_busy"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "            Duration::from_millis(FRONTING_LOCK_WAIT_MS),"
+new = "            Duration::from_millis(FRONTING_LOCK_WAIT_MS * 2), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_press",
+    "computer_capability::fronting_tests::the_fronting_lock_serializes_fronts_and_stops_busy_at_its_limit",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-guard-zero-foreground"
+guards = "a foreground one-way front checks that no release left by an earlier call is unconfirmed, and fronts nothing while one is"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        if !held_input_confirmed(&self.held_input) {\n            return Some(ForegroundFront::stopped("
+new = "        if false { // NON-VACUITY BREAK\n            return Some(ForegroundFront::stopped("
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::an_unconfirmed_release_keeps_every_fronting_path_from_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-cancel-reads-nothing"
+guards = "a foreground read whose front stopped because the call is ending reads nothing instead of falling back to an unfronted read"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = "            if fronting::stop_ends_call(stop) {\n                let mut reply = if stop"
+new = "            if false && fronting::stop_ends_call(stop) { // NON-VACUITY BREAK\n                let mut reply = if stop"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_cancel_while_waiting_for_the_lock_reads_nothing",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-hooked-restore-only"
+guards = "in a hooked fronted dispatch only the hooks' restore decision asks for the previous application back; the bracket never requests it itself"
+file = "crates/cerebellum-computer/src/platform/mod.rs"
+old = "        // registration was refused, so there is nothing to ask for.\n        self.returned();"
+new = "        // registration was refused, so there is nothing to ask for.\n        self.returned();\n        self.inner.request_front(pid); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/platform/mod.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "platform::hooked_fronted_tests::a_refused_registration_fronts_nothing_and_decides_nothing",
+    "platform::hooked_fronted_tests::cleanup_that_took_the_obligation_first_prevents_the_front",
+    "platform::hooked_fronted_tests::the_previous_application_is_asked_back_only_by_the_hooked_decision",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-restore-after-confirmed-release"
+guards = "a chord whose post may have left a key held runs its restore decision only after settling the held input confirmed the release"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        if released {\n            let decided"
+new = "        if true { // NON-VACUITY BREAK\n            let decided"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirmed",
+    "computer_capability::fronting_tests::under_cancel_an_unconfirmed_release_requests_no_restore",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-absorb-own-front"
+guards = "a foreground one-way front is written into the target's seen marks when it is seen, so input made before it does not refuse a later action"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "            if front.fronted {\n                absorb_own_front("
+new = "            if false { // NON-VACUITY BREAK\n                absorb_own_front("
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::input_before_a_foreground_front_does_not_refuse_the_next_action",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-press-pre-read"
+guards = "a press whose element reads disabled while its application is in the background takes the needs-front path"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "Ok(pre_read) => needs_front = pre_read.needs_front(grant.pid),"
+new = "Ok(pre_read) => needs_front = pre_read.needs_front(grant.pid) && false, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_person_switch_with_input_is_left_alone_and_one_without_is_restored",
+    "computer_capability::fronting_tests::a_press_on_a_button_disabled_in_the_background_fronts_presses_and_restores",
+    "computer_capability::fronting_tests::a_press_still_disabled_in_front_refuses_and_restores",
+    "computer_capability::fronting_tests::an_unconfirmed_release_keeps_every_fronting_path_from_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-chord-app-grant"
+guards = "an attended session in an admitted build fronts a modifier chord under the app grant alone instead of refusing modifier_chord_needs_foreground"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "    } else if admission.app_use_fronting_admitted {\n        ChordRoute::FrontWithAppGrant"
+new = "    } else if false { // NON-VACUITY BREAK\n        ChordRoute::FrontWithAppGrant"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::a_background_command_chord_fronts_posts_and_restores",
+    "computer_capability::fronting_tests::a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirmed",
+    "computer_capability::fronting_tests::mode_attendance_and_admission_decide_takeover_chords_and_fronting",
+    "computer_capability::fronting_tests::under_cancel_a_held_command_is_released_before_the_restore",
+    "computer_capability::fronting_tests::under_cancel_an_unconfirmed_release_requests_no_restore",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-capability-foreground-image"
+guards = "in foreground mode an image read whose one-way front succeeded ignores bring_to_front, so it never answers image_needs_takeover"
+file = "crates/cerebellum/src/computer_capability/fronting.rs"
+old = "        AppUse::Foreground => (bring_to_front && !fronted_one_way, false),"
+new = "        AppUse::Foreground => (bring_to_front, false), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::fronting_tests::mode_attendance_and_admission_decide_takeover_chords_and_fronting",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
