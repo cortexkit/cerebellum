@@ -133,7 +133,7 @@ log = Path(sys.argv[1]).read_text()
 assert log.index('linux whole log') < log.index('mac whole log')
 assert '==> FAIL: Linux half (ck motor run) (exit 200)' in log
 assert '==> PASS: macOS half (local)' in log
-assert 'runon: "linux,8c"' in log
+assert "git rev-parse origin/main" in log and "--part linux --base <commit>" in log
 assert 'FAST GATE FAILED:' in log
 PY
 }

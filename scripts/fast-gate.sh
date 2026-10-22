@@ -52,6 +52,14 @@ if [ "$self_test" -eq 0 ]; then
   fi
   require_part_host "$part"
   echo "==> FAST GATE PART: $part"
+  # A build-server snapshot carries the commits but no branch or remote refs,
+  # so a ref name such as origin/main resolves only where the gate was
+  # started. The combined gate passes the base as a commit for that reason.
+  if ! GIT_OPTIONAL_LOCKS=0 git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+    echo "fast gate: base '$base' does not resolve here; nothing has been verified." >&2
+    echo "On the build server, pass the base as a commit taken on the Mac: run 'git rev-parse origin/main' locally, then '--part $part --base <that commit>'." >&2
+    exit 2
+  fi
   python3 "$repo_root/scripts/lib/fast-gate-fingerprint.py" "$base"
 fi
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"

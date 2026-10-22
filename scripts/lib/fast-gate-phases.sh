@@ -104,7 +104,7 @@ run_combined_gate() (
     phase_failed=1
   fi
   if [ "$phase_failed" -ne 0 ]; then
-    echo 'fast gate: both halves are required. In a worker sandbox, run scripts/fast-gate.sh --part linux with bash runon: "linux,8c", and scripts/fast-gate.sh --part mac locally (with the same --base).' >&2
+    echo "fast gate: both halves are required. In a worker sandbox, take the base commit with 'git rev-parse origin/main', then run scripts/fast-gate.sh --part linux --base <commit> with bash runon, and scripts/fast-gate.sh --part mac --base <commit> locally." >&2
   fi
   finish_gate
 )
