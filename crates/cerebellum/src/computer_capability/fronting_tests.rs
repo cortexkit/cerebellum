@@ -363,6 +363,9 @@ struct ScreenState {
     /// a little longer, so a restore made before it returned shows up in
     /// the log ahead of it.
     log_release_end: bool,
+    /// The person presses a key, which the run's own observer drains at its
+    /// next check.
+    person_key_pending: bool,
 }
 
 #[derive(Clone)]
@@ -392,6 +395,7 @@ impl Screen {
                 release_until_stopped: None,
                 release_until: None,
                 log_release_end: false,
+                person_key_pending: false,
             })),
             desk: desk.clone(),
         }
@@ -496,7 +500,15 @@ impl FrontingSession for FakeSession {
         IdleReading::Milliseconds(self.0.state().idle_ms)
     }
     fn drain(&mut self) -> Vec<SourcedInputEvent> {
-        Vec::new()
+        if std::mem::take(&mut self.0.state().person_key_pending) {
+            vec![SourcedInputEvent {
+                source_unix_process_id: 0,
+                detection_latency_ms: 1,
+                platform_delivery_latency_ms: None,
+            }]
+        } else {
+            Vec::new()
+        }
     }
     fn post_heartbeat(&mut self) -> HeartbeatProbe {
         self.0.probe()
@@ -2682,4 +2694,52 @@ async fn a_chord_row_records_its_front_and_decodes_with_the_older_type() {
     assert_eq!(record.restore, FrontingRecordRestore::Restored);
     let older: BeforeFronting = serde_json::from_value(actuation.clone()).unwrap();
     assert_eq!(older.outcome, recorded.outcome);
+}
+
+/// The person types into the target while a fronted press settles, moving
+/// its focus. The settle ends on their input and the previous application
+/// is restored, but what the target looked like after their input is never
+/// recorded as what the conversation was shown: the agent's next press on
+/// it is refused as for any change the person made since the last read.
+#[tokio::test]
+async fn input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = vec![10];
+    let (desk, screen) = (rig.desk.clone(), rig.screen.clone());
+    rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+        desk.state().focus = support::DeskFocus::Element(10);
+        let mut state = screen.state();
+        state.person_key_pending = true;
+        state.last_input_ms = Some(state.now + 1);
+        state.now += 2;
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(reply["fronting"]["person_input_during_fronting"], true);
+    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+
+    let again = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(again["outcome"], "state_changed_by_person", "{again}");
+    assert_eq!(again["reason"], "focus_changed", "{again}");
+    assert_eq!(
+        rig.desk.state().presses,
+        [10],
+        "the second press sent nothing"
+    );
+    assert!(!rig.lock.held());
 }

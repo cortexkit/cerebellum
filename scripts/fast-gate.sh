@@ -140,7 +140,31 @@ for required in (
 PY
 }
 
+# A harness-less desk test (one that opens AppKit windows on the main thread)
+# prints "test NAME ... SKIPPED: reason", or "SKIPPED (what it did check):
+# reason", when this host could not check what it promises, for example
+# because the screen is locked. With CEREBELLUM_DESK_TEST_SKIP_OK=1 it then
+# exits 0 instead of 2, so a locked screen does not turn this gate red; the
+# gate reads the reason back from the output and names it in the summary, so a
+# skip is never silent.
+desk_suites=("cerebellum-macos:preview_hide")
+desk_skip_reason() {
+  sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
+}
+
 if [ "$self_test" -eq 1 ]; then
+  planted_skip="test a_preview_test ... SKIPPED (the window's kind was checked and is right): the screen is locked, so no window is realised"
+  if [ "$(printf '%s\n' "$planted_skip" | desk_skip_reason)" != "the screen is locked, so no window is realised" ] || \
+     [ "$(printf 'test a_preview_test ... SKIPPED: no display is readable\n' | desk_skip_reason)" != "no display is readable" ]; then
+    echo "SELF-TEST FAILED: a planted desk-test skip line did not yield its reason" >&2
+    exit 1
+  fi
+  if [ -n "$(printf 'test a_preview_test ... ok\n' | desk_skip_reason)" ]; then
+    echo "SELF-TEST FAILED: a passing desk test was read as a skip" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a desk-test skip yields its reason and a pass yields none"
+
   suite_plan="$(plan_for_files 'crates/cerebellum/tests/it/tool_catalog.rs')"
   if ! printf '%s\n' "$suite_plan" | grep -Fxq 'T|cerebellum|it'; then
     echo "SELF-TEST FAILED: a planted tests/it source path did not select suite it" >&2
@@ -313,6 +337,26 @@ else
   echo "==> SKIP: touched-package --lib tests (no changed package with a library target)"
 fi
 
+# Desk tests that skipped, each as "<target> skipped (<reason>)".
+not_verified=()
+
+is_desk_suite() {
+  local wanted="$1" suite
+  for suite in "${desk_suites[@]}"; do
+    [ "$suite" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+# Run a command with its standard output also copied to a log, keeping the
+# command's own exit status.
+run_teed() {
+  local log="$1"
+  shift
+  "$@" | tee "$log"
+  return "${PIPESTATUS[0]}"
+}
+
 suite_will_run() {
   local wanted="$1" suite
   if [ "${#suites[@]}" -eq 0 ]; then
@@ -380,7 +424,21 @@ if [ "${#suites[@]}" -gt 0 ]; then
     fi
     package="${suite%%:*}"
     target="${suite#*:}"
-    run_phase "cargo test --locked -p $package --test $target" cargo test --locked -p "$package" --test "$target"
+    if is_desk_suite "$suite"; then
+      log="$static_dir/desk-$package-$target.log"
+      run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
+        run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p "$package" --test "$target"
+      reason="$(desk_skip_reason < "$log")"
+      if [ "$(uname -s)" != Darwin ]; then
+        # Off macOS the target builds to an empty program that prints nothing.
+        reason="AppKit exists only on macOS, so no preview panel was shown"
+      fi
+      if [ -n "$reason" ]; then
+        not_verified+=("$target skipped ($reason)")
+      fi
+    else
+      run_phase "cargo test --locked -p $package --test $target" cargo test --locked -p "$package" --test "$target"
+    fi
   done
 fi
 
@@ -407,4 +465,11 @@ else
   echo "==> SKIP: mutation catalogue --strict check (no catalogue file changed)"
 fi
 
-echo "FAST GATE PASSED: all selected phases are green"
+if [ "${#not_verified[@]}" -eq 0 ]; then
+  echo "FAST GATE PASSED: all selected phases are green"
+else
+  for item in "${not_verified[@]}"; do
+    echo "NOT VERIFIED: $item"
+  done
+  echo "FAST GATE PASSED: every selected phase that ran is green; see the NOT VERIFIED lines above"
+fi

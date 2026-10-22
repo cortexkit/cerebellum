@@ -19,6 +19,9 @@ const PREVIOUS: u32 = 100;
 const THIRD: u32 = 300;
 const OUR_PID: i64 = 7;
 const START_MS: u64 = 10_000;
+/// How often the fake settle asks whether the person acted, as the real
+/// settle polls the application.
+const SETTLE_POLL_MS: u64 = 50;
 
 /// What one step's element and the person do.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,6 +35,9 @@ struct StepScript {
     switch_to_during_settle: Option<u32>,
     /// During the settle, the person presses a key or a button.
     hardware_input_during_settle: bool,
+    /// This many milliseconds into the settle, the person presses a key,
+    /// which the run's own observer drains at the settle's next check.
+    tap_input_into_settle_ms: Option<u64>,
 }
 
 impl StepScript {
@@ -84,6 +90,8 @@ struct PressDesk {
     press_ms: u64,
     /// `None`: each settle takes its whole bound.
     settle_ms: Option<u64>,
+    /// How long each settle actually took, in order.
+    settled_ms: Vec<u64>,
     log: Vec<&'static str>,
 }
 
@@ -117,6 +125,7 @@ impl PressDesk {
             attempt: FrontAttempt::new(),
             press_ms: 10,
             settle_ms: None,
+            settled_ms: Vec::new(),
             log: Vec::new(),
         }
     }
@@ -303,16 +312,44 @@ impl FrontingPressHost for PressDesk {
         self.advance(self.press_ms);
         true
     }
-    fn settle(&mut self, step: usize, bound_ms: u64) {
+    fn settle(
+        &mut self,
+        step: usize,
+        bound_ms: u64,
+        person_acted: &mut dyn FnMut(&mut Self) -> bool,
+    ) -> SettleEnd {
         self.log.push("settle");
-        self.advance(self.settle_ms.unwrap_or(bound_ms));
+        let length = self.settle_ms.unwrap_or(bound_ms);
         let script = self.steps[step];
+        let start = self.now;
+        // Waits in the real settle's poll interval, asking before each one,
+        // as the real settle does.
+        loop {
+            if person_acted(self) {
+                self.settled_ms.push(self.now - start);
+                return SettleEnd::PersonInput;
+            }
+            let elapsed = self.now - start;
+            if elapsed >= length {
+                break;
+            }
+            self.advance(SETTLE_POLL_MS.min(length - elapsed));
+            if script
+                .tap_input_into_settle_ms
+                .is_some_and(|at| self.now - start == at)
+            {
+                self.pending_tap_input = true;
+                self.person_input_now();
+            }
+        }
+        self.settled_ms.push(self.now - start);
         if let Some(pid) = script.switch_to_during_settle {
             self.frontmost = Some(pid);
         }
         if script.hardware_input_during_settle {
             self.person_input_now();
         }
+        SettleEnd::Quiet
     }
     fn claim_restore(&mut self) -> RestoreClaim {
         self.log.push("claim");
@@ -689,4 +726,81 @@ fn cleanup_that_takes_the_obligation_before_the_front_prevents_it() {
     assert!(desk.front_requests.is_empty());
     assert_eq!(report.restore, RestoreStatus::NotNeeded);
     assert!(desk.finishes.is_empty());
+}
+
+/// A settle with no input from the person runs to its bound: the watch on
+/// the settle never ends it early on its own.
+#[test]
+fn a_quiet_settle_runs_to_its_bound() {
+    let mut desk = PressDesk::single();
+    let report = run(&mut desk);
+    assert_eq!(report.stop, None, "{report:?}");
+    assert_eq!(desk.settled_ms, [PRESS_SETTLE_BOUND_MS]);
+    assert_eq!(report.abort, None);
+    assert!(!report.person_input_during_fronting);
+    assert_eq!(report.restore, RestoreStatus::Restored);
+}
+
+/// The person types while a fronted press settles: their keys would land in
+/// the target, so the settle ends at the next check rather than at its
+/// bound, the restore decision runs straight after it, and the input is
+/// reported the way input before a press is. The press itself took effect,
+/// so the run has no stop.
+#[test]
+fn input_during_the_settle_ends_it_early_and_restores_at_once() {
+    let mut desk = PressDesk::new(vec![StepScript {
+        tap_input_into_settle_ms: Some(100),
+        ..StepScript::disabled_in_background()
+    }]);
+    let report = run(&mut desk);
+    assert_eq!(report.stop, None, "{report:?}");
+    assert_eq!(report.steps_pressed, 1);
+    assert_eq!(desk.settled_ms, [100], "the settle ends at the next check");
+    assert!(
+        desk.log
+            .ends_with(&["press", "settle", "claim", "restore_request", "finish"]),
+        "{:?}",
+        desk.log
+    );
+    assert_eq!(
+        report.abort.map(|abort| abort.reason),
+        Some(AbortReason::UserSeizedControl)
+    );
+    assert!(report.person_input_during_fronting);
+    assert_eq!(report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(desk.frontmost, Some(PREVIOUS));
+    assert_eq!(desk.finishes, [RestoreStatus::Restored]);
+}
+
+/// In a batch, input during one step's settle stops the run before the next
+/// step does anything, not even schedule its badge, and that next step is
+/// reported stopped by the person, as input before a press is.
+#[test]
+fn input_during_a_batch_settle_stops_the_next_step_and_restores_at_once() {
+    let mut desk = PressDesk::new(vec![
+        StepScript {
+            tap_input_into_settle_ms: Some(150),
+            ..StepScript::disabled_in_background()
+        },
+        StepScript::disabled_in_background(),
+    ]);
+    let report = run(&mut desk);
+    assert_eq!(
+        report.stop,
+        Some(PressRunStop::Interrupted(FrontingStop::UserSeizedControl))
+    );
+    assert_eq!(report.stopped_at, Some(1));
+    assert_eq!(desk.pressed, [0]);
+    assert_eq!(desk.settled_ms, [150]);
+    assert_eq!(desk.badge_holds, [(0, true)], "the next step never began");
+    assert!(
+        desk.log
+            .ends_with(&["press", "settle", "claim", "restore_request", "finish"]),
+        "{:?}",
+        desk.log
+    );
+    assert!(report.person_input_during_fronting);
+    assert_eq!(report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
 }

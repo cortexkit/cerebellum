@@ -14,7 +14,18 @@
 //! WHY THIS TARGET HAS NO TEST HARNESS. AppKit windows must be created on a
 //! process's main thread, and the standard harness runs every test on a
 //! thread of its own, so `main` stands in for the harness and prints ok,
-//! SKIPPED, or FAILED.
+//! SKIPPED, or FAILED. An ok or FAILED run is reported in the standard
+//! harness's format, summary line included, so tools that read test results
+//! by name (the mutation catalogue's runner among them) can read this one.
+//!
+//! A SKIPPED run checked less than the test promises, so it exits with code 2
+//! rather than 0: a run without a display must not read as a pass. A caller
+//! that accepts a skip, and reports it itself, sets
+//! `CEREBELLUM_DESK_TEST_SKIP_OK=1` to have it exit 0 instead.
+//!
+//! The preview shows a window the person had covered, so it must also stay
+//! out of screen sharing, recordings and screenshots: its sharing type is
+//! checked too.
 //!
 //! The preview is shown fully transparent, so nothing appears on the desk of
 //! the person running the test, and it never takes focus.
@@ -31,10 +42,14 @@ fn main() {
     // Honour name filters the way the standard harness would.
     let mut filters = Vec::new();
     let mut skips = Vec::new();
+    let mut list = false;
+    let mut ignored_only = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--skip" => skips.extend(arguments.next()),
+            "--list" => list = true,
+            "--ignored" => ignored_only = true,
             "--test-threads" | "--format" | "--color" | "--logfile" | "-Z" => {
                 arguments.next();
             }
@@ -47,9 +62,25 @@ fn main() {
             && !filters
                 .iter()
                 .any(|filter| TEST_NAME.contains(filter.as_str())))
+        || ignored_only
     {
+        if list {
+            println!("0 tests, 0 benchmarks");
+            return;
+        }
+        println!("\nrunning 0 tests\n");
+        println!(
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; \
+             finished in 0.00s\n"
+        );
         return;
     }
+    if list {
+        // As the standard harness lists: the test is not run.
+        println!("{TEST_NAME}: test\n\n1 test, 0 benchmarks");
+        return;
+    }
+    println!("\nrunning 1 test");
     // If a locked screen keeps the shown preview out of the window server's
     // on-screen list, the hide cannot be checked; the window's kind still can.
     let locked = cerebellum_macos::screen_is_locked() == Some(true);
@@ -57,7 +88,7 @@ fn main() {
         Ok(probe) => probe,
         Err(reason) => {
             println!("test {TEST_NAME} ... SKIPPED: {reason}");
-            return;
+            exit_skipped();
         }
     };
     println!("{probe:?}");
@@ -73,6 +104,11 @@ fn main() {
     }
     if probe.level <= 0 {
         failures.push("the preview's window does not float above normal windows");
+    }
+    if !probe.hidden_from_capture {
+        failures.push(
+            "the preview's window can be captured by screen sharing, recordings and screenshots",
+        );
     }
     if probe.liquid_glass != probe.liquid_glass_available {
         failures.push(if probe.liquid_glass_available {
@@ -95,7 +131,7 @@ fn main() {
             println!(
                 "test {TEST_NAME} ... SKIPPED (the window's kind was checked and is right): {why}"
             );
-            return;
+            exit_skipped();
         }
     } else {
         if probe.listed_after_hide {
@@ -109,9 +145,31 @@ fn main() {
         }
     }
     if failures.is_empty() {
-        println!("test {TEST_NAME} ... ok");
+        println!("test {TEST_NAME} ... ok\n");
+        println!(
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.00s\n"
+        );
     } else {
-        println!("test {TEST_NAME} ... FAILED\n\n{}\n", failures.join("\n"));
+        println!("test {TEST_NAME} ... FAILED\n");
+        println!(
+            "failures:\n\n---- {TEST_NAME} stdout ----\n{}\n\nfailures:\n    {TEST_NAME}\n",
+            failures.join("\n")
+        );
+        println!(
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.00s\n"
+        );
         std::process::exit(101);
     }
+}
+
+/// End a run that could not check everything. Exit code 2 marks the skip as
+/// not a pass; `CEREBELLUM_DESK_TEST_SKIP_OK=1` turns it into 0 for a caller
+/// that reports the skip on its own.
+#[cfg(target_os = "macos")]
+fn exit_skipped() -> ! {
+    let accepted =
+        std::env::var_os("CEREBELLUM_DESK_TEST_SKIP_OK").is_some_and(|value| value == "1");
+    std::process::exit(if accepted { 0 } else { 2 });
 }

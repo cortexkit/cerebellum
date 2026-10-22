@@ -38,7 +38,7 @@ use objc2_app_kit::{
     NSDeviceRGBColorSpace, NSEventMask, NSFont, NSFontWeightMedium, NSFontWeightSemibold,
     NSGraphicsContext, NSImage, NSLineBreakMode, NSLineJoinStyle, NSPanel, NSScreen, NSShadow,
     NSTextAlignment, NSTextField, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace,
+    NSWindowSharingType, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     NSActivityOptions, NSDate, NSDefaultRunLoopMode, NSDictionary, NSObjectProtocol, NSPoint,
@@ -726,6 +726,10 @@ impl Picture {
         panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
         panel.setLevel(3); // NSFloatingWindowLevel, never the normal layer (0).
         panel.setIgnoresMouseEvents(true);
+        // Keep the badge out of screen sharing, recordings and screenshots,
+        // like the preview panel: its label describes what the agent is
+        // doing, which a shared screen should not reveal either.
+        panel.setSharingType(NSWindowSharingType::None);
         // The view draws its own soft shadow; a window shadow would outline
         // the whole transparent panel.
         panel.setHasShadow(false);
@@ -1101,6 +1105,9 @@ pub struct PreviewHideProbe {
     pub non_activating: bool,
     /// It floats above normal windows (whose level is 0).
     pub level: isize,
+    /// Its sharing type is `NSWindowSharingNone`, so screen sharing,
+    /// recordings and screenshots leave out the covered window it shows.
+    pub hidden_from_capture: bool,
     /// Its frosted pane is the system's Liquid Glass view.
     pub liquid_glass: bool,
     /// This macOS has a Liquid Glass view at all (macOS 26 and later).
@@ -1166,6 +1173,7 @@ pub fn probe_preview_hide() -> Result<PreviewHideProbe, String> {
             .styleMask()
             .contains(NSWindowStyleMask::NonactivatingPanel),
         level: panel.level(),
+        hidden_from_capture: panel.sharingType() == NSWindowSharingType::None,
         liquid_glass: facts.liquid_glass,
         liquid_glass_available: objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
     })

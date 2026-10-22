@@ -18,12 +18,17 @@
 //! 7. the enabled poll, every [`FRONTING_POLL_MS`] for at most
 //!    [`ENABLE_POLL_MS`], else `element_disabled`;
 //! 8. the press;
-//! 9. the settle, at most the plan's settle bound;
+//! 9. the settle, at most the plan's settle bound, ended early by the
+//!    person's input;
 //! 10. the restore decision.
 //!
 //! During the poll, and before every press, the seize watcher is drained and
 //! focus, cancellation and the dispatch gate are checked; any of them stops
-//! the run before the press, and the restore decision still runs. A press
+//! the run before the press, and the restore decision still runs. The
+//! watcher is drained during each fronted settle too: the person's keys
+//! would land in the target while it is in front, so their input ends the
+//! settle, no later step is pressed, and the restore decision runs at once.
+//! A press
 //! whose element is enabled, or whose application is already frontmost,
 //! takes the ordinary path and never touches the fronting lock.
 //!
@@ -153,12 +158,34 @@ pub trait FrontingPressHost: FrontingBracketHost {
     /// `true` when the press took effect.
     fn press(&mut self, step: usize) -> bool;
     /// Step 9: let step `step`'s press settle, for at most `bound_ms`.
-    fn settle(&mut self, step: usize, bound_ms: u64);
+    ///
+    /// `person_acted` must be asked before every wait of the settle, and the
+    /// settle must end as soon as it answers `true`: the person is using the
+    /// input devices, and while the target is in front their keys would land
+    /// in it. A settle that ends that way must not record what the
+    /// application looks like after their input as what the agent was last
+    /// shown, or the next person check would miss it.
+    fn settle(
+        &mut self,
+        step: usize,
+        bound_ms: u64,
+        person_acted: &mut dyn FnMut(&mut Self) -> bool,
+    ) -> SettleEnd;
     /// Step 10: take the restore obligation for the decision, unless terminal
     /// cleanup already has.
     fn claim_restore(&mut self) -> RestoreClaim;
     /// The restore decision is complete; release the fronting lock.
     fn finish_fronting(&mut self, restore: RestoreStatus);
+}
+
+/// How a press's settle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleEnd {
+    /// It saw the press's effect or ran to its bound, with no input from
+    /// the person.
+    Quiet,
+    /// The person's input ended it early.
+    PersonInput,
 }
 
 /// Why a press run stopped before pressing every step.
@@ -252,7 +279,7 @@ pub fn run_fronting_press<H: FrontingPressHost>(
                         break 'steps Some((step, PressRunStop::PressFailed));
                     }
                     report.steps_pressed += 1;
-                    host.settle(step, plan.settle_bound_ms);
+                    host.settle(step, plan.settle_bound_ms, &mut unfronted_settle::<H>);
                     continue;
                 }
                 // 2. The badge arrives before anything is fronted.
@@ -337,8 +364,27 @@ pub fn run_fronting_press<H: FrontingPressHost>(
             session.watcher.take_post_slot();
             report.steps_pressed += 1;
 
-            // 9. Settle.
-            host.settle(step, plan.settle_bound_ms);
+            // 9. Settle, draining the watcher before every wait. Input that is
+            // not ours ends the settle; the press already took effect, so
+            // the stop belongs to the next step, if there is one, and the
+            // restore decision follows at once.
+            let ended = host.settle(step, plan.settle_bound_ms, &mut |host: &mut H| {
+                let drained = host.drain(&session.tap);
+                observe_drained_events(&mut session.watcher, drained, our_pid, step + 1);
+                session.watcher.abort_decision().is_some()
+            });
+            if ended == SettleEnd::PersonInput {
+                report.abort = session.watcher.abort_decision();
+                if step + 1 == plan.steps {
+                    break 'steps None;
+                }
+                let stop = report
+                    .abort
+                    .map_or(FrontingStop::UserSeizedControl, |abort| {
+                        FrontingStop::from_abort(abort.reason)
+                    });
+                break 'steps Some((step + 1, PressRunStop::Interrupted(stop)));
+            }
         }
         None
     };
@@ -525,6 +571,13 @@ fn front_target<H: FrontingPressHost>(
         return Err(FrontingStop::FrontFailed);
     }
     Ok(())
+}
+
+/// The settle check for a press on the ordinary path. Nothing is in front
+/// for it, so the person's input goes where they aim it and does not end the
+/// settle.
+fn unfronted_settle<H>(_host: &mut H) -> bool {
+    false
 }
 
 /// The checks before every poll and every press while the target is in
