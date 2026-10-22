@@ -347,7 +347,17 @@ struct ScreenState {
     /// terminal is chosen, and then fails with them possibly held.
     hold_until_stopped: Option<Arc<crate::TerminalArbiter>>,
     /// Told when the chord's post begins.
-    posting: Option<tokio::sync::oneshot::Sender<()>>,
+    posting: Option<Arc<tokio::sync::Notify>>,
+    /// Told when a paired release of held keys begins.
+    releasing: Option<Arc<tokio::sync::Notify>>,
+    /// The release, once begun, chooses this call's terminal with this
+    /// cause, as the work deadline passing during it would.
+    release_ends_call: Option<(Arc<crate::TerminalArbiter>, crate::TerminalCause)>,
+    /// The release, once begun, stays in flight until this call's terminal
+    /// is chosen.
+    release_until_stopped: Option<Arc<crate::TerminalArbiter>>,
+    /// The release, once begun, stays in flight until this is set.
+    release_until: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -372,6 +382,10 @@ impl Screen {
                 enable_on_front: None,
                 hold_until_stopped: None,
                 posting: None,
+                releasing: None,
+                release_ends_call: None,
+                release_until_stopped: None,
+                release_until: None,
             })),
             desk: desk.clone(),
         }
@@ -558,7 +572,7 @@ impl FrontingBracketHost for FakeBracket {
             )
         };
         if let Some(posting) = posting {
-            let _ = posting.send(());
+            posting.notify_one();
         }
         if let Some(terminal) = hold {
             let give_up = std::time::Instant::now() + Duration::from_secs(10);
@@ -642,11 +656,36 @@ impl PlatformDriver for FakeDriver {
         _target: &ProcessGrant,
         _action: &SyntheticAction,
     ) -> Result<u64, DriverError> {
-        let ok = {
+        let (ok, releasing, ends_call, until_stopped, until) = {
             let mut state = self.screen.state();
             state.log.push("release".into());
-            state.release_ok
+            (
+                state.release_ok,
+                state.releasing.take(),
+                state.release_ends_call.take(),
+                state.release_until_stopped.clone(),
+                state.release_until.clone(),
+            )
         };
+        if let Some(releasing) = releasing {
+            releasing.notify_one();
+        }
+        if let Some((terminal, cause)) = ends_call {
+            terminal.stop(cause);
+        }
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        if let Some(terminal) = until_stopped {
+            while !terminal.gate.stopped() && std::time::Instant::now() < give_up {
+                std::thread::yield_now();
+            }
+        }
+        if let Some(until) = until {
+            while !until.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < give_up
+            {
+                std::thread::yield_now();
+            }
+        }
         if ok {
             Ok(2)
         } else {
@@ -683,6 +722,47 @@ impl PlatformDriver for FakeDriver {
                 &mut estimator,
                 plan,
                 cancelled,
+            ),
+        })
+    }
+    fn read_fronted(
+        &mut self,
+        target: &ProcessGrant,
+        maximum_interval_ms: u64,
+        cancelled: &dyn Fn() -> bool,
+        read: &mut dyn FnMut(),
+    ) -> Result<cerebellum_computer::dispatch::BracketReport, DriverError> {
+        let plan = cerebellum_computer::dispatch::BracketPlan {
+            target_pid: target.pid,
+            units: 1,
+            maximum_interval_ms,
+            maximum_seize_detection_latency_ms: 50,
+        };
+        let screen = self.screen.clone();
+        let mut logged_read = || {
+            screen.state().log.push("read".into());
+            read();
+        };
+        let mut host = FakeBracket(self.screen.clone());
+        let mut estimator = UserIdleEstimator::new();
+        Ok(match self.hooks.take() {
+            Some(mut hooks) => {
+                cerebellum_computer::platform::run_hooked_fronted(
+                    &mut host,
+                    &mut estimator,
+                    plan,
+                    cancelled,
+                    hooks.as_mut(),
+                    Some(&mut logged_read),
+                )
+                .report
+            }
+            None => cerebellum_computer::dispatch::run_fronting_read(
+                &mut host,
+                &mut estimator,
+                plan,
+                cancelled,
+                &mut logged_read,
             ),
         })
     }
@@ -812,6 +892,14 @@ struct Rig {
 }
 
 async fn rig(mode: AppUse, desk: support::Desk) -> Rig {
+    rig_with(mode, desk, support::granted_management().await)
+}
+
+fn rig_with(
+    mode: AppUse,
+    desk: support::Desk,
+    management: Arc<crate::management::ManagementPlane>,
+) -> Rig {
     let screen = Screen::new(&desk);
     let lock = FrontingLock::isolated();
     let driver_screen = screen.clone();
@@ -833,9 +921,99 @@ async fn rig(mode: AppUse, desk: support::Desk) -> Rig {
         plane: Arc::new(plane),
         screen,
         desk,
-        management: support::granted_management().await,
+        management,
         lock,
     }
+}
+
+/// Who a call comes from: the conversation its identity names, and the
+/// caller its grants are held for.
+#[derive(Clone)]
+struct Who {
+    identity: cerebellum_core::journal::JournalIdentity,
+}
+
+impl Who {
+    /// The fixture conversation every other test here acts in.
+    fn fixture() -> Self {
+        Self {
+            identity: support::identity(),
+        }
+    }
+
+    /// A consent context that can ask nobody, for this conversation.
+    fn consent(&self) -> crate::computer_grants::ConsentContext {
+        crate::computer_grants::ConsentContext::without_carrier(Self::caller(
+            &self.identity.conversation_key,
+        ))
+    }
+
+    /// Another conversation of the same agent.
+    fn conversation(key: &str) -> Self {
+        let mut identity = support::identity();
+        identity.conversation_key = key.to_owned();
+        Self { identity }
+    }
+
+    fn caller(key: &str) -> crate::computer_grants::GrantCaller {
+        crate::computer_grants::GrantCaller::new(key.to_owned(), support::GRANTEE.to_owned(), false)
+    }
+
+    /// Hold the app grant for `bundle` for this conversation, answering its
+    /// question "allow for 30 minutes".
+    async fn grant(&self, management: &crate::management::ManagementPlane, bundle: &str) {
+        let carrier = support::ScriptedCarrier::answering(&["allow_30m"]);
+        let (_drain, drain) = tokio::sync::watch::channel(false);
+        std::mem::forget(_drain);
+        let consent = crate::computer_grants::ConsentContext::new(
+            Self::caller(&self.identity.conversation_key),
+            Some(Arc::new(carrier.clone()) as Arc<dyn crate::computer_grants::QuestionCarrier>),
+            Arc::new(crate::computer_grants::AlwaysOpenRoute),
+            drain,
+            None,
+        );
+        management
+            .admit_app(bundle, &consent, &crate::CancelHandle::pending())
+            .await
+            .expect("the fixture grant is answered allow_30m");
+    }
+}
+
+/// A resolver for several running fixture applications, which also names
+/// the application a pid belongs to.
+struct Apps(Vec<ProcessGrant>);
+
+impl crate::management::TargetResolver for Apps {
+    fn resolve(&self, bundle_identity: &str) -> cerebellum_computer::platform::TargetResolution {
+        self.0
+            .iter()
+            .find(|grant| grant.bundle_identity == bundle_identity)
+            .map_or(
+                cerebellum_computer::platform::TargetResolution::NotRunning,
+                |grant| cerebellum_computer::platform::TargetResolution::Resolved(grant.clone()),
+            )
+    }
+    fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
+        self.0.iter().find(|grant| grant.pid == pid).cloned()
+    }
+    fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn crate::computer_grants::AppCode> {
+        Arc::new(support::InjectedCode::default())
+    }
+}
+
+/// A second running application, of another bundle.
+fn other_app() -> ProcessGrant {
+    ProcessGrant {
+        pid: 5151,
+        bundle_identity: "com.example.Other".into(),
+        process_generation_evidence: "1700000000000001".into(),
+    }
+}
+
+fn apps_management() -> Arc<crate::management::ManagementPlane> {
+    Arc::new(crate::management::ManagementPlane::new(Arc::new(Apps(
+        vec![support::grant(), other_app()],
+    ))))
 }
 
 impl Rig {
@@ -853,6 +1031,17 @@ impl Rig {
     }
 
     async fn serve(&self, name: &str, arguments: Value, cancel: crate::CancelHandle) -> Value {
+        self.serve_as(&Who::fixture(), name, arguments, cancel)
+            .await
+    }
+
+    async fn serve_as(
+        &self,
+        who: &Who,
+        name: &str,
+        arguments: Value,
+        cancel: crate::CancelHandle,
+    ) -> Value {
         let clock = cerebellum_core::clock::FakeClock::new();
         self.plane
             .serve(
@@ -861,9 +1050,9 @@ impl Rig {
                 ServeContext {
                     cancel,
                     grantee: support::GRANTEE,
-                    identity: support::identity(),
+                    identity: who.identity.clone(),
                     management: &self.management,
-                    consent: support::no_relay(),
+                    consent: who.consent(),
                     clock: &clock,
                     now_ms: 10,
                 },
@@ -1369,20 +1558,40 @@ fn route_cancel() -> subc_protocol::Frame {
     .unwrap()
 }
 
-/// Serve a Command chord on a route whose post stays in flight with its
-/// keys down, cancel the route once the post has begun, and return the
-/// wire reply's body.
-async fn chord_cancelled_mid_post(rig: &Rig) -> Value {
+/// One call served on a real route, through `run_arbitrated_route`.
+struct Routed {
+    /// The body of the one reply the route sent.
+    reply: Value,
+    /// Told once the worker's own call has returned, however late.
+    worker_done: Arc<tokio::sync::Notify>,
+    /// The route's outgoing frames after that reply.
+    rx: tokio::sync::mpsc::Receiver<subc_protocol::Frame>,
+}
+
+/// Serve `name` on a route as the call's worker. `prepare` runs first, in
+/// the worker, with the call's terminal arbiter. When `cancel_at` is given,
+/// the route is cancelled once it is told.
+async fn routed(
+    rig: &Rig,
+    name: &'static str,
+    arguments: Value,
+    prepare: impl FnOnce(&Rig, Arc<crate::TerminalArbiter>) + Send + 'static,
+    cancel_at: Option<Arc<tokio::sync::Notify>>,
+) -> Routed {
     let mut planes = crate::tests::management_bound_planes(1, 1);
-    let (posting, posted) = tokio::sync::oneshot::channel();
-    rig.screen.state().posting = Some(posting);
-    let input = StdMutex::new(Some(rig.clone()));
+    let worker_done = Arc::new(tokio::sync::Notify::new());
+    let input = StdMutex::new(Some((
+        rig.clone(),
+        prepare,
+        Arc::clone(&worker_done),
+        arguments,
+    )));
     planes.route_test_handler = Some(Arc::new(move || {
-        let rig = input.lock().unwrap().take().unwrap();
+        let (rig, prepare, done, arguments) = input.lock().unwrap().take().unwrap();
         Box::pin(async move {
-            let terminal = crate::TerminalArbiter::current().unwrap();
-            rig.screen.state().hold_until_stopped = Some(terminal);
-            let _ = rig.call("computer.keys", command_chord()).await;
+            prepare(&rig, crate::TerminalArbiter::current().unwrap());
+            let _ = rig.call(name, arguments).await;
+            done.notify_one();
             std::future::pending::<()>().await;
         })
     }));
@@ -1390,15 +1599,55 @@ async fn chord_cancelled_mid_post(rig: &Rig) -> Value {
     crate::handle_frame(route_request(), &tx, &planes)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), posted)
+    if let Some(stage) = cancel_at {
+        tokio::time::timeout(crate::test_support::HANG_GUARD, stage.notified())
+            .await
+            .expect("the worker never reached the moment to cancel at");
+        crate::handle_frame(route_cancel(), &tx, &planes)
+            .await
+            .unwrap();
+    }
+    let reply = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
         .await
-        .expect("the chord's post never began")
+        .expect("the route never replied")
         .unwrap();
-    crate::handle_frame(route_cancel(), &tx, &planes)
-        .await
-        .unwrap();
-    let reply = rx.recv().await.unwrap();
-    serde_json::from_slice(&reply.body).unwrap()
+    Routed {
+        reply: serde_json::from_slice(&reply.body).unwrap(),
+        worker_done,
+        rx,
+    }
+}
+
+impl Routed {
+    /// Wait for the worker's own call to return, then check the route sent
+    /// nothing after its one reply.
+    async fn worker_finished_silently(&mut self) {
+        tokio::time::timeout(crate::test_support::HANG_GUARD, self.worker_done.notified())
+            .await
+            .expect("the worker never returned");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            self.rx.try_recv().is_err(),
+            "the worker's late reply was sent"
+        );
+    }
+}
+
+/// Serve a Command chord on a route whose post stays in flight with its
+/// keys down, cancel the route once the post has begun, and return the
+/// wire reply's body.
+async fn chord_cancelled_mid_post(rig: &Rig) -> Value {
+    let posting = Arc::new(tokio::sync::Notify::new());
+    rig.screen.state().posting = Some(Arc::clone(&posting));
+    routed(
+        rig,
+        "computer.keys",
+        command_chord(),
+        |rig, terminal| rig.screen.state().hold_until_stopped = Some(terminal),
+        Some(posting),
+    )
+    .await
+    .reply
 }
 
 /// A cancel while a chord holds Command in front of a background
@@ -1503,4 +1752,402 @@ async fn a_foreground_press_whose_front_stopped_refuses_not_fronted() {
     assert_eq!(reply["fronting"]["not_fronted_reason"], "person_active");
     assert!(rig.desk.state().presses.is_empty());
     assert!(rig.screen.log().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// open_app
+// ---------------------------------------------------------------------------
+
+/// A desk on which Safari is installed and opening it reports `opened`.
+fn installed_desk(already_running: bool) -> support::Desk {
+    let desk = mail_desk();
+    {
+        let mut state = desk.state();
+        state.installed.apps = vec![cerebellum_computer::app_state::source::InstalledApp {
+            name: "Safari".into(),
+            bundle_identity: support::TARGET_BUNDLE_ID.into(),
+            path: PathBuf::from("/Applications/Safari.app"),
+        }];
+        state.opened.already_running = already_running;
+        state.opened.has_window = true;
+    }
+    desk
+}
+
+/// Foreground mode: `open_app` brings a running application to the front
+/// one way, and a launched one once it reports its window, through the same
+/// front every action uses. The launch itself never activates. Background
+/// mode fronts neither.
+#[tokio::test]
+async fn open_app_fronts_a_running_or_launched_app_only_in_foreground_mode() {
+    for (mode, already_running) in [
+        (AppUse::Foreground, true),
+        (AppUse::Foreground, false),
+        (AppUse::Background, true),
+        (AppUse::Background, false),
+    ] {
+        let management = apps_management();
+        Who::fixture()
+            .grant(&management, support::TARGET_BUNDLE_ID)
+            .await;
+        let rig = rig_with(mode, installed_desk(already_running), management);
+        let reply = rig
+            .call("computer.open_app", json!({"target": "Safari"}))
+            .await;
+        let case = format!("{mode:?} already_running={already_running}: {reply}");
+        let outcome = if already_running {
+            "already_running"
+        } else {
+            "launched"
+        };
+        assert_eq!(reply["outcome"], outcome, "{case}");
+        assert!(
+            !rig.desk.state().opens[0].activates,
+            "the launch never activates: {case}"
+        );
+        match mode {
+            AppUse::Foreground => {
+                assert_eq!(
+                    reply["fronting"],
+                    json!({"mode":"foreground","fronted":true,"purpose":"foreground_mode",
+                        "restore":"left_in_front"}),
+                    "{case}"
+                );
+                assert_eq!(rig.screen.log(), ["front:4242"], "{case}");
+            }
+            AppUse::Background => {
+                assert!(reply.get("fronting").is_none(), "{case}");
+                assert!(rig.screen.log().is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bring_to_front under takeover, through the call's restore obligation
+// ---------------------------------------------------------------------------
+
+/// Background mode: a `bring_to_front` image read under held takeover fronts
+/// the application, reads it while in front, and puts the previous
+/// application back through the call's one restore decision.
+#[tokio::test]
+async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
+    rig.management
+        .computer_grants()
+        .require(
+            &crate::computer_grants::GrantNeed::Takeover,
+            &support::relayed(&carrier),
+            &crate::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.read_state",
+            json!({"target": support::TARGET_BUNDLE_ID, "include_image": true,
+                "bring_to_front": true}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "read", "restore:100"],
+        "{reply}"
+    );
+    assert_eq!(
+        reply["fronting"],
+        json!({"mode":"background","fronted":true,"purpose":"bring_to_front",
+            "restore":"restored"}),
+        "{reply}"
+    );
+    assert!(!rig.lock.held());
+}
+
+// ---------------------------------------------------------------------------
+// Guard (0) across conversations and applications
+// ---------------------------------------------------------------------------
+
+/// A press another conversation posted to another application, whose
+/// release never returned, still keeps this conversation's foreground front
+/// of its own application from happening: a key held anywhere would land on
+/// whatever application comes to the front.
+#[tokio::test]
+async fn a_press_left_held_by_another_conversation_on_another_app_blocks_every_front() {
+    let management = apps_management();
+    let (a, b) = (Who::fixture(), Who::conversation("conversation-b"));
+    a.grant(&management, support::TARGET_BUNDLE_ID).await;
+    b.grant(&management, &other_app().bundle_identity).await;
+    let rig = rig_with(AppUse::Background, support::focused_text_desk(), management);
+
+    // Conversation A's chord on its application X: the post fails with the
+    // keys possibly down, and the paired release never returns.
+    {
+        let mut state = rig.screen.state();
+        state.post_unknown = true;
+        state.release_ok = false;
+    }
+    let held = rig
+        .call_under(&under_terminal(), "computer.keys", command_chord())
+        .await;
+    assert_eq!(held["outcome"], "restore_failed", "{held}");
+    assert!(!held_input_confirmed(&rig.plane.held_input));
+    rig.screen.state().log.clear();
+    rig.desk.state().frontmost = Some(PREVIOUS);
+
+    // Conversation B, in foreground mode, reads its application Y.
+    let rig = rig.with_mode(AppUse::Foreground);
+    let reply = rig
+        .serve_as(
+            &b,
+            "computer.read_state",
+            json!({"target": other_app().bundle_identity}),
+            crate::CancelHandle::pending(),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "held_input_unconfirmed",
+        "{reply}"
+    );
+    assert!(
+        rig.screen.log().is_empty(),
+        "no front was requested: {:?}",
+        rig.screen.log()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lost authorization while a front waits for the lock
+// ---------------------------------------------------------------------------
+
+/// A foreground read waiting for the fronting lock when its authorization
+/// ends reads nothing, captures nothing and records no seen marks. Revoking
+/// the app grant cancels the call where it waits; a dispatch gate closed with
+/// no cancel at all (the call's deadline, or authorization lost in a way only
+/// the gate sees) is caught the moment the lock is taken.
+#[tokio::test(start_paused = true)]
+async fn lost_authorization_while_waiting_for_the_lock_reads_nothing() {
+    let read = json!({"target": support::TARGET_BUNDLE_ID, "include_image": true});
+
+    // The app grant is revoked.
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    let held = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let terminal = under_terminal();
+    let call = {
+        let (rig, terminal, read) = (rig.clone(), Arc::clone(&terminal), read.clone());
+        tokio::spawn(async move { rig.call_under(&terminal, "computer.read_state", read).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let store = rig.management.computer_grants().agent_grants();
+    let revoked = store.revoke_matching(store.now_ms(), |_| true).unwrap();
+    assert!(!revoked.is_empty(), "the app grant was revoked");
+    let reply = call.await.unwrap();
+    drop(held);
+    assert_ne!(reply["outcome"], "completed", "{reply}");
+    assert!(reply.get("image").is_none() && reply.get("image_unavailable").is_none());
+    assert_eq!(rig.desk.state().focus_reads, 0, "no accessibility read");
+    assert!(!rig.seen_marks_recorded());
+    assert!(rig.screen.log().is_empty());
+
+    // The dispatch gate closes, with no cancel, while the lock is held.
+    let rig = self::rig(AppUse::Foreground, mail_desk()).await;
+    let held = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let terminal = under_terminal();
+    let call = {
+        let (rig, terminal, read) = (rig.clone(), Arc::clone(&terminal), read.clone());
+        tokio::spawn(async move { rig.call_under(&terminal, "computer.read_state", read).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    terminal.stop(crate::TerminalCause::Deadline);
+    drop(held);
+    let reply = call.await.unwrap();
+    assert_ne!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "cancelled",
+        "{reply}"
+    );
+    assert!(reply.get("image").is_none() && reply.get("image_unavailable").is_none());
+    assert_eq!(rig.desk.state().focus_reads, 0, "no accessibility read");
+    assert!(!rig.seen_marks_recorded());
+    assert!(rig.screen.log().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Terminal cleanup and the worker, through the route
+// ---------------------------------------------------------------------------
+
+/// The work deadline passes while the worker is releasing a chord's held
+/// key. The release comes first; a confirmed release is then followed by
+/// exactly one restore, and one that does not confirm within the shared
+/// release budget gives `restore_failed` with no restore request at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deadline_passing_during_the_release_restores_only_after_it() {
+    for confirmed in [true, false] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        let finish_release = Arc::new(std::sync::atomic::AtomicBool::new(confirmed));
+        {
+            let mut state = rig.screen.state();
+            state.post_unknown = true;
+            state.release_ok = confirmed;
+            state.release_until = Some(Arc::clone(&finish_release));
+        }
+        let mut routed = routed(
+            &rig,
+            "computer.keys",
+            command_chord(),
+            |rig, terminal| {
+                rig.screen.state().release_ends_call =
+                    Some((terminal, crate::TerminalCause::Deadline));
+            },
+            None,
+        )
+        .await;
+        finish_release.store(true, std::sync::atomic::Ordering::SeqCst);
+        routed.worker_finished_silently().await;
+        let reply = &routed.reply;
+        if confirmed {
+            assert_eq!(
+                rig.screen.log(),
+                ["front:4242", "post", "release", "restore:100"],
+                "{reply}"
+            );
+            assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+            assert_eq!(reply["detail"]["held_state"], "released", "{reply}");
+        } else {
+            assert_eq!(
+                rig.screen.log(),
+                ["front:4242", "post", "release"],
+                "{reply}"
+            );
+            assert_eq!(reply["outcome"], "restore_failed", "{reply}");
+            assert_eq!(reply["fronting"]["restore"], "failed", "{reply}");
+        }
+        assert!(!rig.lock.held());
+    }
+}
+
+/// A cancel arriving while the worker settles the held key races its normal
+/// end: the restore waits for the settled release, exactly one restore
+/// request is made, and the worker finishing afterwards adds none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_racing_the_settle_makes_one_restore_after_the_release() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let releasing = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = rig.screen.state();
+        state.post_unknown = true;
+        state.releasing = Some(Arc::clone(&releasing));
+    }
+    let mut routed = routed(
+        &rig,
+        "computer.keys",
+        command_chord(),
+        |rig, terminal| rig.screen.state().release_until_stopped = Some(terminal),
+        Some(releasing),
+    )
+    .await;
+    routed.worker_finished_silently().await;
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "post", "release", "restore:100"],
+        "{}",
+        routed.reply
+    );
+    assert_eq!(routed.reply["outcome"], "dispatch_outcome_unknown");
+    assert_eq!(routed.reply["detail"]["held_state"], "released");
+    assert_eq!(routed.reply["fronting"]["restore"], "restored");
+    assert!(!rig.lock.held());
+}
+
+/// A needs-front press whose worker is blocked inside the press when the
+/// call is cancelled. `switch` makes the person switch to a third
+/// application first, with hardware input when `input` is set.
+async fn press_cancelled_while_blocked(switch: bool, input: bool) -> (Rig, Routed) {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let send = rig.send_id().await;
+    rig.desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    rig.screen.state().enable_on_front = Some(10);
+    let pressing = Arc::new(tokio::sync::Notify::new());
+    let terminal_slot: Arc<StdMutex<Option<Arc<crate::TerminalArbiter>>>> = Arc::default();
+    {
+        let (desk, screen, pressing, slot) = (
+            rig.desk.clone(),
+            rig.screen.clone(),
+            Arc::clone(&pressing),
+            Arc::clone(&terminal_slot),
+        );
+        rig.desk.state().on_press = Some(support::DeskHook(Arc::new(move || {
+            if switch {
+                desk.state().frontmost = Some(THIRD);
+            }
+            if input {
+                let mut state = screen.state();
+                state.last_input_ms = Some(state.now + 1);
+                state.now += 2;
+            }
+            pressing.notify_one();
+            let terminal = slot.lock().unwrap().clone().unwrap();
+            let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+            while !terminal.gate.stopped() && std::time::Instant::now() < give_up {
+                std::thread::yield_now();
+            }
+        })));
+    }
+    let routed = routed(
+        &rig,
+        "computer.press_element",
+        json!({"element_id": send}),
+        move |_, terminal| *terminal_slot.lock().unwrap() = Some(terminal),
+        Some(pressing),
+    )
+    .await;
+    (rig, routed)
+}
+
+/// A cancel while the worker is blocked in the press of a needs-front press:
+/// terminal cleanup makes the one restore request. When the press returns
+/// later, the worker neither fronts again nor restores again, and nothing it
+/// replies is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_blocked_in_the_press_restores_once() {
+    let (rig, mut routed) = press_cancelled_while_blocked(false, false).await;
+    assert_eq!(
+        routed.reply["fronting"]["restore"], "restored",
+        "{}",
+        routed.reply
+    );
+    routed.worker_finished_silently().await;
+    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    assert_eq!(rig.desk.state().presses, [10]);
+    assert!(!rig.lock.held());
+}
+
+/// The person switched to a third application with hardware input while the
+/// target was in front, and the call is then cancelled: terminal cleanup's
+/// decision reads the restore host's input snapshot and leaves them there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_switch_with_input_under_cancel_is_skipped_by_cleanup() {
+    let (rig, mut routed) = press_cancelled_while_blocked(true, true).await;
+    assert_eq!(
+        routed.reply["fronting"]["restore"], "skipped_person",
+        "{}",
+        routed.reply
+    );
+    assert_eq!(
+        routed.reply["fronting"]["person_input_during_fronting"],
+        true
+    );
+    routed.worker_finished_silently().await;
+    assert_eq!(rig.screen.log(), ["front:4242"], "no restore request");
 }
