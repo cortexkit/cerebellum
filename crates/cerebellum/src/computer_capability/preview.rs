@@ -45,6 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::source::{AppStateSource, ElementHandle};
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 use cerebellum_computer::capture::{CaptureBackend, ScopedCaptureController};
 use cerebellum_computer::cursor::{
     CursorFrame, CursorPreview, PreviewFallback, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, PREVIEW_SLOTS,
@@ -766,12 +767,15 @@ pub(crate) trait PreviewCapturer: Send + Sync {
 
 /// Captures through a fresh capture backend and controller for each
 /// request, bound to that request's grant, so every capture checks live
-/// permission and the window's verified owner itself.
+/// permission and the window's verified owner itself. Only the platforms with
+/// a native capture backend build one outside tests.
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 pub(crate) struct BackendPreviewCapture<F> {
     backend: F,
     epoch: Instant,
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 impl<F> BackendPreviewCapture<F> {
     pub(crate) fn new(backend: F) -> Self {
         Self {
@@ -781,6 +785,7 @@ impl<F> BackendPreviewCapture<F> {
     }
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 impl<F, B> PreviewCapturer for BackendPreviewCapture<F>
 where
     F: Fn() -> B + Send + Sync,
