@@ -1983,3 +1983,279 @@ expect_red = [
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-capture-takes-the-named-window"
+guards = "the background-mode preview captures exactly the window it names from the target's verified enumerated windows, not the target's frontmost window"
+file = "crates/cerebellum-computer/src/capture/mod.rs"
+old = "            .find(|window| window.window_id == window_id)"
+new = "            .find(|window| window.window_id != window_id) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum-computer/src/capture/mod.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "capture::tests::a_preview_capture_refuses_without_live_permission_or_a_verified_owner",
+    "capture::tests::a_preview_captures_the_named_window_not_the_frontmost_one",
+    "capture::tests::a_preview_frame_too_large_for_a_frame_line_is_refused",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-capture-checks-the-owner-at-capture"
+guards = "a preview capture whose window id another process owns by the time it is captured returns no pixels"
+file = "crates/cerebellum-computer/src/capture/mod.rs"
+old = "        self.verify_vision_owner(&pending.frame)?;\n        let (mut width_px, mut height_px) = preview_scaled_size("
+new = "        // NON-VACUITY BREAK\n        let (mut width_px, mut height_px) = preview_scaled_size("
+edits = []
+test_file = "crates/cerebellum-computer/src/capture/mod.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "capture::tests::a_preview_capture_refuses_without_live_permission_or_a_verified_owner",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-capture-needs-live-permission"
+guards = "a preview capture checks Screen Recording is live before any window is captured"
+file = "crates/cerebellum-computer/src/capture/mod.rs"
+old = "        self.ready_for_single_window(now_ms)?;\n        let window = self"
+new = "        self.refresh_if_needed(now_ms).map_err(SingleWindowCaptureError::Capture)?; // NON-VACUITY BREAK\n        let window = self"
+edits = []
+test_file = "crates/cerebellum-computer/src/capture/mod.rs"
+runner = "cargo"
+package = "cerebellum-computer"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "capture::tests::a_preview_capture_refuses_without_live_permission_or_a_verified_owner",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-no-capture-unless-admitted"
+guards = "without preview_capture_admitted the preview schedule never requests a capture, even while an action is in flight"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        if !self.capture_admitted {\n            return step;\n        }"
+new = "        // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::without_capture_admitted_every_preview_shows_its_icon_and_nothing_is_captured",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-icon-unless-admitted"
+guards = "without preview_capture_admitted every preview line shows the application's icon with capture_refused"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        let icon = if !self.capture_admitted {"
+new = "        let icon = if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::without_capture_admitted_every_preview_shows_its_icon_and_nothing_is_captured",
+    "computer_capability::preview::tests::without_capture_admitted_the_worker_shows_the_icon_and_requests_nothing",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-one-outstanding-request"
+guards = "a capture request whose wait ended without an answer still blocks every other request, for every agent, until it answers"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "            // Nothing more until the request answers, however late.\n            return step;"
+new = "            // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::an_unanswered_capture_then_hide_then_late_answer_sends_no_frame",
+    "computer_capability::preview::tests::an_unanswered_request_blocks_every_other_and_refreshes_coalesce",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-stalled-request-shows-icons"
+guards = "once a capture request's wait ends without an answer, every shown preview switches to its icon"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "                        shown.icon = Some(IconCause::Stalled);\n                        step.lines.push(shown.shown_line());"
+new = "                        shown.icon = Some(IconCause::Stalled); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::an_unanswered_capture_then_hide_then_late_answer_sends_no_frame",
+    "computer_capability::preview::tests::an_unanswered_request_blocks_every_other_and_refreshes_coalesce",
+    "computer_capability::preview::tests::another_agents_action_during_an_outstanding_capture_shows_its_icon_and_is_not_held",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-late-frame-current-generation"
+guards = "a capture that answers late sends its frame only while the agent's preview is still in the generation the capture was asked for"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "            .filter(|shown| shown.generation() == job.generation && shown.window() == job.window)"
+new = "            .filter(|shown| shown.window() == job.window) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::a_late_frame_is_sent_only_for_the_current_generation",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-hidden-has-no-capture-or-timer"
+guards = "a hidden preview is forgotten by the schedule, so it gets no capture, no timer and no late frame"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        self.shown.remove(agent).is_some()"
+new = "        self.shown.contains_key(agent) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::a_hidden_preview_has_no_capture_and_no_timer",
+    "computer_capability::preview::tests::a_late_frame_is_sent_only_for_the_current_generation",
+    "computer_capability::preview::tests::an_unanswered_capture_then_hide_then_late_answer_sends_no_frame",
+    "computer_capability::preview::tests::an_unanswered_request_blocks_every_other_and_refreshes_coalesce",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-slots-never-compact"
+guards = "a freed preview slot stays empty until the next new agent takes it; the previews below never move up"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        self.slots[usize::from(slot)] = None;"
+new = "        self.slots[usize::from(slot)..].rotate_left(1); self.slots[PREVIEW_SLOTS as usize - 1] = None; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::slots_fill_top_down_reuse_a_freed_slot_and_never_compact",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-fourth-agent-not-shown"
+guards = "with three previews showing, a fourth agent gets not_shown_capacity and nothing is captured for it"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        let Some(slot) = self.slots.assign(&request.agent) else {"
+new = "        let Some(slot) = self.slots.assign(&request.agent).or(Some(0)) else { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::a_fourth_agent_gets_not_shown_capacity_and_no_capture",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-target-is-the-elements-window"
+guards = "an action on an element shows that element's own window in the preview, even when another of the application's windows is in front"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "            (source.cursor_window(target, Some(element))?, None)"
+new = "            let _ = element; (source.cursor_window(target, None)?, None) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::the_target_window_is_one_definition_for_capture_and_mapping",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-frontmost-must-agree"
+guards = "a read with no element shows the frontmost window only when the window list and the application agree on which it is"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "    if expected.is_some_and(|expected| expected != id) {"
+new = "    if false && expected.is_some_and(|expected| expected != id) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::the_target_window_is_one_definition_for_capture_and_mapping",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "agent-preview-in-flight-twice-a-second"
+guards = "while an action is in flight its preview is refreshed at most twice a second"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "                    || (shown.in_flight && shown.last_submit.is_none_or(|at| now >= at + refresh))"
+new = "                    || (shown.in_flight && shown.last_submit.is_none_or(|at| now >= at)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::a_hidden_preview_has_no_capture_and_no_timer",
+    "computer_capability::preview::tests::an_action_in_flight_refreshes_at_most_twice_a_second",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
