@@ -138,3 +138,7 @@ test = true
 [[example]]
 name = "stuck_app_desk_probe"
 test = true
+
+[[example]]
+name = "app_use_desk_probe"
+test = true
