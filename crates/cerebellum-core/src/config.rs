@@ -20,9 +20,10 @@
 //! `computer_use.agent_cursor` is an optional Boolean, default true. It only
 //! controls ephemeral cursor pictures and takes effect at module startup.
 //! `computer_use.app_use` is `"background"` (the default) or `"foreground"`;
-//! see [`AppUse`]. It is the one key a running module re-reads: the computer
-//! plane checks the file before each `computer_use` call. Every other key,
-//! `agent_cursor` included, is read once at startup.
+//! see [`AppUse`]. It is the one key whose edits a running module acts on:
+//! the computer plane checks the file before each `computer_use` call, and on
+//! a change parses the whole file again but uses only `app_use` from it. Every
+//! other key, `agent_cursor` included, takes effect only at startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -160,8 +161,9 @@ pub struct ComputerUseConfig {
     /// still present leaves the whole config unreadable, and the module fails
     /// to register until the key is removed.
     ///
-    /// Unlike every other key, this one is re-read while the module runs, so
-    /// an edit applies to the next `computer_use` call without a restart.
+    /// Unlike every other key, an edit to this one is acted on while the
+    /// module runs: it applies to the next `computer_use` call without a
+    /// restart. Other keys take effect only at startup.
     pub app_use: AppUse,
 }
 

@@ -525,7 +525,8 @@ where
     own_input: Arc<OwnInputLedger>,
     cursor: cursor::Coordinator,
     /// The config file's `computer_use.app_use`, checked as each call
-    /// arrives. The only setting read again while the module runs.
+    /// arrives. The only setting whose edits are acted on while the module
+    /// runs.
     app_use: app_use::LiveAppUse,
     /// The mode each call's work saw, in order, for tests that check an edit
     /// to the config file reaches the very next call.
@@ -797,9 +798,11 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
-        // First of all: until the config file parses, the person's chosen way
-        // of using apps is unknown, so no action of any kind may run under a
-        // guess. Nothing has been looked up or dispatched yet.
+        // First of all: while an existing config file cannot be read or does
+        // not parse, the person's chosen way of using apps is unknown, so no
+        // action of any kind may run under a guess. A missing file is not
+        // this case; it means background. Nothing has been looked up or
+        // dispatched yet.
         let app_use = match self.app_use.current() {
             Ok(mode) => mode,
             Err(invalid) => {

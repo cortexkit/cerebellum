@@ -1,7 +1,7 @@
 //! The live `computer_use.app_use` setting.
 //!
-//! Every other key in `~/.config/cortexkit/cerebellum.jsonc` is read once at
-//! startup. `app_use` is read again while the module runs, so a person who
+//! Every other key in `~/.config/cortexkit/cerebellum.jsonc` takes effect only
+//! at startup. `app_use` is read again while the module runs, so a person who
 //! switches between background and foreground use sees the change on the next
 //! `computer_use` call without restarting anything.
 //!
@@ -196,8 +196,8 @@ pub(crate) async fn scope<F: std::future::Future>(mode: AppUse, work: F) -> F::O
 
 /// The mode of the `computer_use` call this task is serving, or `None`
 /// outside one.
-// Read so far only by this crate's tests; the fronting paths that act on the
-// mode read it here.
+// Only this crate's tests read it so far. Code that acts differently in the
+// two modes reads the call's mode through this function.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn call_mode() -> Option<AppUse> {
     CALL_APP_USE.try_with(|mode| *mode).ok()
