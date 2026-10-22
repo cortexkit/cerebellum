@@ -46,8 +46,13 @@ fn test_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
                         .canonicalize()
                         .expect("explicit test module exists");
                     for candidate in files {
-                        if (candidate == &module
-                            || candidate.starts_with(module.with_extension("")))
+                        // Compare resolved paths: a file reached through a
+                        // symlink (macOS /var and /tmp, a target directory on
+                        // another volume) must still match its #[path] module.
+                        let Ok(resolved) = candidate.canonicalize() else {
+                            continue;
+                        };
+                        if (resolved == module || resolved.starts_with(module.with_extension("")))
                             && !selected.contains(candidate)
                         {
                             selected.push(candidate.clone());
