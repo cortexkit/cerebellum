@@ -10,6 +10,8 @@
 !.cortexkit/prefrontal/
 .cortexkit/prefrontal/*
 !.cortexkit/prefrontal/rules/
+# The worker guide is repository content: every mason reads it.
+!.cortexkit/WORKER.md
 
 # AFT-generated codebase analysis docs (regenerated from source, not authored) —
 # kept out of the repo so generated content never churns the tree.
