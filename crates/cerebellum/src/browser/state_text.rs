@@ -69,12 +69,13 @@ pub const NESTED_LOOSE_BYTES: usize = INLINE_BYTES;
 /// count once there are more than this many of them, outside a zoom.
 pub const REPEAT_THRESHOLD: usize = 3;
 
-/// The most text leaves a subtree may contain to print as one filtered row
-/// (see `Tree::leaf_row`). Leaves count across nested wrappers: a property
-/// line may wrap its key and value separately, and table cells may wrap their
-/// text. The smallest bounded ancestor with another word-bearing leaf gives
-/// the match context. Eight leaves cover both, while a wider subtree is more
-/// likely a layout container whose other texts are unrelated to the match.
+/// The most leaf nodes, empty or not, a subtree may contain to print as one
+/// filtered row (see `Tree::leaf_row`). Leaves count across nested wrappers: a
+/// property line may wrap its key and value separately, and table cells may
+/// wrap their text. The match prints with the smallest such subtree that holds
+/// another leaf with a letter or digit. Eight leaves cover both shapes, while
+/// a wider subtree is more likely a layout container whose other texts are
+/// unrelated to the match.
 pub const ROW_LEAVES: usize = 8;
 
 /// The most bytes a subtree's leaf texts, allowing a space per leaf, may
@@ -793,8 +794,8 @@ impl<'a> Tree<'a> {
     /// `None` when the subtree contains a control or a text field (whose ref
     /// or withheld value a joined line would lose), the page or a landmark
     /// (a list or a table is a region, not a row), or more than [`ROW_LEAVES`]
-    /// leaves or [`ROW_BYTES`] bytes. A single leaf is allowed while searching
-    /// ancestors, but cannot supply another word-bearing leaf on its own.
+    /// leaves or [`ROW_BYTES`] bytes. A subtree of a single leaf is accepted,
+    /// though it never holds a second leaf for a match to print with.
     fn leaf_row(&self, node: usize) -> Option<Vec<(usize, String)>> {
         if node == 0 || self.is_landmark(node) {
             return None;
@@ -839,9 +840,12 @@ impl<'a> Tree<'a> {
         Some(texts)
     }
 
-    /// Give each matching leaf its nearest bounded text-only ancestor with
-    /// another word-bearing leaf. Quotes and separators alone do not give a
-    /// key its value, and climbing farther would include unrelated properties.
+    /// Give each matching leaf its nearest ancestor that `leaf_row` accepts and
+    /// that holds another leaf with a letter or digit, so a key prints with its
+    /// value. Quotes and separators alone do not count. The climb stops at the
+    /// first ancestor `leaf_row` rejects, and never goes past the nearest
+    /// accepted one, because a larger ancestor can pull in neighbouring
+    /// properties.
     fn collect_filter_rows(
         &self,
         node: usize,
