@@ -785,6 +785,7 @@ where
             self.cursor.clone(),
             self.app_state_source.clone(),
             self.preview.clone(),
+            self.app_use_fronting_admitted,
             app,
         )
     }

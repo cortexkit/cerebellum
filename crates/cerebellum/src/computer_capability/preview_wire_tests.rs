@@ -245,7 +245,16 @@ fn agent() -> String {
     support::identity().agent_project_id
 }
 
-async fn rig(mode: AppUse, admitted: bool, cursor_on: bool) -> Rig {
+async fn rig(mode: AppUse, capture_admitted: bool, cursor_on: bool) -> Rig {
+    rig_with_app_use_admission(mode, capture_admitted, cursor_on, true).await
+}
+
+async fn rig_with_app_use_admission(
+    mode: AppUse,
+    capture_admitted: bool,
+    cursor_on: bool,
+    app_use_fronting_admitted: bool,
+) -> Rig {
     let desk = two_window_desk();
     let captures = Arc::new(CountingCapture::default());
     let frontmost: super::cursor::FrontmostWindow = Arc::new(|_: &ProcessGrant| Some(FRONT.1));
@@ -259,9 +268,10 @@ async fn rig(mode: AppUse, admitted: bool, cursor_on: bool) -> Rig {
     .with_permission_liveness(support::live_permissions())
     .with_app_state_source(desk.source())
     .with_app_use(app_use_file(mode))
+    .with_app_use_fronting_admitted(app_use_fronting_admitted)
     .with_preview(PreviewPlane::new(
         captures.clone(),
-        admitted,
+        capture_admitted,
         frontmost,
         bundle,
     ));
@@ -582,11 +592,10 @@ async fn a_stalled_badge_write_replies_not_synchronized_at_the_cap() {
     assert_eq!(rig.dispatched(), [start + super::cursor::ARRIVAL_CAP]);
 }
 
-/// A build without `preview_capture_admitted` captures nothing: the
-/// preview shows the application's icon with `capture_refused`, the badge
-/// makes no motion there, and the action waits for nothing.
+/// When frame capture is not admitted, the preview still appears with the
+/// application's icon instead of a captured frame.
 #[tokio::test(start_paused = true)]
-async fn an_unadmitted_build_captures_nothing_and_shows_the_icon() {
+async fn a_build_without_capture_review_shows_the_preview_icon() {
     let mut rig = rig(AppUse::Background, false, true).await;
     let tree = rig.read().await;
     let start = tokio::time::Instant::now();
@@ -618,6 +627,61 @@ async fn an_unadmitted_build_captures_nothing_and_shows_the_icon() {
     assert_eq!(rig.captures(), 0);
     rig.lines.take();
     assert_eq!(rig.lines.frames(&agent()), 0);
+}
+
+/// Without the app-use review, background actions keep their on-screen badge
+/// and wait for it as they did before previews were added.
+#[tokio::test(start_paused = true)]
+async fn an_unadmitted_background_build_keeps_the_screen_badge_without_a_preview() {
+    let mut rig = rig_with_app_use_admission(AppUse::Background, true, true, false).await;
+    rig.desk.state().cursor_visible = true;
+    let read = rig.call("computer.read_state", read_arguments()).await;
+    assert_eq!(read["outcome"], "completed", "{read}");
+    assert_eq!(read.get("preview"), None, "{read}");
+    let tree = read["state_text"].as_str().expect("read state text");
+
+    let start = tokio::time::Instant::now();
+    let reply = rig
+        .call(
+            "computer.press_element",
+            json!({"element_id": id_of(tree, "Save")}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply.get("preview"), None, "{reply}");
+    rig.lines.take();
+
+    let me = agent();
+    let press_picture = rig
+        .lines
+        .seen
+        .iter()
+        .find_map(|line| match line {
+            CursorLine::Picture(event)
+                if event.agent == me
+                    && event.kind == cerebellum_computer::cursor::CursorKind::Press =>
+            {
+                Some(event)
+            }
+            _ => None,
+        })
+        .expect("the press draws its badge on screen");
+    assert!(press_picture.motion.duration_ms > 0.0);
+    assert!(rig.lines.pictures(&me) > 0);
+    assert!(rig.lines.previews(&me).is_empty());
+    assert_eq!(rig.lines.frames(&me), 0);
+    assert!(rig.lines.motions(&me).is_empty());
+
+    let dispatched = rig.dispatched();
+    assert_eq!(dispatched.len(), 1);
+    let badge_arrival = Duration::from_secs_f64(press_picture.motion.duration_ms / 1_000.0);
+    assert!(
+        dispatched[0] >= start + badge_arrival,
+        "the press went ahead before the on-screen badge arrived"
+    );
+    assert!(dispatched[0] <= start + super::cursor::ARRIVAL_CAP);
+    assert!(rig.plane.preview.running().is_none());
+    assert_eq!(rig.captures(), 0);
 }
 
 /// A minimized target window shows the application's icon with

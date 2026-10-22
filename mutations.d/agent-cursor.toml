@@ -3309,3 +3309,22 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-cursor-unadmitted-build-keeps-screen-badge"
+guards = "without the app-use fronting review, a background read and press keep the on-screen badge and arrival wait, start no preview worker, and omit the preview reply field"
+file = "crates/cerebellum/src/computer_capability/preview_call.rs"
+old = '        if !self.background || !self.app_use_fronting_admitted {'
+new = '        if !self.background { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview_wire_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview_wire_tests::an_unadmitted_background_build_keeps_the_screen_badge_without_a_preview",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
