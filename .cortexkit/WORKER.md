@@ -4,15 +4,20 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 ## Gates
 
-Before you deliver, run `bash scripts/fast-gate.sh` on this Mac. It chooses what to run from your diff, and takes 2 to 6 minutes. It always runs fmt, clippy, the changed crates' tests and the protective checks. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
+The fast gate has two halves, chosen from your diff:
 
-## The computer plane runs only on macOS and Windows
+- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. Run it with your bash tool's `runon: "linux,8c"`: `bash scripts/fast-gate.sh --part linux`.
+- **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac`. It also runs the strict catalogue check when a `mutations.d/` file changed.
 
-`crates/cerebellum/src/computer_capability/` and the platform crates compile only on macOS and Windows. The Linux build server never runs their tests.
+Run both before you deliver, as two parallel tool calls, with the same `--base` if you pass one. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
 
-- For any change there, run `cargo test -p cerebellum --lib` on this Mac before you deliver, not with `runon`.
+## Some computer-plane tests run only on macOS
+
+`crates/cerebellum/src/computer_capability/` compiles on every platform, but many of its tests, and all of `cerebellum-macos`, run only on macOS. The Linux build server runs only the platform-neutral ones. A test that relies on macOS behaviour, such as macOS's own keyboard shortcuts, needs `#[cfg(target_os = "macos")]`, or it fails on Linux.
+
+- For any change there, the gate's Mac half must pass on this Mac; running it with `runon` doesn't count.
 - The test `computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack` runs a real call on a 1 MiB thread. When a future on the serve path grows too large, the whole test binary aborts with "fatal runtime error: stack overflow" and names no test. To find it, run each test alone with the binary's `--exact` flag. Box the future that grew (`Box::pin`) where it is created. Never raise a stack size.
-- Also run clippy on Linux (`runon: linux,4c`, `cargo clippy --locked --workspace --all-targets -- -D warnings`). Code used only on macOS and Windows is dead code on Linux, and `-D warnings` refuses it.
+- Clippy for Linux and Windows runs in the gate's Linux half. Code used only on macOS is dead code on Linux, and `-D warnings` refuses it.
 
 ## Mutation proofs
 
