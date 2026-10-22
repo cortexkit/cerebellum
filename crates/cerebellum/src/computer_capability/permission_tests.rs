@@ -36,6 +36,7 @@ fn context(state: PermissionLiveness) -> CapabilityAdvertisementContext {
             app_state_review_revision: pin.clone(),
             element_addressed_review_revision: pin.clone(),
             takeover_dispatch_review_revision: pin.clone(),
+            app_use_fronting_review_revision: pin.clone(),
             windows_actuation_review_revision: pin.clone(),
             release_signing_topology_revision: pin,
             vocabulary_digests: VocabularyDigestInputs {

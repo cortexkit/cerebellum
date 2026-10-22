@@ -1808,6 +1808,9 @@ mod tests {
             takeover_dispatch_review_revision: Some(
                 "fixture-takeover-dispatch-review-v1".to_string(),
             ),
+            app_use_fronting_review_revision: Some(
+                "fixture-app-use-fronting-review-v1".to_string(),
+            ),
             windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
             release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
             vocabulary_digests: VocabularyDigestInputs {
@@ -1993,6 +1996,9 @@ mod tests {
                 takeover_dispatch_review_revision: Some(
                     "fixture-takeover-dispatch-review-v1".to_string(),
                 ),
+                app_use_fronting_review_revision: Some(
+                    "fixture-app-use-fronting-review-v1".to_string(),
+                ),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),
                 vocabulary_digests: VocabularyDigestInputs {
@@ -2035,6 +2041,9 @@ mod tests {
                 ),
                 takeover_dispatch_review_revision: Some(
                     "fixture-takeover-dispatch-review-v1".to_string(),
+                ),
+                app_use_fronting_review_revision: Some(
+                    "fixture-app-use-fronting-review-v1".to_string(),
                 ),
                 windows_actuation_review_revision: Some("fixture-windows-review-v1".to_string()),
                 release_signing_topology_revision: Some("fixture-topology-v1".to_string()),

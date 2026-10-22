@@ -222,6 +222,22 @@ export CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION="takeover-dispatch-review/v1
 # needs a new revision. Without it, type and keys use the public route only.
 export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-review/v1@b3f42392"
 
+# Background app use, CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION. Its scope is
+# two mechanisms the takeover review above does not cover:
+#   - fronting outside the keystroke bracket: foreground mode's one-way front
+#     of the target before each action, and in background mode bringing an
+#     application forward under the app grant alone for a press on an element
+#     disabled in the background or a Command/Control/Option chord, then
+#     restoring the previous application (or not, when the person switched
+#     apps), with the restore held until a held key's release is confirmed;
+#   - preview capture: the background-mode preview's capture of a covered
+#     window's pixels, outside capture custody.
+# It gates no capability row. With the takeover review it admits that
+# fronting; with the capture review it admits preview capture. Without it,
+# foreground mode acts without fronting, a press on a disabled element refuses
+# element_disabled, chords keep the takeover bracket, and the preview shows the
+# application's icon. Left UNSET: its review does not exist yet.
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
@@ -240,6 +256,7 @@ readonly ATTESTATIONS=(
   CEREBELLUM_APP_STATE_REVIEW_REVISION
   CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION
   CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION
+  CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION
   CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION
   CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION
   CEREBELLUM_INPUT_REVIEW_REVISION

@@ -291,7 +291,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 22] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 23] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -342,6 +342,12 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 22] = [
     },
     ComputerReleaseGate {
         name: "takeover_dispatch_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    // Reported in release evidence but required by no capability row: it
+    // admits fronting and preview capture inside rows that other gates admit.
+    ComputerReleaseGate {
+        name: "app_use_fronting_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     ComputerReleaseGate {
@@ -480,6 +486,7 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         "app_state_review_revision" => inputs.app_state_review_revision.as_deref(),
         "element_addressed_review_revision" => inputs.element_addressed_review_revision.as_deref(),
         "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision.as_deref(),
+        "app_use_fronting_review_revision" => inputs.app_use_fronting_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
     }
@@ -1158,7 +1165,7 @@ fn computer_permission_readings(
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The eleven external identifiers use `option_env!` so a release invocation must
+/// The twelve external identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
@@ -1171,6 +1178,8 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         option_env!("CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION");
     let takeover_dispatch_review_revision =
         option_env!("CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION");
+    let app_use_fronting_review_revision =
+        option_env!("CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION");
     let release_signing_topology_revision =
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
     release_inputs_from_build_bindings(BuildReleaseBindings {
@@ -1184,6 +1193,7 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         app_state_review_revision,
         element_addressed_review_revision,
         takeover_dispatch_review_revision,
+        app_use_fronting_review_revision,
         release_signing_topology_revision,
     })
 }
@@ -1199,6 +1209,7 @@ struct BuildReleaseBindings<'a> {
     app_state_review_revision: Option<&'a str>,
     element_addressed_review_revision: Option<&'a str>,
     takeover_dispatch_review_revision: Option<&'a str>,
+    app_use_fronting_review_revision: Option<&'a str>,
     release_signing_topology_revision: Option<&'a str>,
 }
 
@@ -1225,6 +1236,9 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
         takeover_dispatch_review_revision: bindings
             .takeover_dispatch_review_revision
             .map(str::to_owned),
+        app_use_fronting_review_revision: bindings
+            .app_use_fronting_review_revision
+            .map(str::to_owned),
         release_signing_topology_revision: bindings
             .release_signing_topology_revision
             .map(str::to_owned),
@@ -1237,6 +1251,64 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
             computed_artifact_digest: Some(computed_vocabulary_digest),
         },
     }
+}
+
+/// Whether the build carries an attestation that release evidence reports as
+/// passing. An empty value or a stand-in such as "placeholder" binds nothing,
+/// exactly as the release gate reports it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn release_attestation_bound(gate: &'static str, value: Option<&str>) -> bool {
+    matches!(pin_outcome(gate, value, None), ComputerGateOutcome::Pass)
+}
+
+/// The keystroke fronting bracket: bring a background application forward for
+/// at most 100 ms, post, always restore, under the takeover grant. It also
+/// admits a `bring_to_front` image read under held takeover. Only the takeover
+/// review covers it, and the app-use review changes nothing here.
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
+    inputs.takeover_dispatch_review_revision.is_some()
+}
+
+/// Fronting outside the keystroke bracket: foreground mode's one-way front,
+/// fronting a disabled press or a modifier chord under the app grant alone,
+/// skipping the restore when the person switched apps, and holding the restore
+/// until a held key's release is confirmed. It brings an application forward
+/// as the takeover review's bracket does, but under rules that review never
+/// covered, so both the takeover review and the app-use review must bind.
+/// The vocabulary digests play no part.
+// The computer plane reads this at construction once it carries the flag;
+// until then only the tests below call it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
+    release_attestation_bound(
+        "takeover_dispatch_review_revision",
+        inputs.takeover_dispatch_review_revision.as_deref(),
+    ) && release_attestation_bound(
+        "app_use_fronting_review_revision",
+        inputs.app_use_fronting_review_revision.as_deref(),
+    )
+}
+
+/// Capturing a covered window for the background-mode preview. The pixels
+/// leave the module outside capture custody, so both the capture review and
+/// the app-use review, whose scope names this exception, must bind. Without
+/// it the preview shows the application's icon instead of a frame. The
+/// vocabulary digests play no part.
+// The computer plane reads this at construction once it carries the flag;
+// until then only the tests below call it.
+#[cfg_attr(not(test), allow(dead_code))]
+fn preview_capture_admitted(inputs: &ComputerReleaseInputs) -> bool {
+    release_attestation_bound(
+        "capture_review_revision",
+        inputs.capture_review_revision.as_deref(),
+    ) && release_attestation_bound(
+        "app_use_fronting_review_revision",
+        inputs.app_use_fronting_review_revision.as_deref(),
+    )
 }
 
 /// The computer-plane context for the HELLO message the module sends the daemon.
@@ -3211,11 +3283,9 @@ impl Planes {
                     })
                     // The fronting bracket is served only by a build carrying
                     // its review; without it a background target is refused.
-                    .with_fronting_bracket_admitted(
-                        compiled_release_inputs()
-                            .takeover_dispatch_review_revision
-                            .is_some(),
-                    ),
+                    .with_fronting_bracket_admitted(fronting_bracket_admitted(
+                        &compiled_release_inputs(),
+                    )),
                 )
             }),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -8739,8 +8809,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            11,
-            "expected eleven attestations, found {read_here:?}"
+            12,
+            "expected twelve attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -12206,6 +12276,7 @@ mod tests {
             app_state_review_revision: None,
             element_addressed_review_revision: None,
             takeover_dispatch_review_revision: None,
+            app_use_fronting_review_revision: None,
             release_signing_topology_revision: None,
         });
         assert_eq!(
@@ -12221,6 +12292,7 @@ mod tests {
                 app_state_review_revision: None,
                 element_addressed_review_revision: None,
                 takeover_dispatch_review_revision: None,
+                app_use_fronting_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
                     manifest_digest: Some(
@@ -12284,6 +12356,7 @@ mod tests {
                 app_state_review_revision: Some("fixture-app-state-review"),
                 element_addressed_review_revision: Some("fixture-element-addressed-review"),
                 takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review"),
+                app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
                 release_signing_topology_revision: Some("fixture-signing-topology"),
             }),
             permissions: Default::default(),
@@ -12292,8 +12365,193 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 14]
+            vec![ComputerGateOutcome::Pass; 15]
         );
+    }
+
+    /// Every external attestation bound, as a release build supplying all of
+    /// them would compile it.
+    fn fully_bound_release_bindings() -> BuildReleaseBindings<'static> {
+        BuildReleaseBindings {
+            attendance_contract_owner: Some("fixture-attendance-owner"),
+            attendance_contract_revision: Some("fixture-attendance-revision"),
+            input_review_revision: Some("fixture-input-review"),
+            global_dispatch_review_revision: Some("fixture-global-dispatch-review"),
+            capture_review_revision: Some("fixture-capture-review"),
+            semantic_actuation_review_revision: Some("fixture-semantic-actuation-review"),
+            windows_actuation_review_revision: Some("fixture-windows-actuation-review"),
+            app_state_review_revision: Some("fixture-app-state-review"),
+            element_addressed_review_revision: Some("fixture-element-addressed-review"),
+            takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review"),
+            app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
+            release_signing_topology_revision: Some("fixture-signing-topology"),
+        }
+    }
+
+    /// The app-use review travels from its compile-time binding into the
+    /// release inputs, is reported by release evidence like every other
+    /// external attestation, and withholds no capability row when absent.
+    #[test]
+    fn app_use_fronting_review_is_reported_and_gates_no_row() {
+        let bound = release_inputs_from_build_bindings(fully_bound_release_bindings());
+        assert_eq!(
+            bound.app_use_fronting_review_revision.as_deref(),
+            Some("fixture-app-use-fronting-review")
+        );
+        let unbound = release_inputs_from_build_bindings(BuildReleaseBindings {
+            app_use_fronting_review_revision: None,
+            ..fully_bound_release_bindings()
+        });
+        assert_eq!(unbound.app_use_fronting_review_revision, None);
+
+        let context = |inputs: ComputerReleaseInputs| ComputerCapabilityAdvertisementContext {
+            inputs,
+            permissions: Default::default(),
+            startup: StartupCapabilityProbe::default(),
+        };
+        let bound = context(bound);
+        let unbound = context(unbound);
+        assert_eq!(
+            computer_gate_outcomes(&bound).get("app_use_fronting_review_revision"),
+            Some(&ComputerGateOutcome::Pass)
+        );
+        assert_eq!(
+            computer_gate_outcomes(&unbound).get("app_use_fronting_review_revision"),
+            Some(&ComputerGateOutcome::MissingExternalInput {
+                gate: "app_use_fronting_review_revision".to_string(),
+            })
+        );
+
+        // Every declaration is taken as advertised so that only the release
+        // gate decides; the missing app-use review must withhold nothing.
+        let admitted = |context: &ComputerCapabilityAdvertisementContext| {
+            let mut declarations = computer::platform::capability_declarations(context, true);
+            for declaration in &mut declarations {
+                declaration.advertised = true;
+            }
+            let outcomes = computer_gate_outcomes(context);
+            gate_admitted_computer_declarations(&declarations, &outcomes)
+                .into_iter()
+                .map(|declaration| declaration.capability_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let with_review = admitted(&bound);
+        assert!(
+            with_review.len() > 1,
+            "the fully bound fixture must admit the reviewed rows: {with_review:?}"
+        );
+        assert_eq!(admitted(&unbound), with_review);
+    }
+
+    /// The places where this module brings an application forward or captures
+    /// a covered window, each named for the admission it needs.
+    #[derive(Debug, Clone, Copy)]
+    enum FrontingPath {
+        ForegroundOneWayFront,
+        NeedsFrontPress,
+        ModifierChordUnderAppGrant,
+        PersonSwitchRestoreSkip,
+        HeldInputRestoreOrdering,
+        KeystrokeBracketUnderTakeover,
+        BringToFrontReadUnderTakeover,
+        PreviewCapture,
+    }
+
+    const FRONTING_PATHS: [FrontingPath; 8] = [
+        FrontingPath::ForegroundOneWayFront,
+        FrontingPath::NeedsFrontPress,
+        FrontingPath::ModifierChordUnderAppGrant,
+        FrontingPath::PersonSwitchRestoreSkip,
+        FrontingPath::HeldInputRestoreOrdering,
+        FrontingPath::KeystrokeBracketUnderTakeover,
+        FrontingPath::BringToFrontReadUnderTakeover,
+        FrontingPath::PreviewCapture,
+    ];
+
+    fn path_admitted(path: FrontingPath, inputs: &ComputerReleaseInputs) -> bool {
+        match path {
+            FrontingPath::ForegroundOneWayFront
+            | FrontingPath::NeedsFrontPress
+            | FrontingPath::ModifierChordUnderAppGrant
+            | FrontingPath::PersonSwitchRestoreSkip
+            | FrontingPath::HeldInputRestoreOrdering => app_use_fronting_admitted(inputs),
+            FrontingPath::KeystrokeBracketUnderTakeover
+            | FrontingPath::BringToFrontReadUnderTakeover => fronting_bracket_admitted(inputs),
+            FrontingPath::PreviewCapture => preview_capture_admitted(inputs),
+        }
+    }
+
+    /// Each combination of the takeover, capture and app-use reviews against
+    /// each fronting path and preview capture. The expected admissions are
+    /// written out per row rather than derived, so a change to either
+    /// predicate shows up as a named row. Every row is checked with valid and
+    /// with missing vocabulary digests, which must change nothing.
+    #[test]
+    fn each_attestation_combination_admits_exactly_its_fronting_paths() {
+        // (takeover, capture, app use) bound ->
+        // (app-use fronting paths, takeover bracket paths, preview capture)
+        let table: [((bool, bool, bool), (bool, bool, bool)); 8] = [
+            ((false, false, false), (false, false, false)),
+            ((true, false, false), (false, true, false)),
+            ((false, true, false), (false, false, false)),
+            ((false, false, true), (false, false, false)),
+            ((true, true, false), (false, true, false)),
+            ((true, false, true), (true, true, false)),
+            ((false, true, true), (false, false, true)),
+            ((true, true, true), (true, true, true)),
+        ];
+        for ((takeover, capture, app_use), (app_use_paths, bracket_paths, preview)) in table {
+            let base = fully_bound_release_bindings();
+            let inputs = release_inputs_from_build_bindings(BuildReleaseBindings {
+                takeover_dispatch_review_revision: base
+                    .takeover_dispatch_review_revision
+                    .filter(|_| takeover),
+                capture_review_revision: base.capture_review_revision.filter(|_| capture),
+                app_use_fronting_review_revision: base
+                    .app_use_fronting_review_revision
+                    .filter(|_| app_use),
+                ..fully_bound_release_bindings()
+            });
+            let mut without_digests = inputs.clone();
+            without_digests.vocabulary_digests = Default::default();
+            for inputs in [&inputs, &without_digests] {
+                for path in FRONTING_PATHS {
+                    let expected = match path {
+                        FrontingPath::ForegroundOneWayFront
+                        | FrontingPath::NeedsFrontPress
+                        | FrontingPath::ModifierChordUnderAppGrant
+                        | FrontingPath::PersonSwitchRestoreSkip
+                        | FrontingPath::HeldInputRestoreOrdering => app_use_paths,
+                        FrontingPath::KeystrokeBracketUnderTakeover
+                        | FrontingPath::BringToFrontReadUnderTakeover => bracket_paths,
+                        FrontingPath::PreviewCapture => preview,
+                    };
+                    assert_eq!(
+                        path_admitted(path, inputs),
+                        expected,
+                        "{path:?} with takeover={takeover} capture={capture} \
+                         app_use={app_use} digests={}",
+                        inputs.vocabulary_digests.manifest_digest.is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A stand-in value is not a review. The release gate reports it as an
+    /// implementation failure, and neither fronting outside the bracket nor
+    /// preview capture may treat it as bound.
+    #[test]
+    fn a_stand_in_app_use_review_admits_no_fronting_and_no_preview_capture() {
+        for stand_in in ["placeholder", "tbd", "unknown", " "] {
+            let inputs = release_inputs_from_build_bindings(BuildReleaseBindings {
+                app_use_fronting_review_revision: Some(stand_in),
+                ..fully_bound_release_bindings()
+            });
+            assert!(!app_use_fronting_admitted(&inputs), "{stand_in:?}");
+            assert!(!preview_capture_admitted(&inputs), "{stand_in:?}");
+            assert!(fronting_bracket_admitted(&inputs), "{stand_in:?}");
+        }
     }
 
     /// The release gate itself holds the takeover rows to both reviews,
@@ -12315,6 +12573,7 @@ mod tests {
                     app_state_review_revision: Some("fixture-app-state-review"),
                     element_addressed_review_revision: Some("fixture-element-addressed-review"),
                     takeover_dispatch_review_revision: takeover,
+                    app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
                     release_signing_topology_revision: Some("fixture-signing-topology"),
                 }),
                 permissions: Default::default(),
