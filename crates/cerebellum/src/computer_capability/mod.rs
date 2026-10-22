@@ -90,6 +90,7 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+mod app_use;
 pub mod cursor;
 mod element_actions;
 pub mod image_freshness;
@@ -523,6 +524,15 @@ where
     /// counts as this module's whichever conversation asked for it.
     own_input: Arc<OwnInputLedger>,
     cursor: cursor::Coordinator,
+    /// The config file's `computer_use.app_use`, checked as each call
+    /// arrives. The only setting whose edits are acted on while the module
+    /// runs. No file is read until module startup calls
+    /// [`Self::read_app_use_from_config_file`].
+    app_use: app_use::LiveAppUse,
+    /// The mode each call's work saw, in order, for tests that check an edit
+    /// to the config file reaches the very next call.
+    #[cfg(test)]
+    app_use_seen_for_test: StdMutex<Vec<Option<cerebellum_core::config::AppUse>>>,
     /// The screen-lock reading this crate's own tests serve under, in place of
     /// the machine's. Tests that drive the production plane through the frame
     /// loop must not refuse or disclose according to whether the developer's
@@ -624,6 +634,9 @@ where
             fronting_bracket_admitted: false,
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),
+            app_use: app_use::LiveAppUse::without_file(),
+            #[cfg(test)]
+            app_use_seen_for_test: StdMutex::new(Vec::new()),
             #[cfg(test)]
             session_lock_for_test: None,
         }
@@ -670,6 +683,33 @@ where
     /// Read application state from `source` instead of the platform's reader.
     pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
         self.app_state_source = source;
+        self
+    }
+
+    /// Read `computer_use.app_use` from the person's config file,
+    /// `config_path()`, for every call from now on.
+    ///
+    /// Every constructor builds a plane that reads no file, so test binaries
+    /// and examples never act on the config of whoever runs them. Only the
+    /// module's own startup, which already loads that file to register,
+    /// calls this.
+    // Only macOS and Windows build a computer plane in a running module.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn read_app_use_from_config_file(&self) {
+        self.app_use.read_config_file();
+    }
+
+    /// The config file this plane's calls read `app_use` from, if any.
+    #[cfg(test)]
+    pub(crate) fn app_use_config_path_for_test(&self) -> Option<PathBuf> {
+        self.app_use.path()
+    }
+
+    /// Read `computer_use.app_use` through `live` instead of the plane's
+    /// default.
+    #[cfg(test)]
+    pub(crate) fn with_app_use(mut self, live: app_use::LiveAppUse) -> Self {
+        self.app_use = live;
         self
     }
 
@@ -778,6 +818,23 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
+        // First of all: while an existing config file cannot be read or does
+        // not parse, the person's chosen way of using apps is unknown, so no
+        // action of any kind may run under a guess. A missing file is not
+        // this case; it means background. Nothing has been looked up or
+        // dispatched yet.
+        let app_use = match self.app_use.current() {
+            Ok(mode) => mode,
+            Err(invalid) => {
+                let reply = match capability.0 {
+                    Served::Type | Served::Keys => {
+                        synthetic_wire_envelope(keystrokes::refused_before_posting(invalid.reply()))
+                    }
+                    _ => invalid.reply(),
+                };
+                return self.finish_reply(capability.capability(), reply);
+            }
+        };
         // Before target lookup, consent or any platform work: offering a tool
         // does not imply the startup permission readings allow it to execute.
         if let Some(reply) = permissions::refusal(capability.capability(), &self.permissions) {
@@ -867,7 +924,12 @@ where
                 Arc::clone(&matched_app),
                 crate::grant_enforcement::scope(
                     grant_cancel,
-                    Box::pin(work.scope(async {
+                    Box::pin(work.scope(app_use::scope(app_use, async {
+                        #[cfg(test)]
+                        self.app_use_seen_for_test
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(app_use::call_mode());
                         match capability.0 {
                             Served::ReadState => {
                                 self.serve_read_state(arguments, context, make_backend)
@@ -914,7 +976,7 @@ where
                                 .await
                             }
                         }
-                    })),
+                    }))),
                 ),
             )
             .await;

@@ -608,3 +608,141 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "app-use-unchanged-config-time-reads-nothing"
+guards = "a computer_use call whose config file has the modification time seen last time uses the cached app_use mode and reads nothing beyond its one stat"
+file = "crates/cerebellum/src/computer_capability/app_use.rs"
+old = 'if let Some(reading) = last.as_ref().filter(|reading| reading.stamp == stamp) {'
+new = 'if let Some(reading) = last.as_ref().filter(|_reading| false) { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::tests::an_unchanged_time_uses_the_cached_mode_and_reads_nothing",
+    "computer_capability::app_use::tests::a_parse_failure_refuses_naming_the_file_and_error_until_fixed",
+    "computer_capability::app_use::serve_tests::every_action_refuses_config_invalid_while_the_file_does_not_parse",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-unusable-config-refuses-every-action"
+guards = "while the config file exists but does not parse or cannot be read, every computer_use action refuses config_invalid before any lookup or work, instead of guessing a mode"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = 'let app_use = match self.app_use.current() {'
+new = 'let app_use = match self.app_use.current().or_else(|_| Ok::<_, app_use::ConfigInvalid>(cerebellum_core::config::AppUse::Background)) { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::serve_tests::every_action_refuses_config_invalid_while_the_file_does_not_parse",
+    "computer_capability::app_use::serve_tests::a_live_edit_reaches_the_next_call_without_a_restart",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-edit-reaches-the-next-call"
+guards = "the app_use mode read when a computer_use call arrives is the mode that call's work runs under, so an edit to the config file applies to the next call without a restart"
+file = "crates/cerebellum/src/computer_capability/mod.rs"
+old = 'Box::pin(work.scope(app_use::scope(app_use, async {'
+new = 'Box::pin(work.scope(app_use::scope(cerebellum_core::config::AppUse::Background, async { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::serve_tests::a_live_edit_reaches_the_next_call_without_a_restart",
+    "computer_capability::app_use::serve_tests::an_edit_to_agent_cursor_changes_nothing_while_running",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-unknown-value-is-a-config-error"
+guards = "a computer_use.app_use value other than background or foreground is a config error naming the key and both allowed values, never a silent fallback to background"
+file = "crates/cerebellum-core/src/config.rs"
+old = 'Some("background") => AppUse::Background,'
+new = 'Some(other) if other != "foreground" => AppUse::Background, // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum-core/src/config.rs"
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "config::cursor_config_tests::app_use_is_background_when_absent_and_strictly_one_of_two_words",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-unreadable-config-is-not-a-missing-one"
+guards = "a config file whose metadata cannot be read for a reason other than its absence refuses config_invalid rather than reading as a missing file, which would mean background"
+file = "crates/cerebellum/src/computer_capability/app_use.rs"
+old = 'Err(error) if error.kind() == io::ErrorKind::NotFound => Stamp::Absent,'
+new = 'Err(_) => Stamp::Absent, // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::tests::a_read_error_other_than_absence_refuses_and_retries_each_call",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-only-module-startup-reads-the-config-file"
+guards = "the module's own startup, which loads cerebellum.jsonc to register, is what points the computer plane at that file for the live app_use read"
+file = "crates/cerebellum/src/lib.rs"
+old = '        computer.read_app_use_from_config_file();'
+new = '        let _ = computer; // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "live_settings_tests::module_startup_points_the_computer_plane_at_the_config_file",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "app-use-planes-read-no-config-file-by-default"
+guards = "a computer plane from any constructor reads no config file, so test binaries and examples never take a mode or a config_invalid refusal from the config of whoever runs them"
+file = "crates/cerebellum/src/computer_capability/app_use.rs"
+old = '        Self::new(None, Arc::new(NativeConfigFiles))'
+new = '        Self::new(cerebellum_core::config::config_path(), Arc::new(NativeConfigFiles)) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/app_use.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::app_use::serve_tests::a_plane_from_any_constructor_reads_no_config_file",
+    "live_settings_tests::module_startup_points_the_computer_plane_at_the_config_file",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

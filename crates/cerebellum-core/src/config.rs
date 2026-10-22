@@ -19,6 +19,11 @@
 //! and trailing commas are stripped via `subc_jsonc` before JSON parsing).
 //! `computer_use.agent_cursor` is an optional Boolean, default true. It only
 //! controls ephemeral cursor pictures and takes effect at module startup.
+//! `computer_use.app_use` is `"background"` (the default) or `"foreground"`;
+//! see [`AppUse`]. It is the one key whose edits a running module acts on:
+//! the computer plane checks the file before each `computer_use` call, and on
+//! a change parses the whole file again but uses only `app_use` from it. Every
+//! other key, `agent_cursor` included, takes effect only at startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -61,6 +66,9 @@ pub enum ConfigReason {
     TopLevelNotObject,
     ComputerUseNotObject,
     NotBoolean,
+    /// A string-valued key held a value outside its closed set. Carries the
+    /// allowed values so the message can name them.
+    NotOneOf(&'static [&'static str]),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -69,6 +77,10 @@ impl std::fmt::Display for ConfigError {
             ConfigReason::HealthNotObject => write!(f, "health: expected a JSON object"),
             ConfigReason::ComputerUseNotObject => write!(f, "computer_use: expected a JSON object"),
             ConfigReason::NotBoolean => write!(f, "{}: expected a Boolean", self.field),
+            ConfigReason::NotOneOf(allowed) => {
+                let allowed: Vec<String> = allowed.iter().map(|value| format!("\"{value}\"")).collect();
+                write!(f, "{}: expected one of {}", self.field, allowed.join(", "))
+            }
             ConfigReason::UnknownMember(m) if self.field == "health" && m == "action_age_stale_ms" => write!(f, "health.action_age_stale_ms was renamed to health.queue_age_stale_ms; it now budgets the oldest queued age only"),
             ConfigReason::UnknownMember(m) => write!(f, "{}: unknown member `{m}`", self.field),
             ConfigReason::NotInteger => write!(f, "{}: expected a positive integer", self.field),
@@ -143,11 +155,47 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputerUseConfig {
     pub agent_cursor: bool,
+    /// `computer_use.app_use`. The `computer_use` section rejects members it
+    /// does not know, so a binary built before this key existed cannot read a
+    /// config file that sets it: rolling back to such a binary with the key
+    /// still present leaves the whole config unreadable, and the module fails
+    /// to register until the key is removed.
+    ///
+    /// Unlike every other key, an edit to this one is acted on while the
+    /// module runs: it applies to the next `computer_use` call without a
+    /// restart. Other keys take effect only at startup.
+    pub app_use: AppUse,
 }
 
 impl Default for ComputerUseConfig {
     fn default() -> Self {
-        Self { agent_cursor: true }
+        Self {
+            agent_cursor: true,
+            app_use: AppUse::Background,
+        }
+    }
+}
+
+/// How `computer_use` treats the application it acts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppUse {
+    /// Act without bringing the application to the front. The default.
+    #[default]
+    Background,
+    /// Bring the application to the front before acting in it.
+    Foreground,
+}
+
+impl AppUse {
+    /// The values `computer_use.app_use` accepts, as spelled in the file.
+    pub const ALLOWED: &'static [&'static str] = &["background", "foreground"];
+
+    /// The value as spelled in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Foreground => "foreground",
+        }
     }
 }
 
@@ -166,6 +214,59 @@ mod cursor_config_tests {
         assert!(parse_config(r#"{"computer_use":{"agent_cursor":"false"}}"#).is_err());
         assert!(parse_config(r#"{"computer_use":{"unknown":true}}"#).is_err());
         assert!(parse_config(r#"{"computer_use":null}"#).is_err());
+    }
+
+    #[test]
+    fn app_use_is_background_when_absent_and_strictly_one_of_two_words() {
+        assert_eq!(
+            parse_config("{}").unwrap().computer_use.app_use,
+            AppUse::Background
+        );
+        assert_eq!(
+            parse_config(r#"{"computer_use":{"agent_cursor":false}}"#)
+                .unwrap()
+                .computer_use
+                .app_use,
+            AppUse::Background
+        );
+        for (text, expected) in [
+            (
+                r#"{"computer_use":{"app_use":"background"}}"#,
+                AppUse::Background,
+            ),
+            (
+                r#"{"computer_use":{"app_use":"foreground"}}"#,
+                AppUse::Foreground,
+            ),
+        ] {
+            assert_eq!(parse_config(text).unwrap().computer_use.app_use, expected);
+        }
+        // Setting app_use leaves agent_cursor at its own default.
+        assert!(
+            parse_config(r#"{"computer_use":{"app_use":"foreground"}}"#)
+                .unwrap()
+                .computer_use
+                .agent_cursor
+        );
+        for invalid in [
+            r#""Foreground""#,
+            r#""front""#,
+            r#""""#,
+            "true",
+            "null",
+            "1",
+            r#"["foreground"]"#,
+        ] {
+            let error = parse_config(&format!(r#"{{"computer_use":{{"app_use":{invalid}}}}}"#))
+                .unwrap_err();
+            assert_eq!(error.field, "computer_use.app_use", "{invalid}");
+            assert_eq!(error.reason, ConfigReason::NotOneOf(AppUse::ALLOWED));
+            assert_eq!(
+                error.to_string(),
+                r#"computer_use.app_use: expected one of "background", "foreground""#,
+                "{invalid}"
+            );
+        }
     }
 }
 
@@ -233,7 +334,7 @@ pub fn parse_config_value(value: &serde_json::Value) -> Result<Config, ConfigErr
             reason: ConfigReason::ComputerUseNotObject,
         })?;
         for key in object.keys() {
-            if key != "agent_cursor" {
+            if key != "agent_cursor" && key != "app_use" {
                 return Err(ConfigError {
                     field: "computer_use",
                     reason: ConfigReason::UnknownMember(key.clone()),
@@ -245,6 +346,18 @@ pub fn parse_config_value(value: &serde_json::Value) -> Result<Config, ConfigErr
                 field: "computer_use.agent_cursor",
                 reason: ConfigReason::NotBoolean,
             })?;
+        }
+        if let Some(value) = object.get("app_use") {
+            computer_use.app_use = match value.as_str() {
+                Some("background") => AppUse::Background,
+                Some("foreground") => AppUse::Foreground,
+                _ => {
+                    return Err(ConfigError {
+                        field: "computer_use.app_use",
+                        reason: ConfigReason::NotOneOf(AppUse::ALLOWED),
+                    })
+                }
+            };
         }
     }
     Ok(Config {

@@ -1882,7 +1882,46 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
     record_engram_catalog_write();
-    conclude(run(config, |_| {}, true).await)
+    conclude(run(config, read_live_settings_from_config_file, true).await)
+}
+
+/// Point the planes at the settings a running module re-reads from its config
+/// file, `cerebellum.jsonc`, while it runs: today only `computer_use.app_use`.
+///
+/// Only [`run_entry`] calls this, because only it loaded that file to
+/// register. Every plane constructor reads no config file, so in-process
+/// tests, child-process tests through [`run_entry_prepared_for_test`] and
+/// examples never act on the config of whoever runs them.
+fn read_live_settings_from_config_file(planes: &mut Planes) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Ok(computer) = &planes.computer {
+        computer.read_app_use_from_config_file();
+    }
+    // No other platform builds a computer plane, so nothing reads app_use.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = planes;
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod live_settings_tests {
+    use super::*;
+
+    /// The production entry is the one place a computer plane starts reading
+    /// the person's config file; before that step the same planes read none.
+    #[test]
+    fn module_startup_points_the_computer_plane_at_the_config_file() {
+        let expected = cerebellum_core::config::config_path();
+        assert!(expected.is_some(), "this host has a config home");
+        let mut planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::default()),
+            None,
+            JournalPersistence::Isolated,
+        );
+        let computer = planes.computer.as_ref().unwrap().clone();
+        assert_eq!(computer.app_use_config_path_for_test(), None);
+        read_live_settings_from_config_file(&mut planes);
+        assert_eq!(computer.app_use_config_path_for_test(), expected);
+    }
 }
 
 /// [`run_entry`] with the configuration supplied here instead of read from the
