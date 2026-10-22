@@ -83,7 +83,7 @@ The result tables below omit `extension_revision`.
 | `open_tab` | optional `url` (HTTP(S), default `about:blank`), optional `opener_tab` (claimed handle from this route) | `{tab, interaction_epoch, connection_epoch}` |
 | `claim_tab` | required `tab` (unclaimed handed handle, or already claimed by this route) | `{tab, interaction_epoch, connection_epoch}` |
 | `close` | none | `{connection_epoch}` |
-| `cdp` | required `tab`, required nonempty `commands` (maximum 256), optional `interaction_epoch` and `observer_continuity` (both required for input and observed navigation) | `{tab, results:[...], interaction_epoch, observer_available, observer_continuity, connection_epoch, popup_activated_briefly?:true}` |
+| `cdp` | required `tab`, required nonempty `commands` (maximum 256), optional `interaction_epoch` and `observer_continuity` (both required for input and observed navigation) | `{tab, results:[...], interaction_epoch, interaction_cause?, observer_available, observer_continuity, connection_epoch, popup_activated_briefly?:true}` |
 
 `tab` is an opaque string, never a Chrome tab id. Status lists only this route's
 claims and unclaimed handed tabs, not another route's claims or unclaimed
@@ -92,7 +92,13 @@ the group; handed tabs are ungrouped. No close path closes Chrome or a tab.
 
 CDP replies pair `interaction_epoch`, the counter of observed interactions and
 unattributed navigation, with `observer_available`, which is true only after all
-live frames answered the observer sample.
+live frames answered the observer sample. `interaction_cause`, present once the
+counter has moved, is a short code for the last thing that moved it:
+`input.<event>.<main|subframe>`, naming one of the sentinel's event types and
+whether it happened in the main frame or a child frame, or `navigation.main`
+for a main-frame navigation the agent did not start. It never carries page
+text, URLs or field values; cerebellum passes on only codes from this
+vocabulary and names them in a `state_changed_by_person` refusal's `detail`.
 `observer_available:false` never means no interaction occurred; its numeric counter
 cannot authorize input. `observer_continuity` fences snapshots across observer loss
 and replacement independently of the human-input counter. Unknown observation
@@ -302,8 +308,12 @@ Focus/blur, tab activation and window focus never count as interaction.
 Cursor movement alone
 (`pointermove`/`mousemove`) is not interaction and is neither observed nor attributed.
 The browser adapter types text with `Input.insertText` and uses
-`Input.dispatchKeyEvent` only for non-text keys. Non-agent navigation still
-invalidates freshness; agent Page navigation is excluded.
+`Input.dispatchKeyEvent` only for non-text keys. Non-agent main-frame navigation
+still invalidates freshness; agent Page navigation is excluded. A child frame's
+navigation does not count: page script, input inside a frame (already counted
+by that frame's sentinel, since every live frame must answer a sample) or the
+back button walking a frame's history start it, and its new document changes
+continuity when it commits.
 Missing observer/frame coverage and changed document identity invalidate input.
 
 Successful AX/DOM content reads or screenshots with live observer coverage establish

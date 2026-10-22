@@ -19,8 +19,10 @@
     sequence += 1;
     // Event time, rather than message delivery time, identifies input within a
     // debugger attachment. Keep bounded history so sampling can catch delayed
-    // notifications without extending the action window past detach.
-    interactions.push({ sequence, at: now() });
+    // notifications without extending the action window past detach. The
+    // event type (one of `types` below) lets a refusal name what moved the
+    // interaction epoch; it says nothing about the page or its content.
+    interactions.push({ sequence, at: now(), kind: event.type });
     if (interactions.length > 256) interactions.shift();
     notify();
   };

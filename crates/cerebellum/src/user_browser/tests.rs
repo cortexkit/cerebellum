@@ -127,6 +127,24 @@ struct DoubleState {
     plan_delay: Duration,
     consent_delay: Duration,
     observer_unavailable: bool,
+    /// How many more CDP plans report the observer unavailable before it
+    /// arrives, as for a document whose observer is still being installed.
+    observer_unavailable_reads: usize,
+    /// When set, a plan reading the accessibility tree loses the observer and
+    /// the next this many plans report it unavailable, as when a page commits
+    /// a child frame during a capture.
+    observer_loss_on_capture: usize,
+    /// When set, `Page.navigate` commits its document but the observer never
+    /// arrives on it.
+    observer_lost_on_navigate: bool,
+    /// The extension's code for why the interaction epoch last moved.
+    interaction_cause: Option<&'static str>,
+    /// What the page does in reaction to the agent's `DOM.focus`, applied
+    /// after that plan's reply, between the agent's plans.
+    page_reaction: Option<PageReaction>,
+    /// The navigation history the double reports instead of the tab's single
+    /// entry, once a same-document history change replaced it.
+    history: Option<Value>,
     observer_missing_on_blank: bool,
     observer_continuity: u64,
     metadata_unready: usize,
@@ -154,6 +172,25 @@ struct DoubleState {
     /// A field removed from every CDP plan reply, as an extension built
     /// against an older reply shape would omit it.
     drop_plan_reply_field: Option<&'static str>,
+}
+
+/// What a page does when the agent focuses one of its fields, each a
+/// candidate for a type that the person check stopped half-way.
+#[derive(Clone, Copy, Debug)]
+enum PageReaction {
+    /// `document.execCommand("insertText")`: trusted beforeinput and input.
+    ExecCommand,
+    /// A child frame navigates, then commits a new document.
+    ChildNavigation,
+    /// `history.replaceState` with the same URL.
+    ReplaceState,
+    /// `history.pushState` to a new URL.
+    PushState,
+    /// Not the page: the person presses a key just then.
+    PersonKey,
+    /// The person presses a key, and the extension names it with text
+    /// outside its cause vocabulary.
+    ForeignCause,
 }
 
 /// `value` (a reply or refusal object) with the double's revision stamp.
@@ -817,6 +854,8 @@ fn execute(
                 if state.metadata_unready > 0 {
                     state.metadata_unready -= 1;
                     json!({"currentIndex":0,"entries":[]})
+                } else if let Some(history) = &state.history {
+                    history.clone()
                 } else {
                     json!({"currentIndex":0,"entries":[{"id":tab.loader,"url":tab.url}]})
                 }
@@ -842,6 +881,9 @@ fn execute(
                     .clone()
                     .unwrap_or_else(|| command["params"]["url"].as_str().unwrap().into());
                 tab.loader += 1;
+                if state.observer_lost_on_navigate {
+                    state.observer_unavailable = true;
+                }
                 json!({"frameId":"main","loaderId":format!("l{}",tab.loader)})
             }
             "Accessibility.getFullAXTree" => {
@@ -1004,10 +1046,54 @@ fn execute(
     {
         state.observer_unavailable = true;
     }
-    Ok((
-        json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"observer_available":!state.observer_unavailable && !(state.observer_missing_on_blank && tab.url == "about:blank"),"observer_continuity":state.observer_continuity,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings}),
-        input,
-    ))
+    if state.observer_loss_on_capture > 0
+        && commands
+            .iter()
+            .any(|step| step["method"] == "Accessibility.getFullAXTree")
+    {
+        state.observer_unavailable_reads = state.observer_loss_on_capture;
+        state.observer_loss_on_capture = 0;
+    }
+    let observer_arriving = state.observer_unavailable_reads > 0;
+    if observer_arriving {
+        state.observer_unavailable_reads -= 1;
+    }
+    let mut reply = json!({"tab":handle,"results":results,"interaction_epoch":tab.interaction,"observer_available":!observer_arriving && !state.observer_unavailable && !(state.observer_missing_on_blank && tab.url == "about:blank"),"observer_continuity":state.observer_continuity,"connection_epoch":epoch,"popup_activated_briefly":state.popup || metadata_popup,"frame_mappings":mappings});
+    if let Some(cause) = state.interaction_cause {
+        reply["interaction_cause"] = json!(cause);
+    }
+    // The page reacts after the agent's focus plan has returned, between it
+    // and the agent's next plan, as an asynchronous focus handler would.
+    if commands.iter().any(|step| step["method"] == "DOM.focus") {
+        match state.page_reaction.take() {
+            Some(PageReaction::ExecCommand) => {
+                tab.interaction += 2;
+                state.interaction_cause = Some("input.input.main");
+            }
+            Some(PageReaction::ChildNavigation) => state.observer_continuity += 1,
+            Some(PageReaction::ReplaceState) => {
+                state.history = Some(
+                    json!({"currentIndex":0,"entries":[{"id":tab.loader + 100,"url":tab.url}]}),
+                );
+            }
+            Some(PageReaction::PushState) => {
+                state.history = Some(json!({"currentIndex":1,"entries":[
+                    {"id":tab.loader,"url":tab.url},
+                    {"id":tab.loader + 100,"url":format!("{}search", tab.url)}
+                ]}));
+            }
+            Some(PageReaction::PersonKey) => {
+                tab.interaction += 1;
+                state.interaction_cause = Some("input.keydown.main");
+            }
+            Some(PageReaction::ForeignCause) => {
+                tab.interaction += 1;
+                state.interaction_cause = Some("typed https://private.example/secret");
+            }
+            None => {}
+        }
+    }
+    Ok((reply, input))
 }
 
 fn ax() -> Value {
@@ -2814,6 +2900,8 @@ mod worker;
 
 mod agent_enforcement;
 mod codemode;
+mod observer_wait;
+mod person_check;
 
 #[tokio::test]
 async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card() {

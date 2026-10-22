@@ -17,7 +17,7 @@ test("sentinel timestamps every trusted click without a post-action grace period
   s.event({ type: "click", isTrusted: true });
   s.advance(1);
   s.event({ type: "click", isTrusted: true });
-  assert.deepEqual(s.send("sample").interactions, [{ sequence: 1, at: 10 }, { sequence: 2, at: 11 }]);
+  assert.deepEqual(s.send("sample").interactions, [{ sequence: 1, at: 10, kind: "click" }, { sequence: 2, at: 11, kind: "click" }]);
 });
 
 test("sentinel never records focus or tab visibility as interaction", () => {
