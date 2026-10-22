@@ -1020,16 +1020,6 @@ where
         if let (Some(name), Some(object)) = (matched_app, reply.as_object_mut()) {
             object.insert("matched_app".into(), json!(name));
         }
-        // An action that went through says how it used the front of the
-        // screen even when it did not touch it, so a caller can tell the mode
-        // it ran under.
-        if fronting::listed(capability.0) && fronting::went_through(&reply) {
-            if let Some(object) = reply.as_object_mut() {
-                object
-                    .entry("fronting")
-                    .or_insert_with(|| fronting::Fronting::untouched(app_use).to_value());
-            }
-        }
         // The call went ahead without knowing whether the screen was locked.
         // Said on the reply so an empty tree or a missing element is not
         // taken for an application that has nothing there.
