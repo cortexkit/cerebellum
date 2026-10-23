@@ -4,6 +4,11 @@ use std::collections::{HashMap, HashSet};
 /// Resolve non-element refs through the captured DOM, without asking Chrome to
 /// run an element-only selector on a text node. Skip wrappers that add no text
 /// so a field key includes its sibling value rather than just the key's span.
+///
+/// Text is measured in letters and digits only. A JSON viewer renders a key as
+/// its own span holding `'event':`, so the span adds quotes and a colon to the
+/// key's text but no content; counting every character would stop the climb
+/// at that span and show the key without its value.
 pub(crate) fn enclosing_element(
     dom: &Map<String, Value>,
     backend: u64,
@@ -27,6 +32,7 @@ pub(crate) fn enclosing_element(
             .as_str()
             .unwrap_or_default()
             .chars()
+            .filter(|character| character.is_alphanumeric())
             .count();
         let mut current = Some(text);
         let mut seen = HashSet::new();
@@ -89,6 +95,43 @@ pub(crate) fn key_value_fixture() -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JSON viewer's expanded event: each property is a line wrapper
+    /// holding the key as its own click-to-filter span (`'event':`, three
+    /// text nodes, so the accessibility text is just `event`) and the value
+    /// in a sibling span.
+    fn json_viewer_chip_fixture() -> Map<String, Value> {
+        let chip = "inline-block py-0.5 rounded hover:bg-blue-500/30 hover:cursor-pointer transition-colors duration-400 text-nowrap";
+        serde_json::json!({"nodes":[
+            {"nodeId":1,"backendNodeId":1,"nodeType":9,"nodeName":"#document"},
+            {"nodeId":2,"parentId":1,"backendNodeId":2,"nodeType":1,"nodeName":"BODY","attributes":[]},
+            {"nodeId":3,"parentId":2,"backendNodeId":3,"nodeType":1,"nodeName":"DIV","attributes":[]},
+            {"nodeId":4,"parentId":3,"backendNodeId":4,"nodeType":1,"nodeName":"DIV","attributes":[]},
+            {"nodeId":5,"parentId":4,"backendNodeId":5,"nodeType":1,"nodeName":"SPAN","attributes":["class",chip]},
+            {"nodeId":6,"parentId":5,"backendNodeId":6,"nodeType":3,"nodeName":"#text","nodeValue":"'"},
+            {"nodeId":7,"parentId":5,"backendNodeId":7,"nodeType":3,"nodeName":"#text","nodeValue":"event"},
+            {"nodeId":8,"parentId":5,"backendNodeId":8,"nodeType":3,"nodeName":"#text","nodeValue":"':"},
+            {"nodeId":9,"parentId":4,"backendNodeId":9,"nodeType":1,"nodeName":"SPAN","attributes":[]},
+            {"nodeId":10,"parentId":9,"backendNodeId":10,"nodeType":3,"nodeName":"#text","nodeValue":"'boat_pool_retire'"},
+            {"nodeId":11,"parentId":3,"backendNodeId":11,"nodeType":1,"nodeName":"DIV","attributes":[]},
+            {"nodeId":12,"parentId":11,"backendNodeId":12,"nodeType":1,"nodeName":"SPAN","attributes":["class",chip]},
+            {"nodeId":13,"parentId":12,"backendNodeId":13,"nodeType":3,"nodeName":"#text","nodeValue":"'eventType':"},
+            {"nodeId":14,"parentId":11,"backendNodeId":14,"nodeType":1,"nodeName":"SPAN","attributes":[]},
+            {"nodeId":15,"parentId":14,"backendNodeId":15,"nodeType":3,"nodeName":"#text","nodeValue":"'cron'"}
+        ]}).as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn a_text_zoom_on_a_json_viewer_key_climbs_past_its_punctuated_chip_to_the_line() {
+        let dom = json_viewer_chip_fixture();
+        // The key's chip holds `'event':`, which adds only punctuation to
+        // `event`, so the zoom shows the property line with its value.
+        assert_eq!(enclosing_element(&dom, 7), Ok((4, Some("text"))));
+        // A quote holds no content of its own, so its chip already adds some.
+        assert_eq!(enclosing_element(&dom, 6), Ok((5, Some("text"))));
+        // A key whose text node carries its own quotes climbs the same way.
+        assert_eq!(enclosing_element(&dom, 13), Ok((11, Some("text"))));
+    }
 
     #[test]
     fn non_element_zoom_skips_wrappers_with_no_additional_text() {
