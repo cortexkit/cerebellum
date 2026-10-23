@@ -151,11 +151,20 @@ pub(crate) async fn begin_call_record(
     begin: impl FnOnce() -> journal::call_records::Begin + Send + 'static,
 ) -> journal::call_records::Begin {
     use journal::call_records::{Begin, CallRecordError, Settlement};
-    let Ok(permit) = Arc::clone(&planes.call_record_workers.permits).try_acquire_owned() else {
+    // Queueing for a worker and writing the begin share one admission budget.
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS);
+    let Ok(permit) = tokio::time::timeout_at(
+        deadline,
+        Arc::clone(&planes.call_record_workers.permits).acquire_owned(),
+    )
+    .await
+    else {
         return Begin::Unavailable(CallRecordError::WriteFailed(
-            "call-record capacity exhausted".into(),
+            "call-record admission timed out while all record workers were busy".into(),
         ));
     };
+    let permit = permit.expect("call-record pool stays open");
     let timeout_error = CallRecordError::WriteFailed("call-record admission timed out".into());
     let refusal = Settlement::admission_timeout(&call_record_unavailable(address, &timeout_error));
     let task = CallRecordTask::new(&planes.call_record_workers);
@@ -190,12 +199,7 @@ pub(crate) async fn begin_call_record(
             calls.settle(ticket, refusal, wall_clock_ms());
         }
     });
-    match tokio::time::timeout(
-        Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS),
-        receiver,
-    )
-    .await
-    {
+    match tokio::time::timeout_at(deadline, receiver).await {
         Ok(Ok(())) => {
             let mut state = wait
                 .delivery
@@ -417,6 +421,204 @@ mod call_record_deadline_tests {
         record
     }
 
+    fn poll_once<F: std::future::Future>(
+        future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    async fn without_time_advancing<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(output) = poll_once(future.as_mut()) {
+                return output;
+            }
+            // Blocking workers need CPU time, not advancement of the paused clock.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_keyed_admissions_wait_for_workers_and_all_execute() {
+        let (planes, _, writes, _) = fixture(usize::MAX);
+        let gates: Vec<_> = (0..4)
+            .map(|_| ReleaseOnDrop(Arc::new(WriteBarrier::default())))
+            .collect();
+        let mut admissions = Vec::new();
+        let started = tokio::time::Instant::now();
+        for (index, gate) in gates.iter().enumerate() {
+            let planes = planes.clone();
+            let barrier = gate.0.clone();
+            admissions.push(tokio::spawn(async move {
+                let calls = planes.calls.clone();
+                let principal = principal(&planes);
+                begin_call_record(&planes, (PROTOCOL_VERSION, 1, 1, index as u64), move || {
+                    barrier.block();
+                    calls.begin(&principal, &format!("burst:{index}"), "records", 0)
+                })
+                .await
+            }));
+            tokio::task::yield_now().await;
+            if index < budgets::MAX_CALL_RECORD_WORKERS {
+                without_time_advancing(gate.0.entered.notified()).await;
+            }
+        }
+        assert_eq!(planes.call_record_workers.permits.available_permits(), 0);
+        assert!(
+            admissions.iter().all(|admission| !admission.is_finished()),
+            "a burst queues rather than refusing calls when the workers are busy"
+        );
+        for index in 0..4 {
+            gates[index].0.release();
+            assert!(matches!(
+                without_time_advancing(&mut admissions[index])
+                    .await
+                    .unwrap(),
+                Begin::Execute(_)
+            ));
+            if index + budgets::MAX_CALL_RECORD_WORKERS < gates.len() {
+                without_time_advancing(
+                    gates[index + budgets::MAX_CALL_RECORD_WORKERS]
+                        .0
+                        .entered
+                        .notified(),
+                )
+                .await;
+            }
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+        assert_eq!(tokio::time::Instant::now(), started);
+        idle(&planes).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_workers_refuse_admission_only_at_the_deadline() {
+        let (planes, memory, writes, _) = fixture(usize::MAX);
+        let held = planes
+            .call_record_workers
+            .permits
+            .clone()
+            .acquire_many_owned(budgets::MAX_CALL_RECORD_WORKERS as u32)
+            .await
+            .unwrap();
+        let (writer, mut frames) = mpsc::channel(8);
+        let started = tokio::time::Instant::now();
+        let mut admission = Box::pin(handle_keyed_tool_request(request(1), &writer, &planes));
+        assert!(poll_once(admission.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS - 1)).await;
+        assert!(poll_once(admission.as_mut()).is_pending());
+        assert!(frames.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            matches!(
+                poll_once(admission.as_mut()),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "a full pool must refuse at the admission deadline, not wait forever"
+        );
+        let refusal = frames.try_recv().unwrap();
+        assert_eq!(body(&refusal)["code"], "call_record_unavailable");
+        assert!(body(&refusal)["message"]
+            .as_str()
+            .unwrap()
+            .contains("call-record admission timed out while all record workers were busy"));
+        assert!(refused_before_dispatch(&refusal));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS)
+        );
+        assert_eq!(planes.call_record_workers.permits.available_permits(), 0);
+        assert_eq!(
+            planes.call_record_workers.detached.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(memory.load().unwrap().is_none());
+        drop(admission);
+        drop(held);
+        idle(&planes).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "no late record worker was spawned"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_and_dropped_admissions_leave_no_permit_waiter_or_record() {
+        let (planes, memory, writes, _) = fixture(usize::MAX);
+        let held = planes
+            .call_record_workers
+            .permits
+            .clone()
+            .acquire_many_owned(budgets::MAX_CALL_RECORD_WORKERS as u32)
+            .await
+            .unwrap();
+        let (writer, mut frames) = mpsc::channel(8);
+        let cancelled = tokio::spawn({
+            let planes = planes.clone();
+            let writer = writer.clone();
+            async move { handle_keyed_tool_request(request(1), &writer, &planes).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancelled.is_finished());
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        {
+            let mut dropped = Box::pin(handle_keyed_tool_request(request(2), &writer, &planes));
+            assert!(poll_once(dropped.as_mut()).is_pending());
+        }
+        assert_eq!(planes.call_record_workers.permits.available_permits(), 0);
+        assert_eq!(
+            planes.call_record_workers.detached.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        drop(held);
+        idle(&planes).await;
+        assert_eq!(
+            planes.call_record_workers.permits.available_permits(),
+            budgets::MAX_CALL_RECORD_WORKERS
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(memory.load().unwrap().is_none());
+        assert!(frames.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permit_wait_and_begin_share_one_admission_deadline() {
+        let (planes, _, writes, release) = fixture(1);
+        let held = planes
+            .call_record_workers
+            .permits
+            .clone()
+            .acquire_many_owned(budgets::MAX_CALL_RECORD_WORKERS as u32)
+            .await
+            .unwrap();
+        let (writer, mut frames) = mpsc::channel(8);
+        let mut admission = Box::pin(handle_keyed_tool_request(request(1), &writer, &planes));
+        assert!(poll_once(admission.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS - 1)).await;
+        drop(held);
+        assert!(poll_once(admission.as_mut()).is_pending());
+        without_time_advancing(release.0.entered.notified()).await;
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            poll_once(admission.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let refusal = frames.try_recv().unwrap();
+        assert_eq!(body(&refusal)["code"], "call_record_unavailable");
+        let message = body(&refusal)["message"].as_str().unwrap().to_owned();
+        assert!(message.contains("call-record admission timed out"));
+        assert!(!message.contains("all record workers were busy"));
+        drop(admission);
+        release.0.release();
+        idle(&planes).await;
+        assert_eq!(snapshot(&planes).state, CallState::Refused);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn admission_timeout_refuses_late_execute_and_bounds_worker_capacity() {
         let (planes, _, writes, release) = fixture(1);
@@ -464,10 +666,28 @@ mod call_record_deadline_tests {
         );
         assert_eq!(planes.call_record_workers.permits.available_permits(), 0);
         let started = tokio::time::Instant::now();
-        handle_keyed_tool_request(request(3), &writer, &planes)
-            .await
-            .unwrap();
-        assert_eq!(tokio::time::Instant::now(), started);
+        let queued = tokio::spawn({
+            let planes = planes.clone();
+            let writer = writer.clone();
+            async move {
+                handle_keyed_tool_request(request(3), &writer, &planes)
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS - 1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            frames.try_recv().is_err(),
+            "a busy pool waits up to the deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        queued.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS)
+        );
         assert_eq!(
             body(&frames.recv().await.unwrap())["code"],
             "call_record_unavailable"
@@ -613,6 +833,22 @@ mod call_record_deadline_tests {
             planes.call_record_workers.detached.load(Ordering::SeqCst),
             1
         );
+        let (writer, mut admission_frames) = mpsc::channel(8);
+        let started = tokio::time::Instant::now();
+        handle_keyed_tool_request(request(2), &writer, &planes)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS)
+        );
+        let refusal = admission_frames.recv().await.unwrap();
+        assert_eq!(body(&refusal)["code"], "call_record_unavailable");
+        assert!(body(&refusal)["message"]
+            .as_str()
+            .unwrap()
+            .contains("call-record admission timed out while all record workers were busy"));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
         drop(held);
         idle(&planes).await;
         let Begin::Replay(reply) =
