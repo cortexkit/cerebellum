@@ -4023,7 +4023,7 @@ async fn snapshot_accepts_wait_none_and_refuses_wait_settle_by_name() {
     assert_eq!(fixture.state.lock().unwrap().commands.len(), before);
 }
 
-/// The settlement note every person's-browser read reports in its text.
+/// The settlement note in a person's-browser read's text projection.
 const SETTLEMENT_NOTE: &str = "Page settlement was not confirmed.";
 
 /// Make channel 1's reader declare content/v1, so its replies arrive as the
@@ -4082,7 +4082,7 @@ async fn the_settlement_note_prints_on_a_tabs_first_read_after_each_claim() {
         second_text.contains("Go"),
         "the page itself still prints: {second_text}"
     );
-    // Only the text line goes: both structured replies say the settlement
+    // Only the settlement text lines go: both structured replies say the settlement
     // was not observed, and apart from the snapshot's identity they match.
     for reply in [&first, &second] {
         let structured = &reply["structuredContent"];

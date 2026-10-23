@@ -376,7 +376,8 @@ struct State {
     /// claimed. Settlement is never observed on the person's browser, so the
     /// text of later replies about the same tab leaves the settlement note
     /// out (their `settled` field still says it). A route whose reader takes
-    /// the raw JSON reply shows no text, but its replies count too.
+    /// the raw JSON reply gets no separate text projection, but its replies
+    /// count too.
     settlement_noted: BTreeSet<String>,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: Vec<String>,
@@ -1533,9 +1534,9 @@ async fn serve_scoped(
 
 /// Print the settlement note once per claimed tab. Settlement is never
 /// observed on the person's browser, so every read of a tab reports
-/// `settled: false`; the first such reply after the tab is claimed says so in
-/// its text, and later replies about the same tab ask the text projection to
-/// leave the note out. The reply itself is not changed.
+/// `settled: false`. Where a text projection is made, the first such reply
+/// after the tab is claimed carries the note and later ones leave it out;
+/// raw-JSON replies count toward this too. The reply itself is not changed.
 fn note_settlement_once(target: &UserBrowser, reply: &Value) {
     if reply["settled"] != false {
         return;

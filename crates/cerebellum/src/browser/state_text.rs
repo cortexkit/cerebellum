@@ -88,11 +88,12 @@ pub const ROW_BYTES: usize = 300;
 // A filtered match on a page that lists repeated items without a table (an
 // app list with an icon, a name and a `Configure` link per item, all inside
 // unlabelled containers) prints with its "row block": the nearest enclosing
-// element that holds both a control and a text or label, so a name prints
-// with the link that acts on it and the link with the name it belongs to.
-// The block uses the same size bound as a joined row, [`ROW_LEAVES`] leaves
-// and [`ROW_BYTES`] bytes of leaf text. The bound keeps a block small; it does
-// not prove the block is one item, since an unlabelled container holding two
+// element that holds a control and a label outside any control (a name with a
+// letter or digit), so a name prints with the link that acts on it and the
+// link with the name it belongs to. The block uses the same limits as a joined
+// row, [`ROW_LEAVES`] leaves and [`ROW_BYTES`] bytes of leaf text. They bound
+// the leaves, not every printed element or container name, and they do not
+// prove the block is one item, since an unlabelled container holding two
 // small items can still qualify. The search stops at landmarks (a list, a
 // region) and table parts, so a block is never a whole list or table. See
 // `Tree::row_block`.
@@ -329,9 +330,9 @@ fn is_text_field(role: &str) -> bool {
     matches!(role, "textbox" | "searchbox" | "combobox")
 }
 
-/// The parts of a table. A filtered match inside a table keeps the joined
-/// table-row line (see `Tree::leaf_row`), so the search for a row block
-/// stops at any of them.
+/// The parts of a table. A filtered match inside a table keeps the existing
+/// table behaviour (a joined row where `Tree::leaf_row` accepts one), so the
+/// search for a row block stops at any of them.
 fn is_table_part(role: &str) -> bool {
     matches!(
         role,
@@ -480,8 +481,8 @@ impl Line {
 enum FilterRow {
     /// The node's leaf texts joined on one line (see `Tree::leaf_row`).
     Joined(String),
-    /// The node's whole subtree, one element per line, each with its ref
-    /// (see `Tree::row_block`).
+    /// The node's printed subtree, one element per line, each with the ref it
+    /// has (see `Tree::row_block`).
     Block,
 }
 
@@ -905,8 +906,9 @@ impl<'a> Tree<'a> {
 
     /// Whether `node`'s subtree is a row block for the match `matched` (see
     /// `row_block`), or `None` when it is too large or holds a landmark or a
-    /// table part. A text inside a control is that control's label, not a
-    /// separate text, so it does not count as one.
+    /// table part. For qualifying, a text inside a control is that control's
+    /// label, not a separate label; it still counts toward the leaf and byte
+    /// limits.
     fn is_row_block(&self, node: usize, matched: usize) -> Option<bool> {
         // Each entry: the node, whether it lies inside the match, and whether
         // it lies inside a control.

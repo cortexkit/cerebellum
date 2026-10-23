@@ -471,9 +471,9 @@ pub(super) fn body(object: &Map<String, Value>) -> Option<String> {
 
 /// Every fact line for a reply, in reading order: what happened, the
 /// remedy, then the few facts the next call needs. `settlement_note` false
-/// leaves out the lines saying page settlement was not confirmed, which the
-/// person's browser repeats on every read of a tab (see
-/// `super::omit_settlement_note`).
+/// leaves out the lines saying page settlement was not confirmed, which would
+/// otherwise print for every person's-browser reply reporting `settled:
+/// false` (see `super::omit_settlement_note`).
 pub(super) fn facts(
     object: &Map<String, Value>,
     login_notice: Option<String>,
