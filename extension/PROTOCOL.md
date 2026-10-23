@@ -56,6 +56,23 @@ chunk 5 seconds, detach/cancellation 2 seconds. The bridge owns its FIFO queue;
 overlapping extension invocations refuse as `action_busy` rather than forming a
 second hidden queue.
 
+Attach rejections retain the `debugger_busy` machine code for compatibility;
+their `remedy` distinguishes another debugger, a missing tab, a restricted page,
+and an unknown Chrome rejection. An unknown rejection quotes at most 200
+characters of Chrome's message. The attach deadline remains `attach_deadline`,
+and its remedy names the 5-second deadline rather than suggesting DevTools is
+open. Refusal JSON also carries `attach_failure` (`rejection` or `deadline`) and
+`attach_reason`; cerebellum currently forwards only the reason and remedy.
+An existing pending attach refuses before contacting Chrome, with the separate
+remedy to wait for debugger cleanup.
+
+On Chrome's already-attached rejection, another attached active plan on the tab
+is never disturbed. Otherwise the extension probes with `debugger.detach`,
+which can detach only its own session. A successful probe permits one attach
+retry; a rejected probe identifies another holder and permits no retry. The
+probe and retry share the attach deadline, and cancellation prevents a late
+probe from starting a new attach.
+
 ## Closed plans
 
 All plans have `version:2` (the native socket envelope remains protocol 1). Unknown plan/command fields refuse. Optional fields

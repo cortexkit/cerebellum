@@ -7,4 +7,4 @@
 // plan, reply or refusal shape changes. The manifest `version` cannot serve
 // here: Chrome keeps running whatever unpacked copy it loaded, and an old copy
 // can carry the same `version` as a new one.
-export const EXTENSION_REVISION = 2;
+export const EXTENSION_REVISION = 3;

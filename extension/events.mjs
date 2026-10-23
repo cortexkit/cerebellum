@@ -42,6 +42,13 @@ export class BrowserEvents {
       this.tabs.withdraw(tabId);
       for (const [windowId, active] of this.activeTabs) if (active === tabId) this.activeTabs.delete(windowId);
     });
+    this.chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
+      // Prerender activation can replace a tab without an onRemoved event.
+      // Revoke the old identity and its plan before adopting eligible members.
+      this.tabs.withdraw(removedTabId);
+      for (const [windowId, active] of this.activeTabs) if (active === removedTabId) this.activeTabs.delete(windowId);
+      void this.tabs.reconcile("tabs.onReplaced").catch(error => this.handoverFailed(removedTabId, error));
+    });
     this.chrome.tabGroups.onRemoved.addListener(group => {
       if (group.id !== this.tabs.group?.id) return;
       for (const tabId of [...this.tabs.tabs.keys()]) this.tabs.withdraw(tabId);
