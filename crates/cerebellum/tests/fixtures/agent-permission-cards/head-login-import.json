@@ -32,7 +32,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Copy your x.com login from a browser on this Mac into the agent's browser.",
+  "prompt": "Copy your x.com login from a browser on this computer into the agent's browser.",
   "requester_ref": "pf:card-golden",
   "scope": {
     "origin": "https://x.com"

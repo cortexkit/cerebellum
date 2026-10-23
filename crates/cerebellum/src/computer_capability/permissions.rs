@@ -47,7 +47,7 @@ pub(super) fn refusal(
             "restart cerebellum to use the permission already granted to ck-cerebellum".to_string()
         } else {
             format!(
-                "grant {label} to ck-cerebellum in System Settings > Privacy & Security, then \
+                "On macOS, grant {label} to ck-cerebellum in System Settings > Privacy & Security, then \
                  restart cerebellum; permission readings are taken only at startup"
             )
         };

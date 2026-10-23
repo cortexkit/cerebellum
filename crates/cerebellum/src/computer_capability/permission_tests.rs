@@ -278,6 +278,7 @@ mod wire {
             if state == PermissionLiveness::GrantedPendingRelaunch {
                 assert!(!remedy.contains("System Settings"), "{reply}");
             } else {
+                assert!(remedy.starts_with("On macOS, grant "), "{reply}");
                 assert!(
                     remedy.contains("System Settings") && remedy.contains("ck-cerebellum"),
                     "{reply}"

@@ -539,7 +539,7 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
                     Some("different_keychain_item") => "can't be copied (different keychain)",
                     Some("session_only") if b.session_rows > 0 => "only a temporary login is saved",
                     Some("session_only") => "nothing saved",
-                    Some("os_protected") => "macOS protects this browser's data",
+                    Some("os_protected") => "The operating system protects this browser's data",
                     Some("unreadable") => "can't read saved logins",
                     Some("safari_transfer_unsupported") => "can't be copied from Safari",
                     _ if b.transfer == "available" => "login available",
@@ -552,7 +552,7 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
     ConsentCard {
         title: format!("Copy your {host} login?"),
         prompt: format!(
-            "Copy your {host} login from a browser on this Mac into the agent's browser."
+            "Copy your {host} login from a browser on this computer into the agent's browser."
         ),
         target: Target {
             kind: TargetKind::Site,
@@ -2384,7 +2384,10 @@ mod tests {
         }
         let card = plan.question("agent");
         for fact in card["params"]["facts"].as_array().unwrap().iter().take(2) {
-            assert_eq!(fact["value"], "macOS protects this browser's data");
+            assert_eq!(
+                fact["value"],
+                "The operating system protects this browser's data"
+            );
         }
         assert!(!marker.exists(), "SQLite must not run on a denied store");
 

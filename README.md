@@ -38,7 +38,7 @@ browser profile, so a login a human sets up once persists across sessions.
 
 **Computer plane** — macOS screen capture and semantic actuation through the
 accessibility API. Three capabilities are served: screenshot (with window-local
-region capture), wait, and click. Capture and actuation additionally require
+region capture), wait, and click. On macOS, capture and actuation additionally require
 attestations bound at compile time by `scripts/release-build.sh`, so a
 development build advertises only what it can prove it is allowed to serve.
 Synthetic input — typing, key presses, scrolling, dragging — is deliberately

@@ -90,7 +90,7 @@ where
             Ok(app) => app,
             Err(mut reply) => {
                 if !listed.complete && reply["outcome"] == "no_installed_app_named" {
-                    reply["remedy"] = json!("the application may be in the unreadable part of the installed inventory; restore access and retry, or use the exact name or bundle identity of an app shown by list_apps");
+                    reply["remedy"] = json!("the application may be in the unreadable part of the installed inventory; restore access and retry, or use the exact name or app identity (a bundle id on macOS) of an app shown by list_apps");
                 }
                 return reply;
             }
@@ -120,7 +120,7 @@ where
             .ok()
             .and_then(Result::ok);
         let Some(identity) = identity else {
-            return json!({"outcome":"consent_unavailable", "detail":{"reason":"app_identity_unreadable","grant":"app","grant_label":app.name}, "remedy":"the installed application must carry a valid, non-ad-hoc signature before it can be launched"});
+            return json!({"outcome":"consent_unavailable", "detail":{"reason":"app_identity_unreadable","grant":"app","grant_label":app.name}, "remedy":"On macOS, the installed application must carry a valid, non-ad-hoc signature before it can be launched"});
         };
         let history_key = AppKey::verified(&app.bundle_identity, &identity);
         let need = GrantNeed::App {
@@ -146,7 +146,7 @@ where
             .computer_grants()
             .holds(&context.consent.caller, &need)
         {
-            return json!({"outcome":"consent_unavailable", "remedy":"the bundle changed after approval; retry to approve its current signer"});
+            return json!({"outcome":"consent_unavailable", "remedy":"the application changed after approval; retry to approve its current signer"});
         }
         if context.cancel.is_cancelled() {
             return json!({"outcome":"cancelled"});
@@ -246,10 +246,10 @@ where
                 "pid": opened.pid, "has_window": opened.has_window, "frontmost": opened.frontmost,
             }),
             Err(OpenAppError::TimedOut) => {
-                json!({"outcome":"launch_failed", "remedy":format!("LaunchServices did not return a process within its {} ms process wait; list_apps before retrying because the application may still start", bounds.process_timeout.as_millis())})
+                json!({"outcome":"launch_failed", "remedy":format!("On macOS, LaunchServices did not return a process within its {} ms process wait; list_apps before retrying because the application may still start", bounds.process_timeout.as_millis())})
             }
             Err(OpenAppError::Failed) => {
-                json!({"outcome":"launch_failed", "remedy":"LaunchServices could not open the application; list_apps before retrying because the application may still start"})
+                json!({"outcome":"launch_failed", "remedy":"On macOS, LaunchServices could not open the application; list_apps before retrying because the application may still start"})
             }
         };
         // Foreground mode brings the opened application to the front through
@@ -372,7 +372,7 @@ fn admit_url(url: &str, registered: &[String], bundle: &str) -> Result<(), Value
         return Ok(());
     }
     Err(
-        json!({"outcome":"url_scheme_refused", "scheme":scheme, "target":bundle, "remedy":format!("scheme {scheme:?} is forbidden or not declared by {bundle}'s CFBundleURLTypes; use a registered app page address")}),
+        json!({"outcome":"url_scheme_refused", "scheme":scheme, "target":bundle, "remedy":format!("On macOS, scheme {scheme:?} is forbidden or not declared by {bundle}'s CFBundleURLTypes; use a registered app page address")}),
     )
 }
 
@@ -395,10 +395,10 @@ pub(super) fn resolve_installed(
     match matches.as_slice() {
         [app] => Ok((*app).clone()),
         [] => Err(
-            json!({"outcome":"no_installed_app_named", "target":wanted, "remedy":"list_apps shows installed applications; use an exact name or bundle identity"}),
+            json!({"outcome":"no_installed_app_named", "target":wanted, "remedy":"list_apps shows installed applications; use an exact name or app identity (a bundle id on macOS)"}),
         ),
         _ => Err(
-            json!({"outcome":"ambiguous_app", "target":wanted, "candidates":matches.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity})).collect::<Vec<_>>(), "remedy":"several installed bundles match; use a unique bundle identity (duplicate installations must be removed or renamed)"}),
+            json!({"outcome":"ambiguous_app", "target":wanted, "candidates":matches.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity})).collect::<Vec<_>>(), "remedy":"several installed applications match; use a unique app identity (a bundle id on macOS; duplicate installations must be removed or renamed)"}),
         ),
     }
 }

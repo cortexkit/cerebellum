@@ -1,6 +1,6 @@
 # Hardened runtime
 
-`ck-cerebellum` is signed with hardened runtime (`codesign --options runtime`)
+On macOS, `ck-cerebellum` is signed with hardened runtime (`codesign --options runtime`)
 and no entitlements. Without it, or with `com.apple.security.get-task-allow`,
 any other program running as the same user can attach a debugger to the
 module and read its memory, including the launch secret it holds. `lldb -p`
@@ -53,7 +53,7 @@ per-user `$TMPDIR` hangs on macOS 27. The identifier differs from
 binary's permission grants.
 
 ```sh
-# From the repository root.
+# On macOS, from the repository root.
 cargo build -p cerebellum --example live_launch
 
 PROBE=/tmp/ck-hardened-launch-probe
