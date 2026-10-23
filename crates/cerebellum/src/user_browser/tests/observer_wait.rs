@@ -9,8 +9,13 @@ use super::*;
 async fn snapshot_waits_for_an_observer_that_arrives_late() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
+    // Establish the site grant before freezing time: its initial card writes
+    // the fixture's registry. Subsequent reads use only the in-memory bridge
+    // and Tokio sleeps, so auto-advance cannot race a blocking worker.
+    fixture.snapshot(1, &tab, "allow_30m").await;
     let plans = fixture.state.lock().unwrap().plan_count;
     fixture.state.lock().unwrap().observer_unavailable_reads = 3;
+    tokio::time::pause();
     let start = tokio::time::Instant::now();
     let (read, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(read["outcome"], "ok", "{read}");

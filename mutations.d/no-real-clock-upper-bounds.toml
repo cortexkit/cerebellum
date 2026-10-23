@@ -1,0 +1,146 @@
+[[control]]
+id = "observer-success-does-not-wait-out-the-bound"
+guards = "a late observer yields a successful snapshot before the observer wait expires, measured only on paused Tokio time"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "if observed.observer_available || now >= bound {"
+new = "if observed.observer_available { tokio::time::sleep(OBSERVER_WAIT).await; } // NON-VACUITY BREAK\n                if observed.observer_available || now >= bound {"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/observer_wait.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::observer_wait::snapshot_waits_for_an_observer_that_arrives_late"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "async fn observed_document(&self, tab: &str) -> Result<Document, Value> {"
+before = "async fn serve_inner("
+
+[[control]]
+id = "blocked-cursor-geometry-must-reach-a-decision"
+guards = "a held geometry read is discarded at its deadline without waiting for the worker or drawing a badge"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "tokio::time::timeout(READ_BUDGET, read).await"
+new = "Ok::<_, tokio::time::error::Elapsed>(read.await) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::cursor_geometry_deadline_discards_late_reads_without_blocking_actions"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn schedule_with_fallback("
+before = "async fn draw_on_screen("
+
+[[control]]
+id = "ended-cursor-picture-cannot-return"
+guards = "geometry completed after end cannot redraw the badge, even when the geometry deadline has not advanced"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = ".is_some_and(|ended| event.serial < *ended)"
+new = ".is_some_and(|ended| event.serial < *ended && false) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::a_picture_scheduled_before_an_end_does_not_bring_the_badge_back"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn send_unless_ended(&self, mut event: CursorEvent) -> Option<Sent> {"
+before = "fn send_awaited("
+
+[[control]]
+id = "gone-cursor-window-sends-no-follow"
+guards = "a synchronous gone-window callback must not move the badge"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "if change == WindowChange::Gone {"
+new = "if change == WindowChange::Gone { self.send_line(CursorLine::Follow(CursorFollow { agent: agent.to_owned(), serial: follow.serial, offset: [1.0, 1.0] })); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::a_window_move_moves_the_badge_with_its_element"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {"
+before = "pub(crate) fn end_route("
+
+[[control]]
+id = "released-cursor-watch-sends-no-follow"
+guards = "a callback from a released window watch cannot move the badge"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "// A watch already replaced or removed; its report is stale."
+new = "if follows.is_empty() { self.send_line(CursorLine::Follow(CursorFollow { agent: agent.to_owned(), serial: 0, offset: [1.0, 1.0] })); } // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::a_window_move_moves_the_badge_with_its_element"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {"
+before = "pub(crate) fn end_route("
+
+[[control]]
+id = "replaced-cursor-watch-sends-no-follow"
+guards = "a callback from the replaced watch cannot move the badge's new target"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "// A watch already replaced or removed; its report is stale."
+new = "if !follows.is_empty() { self.send_line(CursorLine::Follow(CursorFollow { agent: agent.to_owned(), serial: 0, offset: [1.0, 1.0] })); } // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::the_window_watch_is_removed_on_hide_and_replaced_on_a_new_target"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {"
+before = "pub(crate) fn end_route("
+
+[[control]]
+id = "hidden-cursor-watch-sends-no-follow"
+guards = "a callback from a hidden badge's watch cannot move that badge"
+file = "crates/cerebellum/src/computer_capability/cursor.rs"
+old = "// A watch already replaced or removed; its report is stale."
+new = "if follows.is_empty() { self.send_line(CursorLine::Follow(CursorFollow { agent: agent.to_owned(), serial: 0, offset: [1.0, 1.0] })); } // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/cursor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::cursor::tests::the_window_watch_is_removed_on_hide_and_replaced_on_a_new_target"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {"
+before = "pub(crate) fn end_route("

@@ -2176,35 +2176,6 @@ mod tests {
     use cerebellum_computer::cursor::MAX_FRAME_BYTES;
 
     /// Geometry that takes the given time to read.
-    struct SlowGeometry(Duration);
-    impl AppStateSource for SlowGeometry {
-        fn read_app_state(
-            &self,
-            _: &ProcessGrant,
-            _: cerebellum_computer::app_state::source::ReadBounds,
-        ) -> Result<
-            cerebellum_computer::app_state::source::RawAppState,
-            cerebellum_computer::app_state::source::AppStateReadError,
-        > {
-            Err(cerebellum_computer::app_state::source::AppStateReadError::Unreadable)
-        }
-        fn cursor_label(&self, _: &ElementHandle) -> Option<(Option<String>, bool)> {
-            Some((Some("Send".into()), false))
-        }
-        fn cursor_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
-            std::thread::sleep(self.0);
-            Some([0.0, 0.0, 10.0, 10.0])
-        }
-        fn visible_cursor_point(
-            &self,
-            _: &ProcessGrant,
-            p: Option<[f64; 2]>,
-            _: Option<[f64; 4]>,
-        ) -> Option<[f64; 2]> {
-            p
-        }
-    }
-
     /// Keeps an AX read blocked until the test releases it, without sleeping on
     /// the runtime thread that schedules the cursor update.
     struct HeldGeometry {
@@ -2285,14 +2256,14 @@ mod tests {
                         .handle,
                 ),
                 None,
-            );
+            )
         });
         let scheduled = tokio::time::timeout(HANG_GUARD, scheduling).await;
         if scheduled.is_err() {
             let _ = release_tx.send(());
             panic!("scheduling waited for the blocked geometry read");
         }
-        scheduled.unwrap().unwrap();
+        let arrival = scheduled.unwrap().unwrap();
         tokio::time::timeout(HANG_GUARD, started_rx)
             .await
             .expect("the geometry worker never started")
@@ -2302,18 +2273,39 @@ mod tests {
             .expect("the runtime stopped dispatching while geometry was blocked")
             .unwrap();
         assert_eq!(runtime_work, "completed");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), receiver.recv())
-                .await
-                .is_err(),
-            "late geometry must not reach the helper"
-        );
+        // The geometry is still held. Its decision must finish without a
+        // picture, rather than merely leaving the helper quiet for a while.
+        assert!(receiver.try_recv().is_err());
+        let decision = arrival.decision.expect("a scheduled geometry decision");
+        tokio::time::timeout(HANG_GUARD, async {
+            tokio::select! {
+                result = decision => assert!(result.is_err(), "a timed-out read drops its decision"),
+                line = receiver.recv() => panic!("late geometry reached the helper: {line:?}"),
+            }
+        })
+        .await
+        .expect("the blocked geometry read never reached its deadline");
         release_tx.send(()).unwrap();
         tokio::time::timeout(HANG_GUARD, finished_rx)
             .await
             .expect("the released geometry worker did not finish")
             .unwrap();
         assert!(receiver.try_recv().is_err(), "a late picture was sent");
+    }
+
+    /// Await a worker without letting an idle runtime advance paused time past
+    /// its geometry deadline. Real time is used only to detect a hung test.
+    async fn frozen_step<F: Future>(step: F) -> F::Output {
+        tokio::pin!(step);
+        let start = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut step => return result,
+                () = tokio::task::yield_now() => {}
+            }
+            assert!(start.elapsed() < HANG_GUARD, "the frozen step hung");
+        }
     }
 
     /// No action waits past the cap after its picture was scheduled: not
@@ -2417,16 +2409,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_picture_scheduled_before_an_end_does_not_bring_the_badge_back() {
         let (cursor, mut receiver) = Coordinator::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let geometry = Arc::new(HeldGeometry {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            finished: std::sync::Mutex::new(Some(finished_tx)),
+        });
         let schedule = || {
             cursor.schedule(
                 Identity::for_test("agent-a", None, None),
                 CursorKind::Press,
                 grant(),
-                // Well inside the read budget, so the picture would be sent.
-                Arc::new(SlowGeometry(Duration::from_millis(20))),
+                geometry.clone(),
                 Some(
                     cerebellum_computer::app_state::source::RawElement::fixture(1, "AXButton")
                         .handle,
@@ -2435,23 +2434,28 @@ mod tests {
                 Some([1.0, 1.0]),
             )
         };
-        schedule();
+        let arrival = schedule();
+        frozen_step(started_rx).await.unwrap();
         cursor.end("agent-a");
-        let hide = tokio::time::timeout(HANG_GUARD, receiver.recv())
-            .await
-            .expect("end sends a hide at once")
-            .unwrap();
+        let hide = receiver.try_recv().expect("end sends a hide synchronously");
         assert_eq!(hidden(hide), "agent-a");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), receiver.recv())
-                .await
-                .is_err(),
-            "the read that finished after the end must not redraw the badge"
-        );
+        release_tx.send(()).unwrap();
+        frozen_step(finished_rx).await.unwrap();
+        // Keep Tokio time frozen while the blocking worker completes, so the
+        // geometry deadline cannot expire and discard the read before the
+        // ended-agent check suppresses its picture.
+        let decision = arrival.decision.expect("a scheduled geometry decision");
+        frozen_step(async {
+            tokio::select! {
+                result = decision => assert!(matches!(result, Ok(None))),
+                line = receiver.recv() => panic!("the ended badge was redrawn: {line:?}"),
+            }
+        })
+        .await;
+        assert!(receiver.try_recv().is_err());
         schedule();
-        let picture = tokio::time::timeout(HANG_GUARD, receiver.recv())
+        let picture = frozen_step(receiver.recv())
             .await
-            .unwrap()
             .unwrap()
             .picture()
             .expect("an action after the end draws the badge again");
@@ -2754,10 +2758,10 @@ mod tests {
             .unwrap()
     }
 
-    async fn no_line(receiver: &mut mpsc::Receiver<CursorLine>, why: &str) {
-        if let Ok(Some(line)) =
-            tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await
-        {
+    fn no_line(receiver: &mut mpsc::Receiver<CursorLine>, why: &str) {
+        // FollowGeometry::fire runs the callback, including its helper send,
+        // synchronously. There is no producer left to wait for after it returns.
+        if let Ok(line) = receiver.try_recv() {
             panic!("{why}: got {line:?}");
         }
     }
@@ -2810,10 +2814,10 @@ mod tests {
         // The window closes: nothing is sent, so the badge stays where it
         // last was, and the watch is released.
         geometry.fire(0, WindowChange::Gone);
-        no_line(&mut receiver, "a closed window moved the badge").await;
+        no_line(&mut receiver, "a closed window moved the badge");
         assert_eq!(geometry.live(), 0, "the closed window's watch was kept");
         geometry.fire(0, WindowChange::Moved);
-        no_line(&mut receiver, "a released watch still reported").await;
+        no_line(&mut receiver, "a released watch still reported");
     }
 
     #[tokio::test]
@@ -2849,14 +2853,14 @@ mod tests {
         .await;
         FollowGeometry::shift(&geometry.window_frame, [5.0, 5.0, 0.0, 0.0]);
         geometry.fire(0, WindowChange::Moved);
-        no_line(&mut receiver, "the replaced watch moved the badge").await;
+        no_line(&mut receiver, "the replaced watch moved the badge");
 
         // The turn ends: the badge hides and its window is no longer watched.
         cursor.end(AGENT);
         assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
         assert_eq!(geometry.live(), 0, "the hidden badge's watch was kept");
         geometry.fire(1, WindowChange::Moved);
-        no_line(&mut receiver, "a hidden badge was moved").await;
+        no_line(&mut receiver, "a hidden badge was moved");
     }
 
     #[test]
