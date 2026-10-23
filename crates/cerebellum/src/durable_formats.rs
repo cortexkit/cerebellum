@@ -38,6 +38,9 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         crate::profile::REGISTRY_FORMAT,
         crate::browser_signed_in::SIGNED_IN_FORMAT,
         crate::profile_custody::CUSTODY_LOCK_FORMAT,
+        // A separate tree keeps rollback to builds predating this optional
+        // store a plain swap: their staging gate ignores this tree's floor.
+        crate::private_content::PRIVATE_CONTENT_FORMAT,
     ]
 }
 

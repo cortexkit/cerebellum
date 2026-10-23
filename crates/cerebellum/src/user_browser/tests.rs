@@ -1798,6 +1798,10 @@ async fn handed_tab_claims_refs_and_snapshots_are_route_tab_and_epoch_scoped() {
         .await;
     assert_eq!(held["reason"], "tab_already_claimed");
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(
+        crate::private_content_marks_tests::query(&fixture.planes, "card-tests").await,
+        json!({"private_content":true,"sources":["person_browser"]})
+    );
     let reference = reference(&snapshot, "Go");
     let (other, _) = fixture
         .call(

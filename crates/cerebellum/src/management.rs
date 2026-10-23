@@ -78,7 +78,7 @@ pub const LIST_GRANTS: &str = "grants.list";
 /// only. Interim: to be replaced by a subscription to the harness module's
 /// turn-ended event, after which core's direct call goes away.
 pub const SESSION_TURN_ENDED: &str = "session.turn_ended";
-pub const OPERATIONS: [&str; 17] = [
+pub const OPERATIONS: [&str; 18] = [
     WOULD_ASK,
     OPEN_TARGET,
     LIST_APP_GRANTS,
@@ -95,6 +95,7 @@ pub const OPERATIONS: [&str; 17] = [
     LIST_GRANTS,
     crate::permissions::LIST,
     crate::permissions::REVOKE,
+    crate::private_content::QUERY,
     SESSION_TURN_ENDED,
 ];
 

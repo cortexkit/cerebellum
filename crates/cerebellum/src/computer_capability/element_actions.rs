@@ -1200,7 +1200,7 @@ pub(crate) fn settle_and_observe_view(
 /// What an action reply says when the application could not be read after
 /// the action: nothing is known of what changed, which is not "nothing
 /// changed".
-const DIFF_UNREADABLE: &str =
+pub(crate) const DIFF_UNREADABLE: &str =
     "The application could not be read after the action, so what changed is unknown; \
      read_state to see its state.\n";
 

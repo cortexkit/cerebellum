@@ -316,6 +316,26 @@ impl SignedInDomains {
         }
     }
 
+    /// A page read can include embedded documents and pixels from other sites.
+    /// Until capture provenance is complete, any login in the profile makes its
+    /// returned page content private. Incomplete history cannot prove no login.
+    pub(crate) fn has_login_evidence(&self, agent: &str, profile: &str) -> bool {
+        match self.state.lock() {
+            Ok(state) => match state.as_ref() {
+                Ok(state) => state
+                    .profiles
+                    .get(agent)
+                    .and_then(|profiles| profiles.get(profile))
+                    .is_some_and(|facts| {
+                        facts.signed_in_coverage == SignedInCoverage::Incomplete
+                            || !facts.domains.is_empty()
+                    }),
+                Err(_) => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Called only for an observed handoff login or a successful login import.
     pub fn record(&self, agent: &str, profile: &str, origin: &str) -> Result<(), String> {
         let Some(domain) = Self::domain(origin) else {

@@ -6128,7 +6128,7 @@ async fn typed_text_never_reaches_the_call_records() {
 // ---------------------------------------------------------------------------
 
 const SCOPE_OWNER: &str = "reserved:prefrontal-core";
-const SCOPE_CARRIER: &str = "reserved:broca";
+const SCOPE_CARRIER: &str = "reserved:prefrontal-routing";
 
 fn scope_stamp(scope_epoch: u64, owner_authorized: bool) -> subc_protocol::scope::ScopeStamp {
     subc_protocol::scope::ScopeStamp::new(
@@ -6725,7 +6725,13 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
 /// scope s-1 at epoch 4, and the carrier's own answer for it.
 async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Receiver<Frame>, Value) {
     let (planes, _launcher) = blocking_grant_fixture().await;
-    bind_route(&planes, 10, reserved("broca"), Some(scope_stamp(4, true))).await;
+    bind_route(
+        &planes,
+        10,
+        reserved("prefrontal-routing"),
+        Some(scope_stamp(4, true)),
+    )
+    .await;
     let (tx, mut rx) = mpsc::channel(8);
     // Broca may not act in a conversation, so the call is refused before
     // dispatch; it is still a call recorded under the scope.
@@ -8352,7 +8358,7 @@ async fn scope_admission_requires_core_owner() {
 }
 #[tokio::test]
 async fn scope_admission_requires_core_route_principal() {
-    assert_scope_unattested(admission_stamp(), reserved("broca")).await;
+    assert_scope_unattested(admission_stamp(), reserved("prefrontal-routing")).await;
 }
 #[tokio::test]
 async fn scope_admission_excludes_flow_scopes() {
@@ -8878,7 +8884,7 @@ async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
 async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
     for (principal, owner, authorized) in [
         ("prefrontal-core", "prefrontal-core", true),
-        ("broca", "prefrontal-core", true),
+        ("prefrontal-routing", "prefrontal-core", true),
     ] {
         let (planes, launcher) = flow_planes();
         let mut stamp = flow_stamp();

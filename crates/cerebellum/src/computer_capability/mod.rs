@@ -93,6 +93,7 @@ use tokio::sync::Mutex;
 mod app_use;
 pub mod cursor;
 mod element_actions;
+pub(crate) use element_actions::DIFF_UNREADABLE;
 mod fronting;
 #[cfg(test)]
 mod fronting_tests;

@@ -83,10 +83,13 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
         browser_exit_observation_deadline_ms: 1000,
         navigation_settle_deadline_ms: 1000,
     };
-    let mut planes = Planes::with_browser_config_journaling(
+    let signed_in = Arc::new(cerebellum::browser_signed_in::SignedInDomains::default());
+    let mut planes = Planes::with_browser_state(
         Arc::new(HealthState::new()),
         Some(config.clone()),
         JournalPersistence::Isolated,
+        None,
+        Some(Arc::clone(&signed_in)),
     );
     let (writer, mut output) = tokio::sync::mpsc::channel(8);
     let frame = |args: Value, corr| {
@@ -110,6 +113,13 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
         .unwrap();
         output.recv().await.unwrap();
         let facts = planes.routes.accepted_bind_for_test(7, 1).unwrap();
+        signed_in
+            .record(
+                &facts.identity.agent_project_id,
+                &cerebellum::browser_signed_in::SignedInDomains::profile_name(&facts.identity),
+                "https://accounts.example.net",
+            )
+            .unwrap();
         assert!(matches!(
             planes
                 .sessions
@@ -163,6 +173,56 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
             "ok",
             "snapshot success fixture"
         );
+        let scope = planes
+            .routes
+            .accepted_bind_for_test(7, 1)
+            .unwrap()
+            .identity
+            .conversation_key;
+        let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
+            route_channel: 9,
+            epoch: 1,
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            identity: subc_protocol::BindIdentity::new("/fixture", "fixture", "session"),
+            admission_facts: None,
+            consumer_capabilities: None,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "cerebellum".into(),
+            },
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        for (channel, body) in [
+            (0, serde_json::to_value(bind).unwrap()),
+            (
+                9,
+                json!({"method":"private_content.query", "params":{"scope_ref":scope}}),
+            ),
+        ] {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                if channel == 0 { 0 } else { 1 },
+                3,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            cerebellum::handle_frame_for_test(frame, &writer, &planes)
+                .await
+                .unwrap();
+            let reply = output.recv().await.unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response);
+            if channel == 9 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&reply.body).unwrap(),
+                    json!({"private_content":true,"sources":["signed_in_site"]})
+                );
+            }
+        }
     }
     response
 }
