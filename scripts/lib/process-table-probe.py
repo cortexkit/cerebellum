@@ -10,11 +10,13 @@ whoever runs it), then the arguments of this user's own processes, through
 binary's descendants, which they find with `/bin/ps -A -o pid=,ppid=`
 (`ScopedTable` in browser_launch_service.rs). A worker sandbox refuses
 `/bin/ps` even where the reading itself works, and those tests then fail with
-`process_table_unreadable`. This probe makes the same two reads for every
-process, in the same order, with the same retry (it checks only that an
-argument answer arrived, where launch recovery also parses it), and runs the
-same `ps` command. When either fails, the gate skips the
-launch_recovery_clear tests and says so.
+`process_table_unreadable`. This probe checks the same owner and argument
+facts, in the same order and with the same retry, and runs the same `ps`
+command. It differs in two ways: it scans every process rather than only a
+test binary's descendants, so it can be stricter than the scoped tests, and it
+checks only that an argument answer arrived, where launch recovery also parses
+it. When either check fails, the gate skips the launch_recovery_clear tests
+and prints a NOT VERIFIED line.
 
 Exit 0 when the table is readable, 1 when it is not.
 """
@@ -89,8 +91,8 @@ def readable(pids, owner, arguments, this_user, retry_window=1.0, pause=0.02):
 
 
 def ps_lists_parents(run=subprocess.run):
-    """Whether `/bin/ps -A -o pid=,ppid=` lists processes with their parents,
-    the way the tests' `ScopedTable` reads it."""
+    """Whether `/bin/ps -A -o pid=,ppid=` succeeds and lists at least one
+    process, each row exactly a numeric pid and a numeric parent pid."""
     try:
         result = run(["/bin/ps", "-A", "-o", "pid=,ppid="],
                      capture_output=True, text=True, timeout=10)
@@ -196,8 +198,8 @@ def self_test():
         return ps_lists_parents(run)
 
     assert ps()
-    # A sandbox that refuses ps, or a ps that fails or prints something else,
-    # leaves the tests' scoping unreadable.
+    # A sandbox that refuses ps, a ps that fails, or a listing this probe
+    # cannot parse each count as unreadable.
     assert not ps(error=PermissionError(1, "Operation not permitted"))
     assert not ps(returncode=1)
     assert not ps(stdout="")
