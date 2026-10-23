@@ -5660,6 +5660,21 @@ pub(crate) fn validate_user_browser_result(
     action: &str,
     result: &Value,
 ) -> Result<(), CapabilityResultValidationError> {
+    let schema = user_browser_result_schema(action);
+    let mut violations = Vec::new();
+    collect_result_violations(&schema, result, "$", &mut violations);
+    violations.sort();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CapabilityResultValidationError::ReplyViolations {
+            capability_id: format!("browser:user:{action}"),
+            violations,
+        })
+    }
+}
+
+pub(crate) fn user_browser_result_schema(action: &str) -> Value {
     let mut schema = if matches!(action, "revoke_access" | crate::management::REVOKE_ACCESS) {
         let mut schema = revoke_access_result_schema();
         schema["properties"]["browser"] = enum_schema(&["user"]);
@@ -5710,17 +5725,7 @@ pub(crate) fn validate_user_browser_result(
     };
     let embedded = schema.clone();
     schema["properties"]["read_page"] = embedded;
-    let mut violations = Vec::new();
-    collect_result_violations(&schema, result, "$", &mut violations);
-    violations.sort();
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(CapabilityResultValidationError::ReplyViolations {
-            capability_id: format!("browser:user:{action}"),
-            violations,
-        })
-    }
+    schema
 }
 
 fn parse_severity(object: &Map<String, Value>) -> Result<Severity, BrowserError> {

@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cerebellum_core::format_floor::{DurableFormat, FormatFloor};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub(crate) const QUERY: &str = "private_content.query";
 pub(crate) const CAPABILITY: &str = "private-content-marks/v1";
 pub const PRIVATE_CONTENT_FORMAT: DurableFormat = DurableFormat::new("private-content-marks", 1);
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+const REFRESH_MS: u64 = 60 * 60 * 1000;
 const FILE_NAME: &str = "private-content-marks.json";
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -35,7 +37,7 @@ const SOURCES: [Source; 3] = [
     Source::SignedInSite,
 ];
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     version: u64,
@@ -44,6 +46,8 @@ struct Document {
 
 struct State {
     document: Document,
+    persisted: Document,
+    failures: u64,
 }
 
 pub(crate) struct PrivateContent {
@@ -51,9 +55,12 @@ pub(crate) struct PrivateContent {
     unreadable: AtomicBool,
     // Disk work never holds the memory lock: Broca must not wait for a platform
     // read, consent answer or filesystem write to decide where content may go.
-    writes: Mutex<()>,
+    workers: crate::blocking_permits::PermitPool,
     path: Option<PathBuf>,
     floor: FormatFloor,
+    write_deadline_ms: AtomicU64,
+    #[cfg(test)]
+    pub(crate) write_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl PrivateContent {
@@ -64,11 +71,16 @@ impl PrivateContent {
                     version: PRIVATE_CONTENT_FORMAT.version,
                     ..Document::default()
                 },
+                persisted: Document::default(),
+                failures: 0,
             }),
             unreadable: AtomicBool::new(false),
-            writes: Mutex::new(()),
+            workers: crate::blocking_permits::PermitPool::new(1),
             path: None,
             floor: FormatFloor::isolated(),
+            write_deadline_ms: AtomicU64::new(crate::budgets::PRIVATE_CONTENT_WRITE.cap_ms),
+            #[cfg(test)]
+            write_hook: Mutex::new(None),
         }
     }
 
@@ -129,6 +141,7 @@ impl PrivateContent {
                 Err(_) => store.unreadable.store(true, Ordering::Release),
             }
             prune(&mut state.document, crate::wall_clock_ms());
+            state.persisted = state.document.clone();
         }
         store
     }
@@ -139,6 +152,21 @@ impl PrivateContent {
         } else {
             "loaded"
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_idle(&self) -> bool {
+        self.workers.available() == 1
+    }
+
+    /// A shared build server's disk can take longer than the production
+    /// deadline to sync while it flushes build output. Tests of durability,
+    /// rather than of the deadline, lengthen it so they cannot flake into the
+    /// fail-closed path.
+    #[cfg(test)]
+    pub(crate) fn set_write_deadline(&self, deadline: Duration) {
+        self.write_deadline_ms
+            .store(deadline.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn answer(&self, scope: &str, heads: &[String], now: u64) -> Value {
@@ -157,9 +185,12 @@ impl PrivateContent {
     }
 
     pub(crate) async fn mark(self: &Arc<Self>, scope: &str, source: Source) {
-        {
+        self.mark_at(scope, source, crate::wall_clock_ms()).await;
+    }
+
+    pub(crate) async fn mark_at(self: &Arc<Self>, scope: &str, source: Source, now: u64) {
+        let failures = {
             let mut state = self.state.lock().unwrap();
-            let now = crate::wall_clock_ms();
             prune(&mut state.document, now);
             state
                 .document
@@ -167,26 +198,67 @@ impl PrivateContent {
                 .entry(scope.to_owned())
                 .or_default()
                 .insert(source, now);
-        }
-        if self.path.is_some() {
-            let store = Arc::clone(self);
-            // Publish in memory before awaiting durability and before releasing
-            // the reply. A failed write withholds trust, not the provenance mark.
-            if tokio::task::spawn_blocking(move || store.persist())
-                .await
-                .is_err()
-            {
-                self.unreadable.store(true, Ordering::Release);
+            // Memory always holds the newest timestamp, but the file is
+            // rewritten only for a new (scope, source) pair or when the
+            // persisted timestamp is at least an hour old, so repeated reads
+            // do not each wait on the disk. After a crash a mark can therefore
+            // expire up to an hour early against its 24-hour retention.
+            let fresh = state
+                .persisted
+                .scopes
+                .get(scope)
+                .and_then(|marks| marks.get(&source))
+                .is_some_and(|saved| now.saturating_sub(*saved) < REFRESH_MS);
+            if self.path.is_none() || (fresh && !self.unreadable.load(Ordering::Acquire)) {
+                return;
             }
+            state.failures
+        };
+        // One deadline covers waiting for the single writer permit and the
+        // write itself, so a slow or hung disk delays a content reply by at
+        // most this phase. Writes are serialized by the one-permit pool: each
+        // snapshots the whole document, so a later write never loses an
+        // earlier one's marks. A hung write keeps its permit until its thread
+        // really ends; later marks wait out their deadline and fail closed
+        // without starting more blocking jobs.
+        let store = Arc::clone(self);
+        let written = tokio::time::timeout(
+            Duration::from_millis(self.write_deadline_ms.load(Ordering::Relaxed)),
+            async move {
+                let permit = store.workers.acquire().await;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    #[cfg(test)]
+                    {
+                        let hook = store.write_hook.lock().unwrap().clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    store.persist(failures)
+                })
+                .await
+            },
+        )
+        .await;
+        if !matches!(written, Ok(Ok(Ok(())))) {
+            // The reply is sent anyway; the store instead answers every
+            // query as marked until a later write succeeds.
+            self.fail_closed();
         }
     }
 
-    fn persist(&self) {
-        let _write = self.writes.lock().unwrap();
-        let bytes = {
-            let state = self.state.lock().unwrap();
-            serde_json::to_vec(&state.document).expect("marks serialize")
-        };
+    fn fail_closed(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.failures += 1;
+        self.unreadable.store(true, Ordering::Release);
+    }
+
+    /// Writes the current document atomically. `failures` is the failure
+    /// count seen when the mark that needed this write was recorded.
+    fn persist(&self, failures: u64) -> io::Result<()> {
+        let document = self.state.lock().unwrap().document.clone();
+        let bytes = serde_json::to_vec(&document).expect("marks serialize");
         let path = self.path.as_ref().expect("durable marks path");
         let directory = path.parent().expect("marks directory");
         let temporary = path.with_extension(format!(
@@ -215,8 +287,19 @@ impl PrivateContent {
         })();
         if written.is_err() {
             let _ = fs::remove_file(temporary);
+            return written;
         }
-        self.unreadable.store(written.is_err(), Ordering::Release);
+        // Recorded while still holding the writer permit, so the persisted
+        // copy always matches the newest file on disk.
+        let mut state = self.state.lock().unwrap();
+        state.persisted = document;
+        // If another mark's write failed or timed out after this mark read the
+        // failure count, this write does not clear the unreadable state; the
+        // next write, which reads the updated count, can.
+        if state.failures == failures {
+            self.unreadable.store(false, Ordering::Release);
+        }
+        Ok(())
     }
 }
 
@@ -245,7 +328,8 @@ fn carries_content(reply: &Value) -> bool {
 
 pub(crate) enum ReplyPlane {
     PersonBrowser,
-    // Linux has no computer plane, but exercises its reply boundary in tests.
+    // Linux does not enable desktop-app access in production, but tests still
+    // exercise the desktop-app reply path.
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "windows", test)),
         allow(dead_code)
@@ -365,18 +449,28 @@ pub(crate) async fn handle(
             .get("params")
             .and_then(Value::as_object)
             .ok_or(("params", "wrong_type"))?;
-        if let Some(field) = params.keys().find(|field| field.as_str() != "scope_ref") {
+        if let Some(field) = params
+            .keys()
+            .find(|field| !matches!(field.as_str(), "scope_ref" | "parent_scope_ref"))
+        {
             return Err((field.as_str(), "unknown_field"));
         }
-        match params.get("scope_ref") {
-            Some(Value::String(scope)) if !scope.is_empty() => Ok(scope.as_str()),
-            Some(Value::String(_)) => Err(("scope_ref", "empty_value")),
-            Some(_) => Err(("scope_ref", "wrong_type")),
-            None => Err(("scope_ref", "missing_field")),
-        }
+        let scope = match params.get("scope_ref") {
+            Some(Value::String(scope)) if !scope.is_empty() => scope.as_str(),
+            Some(Value::String(_)) => return Err(("scope_ref", "empty_value")),
+            Some(_) => return Err(("scope_ref", "wrong_type")),
+            None => return Err(("scope_ref", "missing_field")),
+        };
+        let parent = match params.get("parent_scope_ref") {
+            Some(Value::String(scope)) if !scope.is_empty() => Some(scope.as_str()),
+            Some(Value::String(_)) => return Err(("parent_scope_ref", "empty_value")),
+            Some(_) => return Err(("parent_scope_ref", "wrong_type")),
+            None => None,
+        };
+        Ok((scope, parent))
     })();
-    let scope = match parsed {
-        Ok(scope) => scope,
+    let (scope, parent) = match parsed {
+        Ok(parsed) => parsed,
         Err((field, reason)) => {
             return crate::send_invalid_request_response(
                 writer, ver, channel, epoch, corr, field, reason,
@@ -394,11 +488,16 @@ pub(crate) async fn handle(
         .filter(|stamp| stamp.scope_ref == scope)
         .cloned()
         .collect();
-    let heads: Vec<_> = runs
+    let mut heads: Vec<_> = runs
         .iter()
         .filter_map(|run| planes.routes.run_head(run).ok())
         .filter_map(|head| head.scope.map(|stamp| stamp.scope_ref))
         .collect();
+    // Broca knows the linked parent even when the run never opened a
+    // Cerebellum route (for example, source pasted after a head's read).
+    if let Some(parent) = parent {
+        heads.push(parent.to_owned());
+    }
     let reply = planes
         .private_content
         .answer(scope, &heads, crate::wall_clock_ms());

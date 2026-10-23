@@ -1,5 +1,5 @@
 //! Bounded blocking-worker capacity, shared by the computer and browser
-//! planes.
+//! planes and by the private-content mark writer.
 //!
 //! Each plane runs its blocking platform or Chrome work on its own pool of
 //! permits. A call takes one work permit and one release permit, atomically,
@@ -43,6 +43,17 @@ impl PermitPool {
             .try_acquire_owned()
             .ok()
             .map(Arc::new)
+    }
+
+    /// Waits for one work permit. The pool's semaphore is never closed, so
+    /// this only waits; the caller bounds the wait with its own deadline.
+    pub(crate) async fn acquire(&self) -> Arc<OwnedSemaphorePermit> {
+        Arc::new(
+            Arc::clone(&self.permits)
+                .acquire_owned()
+                .await
+                .expect("a permit pool's semaphore is never closed"),
+        )
     }
 
     #[cfg(test)]

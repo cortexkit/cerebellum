@@ -124,6 +124,18 @@ pub struct Phase {
     pub count: u64,
 }
 
+// A private-content mark is recorded in memory before a content reply is sent;
+// writing it to disk may delay that reply by at most this phase, which fits
+// inside the existing boundary slack. A write that misses the deadline does not
+// hold the reply: the store instead answers every privacy query as marked until
+// a later write succeeds. Covers both the wait for the single writer permit
+// and the atomic write, including a file sync and, on Unix, a directory sync.
+pub const PRIVATE_CONTENT_WRITE: Phase = Phase {
+    name: "private_content_write",
+    cap_ms: 500,
+    count: 1,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionBudget {
     pub action: &'static str,
@@ -1590,6 +1602,14 @@ mod tests {
         assert_eq!(EGRESS_SEND_MS, write_ms + 2 * EGRESS_FLUSH_MS);
         assert_eq!(EGRESS_BUFFER, crate::EGRESS_BUFFER);
         assert_eq!(BOUNDARY_SLACK_MS, 5_000);
+        // The private-content write is spent from the boundary slack, so it
+        // must leave most of that slack for the reply itself.
+        const {
+            assert!(
+                PRIVATE_CONTENT_WRITE.cap_ms * PRIVATE_CONTENT_WRITE.count
+                    <= BOUNDARY_SLACK_MS / 10
+            )
+        };
         for workers in [
             MAX_BLOCKING_WORKERS_COMPUTER,
             MAX_BLOCKING_WORKERS_BROWSER,

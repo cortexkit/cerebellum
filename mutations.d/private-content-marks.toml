@@ -24,6 +24,8 @@ build_timeout_s = 1200
 
 [[control]]
 id = "private-desktop-hook"
+# The expected test lives in a macOS-only module of model_view_tests.
+platforms = ["macos"]
 guards = "the desktop app reply path marks its calling scope before delivery"
 file = "crates/cerebellum/src/lib.rs"
 old = '''private_content::send_reply(
@@ -291,14 +293,17 @@ build_timeout_s = 1200
 id = "private-write-fails-closed"
 guards = "failed durable writes fail closed rather than trusting unpersisted marks"
 file = "crates/cerebellum/src/private_content.rs"
-old = "self.unreadable.store(written.is_err(), Ordering::Release);"
-new = "self.unreadable.store(false, Ordering::Release); // NON-VACUITY BREAK"
+old = "if !matches!(written, Ok(Ok(Ok(())))) {"
+new = "if false && !matches!(written, Ok(Ok(Ok(())))) { // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
-expect_red = ["private_content_marks_tests::a_failed_floor_write_fails_closed_without_writing_marks"]
+expect_red = [
+  "private_content_marks_tests::a_failed_floor_write_fails_closed_without_writing_marks",
+  "private_content_marks_tests::a_stuck_write_releases_the_reply_at_its_deadline_and_fails_closed",
+]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
@@ -337,6 +342,75 @@ target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
 expect_red = ["private_content_marks_tests::replay_and_withdraw_renew_marks_for_the_receiving_scope"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-hourly-refresh"
+guards = "a repeat mark within the hour of its persisted timestamp updates memory and writes nothing"
+file = "crates/cerebellum/src/private_content.rs"
+old = ".is_some_and(|saved| now.saturating_sub(*saved) < REFRESH_MS);"
+new = ".is_some_and(|saved| false && now.saturating_sub(*saved) < REFRESH_MS); // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::repeat_marks_write_only_when_new_or_an_hour_old"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-write-deadline"
+guards = "a stuck mark write releases the content reply at the private-content write deadline"
+file = "crates/cerebellum/src/private_content.rs"
+old = "write_deadline_ms: AtomicU64::new(crate::budgets::PRIVATE_CONTENT_WRITE.cap_ms),"
+new = "write_deadline_ms: AtomicU64::new(3_600_000), // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_stuck_write_releases_the_reply_at_its_deadline_and_fails_closed"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-parent-union"
+guards = "a query naming the run's linked parent scope answers that parent's marks too"
+file = "crates/cerebellum/src/private_content.rs"
+old = "heads.push(parent.to_owned());"
+new = "let _ = parent; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::linked_parent_marks_a_run_without_a_cerebellum_route"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-landing-page-read"
+guards = "a person's-browser navigate that returns its landing page read marks the scope"
+file = "crates/cerebellum/src/private_content.rs"
+old = '|| reply.get("read_page").is_some_and(carries_content)'
+new = '|| reply.get("read_page").is_some_and(|_| false) // NON-VACUITY BREAK'
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = [
+  "private_content_marks_tests::images_nested_reads_and_intercepted_page_names_are_content",
+  "private_content_marks_tests::person_navigate_read_page_marks",
+  "private_content_marks_tests::person_result_schema_has_no_unmarked_content_fields",
+  "private_content_marks_tests::person_schema_guard_rejects_a_planted_title_field",
+]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
