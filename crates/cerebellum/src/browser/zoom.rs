@@ -97,9 +97,9 @@ mod tests {
     use super::*;
 
     /// A JSON viewer's expanded event: each property is a line wrapper
-    /// holding the key as its own click-to-filter span (`'event':`, three
-    /// text nodes, so the accessibility text is just `event`) and the value
-    /// in a sibling span.
+    /// holding the key as its own click-to-filter span (`'event':` as three
+    /// text nodes, `'`, `event` and `':`, whose only letters spell `event`)
+    /// and the value in a sibling span.
     fn json_viewer_chip_fixture() -> Map<String, Value> {
         let chip = "inline-block py-0.5 rounded hover:bg-blue-500/30 hover:cursor-pointer transition-colors duration-400 text-nowrap";
         serde_json::json!({"nodes":[

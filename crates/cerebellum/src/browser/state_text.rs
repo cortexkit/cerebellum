@@ -996,10 +996,9 @@ impl<'a> Tree<'a> {
     /// as a click-to-filter chip holding `'event':` (the key between quotes
     /// and a colon), and a filter on `event` matches the text inside it; the
     /// chip belongs to that key rather than being a separate control beside
-    /// it. A control that is itself the match is never one, so a matched
-    /// link among other links keeps printing alone. Text fields and value
-    /// controls are never one either, since their values are withheld or
-    /// are not text.
+    /// it. A control that is itself the match is never a key chip; a row block
+    /// around it may still print it with a label beside it. Text fields and
+    /// value controls are never key chips, even when their values are shown.
     fn is_key_chip(&self, node: usize, matched: usize) -> bool {
         let role = self.role(node);
         if node == matched || !is_actionable(role) || is_text_field(role) || is_value_control(role)
