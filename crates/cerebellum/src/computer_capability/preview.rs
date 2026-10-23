@@ -1915,6 +1915,88 @@ mod tests {
         );
     }
 
+    /// A shown preview for agent `a` with its first capture queued, the
+    /// capture thread not yet started, and the output of the show cleared.
+    fn queued_first_capture() -> (PreviewWorker, Arc<Recorder>, CaptureJob) {
+        let output = Arc::new(Recorder::default());
+        let worker = PreviewWorker {
+            shared: Arc::new(Shared {
+                locked: Mutex::new(Locked {
+                    schedule: admitted(),
+                    stopped: false,
+                }),
+                changed: Condvar::new(),
+                output: output.clone(),
+                gauges: &PREVIEW_GAUGES,
+            }),
+        };
+        worker.show(request("a", 10));
+        let job = worker
+            .shared
+            .lock()
+            .schedule
+            .next(Instant::now())
+            .submit
+            .expect("a shown preview queues its first capture");
+        output.sent().clear();
+        (worker, output, job)
+    }
+
+    /// Run the real capture loop over `job` alone and count the native
+    /// captures it started.
+    fn native_captures_for(worker: &PreviewWorker, job: CaptureJob) -> u32 {
+        let held = Arc::new(Held::default());
+        held.open();
+        let (jobs, requests) = std::sync::mpsc::channel();
+        jobs.send(job).unwrap();
+        drop(jobs);
+        capture_requests(&worker.shared, held.as_ref(), requests);
+        held.calls()
+    }
+
+    /// The preview was hidden and shown again before the capture thread took
+    /// the job: the job belongs to the earlier showing, so it is dropped.
+    #[test]
+    fn a_queued_capture_from_an_earlier_showing_is_dropped() {
+        let (worker, output, job) = queued_first_capture();
+        worker.hide("a");
+        worker.show(request("a", 10));
+        assert!(worker.is_shown("a"));
+        output.sent().clear();
+        assert_eq!(native_captures_for(&worker, job), 0);
+        assert!(output.sent().is_empty(), "a dropped job wrote output");
+    }
+
+    /// The helper fades a preview out by itself after `PREVIEW_IDLE`, so a job
+    /// taken after that would capture a window nobody sees: it is dropped.
+    #[test]
+    fn a_queued_capture_for_a_preview_gone_idle_is_dropped() {
+        let (worker, output, job) = queued_first_capture();
+        {
+            let mut locked = worker.shared.lock();
+            let shown = locked.schedule.shown.get_mut("a").unwrap();
+            shown.in_flight = false;
+            shown.last_active = Instant::now()
+                .checked_sub(PREVIEW_IDLE)
+                .expect("the clock has run longer than the idle limit");
+        }
+        assert!(
+            !worker.is_shown("a"),
+            "the preview should read as faded out"
+        );
+        assert_eq!(native_captures_for(&worker, job), 0);
+        assert!(output.sent().is_empty(), "a dropped job wrote output");
+    }
+
+    /// A job still queued when the worker stops starts no capture.
+    #[test]
+    fn a_queued_capture_after_the_worker_stopped_is_dropped() {
+        let (worker, output, job) = queued_first_capture();
+        worker.shared.lock().stopped = true;
+        assert_eq!(native_captures_for(&worker, job), 0);
+        assert!(output.sent().is_empty(), "a dropped job wrote output");
+    }
+
     /// A request whose answer does not come, repeated refreshes, a hide,
     /// then the late answer: one native request in all, and no frame.
     #[test]
