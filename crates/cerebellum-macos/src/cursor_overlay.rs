@@ -25,11 +25,13 @@ use crate::cursor_schedule::{
 pub use crate::cursor_schedule::{CursorMotion, PictureTiming};
 use crate::preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, Previews};
 
+#[cfg(feature = "desk-probe")]
+mod capture_probe;
+#[cfg(feature = "desk-probe")]
+pub use capture_probe::probe_overlay_capture_exclusion;
 // The preview's window: a child module, so it draws the badge and its chip
 // with the same private drawing code as the badge's own panel.
-mod capture_probe;
 mod preview_window;
-pub use capture_probe::probe_overlay_capture_exclusion;
 use preview_window::{primary_visible_area, PreviewWindow};
 
 use objc2::rc::Retained;

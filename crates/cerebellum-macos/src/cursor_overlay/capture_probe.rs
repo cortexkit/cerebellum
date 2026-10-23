@@ -3,7 +3,92 @@
 //! exclusions, then makes them shareable as a positive capture control.
 
 use super::*;
-use crate::macos::{capture_probe_display_region, CaptureSourceRect, RawCapture};
+use crate::macos::{
+    establish_window_server_connection, read_pixels, CaptureSourceRect, RawCapture,
+};
+use block2::RcBlock;
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGImage;
+use objc2_foundation::{NSArray, NSError};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+};
+
+// Display capture includes other apps, so it exists only in this opt-in probe.
+fn capture_probe_display_region(
+    region: CaptureSourceRect,
+    timeout: Duration,
+) -> Result<RawCapture, String> {
+    establish_window_server_connection();
+    let (sink, delivery) = std::sync::mpsc::channel();
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            // SAFETY: framework callback objects are valid for the callback; retain
+            // the display before returning. The probe places its panels on main.
+            let result = unsafe {
+                if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else if let Some(content) = content.as_ref() {
+                    content
+                        .displays()
+                        .iter()
+                        .find(|d| d.displayID() == objc2_core_graphics::CGMainDisplayID())
+                        .ok_or_else(|| "the main display is not shareable".to_owned())
+                } else {
+                    Err("no shareable content or error".to_owned())
+                }
+            };
+            let _ = sink.send(result);
+        },
+    );
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+    let display = delivery
+        .recv_timeout(timeout)
+        .map_err(|_| "display enumeration timed out")??;
+    // No explicit window exclusions: the experiment measures whether the
+    // panels' sharing policy actually removes their pixels from a display.
+    let (filter, configuration) = unsafe {
+        let filter = SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            &display,
+            &NSArray::new(),
+        );
+        let configuration = SCStreamConfiguration::new();
+        configuration.setSourceRect(CGRect::new(
+            CGPoint::new(region.x, region.y),
+            CGSize::new(region.width, region.height),
+        ));
+        configuration.setWidth(region.width as usize);
+        configuration.setHeight(region.height as usize);
+        configuration.setShowsCursor(false);
+        (filter, configuration)
+    };
+    let (sink, delivery) = std::sync::mpsc::channel();
+    let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        // SAFETY: same screenshot completion contract as capture_window; copy
+        // the raster while the image is alive, never retain private pixels.
+        let result = unsafe {
+            if let Some(error) = error.as_ref() {
+                Err(error.localizedDescription().to_string())
+            } else if let Some(image) = image.as_ref() {
+                read_pixels(image, std::process::id())
+            } else {
+                Err("no captured image or error".to_owned())
+            }
+        };
+        let _ = sink.send(result);
+    });
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+            &filter,
+            &configuration,
+            Some(&handler),
+        );
+    }
+    delivery
+        .recv_timeout(timeout)
+        .map_err(|_| "display capture timed out".to_owned())?
+}
 
 const SIDE: f64 = 128.0;
 const GAP: f64 = 64.0;

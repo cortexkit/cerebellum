@@ -13,6 +13,8 @@ default = []
 # Forwards to the substrate crate, which owns the observer now that identity
 # lives in cerebellum-core.
 test-observer = ["cerebellum-core/test-observer"]
+# Keep display capture out of default builds; only the manual desk probe opts in.
+desk-probe = ["cerebellum-macos/desk-probe"]
 # Stock Chrome for Testing has an ad-hoc loader signature, not Google's
 # Developer ID. This weaker pin is for operator-approved browser tests only;
 # cerebellum-macos rejects the feature in signing-attested release builds.
@@ -143,3 +145,4 @@ test = true
 [[example]]
 name = "app_use_desk_probe"
 test = true
+required-features = ["desk-probe"]

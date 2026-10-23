@@ -10,6 +10,8 @@ description = "Raw macOS framework readings for ck-cerebellum. One of two seam c
 default = []
 # Exposes permission-skip helpers only when a dependent test target opts in.
 test-support = []
+# Display-capture experiment for the manually started desk probe only.
+desk-probe = []
 # Acceptance probes only. release-build.sh binds the signing-topology revision,
 # which makes compilation reject this weaker parent identity in shipped builds.
 chrome-for-testing-parent-probe = []

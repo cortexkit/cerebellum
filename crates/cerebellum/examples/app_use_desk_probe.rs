@@ -6,7 +6,7 @@
 //! Mac, after building the module binary it uses as the cursor helper:
 //!
 //! ```text
-//! cargo build -p cerebellum --bin ck-cerebellum --example app_use_desk_probe
+//! cargo build -p cerebellum --features desk-probe --bin ck-cerebellum --example app_use_desk_probe
 //! target/debug/examples/app_use_desk_probe --approve-desk-probe
 //! ```
 //!
