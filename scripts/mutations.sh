@@ -12,9 +12,11 @@ narrow=1
 full=1
 only_mode=""
 check_only=0
+anchors_only=0
+platform=""
 diff_given=0
 usage() {
-  echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only]"
+  echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only [--anchors-only | --platform OS]]"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -40,6 +42,15 @@ while [ "$#" -gt 0 ]; do
       check_only=1
       shift
       ;;
+    --anchors-only)
+      anchors_only=1
+      shift
+      ;;
+    --platform)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      case "$2" in linux|macos|windows) platform="$2" ;; *) usage >&2; exit 2 ;; esac
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -55,6 +66,14 @@ if [ "$check_only" -eq 1 ] && [ -n "$only_mode" ]; then
   echo "--check-only replays nothing, so it takes no replay mode" >&2
   exit 2
 fi
+if [ "$check_only" -eq 0 ] && { [ "$anchors_only" -eq 1 ] || [ -n "$platform" ]; }; then
+  echo "--anchors-only and --platform require --check-only" >&2
+  exit 2
+fi
+if [ "$anchors_only" -eq 1 ] && [ -n "$platform" ]; then
+  echo "--anchors-only cannot be combined with --platform" >&2
+  exit 2
+fi
 
 # Keep the check's scratch catalogue outside the installed tools and source tree.
 scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
@@ -68,7 +87,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
 export TMPDIR="$tmpdir"
 catalogue=mutations.d
-if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
+if [ "$check_only" -eq 1 ]; then
   planner_python=""
   for python in python3 python3.14 python3.13 python3.12 python3.11; do
     if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
@@ -77,6 +96,9 @@ if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
     fi
   done
   [ -n "$planner_python" ] || { echo 'mutation check planner: Python 3.11+ is required' >&2; exit 2; }
+  "$planner_python" scripts/lib/mutation-catalogue.py coverage mutations.d
+fi
+if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
   selection="$("$planner_python" scripts/lib/mutation-check-plan.py "$base" "$tmpdir/selected.toml")"
   echo "mutations: strict check selection: $selection"
   case "$selection" in
@@ -94,8 +116,8 @@ fi
 # own: it names the exact install command and stops.
 # Cargo's install record distinguishes the reviewed source revision from another
 # binary that happens to report the same semantic version.
-expected_version="0.12.3"
-expected_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
+expected_version="0.12.10"
+expected_revision="73af60d143d64fe874606ce73f22e02cb356a4bb"
 tools_root="${CARGO_TARGET_DIR:-$repo_root/target}/tools"
 case "$tools_root" in /*) ;; *) tools_root="$repo_root/$tools_root" ;; esac
 mutate="$tools_root/bin/ckdev-mutate"
@@ -141,13 +163,19 @@ if [ ! -d mutations.d ]; then
   exit 2
 fi
 
-"$mutate" check --catalogue "$catalogue" --strict
+check_options=(--strict)
+if [ "$anchors_only" -eq 1 ]; then
+  check_options=(--anchors-only)
+elif [ -n "$platform" ]; then
+  check_options+=(--platform "$platform")
+fi
+"$mutate" check --catalogue "$catalogue" "${check_options[@]}"
 
 # Validating the catalogue alone is what a landing gate needs when a change
 # touches it: a row the runner refuses under --strict stops every later replay,
 # and nothing else would notice until someone ran one.
 if [ "$check_only" -eq 1 ]; then
-  echo "mutations: the catalogue is valid under --strict"
+  echo "mutations: the catalogue is valid (${check_options[*]})"
   exit 0
 fi
 

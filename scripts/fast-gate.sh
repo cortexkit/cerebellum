@@ -190,6 +190,7 @@ if [ "$self_test" -eq 1 ]; then
   done
   [ -n "$planner_python" ] || { echo 'mutation check planner: Python 3.11+ is required' >&2; exit 2; }
   "$planner_python" scripts/lib/mutation-check-plan.py --self-test
+  "$planner_python" scripts/lib/mutation-catalogue.py --self-test
   scripts/mutations.test.sh
   planted_skip="test a_preview_test ... SKIPPED (the window's kind was checked and is right): the screen is locked, so no window is realised"
   if [ "$(printf '%s\n' "$planted_skip" | desk_skip_reason)" != "the screen is locked, so no window is realised" ] || \
@@ -330,6 +331,8 @@ release_lock() {
 trap release_lock EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
+
+run_catalogue_checks
 
 if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
@@ -495,18 +498,7 @@ fi
 
 if [ "$part" = mac ] && [ "$mutations" -eq 1 ]; then
   run_serial_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
-elif catalogue_check_needed "$part" "$changed_files"; then
-  # The pinned runner lists tests by compiling them, and some catalogue test
-  # names exist only on macOS. Run the full check here after the library tests.
-  run_serial_phase "mutation catalogue --strict check (a catalogue file changed)" ./scripts/mutations.sh --check-only
-else
-  echo "==> SKIP: mutation catalogue --strict check (Mac half only, when catalogue files changed)"
 fi
-
-# Runner upgrade switch point: once the pinned release supports --anchors-only
-# and --platform, run anchors locally first, then --platform linux / macos in
-# their halves. Require the two reports' union to cover every catalogue row
-# before replacing the full macOS check; 0.12.3 cannot report that coverage.
 
 # Source-check logs are replayed in launch order, never interleaved with Cargo.
 wait_static_phases

@@ -15,10 +15,10 @@ scratch="$(mktemp -d "$scratch_root/mutations-test.XXXXXX")"
 unset CARGO_TARGET_DIR
 trap 'rm -rf "$scratch"' EXIT
 failures=0
-checks=8
+checks=14
 
-pinned_version="0.12.3"
-pinned_revision="649d5f126c3b7da49e3019407ea1a94652d32eea"
+pinned_version="0.12.10"
+pinned_revision="73af60d143d64fe874606ce73f22e02cb356a4bb"
 other_revision="0000000000000000000000000000000000000000"
 
 # write_runner DIR NAME VERSION: a fake ckdev-mutate that reports VERSION and
@@ -45,24 +45,33 @@ write_record() {
 JSON
 }
 
-# run_case NAME EXPECTED_STATUS SETUP [MODE]: build a fresh scratch checkout
+# run_case NAME EXPECTED_STATUS SETUP [ARGS...]: build a fresh scratch checkout
 # holding a copy of mutations.sh, let SETUP install runners into it, then run
-# mutations.sh in MODE (default --full-only) with a decoy runner first on PATH
+# mutations.sh with ARGS (default --full-only) with a decoy runner first on PATH
 # and in CARGO_HOME.
 run_case() {
-  local name="$1" expected="$2" setup="$3" mode="${4:---full-only}"
+  local name="$1" expected="$2" setup="$3"
+  shift 3
+  [ "$#" -gt 0 ] || set -- --full-only
+  local mode="$1" check_args="--strict"
+  case "$*" in
+    *--anchors-only*) check_args="--anchors-only" ;;
+    *--platform*) check_args="--strict --platform ${@: -1}" ;;
+  esac
   local case_dir="$scratch/$name"
   local repo="$case_dir/repo"
-  mkdir -p "$repo/scripts" "$repo/mutations.d"
+  mkdir -p "$repo/scripts/lib" "$repo/mutations.d"
   cp "$root/scripts/mutations.sh" "$repo/scripts/mutations.sh"
+  cp "$root/scripts/lib/mutation-catalogue.py" "$repo/scripts/lib/"
+  printf '[[control]]\nid = "fixture"\n' >"$repo/mutations.d/rows.toml"
   # The tree check guards the real checkout; this scratch copy has nothing to check.
   printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/scripts/check-mutation-tree.sh"
   chmod +x "$repo/scripts/check-mutation-tree.sh"
   : > "$case_dir/calls"
   "$setup" "$case_dir" "$repo"
   env CALL_LOG="$case_dir/calls" CARGO_HOME="$case_dir/cargo-home" \
-    PATH="$case_dir/path-bin:/usr/bin:/bin" \
-    "$repo/scripts/mutations.sh" "$mode" >"$case_dir/out" 2>&1
+    PATH="$case_dir/path-bin:$PATH" \
+    "$repo/scripts/mutations.sh" "$@" >"$case_dir/out" 2>&1
   local status=$?
   local problem=""
   [ "$status" = "$expected" ] || problem="exit $status, expected $expected"
@@ -70,7 +79,7 @@ run_case() {
     problem="${problem:+$problem; }a shared runner was invoked"
   fi
   if [ "$expected" = 0 ]; then
-    if ! grep -qx 'private check --catalogue mutations.d --strict' "$case_dir/calls"; then
+    if ! grep -qx "private check --catalogue mutations.d $check_args" "$case_dir/calls"; then
       problem="${problem:+$problem; }the private runner did not check the catalogue"
     fi
     if [ "$mode" = "--check-only" ]; then
@@ -80,6 +89,11 @@ run_case() {
     elif ! grep -qx 'private run --catalogue mutations.d --all' "$case_dir/calls"; then
       problem="${problem:+$problem; }the private runner did not run the replay"
     fi
+  elif [ "$setup" = setup_uncovered ]; then
+    grep -qF 'rows not covered by linux or macos: windows-only' "$case_dir/out" || problem="coverage refusal missing"
+    [ ! -s "$case_dir/calls" ] || problem="uncovered row reached runner"
+  elif [ "$setup" = setup_private_pinned ] && [ "$expected" = 2 ]; then
+    [ ! -s "$case_dir/calls" ] || problem="invalid options reached runner"
   elif ! grep -qF "cargo install --locked --root \"$repo/target/tools\" --git https://github.com/cortexkit/commons --rev $pinned_revision cortexkit-mutate" "$case_dir/out"; then
     problem="${problem:+$problem; }the refusal did not name the install command"
   fi
@@ -122,6 +136,10 @@ setup_private_unrecorded() {
   decoys "$1"
   write_runner "$2/target/tools/bin" private "$pinned_version"
 }
+setup_uncovered() {
+  setup_private_pinned "$@"
+  printf '[[control]]\nid = "windows-only"\nplatforms = ["windows"]\n' >"$2/mutations.d/rows.toml"
+}
 
 # Without a private runner the replay refuses, even though PATH and CARGO_HOME
 # both offer one; it never falls back to either.
@@ -137,12 +155,19 @@ run_case private_without_install_record_refuses 2 setup_private_unrecorded
 # only through the private pinned runner.
 run_case check_only_validates_without_replaying 0 setup_private_pinned --check-only
 run_case check_only_still_refuses_a_missing_private_runner 2 setup_private_missing --check-only
+run_case anchors_only_checks_without_strict_or_replay 0 setup_private_pinned --check-only --anchors-only
+run_case platform_checks_strictly_without_replay 0 setup_private_pinned --check-only --platform linux
+run_case macos_platform_is_forwarded 0 setup_private_pinned --check-only --platform macos
+run_case anchors_only_requires_check_only 2 setup_private_pinned --anchors-only
+run_case platform_requires_check_only 2 setup_private_pinned --platform linux
+run_case anchors_only_conflicts_with_platform 2 setup_private_pinned --check-only --anchors-only --platform linux
 
 scoped_invalid_row() {
   local repo="$scratch/scoped/repo" status
   mkdir -p "$repo/scripts/lib" "$repo/mutations.d"
   cp "$root/scripts/mutations.sh" "$repo/scripts/"
   cp "$root/scripts/lib/mutation-check-plan.py" "$repo/scripts/lib/"
+  cp "$root/scripts/lib/mutation-catalogue.py" "$repo/scripts/lib/"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/check-mutation-tree.sh"
   chmod +x "$repo/scripts/check-mutation-tree.sh"
   setup_private_pinned "$scratch/scoped" "$repo"
@@ -209,6 +234,12 @@ ROW
   fi
 }
 scoped_invalid_row
+
+# Coverage is catalogue-wide, including when diff selection would find no rows.
+checks=$((checks + 1))
+run_case windows_only_is_not_covered 2 setup_uncovered --check-only --anchors-only
+checks=$((checks + 1))
+run_case coverage_precedes_diff_selection 2 setup_uncovered --check-only --platform linux --diff nonexistent-base
 
 echo "mutations wrapper tests: $checks checks, $failures failures"
 [ "$failures" = 0 ]
