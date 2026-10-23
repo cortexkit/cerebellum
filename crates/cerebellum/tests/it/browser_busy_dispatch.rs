@@ -417,13 +417,12 @@ async fn fixture_with_fault(
 
 async fn click_text(plane: &BrowserPlane, route: &RouteIdentity, snapshot: &Value) -> Value {
     let text = snapshot["state_text"].as_str().unwrap();
+    // An ax line reads `<ref> <role> <name>`: take the first text node's ref.
     let reference = text
         .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|node| node["role"] == "StaticText")
-        .unwrap()["ref"]
-        .as_str()
-        .unwrap()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|words| words.get(1) == Some(&"StaticText"))
+        .unwrap_or_else(|| panic!("no text ref in {text}"))[0]
         .to_string();
     plane.dispatch(route,BrowserCapability::Click,&json!({"ref":reference,"snapshot_id":snapshot["snapshot_id"],"intent":"open local event drawer","severity":{"tier":2,"credential":false,"financial":false}})).await
 }

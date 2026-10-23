@@ -5,13 +5,14 @@
 //! the two together prevents a click from silently falling back to a newer
 //! document or to an unredacted accessible name.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::browser::state_text::{one_line, short_url, NodeFacts};
 use crate::coordinate::ScreenshotSnapshot;
 use crate::journal::redaction::utf8_safe_truncate;
 
@@ -21,8 +22,9 @@ pub const MAX_REF: usize = 4_096;
 pub const MAX_ROLE_BYTES: usize = 128;
 pub const MAX_NAME_BYTES: usize = 4_096;
 pub const MAX_VALUE_BYTES: usize = 4_096;
-pub const MAX_AX_RECORD_BYTES: usize = 1_048_576;
-pub const AX_SCHEMA: &str = "ck-browser-snapshot-ax-jsonl/v1";
+/// The `ax` snapshot's page text: one accessibility node per line, as
+/// [`render_ax_text`] renders it.
+pub const AX_SCHEMA: &str = "ck-browser-snapshot-ax-text/v1";
 pub const DOM_SCHEMA: &str = "ck-browser-snapshot-dom-text/v1";
 /// The default snapshot's page text: one element per line, as
 /// `crate::browser::state_text` renders it.
@@ -213,7 +215,9 @@ pub struct AxRecord {
 }
 
 impl AxRecord {
-    pub fn canonical_line(&self) -> Result<String, SnapshotError> {
+    /// Refuse a record outside the snapshot's bounds: a negative depth, or a
+    /// role, name or value longer than its byte limit.
+    pub fn check_bounds(&self) -> Result<(), SnapshotError> {
         if self.depth < 0
             || self.role.len() > MAX_ROLE_BYTES
             || self.name.len() > MAX_NAME_BYTES
@@ -224,12 +228,7 @@ impl AxRecord {
         {
             return Err(SnapshotError::BoundExceeded);
         }
-        let value = serde_json::json!({"depth":self.depth,"role":self.role,"name":self.name,"value":self.value,"ref":self.reference});
-        let line = serde_json::to_string(&value).map_err(|_| SnapshotError::Serialization)?;
-        if line.len() > MAX_AX_RECORD_BYTES {
-            return Err(SnapshotError::BoundExceeded);
-        }
-        Ok(format!("{line}\n"))
+        Ok(())
     }
 }
 
@@ -736,40 +735,192 @@ pub fn new_snapshot_id(seed: impl AsRef<[u8]>) -> String {
     hex(&digest[..16])
 }
 
-pub fn encode_ax_jsonl(
+/// The `ax` snapshot's page text, cut to its byte bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxText {
+    /// One accessibility node per line, as [`render_ax_text`] describes.
+    pub text: String,
+    /// The ref of every line in `text`. These, and only these, stay usable
+    /// for an action on this snapshot.
+    pub printed_refs: BTreeSet<String>,
+    /// Bytes and lines the byte bound removed; zero when nothing was cut.
+    pub cut_bytes: usize,
+    pub cut_lines: usize,
+}
+
+/// Render the accessibility tree as plain text, one node per line, in the
+/// default snapshot's line style (see `crate::browser::state_text`):
+///
+/// ```text
+/// <ref> <role> <name>[, Value: <value>]
+/// ```
+///
+/// Each line is indented two spaces per printed ancestor. A node without a
+/// ref prints without one, and the role is Chrome's own accessibility role.
+/// Unlike the default snapshot nothing is folded into an outline: every node
+/// prints except the ones that repeat text already shown (see below).
+///
+/// A value prints under the default snapshot's rules: a link shows where it
+/// points, a numeric control (slider, progress bar, ...) its level, and a text
+/// field its contents only when `facts` show its DOM node is neither a
+/// credential nor a payment field. Below a text field only controls print,
+/// because Chrome's inner editor there names its text with the field's value.
+///
+/// The text is cut at a whole line so that it fits `max_bytes`, and the
+/// lines after the first one that does not fit are dropped with it.
+pub fn render_ax_text(
     records: &[AxRecord],
+    facts: &HashMap<String, NodeFacts>,
     max_bytes: usize,
-) -> Result<(String, bool), SnapshotError> {
-    let mut output = String::new();
-    let mut truncated = false;
-    let mut ancestors: Vec<&AxRecord> = Vec::new();
+) -> Result<AxText, SnapshotError> {
+    struct Seen<'a> {
+        record: &'a AxRecord,
+        /// Inside a text field, outside any control within it: the node's
+        /// text may be the field's value.
+        in_field: bool,
+    }
+    let mut lines: Vec<(String, Option<&str>)> = Vec::new();
+    let mut ancestors: Vec<Seen<'_>> = Vec::new();
+    // Depths of the ancestors that printed, which set a line's indent.
+    let mut printed: Vec<i64> = Vec::new();
     for record in records {
-        let line = record.canonical_line()?;
+        record.check_bounds()?;
         while ancestors
             .last()
-            .is_some_and(|parent| parent.depth >= record.depth)
+            .is_some_and(|parent| parent.record.depth >= record.depth)
         {
             ancestors.pop();
         }
+        while printed.last().is_some_and(|depth| *depth >= record.depth) {
+            printed.pop();
+        }
+        let parent = ancestors.last();
         // Inline boxes are layout fragments of text already named by their parent.
         // Repeating them can exhaust the byte budget before any controls are shown.
         let folded = record.role == "InlineTextBox"
             || (record.role == "StaticText"
                 && record.value.is_none()
-                && ancestors
-                    .last()
-                    .is_some_and(|parent| !record.name.is_empty() && parent.name == record.name));
-        ancestors.push(record);
-        if folded {
+                && parent.is_some_and(|parent| {
+                    !record.name.is_empty() && parent.record.name == record.name
+                }));
+        let withheld = parent.is_some_and(|parent| parent.in_field) && !is_actionable(&record.role);
+        ancestors.push(Seen {
+            record,
+            in_field: is_text_field(&record.role) || withheld,
+        });
+        if folded || withheld {
             continue;
         }
-        if output.len().saturating_add(line.len()) > max_bytes {
-            truncated = true;
+        let mut line = "  ".repeat(printed.len());
+        if let Some(reference) = &record.reference {
+            line.push_str(reference);
+            line.push(' ');
+        }
+        line.push_str(&one_line(&record.role));
+        let name = one_line(&record.name);
+        if !name.is_empty() {
+            line.push(' ');
+            line.push_str(&name);
+        }
+        if let Some(value) = ax_shown_value(record, facts).filter(|value| !value.is_empty()) {
+            line.push_str(", Value: ");
+            line.push_str(&value);
+        }
+        line.push('\n');
+        lines.push((line, record.reference.as_deref()));
+        printed.push(record.depth);
+    }
+    let mut rendered = AxText {
+        text: String::new(),
+        printed_refs: BTreeSet::new(),
+        cut_bytes: 0,
+        cut_lines: 0,
+    };
+    let mut lines = lines.into_iter();
+    for (line, reference) in lines.by_ref() {
+        if rendered.text.len().saturating_add(line.len()) > max_bytes {
+            rendered.cut_bytes = line.len();
+            rendered.cut_lines = 1;
             break;
         }
-        output.push_str(&line);
+        rendered.text.push_str(&line);
+        rendered.printed_refs.extend(reference.map(str::to_string));
     }
-    Ok((output, truncated))
+    for (line, _) in lines {
+        rendered.cut_bytes += line.len();
+        rendered.cut_lines += 1;
+    }
+    Ok(rendered)
+}
+
+/// The value an `ax` line shows, by the default snapshot's value rules
+/// (`Tree::shown_value` in `crate::browser::state_text`).
+fn ax_shown_value(record: &AxRecord, facts: &HashMap<String, NodeFacts>) -> Option<String> {
+    let facts = record
+        .reference
+        .as_deref()
+        .and_then(|reference| facts.get(reference));
+    let value = record.value.as_deref();
+    if record.role == "link" {
+        facts
+            .and_then(|facts| facts.url.as_deref())
+            .and_then(short_url)
+    } else if is_text_field(&record.role) {
+        // What a person typed prints only when the field's DOM node is known
+        // to be neither a credential nor a payment field. No facts, or no
+        // verdict in them, withholds it.
+        value
+            .filter(|_| facts.and_then(|facts| facts.credential) == Some(false))
+            .map(one_line)
+    } else if is_value_control(&record.role) {
+        value.map(one_line)
+    } else {
+        None
+    }
+}
+
+// The three role sets below copy the default snapshot's private ones in
+// `crate::browser::state_text` (`is_text_field`, `is_value_control`,
+// `is_actionable`), so both views withhold the same values. The test
+// `ax_value_rules_match_the_default_snapshot` renders the same nodes through
+// both and fails if the copies drift apart.
+
+fn is_text_field(role: &str) -> bool {
+    matches!(role, "textbox" | "searchbox" | "combobox")
+}
+
+fn is_value_control(role: &str) -> bool {
+    matches!(
+        role,
+        "slider" | "spinbutton" | "progressbar" | "meter" | "scrollbar"
+    )
+}
+
+fn is_actionable(role: &str) -> bool {
+    matches!(
+        role,
+        "link"
+            | "button"
+            | "textbox"
+            | "searchbox"
+            | "combobox"
+            | "listbox"
+            | "option"
+            | "checkbox"
+            | "radio"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "tab"
+            | "menuitem"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "treeitem"
+            | "PopUpButton"
+            | "ToggleButton"
+            | "MenuListOption"
+            | "ListBoxOption"
+    )
 }
 
 pub fn encode_dom_text(content: &str, max_bytes: usize) -> (String, bool) {
@@ -815,7 +966,7 @@ pub fn ax_record_from_value(value: &Value) -> Result<AxRecord, SnapshotError> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     };
-    item.canonical_line()?;
+    item.check_bounds()?;
     Ok(item)
 }
 
@@ -832,8 +983,8 @@ fn hex(bytes: &[u8]) -> String {
 ///
 /// - the default view arrives already rendered within the bound with its refs
 ///   narrowed to the printed ones (`prior_cut` carries what that render cut);
-/// - the AX view is cut at a line boundary and keeps the refs its remaining
-///   lines name;
+/// - the AX view likewise arrives cut at a whole line by [`render_ax_text`],
+///   with its refs narrowed to the ones its printed lines name;
 /// - the raw DOM view arrives already laid out within the bound (see
 ///   `browser::dom_layout`) with its refs narrowed to the ones its comments
 ///   name; anything still over the bound is cut at a character boundary.
@@ -861,24 +1012,6 @@ pub fn bounded_text_reply(
         snapshot.content.truncate(end);
         snapshot.truncated = true;
     }
-    match snapshot.kind {
-        SnapshotKind::Ax => {
-            let named: std::collections::HashSet<String> = snapshot
-                .content
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .filter_map(|row| row.get("ref").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            let before = snapshot.refs.len();
-            snapshot
-                .refs
-                .retain(|r| named.contains(&r.captured.reference));
-            if snapshot.refs.len() != before {
-                snapshot.refs_truncated = true;
-            }
-        }
-        SnapshotKind::DomFull | SnapshotKind::Actionable | SnapshotKind::Screenshot => {}
-    }
     let source = utf8_safe_truncate(&snapshot.source_origin, MAX_SOURCE_ORIGIN_BYTES);
     serde_json::json!({
         "outcome":"ok", "mode":snapshot.kind.as_str(),
@@ -900,86 +1033,305 @@ mod tests {
         new_snapshot_id(seed)
     }
 
-    #[test]
-    fn ax_inline_fragments_cannot_exhaust_the_control_budget() {
-        let record = |depth, role: &str, name: &str| AxRecord {
+    fn ax(depth: i64, role: &str, name: &str, reference: Option<&str>) -> AxRecord {
+        AxRecord {
             depth,
             role: role.into(),
             name: name.into(),
             value: None,
-            reference: None,
-        };
+            reference: reference.map(str::to_string),
+        }
+    }
+
+    fn valued(record: AxRecord, value: &str) -> AxRecord {
+        AxRecord {
+            value: Some(value.into()),
+            ..record
+        }
+    }
+
+    fn credential(verdict: Option<bool>) -> NodeFacts {
+        NodeFacts {
+            credential: verdict,
+            ..NodeFacts::default()
+        }
+    }
+
+    #[test]
+    fn ax_inline_fragments_cannot_exhaust_the_control_budget() {
         let mut records = vec![
-            record(0, "RootWebArea", "Local form"),
-            record(1, "StaticText", "Skip to content"),
+            ax(0, "RootWebArea", "Local form", None),
+            ax(1, "StaticText", "Skip to content", None),
         ];
         for _ in 0..100 {
             for letter in "Skip to content".chars() {
-                records.push(record(2, "InlineTextBox", &letter.to_string()));
+                records.push(ax(2, "InlineTextBox", &letter.to_string(), None));
             }
         }
-        records.push(AxRecord {
-            reference: Some("e2".into()),
-            ..record(1, "checkbox", "Request authorization")
-        });
-        let (text, truncated) = encode_ax_jsonl(&records, 12000).unwrap();
-        assert!(!truncated);
-        assert!(text.contains("Request authorization"));
-        assert!(!text.contains("InlineTextBox"));
-        assert_eq!(text.lines().count(), 3);
+        records.push(ax(1, "checkbox", "Request authorization", Some("e2")));
+        let rendered = render_ax_text(&records, &HashMap::new(), 12000).unwrap();
+        assert_eq!(rendered.cut_lines, 0);
+        assert_eq!(
+            rendered.text,
+            "RootWebArea Local form\n  StaticText Skip to content\n  e2 checkbox Request authorization\n"
+        );
     }
 
     #[test]
     fn ax_repeated_static_text_folds_but_distinct_text_and_controls_remain() {
-        let record = |depth, role: &str, name: &str| AxRecord {
-            depth,
-            role: role.into(),
-            name: name.into(),
-            value: None,
-            reference: None,
-        };
         let records = [
-            record(0, "RootWebArea", "Form"),
-            record(1, "button", "Save"),
-            record(2, "StaticText", "Save"),
-            record(3, "InlineTextBox", "S"),
-            record(2, "StaticText", "Details"),
-            record(1, "checkbox", "Save"),
+            ax(0, "RootWebArea", "Form", None),
+            ax(1, "button", "Save", None),
+            ax(2, "StaticText", "Save", None),
+            ax(3, "InlineTextBox", "S", None),
+            ax(2, "StaticText", "Details", None),
+            ax(1, "checkbox", "Save", None),
         ];
-        let (text, truncated) = encode_ax_jsonl(&records, 12000).unwrap();
-        assert!(!truncated);
-        let rows: Vec<Value> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[2]["name"], "Details");
-        assert_eq!(rows[3]["role"], "checkbox");
+        let rendered = render_ax_text(&records, &HashMap::new(), 12000).unwrap();
+        assert_eq!(
+            rendered.text,
+            "RootWebArea Form\n  button Save\n    StaticText Details\n  checkbox Save\n"
+        );
+    }
+
+    /// The whole `ax` line grammar on one small page: refs, indentation by
+    /// printed ancestor (an unrecorded ignored node leaves no gap), folded
+    /// text, names on one line, and each value rule.
+    #[test]
+    fn ax_text_golden_for_a_small_sign_in_page() {
+        let records = vec![
+            ax(0, "RootWebArea", "Sign in", Some("e1")),
+            ax(1, "heading", "Welcome back", Some("e2")),
+            ax(2, "StaticText", "Welcome back", None),
+            valued(ax(1, "textbox", "Email", Some("e3")), "ada@example.test"),
+            ax(2, "generic", "", Some("e4")),
+            ax(3, "StaticText", "ada@example.test", None),
+            valued(ax(1, "textbox", "Password", Some("e5")), "hunter2"),
+            valued(
+                ax(1, "textbox", "Card number", Some("e6")),
+                "4111111111111111",
+            ),
+            valued(
+                ax(1, "link", "Help", Some("e7")),
+                "https://example.test/help",
+            ),
+            valued(ax(1, "slider", "Volume", Some("e8")), "40"),
+            valued(ax(1, "button", "Continue", Some("e9")), "pressed"),
+            ax(2, "StaticText", "Continue", None),
+            ax(3, "InlineTextBox", "Continue", None),
+            ax(1, "list", "Steps", Some("e10")),
+            ax(3, "listitem", "First", Some("e11")),
+            ax(1, "StaticText", "Line one\n  line two", None),
+        ];
+        let facts = HashMap::from([
+            ("e3".to_string(), credential(Some(false))),
+            ("e5".to_string(), credential(Some(true))),
+            (
+                "e7".to_string(),
+                NodeFacts {
+                    url: Some("https://example.test/help?session=1".into()),
+                    ..credential(Some(false))
+                },
+            ),
+        ]);
+        let rendered = render_ax_text(&records, &facts, usize::MAX).unwrap();
+        assert_eq!(
+            rendered.text,
+            "e1 RootWebArea Sign in
+  e2 heading Welcome back
+  e3 textbox Email, Value: ada@example.test
+  e5 textbox Password
+  e6 textbox Card number
+  e7 link Help, Value: example.test/help
+  e8 slider Volume, Value: 40
+  e9 button Continue
+  e10 list Steps
+    e11 listitem First
+  StaticText Line one line two
+"
+        );
+        let printed: Vec<&str> = rendered.printed_refs.iter().map(String::as_str).collect();
+        assert_eq!(
+            printed,
+            ["e1", "e10", "e11", "e2", "e3", "e5", "e6", "e7", "e8", "e9"]
+        );
+        assert_eq!((rendered.cut_bytes, rendered.cut_lines), (0, 0));
+    }
+
+    /// A credential or payment field's value never prints: not on the
+    /// field's own line, and not through the text Chrome's inner editor holds
+    /// below it, whatever the field's DOM verdict says or when there is none.
+    #[test]
+    fn ax_text_never_prints_a_credential_fields_value() {
+        const SECRET: &str = "hunter2-4111111111111111";
+        for role in ["textbox", "searchbox", "combobox"] {
+            for verdict in [Some(true), None, Some(false)] {
+                let records = vec![
+                    ax(0, "RootWebArea", "Pay", Some("e1")),
+                    valued(ax(1, role, "Card", Some("e2")), SECRET),
+                    ax(2, "generic", "", Some("e3")),
+                    ax(3, "StaticText", SECRET, Some("e4")),
+                    ax(4, "InlineTextBox", SECRET, None),
+                    ax(3, "paragraph", SECRET, None),
+                    ax(3, "link", "Card help", Some("e5")),
+                ];
+                let facts = HashMap::from([("e2".to_string(), credential(verdict))]);
+                let rendered = render_ax_text(&records, &facts, usize::MAX).unwrap();
+                let field_line = rendered.text.lines().nth(1).unwrap();
+                assert_eq!(
+                    rendered
+                        .text
+                        .lines()
+                        .filter(|line| line.contains(SECRET))
+                        .count(),
+                    usize::from(verdict == Some(false)),
+                    "{role} {verdict:?}: {}",
+                    rendered.text
+                );
+                if verdict != Some(false) {
+                    assert_eq!(field_line, format!("  e2 {role} Card"));
+                }
+                // A control inside the field stays reachable; the editor's
+                // text and its ref do not.
+                assert!(rendered.text.contains("\n    e5 link Card help\n"));
+                assert!(!rendered.printed_refs.contains("e3"));
+                assert!(!rendered.printed_refs.contains("e4"));
+            }
+        }
+    }
+
+    /// The `ax` view copies the default snapshot's private role sets; this
+    /// renders the same nodes through both and fails when they disagree on a
+    /// value shown or on an element printed inside a text field.
+    #[test]
+    fn ax_value_rules_match_the_default_snapshot() {
+        use crate::browser::state_text::{render, Filters, RenderInput, Zoom};
+        let roles = [
+            "textbox",
+            "searchbox",
+            "combobox",
+            "slider",
+            "spinbutton",
+            "progressbar",
+            "meter",
+            "scrollbar",
+            "link",
+            "button",
+            "listbox",
+            "option",
+            "checkbox",
+            "radio",
+            "switch",
+            "tab",
+            "menuitem",
+            "menuitemcheckbox",
+            "menuitemradio",
+            "treeitem",
+            "PopUpButton",
+            "ToggleButton",
+            "MenuListOption",
+            "ListBoxOption",
+            "heading",
+            "paragraph",
+            "image",
+            "listitem",
+            "cell",
+            "StaticText",
+        ];
+        // The default snapshot's printed value, or `None`, and whether its
+        // line for `inner` appears, as zooming into the page prints them.
+        let outline = |records: &[AxRecord], facts: &HashMap<String, NodeFacts>| {
+            render(&RenderInput {
+                records,
+                facts,
+                page_url: "https://example.test/",
+                snapshot_id: "0123456789abcdef0123456789abcdef",
+                zoom: Some(Zoom {
+                    requested: "e1",
+                    target: Some("e1"),
+                }),
+                filters: &Filters::default(),
+                max_bytes: usize::MAX,
+            })
+            .text
+        };
+        let value_of = |text: &str, reference: &str| {
+            text.lines()
+                .find(|line| line.split_whitespace().next() == Some(reference))
+                .map(|line| {
+                    line.split_once(", Value: ")
+                        .map(|(_, value)| value.to_string())
+                })
+        };
+        for role in roles {
+            for verdict in [None, Some(true), Some(false)] {
+                let records = vec![
+                    ax(0, "RootWebArea", "Page", Some("e1")),
+                    valued(ax(1, role, "Field", Some("e2")), "v42"),
+                ];
+                let facts = HashMap::from([(
+                    "e2".to_string(),
+                    NodeFacts {
+                        url: Some("https://example.test/target".into()),
+                        ..credential(verdict)
+                    },
+                )]);
+                let ours = render_ax_text(&records, &facts, usize::MAX).unwrap().text;
+                assert_eq!(
+                    value_of(&ours, "e2"),
+                    value_of(&outline(&records, &facts), "e2"),
+                    "{role} {verdict:?}"
+                );
+            }
+            for field in ["textbox", "searchbox", "combobox"] {
+                let records = vec![
+                    ax(0, "RootWebArea", "Page", Some("e1")),
+                    ax(1, field, "Field", Some("e2")),
+                    ax(2, "generic", "Editor", Some("e3")),
+                    ax(3, role, "Inner", Some("e4")),
+                ];
+                let ours = render_ax_text(&records, &HashMap::new(), usize::MAX)
+                    .unwrap()
+                    .text;
+                assert_eq!(
+                    value_of(&ours, "e4").is_some(),
+                    value_of(&outline(&records, &HashMap::new()), "e4").is_some(),
+                    "{role} inside {field}"
+                );
+            }
+        }
+    }
+
+    /// The text is cut at a whole line, and only the refs of lines that
+    /// printed are reported: a ref on a cut line is never usable.
+    #[test]
+    fn ax_cut_keeps_whole_lines_and_only_their_refs() {
+        let records = vec![
+            ax(0, "RootWebArea", "hello", Some("e1")),
+            ax(1, "button", "world", Some("e2")),
+            ax(1, "button", "again", Some("e3")),
+        ];
+        let first = "e1 RootWebArea hello\n";
+        let rendered = render_ax_text(&records, &HashMap::new(), first.len() + 1).unwrap();
+        assert_eq!(rendered.text, first);
+        assert_eq!(rendered.printed_refs, BTreeSet::from(["e1".to_string()]));
+        assert_eq!(rendered.cut_lines, 2);
+        assert_eq!(
+            rendered.cut_bytes,
+            "  e2 button world\n  e3 button again\n".len()
+        );
+        let none = render_ax_text(&records, &HashMap::new(), 0).unwrap();
+        assert!(none.text.is_empty() && none.printed_refs.is_empty());
+        assert_eq!(none.cut_lines, 3);
     }
 
     #[test]
-    fn ax_truncation_keeps_complete_records_and_refs_are_bounded() {
-        let records = vec![
-            AxRecord {
-                depth: 0,
-                role: "root".into(),
-                name: "hello".into(),
-                value: None,
-                reference: Some("e1".into()),
-            },
-            AxRecord {
-                depth: 1,
-                role: "button".into(),
-                name: "world".into(),
-                value: None,
-                reference: Some("e2".into()),
-            },
-        ];
-        let one = records[0].canonical_line().unwrap();
-        let (content, truncated) = encode_ax_jsonl(&records, one.len() + 1).unwrap();
-        assert_eq!(content, one);
-        assert!(truncated);
-        assert!(content.ends_with('\n'));
+    fn ax_text_refuses_an_out_of_bounds_record() {
+        let records = [ax(-1, "button", "Save", Some("e1"))];
+        assert_eq!(
+            render_ax_text(&records, &HashMap::new(), usize::MAX),
+            Err(SnapshotError::BoundExceeded)
+        );
     }
 
     #[test]

@@ -1892,17 +1892,22 @@ async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
 // Public browsing without stored grants
 // ---------------------------------------------------------------------------
 
+/// The ref of the ax line whose name is `name`: such a line reads
+/// `<ref> <role> <name>[, Value: <value>]`.
 fn named_ref(snapshot: &Value, name: &str) -> String {
     snapshot["state_text"]
         .as_str()
         .unwrap()
         .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|row| row["name"] == name)
-        .unwrap()["ref"]
-        .as_str()
-        .unwrap()
-        .to_string()
+        .find_map(|line| {
+            let (reference, rest) = line.trim_start().split_once(' ')?;
+            let (_, line_name) = rest.split_once(' ')?;
+            let line_name = line_name
+                .split_once(", Value: ")
+                .map_or(line_name, |(line_name, _)| line_name);
+            (line_name == name).then(|| reference.to_string())
+        })
+        .unwrap_or_else(|| panic!("no line named {name}: {snapshot}"))
 }
 
 async fn public_snapshot(fixture: &Fixture, route: &Route, origin: &str) -> Value {
@@ -2348,10 +2353,15 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
             .iter()
             .any(|frame| frame.frame_id == "frame-private" || frame.frame_id == "frame-nested"));
         if mode == "ax" {
+            // Every ax line that names a ref starts with it.
             assert_eq!(
                 text.lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .filter(|row| row["ref"].is_string())
+                    .filter_map(|line| line.split_whitespace().next())
+                    .filter(|word| {
+                        word.len() > 1
+                            && word.starts_with('e')
+                            && word[1..].chars().all(|c| c.is_ascii_digit())
+                    })
                     .count(),
                 7
             );

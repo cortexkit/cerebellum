@@ -2127,18 +2127,12 @@ async fn snapshot_returns_the_named_page_structure_and_backend_refs() {
         .await;
 
     assert_eq!(result["outcome"], "ok");
-    let records = result["state_text"]
-        .as_str()
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(records[1]["role"], "heading");
-    assert_eq!(records[1]["name"], "Account details");
-    assert_eq!(records[2]["role"], "button");
-    assert_eq!(records[2]["name"], "Save profile");
-    // The rows carry the refs; there is no second ref table.
-    assert_eq!(records[2]["ref"], "e3");
+    // One node per line, the ref first: there is no second ref table.
+    assert_eq!(
+        result["state_text"],
+        "e1 RootWebArea Structured fixture\n  e2 heading Account details\n  e3 button Save profile\n"
+    );
+    assert_eq!(result["content_schema"], "ck-browser-snapshot-ax-text/v1");
     assert!(result.get("refs").is_none(), "{result}");
     assert_eq!(result["truncated"], false);
     assert_eq!(result["refs_truncated"], false);
@@ -2371,7 +2365,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
             reference: Some("e2".into()),
         },
     ];
-    let first_line = records[0].canonical_line().unwrap();
+    let first_line = "e1 RootWebArea Large fixture\n";
     let plane = plane_with_process(
         &route,
         Box::new(SnapshotProcess {
@@ -2390,12 +2384,9 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         .await;
 
     assert_eq!(result["truncated"], true);
+    // The cut keeps whole lines only.
     assert_eq!(result["state_text"], first_line);
-    for line in result["state_text"].as_str().unwrap().lines() {
-        let parsed: Value = serde_json::from_str(line).unwrap();
-        assert!(parsed.get("role").is_some());
-        assert!(parsed.get("name").is_some());
-    }
+    assert_eq!(result["omitted"]["state_text_lines"], 1);
 
     let route = identity();
     let mut observation = snapshot_observation(vec![AxRecord {
@@ -2577,7 +2568,10 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
             reference: Some("e2".into()),
         },
     ];
-    let first_line = records[0].canonical_line().unwrap();
+    // A budget too small for the whole page text, so the read is cut. It is
+    // the byte length the first record had when ax lines were JSON, kept so
+    // the bound this test exercises is unchanged.
+    let budget = 80;
     let plane = plane_with_process(
         &route,
         Box::new(SnapshotProcess {
@@ -2597,7 +2591,7 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
                 "wait": "settle",
                 "severity": {"tier": 2, "credential": false, "financial": false},
                 "read_page": true,
-                "max_bytes": first_line.len()
+                "max_bytes": budget
             }),
         )
         .await;
@@ -2605,7 +2599,7 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
     assert_eq!(result["outcome"], "ok", "{result}");
     assert_eq!(result["read_page"]["truncated"], true, "{result}");
     let text = result["state_text"].as_str().unwrap();
-    assert!(text.len() <= first_line.len(), "{result}");
+    assert!(text.len() <= budget, "{result}");
     assert!(!text.contains("This record exceeds"), "{result}");
     assert!(
         result["read_page"]["omitted"]["state_text_lines"]
