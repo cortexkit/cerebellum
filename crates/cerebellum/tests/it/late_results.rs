@@ -734,6 +734,44 @@ async fn catalog_and_role_ops_are_served() {
     }
 }
 
+/// The detail of a role op's refusal, which must arrive as an `ERROR` frame:
+/// a caller decodes a `RESPONSE` body as the op's answer.
+fn refusal_detail(reply: &Frame) -> Value {
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    body["detail"].clone()
+}
+
+/// A preset is refused by name, since this provider serves none, and a null
+/// preset is no preset. Every refusal is an `ERROR` frame naming its field.
+#[tokio::test]
+async fn role_op_refusals_are_error_frames_naming_the_field() {
+    let scratch = Scratch::new();
+    let (planes, _) = planes(&scratch, false);
+    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    for name in ["role.describe", "tool.catalog"] {
+        let preset = json!({"name":name,"arguments":{},"preset":"head"});
+        assert_eq!(
+            refusal_detail(&exchange(&planes, frame(9, preset)).await),
+            json!({"field":"preset","reason_code":"unsupported_value","value":"head"})
+        );
+        let unknown = json!({"name":name,"arguments":{},"bogus":1});
+        assert_eq!(
+            refusal_detail(&exchange(&planes, frame(9, unknown)).await),
+            json!({"field":"bogus","reason_code":"unknown_field"})
+        );
+        let null = json!({"name":name,"arguments":{},"preset":null});
+        let reply = exchange(&planes, frame(9, null)).await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{name}");
+    }
+    let extra = json!({"name":"late_results","arguments":{"since":null,"extra":1}});
+    assert_eq!(
+        refusal_detail(&exchange(&planes, frame(9, extra)).await),
+        json!({"field":"arguments.extra","reason_code":"unknown_field"})
+    );
+}
+
 #[tokio::test]
 async fn keyed_present_login_ack_and_custodian_isolation() {
     let scratch = Scratch::new();

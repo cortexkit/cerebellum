@@ -243,6 +243,14 @@ pub(crate) fn check_tool_call(
     Ok(())
 }
 
+/// A role op's refusal of a malformed request. The contract sends every
+/// refusal as an `ERROR` frame: a caller decodes a `RESPONSE` body as the op's
+/// answer, so a refusal sent that way reads as a broken answer.
+fn malformed(field: &str, reason_code: &str) -> ErrorBody {
+    errors::invalid_request(field, format!("{field}: {reason_code}"))
+        .with_detail(json!({"field": field, "reason_code": reason_code}))
+}
+
 pub(crate) async fn send_error(
     error: ErrorBody,
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
@@ -299,29 +307,33 @@ pub(crate) async fn serve(
     if let Some(field) = object.keys().find(|field| {
         !matches!(
             field.as_str(),
-            "name" | "arguments" | "progress_token" | "tool_call_id"
+            "name" | "arguments" | "preset" | "progress_token" | "tool_call_id"
         )
     }) {
-        return send_invalid_request_response(
+        return send_error(
+            malformed(field, "unknown_field"),
+            (ver, channel, epoch, corr),
             writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            field,
-            "unknown_field",
+        )
+        .await;
+    }
+    // This provider serves no presets. A non-null preset is refused by name,
+    // as on tool calls, rather than served as if it were absent.
+    if let Some(preset) = object.get("preset").filter(|value| !value.is_null()) {
+        return send_error(
+            errors::invalid_request("preset", "this provider serves no presets").with_detail(
+                json!({"field": "preset", "reason_code": "unsupported_value", "value": preset}),
+            ),
+            (ver, channel, epoch, corr),
+            writer,
         )
         .await;
     }
     let Some(Value::Object(arguments)) = object.get("arguments") else {
-        return send_invalid_request_response(
+        return send_error(
+            malformed("arguments", "wrong_type"),
+            (ver, channel, epoch, corr),
             writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "arguments",
-            "wrong_type",
         )
         .await;
     };
@@ -365,14 +377,10 @@ pub(crate) async fn serve(
                 .keys()
                 .find(|field| !allowed.contains(&field.as_str()))
             {
-                return send_invalid_request_response(
+                return send_error(
+                    malformed(&format!("arguments.{field}"), "unknown_field"),
+                    (ver, channel, epoch, corr),
                     writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &format!("arguments.{field}"),
-                    "unknown_field",
                 )
                 .await;
             }
@@ -386,14 +394,10 @@ pub(crate) async fn serve(
                 )) {
                     Ok(request) if arguments.contains_key("since") => request,
                     _ => {
-                        return send_invalid_request_response(
+                        return send_error(
+                            malformed("arguments", "wrong_type"),
+                            (ver, channel, epoch, corr),
                             writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            "arguments",
-                            "wrong_type",
                         )
                         .await
                     }
@@ -424,14 +428,10 @@ pub(crate) async fn serve(
                     match serde_json::from_value::<AckRequest>(Value::Object(arguments.clone())) {
                         Ok(request) => request,
                         Err(_) => {
-                            return send_invalid_request_response(
+                            return send_error(
+                                malformed("arguments.through", "wrong_type"),
+                                (ver, channel, epoch, corr),
                                 writer,
-                                ver,
-                                channel,
-                                epoch,
-                                corr,
-                                "arguments.through",
-                                "wrong_type",
                             )
                             .await
                         }
