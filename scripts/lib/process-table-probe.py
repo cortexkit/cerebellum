@@ -6,17 +6,21 @@ The launch_recovery_clear tests run the real reading in
 `launch_recovery::user_process_arguments`: the owner of every process, through
 `PROC_PIDT_SHORTBSDINFO` (which the kernel normally answers for any process,
 whoever runs it), then the arguments of this user's own processes, through
-`KERN_PROCARGS2`. A worker sandbox hides older processes, and those tests then
-fail with `process_table_unreadable`. This probe makes the same two reads for
-every process, in the same order, with the same retry; it checks only that an
-argument answer arrived, where launch recovery also parses it. When the probe
-reports the table unreadable, the gate skips the launch_recovery_clear tests
-and says so.
+`KERN_PROCARGS2`. Most of them also scope that reading to their own test
+binary's descendants, which they find with `/bin/ps -A -o pid=,ppid=`
+(`ScopedTable` in browser_launch_service.rs). A worker sandbox refuses
+`/bin/ps` even where the reading itself works, and those tests then fail with
+`process_table_unreadable`. This probe makes the same two reads for every
+process, in the same order, with the same retry (it checks only that an
+argument answer arrived, where launch recovery also parses it), and runs the
+same `ps` command. When either fails, the gate skips the
+launch_recovery_clear tests and says so.
 
 Exit 0 when the table is readable, 1 when it is not.
 """
 import ctypes
 import os
+import subprocess
 import sys
 import time
 
@@ -82,6 +86,22 @@ def readable(pids, owner, arguments, this_user, retry_window=1.0, pause=0.02):
                 return False
             time.sleep(min(pause, deadline - now))
     return True
+
+
+def ps_lists_parents(run=subprocess.run):
+    """Whether `/bin/ps -A -o pid=,ppid=` lists processes with their parents,
+    the way the tests' `ScopedTable` reads it."""
+    try:
+        result = run(["/bin/ps", "-A", "-o", "pid=,ppid="],
+                     capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    return bool(rows) and all(
+        len(row) == 2 and row[0].isdigit() and row[1].isdigit() for row in rows
+    )
 
 
 def system_reads():
@@ -163,6 +183,25 @@ def self_test():
     assert not run({2: (me, False)}, {2})
     # Gone and zombie processes are skipped.
     assert run({2: GONE, 3: (me, True)}, {3})
+
+    class Ran:
+        def __init__(self, returncode, stdout):
+            self.returncode, self.stdout = returncode, stdout
+
+    def ps(returncode=0, stdout="    1     0\n  412     1\n", error=None):
+        def run(*_args, **_kwargs):
+            if error:
+                raise error
+            return Ran(returncode, stdout)
+        return ps_lists_parents(run)
+
+    assert ps()
+    # A sandbox that refuses ps, or a ps that fails or prints something else,
+    # leaves the tests' scoping unreadable.
+    assert not ps(error=PermissionError(1, "Operation not permitted"))
+    assert not ps(returncode=1)
+    assert not ps(stdout="")
+    assert not ps(stdout="  PID  PPID\n    1     0\n")
     print("process table probe: self-test passed")
 
 
@@ -178,7 +217,7 @@ def main():
         me = owner(os.getpid())
         if me == GONE or me is None:
             return 1
-        return 0 if readable(pids(), owner, arguments, me[0]) else 1
+        return 0 if readable(pids(), owner, arguments, me[0]) and ps_lists_parents() else 1
     except (OSError, AttributeError):
         return 1
 
