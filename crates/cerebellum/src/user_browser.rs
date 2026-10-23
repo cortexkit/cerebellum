@@ -2430,7 +2430,14 @@ async fn serve_inner(
         if action == "screenshot" {
             return screenshot(&context, tab, args, &observed, &once).await;
         }
-        let zoom = if args.get("zoom").is_some() {
+        let known_zoom = args["zoom"].as_str().is_some_and(|reference| {
+            target
+                .state()
+                .snapshots
+                .values()
+                .any(|snapshot| snapshot.refs.contains_key(reference))
+        });
+        let zoom = if known_zoom {
             Some(target.snapshot(route, tab, connection, &json!({"ref":args["zoom"]}))?)
         } else {
             None
@@ -2629,7 +2636,14 @@ async fn capture(
     let mut retry_document = None;
     for attempt in 0..2 {
         let current = retry_document.as_ref().unwrap_or(document);
-        let result = capture_attempt(context, tab, args, current, once, zoom, attempt != 0).await;
+        let result = capture_attempt(context, tab, args, current, once, zoom, attempt != 0)
+            .await
+            .map_err(|mut reply| {
+                if args.get("zoom").is_some() && reply["reason"] == "cdp_error" {
+                    reply["detail"]["step"] = reply["detail"]["method"].clone();
+                }
+                reply
+            });
         if attempt == 0
             && result
                 .as_ref()
@@ -2712,6 +2726,7 @@ async fn capture_attempt(
     let mut ax_truncated = false;
     let mut refs_truncated = false;
     let mut zoom_target = None;
+    let mut zoom_notice = String::new();
     let mut omitted_frames = 0;
     let zoom_ref = args["zoom"].as_str();
     let expected_zoom =
@@ -3018,6 +3033,9 @@ async fn capture_attempt(
             record_frames.extend(owners);
         }
         if args["mode"] == "dom_full" {
+            if zoom_ref.is_some() && zoom_target.is_none() {
+                continue;
+            }
             if expected_zoom.is_some_and(|reference| !reference.frame.same_document(frame)) {
                 continue;
             }
@@ -3034,6 +3052,16 @@ async fn capture_attempt(
                     continue;
                 }
                 return Err(refusal("snapshot_not_ready"));
+            };
+            let root = if expected_zoom.is_some() {
+                let (root, kind) = crate::browser::zoom::enclosing_element(dom, root)
+                    .map_err(|_| protocol_field_error("DOM.getFlattenedDocument", "nodes"))?;
+                if let (Some(reference), Some(kind)) = (zoom_ref, kind) {
+                    zoom_notice = crate::browser::zoom::enclosing_notice(reference, kind);
+                }
+                root
+            } else {
+                root
             };
             // Read only outermost landmarks in the requested subtree. Nested
             // landmarks are already held by their parent's markup, and a cap
@@ -3156,9 +3184,6 @@ async fn capture_attempt(
                     && record.name.starts_with("[embedded frame not readable:")
             })
     });
-    if expected_zoom.is_some() && zoom_target.is_none() && !omitted_zoom {
-        return Err(refusal("ref_scope_mismatch"));
-    }
     let observed = context.document(tab).await?;
     if !observed.observer_available || observed.observer_continuity != document.observer_continuity
     {
@@ -3166,6 +3191,21 @@ async fn capture_attempt(
     }
     if observed.committed != document.committed || observed.interaction != document.interaction {
         return Err(read_again(false));
+    }
+    if let Some(requested) = zoom_ref.filter(|_| zoom_target.is_none() && !omitted_zoom) {
+        let text = state_text::missing_zoom(
+            requested,
+            records.iter().filter(|record| {
+                record
+                    .reference
+                    .as_ref()
+                    .is_some_and(|name| prior_refs.values().any(|(prior, _)| prior == name))
+            }),
+        );
+        return Ok(
+            json!({"browser":"user", "outcome":"ref_not_found", "tab":tab,
+            "state_text":text,"input_dispatched":false}),
+        );
     }
     let mut changed = failed_frames;
     for frame in document
@@ -3302,7 +3342,7 @@ async fn capture_attempt(
         facts: &facts,
         page_url: &document.committed.url,
         snapshot_id: &id,
-        zoom: zoom_ref.map(|requested| Zoom {
+        zoom: zoom_ref.filter(|_| !omitted_zoom).map(|requested| Zoom {
             requested,
             target: zoom_target.as_deref(),
         }),
@@ -3349,12 +3389,16 @@ async fn capture_attempt(
                 })
             })
             .collect();
+        while zoom_notice.len() > max_bytes {
+            zoom_notice.pop();
+        }
+        let max_bytes = max_bytes.saturating_sub(zoom_notice.len());
         let layout = dom_layout::lay_out(&documents.join("\n"), &landmarks, max_bytes);
         snapshot
             .refs
             .retain(|reference, _| layout.named_refs.contains(reference));
         (
-            layout.text,
+            format!("{zoom_notice}{}", layout.text),
             layout.omitted_bytes > 0 || layout.omitted_lines > 0,
         )
     } else {

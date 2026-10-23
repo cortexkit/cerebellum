@@ -12,6 +12,7 @@ pub mod navigation;
 mod refs;
 mod scroll;
 pub mod state_text;
+pub(crate) mod zoom;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -273,6 +274,9 @@ pub enum BrowserError {
     CdpStepFailure {
         step: String,
     },
+    ZoomStepFailure {
+        step: String,
+    },
     BrowserCrashed,
     Internal {
         reason_code: JournalReasonCode,
@@ -311,6 +315,7 @@ impl BrowserError {
             Self::TypeNotReady { .. } => "type_not_ready",
             Self::CommandTimeout { .. } => "command_timeout",
             Self::BrowserCrashed => "browser_crashed",
+            Self::ZoomStepFailure { .. } => "zoom_not_ready",
             Self::Internal { .. } | Self::CdpStepFailure { .. } => "internal_error",
             Self::SessionStateUnavailable => "internal_failure",
         }
@@ -328,7 +333,7 @@ impl BrowserError {
             Self::NavigateNotReady { navigation_sent: true, .. } => "Page.navigate was sent but its response did not arrive before the deadline; navigation may have completed; snapshot first to inspect the current page, then retry only if needed",
             Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
             Self::CommandTimeout { .. } => "the CDP step in detail.step exceeded its deadline; let the page settle, then retry snapshot; inspect the page before retrying input because earlier input may have reached it",
-            Self::CdpStepFailure { .. } => "the CDP step in detail.step could not supply a valid response; let the page settle, then retry snapshot; if it persists, report detail.reason_code and detail.step; do not assume earlier input completed",
+            Self::CdpStepFailure { .. } | Self::ZoomStepFailure { .. } => "the CDP step in detail.step could not supply a valid response; let the page settle, then retry snapshot; if it persists, report detail.reason_code and detail.step; do not assume earlier input completed",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }
@@ -445,7 +450,9 @@ impl BrowserError {
             Self::CommandTimeout { step, command_sent } => {
                 json!({"reason_code":"command_deadline_expired","step":step,"command_sent":command_sent})
             }
-            Self::CdpStepFailure { step } => json!({"reason_code":"cdp_failure","step":step}),
+            Self::CdpStepFailure { step } | Self::ZoomStepFailure { step } => {
+                json!({"reason_code":"cdp_failure","step":step})
+            }
             Self::StaleSnapshot { reason_code } => json!({"reason_code":reason_code}),
             Self::PageChangedSinceSnapshot {
                 snapshot_origin,
@@ -1317,7 +1324,7 @@ impl ContextState {
 }
 
 /// A zoom must prove that the previously printed ref still names the same
-/// browser node in the same document. Unknown or removed nodes show the outline;
+/// browser node in the same document. Unknown or removed nodes get a short miss;
 /// missing identity evidence refuses rather than selecting by capture position.
 fn zoom_target(
     context: &ContextState,
@@ -3062,7 +3069,12 @@ impl BrowserPlane {
                     )
                     .await?;
                 }
-                let error = map_navigation_drive_error(error);
+                let error = match map_navigation_drive_error(error) {
+                    BrowserError::CdpStepFailure { step } if zoom.is_some() => {
+                        BrowserError::ZoomStepFailure { step }
+                    }
+                    error => error,
+                };
                 if let BrowserError::PageNavigatedDuringRead { live_origin, .. } = &error {
                     self.record_snapshot_refusal(
                         identity,
@@ -3231,14 +3243,24 @@ impl BrowserPlane {
                     .clone()
                     .unwrap_or_else(|| "null".into())
             });
+        let target = match zoom {
+            Some(requested) => zoom_target(context, requested, &refs, source_document.as_ref())?,
+            None => None,
+        };
+        if let Some(requested) = zoom.filter(|_| target.is_none()) {
+            let text = state_text::missing_zoom(
+                requested,
+                records.iter().filter(|record| {
+                    record
+                        .reference
+                        .as_deref()
+                        .is_some_and(|reference| context.refs.shown(reference).is_some())
+                }),
+            );
+            return Ok((json!({"outcome":"ref_not_found", "state_text":text}), 0));
+        }
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
-                let target = match zoom {
-                    Some(requested) => {
-                        zoom_target(context, requested, &refs, source_document.as_ref())?
-                    }
-                    None => None,
-                };
                 let rendered = state_text::render(&state_text::RenderInput {
                     records: &records,
                     facts: &facts,
@@ -3268,26 +3290,6 @@ impl BrowserPlane {
             SnapshotKind::DomFull => {
                 let (markup, _) =
                     snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), usize::MAX);
-                // A zoom on an element that has left the page reads the whole
-                // page instead (the capture falls back the same way the
-                // default view does), and says so first.
-                let notice = match zoom {
-                    Some(requested)
-                        if zoom_target(context, requested, &refs, source_document.as_ref())?
-                            .is_none() =>
-                    {
-                        format!(
-                            "<!-- zoom {}: no such element on the page now; showing the whole page -->\n",
-                            state_text::cap_chars(state_text::one_line(requested), 16)
-                        )
-                    }
-                    _ => String::new(),
-                };
-                let notice = if notice.len() <= max_bytes {
-                    notice
-                } else {
-                    String::new()
-                };
                 // Landmarks in document order, each with the markup the
                 // capture read for it; only a dom_full capture reads any.
                 let landmarks: Vec<dom_layout::DomLandmark<'_>> = records
@@ -3301,12 +3303,12 @@ impl BrowserPlane {
                         })
                     })
                     .collect();
-                let layout = dom_layout::lay_out(&markup, &landmarks, max_bytes - notice.len());
+                let layout = dom_layout::lay_out(&markup, &landmarks, max_bytes);
                 // A ref stays usable only if the caller was shown it, which
                 // here means named by one of the layout's own comments.
                 refs.retain(|record| layout.named_refs.contains(&record.captured.reference));
                 (
-                    format!("{notice}{}", layout.text),
+                    layout.text,
                     layout.omitted_bytes > 0,
                     DOM_SCHEMA,
                     (layout.omitted_bytes, layout.omitted_lines),
@@ -4873,6 +4875,7 @@ fn browser_result_outcome_schema() -> Value {
             "human_in_control",
             "stale_snapshot",
         "ref_not_found",
+        "zoom_not_ready",
         "ref_ambiguous",
         "classification_unavailable",
         "element_intercepted",
@@ -5652,7 +5655,7 @@ pub(crate) fn validate_user_browser_result(
         closed_object(
             json!({
                 "browser":enum_schema(&["user"]),
-                "outcome":enum_schema(&["ok","refused","closed","invalid_request","cancelled","outcome_unknown","authorization_denied","consent_pending"]),
+                "outcome":enum_schema(&["ok","ref_not_found","refused","closed","invalid_request","cancelled","outcome_unknown","authorization_denied","consent_pending"]),
                 "ask_id":string_schema(),
             "reason":string_schema(), "remedy":string_schema(),
             "settled":boolean_schema(), "settlement_reason":string_schema(),
@@ -5674,7 +5677,7 @@ pub(crate) fn validate_user_browser_result(
                     closed_object(json!({"reason":string_schema()}), &["reason"]),
                     // A cdp_error refusal names the rejected plan command and
                     // Chrome's fixed error code and message, never page text.
-                    closed_object(json!({"method":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"]),
+                    closed_object(json!({"method":string_schema(),"step":string_schema(),"code":integer_schema(),"message":string_schema()}), &["method","code","message"]),
                     // An extension_outdated or extension_newer refusal names
                     // the extension's contract revision (null when it sent
                     // none) and the one this build requires.
@@ -6017,6 +6020,7 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         | BrowserError::HumanInControl { .. }
         | BrowserError::Internal { .. }
         | BrowserError::CdpStepFailure { .. }
+        | BrowserError::ZoomStepFailure { .. }
         | BrowserError::SessionStateUnavailable
         | BrowserError::BrowserCrashed
         | BrowserError::NotSettled { .. }
@@ -6969,6 +6973,7 @@ mod tests {
             BrowserError::TypeNotReady { .. } => "TypeNotReady",
             BrowserError::CommandTimeout { .. } => "CommandTimeout",
             BrowserError::CdpStepFailure { .. } => "CdpStepFailure",
+            BrowserError::ZoomStepFailure { .. } => "ZoomStepFailure",
             BrowserError::BrowserCrashed => "BrowserCrashed",
             BrowserError::Internal { .. } => "Internal",
             BrowserError::SessionStateUnavailable => "SessionStateUnavailable",

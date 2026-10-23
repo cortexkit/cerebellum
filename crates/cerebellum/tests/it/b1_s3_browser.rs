@@ -309,6 +309,99 @@ struct SnapshotProcess {
     observation: BrowserSnapshotObservation,
 }
 
+struct FailingZoomProcess(SnapshotProcess);
+
+impl OwnedBrowserProcess for FailingZoomProcess {
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(page_document())
+    }
+    fn snapshot(
+        &mut self,
+        route: &str,
+        kind: SnapshotKind,
+        deadline: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.0.snapshot(route, kind, deadline)
+    }
+    fn snapshot_subtree_classified(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        _: &RefRecord,
+        _: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Err(NavigationDriveError::CdpStepFailure {
+            method: "DOM.querySelector".into(),
+        })
+    }
+    fn generation_matches(&self) -> bool {
+        true
+    }
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn zoom_cdp_resolution_failure_is_a_typed_refusal_at_the_serve_boundary() {
+    use cerebellum::computer_capability::ResultSchemaEnforcement;
+    let route = identity();
+    let process = SnapshotProcess {
+        observation: snapshot_observation(vec![AxRecord {
+            depth: 0,
+            role: "button".into(),
+            name: "Go".into(),
+            value: None,
+            reference: Some("e1".into()),
+        }]),
+    };
+    let plane = plane_with_process(&route, Box::new(FailingZoomProcess(process)), 1000)
+        .with_result_schema_enforcement(ResultSchemaEnforcement::Withhold);
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let snapshot = plane
+        .serve(&route, BrowserCapability::Snapshot, &json!({}))
+        .await
+        .unwrap();
+    let reference = snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("button Go"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    for mode in ["actionable", "dom_full"] {
+        let reply = plane
+            .serve(
+                &route,
+                BrowserCapability::Snapshot,
+                &json!({"zoom":reference,"mode":mode}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["outcome"], "zoom_not_ready", "{reply}");
+        assert_eq!(reply["detail"]["reason_code"], "cdp_failure", "{reply}");
+        assert_eq!(reply["detail"]["step"], "DOM.querySelector", "{reply}");
+    }
+}
+
 impl OwnedBrowserProcess for SnapshotProcess {
     fn navigate(
         &mut self,
@@ -2178,7 +2271,7 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         .unwrap();
     assert_eq!(unprinted["outcome"], "ref_not_found", "{unprinted}");
 
-    // An unknown ref cannot select a node; the reply says so and shows the outline.
+    // An unknown ref reports a short miss instead of repeating the outline.
     let missing = plane
         .serve(
             &route,
@@ -2187,14 +2280,15 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         )
         .await
         .unwrap();
-    assert_eq!(missing["outcome"], "ok", "{missing}");
+    assert_eq!(missing["outcome"], "ref_not_found", "{missing}");
     let text = missing["state_text"].as_str().unwrap();
     assert!(
-        text.contains("\nzoom e999: no such element on the page now; showing the outline\n"),
+        text.starts_with("zoom e999: no such element on the page now."),
         "{text}"
     );
-    assert!(text.contains("article Ada posted"), "{text}");
-    assert!(text.contains(" navigation Primary"), "{text}");
+    assert!(text.contains("After: none"), "{text}");
+    assert!(!text.contains(" navigation Primary"), "{text}");
+    assert!(missing.to_string().len() < 1024, "{missing}");
     let invalid = plane
         .serve(
             &route,

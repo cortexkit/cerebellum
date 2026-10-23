@@ -253,11 +253,8 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
                 lines
             }
             None => {
-                header.push_str(&format!(
-                    "\nzoom {}: no such element on the page now; showing the outline",
-                    cap_chars(one_line(zoom.requested), 16)
-                ));
-                tree.outline_lines()
+                header = missing_zoom(zoom.requested, input.records.iter());
+                Vec::new()
             }
         },
         None if input.filters.narrows() => {
@@ -271,6 +268,45 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
         header.push_str("\nNo matches for the requested filters.");
     }
     fit(header, header_refs, lines, &tree, input.max_bytes)
+}
+
+/// Neighbours are numeric ref neighbours, not DOM siblings. Callers pass only
+/// live records whose refs were printed in an earlier snapshot.
+pub(crate) fn missing_zoom<'a>(
+    requested: &str,
+    records: impl Iterator<Item = &'a AxRecord>,
+) -> String {
+    let number = |reference: &str| reference.strip_prefix('e')?.parse::<u64>().ok();
+    let wanted = number(requested);
+    let mut before = None;
+    let mut after = None;
+    for record in records {
+        let Some(id) = record.reference.as_deref().and_then(number) else {
+            continue;
+        };
+        if wanted.is_some_and(|wanted| id < wanted)
+            && before.is_none_or(|(previous, _)| id > previous)
+        {
+            before = Some((id, record));
+        }
+        if wanted.is_some_and(|wanted| id > wanted)
+            && after.is_none_or(|(previous, _)| id < previous)
+        {
+            after = Some((id, record));
+        }
+    }
+    let label = |candidate: Option<(u64, &AxRecord)>| match candidate {
+        Some((id, record)) => format!(
+            "e{id} {} {}",
+            cap_chars(one_line(&record.role), 40),
+            cap_chars(one_line(&record.name), 40)
+        ),
+        None => "none".into(),
+    };
+    format!(
+        "zoom {}: no such element on the page now.\nBefore: {}\nAfter: {}\nTake a fresh snapshot if the page changed.",
+        cap_chars(one_line(requested), 16), label(before), label(after)
+    )
 }
 
 /// The role word a line prints: `StaticText` reads as `text` and the root
