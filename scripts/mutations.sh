@@ -85,7 +85,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
-export TMPDIR="$tmpdir"
+# The runner's own temporary files stay out of the per-user temp directory too,
+# but in a directory this script never deletes. A compiler cache server started
+# by the runner's first build would keep this TMPDIR for its whole life and serve
+# every later build on the machine, so start it first, with the caller's TMPDIR.
+if command -v sccache >/dev/null 2>&1; then
+  sccache --start-server >/dev/null 2>&1 || true
+fi
+export TMPDIR="$scratch_root/tmp"
+mkdir -p "$TMPDIR"
 catalogue=mutations.d
 if [ "$check_only" -eq 1 ]; then
   planner_python=""
