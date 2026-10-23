@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::snapshot_store::AxRecord;
+use crate::snapshot_store::{truncate_ax_field, AxRecord, MAX_NAME_BYTES};
 
 /// The reply field that carries the rendered page. Prefrontal lifts a
 /// top-level string of this name into a native text part, so the page reaches
@@ -249,6 +249,15 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
                     tree.filtered_lines(target, 0, input.filters, &mut lines);
                 } else {
                     tree.full_lines(target, 0, &mut lines);
+                    // The target's line may hold its whole name in what the
+                    // header and its text children leave of `max_bytes`.
+                    let others: usize = lines[1..].iter().map(Line::bytes).sum();
+                    let room = input
+                        .max_bytes
+                        .saturating_sub(header.len() + 1 + others + 1);
+                    if let Some(text) = tree.full_name_text(target, room) {
+                        lines[0].text = text;
+                    }
                 }
                 lines
             }
@@ -492,6 +501,12 @@ pub(super) fn size_text(bytes: usize) -> String {
 /// The name with its digits removed: "3 Likes" and "12 Likes" have one shape.
 fn shape(name: &str) -> String {
     name.chars().filter(|c| !c.is_ascii_digit()).collect()
+}
+
+/// The letters and digits of `text`: what it says, without the quotes,
+/// colons and other punctuation a viewer wraps around it.
+fn content_chars(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -745,6 +760,11 @@ impl<'a> Tree<'a> {
     }
 
     fn element_text(&self, node: usize, name_chars: usize) -> String {
+        self.element_text_named(node, cap_chars(self.names[node].clone(), name_chars))
+    }
+
+    /// The element's line with `name` printed as its name.
+    fn element_text_named(&self, node: usize, name: String) -> String {
         let role = self.role(node);
         let facts = self.facts(node);
         let mut text = String::new();
@@ -765,10 +785,9 @@ impl<'a> Tree<'a> {
             text.push_str(&states.join(", "));
             text.push(')');
         }
-        let name = &self.names[node];
         if !name.is_empty() {
             text.push(' ');
-            text.push_str(&cap_chars(name.clone(), name_chars));
+            text.push_str(&name);
         }
         let shown_value = self.shown_value(node);
         if let Some(value) = shown_value.filter(|value| !value.is_empty()) {
@@ -779,7 +798,7 @@ impl<'a> Tree<'a> {
             if let Some(placeholder) = facts
                 .and_then(|facts| facts.placeholder.as_deref())
                 .map(one_line)
-                .filter(|placeholder| !placeholder.is_empty() && placeholder != name)
+                .filter(|placeholder| !placeholder.is_empty() && placeholder != &self.names[node])
             {
                 text.push_str(", Placeholder: ");
                 text.push_str(&cap_chars(placeholder, NAME_CHARS));
@@ -815,6 +834,53 @@ impl<'a> Tree<'a> {
             TEXT_CHARS
         } else {
             NAME_CHARS
+        }
+    }
+
+    /// The line a zoom prints for `node` when it is a single element (any
+    /// children it has are text leaves) whose usual cap cut its name: the
+    /// whole stored name, up to [`MAX_NAME_BYTES`], in a line of at most
+    /// `room` bytes. A row's Copy button can carry a whole JSON event in its
+    /// name, and a zoom on it is how an agent reads that. A name still cut,
+    /// by `room` or because the capture stored it at its byte limit, ends
+    /// with a marker saying so.
+    ///
+    /// `None` when the cap cut nothing, when `node` holds other elements (a
+    /// container's name repeats the subtree it heads, see [`NAME_CHARS`]), or
+    /// when `room` holds no more of the name than the capped line does.
+    fn full_name_text(&self, node: usize, room: usize) -> Option<String> {
+        let name = &self.names[node];
+        if name.chars().count() <= self.name_chars(node)
+            || self.kids[node]
+                .iter()
+                .any(|&kid| self.role(kid) != "StaticText" || !self.kids[kid].is_empty())
+        {
+            return None;
+        }
+        // The capture cuts a longer name to `MAX_NAME_BYTES` on a character
+        // boundary, so a stored name within one character (at most four
+        // bytes) of that limit may have been cut there.
+        let stored = self.records[node].map_or(0, |record| record.name.len());
+        let mut cut = stored + 4 > MAX_NAME_BYTES;
+        let mut shown = truncate_ax_field(name, MAX_NAME_BYTES);
+        cut |= shown.len() < name.len();
+        let capped = self.element_text(node, self.name_chars(node));
+        loop {
+            let printed = if cut {
+                format!("{shown}… [name cut at {} bytes]", shown.len())
+            } else {
+                shown.clone()
+            };
+            let text = self.element_text_named(node, printed);
+            if text.len() <= room {
+                return (text.len() > capped.len()).then_some(text);
+            }
+            let over = text.len() - room;
+            if over >= shown.len() {
+                return None;
+            }
+            shown = truncate_ax_field(&shown, shown.len() - over);
+            cut = true;
         }
     }
 
@@ -872,7 +938,12 @@ impl<'a> Tree<'a> {
     /// (a list or a table is a region, not a row), or more than [`ROW_LEAVES`]
     /// leaves or [`ROW_BYTES`] bytes. A subtree of a single leaf is accepted,
     /// though it never holds a second leaf for a match to print with.
-    fn leaf_row(&self, node: usize) -> Option<Vec<(usize, String)>> {
+    ///
+    /// A key chip of the match `matched` (see `is_key_chip`) is part of the
+    /// key, not a control that refuses the row; the returned flag says the
+    /// row holds one, so the caller prints it with its refs rather than as
+    /// one joined line that would drop the chip's ref.
+    fn leaf_row(&self, node: usize, matched: usize) -> Option<(Vec<(usize, String)>, bool)> {
         if node == 0 || self.is_landmark(node) {
             return None;
         }
@@ -880,10 +951,13 @@ impl<'a> Tree<'a> {
         let mut texts = Vec::new();
         let mut bytes = 0;
         let mut leaves = 0;
+        let mut holds_chip = false;
         while let Some(kid) = pending.pop() {
             let role = self.role(kid);
+            let chip = self.is_key_chip(kid, matched);
+            holds_chip |= chip;
             if self.is_landmark(kid)
-                || is_actionable(role)
+                || (is_actionable(role) && !chip)
                 || is_text_field(role)
                 || is_value_control(role)
             {
@@ -913,7 +987,57 @@ impl<'a> Tree<'a> {
             }
             texts.push((kid, text));
         }
-        Some(texts)
+        Some((texts, holds_chip))
+    }
+
+    /// Whether `node` is a control that is only the match's own key: the
+    /// match lies strictly inside it, and the letters and digits of all the
+    /// text below it are exactly the match's. A JSON viewer renders each key
+    /// as a click-to-filter chip holding `'event':` (the key between quotes
+    /// and a colon), and a filter on `event` matches the text inside it; the
+    /// chip belongs to that key rather than being a separate control beside
+    /// it. A control that is itself the match is never a key chip; a row block
+    /// around it may still print it with a label beside it. Text fields and
+    /// value controls are never key chips, even when their values are shown.
+    fn is_key_chip(&self, node: usize, matched: usize) -> bool {
+        let role = self.role(node);
+        if node == matched || !is_actionable(role) || is_text_field(role) || is_value_control(role)
+        {
+            return false;
+        }
+        let key = content_chars(&self.names[matched]);
+        if key.is_empty() {
+            return false;
+        }
+        let mut inside = false;
+        let mut current = self.parent[matched];
+        while let Some(ancestor) = current {
+            if ancestor == node {
+                inside = true;
+                break;
+            }
+            current = self.parent[ancestor];
+        }
+        if !inside {
+            return false;
+        }
+        let mut text = String::new();
+        let mut leaves = 0;
+        let mut pending = vec![node];
+        while let Some(kid) = pending.pop() {
+            if self.kids[kid].is_empty() {
+                // A chip holds one key, so a larger subtree is never one;
+                // stopping early keeps the check cheap on large controls.
+                leaves += 1;
+                text.push_str(&content_chars(&self.names[kid]));
+                if leaves > ROW_LEAVES || text.len() > key.len() {
+                    return false;
+                }
+            } else {
+                pending.extend(self.kids[kid].iter().rev().copied());
+            }
+        }
+        text == key
     }
 
     /// The row block a match prints with: its nearest ancestor (in the
@@ -944,7 +1068,8 @@ impl<'a> Tree<'a> {
     /// `row_block`), or `None` when it is too large or holds a landmark or a
     /// table part. For qualifying, a text inside a control is that control's
     /// label, not a separate label; it still counts toward the leaf and byte
-    /// limits.
+    /// limits. A key chip (see `is_key_chip`) counts as part of the match, and
+    /// its text as a label: the key is the label its value prints with.
     fn is_row_block(&self, node: usize, matched: usize) -> Option<bool> {
         // Each entry: the node, whether it lies inside the match, and whether
         // it lies inside a control.
@@ -956,10 +1081,12 @@ impl<'a> Tree<'a> {
             if kid != node && (self.is_landmark(kid) || is_table_part(role)) {
                 return None;
             }
-            let in_match = in_match || kid == matched;
+            let chip = self.is_key_chip(kid, matched);
+            let in_match = in_match || kid == matched || chip;
             let actionable = is_actionable(role);
-            let labelled =
-                !actionable && !in_control && self.names[kid].chars().any(char::is_alphanumeric);
+            let labelled = (!actionable || chip)
+                && !in_control
+                && self.names[kid].chars().any(char::is_alphanumeric);
             control |= actionable;
             label |= labelled;
             beside_match |= (actionable || labelled) && !in_match;
@@ -968,7 +1095,7 @@ impl<'a> Tree<'a> {
                     self.kids[kid]
                         .iter()
                         .rev()
-                        .map(|&grandkid| (grandkid, in_match, in_control || actionable)),
+                        .map(|&grandkid| (grandkid, in_match, in_control || (actionable && !chip))),
                 );
                 continue;
             }
@@ -998,7 +1125,8 @@ impl<'a> Tree<'a> {
     /// value. Quotes and separators alone do not count. The climb stops at the
     /// first ancestor `leaf_row` rejects, and never goes past the nearest
     /// accepted one, because a larger ancestor can pull in neighbouring
-    /// properties.
+    /// properties. A row holding the key's chip prints element by element, so
+    /// the chip keeps its ref and can still be clicked.
     fn collect_filter_rows(
         &self,
         node: usize,
@@ -1011,23 +1139,25 @@ impl<'a> Tree<'a> {
             rows.insert(block, FilterRow::Block);
         } else if self.kids[node].is_empty() && matched {
             for &ancestor in ancestors.iter().rev() {
-                let Some(texts) = self.leaf_row(ancestor) else {
+                let Some((texts, holds_chip)) = self.leaf_row(ancestor, node) else {
                     break;
                 };
                 if texts
                     .iter()
                     .any(|(leaf, text)| *leaf != node && text.chars().any(char::is_alphanumeric))
                 {
-                    rows.insert(
-                        ancestor,
+                    let row = if holds_chip {
+                        FilterRow::Block
+                    } else {
                         FilterRow::Joined(
                             texts
                                 .into_iter()
                                 .map(|(_, text)| text)
                                 .collect::<Vec<_>>()
                                 .join(" "),
-                        ),
-                    );
+                        )
+                    };
+                    rows.insert(ancestor, row);
                     break;
                 }
             }
@@ -1573,6 +1703,308 @@ mod tests {
             "{over}"
         );
         assert!(!over.contains("Open"), "{over}");
+    }
+
+    /// How a JSON viewer renders a property's value next to its key chip.
+    #[derive(Clone, Copy, Debug)]
+    enum ValueShape {
+        /// A span holding the value as three texts (quote, value, quote).
+        Element,
+        /// The same span as a click-to-filter button.
+        ClickableElement,
+        /// One text right after the chip.
+        NextText,
+        /// A click-to-filter button right after the chip, its one text
+        /// repeating its name.
+        NextClickable,
+    }
+
+    /// An expanded Workers Observability event,
+    /// `{ 'event': 'boat_pool_retire', 'eventType': 'cron' }`, one line
+    /// wrapper per property. Each key is a click-to-filter chip: a button
+    /// named `'event':` whose texts are `'`, `event` and `':`, which is why
+    /// the key's text prints as `event`. Refs follow document order.
+    fn json_viewer(shape: ValueShape) -> Vec<AxRecord> {
+        let mut records = Vec::new();
+        let mut push = |depth: i64, role: &str, name: &str| {
+            let reference = format!("e{}", records.len() + 1);
+            records.push(record(depth, role, name, Some(&reference)));
+        };
+        push(0, "RootWebArea", "Workers Observability");
+        push(1, "main", "");
+        push(2, "generic", "");
+        push(3, "StaticText", "{");
+        for (key, value) in [("event", "boat_pool_retire"), ("eventType", "cron")] {
+            let quoted = format!("'{value}'");
+            push(3, "generic", "");
+            push(4, "button", &format!("'{key}':"));
+            push(5, "StaticText", "'");
+            push(5, "StaticText", key);
+            push(5, "StaticText", "':");
+            match shape {
+                ValueShape::Element | ValueShape::ClickableElement => {
+                    if matches!(shape, ValueShape::Element) {
+                        push(4, "generic", "");
+                    } else {
+                        push(4, "button", &quoted);
+                    }
+                    push(5, "StaticText", "'");
+                    push(5, "StaticText", value);
+                    push(5, "StaticText", "'");
+                }
+                ValueShape::NextText => push(4, "StaticText", &quoted),
+                ValueShape::NextClickable => {
+                    push(4, "button", &quoted);
+                    push(5, "StaticText", &quoted);
+                }
+            }
+            push(4, "StaticText", ",");
+        }
+        push(3, "StaticText", "}");
+        records
+    }
+
+    fn filtered(records: &[AxRecord], text: &str) -> RenderedState {
+        render(&RenderInput {
+            records,
+            facts: &HashMap::new(),
+            filters: &Filters {
+                text: Some(text.into()),
+                roles: Vec::new(),
+            },
+            page_url: "https://dash.cloudflare.com/",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 65_536,
+        })
+    }
+
+    /// The rendered text below its header line.
+    fn body(state: &RenderedState) -> &str {
+        state.text.split_once('\n').map_or("", |(_, body)| body)
+    }
+
+    /// A filter on a key prints each matching property line with its value,
+    /// element by element, so the key's chip keeps its ref and can be
+    /// clicked. Both value shapes are covered, plain and clickable. A plain
+    /// value already printed this way, the value being a label beside the
+    /// chip; a clickable value used to leave the line with no label outside
+    /// a control, so the key printed alone.
+    #[test]
+    fn a_text_filter_on_a_json_viewer_key_chip_prints_its_property_line() {
+        let element = |value: &str, quote_refs: [usize; 3]| {
+            format!(
+                "      e{} text '\n      e{} text {value}\n      e{} text '\n",
+                quote_refs[0], quote_refs[1], quote_refs[2]
+            )
+        };
+        let line = |first: usize, key: &str, value: String, comma: usize| {
+            format!(
+                "  e{first} generic\n    e{} button '{key}':\n      e{} text '\n      e{} text {key}\n      e{} text ':\n{value}    e{comma} text ,\n",
+                first + 1,
+                first + 2,
+                first + 3,
+                first + 4,
+            )
+        };
+        let cases = [
+            (
+                ValueShape::Element,
+                line(
+                    5,
+                    "event",
+                    format!(
+                        "    e10 generic\n{}",
+                        element("boat_pool_retire", [11, 12, 13])
+                    ),
+                    14,
+                ) + &line(
+                    15,
+                    "eventType",
+                    format!("    e20 generic\n{}", element("cron", [21, 22, 23])),
+                    24,
+                ),
+            ),
+            (
+                ValueShape::ClickableElement,
+                line(
+                    5,
+                    "event",
+                    format!(
+                        "    e10 button 'boat_pool_retire'\n{}",
+                        element("boat_pool_retire", [11, 12, 13])
+                    ),
+                    14,
+                ) + &line(
+                    15,
+                    "eventType",
+                    format!("    e20 button 'cron'\n{}", element("cron", [21, 22, 23])),
+                    24,
+                ),
+            ),
+            (
+                ValueShape::NextText,
+                line(5, "event", "    e10 text 'boat_pool_retire'\n".into(), 11)
+                    + &line(12, "eventType", "    e17 text 'cron'\n".into(), 18),
+            ),
+            (
+                ValueShape::NextClickable,
+                line(5, "event", "    e10 button 'boat_pool_retire'\n".into(), 12)
+                    + &line(13, "eventType", "    e18 button 'cron'\n".into(), 20),
+            ),
+        ];
+        for (shape, expected) in cases {
+            let found = filtered(&json_viewer(shape), "event");
+            assert_eq!(
+                body(&found),
+                format!("e1 page Workers Observability\n{expected}"),
+                "{shape:?}"
+            );
+            assert!(
+                found.printed_refs.contains("e6"),
+                "{shape:?}: the chip's ref"
+            );
+        }
+    }
+
+    /// A key chip in a table cell: a table keeps its own row rule, so the
+    /// cell is the row, and the chip in it no longer refuses that row. The
+    /// cell prints element by element, so the chip keeps its ref.
+    #[test]
+    fn a_key_chip_in_a_table_cell_prints_with_its_value_and_keeps_its_ref() {
+        let records = vec![
+            record(0, "RootWebArea", "Log", Some("e1")),
+            record(1, "table", "Properties", Some("e2")),
+            record(2, "row", "", Some("e3")),
+            record(3, "cell", "", Some("e4")),
+            record(4, "button", "'event':", Some("e5")),
+            record(5, "StaticText", "'", Some("e6")),
+            record(5, "StaticText", "event", Some("e7")),
+            record(5, "StaticText", "':", Some("e8")),
+            record(4, "StaticText", "'boat_pool_retire'", Some("e9")),
+        ];
+        let found = filtered(&records, "event");
+        assert_eq!(
+            body(&found),
+            "e1 page Log\n  e2 table Properties\n    e4 cell\n      e5 button 'event':\n        e6 text '\n        e7 text event\n        e8 text ':\n      e9 text 'boat_pool_retire'\n"
+        );
+        assert!(found.printed_refs.contains("e5"));
+    }
+
+    /// A control whose text holds more than the match is a separate control,
+    /// and a matched control is never its own key chip: a link matched among
+    /// other links prints alone, as before.
+    #[test]
+    fn a_control_holding_more_than_the_match_or_matched_itself_is_no_key_chip() {
+        let records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "generic", "", Some("e2")),
+            record(2, "button", "Retry event", Some("e3")),
+            record(3, "StaticText", "Retry", Some("e4")),
+            record(3, "StaticText", "event", Some("e5")),
+            record(2, "link", "Open", Some("e6")),
+            record(1, "generic", "", Some("e7")),
+            record(2, "link", "Close", Some("e8")),
+            record(2, "link", "Edit", Some("e9")),
+        ];
+        assert_eq!(
+            body(&filtered(&records, "event")),
+            "e1 page Page\n  e3 button Retry event\n    e5 text event\n"
+        );
+        assert_eq!(
+            body(&filtered(&records, "Close")),
+            "e1 page Page\n  e8 link Close\n"
+        );
+    }
+
+    fn zoomed(records: &[AxRecord], target: &str, max_bytes: usize) -> RenderedState {
+        render(&RenderInput {
+            records,
+            facts: &HashMap::new(),
+            filters: &Filters::default(),
+            page_url: "https://dash.cloudflare.com/",
+            snapshot_id: "s1",
+            zoom: Some(Zoom {
+                requested: target,
+                target: Some(target),
+            }),
+            max_bytes,
+        })
+    }
+
+    /// A row's Copy button named with the whole event JSON (about 1.4 KB),
+    /// and a container carrying the same name.
+    fn copy_button_page(name: &str) -> Vec<AxRecord> {
+        vec![
+            record(0, "RootWebArea", "Workers Observability", Some("e1")),
+            record(1, "button", name, Some("e2")),
+            record(2, "StaticText", "Copy", Some("e3")),
+            record(1, "generic", name, Some("e4")),
+            record(2, "link", "Open", Some("e5")),
+        ]
+    }
+
+    fn copy_name() -> String {
+        let mut json = String::from("Copy { 'event': 'boat_pool_retire'");
+        for index in 0..60 {
+            json.push_str(&format!(", 'field{index}': 'value {index}'"));
+        }
+        json.push_str(" }");
+        json
+    }
+
+    #[test]
+    fn a_zoom_on_a_single_element_prints_its_whole_name() {
+        let name = copy_name();
+        assert!(name.len() > 1_000 && name.len() < MAX_NAME_BYTES);
+        let records = copy_button_page(&name);
+        let found = zoomed(&records, "e2", 65_536);
+        assert_eq!(body(&found), format!("e2 button {name}\n  e3 text Copy\n"));
+        assert_eq!(found.cut_lines, 0);
+
+        // A budget smaller than the name cuts it to fit, with a marker.
+        let tight = zoomed(&records, "e2", 800);
+        assert!(tight.text.len() <= 800, "{}", tight.text);
+        let line = body(&tight).lines().next().unwrap();
+        let shown = line
+            .strip_prefix("e2 button ")
+            .and_then(|line| line.split_once("… [name cut at "))
+            .map(|(shown, _)| shown)
+            .unwrap_or_else(|| panic!("{}", tight.text));
+        assert!(
+            shown.len() > NAME_CHARS && name.starts_with(shown),
+            "{line}"
+        );
+        assert!(line.ends_with(&format!("… [name cut at {} bytes]", shown.len())));
+        assert!(
+            body(&tight).ends_with("\n  e3 text Copy\n"),
+            "{}",
+            tight.text
+        );
+
+        // A name the capture stored at its byte limit says it was cut there.
+        let stored = "x".repeat(MAX_NAME_BYTES);
+        let found = zoomed(&copy_button_page(&stored), "e2", 65_536);
+        assert!(
+            body(&found).starts_with(&format!(
+                "e2 button {stored}… [name cut at {MAX_NAME_BYTES} bytes]\n"
+            )),
+            "{}",
+            found.text
+        );
+    }
+
+    #[test]
+    fn a_zoom_on_a_container_keeps_its_name_capped() {
+        let name = copy_name();
+        let found = zoomed(&copy_button_page(&name), "e4", 65_536);
+        assert_eq!(
+            body(&found),
+            format!(
+                "e4 generic {}\n  e5 link Open\n",
+                cap_chars(name.clone(), NAME_CHARS)
+            )
+        );
     }
 
     fn record(depth: i64, role: &str, name: &str, reference: Option<&str>) -> AxRecord {
