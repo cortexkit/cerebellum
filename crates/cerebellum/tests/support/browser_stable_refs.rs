@@ -207,17 +207,19 @@ async fn stable_refs_wire_zoom_routes_the_retained_identity_to_subtree_capture()
 }
 
 #[tokio::test]
-async fn stable_refs_wire_removed_zoom_shows_outline_and_click_refuses_without_reassignment() {
+async fn stable_refs_wire_removed_zoom_is_brief_and_click_refuses_without_reassignment() {
     let (planes, launcher, dropdowns) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
     let removed = ref_named(&before, "Access: Permission 00");
     dropdowns.lock().unwrap().removed.insert(0);
     let zoom = call(&planes, "snapshot", json!({"zoom":removed})).await;
-    assert_eq!(zoom["outcome"], "ok", "{zoom}");
-    let message = format!("zoom {removed}: no such element on the page now; showing the outline");
+    assert_eq!(zoom["outcome"], "ref_not_found", "{zoom}");
+    let message = format!("zoom {removed}: no such element on the page now.");
     let text = zoom["state_text"].as_str().unwrap();
     assert!(text.contains(&message), "{text}");
-    assert!(text.contains("Permissions"), "{text}");
+    assert!(text.contains("After:"), "{text}");
+    assert!(!text.contains("Permissions"), "{text}");
+    assert!(zoom.to_string().len() < 1024, "{zoom}");
     assert!(!text.contains("Access: Permission 00"), "{text}");
     let clicked = click(&planes, &before, &removed).await;
     assert_eq!(clicked["outcome"], "stale_snapshot", "{clicked}");
@@ -225,7 +227,7 @@ async fn stable_refs_wire_removed_zoom_shows_outline_and_click_refuses_without_r
     let after = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
     assert_ne!(ref_named(&after, "Access: Permission 01"), removed);
     let old_zoom = call(&planes, "snapshot", json!({"zoom":removed})).await;
-    assert_eq!(old_zoom["outcome"], "ok", "{old_zoom}");
+    assert_eq!(old_zoom["outcome"], "ref_not_found", "{old_zoom}");
     assert!(old_zoom["state_text"].as_str().unwrap().contains(&message));
 }
 
@@ -250,6 +252,37 @@ async fn stable_refs_wire_filters_keep_only_matches_under_ancestors() {
     assert!(!text.contains("Permission 18"));
     let empty = call(&planes, "snapshot", json!({"text_filter":"missing"})).await;
     assert!(empty["state_text"].as_str().unwrap().contains("No matches"));
+}
+
+#[tokio::test]
+async fn missing_zoom_names_the_numeric_printed_neighbours_in_every_zoom_mode() {
+    for mode in ["actionable", "dom_full"] {
+        let (planes, _, dropdowns) = fixture().await;
+        let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
+        let missing = ref_named(&before, "Access: Permission 01");
+        let lower = ref_named(&before, "Access: Permission 00");
+        let upper = ref_named(&before, "listitem Permission 02");
+        dropdowns.lock().unwrap().removed.insert(1);
+        let reply = call(&planes, "snapshot", json!({"zoom":missing,"mode":mode})).await;
+        assert_eq!(reply["outcome"], "ref_not_found", "{reply}");
+        let text = reply["state_text"].as_str().unwrap();
+        assert!(text.contains(&format!("zoom {missing}:")), "{text}");
+        assert!(
+            text.contains(&format!("Before: {lower} button Access: Permission 00")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("After: {upper} listitem Permission 02")),
+            "{text}"
+        );
+        assert!(
+            text.contains("Take a fresh snapshot if the page changed."),
+            "{text}"
+        );
+        assert!(!text.contains("Access: Permission 03"), "{text}");
+        assert!(!text.contains(" · snapshot "), "{text}");
+        assert!(reply.to_string().len() < 1024, "{reply}");
+    }
 }
 
 #[tokio::test]
@@ -316,14 +349,12 @@ async fn stable_refs_wire_old_refs_survive_views_but_not_snapshot_eviction() {
     assert_eq!(stale["outcome"], "stale_snapshot", "{stale}");
     assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
     // Eviction removes proof of what the caller saw, even if the name cache
-    // remembers the node. An unknown zoom shows the outline, not that node.
+    // remembers the node. An unknown zoom reports a miss, not that node.
     let zoom = call(&planes, "snapshot", json!({"zoom":old})).await;
-    assert_eq!(zoom["outcome"], "ok", "{zoom}");
+    assert_eq!(zoom["outcome"], "ref_not_found", "{zoom}");
     let text = zoom["state_text"].as_str().unwrap();
     assert!(
-        text.contains(&format!(
-            "zoom {old}: no such element on the page now; showing the outline"
-        )),
+        text.contains(&format!("zoom {old}: no such element on the page now.")),
         "{text}"
     );
     assert!(!text.contains("Access: Permission 39"), "{text}");

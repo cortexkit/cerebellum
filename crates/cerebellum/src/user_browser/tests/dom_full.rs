@@ -29,6 +29,110 @@ fn dom_args(tab: &str, max_bytes: usize) -> Value {
     json!({"browser":"user","action":"snapshot","tab":tab,"mode":"dom_full","max_bytes":max_bytes})
 }
 
+#[tokio::test]
+async fn text_zoom_shows_the_key_value_line_and_outline_zoom_stays_on_text() {
+    let fixture = Fixture::new();
+    let markup = include_str!("../../../tests/fixtures/browser-zoom-key-value.html").trim();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.ax_override = Some(json!({"nodes":[
+            {"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Fields"},"backendDOMNodeId":1,"frameId":"main","childIds":["key","value"]},
+            {"nodeId":"key","ignored":false,"role":{"value":"StaticText"},"name":{"value":"event"},"backendDOMNodeId":5},
+            {"nodeId":"value","ignored":false,"role":{"value":"button"},"name":{"value":"request"},"backendDOMNodeId":6}
+        ]}));
+        state.dom_override = Some(json!(crate::browser::zoom::key_value_fixture()));
+        state.outer_html.insert(("main".into(), 3), markup.into());
+    }
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let key = reference(&snapshot, "event");
+    let (outline, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"zoom":key}),
+            "",
+        )
+        .await;
+    assert_eq!(outline["outcome"], "ok", "{outline}");
+    let text = outline["state_text"].as_str().unwrap();
+    assert!(text.contains("text event"), "{text}");
+    assert!(!text.contains("request"), "{text}");
+    let mut args = dom_args(&tab, 5000);
+    args["zoom"] = json!(key);
+    let (zoom, _) = fixture.call(1, args, "").await;
+    assert_eq!(zoom["outcome"], "ok", "{zoom}");
+    assert_eq!(
+        zoom["state_text"],
+        format!("{key} is a text node; showing its enclosing element\n{markup}")
+    );
+}
+
+#[tokio::test]
+async fn missing_zoom_has_numeric_printed_neighbours_in_both_modes_without_an_outline() {
+    for mode in ["actionable", "dom_full"] {
+        let fixture = Fixture::new();
+        dashboard(&fixture);
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"role_filter":["RootWebArea","navigation","main"]}), "allow_30m").await;
+        let missing = reference(&snapshot, "Navigation");
+        let before = reference(&snapshot, "page Dashboard");
+        let after = reference(&snapshot, "Quarterly results");
+        fixture.state.lock().unwrap().ax_override.as_mut().unwrap()["nodes"] = json!([
+            {"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Dashboard"},"backendDOMNodeId":1,"frameId":"main","childIds":["main"]},
+            {"nodeId":"main","ignored":false,"role":{"value":"main"},"name":{"value":"Quarterly results"},"backendDOMNodeId":4}
+        ]);
+        for requested in [missing, "e999999".to_owned()] {
+            let (reply, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"mode":mode,"zoom":requested}), "").await;
+            assert_eq!(reply["outcome"], "ref_not_found", "{reply}");
+            let text = reply["state_text"].as_str().unwrap();
+            if requested != "e999999" {
+                assert!(
+                    text.contains(&format!("Before: {before} RootWebArea Dashboard")),
+                    "{text}"
+                );
+                assert!(
+                    text.contains(&format!("After: {after} main Quarterly results")),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    text.contains(&format!("Before: {after} main Quarterly results")),
+                    "{text}"
+                );
+                assert!(text.contains("After: none"), "{text}");
+            }
+            assert!(
+                text.contains("Take a fresh snapshot if the page changed."),
+                "{text}"
+            );
+            assert!(!text.contains("<html>"), "{text}");
+            assert!(!text.contains(" · snapshot "), "{text}");
+            assert!(reply.to_string().len() < 1024, "{reply}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn zoom_cdp_failure_is_a_typed_refusal_naming_the_step() {
+    let fixture = Fixture::new();
+    dashboard(&fixture);
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    fixture.state.lock().unwrap().fail_method = Some((
+        "DOM.getOuterHTML",
+        -32000,
+        "Could not find node with given id".into(),
+    ));
+    let mut args = dom_args(&tab, 5000);
+    args["zoom"] = json!(reference(&snapshot, "Navigation"));
+    let (reply, _) = fixture.call(1, args, "").await;
+    assert_eq!(reply["outcome"], "refused", "{reply}");
+    assert_eq!(reply["reason"], "cdp_error", "{reply}");
+    assert_eq!(reply["detail"]["step"], "DOM.getOuterHTML", "{reply}");
+    assert!(!reply.to_string().contains("internal_error"), "{reply}");
+}
+
 fn comment_ref(text: &str, role: &str) -> String {
     let prefix = format!("<!-- {role} ");
     text.lines()

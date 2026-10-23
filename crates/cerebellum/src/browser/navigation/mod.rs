@@ -2033,11 +2033,40 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         timings.ax_ms = ax_started.elapsed().as_millis();
         let dom_started = Instant::now();
+        let zoom_dom = if mode == SnapshotKind::DomFull && subtree.is_some() {
+            self.command(
+                "DOM.enable",
+                None,
+                Some(attachment.session_id.clone()),
+                snapshot_step_deadline(deadline, bounded, clock.now()),
+                None,
+                clock,
+            )?;
+            Some(
+                self.command(
+                    "DOM.getFlattenedDocument",
+                    Some(
+                        serde_json::json!({"depth":-1,"pierce":true})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    snapshot_step_deadline(deadline, bounded, clock.now()),
+                    None,
+                    clock,
+                )?,
+            )
+        } else {
+            None
+        };
         // A bounded AX prefix must not start another unbounded DOM read on the
         // same oversized page. Refs remain observable, with explicitly unknown
         // classification and withheld field values rather than weaker permission.
         let snapshot_dom = if observation.ax_truncated {
             Some(Err(ClassificationUnavailable::NotCaptured))
+        } else if let Some(dom) = &zoom_dom {
+            Some(parse_flattened_dom_nodes(dom))
         } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
             Some(
                 self.flattened_dom_nodes_before(
@@ -2097,73 +2126,106 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         timings.dom_facts_ms = facts_started.elapsed().as_millis();
         let body_started = Instant::now();
         if mode == SnapshotKind::DomFull {
-            // Resolve the captured document, not the session's default document:
-            // same-process iframes share a session but have different bodies.
-            let document = self.command(
-                "DOM.getDocument",
-                Some(
-                    serde_json::json!({"depth":0,"pierce":true})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                clock,
-            )?;
-            document
-                .get("root")
-                .and_then(|root| root.get("nodeId"))
-                .and_then(Value::as_u64)
-                .filter(|id| *id > 0)
-                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getDocument"))?;
-            let pushed = self.command("DOM.pushNodesByBackendIdsToFrontend", Some(serde_json::json!({"backendNodeIds":[root_backend_id.ok_or(NavigationDriveError::CdpFailure)?]}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), deadline, None, clock)?;
-            let document_id = pushed
-                .get("nodeIds")
-                .and_then(Value::as_array)
-                .and_then(|ids| ids.first())
-                .and_then(Value::as_u64)
-                .filter(|id| *id > 0)
-                .ok_or_else(|| {
-                    NavigationDriveError::CdpFailure.at_step("DOM.pushNodesByBackendIdsToFrontend")
+            if let (Some(reference), Some(dom)) = (subtree, zoom_dom.as_ref()) {
+                let backend = root_backend_id.ok_or_else(|| {
+                    NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
                 })?;
-            let selected = self.command(
-                "DOM.querySelector",
-                Some(
-                    serde_json::json!({"nodeId":document_id,"selector":"body"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                clock,
-            )?;
-            let body_id = selected
-                .get("nodeId")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.querySelector"))?;
-            // A non-HTML document (for example SVG) need not have a body.
-            let node_id = if body_id == 0 { document_id } else { body_id };
-            let outer_html = self.command(
-                "DOM.getOuterHTML",
-                Some(
-                    serde_json::json!({"nodeId":node_id})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-                Some(attachment.session_id.clone()),
-                deadline,
-                None,
-                clock,
-            )?;
-            observation.dom_text = Some(
-                required_result_string(&outer_html, "outerHTML")
-                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
-            );
+                let (backend, kind) =
+                    super::zoom::enclosing_element(dom, backend).map_err(|_| {
+                        NavigationDriveError::CdpFailure.at_step("DOM.getFlattenedDocument")
+                    })?;
+                let outer = self.command(
+                    "DOM.getOuterHTML",
+                    Some(
+                        serde_json::json!({"backendNodeId":backend})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    snapshot_step_deadline(deadline, bounded, clock.now()),
+                    None,
+                    clock,
+                )?;
+                let markup = required_result_string(&outer, "outerHTML")
+                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?;
+                observation.dom_text = Some(format!(
+                    "{}{markup}",
+                    kind.map(|kind| {
+                        super::zoom::enclosing_notice(&reference.captured.reference, kind)
+                    })
+                    .unwrap_or_default()
+                ));
+            } else {
+                // Resolve the captured document, not the session's default document:
+                // same-process iframes share a session but have different bodies.
+                let document = self.command(
+                    "DOM.getDocument",
+                    Some(
+                        serde_json::json!({"depth":0,"pierce":true})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    deadline,
+                    None,
+                    clock,
+                )?;
+                document
+                    .get("root")
+                    .and_then(|root| root.get("nodeId"))
+                    .and_then(Value::as_u64)
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getDocument"))?;
+                let pushed = self.command("DOM.pushNodesByBackendIdsToFrontend", Some(serde_json::json!({"backendNodeIds":[root_backend_id.ok_or(NavigationDriveError::CdpFailure)?]}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), deadline, None, clock)?;
+                let document_id = pushed
+                    .get("nodeIds")
+                    .and_then(Value::as_array)
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_u64)
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        NavigationDriveError::CdpFailure
+                            .at_step("DOM.pushNodesByBackendIdsToFrontend")
+                    })?;
+                let selected = self.command(
+                    "DOM.querySelector",
+                    Some(
+                        serde_json::json!({"nodeId":document_id,"selector":"body"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    deadline,
+                    None,
+                    clock,
+                )?;
+                let body_id = selected
+                    .get("nodeId")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.querySelector"))?;
+                // A non-HTML document (for example SVG) need not have a body.
+                let node_id = if body_id == 0 { document_id } else { body_id };
+                let outer_html = self.command(
+                    "DOM.getOuterHTML",
+                    Some(
+                        serde_json::json!({"nodeId":node_id})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                    Some(attachment.session_id.clone()),
+                    deadline,
+                    None,
+                    clock,
+                )?;
+                observation.dom_text = Some(
+                    required_result_string(&outer_html, "outerHTML")
+                        .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
+                );
+            }
             self.read_landmark_markup(&mut observation, &attachment.session_id, deadline, clock);
         }
 
@@ -7931,6 +7993,58 @@ mod tests {
             json!({"nodeId":42,"selector":"body"})
         );
         assert_eq!(driver.pipe.writes[5]["params"], json!({"nodeId":43}));
+    }
+
+    #[test]
+    fn dom_full_text_zoom_reads_the_key_value_line_without_an_element_selector() {
+        let markup = include_str!("../../../tests/fixtures/browser-zoom-key-value.html").trim();
+        let reference = RefRecord {
+            captured: SnapshotRef::new("e2640", "StaticText", "event", 0).unwrap(),
+            frame_path: vec!["frame-own".into()],
+            backend_identity: Some(BackendNodeIdentity::new("target-own", "frame-own", 5).unwrap()),
+            frame_document: None,
+            raw_role: None,
+            raw_name: None,
+            classification: Err(ClassificationUnavailable::NotCaptured),
+        };
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"nodes":[ax_node("key","StaticText","event", &[], 5, Some("frame-own"))]}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+            json!({"id":4,"sessionId":"session-own","result":crate::browser::zoom::key_value_fixture()}),
+            json!({"id":5,"sessionId":"session-own","result":{"outerHTML":markup}}),
+        ]);
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::DomFull,
+                1000,
+                None,
+                Some(&reference),
+                &mut FakeClock::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            observation.dom_text.unwrap(),
+            format!("e2640 is a text node; showing its enclosing element\n{markup}")
+        );
+        assert_eq!(
+            driver.pipe.writes.last().unwrap()["params"],
+            json!({"backendNodeId":3})
+        );
+        assert!(!driver
+            .pipe
+            .writes
+            .iter()
+            .any(|command| command["method"] == "DOM.querySelector"));
+        assert_eq!(
+            observation.refs[0]
+                .backend_identity
+                .as_ref()
+                .unwrap()
+                .backend_node_id,
+            5
+        );
     }
 
     /// A dom_full capture also reads the outerHTML of each outermost content

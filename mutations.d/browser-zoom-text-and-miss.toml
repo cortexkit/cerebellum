@@ -1,0 +1,101 @@
+[[control]]
+id = "browser-dom-text-zoom-enclosing-line"
+guards = "text refs skip a key-only wrapper and zoom to the line containing its clickable value"
+file = "crates/cerebellum/src/browser/zoom.rs"
+old = "if text_sizes.get(&id).copied().unwrap_or_default() > own_size {"
+new = "if true { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser/navigation/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser::navigation::tests::dom_full_text_zoom_reads_the_key_value_line_without_an_element_selector"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "user-dom-text-zoom-enclosing-line"
+guards = "the person's browser resolves a text ref to the enclosing key/value line"
+file = "crates/cerebellum/src/browser/zoom.rs"
+old = "if text_sizes.get(&id).copied().unwrap_or_default() > own_size {"
+new = "if true { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::text_zoom_shows_the_key_value_line_and_outline_zoom_stays_on_text"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "browser-zoom-cdp-failure-is-typed"
+guards = "CDP failures during zoom name the step without becoming internal errors"
+file = "crates/cerebellum/src/browser/mod.rs"
+old = "BrowserError::CdpStepFailure { step } if zoom.is_some() => {"
+new = "BrowserError::CdpStepFailure { step } if false && zoom.is_some() => { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/tests/it/b1_s3_browser.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = ["b1_s3_browser::zoom_cdp_resolution_failure_is_a_typed_refusal_at_the_serve_boundary"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "user-zoom-cdp-failure-names-step"
+guards = "the person's browser preserves detail.step on zoom resolution failures"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "reply[\"detail\"][\"step\"] = reply[\"detail\"][\"method\"].clone();"
+new = "let _ = &reply; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::zoom_cdp_failure_is_a_typed_refusal_naming_the_step"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "browser-missing-zoom-numeric-neighbours"
+guards = "missing zoom refs get the nearest printed live numeric neighbours, never an outline or a reply over 1 KiB"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "let wanted = number(requested);"
+new = "let wanted = Some(0); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/tests/support/browser_stable_refs.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test browser_session_wire"
+select = "expected"
+expect_red = ["stable_refs::missing_zoom_names_the_numeric_printed_neighbours_in_every_zoom_mode"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "user-missing-zoom-numeric-neighbours"
+guards = "the person's browser reports a short missing zoom with correct neighbours in both snapshot modes"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "let wanted = number(requested);"
+new = "let wanted = Some(0); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests/dom_full.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["user_browser::tests::dom_full::missing_zoom_has_numeric_printed_neighbours_in_both_modes_without_an_outline"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
