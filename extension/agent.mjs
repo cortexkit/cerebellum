@@ -4,6 +4,7 @@ import { classifyCommand, resolveParams, verifyRuntime } from "./commands.mjs";
 import { Frames } from "./frames.mjs";
 import { FrameGeometry } from "./frame-geometry.mjs";
 import { diagnosticReason, probeReadDiagnostic } from "./read-diagnostics.mjs";
+import { attachFailureKind, attachRefusal } from "./attach-errors.mjs";
 
 const routeKey = route => `${route.channel}:${route.epoch}`;
 const closed = (value, fields) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
@@ -94,6 +95,11 @@ export class Agent {
   }
 
   async release(key) {
+    // A close can release claims while another call on the route is attached.
+    // Cancel and detach that work before rotating handles or returning tabs.
+    const active = [...this.active].filter(state => state.route === key && state.tabId !== undefined);
+    for (const state of active) state.cancelled = true;
+    await Promise.all(active.map(state => this.detach(state)));
     for (const [tabId, owner] of this.claims) {
       if (owner !== key) continue;
       this.claims.delete(tabId);
@@ -150,30 +156,53 @@ export class Agent {
         // Attach is not dispatch: no Page, Runtime or Input commands run here.
         // A late attach completion still detaches even after timeout/cancellation.
         probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "attach_start" });
-        const pending = this.chrome.debugger.attach({ tabId: state.tabId }, "1.3").then(async () => {
+        const pending = this.attach(state).then(async () => {
           probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "attach_done" });
           state.attached = true;
           state.actionWindow = this.epochs.beginAction(state.tabId);
-          if (state.cancelled || this.connectionEpoch !== state.epoch) await this.detach(state);
+          if (state.cancelled || this.connectionEpoch !== state.epoch) {
+            await this.detach(state);
+            if (!state.attached) this.active.delete(state);
+          }
         }).finally(() => {
           state.attachSettled = true;
           this.pendingAttaches.delete(pending);
+          if (state.cancelled && !state.attached) this.active.delete(state);
         });
         this.pendingAttaches.add(pending);
         try { await bounded(pending, "attach"); } catch (error) {
           state.cancelled = true;
-          if (error instanceof Refusal) throw error;
-          throw new Refusal("debugger_busy", "close DevTools or the other debugger, then read again");
+          if (error instanceof Refusal && error.reason !== "attach_deadline") throw error;
+          throw attachRefusal(error);
         }
         await this.guard(state);
       }
       return state;
     } catch (error) {
       state.cancelled = true;
-      await this.detach(state);
-      error.detached = state.attachSettled !== false;
-      this.active.delete(state);
+      try { await this.detach(state); } catch { /* Cleanup is unconfirmed; retain the state for disconnect cleanup. */ }
+      error.detached = state.attachSettled !== false && !state.attached;
+      if (error.detached) this.active.delete(state);
       throw error;
+    }
+  }
+
+  async attach(state) {
+    const target = { tabId: state.tabId };
+    try {
+      await this.chrome.debugger.attach(target, "1.3");
+      return;
+    } catch (error) {
+      if (attachFailureKind(error) !== "another_debugger") throw error;
+      // detach only affects this extension's session, but it must never take
+      // an attachment away from another live plan of ours on the same tab.
+      if ([...this.active].some(other => other !== state && other.tabId === state.tabId && other.attached)) throw attachRefusal(error, "active_plan");
+      try { await this.chrome.debugger.detach(target); }
+      catch { throw attachRefusal(error, "another_debugger"); }
+      // A successful detach proves the busy session belonged to this extension.
+      // Membership and cancellation may have changed while Chrome answered.
+      await this.guard(state);
+      await this.chrome.debugger.attach(target, "1.3");
     }
   }
 
@@ -190,6 +219,7 @@ export class Agent {
           state.attached = false;
           state.frames?.close();
           this.epochs.endAction(state.actionWindow);
+          if (state.cancelled) this.active.delete(state);
         });
         await bounded(pending, "cancel");
       }

@@ -39,7 +39,7 @@ export function fakeChrome() {
     storage: { session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } } },
     permissions: { async contains(options) { calls.push(["hostPermission", options]); return true; } },
     tabs: {
-      onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onActivated: new Event(), onCreated: new Event(),
+      onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onReplaced: new Event(), onActivated: new Event(), onCreated: new Event(),
       async get(id) { calls.push(["get", id]); if (!tabData.has(id)) throw new Error("closed"); return { ...tabData.get(id) }; },
       async query(query) {
         if (query.active === true && query.lastFocusedWindow === true) return [...tabData.values()].filter(tab => tab.active).map(({ id, windowId }) => ({ id, windowId }));

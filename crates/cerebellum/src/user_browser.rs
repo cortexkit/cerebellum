@@ -643,7 +643,7 @@ fn refusal(reason: &str) -> Value {
 /// can keep running an old unpacked copy that reports the same `version`, and
 /// replies from such a copy must refuse with a reload remedy instead of
 /// failing to decode.
-pub(crate) const EXTENSION_REVISION: u64 = 2;
+pub(crate) const EXTENSION_REVISION: u64 = 3;
 
 const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
 const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
