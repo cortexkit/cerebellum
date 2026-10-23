@@ -138,7 +138,21 @@ TOML
 }
 
 catalogue_routing() {
-  local lane touched
+  local lane touched runner_dir="$scratch/catalogue-target" CARGO_TARGET_DIR="$scratch/catalogue-target"
+  setup_phases
+  run_serial_phase() { shift; printf '%s\n' "$*" >>"$scratch/catalogue-calls"; }
+  catalogue_check_needed() { [ "$1" = touched ]; }
+  # Without the runner, an unrelated change skips the anchor-scope check and
+  # says so; a catalogue change still runs both checks, which then need it.
+  rm -rf "$runner_dir"
+  part=mac changed_files=unrelated
+  : >"$scratch/catalogue-calls"
+  run_catalogue_checks
+  [ ! -s "$scratch/catalogue-calls" ] || return 1
+  [ "${not_verified[*]}" = 'catalogue anchor scopes (pinned ckdev-mutate not installed here; anchors themselves are checked by check-mutation-tree.sh)' ] || return 1
+  mkdir -p "$runner_dir/tools/bin"
+  printf '#!/usr/bin/env bash\n' >"$runner_dir/tools/bin/ckdev-mutate"
+  chmod +x "$runner_dir/tools/bin/ckdev-mutate"
   setup_phases
   run_serial_phase() { shift; printf '%s\n' "$*" >>"$scratch/catalogue-calls"; }
   catalogue_check_needed() { [ "$1" = touched ]; }
@@ -272,10 +286,22 @@ PY
     printf 'fixture\n' >crates/cerebellum/src/lib.rs
     printf 'changed\n' >crates/cerebellum-linux/src/lib.rs
     : >"$CALL_LOG"
+    # No runner installed and no catalogue or anchored file changed: the
+    # anchor-scope check is reported NOT VERIFIED instead of failing the gate.
+    ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-linux-only" 2>&1 || exit 1
+    [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 1 ] || exit 1
+    ! grep -q '^mutation ' "$CALL_LOG" || exit 1
+    grep -Fq 'NOT VERIFIED: catalogue anchor scopes' "$scratch/mac-linux-only" || exit 1
+    # With the runner installed, the same change runs the anchor check only.
+    mkdir -p "$CARGO_TARGET_DIR/tools/bin"
+    printf '#!/usr/bin/env bash\n' >"$CARGO_TARGET_DIR/tools/bin/ckdev-mutate"
+    chmod +x "$CARGO_TARGET_DIR/tools/bin/ckdev-mutate"
+    : >"$CALL_LOG"
     ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-linux-only" 2>&1 || exit 1
     [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 2 ] || exit 1
     grep -Fxq 'mutation --check-only --anchors-only' "$CALL_LOG" || exit 1
     ! grep -q 'mutation --check-only --platform' "$CALL_LOG" || exit 1
+    rm "$CARGO_TARGET_DIR/tools/bin/ckdev-mutate"
     printf 'fixture\n' >crates/cerebellum-linux/src/lib.rs
     printf 'changed\n' >crates/cerebellum/src/lib.rs
     : >"$CALL_LOG"
@@ -316,7 +342,7 @@ check 'a readable process table leaves library tests unchanged' readable_process
 check '--part linux selects the remote Linux lane' linux_mode
 check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
 check 'catalogue and every anchored path select name checks, unrelated paths do not' catalogue_selection
-check 'both halves always check anchors and route selected names to their platform' catalogue_routing
+check 'catalogue anchors run where the runner is installed, NOT VERIFIED otherwise; names route to their platform' catalogue_routing
 check 'anchor, name-check, and catalogue-selection errors fail the gate' catalogue_refusals
 check 'Mac clippy precedes tests, fails fast, and excludes Linux-only changes' mac_clippy_pipeline
 check 'default mode collects both halves and reports a runner connection failure' combined_mode

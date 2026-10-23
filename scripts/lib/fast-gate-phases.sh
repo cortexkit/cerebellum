@@ -62,19 +62,32 @@ catalogue_check_needed() {
 }
 
 run_catalogue_checks() {
-  local platform status
+  local platform needed=0 runner
   case "$part" in linux) platform=linux ;; mac) platform=macos ;; esac
-  # Anchors can move in any source edit, even when no catalogue row was edited.
-  run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
-  if catalogue_check_needed "$changed_files"; then
+  runner="${CARGO_TARGET_DIR:-$repo_root/target}/tools/bin/ckdev-mutate"
+  case "$runner" in /*) ;; *) runner="$repo_root/$runner" ;; esac
+  catalogue_check_needed "$changed_files" || needed=$?
+  if [ "$needed" -eq 0 ]; then
+    # A catalogue row or a file a row anchors on changed: the pinned runner is
+    # required, and scripts/mutations.sh names its install command if absent.
+    run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
     run_serial_phase "mutation catalogue --strict check ($platform)" ./scripts/mutations.sh --check-only --platform "$platform"
+    return
+  fi
+  if [ "$needed" -ne 1 ]; then
+    phase_failed=1
+    return
+  fi
+  echo '==> SKIP: mutation catalogue test names (no catalogue or anchored file changed)'
+  # Nothing the catalogue names changed, so anchors can only have moved through
+  # an edit check-mutation-tree.sh already sees: it requires every row's anchor
+  # to occur exactly once. The runner's own anchor check adds scopes and extra
+  # edits; run it where the runner is installed rather than make every fresh
+  # checkout install it first.
+  if [ -x "$runner" ]; then
+    run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
   else
-    status=$?
-    if [ "$status" -ne 1 ]; then
-      phase_failed=1
-    else
-      echo '==> SKIP: mutation catalogue test names (no catalogue or anchored file changed)'
-    fi
+    not_verified+=("catalogue anchor scopes (pinned ckdev-mutate not installed here; anchors themselves are checked by check-mutation-tree.sh)")
   fi
 }
 
