@@ -372,11 +372,11 @@ struct State {
     ended_routes: BTreeSet<Route>,
     claims: BTreeMap<String, Route>,
     unobserved_blank: BTreeSet<String>,
-    /// Tabs whose settlement note ("Page settlement was not confirmed")
-    /// a reply has already printed since the tab was claimed. Settlement is
-    /// never observed on the person's browser, so later replies about the
-    /// same tab leave the note out of their text (their `settled` field
-    /// still says it).
+    /// Tabs that have had a reply reporting `settled: false` since they were
+    /// claimed. Settlement is never observed on the person's browser, so the
+    /// text of later replies about the same tab leaves the settlement note
+    /// out (their `settled` field still says it). A route whose reader takes
+    /// the raw JSON reply shows no text, but its replies count too.
     settlement_noted: BTreeSet<String>,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: Vec<String>,

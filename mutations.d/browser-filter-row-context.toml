@@ -1,0 +1,143 @@
+[[control]]
+id = "text-filter-match-prints-its-row-block"
+guards = "a text_filter match outside a table prints its nearest bounded row block, so an app's name prints with its Configure link and each Configure link with its app's name"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "                return Some(ancestor);"
+new = "                return None; // NON-VACUITY BREAK: never print a row block"
+edits = []
+test_file = "crates/cerebellum/src/browser/navigation/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::navigation::tests::a_text_filter_match_on_an_app_name_prints_its_row_with_the_configure_link",
+  "browser::navigation::tests::a_text_filter_match_on_a_row_link_prints_the_name_of_its_app",
+  "browser::state_text::tests::a_match_whose_row_is_over_the_row_bound_prints_as_itself",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn row_block("
+before = "fn is_row_block("
+
+[[control]]
+id = "row-block-keeps-the-row-leaf-bound"
+guards = "a row block holds at most ROW_LEAVES leaves; a match in a larger container prints as itself"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "            if leaves > ROW_LEAVES {"
+new = "            if leaves > usize::MAX - 1 { // NON-VACUITY BREAK: no leaf bound"
+edits = []
+test_file = "crates/cerebellum/src/browser/state_text.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::state_text::tests::a_match_whose_row_is_over_the_row_bound_prints_as_itself",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn is_row_block("
+before = "fn collect_filter_rows("
+
+[[control]]
+id = "row-block-search-stops-at-table-parts"
+guards = "a match inside a table keeps the table's own row rule; the row-block search never climbs through a cell or row"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "if ancestor == 0 || self.is_landmark(ancestor) || is_table_part(self.role(ancestor)) {"
+new = "if ancestor == 0 || self.is_landmark(ancestor) { // NON-VACUITY BREAK: climb through table parts"
+edits = []
+test_file = "crates/cerebellum/src/browser/state_text.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::state_text::tests::a_match_in_a_table_row_with_a_link_prints_only_the_cell",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn row_block("
+before = "fn is_row_block("
+
+[[control]]
+id = "settlement-note-omission-needs-a-signal"
+guards = "the person's-browser settlement note prints unless this call asked to omit it; an always-omit signal hides it from a tab's first read"
+file = "crates/cerebellum/src/tool_result.rs"
+old = "    let omitted = SETTLEMENT_NOTE_OMITTED.try_with(Cell::get).unwrap_or(false);"
+new = "    let omitted = true; // NON-VACUITY BREAK: always omit"
+edits = []
+test_file = "crates/cerebellum/src/tool_result.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "tool_result::tests::an_omitted_settlement_note_leaves_only_the_text_line_out",
+  "tool_result::tests::nested_user_navigate_read_is_visible_with_its_snapshot_handle",
+  "user_browser::tests::the_settlement_note_prints_on_a_tabs_first_read_after_each_claim",
+  "user_browser::tests::concurrent_reads_omit_the_note_only_on_a_tabs_second_read",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn settlement_note("
+before = "fn project("
+
+[[control]]
+id = "settlement-note-prints-once-per-tab"
+guards = "a person's-browser read of a tab already read since its claim leaves the settlement note out of its text"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "        crate::tool_result::omit_settlement_note();"
+new = "        let _ = (); // NON-VACUITY BREAK: never omit the note"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "user_browser::tests::the_settlement_note_prints_on_a_tabs_first_read_after_each_claim",
+  "user_browser::tests::concurrent_reads_omit_the_note_only_on_a_tabs_second_read",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn note_settlement_once("
+before = "fn validate(action: &str, args: &Value)"
+
+[[control]]
+id = "a-claim-resets-the-settlement-note"
+guards = "claiming a tab again makes its next read print the settlement note"
+file = "crates/cerebellum/src/user_browser.rs"
+old = "            state.settlement_noted.remove(&claimed.tab);"
+new = "            let _ = &claimed.tab; // NON-VACUITY BREAK: a claim keeps the old note state"
+edits = []
+test_file = "crates/cerebellum/src/user_browser/tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "user_browser::tests::the_settlement_note_prints_on_a_tabs_first_read_after_each_claim",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[control.scope]
+after = "if action == \"claim_tab\" && args[\"tab\"] != claimed.tab {"
+before = "let (Some(url), Some(once)) = (open_url, once) else {"

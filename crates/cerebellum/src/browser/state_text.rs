@@ -91,8 +91,11 @@ pub const ROW_BYTES: usize = 300;
 // element that holds both a control and a text or label, so a name prints
 // with the link that acts on it and the link with the name it belongs to.
 // The block uses the same size bound as a joined row, [`ROW_LEAVES`] leaves
-// and [`ROW_BYTES`] bytes of leaf text, so it stays one item of a list and
-// never the list itself. See `Tree::row_block`.
+// and [`ROW_BYTES`] bytes of leaf text. The bound keeps a block small; it does
+// not prove the block is one item, since an unlabelled container holding two
+// small items can still qualify. The search stops at landmarks (a list, a
+// region) and table parts, so a block is never a whole list or table. See
+// `Tree::row_block`.
 
 /// Facts about one element the accessibility record alone does not carry,
 /// keyed by the element's ref.
@@ -1436,6 +1439,53 @@ mod tests {
         });
         assert!(filtered.text.contains("No matches"), "{}", filtered.text);
         assert!(!filtered.text.contains("hidden-secret"));
+    }
+
+    /// A table whose rows hold a link prints a filtered match as it did
+    /// before row blocks: the matching cell or text under its table, without
+    /// the link, whether the link sits in its own cell or beside the matching
+    /// text in one cell. A table keeps its own row rule (see `Tree::leaf_row`).
+    #[test]
+    fn a_match_in_a_table_row_with_a_link_prints_only_the_cell() {
+        let records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "table", "Apps", Some("e2")),
+            record(2, "row", "", Some("e3")),
+            record(3, "cell", "alpha", Some("e4")),
+            record(4, "StaticText", "alpha", Some("e5")),
+            record(3, "cell", "", Some("e6")),
+            record(4, "link", "Open", Some("e7")),
+            record(2, "row", "", Some("e8")),
+            record(3, "cell", "", Some("e9")),
+            record(4, "StaticText", "beta", Some("e10")),
+            record(4, "link", "Edit", Some("e11")),
+        ];
+        for (filter, expected) in [
+            (
+                "alpha",
+                "e1 page Page\n  e2 table Apps\n    e4 cell alpha\n",
+            ),
+            ("beta", "e1 page Page\n  e2 table Apps\n    e10 text beta\n"),
+        ] {
+            let found = render(&RenderInput {
+                records: &records,
+                facts: &HashMap::new(),
+                filters: &Filters {
+                    text: Some(filter.into()),
+                    roles: Vec::new(),
+                },
+                page_url: "https://example.com",
+                snapshot_id: "s1",
+                zoom: None,
+                max_bytes: 4096,
+            });
+            assert_eq!(
+                found.text.split_once('\n').map(|(_, body)| body),
+                Some(expected),
+                "{}",
+                found.text
+            );
+        }
     }
 
     /// A page holding one unlabelled row: the text `alpha`, an `Open` link and
