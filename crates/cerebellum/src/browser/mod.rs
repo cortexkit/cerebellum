@@ -3286,9 +3286,9 @@ impl BrowserPlane {
             SnapshotKind::Ax => {
                 let rendered = snapshot_store::render_ax_text(&records, &facts, max_bytes)
                     .map_err(map_snapshot_error)?;
-                // A ref stays usable only if the caller was shown it. The AX
-                // view has always reported a ref it withholds this way, a
-                // folded text fragment's included, as `refs_truncated`.
+                // A ref stays usable only if the caller was shown it.
+                // Dropping any captured ref this way, a folded text
+                // fragment's included, marks the reply `refs_truncated`.
                 let before = refs.len();
                 refs.retain(|record| rendered.printed_refs.contains(&record.captured.reference));
                 ax_refs_withheld = refs.len() != before;

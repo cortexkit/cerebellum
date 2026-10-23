@@ -2568,9 +2568,9 @@ async fn read_page_marks_content_truncated_at_its_requested_bound() {
             reference: Some("e2".into()),
         },
     ];
-    // A budget below the page's header line, so the read is cut. It is the
-    // byte length the first record had when ax lines were JSON, kept so the
-    // bound this test exercises is unchanged.
+    // A budget too small for the whole page text, so the read is cut. It is
+    // the byte length the first record had when ax lines were JSON, kept so
+    // the bound this test exercises is unchanged.
     let budget = 80;
     let plane = plane_with_process(
         &route,
