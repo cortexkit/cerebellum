@@ -103,3 +103,37 @@ expect_red = ["cursor_overlay::capture_probe::tests::display_capture_rejects_eit
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "unwatched-settle-keeps-the-ordinary-read-budget"
+guards = "a settle after an action that did not front the application reads with the ordinary budget, so a slow application's tree is not truncated at the 50 ms poll interval"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "        } else {\n            ReadBounds::default()\n        };"
+new = "        } else {\n            ReadBounds { timeout: SETTLE_POLL.min(deadline.saturating_duration_since(Instant::now())), ..ReadBounds::default() } // NON-VACUITY BREAK\n        };"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::fronting_tests::settle_read_budget::an_unwatched_settle_reads_a_slow_application_whole"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "watched-settle-adopts-no-read-cut-short"
+guards = "a fronted settle whose read stopped at the settle-window bound returns no diff and leaves the baseline, instead of adopting a partial tree"
+file = "crates/cerebellum/src/computer_capability/element_actions.rs"
+old = "            Ok(read) if watched && read.read_bound_reached => return None,"
+new = "            Ok(read) if false && watched && read.read_bound_reached => return None, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["computer_capability::fronting_tests::settle_read_budget::a_watched_settle_adopts_nothing_from_a_read_cut_short"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

@@ -1113,14 +1113,32 @@ pub(crate) fn adopt(
     }
 }
 
+/// Whether a settle watches for the person's input while it polls.
+pub(crate) enum PersonWatch<'a> {
+    /// The action did not bring the application to the front, so the
+    /// person's input goes where they aim it and is left to the next person
+    /// check. Each read keeps the ordinary read budget
+    /// ([`ReadBounds::default`]): a shorter one returns partial trees from
+    /// slow applications such as Finder, and a partial tree would show up as
+    /// removed lines in the reply and become the next baseline.
+    NotWatched,
+    /// The application is in front for this action. The closure is asked
+    /// before and after every read and answers `true` once the person has
+    /// acted; the settle then returns at once so the caller can restore.
+    Watched(&'a mut dyn FnMut() -> bool),
+}
+
 /// Wait for an effect without moving the baseline during polling. Only the
 /// final read becomes the baseline and the conversation's last-seen focus.
 ///
-/// `person_acted` is asked before every read. Once it answers `true`, the
-/// settle returns without another read, letting the caller restore at once.
-/// There is no final diff after interruption: even a bounded AX read would
-/// delay the restore and could absorb the person's input into the baseline.
-/// Callers with nothing to watch pass [`person_input_not_watched`].
+/// With [`PersonWatch::Watched`], the settle returns without another read
+/// once the person has acted. There is no final diff after interruption: an
+/// AX read would delay the restore and could absorb the person's input into
+/// the baseline. Each watched read is bounded by the time left in the settle
+/// window, so the application is not held in front for the ordinary
+/// four-second read budget, and a read that stops at that bound is partial:
+/// it is neither shown nor adopted as the baseline, and the settle returns
+/// `None` (no diff) rather than a wrong diff.
 pub(crate) fn settle_and_observe_view(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
@@ -1128,21 +1146,26 @@ pub(crate) fn settle_and_observe_view(
     grant: &ProcessGrant,
     bound: Duration,
     expand_menus: bool,
-    person_acted: &mut dyn FnMut() -> bool,
+    mut watch: PersonWatch<'_>,
 ) -> Option<SessionRead> {
     let deadline = Instant::now() + bound;
+    let watched = matches!(watch, PersonWatch::Watched(_));
+    let mut person_acted = || match &mut watch {
+        PersonWatch::NotWatched => false,
+        PersonWatch::Watched(acted) => acted(),
+    };
     loop {
-        let interrupted = person_acted();
-        if interrupted {
+        if person_acted() {
             return None;
         }
-        let poll_deadline = (Instant::now() + SETTLE_POLL).min(deadline);
         let seen = SeenMarks::read(source, grant);
-        // A poll must not inherit the ordinary four-second AX read budget
-        // while the target is temporarily in front.
-        let bounds = ReadBounds {
-            timeout: poll_deadline.saturating_duration_since(Instant::now()),
-            ..ReadBounds::default()
+        let bounds = if watched {
+            ReadBounds {
+                timeout: deadline.saturating_duration_since(Instant::now()),
+                ..ReadBounds::default()
+            }
+        } else {
+            ReadBounds::default()
         };
         let raw = if expand_menus {
             source.read_app_state_expanding_menus(grant, bounds)
@@ -1153,6 +1176,10 @@ pub(crate) fn settle_and_observe_view(
             return None;
         }
         match raw {
+            // Only the shortened watched bound is treated as truncation.
+            // Unreadable subtrees are not caused by that bound and are
+            // adopted as before.
+            Ok(read) if watched && read.read_bound_reached => return None,
             Ok(read) => {
                 if Instant::now() >= deadline
                     || sessions.differs_from_baseline(conversation_key, grant, &read)
@@ -1165,15 +1192,8 @@ pub(crate) fn settle_and_observe_view(
             // Nothing could be read, so nothing is known about what changed.
             Err(_) => return None,
         }
-        std::thread::sleep(poll_deadline.saturating_duration_since(Instant::now()));
+        std::thread::sleep(SETTLE_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
-}
-
-/// The person check for a settle that has nothing to watch: the action it
-/// follows did not bring the application to the front, so the person's
-/// input goes where they aim it and is left to the next person check.
-pub(crate) fn person_input_not_watched() -> bool {
-    false
 }
 
 /// What an action reply says when the application could not be read after
@@ -1803,7 +1823,7 @@ where
                     &grant,
                     settle,
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
-                    &mut person_input_not_watched,
+                    PersonWatch::NotWatched,
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
@@ -2163,7 +2183,7 @@ where
                         &grant,
                         view.zoom.as_deref(),
                     ),
-                    &mut person_input_not_watched,
+                    PersonWatch::NotWatched,
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
