@@ -866,11 +866,12 @@ impl TerminalArbiter {
     /// Whether a Cancel frame for this call has already chosen its reply.
     ///
     /// A Cancel picks the reply here, synchronously, before the call's own
-    /// work can see that it was cancelled. A call parked on a consent card
-    /// that ends because of that Cancel checks this and then sends no reply
-    /// of its own: the stop body chosen here is the only one, so the bytes
-    /// on the wire cannot depend on whether the worker's own cancellation
-    /// reply reaches the route before cleanup ends.
+    /// work can see that it was cancelled. Until cleanup ends, a worker reply
+    /// with the same stop outcome can still replace that body (see
+    /// `preserve_stop_refusal`). A call parked on a consent card that ends
+    /// because of the Cancel checks this and sends no reply of its own, so
+    /// the bytes on the wire cannot depend on whether its reply would have
+    /// reached the route before cleanup ended.
     pub(crate) fn answered_by_cancel(&self) -> bool {
         matches!(
             self.state.lock().unwrap().cause,

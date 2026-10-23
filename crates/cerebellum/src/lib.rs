@@ -11620,18 +11620,18 @@ mod tests {
         );
     }
 
-    /// Which part of a cancelled capture finishes first.
+    /// Which part of a cancelled capture finishes first, named for that part.
     #[derive(Clone, Copy, Debug)]
     enum CaptureCancelOrdering {
         /// The capture's own polling notices the cancel and ends the capture
         /// while Cingulate is still answering the card's detach.
-        CapturePollFirst,
+        CapturePoll,
         /// The card wait, woken by the same cancel, ends the capture as soon
         /// as the detach is answered, before the capture's polling runs.
-        ConsentWaitFirst,
+        ConsentWait,
         /// The turn stop sends its reply when its cleanup time runs out, and
         /// the capture ends only afterwards.
-        TurnStopFirst,
+        TurnStop,
     }
 
     /// A capture_login cancelled while its card is open is answered with the
@@ -11645,9 +11645,9 @@ mod tests {
         use login_capture::test_support::fixture;
 
         for ordering in [
-            CaptureCancelOrdering::CapturePollFirst,
-            CaptureCancelOrdering::ConsentWaitFirst,
-            CaptureCancelOrdering::TurnStopFirst,
+            CaptureCancelOrdering::CapturePoll,
+            CaptureCancelOrdering::ConsentWait,
+            CaptureCancelOrdering::TurnStop,
         ] {
             let fixture = fixture();
             let cingulate = ScriptedConsent::new();
@@ -11691,7 +11691,7 @@ mod tests {
             let detached =
                 json!({"elicitation_id": "el_cap_303", "state": "pending", "detached": true});
             let reply = match ordering {
-                CaptureCancelOrdering::CapturePollFirst => {
+                CaptureCancelOrdering::CapturePoll => {
                     // Paused time moves only while every task waits, so the
                     // capture's polling (every millisecond in this fixture)
                     // sees the cancel before the detach is answered.
@@ -11699,13 +11699,13 @@ mod tests {
                     detach_reply.send(detached).unwrap();
                     next_frame(&mut writer_rx).await
                 }
-                CaptureCancelOrdering::ConsentWaitFirst => {
+                CaptureCancelOrdering::ConsentWait => {
                     // No time passes, so the polling timer cannot fire: the
                     // answered detach is what ends the capture.
                     detach_reply.send(detached).unwrap();
                     next_frame(&mut writer_rx).await
                 }
-                CaptureCancelOrdering::TurnStopFirst => {
+                CaptureCancelOrdering::TurnStop => {
                     let reply = next_frame(&mut writer_rx).await;
                     assert!(
                         planes.browser.journal_export_for_test().await.is_empty(),
