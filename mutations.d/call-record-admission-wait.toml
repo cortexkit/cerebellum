@@ -1,0 +1,41 @@
+[[control]]
+id = "call-record-burst-waits-for-worker"
+guards = "a burst of keyed admissions queues for busy record workers instead of refusing calls immediately"
+file = "crates/cerebellum/src/call_record_supervisor.rs"
+old = "let Ok(permit) = tokio::time::timeout_at(\n        deadline,\n        Arc::clone(&planes.call_record_workers.permits).acquire_owned(),\n    )\n    .await"
+new = "let Ok(permit) = Arc::clone(&planes.call_record_workers.permits).try_acquire_owned().map(Ok::<_, tokio::sync::AcquireError>) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/call_record_supervisor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["call_record_supervisor::call_record_deadline_tests::burst_keyed_admissions_wait_for_workers_and_all_execute"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) async fn begin_call_record("
+before = "pub(crate) async fn settle_call_record("
+
+[[control]]
+id = "call-record-worker-wait-has-admission-deadline"
+guards = "an admission waiting for a record worker refuses at its deadline without starting a record or tool"
+file = "crates/cerebellum/src/call_record_supervisor.rs"
+old = "let Ok(permit) = tokio::time::timeout_at(\n        deadline,\n        Arc::clone(&planes.call_record_workers.permits).acquire_owned(),\n    )\n    .await"
+new = "let Ok(permit) = Ok::<_, tokio::time::error::Elapsed>(Arc::clone(&planes.call_record_workers.permits).acquire_owned().await) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/call_record_supervisor.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["call_record_supervisor::call_record_deadline_tests::held_workers_refuse_admission_only_at_the_deadline"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) async fn begin_call_record("
+before = "pub(crate) async fn settle_call_record("

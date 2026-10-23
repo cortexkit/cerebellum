@@ -83,6 +83,7 @@ pub const RECORD_WRITE_MS: u64 = 2_000;
 pub const RECORD_COMPACT_MS: u64 = 2_000;
 pub const RECORD_SYNC_MS: u64 = 2_000;
 pub const STORE_MS: u64 = RECORD_WRITE_MS + RECORD_COMPACT_MS + RECORD_SYNC_MS;
+// Admission includes waiting for a record worker and its begin write under one deadline.
 pub const CALL_RECORD_BEGIN_MS: u64 = RECORD_WRITE_MS + RECORD_COMPACT_MS + RECORD_SYNC_MS;
 pub const CALL_RECORD_SETTLE_MS: u64 = RECORD_WRITE_MS + RECORD_COMPACT_MS + RECORD_SYNC_MS;
 // Five keyboard releases (four modifiers and a key), plus a mouse release.
@@ -938,6 +939,7 @@ const fn reply_max_ms(queue_ms: u64, park_ms: u64, work_ms: u64) -> u64 {
 }
 
 // Both tool sums are admission + queue + park + work + release + settle + egress.
+// Admission counts the shared worker-wait and begin-write deadline only once.
 // computer_use: 6,000 + 276,300 + 120,000 + 143,300 + 6,000 + 6,000
 // + 130,001 = 687,601 ms. open_app's 120,000-ms launch ceiling dominates
 // work and queue; its 143,300 ms of work includes waiting up to 1,000 ms for
