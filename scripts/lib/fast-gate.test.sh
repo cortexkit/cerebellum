@@ -113,10 +113,70 @@ mac_mode() {
   lib_packages=(cerebellum-core)
   suites=(cerebellum-core:it)
   select_mac_plan
-  [ "${#packages[@]}" -eq 0 ] && [ "${#lib_packages[@]}" -eq 0 ] && [ "${#suites[@]}" -eq 0 ] &&
-    catalogue_check_needed mac mutations.d/rows.toml &&
-    ! catalogue_check_needed linux mutations.d/rows.toml &&
-    ! catalogue_check_needed mac scripts/fast-gate.sh
+  [ "${#packages[@]}" -eq 0 ] && [ "${#lib_packages[@]}" -eq 0 ] && [ "${#suites[@]}" -eq 0 ]
+}
+
+catalogue_selection() {
+  local fixture="$scratch/catalogue-fixture"
+  mkdir -p "$fixture/mutations.d"
+  cat >"$fixture/mutations.d/rows.toml" <<'TOML'
+[[control]]
+id = "fixture"
+file = "src/guard.rs"
+test_file = "tests/guard.rs"
+edits = [{file = "src/other.rs"}]
+TOML
+  cd "$fixture" || return 1
+  local path
+  for path in mutations.d/rows.toml src/guard.rs tests/guard.rs src/other.rs; do
+    catalogue_check_needed "$path" || return 1
+  done
+  ! catalogue_check_needed README.md || return 1
+  printf 'not toml\n' >mutations.d/rows.toml
+  catalogue_check_needed README.md
+  [ "$?" -eq 2 ]
+}
+
+catalogue_routing() {
+  local lane touched
+  setup_phases
+  run_serial_phase() { shift; printf '%s\n' "$*" >>"$scratch/catalogue-calls"; }
+  catalogue_check_needed() { [ "$1" = touched ]; }
+  for lane in linux mac; do
+    part="$lane"
+    for touched in touched unrelated; do
+      changed_files="$touched"
+      : >"$scratch/catalogue-calls"
+      run_catalogue_checks
+      local platform="$lane" expected=1
+      [ "$lane" != mac ] || platform=macos
+      [ "$touched" != touched ] || expected=2
+      [ "$(wc -l <"$scratch/catalogue-calls" | tr -d ' ')" = "$expected" ] || return 1
+      [ "$(head -n 1 "$scratch/catalogue-calls")" = './scripts/mutations.sh --check-only --anchors-only' ] || return 1
+      if [ "$expected" -eq 2 ]; then
+        grep -Fxq "./scripts/mutations.sh --check-only --platform $platform" "$scratch/catalogue-calls" || return 1
+      fi
+    done
+  done
+}
+
+catalogue_refusals() {
+  local fail_label
+  part=linux
+  changed_files=touched
+  catalogue_check_needed() { return 0; }
+  run_phase() { [ "$1" != "$fail_label" ]; }
+  for fail_label in 'mutation catalogue anchors' 'mutation catalogue --strict check (linux)'; do
+    setup_phases
+    run_catalogue_checks
+    [ "$phase_failed" -eq 1 ] || return 1
+    if finish_gate; then return 1; fi
+  done
+  setup_phases
+  catalogue_check_needed() { return 2; }
+  run_phase() { return 0; }
+  run_catalogue_checks
+  [ "$phase_failed" -eq 1 ]
 }
 
 combined_mode() {
@@ -164,6 +224,11 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
+  cp "$repo_root/scripts/lib/mutation-catalogue.py" "$fixture/scripts/lib/"
+  mkdir -p "$fixture/mutations.d"
+  printf '[[control]]\nid = "fixture"\nfile = "crates/cerebellum/src/lib.rs"\n' >"$fixture/mutations.d/rows.toml"
+  printf '#!/usr/bin/env bash\nprintf "mutation %%s\\n" "$*" >>"$CALL_LOG"\n' >"$fixture/scripts/mutations.sh"
+  chmod +x "$fixture/scripts/mutations.sh"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
   cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
@@ -208,7 +273,9 @@ PY
     printf 'changed\n' >crates/cerebellum-linux/src/lib.rs
     : >"$CALL_LOG"
     ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-linux-only" 2>&1 || exit 1
-    [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 1 ] || exit 1
+    [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 2 ] || exit 1
+    grep -Fxq 'mutation --check-only --anchors-only' "$CALL_LOG" || exit 1
+    ! grep -q 'mutation --check-only --platform' "$CALL_LOG" || exit 1
     printf 'fixture\n' >crates/cerebellum-linux/src/lib.rs
     printf 'changed\n' >crates/cerebellum/src/lib.rs
     : >"$CALL_LOG"
@@ -248,6 +315,9 @@ check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_proce
 check 'a readable process table leaves library tests unchanged' readable_process_table
 check '--part linux selects the remote Linux lane' linux_mode
 check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
+check 'catalogue and every anchored path select name checks, unrelated paths do not' catalogue_selection
+check 'both halves always check anchors and route selected names to their platform' catalogue_routing
+check 'anchor, name-check, and catalogue-selection errors fail the gate' catalogue_refusals
 check 'Mac clippy precedes tests, fails fast, and excludes Linux-only changes' mac_clippy_pipeline
 check 'default mode collects both halves and reports a runner connection failure' combined_mode
 check 'default mode preserves NOT VERIFIED from the Mac half' combined_skip

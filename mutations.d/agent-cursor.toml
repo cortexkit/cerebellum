@@ -710,6 +710,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "app-use-only-module-startup-reads-the-config-file"
+platforms = ["macos", "windows"]
 guards = "the module's own startup, which loads cerebellum.jsonc to register, is what points the computer plane at that file for the live app_use read"
 file = "crates/cerebellum/src/lib.rs"
 old = '        computer.read_app_use_from_config_file();'
@@ -729,6 +730,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "app-use-planes-read-no-config-file-by-default"
+platforms = ["macos", "windows"]
 guards = "a computer plane from any constructor reads no config file, so test binaries and examples never take a mode or a config_invalid refusal from the config of whoever runs them"
 file = "crates/cerebellum/src/computer_capability/app_use.rs"
 old = '        Self::new(None, Arc::new(NativeConfigFiles))'
@@ -1543,6 +1545,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "app-use-journal-serve-action-boxed-where-built"
+platforms = ["macos"]
 guards = "the serve path boxes the action match it wraps in call-front tracking, so a real computer call still fits half a default thread stack on macOS"
 file = "crates/cerebellum/src/computer_capability/mod.rs"
 old = "fronting::tracking_call_front(Box::pin(async {"
@@ -2707,6 +2710,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "agent-preview-bundle-path-is-the-enclosing-app-directory"
+platforms = ["macos"]
 guards = "the preview's icon path is the directory of the nearest enclosing .app, never a file merely named like one"
 file = "crates/cerebellum-macos/src/macos.rs"
 old = "        if component.len() > \".app\".len() && component.ends_with(\".app\") && after < path.len() {"
@@ -2783,6 +2787,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "agent-preview-4k-frame-is-scaled-under-the-limit"
+platforms = ["macos"]
 guards = "a 4K window's preview is scaled to the preview's size before it is encoded, so its frame fits a frame line"
 file = "crates/cerebellum-computer/src/capture/mod.rs"
 old = "            max_px,"
@@ -2802,6 +2807,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "agent-preview-panel-is-kept-out-of-screen-capture"
+platforms = ["macos"]
 guards = "the background-mode preview's panel, which shows a window the person had covered, is kept out of screen sharing, recordings and screenshots"
 file = "crates/cerebellum-macos/src/cursor_overlay/preview_window.rs"
 old = "        panel.setSharingType(NSWindowSharingType::None);"
@@ -2956,6 +2962,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "system-shortcuts-take-the-takeover-route"
+platforms = ["macos"]
 guards = "a system shortcut such as Command-Space acts outside the application, so it takes the takeover route even to a frontmost application: refused without takeover, run in the takeover bracket with it"
 file = "crates/cerebellum/src/computer_capability/fronting.rs"
 old = "    if system_wide {\n        takeover_route(admission)"
@@ -3077,6 +3084,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "the-plane-takes-app-use-fronting-from-its-release"
+platforms = ["macos", "windows"]
 guards = "the computer plane a module builds admits fronting outside the bracket only as the release inputs compiled into it do"
 file = "crates/cerebellum/src/lib.rs"
 old = "                    .with_app_use_fronting_admitted(app_use_fronting_admitted(\n                        &compiled_release_inputs(),\n                    ))"
@@ -3096,6 +3104,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "the-plane-takes-preview-capture-from-its-release"
+platforms = ["macos", "windows"]
 guards = "the computer plane a module builds admits preview capture only as the release inputs compiled into it do"
 file = "crates/cerebellum/src/lib.rs"
 old = "                    .with_native_preview_capture(preview_capture_admitted(\n                        &compiled_release_inputs(),\n                    )),"

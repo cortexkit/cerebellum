@@ -50,7 +50,32 @@ run_mac_clippy() {
 }
 
 catalogue_check_needed() {
-  [ "$1" = mac ] && grep -q '^mutations\.d/' <<<"$2"
+  local python
+  for python in python3 python3.14 python3.13 python3.12 python3.11; do
+    if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
+      "$python" "$repo_root/scripts/lib/mutation-catalogue.py" affected mutations.d <<<"$1"
+      return $?
+    fi
+  done
+  echo 'mutation catalogue: Python 3.11+ is required' >&2
+  return 2
+}
+
+run_catalogue_checks() {
+  local platform status
+  case "$part" in linux) platform=linux ;; mac) platform=macos ;; esac
+  # Anchors can move in any source edit, even when no catalogue row was edited.
+  run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
+  if catalogue_check_needed "$changed_files"; then
+    run_serial_phase "mutation catalogue --strict check ($platform)" ./scripts/mutations.sh --check-only --platform "$platform"
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      phase_failed=1
+    else
+      echo '==> SKIP: mutation catalogue test names (no catalogue or anchored file changed)'
+    fi
+  fi
 }
 
 run_linux_part() {

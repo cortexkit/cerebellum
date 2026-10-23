@@ -1,5 +1,6 @@
 [[control]]
 id = "tests-never-headed-runtime-guard"
+platforms = ["macos"]
 guards = "the test browser helper panics before spawning a browser without new headless mode"
 file = "crates/cerebellum/src/test_browser.rs"
 old = "    assert_headless(arguments);"
