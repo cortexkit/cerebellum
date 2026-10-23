@@ -65,8 +65,9 @@ fn capture_probe_display_region(
     };
     let (sink, delivery) = std::sync::mpsc::channel();
     let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
-        // SAFETY: same screenshot completion contract as capture_window; copy
-        // the raster while the image is alive, never retain private pixels.
+        // SAFETY: same screenshot completion contract as capture_window. Copy
+        // the pixels while the image is alive; the probe keeps that in-memory
+        // copy only long enough to look for its patterns, never the CGImage.
         let result = unsafe {
             if let Some(error) = error.as_ref() {
                 Err(error.localizedDescription().to_string())
