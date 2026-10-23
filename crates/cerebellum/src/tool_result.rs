@@ -4,6 +4,7 @@
 use crate::ModuleError;
 use cortexkit_role_tool_provider::result::{self, ContentPart, ImageContent, ToolResult};
 use serde_json::{json, Map, Value};
+use std::cell::Cell;
 
 mod plain;
 
@@ -15,6 +16,31 @@ const GENERIC_FALLBACK_ACTION_ALLOWLIST: &[&str] = &["close"];
 
 tokio::task_local! {
     pub(crate) static RESULT_BIND: Option<(String, cerebellum_core::identity::AcceptedBindFacts)>;
+    /// Set to true, for one tool call, when the person's-browser plane has
+    /// already told the model on an earlier read of the same tab that page
+    /// settlement is never observed there (see `omit_settlement_note`). The
+    /// call's dispatcher opens this scope with `false` next to `RESULT_BIND`.
+    pub(crate) static SETTLEMENT_NOTE_OMITTED: Cell<bool>;
+}
+
+/// Leave the "Page settlement was not confirmed." lines out of the text of
+/// the reply this call is about to send. Only the text changes: the reply's
+/// `settled` and `settlement_reason` fields, and so its structured content
+/// and its raw JSON body, stay as they are. Outside a call's scope this does
+/// nothing, so the note prints unless a call explicitly asks to omit it.
+pub(crate) fn omit_settlement_note() {
+    let _ = SETTLEMENT_NOTE_OMITTED.try_with(|omitted| omitted.set(true));
+}
+
+/// Whether this reply's text carries the settlement note. It is left out
+/// only when this call asked to omit it and the reply is a person's-browser
+/// reply that reports an unconfirmed settlement; every other reply prints
+/// whatever it reports.
+fn settlement_note(object: &Map<String, Value>) -> bool {
+    let omitted = SETTLEMENT_NOTE_OMITTED.try_with(Cell::get).unwrap_or(false);
+    !(omitted
+        && object.get("browser").and_then(Value::as_str) == Some("user")
+        && object.get("settled").and_then(Value::as_bool) == Some(false))
 }
 
 fn notice(id: Option<&str>, reason: &str) -> String {
@@ -141,7 +167,7 @@ fn project(reply: Value) -> ToolResult {
         content.push(ContentPart::text(body));
     }
     let projected_image = object.get("image").map(image_projection);
-    let facts = plain::facts(object, login_notice(object));
+    let facts = plain::facts(object, login_notice(object), settlement_note(object));
     if !facts.is_empty() {
         content.push(ContentPart::text(facts.join("\n")));
     }
@@ -778,6 +804,53 @@ mod tests {
             rendered.contains("Page settlement was not confirmed."),
             "{rendered}"
         );
+    }
+
+    /// A person's-browser read that asked to leave the settlement note out
+    /// loses only those two text lines; a call that did not ask, or a reply
+    /// outside any call, keeps them, and the structured reply never changes.
+    #[tokio::test]
+    async fn an_omitted_settlement_note_leaves_only_the_text_line_out() {
+        const NOTE: &str = "Page settlement was not confirmed.";
+        let reply = json!({
+            "browser":"user","outcome":"ok","tab":"tab-1","snapshot_id":"snap-3",
+            "state_text":"Example · example.test · snapshot snap-3",
+            "settled":false,
+            "settlement_reason":"Page settlement is not observed on the person's browser."
+        });
+        let outside = decoded(reply.clone());
+        let outside_text = texts(&outside).join("\n");
+        assert!(outside_text.contains(NOTE), "{outside_text}");
+        assert!(outside_text.contains("not observed"), "{outside_text}");
+
+        let kept = SETTLEMENT_NOTE_OMITTED
+            .scope(Cell::new(false), async { decoded(reply.clone()) })
+            .await;
+        assert_eq!(kept, outside);
+
+        let omitted = SETTLEMENT_NOTE_OMITTED
+            .scope(Cell::new(false), async {
+                omit_settlement_note();
+                decoded(reply.clone())
+            })
+            .await;
+        let omitted_text = texts(&omitted).join("\n");
+        assert!(!omitted_text.contains(NOTE), "{omitted_text}");
+        assert!(!omitted_text.contains("not observed"), "{omitted_text}");
+        assert!(omitted_text.contains("snap-3"), "{omitted_text}");
+        assert_eq!(omitted["structuredContent"], reply);
+        assert_eq!(omitted["structuredContent"], outside["structuredContent"]);
+
+        // The own browser observes settlement, so its note always prints.
+        let own =
+            json!({"outcome":"ok","settled":false,"settlement_reason":"network was still busy"});
+        let own_result = SETTLEMENT_NOTE_OMITTED
+            .scope(Cell::new(false), async {
+                omit_settlement_note();
+                decoded(own.clone())
+            })
+            .await;
+        assert!(texts(&own_result).join("\n").contains(NOTE));
     }
 
     #[test]

@@ -1,0 +1,3 @@
+Workers Observability · dash.cloudflare.com/acct/workers/observability · snapshot 0123456789abcdef0123456789abcdef
+e1 page Workers Observability
+  e52 text worker boat-router retried the endpoint withdrawal after the upstream closed the connection; withdrawn_queue_depth=412 pending_acks=97 region=weur colo=AMS shard=17 attempt=3 of 5; the next retry is scheduled with exponential backoff and jitter, and the request id is 8f2c4b7e-1d93-4a55-b0e2-77c1a9d4f310 for correlating with the gateway logs

@@ -1,0 +1,3 @@
+Workers Observability · dash.cloudflare.com/acct/workers/observability · snapshot 0123456789abcdef0123456789abcdef
+e1 page Workers Observability
+  e33 event "boat_endpoint_withdrawn"

@@ -372,6 +372,12 @@ struct State {
     ended_routes: BTreeSet<Route>,
     claims: BTreeMap<String, Route>,
     unobserved_blank: BTreeSet<String>,
+    /// Tabs that have had a reply reporting `settled: false` since they were
+    /// claimed. Settlement is never observed on the person's browser, so the
+    /// text of later replies about the same tab leaves the settlement note
+    /// out (their `settled` field still says it). A route whose reader takes
+    /// the raw JSON reply shows no text, but its replies count too.
+    settlement_noted: BTreeSet<String>,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: Vec<String>,
     executions: BTreeMap<String, Arc<UserExecution>>,
@@ -407,6 +413,7 @@ impl UserBrowser {
         state.claims.retain(|_, owner| *owner != route);
         let claimed: BTreeSet<_> = state.claims.keys().cloned().collect();
         state.unobserved_blank.retain(|tab| claimed.contains(tab));
+        state.settlement_noted.retain(|tab| claimed.contains(tab));
         state
             .snapshots
             .retain(|_, snapshot| snapshot.route != route);
@@ -1494,6 +1501,7 @@ async fn serve_scoped(
         reply["input_dispatched"] = input;
     }
     reply = dispatched_outcome(reply);
+    note_settlement_once(planes.user_browser.target(), &reply);
     let record_origin = args
         .get("url")
         .and_then(Value::as_str)
@@ -1521,6 +1529,23 @@ async fn serve_scoped(
         return dispatched_outcome(failure);
     }
     reply
+}
+
+/// Print the settlement note once per claimed tab. Settlement is never
+/// observed on the person's browser, so every read of a tab reports
+/// `settled: false`; the first such reply after the tab is claimed says so in
+/// its text, and later replies about the same tab ask the text projection to
+/// leave the note out. The reply itself is not changed.
+fn note_settlement_once(target: &UserBrowser, reply: &Value) {
+    if reply["settled"] != false {
+        return;
+    }
+    let Some(tab) = reply["tab"].as_str() else {
+        return;
+    };
+    if !target.state().settlement_noted.insert(tab.to_owned()) {
+        crate::tool_result::omit_settlement_note();
+    }
 }
 
 fn validate(action: &str, args: &Value) -> Result<(), Value> {
@@ -2298,6 +2323,8 @@ async fn serve_inner(
                 return Err(refusal("tab_already_claimed"));
             }
             state.claims.insert(claimed.tab.clone(), route);
+            // A newly claimed tab's first reply prints the settlement note again.
+            state.settlement_noted.remove(&claimed.tab);
             if action == "open_tab"
                 && command.get("opener_tab").is_none()
                 && command

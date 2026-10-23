@@ -4022,3 +4022,160 @@ async fn snapshot_accepts_wait_none_and_refuses_wait_settle_by_name() {
     }
     assert_eq!(fixture.state.lock().unwrap().commands.len(), before);
 }
+
+/// The settlement note every person's-browser read reports in its text.
+const SETTLEMENT_NOTE: &str = "Page settlement was not confirmed.";
+
+/// Make channel 1's reader declare content/v1, so its replies arrive as the
+/// model reads them: text parts plus the structured reply.
+fn read_content_v1(fixture: &Fixture) {
+    let mut facts = fixture.planes.routes.get(1, 1).unwrap();
+    facts.consumer_capabilities = vec![cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()];
+    fixture.planes.routes.insert(1, 1, facts);
+}
+
+/// A content/v1 reply's text parts, joined.
+fn content_text(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("not a content/v1 reply: {result}"))
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .map(|part| part["text"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A snapshot reply without the fields that differ between two reads of an
+/// unchanged page: the snapshot's id and the text whose header names it.
+fn without_snapshot_identity(reply: &Value) -> Value {
+    let mut reply = reply.clone();
+    let fields = reply.as_object_mut().unwrap();
+    assert!(fields.remove("snapshot_id").is_some(), "{reply}");
+    assert!(fields.remove("state_text").is_some());
+    reply
+}
+
+#[tokio::test]
+async fn the_settlement_note_prints_on_a_tabs_first_read_after_each_claim() {
+    let fixture = Fixture::new();
+    read_content_v1(&fixture);
+    let claim = json!({"browser":"user","action":"claim_tab","tab":"handed"});
+    let (claimed, _) = fixture.call(1, claim.clone(), "allow_30m").await;
+    let tab = claimed["structuredContent"]["tab"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{claimed}"))
+        .to_owned();
+    let (first, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (second, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert!(cards.is_empty());
+    let first_text = content_text(&first);
+    let second_text = content_text(&second);
+    assert!(first_text.contains(SETTLEMENT_NOTE), "{first_text}");
+    assert!(
+        first_text.contains("Page settlement is not observed on the person's browser."),
+        "{first_text}"
+    );
+    assert!(!second_text.contains(SETTLEMENT_NOTE), "{second_text}");
+    assert!(!second_text.contains("not observed"), "{second_text}");
+    assert!(
+        second_text.contains("Go"),
+        "the page itself still prints: {second_text}"
+    );
+    // Only the text line goes: both structured replies say the settlement
+    // was not observed, and apart from the snapshot's identity they match.
+    for reply in [&first, &second] {
+        let structured = &reply["structuredContent"];
+        assert_eq!(structured["outcome"], "ok", "{reply}");
+        assert_eq!(structured["settled"], false, "{reply}");
+        assert_eq!(
+            structured["settlement_reason"],
+            "Page settlement is not observed on the person's browser."
+        );
+        assert!(crate::browser::validate_user_browser_result("snapshot", structured).is_ok());
+    }
+    assert_eq!(
+        without_snapshot_identity(&first["structuredContent"]),
+        without_snapshot_identity(&second["structuredContent"])
+    );
+
+    // Claiming the tab again starts over: its next read prints the note.
+    let (reclaimed, _) = fixture.call(1, claim, "allow_30m").await;
+    assert_eq!(
+        reclaimed["structuredContent"]["outcome"], "ok",
+        "{reclaimed}"
+    );
+    let (third, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert!(content_text(&third).contains(SETTLEMENT_NOTE), "{third}");
+}
+
+/// A route whose reader takes the raw JSON reply gets the same reply on a
+/// tab's first and later reads: leaving the note out never adds, drops or
+/// changes a field.
+#[tokio::test]
+async fn a_legacy_reader_gets_the_same_raw_reply_on_every_read_of_a_tab() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (first, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (second, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert!(first.get("content").is_none(), "{first}");
+    assert_eq!(first["settled"], false, "{first}");
+    assert_eq!(
+        without_snapshot_identity(&first),
+        without_snapshot_identity(&second)
+    );
+    assert!(crate::browser::validate_user_browser_result("snapshot", &second).is_ok());
+}
+
+/// Two reads in flight at once on different tabs: the read of a tab already
+/// read once leaves the note out, and the first read of the other tab keeps
+/// it, so one call's request to omit the note never reaches another call.
+#[tokio::test]
+async fn concurrent_reads_omit_the_note_only_on_a_tabs_second_read() {
+    let fixture = Fixture::new();
+    read_content_v1(&fixture);
+    fixture.state.lock().unwrap().tabs.insert(
+        "handed-two".into(),
+        DoubleTab {
+            owner: None,
+            handed: true,
+            group: true,
+            url: "https://example.com/two".into(),
+            loader: 1,
+            interaction: 1,
+        },
+    );
+    let mut tabs = Vec::new();
+    for handed in ["handed", "handed-two"] {
+        let (claimed, _) = fixture
+            .call(
+                1,
+                json!({"browser":"user","action":"claim_tab","tab":handed}),
+                "allow_30m",
+            )
+            .await;
+        tabs.push(
+            claimed["structuredContent"]["tab"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let (read_once, _) = fixture.snapshot(1, &tabs[0], "allow_30m").await;
+    assert!(
+        content_text(&read_once).contains(SETTLEMENT_NOTE),
+        "{read_once}"
+    );
+    // Delay every plan's reply so both reads are in flight together.
+    fixture.state.lock().unwrap().plan_delay = Duration::from_millis(50);
+    let again = fixture.start(1, snapshot_args(&tabs[0]), "allow_30m");
+    let other = fixture.start(1, snapshot_args(&tabs[1]), "allow_30m");
+    let other = fixture.finish(other).await;
+    let again = fixture.finish(again).await;
+    assert_eq!(again["structuredContent"]["outcome"], "ok", "{again}");
+    assert_eq!(other["structuredContent"]["outcome"], "ok", "{other}");
+    assert!(!content_text(&again).contains(SETTLEMENT_NOTE), "{again}");
+    assert!(content_text(&other).contains(SETTLEMENT_NOTE), "{other}");
+    assert_eq!(again["structuredContent"]["settled"], false);
+    assert_eq!(other["structuredContent"]["settled"], false);
+}

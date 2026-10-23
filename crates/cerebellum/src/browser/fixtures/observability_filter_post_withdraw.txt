@@ -1,0 +1,4 @@
+Workers Observability · dash.cloudflare.com/acct/workers/observability · snapshot 0123456789abcdef0123456789abcdef
+e1 page Workers Observability
+  e13 table Invocations
+    e14 2025-01-02 10:00:01 boat-router POST /withdraw 200

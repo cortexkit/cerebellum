@@ -470,8 +470,15 @@ pub(super) fn body(object: &Map<String, Value>) -> Option<String> {
 }
 
 /// Every fact line for a reply, in reading order: what happened, the
-/// remedy, then the few facts the next call needs.
-pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -> Vec<String> {
+/// remedy, then the few facts the next call needs. `settlement_note` false
+/// leaves out the lines saying page settlement was not confirmed, which the
+/// person's browser repeats on every read of a tab (see
+/// `super::omit_settlement_note`).
+pub(super) fn facts(
+    object: &Map<String, Value>,
+    login_notice: Option<String>,
+    settlement_note: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let outcome = text(object, "outcome");
     let failed = outcome.is_some_and(|code| !super::is_success(code));
@@ -556,7 +563,7 @@ pub(super) fn facts(object: &Map<String, Value>, login_notice: Option<String>) -
             }
         }
     }
-    if object.get("settled").and_then(Value::as_bool) == Some(false) {
+    if settlement_note && object.get("settled").and_then(Value::as_bool) == Some(false) {
         lines.push("Page settlement was not confirmed.".into());
         if let Some(reason) = text(object, "settlement_reason") {
             lines.push(sentence(reason));
@@ -811,7 +818,7 @@ mod tests {
     use serde_json::json;
 
     fn fact_lines(reply: Value) -> Vec<String> {
-        facts(reply.as_object().unwrap(), None)
+        facts(reply.as_object().unwrap(), None, true)
     }
 
     #[test]

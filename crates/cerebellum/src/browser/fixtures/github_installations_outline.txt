@@ -1,0 +1,16 @@
+Installed GitHub Apps · github.com/organizations/cortexkit/settings/installations · snapshot 0123456789abcdef0123456789abcdef
+e7 main
+  e8 heading Installed GitHub Apps
+  e9 text GitHub Apps augment and extend your workflows on GitHub.
+  e10 generic
+    e11 generic
+      e12 generic
+        e13 image astro-alfonso
+        e15 text astro-alfonso
+      e17 link Configure, Value: github.com/organizations/cortexkit/settings/installations/1001
+    +4 more generic like this; zoom e10
+e2 banner
+  e3 link Homepage, Value: github.com
+e4 navigation Organization settings
+  e5 link General, Value: github.com/organizations/cortexkit/settings/profile
+  e6 link GitHub Apps, Value: github.com/organizations/cortexkit/settings/installations

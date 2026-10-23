@@ -85,6 +85,18 @@ pub const ROW_LEAVES: usize = 8;
 /// flood a filtered reply.
 pub const ROW_BYTES: usize = 300;
 
+// A filtered match on a page that lists repeated items without a table (an
+// app list with an icon, a name and a `Configure` link per item, all inside
+// unlabelled containers) prints with its "row block": the nearest enclosing
+// element that holds both a control and a text or label, so a name prints
+// with the link that acts on it and the link with the name it belongs to.
+// The block uses the same size bound as a joined row, [`ROW_LEAVES`] leaves
+// and [`ROW_BYTES`] bytes of leaf text. The bound keeps a block small; it does
+// not prove the block is one item, since an unlabelled container holding two
+// small items can still qualify. The search stops at landmarks (a list, a
+// region) and table parts, so a block is never a whole list or table. See
+// `Tree::row_block`.
+
 /// Facts about one element the accessibility record alone does not carry,
 /// keyed by the element's ref.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -317,6 +329,24 @@ fn is_text_field(role: &str) -> bool {
     matches!(role, "textbox" | "searchbox" | "combobox")
 }
 
+/// The parts of a table. A filtered match inside a table keeps the joined
+/// table-row line (see `Tree::leaf_row`), so the search for a row block
+/// stops at any of them.
+fn is_table_part(role: &str) -> bool {
+    matches!(
+        role,
+        "table"
+            | "grid"
+            | "treegrid"
+            | "rowgroup"
+            | "row"
+            | "cell"
+            | "gridcell"
+            | "columnheader"
+            | "rowheader"
+    )
+}
+
 /// Controls whose value is a number or a position (a slider's level, a
 /// progress bar's percentage); their value always prints.
 fn is_value_control(role: &str) -> bool {
@@ -444,6 +474,15 @@ impl Line {
     fn bytes(&self) -> usize {
         self.depth * 2 + self.text.len() + 1
     }
+}
+
+/// What a filtered reply prints for a node that holds a match.
+enum FilterRow {
+    /// The node's leaf texts joined on one line (see `Tree::leaf_row`).
+    Joined(String),
+    /// The node's whole subtree, one element per line, each with its ref
+    /// (see `Tree::row_block`).
+    Block,
 }
 
 enum Item {
@@ -840,7 +879,83 @@ impl<'a> Tree<'a> {
         Some(texts)
     }
 
-    /// Give each matching leaf its nearest ancestor that `leaf_row` accepts and
+    /// The row block a match prints with: its nearest ancestor (in the
+    /// printed tree, `ancestors` running from the outermost) that holds at
+    /// least one control and at least one text or label, at least one of
+    /// which lies outside the match itself. A name matched inside an app's
+    /// row then prints with the row's `Configure` link, and a matched
+    /// `Configure` link prints with the app's name.
+    ///
+    /// `None` when no ancestor qualifies before the climb reaches the page, a
+    /// landmark (a list or a region is not one item of it), a table part (a
+    /// table keeps its joined rows, see `leaf_row`), or an ancestor larger
+    /// than [`ROW_LEAVES`] leaves or [`ROW_BYTES`] bytes of leaf text. Every
+    /// further ancestor is at least as large, so the climb stops there.
+    fn row_block(&self, matched: usize, ancestors: &[usize]) -> Option<usize> {
+        for &ancestor in ancestors.iter().rev() {
+            if ancestor == 0 || self.is_landmark(ancestor) || is_table_part(self.role(ancestor)) {
+                return None;
+            }
+            if self.is_row_block(ancestor, matched)? {
+                return Some(ancestor);
+            }
+        }
+        None
+    }
+
+    /// Whether `node`'s subtree is a row block for the match `matched` (see
+    /// `row_block`), or `None` when it is too large or holds a landmark or a
+    /// table part. A text inside a control is that control's label, not a
+    /// separate text, so it does not count as one.
+    fn is_row_block(&self, node: usize, matched: usize) -> Option<bool> {
+        // Each entry: the node, whether it lies inside the match, and whether
+        // it lies inside a control.
+        let mut pending = vec![(node, false, false)];
+        let (mut control, mut label, mut beside_match) = (false, false, false);
+        let (mut leaves, mut bytes) = (0, 0);
+        while let Some((kid, in_match, in_control)) = pending.pop() {
+            let role = self.role(kid);
+            if kid != node && (self.is_landmark(kid) || is_table_part(role)) {
+                return None;
+            }
+            let in_match = in_match || kid == matched;
+            let actionable = is_actionable(role);
+            let labelled =
+                !actionable && !in_control && self.names[kid].chars().any(char::is_alphanumeric);
+            control |= actionable;
+            label |= labelled;
+            beside_match |= (actionable || labelled) && !in_match;
+            if !self.kids[kid].is_empty() {
+                pending.extend(
+                    self.kids[kid]
+                        .iter()
+                        .rev()
+                        .map(|&grandkid| (grandkid, in_match, in_control || actionable)),
+                );
+                continue;
+            }
+            leaves += 1;
+            if leaves > ROW_LEAVES {
+                return None;
+            }
+            // Measured as `leaf_row` measures a leaf: its name and shown
+            // value joined by a space, plus one separating space.
+            let name = self.names[kid].len();
+            let value = self.shown_value(kid).map_or(0, |value| value.len());
+            let text = name + value + usize::from(name > 0 && value > 0);
+            if text > 0 {
+                bytes += text + 1;
+                if bytes > ROW_BYTES {
+                    return None;
+                }
+            }
+        }
+        Some(control && label && beside_match)
+    }
+
+    /// Give each match a row to print with. A match inside a row block (see
+    /// `row_block`) prints that whole block. Otherwise a matching leaf gets its
+    /// nearest ancestor that `leaf_row` accepts and
     /// that holds another leaf with a letter or digit, so a key prints with its
     /// value. Quotes and separators alone do not count. The climb stops at the
     /// first ancestor `leaf_row` rejects, and never goes past the nearest
@@ -851,9 +966,12 @@ impl<'a> Tree<'a> {
         node: usize,
         filters: &Filters,
         ancestors: &mut Vec<usize>,
-        rows: &mut HashMap<usize, String>,
+        rows: &mut HashMap<usize, FilterRow>,
     ) {
-        if self.kids[node].is_empty() && self.matches(node, filters) {
+        let matched = self.matches(node, filters);
+        if let Some(block) = matched.then(|| self.row_block(node, ancestors)).flatten() {
+            rows.insert(block, FilterRow::Block);
+        } else if self.kids[node].is_empty() && matched {
             for &ancestor in ancestors.iter().rev() {
                 let Some(texts) = self.leaf_row(ancestor) else {
                     break;
@@ -864,11 +982,13 @@ impl<'a> Tree<'a> {
                 {
                     rows.insert(
                         ancestor,
-                        texts
-                            .into_iter()
-                            .map(|(_, text)| text)
-                            .collect::<Vec<_>>()
-                            .join(" "),
+                        FilterRow::Joined(
+                            texts
+                                .into_iter()
+                                .map(|(_, text)| text)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
                     );
                     break;
                 }
@@ -902,17 +1022,24 @@ impl<'a> Tree<'a> {
         node: usize,
         depth: usize,
         filters: &Filters,
-        rows: &HashMap<usize, String>,
+        rows: &HashMap<usize, FilterRow>,
         out: &mut Vec<Line>,
     ) -> bool {
-        if let Some(texts) = rows.get(&node) {
-            let mut text = self
-                .reference(node)
-                .map(|reference| format!("{reference} "))
-                .unwrap_or_default();
-            text.push_str(texts);
-            out.push(self.line(node, depth, text));
-            return true;
+        match rows.get(&node) {
+            Some(FilterRow::Joined(texts)) => {
+                let mut text = self
+                    .reference(node)
+                    .map(|reference| format!("{reference} "))
+                    .unwrap_or_default();
+                text.push_str(texts);
+                out.push(self.line(node, depth, text));
+                return true;
+            }
+            Some(FilterRow::Block) => {
+                self.full_lines(node, depth, out);
+                return true;
+            }
+            None => {}
         }
         let line = self.element_text(node, self.name_chars(node));
         let matched = self.matches(node, filters);
@@ -1312,6 +1439,102 @@ mod tests {
         });
         assert!(filtered.text.contains("No matches"), "{}", filtered.text);
         assert!(!filtered.text.contains("hidden-secret"));
+    }
+
+    /// A table whose rows hold a link prints a filtered match as it did
+    /// before row blocks: the matching cell or text under its table, without
+    /// the link, whether the link sits in its own cell or beside the matching
+    /// text in one cell. A table keeps its own row rule (see `Tree::leaf_row`).
+    #[test]
+    fn a_match_in_a_table_row_with_a_link_prints_only_the_cell() {
+        let records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "table", "Apps", Some("e2")),
+            record(2, "row", "", Some("e3")),
+            record(3, "cell", "alpha", Some("e4")),
+            record(4, "StaticText", "alpha", Some("e5")),
+            record(3, "cell", "", Some("e6")),
+            record(4, "link", "Open", Some("e7")),
+            record(2, "row", "", Some("e8")),
+            record(3, "cell", "", Some("e9")),
+            record(4, "StaticText", "beta", Some("e10")),
+            record(4, "link", "Edit", Some("e11")),
+        ];
+        for (filter, expected) in [
+            (
+                "alpha",
+                "e1 page Page\n  e2 table Apps\n    e4 cell alpha\n",
+            ),
+            ("beta", "e1 page Page\n  e2 table Apps\n    e10 text beta\n"),
+        ] {
+            let found = render(&RenderInput {
+                records: &records,
+                facts: &HashMap::new(),
+                filters: &Filters {
+                    text: Some(filter.into()),
+                    roles: Vec::new(),
+                },
+                page_url: "https://example.com",
+                snapshot_id: "s1",
+                zoom: None,
+                max_bytes: 4096,
+            });
+            assert_eq!(
+                found.text.split_once('\n').map(|(_, body)| body),
+                Some(expected),
+                "{}",
+                found.text
+            );
+        }
+    }
+
+    /// A page holding one unlabelled row: the text `alpha`, an `Open` link and
+    /// `extra` more texts. Filtered on `alpha`, it prints the row with its
+    /// link while the row has at most `ROW_LEAVES` leaves, and the matching
+    /// text alone once it has more.
+    #[test]
+    fn a_match_whose_row_is_over_the_row_bound_prints_as_itself() {
+        let filtered = |extra: usize| {
+            let mut records = vec![
+                record(0, "RootWebArea", "Page", Some("e1")),
+                record(1, "generic", "", Some("e2")),
+                record(2, "StaticText", "alpha", Some("e3")),
+                record(2, "link", "Open", Some("e4")),
+            ];
+            for index in 0..extra {
+                let reference = format!("e{}", index + 5);
+                records.push(record(
+                    2,
+                    "StaticText",
+                    &format!("note {index}"),
+                    Some(&reference),
+                ));
+            }
+            render(&RenderInput {
+                records: &records,
+                facts: &HashMap::new(),
+                filters: &Filters {
+                    text: Some("alpha".into()),
+                    roles: Vec::new(),
+                },
+                page_url: "https://example.com",
+                snapshot_id: "s1",
+                zoom: None,
+                max_bytes: 4096,
+            })
+            .text
+        };
+        let within = filtered(ROW_LEAVES - 2);
+        assert!(
+            within.contains("\n  e2 generic\n    e3 text alpha\n    e4 link Open\n"),
+            "{within}"
+        );
+        let over = filtered(ROW_LEAVES - 1);
+        assert!(
+            over.ends_with("\ne1 page Page\n  e3 text alpha\n"),
+            "{over}"
+        );
+        assert!(!over.contains("Open"), "{over}");
     }
 
     fn record(depth: i64, role: &str, name: &str, reference: Option<&str>) -> AxRecord {
