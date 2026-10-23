@@ -1016,26 +1016,7 @@ impl PreviewWorker {
         // never made, and previews keep their icon: nothing waits on them.
         let _ = std::thread::Builder::new()
             .name("agent-preview-capture".into())
-            .spawn(move || {
-                for job in requests {
-                    answering.gauges.capture_requested();
-                    let result = capturer.capture(&job);
-                    let mut locked = answering.lock();
-                    let answer = locked.schedule.answered(&job, result);
-                    // Sent under the lock, so a hide that bumps the
-                    // generation either comes first and stops the frame, or
-                    // comes after the frame is already queued for the
-                    // helper.
-                    for line in answer.lines {
-                        answering.output.preview(line);
-                    }
-                    if let Some(frame) = answer.frame {
-                        answering.output.frame(frame);
-                    }
-                    drop(locked);
-                    answering.changed.notify_all();
-                }
-            });
+            .spawn(move || capture_requests(&answering, capturer.as_ref(), requests));
         let worker = shared.clone();
         let _ = std::thread::Builder::new()
             .name("agent-preview".into())
@@ -1097,12 +1078,71 @@ impl PreviewWorker {
     fn outstanding(&self) -> bool {
         self.shared.lock().schedule.outstanding()
     }
+
+    /// Wait for queued or running captures, including their output, to finish.
+    /// Call only after hiding the preview so no refresh can follow the wait.
+    #[cfg(test)]
+    pub(crate) fn wait_until_idle(&self) {
+        let (locked, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(
+                self.shared.lock(),
+                crate::test_support::HANG_GUARD,
+                |locked| locked.schedule.outstanding(),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !locked.schedule.outstanding(),
+            "preview capture never became idle"
+        );
+    }
 }
 
 impl Drop for PreviewWorker {
     fn drop(&mut self) {
         self.shared.lock().stopped = true;
         self.shared.changed.notify_all();
+    }
+}
+
+fn capture_requests(
+    shared: &Shared,
+    capturer: &dyn PreviewCapturer,
+    requests: std::sync::mpsc::Receiver<CaptureJob>,
+) {
+    for job in requests {
+        let mut locked = shared.lock();
+        let current = !locked.stopped
+            && locked.schedule.shown.get(&job.agent).is_some_and(|shown| {
+                shown.generation() == job.generation && !shown.idle(Instant::now())
+            });
+        if !current {
+            // Complete the queued request without a native read or any output.
+            let _ = locked.schedule.answered(&job, Err(PreviewRefused));
+            drop(locked);
+            shared.changed.notify_all();
+            continue;
+        }
+        // This check shares hide's lock, but the native capture must not: a
+        // hide never waits for a capture. A hide after this check can still
+        // race the start of capture; its answer is dropped by generation.
+        drop(locked);
+        shared.gauges.capture_requested();
+        let result = capturer.capture(&job);
+        let mut locked = shared.lock();
+        let answer = locked.schedule.answered(&job, result);
+        // Sent under the lock, so a hide that invalidates the generation
+        // either comes first and stops the frame, or comes after the frame
+        // is already queued for the helper.
+        for line in answer.lines {
+            shared.output.preview(line);
+        }
+        if let Some(frame) = answer.frame {
+            shared.output.frame(frame);
+        }
+        drop(locked);
+        shared.changed.notify_all();
     }
 }
 
@@ -1826,6 +1866,54 @@ mod tests {
     /// timing out is reached quickly; nothing is asserted about how long
     /// anything takes.
     const SHORT_WAIT: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn a_queued_capture_is_dropped_if_the_preview_was_hidden_before_pickup() {
+        let output = Arc::new(Recorder::default());
+        let held = Arc::new(Held::default());
+        held.open();
+        let worker = PreviewWorker {
+            shared: Arc::new(Shared {
+                locked: Mutex::new(Locked {
+                    schedule: admitted(),
+                    stopped: false,
+                }),
+                changed: Condvar::new(),
+                output: output.clone(),
+                gauges: &PREVIEW_GAUGES,
+            }),
+        };
+        worker.show(request("a", 10));
+        let (jobs, requests) = std::sync::mpsc::channel();
+        let job = worker
+            .shared
+            .lock()
+            .schedule
+            .next(Instant::now())
+            .submit
+            .expect("a shown preview queues its first capture");
+        jobs.send(job).unwrap();
+        assert!(worker.outstanding());
+        worker.hide("a");
+        assert!(!worker.is_shown("a"));
+        output.sent().clear();
+
+        // Start the real capture loop only after hide, so it cannot take
+        // the queued job until the job has become stale.
+        let shared = worker.shared.clone();
+        let capturer = held.clone();
+        let capture = std::thread::spawn(move || {
+            capture_requests(&shared, capturer.as_ref(), requests);
+        });
+        drop(jobs);
+        capture.join().unwrap();
+        assert!(!worker.outstanding(), "the dropped job was not answered");
+        assert_eq!(held.calls(), 0, "a hidden preview started a native capture");
+        assert!(
+            output.sent().is_empty(),
+            "a dropped job wrote preview output"
+        );
+    }
 
     /// A request whose answer does not come, repeated refreshes, a hide,
     /// then the late answer: one native request in all, and no frame.

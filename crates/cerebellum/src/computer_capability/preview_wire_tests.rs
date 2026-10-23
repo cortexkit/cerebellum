@@ -769,6 +769,9 @@ async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreg
             seen.iter().any(|line| matches!(line, CursorLine::Hide(_)))
         })
         .await;
+    // A capture admitted just before hide may still be returning. Drain it
+    // before sampling; no later request is allowed to start while hidden.
+    rig.plane.preview.running().unwrap().wait_until_idle();
     let captured = rig.captures();
     let frames = rig.lines.frames(&me);
     for _ in 0..50 {
@@ -796,6 +799,21 @@ async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreg
     assert!(rig.shown(&me));
     rig.plane.cursor().end(&me);
     assert!(!rig.shown(&me), "an end left the preview showing");
+    rig.plane.preview.running().unwrap().wait_until_idle();
+    rig.lines.take();
+    let captured = rig.captures();
+    let frames = rig.lines.frames(&me);
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rig.captures(), captured, "captured after the end signal");
+    rig.lines.take();
+    assert_eq!(
+        rig.lines.frames(&me),
+        frames,
+        "a frame after the end signal"
+    );
 
     // A switch to foreground mode, at the agent's next action.
     rig.read().await;
@@ -837,6 +855,7 @@ async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreg
         .position(|line| matches!(line, CursorLine::Picture(_)))
         .unwrap();
     assert!(hide_at < picture_at, "the badge was drawn before the hide");
+    rig.plane.preview.running().unwrap().wait_until_idle();
     let captured = rig.captures();
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(1));
@@ -1096,6 +1115,7 @@ async fn a_cancel_frame_hides_the_preview_its_call_showed() {
     .await
     .unwrap();
     assert!(!rig.shown(&agent()), "the Cancel left the preview showing");
+    rig.plane.preview.running().unwrap().wait_until_idle();
     let captured = rig.captures();
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(1));
@@ -1142,6 +1162,7 @@ async fn a_goodbye_frame_hides_the_previews_its_route_showed() {
     .await
     .unwrap();
     assert!(!rig.shown(&agent()), "the GOODBYE left the preview showing");
+    rig.plane.preview.running().unwrap().wait_until_idle();
     let captured = rig.captures();
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(1));

@@ -1,0 +1,18 @@
+[[control]]
+id = "preview-no-capture-after-hide"
+guards = "a queued capture is dropped without a native read or output when its preview was hidden before pickup"
+file = "crates/cerebellum/src/computer_capability/preview.rs"
+old = "        if !current {"
+new = "        if !current && false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/computer_capability/preview.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "computer_capability::preview::tests::a_queued_capture_is_dropped_if_the_preview_was_hidden_before_pickup",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
