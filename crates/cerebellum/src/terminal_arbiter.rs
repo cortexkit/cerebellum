@@ -863,6 +863,22 @@ impl TerminalArbiter {
         self.choose(Some(frame), TerminalCause::Deadline)
     }
 
+    /// Whether a Cancel frame for this call has already chosen its reply.
+    ///
+    /// A Cancel picks the reply here, synchronously, before the call's own
+    /// work can see that it was cancelled. Until cleanup ends, a worker reply
+    /// with the same stop outcome can still replace that body (see
+    /// `preserve_stop_refusal`). A call parked on a consent card that ends
+    /// because of the Cancel checks this and sends no reply of its own, so
+    /// the bytes on the wire cannot depend on whether its reply would have
+    /// reached the route before cleanup ended.
+    pub(crate) fn answered_by_cancel(&self) -> bool {
+        matches!(
+            self.state.lock().unwrap().cause,
+            Some(TerminalCause::Cancelled)
+        )
+    }
+
     fn preserve_stop_refusal(&self, reply: Frame) {
         let mut state = self.state.lock().unwrap();
         if state.reply_finalized || state.possibly_dispatched {

@@ -1,0 +1,60 @@
+
+[[control]]
+id = "capture-cancel-defers-to-turn-stop-reply"
+guards = "a capture cancelled on its card sends no reply of its own, so its context-less body never replaces the turn stop's reply"
+file = "crates/cerebellum/src/lib.rs"
+old = """
+        if reply["outcome"] == "cancelled"
+            && TerminalArbiter::current().is_some_and(|terminal| terminal.answered_by_cancel())
+        {"""
+new = """
+        if false // NON-VACUITY BREAK
+            && reply["outcome"] == "cancelled"
+            && TerminalArbiter::current().is_some_and(|terminal| terminal.answered_by_cancel())
+        {"""
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::a_cancel_during_consent_ends_the_capture_and_leaves_its_card_open",
+    "tests::a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "    if method == management::CAPTURE_LOGIN {"
+before = "    if method == management::RESUME {"
+
+[[control]]
+id = "capture-cancel-withdrawn-card-is-cancellation"
+guards = "a capture whose card wait ends first because the call was cancelled records a cancellation, as when its polling notices first"
+file = "crates/cerebellum/src/login_capture/mod.rs"
+old = """
+                    if (call.cancelled)() {
+                        return record.ended("cancelled", None);
+                    }
+                    return record.refused("capture_consent_not_given","""
+new = """
+                    if false && (call.cancelled)() { // NON-VACUITY BREAK
+                        return record.ended("cancelled", None);
+                    }
+                    return record.refused("capture_consent_not_given","""
+edits = []
+test_file = "crates/cerebellum/src/lib.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "        let answer = match answer {"
+before = "        if let Some(reason) = consent_refusal(&answer.ending) {"

@@ -1235,6 +1235,14 @@ impl CaptureModule {
                     );
                 }
                 if answer.ending == Ending::Withdrawn {
+                    // The consent wait watches the same cancel handle as the
+                    // polling loop above, so a cancelled call can end either
+                    // way, depending on which notices first. Both are the
+                    // caller's cancellation, not a withdrawn question, and
+                    // must give the same result.
+                    if (call.cancelled)() {
+                        return record.ended("cancelled", None);
+                    }
                     return record.refused("capture_consent_not_given", json!({"reason":"question_withdrawn", "remedy":"retry this call to ask again"}));
                 }
                 if answer.taken_approval {
