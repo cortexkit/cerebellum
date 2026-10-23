@@ -1079,8 +1079,9 @@ impl PreviewWorker {
         self.shared.lock().schedule.outstanding()
     }
 
-    /// Wait for queued or running captures, including their output, to finish.
-    /// Call only after hiding the preview so no refresh can follow the wait.
+    /// Wait until no capture is queued or running, so the last answer's output
+    /// has been handed to the helper writer. Call only once no shown preview
+    /// can ask for another capture, or one may start after this returns.
     #[cfg(test)]
     pub(crate) fn wait_until_idle(&self) {
         let (locked, _) = self
@@ -1118,7 +1119,9 @@ fn capture_requests(
                 shown.generation() == job.generation && !shown.idle(Instant::now())
             });
         if !current {
-            // Complete the queued request without a native read or any output.
+            // The preview this job was for is hidden, shown anew, faded out, or
+            // the worker has stopped: retire the job with no native read, and
+            // discard its answer unsent.
             let _ = locked.schedule.answered(&job, Err(PreviewRefused));
             drop(locked);
             shared.changed.notify_all();
@@ -1968,7 +1971,7 @@ mod tests {
     }
 
     /// The helper fades a preview out by itself after `PREVIEW_IDLE`, so a job
-    /// taken after that would capture a window nobody sees: it is dropped.
+    /// taken after that starts no native read and writes nothing.
     #[test]
     fn a_queued_capture_for_a_preview_gone_idle_is_dropped() {
         let (worker, output, job) = queued_first_capture();

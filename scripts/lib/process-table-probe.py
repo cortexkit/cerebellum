@@ -4,11 +4,14 @@ reads it, without compiling anything.
 
 The launch_recovery_clear tests run the real reading in
 `launch_recovery::user_process_arguments`: the owner of every process, through
-`PROC_PIDT_SHORTBSDINFO`, which the kernel answers for any process whoever runs
-it, then the arguments of this user's own processes, through `KERN_PROCARGS2`.
-A worker sandbox hides older processes, and those tests then fail with
-`process_table_unreadable`. This probe makes the same reads in the same order,
-so the gate skips those tests only where they cannot pass.
+`PROC_PIDT_SHORTBSDINFO` (which the kernel normally answers for any process,
+whoever runs it), then the arguments of this user's own processes, through
+`KERN_PROCARGS2`. A worker sandbox hides older processes, and those tests then
+fail with `process_table_unreadable`. This probe makes the same two reads for
+every process, in the same order, with the same retry; it checks only that an
+argument answer arrived, where launch recovery also parses it. When the probe
+reports the table unreadable, the gate skips the launch_recovery_clear tests
+and says so.
 
 Exit 0 when the table is readable, 1 when it is not.
 """
@@ -43,15 +46,18 @@ class ProcBsdShortInfo(ctypes.Structure):
     ]
 
 
-def readable(pids, owner, arguments, this_user, attempts=3, pause=0.05):
+def readable(pids, owner, arguments, this_user, retry_window=1.0, pause=0.02):
     """Whether every process of `this_user` reads as launch recovery needs.
 
     `owner(pid)` answers GONE, `(uid, zombie)`, or None when the kernel
     refuses. `arguments(pid)` answers GONE, True when read, or False when
     refused. Another user's process is skipped on its owner alone, as launch
     recovery skips it, so a process only root may inspect in full never makes
-    the table unreadable.
+    the table unreadable. Refused arguments are retried until one deadline
+    shared by the whole scan, as in launch recovery (`UNREADABLE_RETRY_WINDOW`
+    and `UNREADABLE_RETRY_PAUSE`).
     """
+    deadline = None
     for pid in pids:
         found = owner(pid)
         if found == GONE:
@@ -61,19 +67,20 @@ def readable(pids, owner, arguments, this_user, attempts=3, pause=0.05):
         uid, zombie = found
         if zombie or uid != this_user:
             continue
-        for attempt in range(attempts):
+        while True:
             answer = arguments(pid)
             if answer is True or answer == GONE:
                 break
-            # A process exiting or exec'ing can refuse for a moment; launch
-            # recovery retries the same way before refusing a clear.
+            # A process exiting or exec'ing can refuse for a moment.
             again = owner(pid)
             if again == GONE or (again is not None and again[1]):
                 break
-            if attempt + 1 < attempts:
-                time.sleep(pause)
-        else:
-            return False
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + retry_window
+            if now >= deadline:
+                return False
+            time.sleep(min(pause, deadline - now))
     return True
 
 
@@ -144,7 +151,7 @@ def self_test():
             lambda pid: owners[pid],
             lambda pid: pid not in refused_arguments,
             me,
-            pause=0,
+            retry_window=0,
         )
 
     # Root's launchd refuses the full information form to an unprivileged
