@@ -243,9 +243,10 @@ pub(crate) fn check_tool_call(
     Ok(())
 }
 
-/// A role op's refusal of a malformed request. The contract sends every
-/// refusal as an `ERROR` frame: a caller decodes a `RESPONSE` body as the op's
-/// answer, so a refusal sent that way reads as a broken answer.
+/// A role op's refusal of a malformed request, sent as an `ERROR` frame as the
+/// tool-provider contract requires of every refusal. A caller decodes a
+/// `RESPONSE` body as the op's answer, so a refusal sent that way reads as a
+/// broken answer.
 fn malformed(field: &str, reason_code: &str) -> ErrorBody {
     errors::invalid_request(field, format!("{field}: {reason_code}"))
         .with_detail(json!({"field": field, "reason_code": reason_code}))
