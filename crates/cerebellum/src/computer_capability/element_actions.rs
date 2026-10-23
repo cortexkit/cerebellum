@@ -1155,7 +1155,8 @@ pub(crate) fn settle_and_observe_view(
         PersonWatch::Watched(acted) => acted(),
     };
     loop {
-        if person_acted() {
+        let interrupted = person_acted();
+        if interrupted {
             return None;
         }
         let seen = SeenMarks::read(source, grant);
