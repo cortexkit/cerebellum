@@ -180,6 +180,7 @@ desk_skip_reason() {
 if [ "$self_test" -eq 1 ]; then
   scripts/lib/fast-gate.test.sh
   python3 scripts/lib/fast-gate-fingerprint.py --self-test
+  python3 scripts/lib/process-table-probe.py --self-test
   planner_python=""
   for python in python3 python3.14 python3.13 python3.12 python3.11; do
     if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then

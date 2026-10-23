@@ -163,7 +163,7 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
-    "$repo_root/scripts/lib/process-start-time-probe.py" "$fixture/scripts/lib/"
+    "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
   cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash

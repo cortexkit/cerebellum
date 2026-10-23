@@ -152,7 +152,7 @@ wait_static_phases() {
 }
 
 process_table_readable() {
-  python3 "$repo_root/scripts/lib/process-start-time-probe.py"
+  python3 "$repo_root/scripts/lib/process-table-probe.py"
 }
 
 configure_lib_tests() {
