@@ -658,7 +658,7 @@ impl FrontingBracketHost for FakeBracket {
             posting.notify_one();
         }
         if let Some(terminal) = hold {
-            let give_up = std::time::Instant::now() + Duration::from_secs(10);
+            let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
             while !terminal.gate.stopped() && std::time::Instant::now() < give_up {
                 std::thread::yield_now();
             }

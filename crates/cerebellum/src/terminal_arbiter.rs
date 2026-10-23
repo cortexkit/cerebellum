@@ -2274,7 +2274,7 @@ mod restore_slot_tests {
     /// cleanup that wrongly decided without waiting for the front has its
     /// restore logged before `front_returned`.
     fn return_front_after_take(cell: &RestoreCell, shared: &SharedScreen) {
-        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         while !cell.inner().attempt.taken() && std::time::Instant::now() < give_up {
             std::thread::yield_now();
         }
@@ -2767,7 +2767,7 @@ mod restore_slot_tests {
         handle_frame(request(), &tx, &planes).await.unwrap();
         worker_started.await.unwrap();
         handle_frame(cancel(), &tx, &planes).await.unwrap();
-        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         while decision_started.try_recv().is_err() {
             assert!(
                 std::time::Instant::now() < give_up,
