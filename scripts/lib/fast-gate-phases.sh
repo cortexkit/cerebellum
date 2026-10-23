@@ -100,8 +100,11 @@ run_linux_part() {
   # example when it is full): nothing ran, so asking again is safe. Any other
   # exit, including ck's own codes for a lost or timed-out job, is the verdict.
   local attempt status
+  # 12 CPUs keeps the job on the build server, whose job toolchain carries the
+  # pinned mutation runner. Smaller jobs can be placed on other hosts whose
+  # images may not have it yet, and then any catalogue check fails there.
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    ck motor run --vcpus 8 --timeout 1800 --cwd "$repo_root" -- \
+    ck motor run --vcpus 12 --timeout 1800 --cwd "$repo_root" -- \
       ./scripts/fast-gate.sh --part linux --base "$base" "${replay_options[@]+${replay_options[@]}}"
     status=$?
     [ "$status" -eq 200 ] || return "$status"
