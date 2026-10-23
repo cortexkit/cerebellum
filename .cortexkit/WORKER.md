@@ -4,6 +4,8 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 ## Gates
 
+Run cargo on this Mac only for the gate's Mac half and for tests that need macOS. Run check, clippy and every other test on the build server with `runon`. Each fresh test binary run on this Mac costs a system security scan while Ufuk works on it.
+
 The fast gate has two halves, chosen from your diff:
 
 - **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,4c"`.
