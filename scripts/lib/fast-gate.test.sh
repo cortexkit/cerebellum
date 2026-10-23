@@ -138,21 +138,19 @@ TOML
 }
 
 catalogue_routing() {
-  local lane touched runner_dir="$scratch/catalogue-target" CARGO_TARGET_DIR="$scratch/catalogue-target"
+  local lane touched installed=0
   setup_phases
   run_serial_phase() { shift; printf '%s\n' "$*" >>"$scratch/catalogue-calls"; }
   catalogue_check_needed() { [ "$1" = touched ]; }
+  runner_available() { [ "$installed" -eq 1 ]; }
   # Without the runner, an unrelated change skips the anchor-scope check and
   # says so; a catalogue change still runs both checks, which then need it.
-  rm -rf "$runner_dir"
   part=mac changed_files=unrelated
   : >"$scratch/catalogue-calls"
   run_catalogue_checks
   [ ! -s "$scratch/catalogue-calls" ] || return 1
   [ "${not_verified[*]}" = 'catalogue anchor scopes (pinned ckdev-mutate not installed here; anchors themselves are checked by check-mutation-tree.sh)' ] || return 1
-  mkdir -p "$runner_dir/tools/bin"
-  printf '#!/usr/bin/env bash\n' >"$runner_dir/tools/bin/ckdev-mutate"
-  chmod +x "$runner_dir/tools/bin/ckdev-mutate"
+  installed=1
   setup_phases
   run_serial_phase() { shift; printf '%s\n' "$*" >>"$scratch/catalogue-calls"; }
   catalogue_check_needed() { [ "$1" = touched ]; }
@@ -241,7 +239,7 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/lib/mutation-catalogue.py" "$fixture/scripts/lib/"
   mkdir -p "$fixture/mutations.d"
   printf '[[control]]\nid = "fixture"\nfile = "crates/cerebellum/src/lib.rs"\n' >"$fixture/mutations.d/rows.toml"
-  printf '#!/usr/bin/env bash\nprintf "mutation %%s\\n" "$*" >>"$CALL_LOG"\n' >"$fixture/scripts/mutations.sh"
+  printf '#!/usr/bin/env bash\nif [ "$1" = --resolve-runner ]; then [ -x "$CARGO_TARGET_DIR/tools/bin/ckdev-mutate" ]; exit; fi\nprintf "mutation %%s\\n" "$*" >>"$CALL_LOG"\n' >"$fixture/scripts/mutations.sh"
   chmod +x "$fixture/scripts/mutations.sh"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
   cat >"$fixture/bin/cargo" <<'SH'

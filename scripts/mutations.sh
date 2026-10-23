@@ -5,8 +5,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-./scripts/check-mutation-tree.sh
-
 base="${MUTATION_BASE:-origin/main}"
 narrow=1
 full=1
@@ -15,8 +13,9 @@ check_only=0
 anchors_only=0
 platform=""
 diff_given=0
+resolve_only=0
 usage() {
-  echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only [--anchors-only | --platform OS]]"
+  echo "usage: $0 [--diff REF] [--narrow-only | --full-only | --check-only [--anchors-only | --platform OS]] | --resolve-runner"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -51,6 +50,10 @@ while [ "$#" -gt 0 ]; do
       case "$2" in linux|macos|windows) platform="$2" ;; *) usage >&2; exit 2 ;; esac
       shift 2
       ;;
+    --resolve-runner)
+      resolve_only=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -74,6 +77,75 @@ if [ "$anchors_only" -eq 1 ] && [ -n "$platform" ]; then
   echo "--anchors-only cannot be combined with --platform" >&2
   exit 2
 fi
+
+# The pinned runner comes from one of two places, both tied to the reviewed
+# commons revision:
+# 1. this checkout's Cargo target directory, installed with the command below.
+#    Cargo's install record there distinguishes the reviewed revision from
+#    another binary that happens to report the same version;
+# 2. the build server's job toolchain, which puts each pin on PATH under a name
+#    carrying the first 8 characters of its revision (ckdev-mutate-73af60d1).
+#    A build cache can be emptied between jobs, so jobs there rely on this one.
+# Never the plain `ckdev-mutate` on PATH or in ~/.cargo/bin: those are shared
+# by every repository on a machine, and another repository installing a
+# different version there would silently change, or block, this replay. The
+# script never installs on its own: it names the exact install command and stops.
+expected_version="0.12.10"
+expected_revision="73af60d143d64fe874606ce73f22e02cb356a4bb"
+toolchain_runner="ckdev-mutate-${expected_revision:0:8}"
+tools_root="${CARGO_TARGET_DIR:-$repo_root/target}/tools"
+case "$tools_root" in /*) ;; *) tools_root="$repo_root/$tools_root" ;; esac
+mutate="$tools_root/bin/ckdev-mutate"
+refuse_runner() {
+  echo "mutations: $1" >&2
+  echo "mutations: install the pinned runner into this checkout with:" >&2
+  echo "  cargo install --locked --root \"$tools_root\" --git https://github.com/cortexkit/commons --rev $expected_revision cortexkit-mutate" >&2
+  exit 2
+}
+if [ -x "$mutate" ]; then
+  actual_version="$("$mutate" --version)" || refuse_runner "$mutate --version failed"
+  if [ "$actual_version" != "ckdev-mutate $expected_version" ]; then
+    refuse_runner "expected ckdev-mutate $expected_version from revision $expected_revision in $tools_root; found '$actual_version'"
+  fi
+  python3 - "$tools_root/.crates2.json" "$expected_version" "$expected_revision" <<'PY' || refuse_runner "$tools_root does not record ckdev-mutate from commons revision $expected_revision"
+import json
+from pathlib import Path
+import sys
+
+metadata_path, version, revision = sys.argv[1:]
+expected = (
+    f"cortexkit-mutate {version} "
+    f"(git+https://github.com/cortexkit/commons?rev={revision}#{revision})"
+)
+try:
+    installs = json.loads(Path(metadata_path).read_text())['installs']
+except (OSError, KeyError, json.JSONDecodeError) as error:
+    print(f"mutations: cannot verify ckdev-mutate install revision: {error}", file=sys.stderr)
+    sys.exit(2)
+install = installs.get(expected)
+if install is None or "ckdev-mutate" not in install.get("bins", []):
+    print(
+        f"mutations: ckdev-mutate must be installed from commons revision {revision}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+PY
+elif toolchain_path="$(command -v "$toolchain_runner")"; then
+  # The toolchain's name carries the revision; the version must still match.
+  mutate="$toolchain_path"
+  actual_version="$("$mutate" --version)" || refuse_runner "$mutate --version failed"
+  if [ "$actual_version" != "ckdev-mutate $expected_version" ]; then
+    refuse_runner "expected ckdev-mutate $expected_version from $toolchain_runner; found '$actual_version'"
+  fi
+else
+  refuse_runner "ckdev-mutate is missing from $tools_root/bin, and $toolchain_runner is not on PATH"
+fi
+if [ "$resolve_only" -eq 1 ]; then
+  echo "$mutate"
+  exit 0
+fi
+
+./scripts/check-mutation-tree.sh
 
 # Keep the check's scratch catalogue outside the installed tools and source tree.
 scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
@@ -117,54 +189,6 @@ if [ "$check_only" -eq 1 ] && [ "$diff_given" -eq 1 ]; then
   esac
 fi
 
-# The runner lives in this checkout's Cargo target directory. ~/.cargo/bin is shared
-# by every repository on the machine, so another repository installing a
-# different ckdev-mutate there would silently change, or block, this replay.
-# The script never looks on PATH or in ~/.cargo/bin, and never installs on its
-# own: it names the exact install command and stops.
-# Cargo's install record distinguishes the reviewed source revision from another
-# binary that happens to report the same semantic version.
-expected_version="0.12.10"
-expected_revision="73af60d143d64fe874606ce73f22e02cb356a4bb"
-tools_root="${CARGO_TARGET_DIR:-$repo_root/target}/tools"
-case "$tools_root" in /*) ;; *) tools_root="$repo_root/$tools_root" ;; esac
-mutate="$tools_root/bin/ckdev-mutate"
-refuse_runner() {
-  echo "mutations: $1" >&2
-  echo "mutations: install the pinned runner into this checkout with:" >&2
-  echo "  cargo install --locked --root \"$tools_root\" --git https://github.com/cortexkit/commons --rev $expected_revision cortexkit-mutate" >&2
-  exit 2
-}
-if [ ! -x "$mutate" ]; then
-  refuse_runner "ckdev-mutate is missing from $tools_root/bin"
-fi
-actual_version="$("$mutate" --version)" || refuse_runner "$mutate --version failed"
-if [ "$actual_version" != "ckdev-mutate $expected_version" ]; then
-  refuse_runner "expected ckdev-mutate $expected_version from revision $expected_revision in $tools_root; found '$actual_version'"
-fi
-python3 - "$tools_root/.crates2.json" "$expected_version" "$expected_revision" <<'PY' || refuse_runner "$tools_root does not record ckdev-mutate from commons revision $expected_revision"
-import json
-from pathlib import Path
-import sys
-
-metadata_path, version, revision = sys.argv[1:]
-expected = (
-    f"cortexkit-mutate {version} "
-    f"(git+https://github.com/cortexkit/commons?rev={revision}#{revision})"
-)
-try:
-    installs = json.loads(Path(metadata_path).read_text())['installs']
-except (OSError, KeyError, json.JSONDecodeError) as error:
-    print(f"mutations: cannot verify ckdev-mutate install revision: {error}", file=sys.stderr)
-    sys.exit(2)
-install = installs.get(expected)
-if install is None or "ckdev-mutate" not in install.get("bins", []):
-    print(
-        f"mutations: ckdev-mutate must be installed from commons revision {revision}",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-PY
 
 if [ ! -d mutations.d ]; then
   echo "mutations: missing mutations.d catalogue" >&2

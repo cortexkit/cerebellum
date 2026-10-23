@@ -61,11 +61,15 @@ catalogue_check_needed() {
   return 2
 }
 
+# Whether this host has the pinned mutation runner, in either place
+# scripts/mutations.sh accepts.
+runner_available() {
+  ./scripts/mutations.sh --resolve-runner >/dev/null 2>&1
+}
+
 run_catalogue_checks() {
-  local platform needed=0 runner
+  local platform needed=0
   case "$part" in linux) platform=linux ;; mac) platform=macos ;; esac
-  runner="${CARGO_TARGET_DIR:-$repo_root/target}/tools/bin/ckdev-mutate"
-  case "$runner" in /*) ;; *) runner="$repo_root/$runner" ;; esac
   catalogue_check_needed "$changed_files" || needed=$?
   if [ "$needed" -eq 0 ]; then
     # A catalogue row or a file a row anchors on changed: the pinned runner is
@@ -84,7 +88,7 @@ run_catalogue_checks() {
   # to occur exactly once. The runner's own anchor check adds scopes and extra
   # edits; run it where the runner is installed rather than make every fresh
   # checkout install it first.
-  if [ -x "$runner" ]; then
+  if runner_available; then
     run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
   else
     not_verified+=("catalogue anchor scopes (pinned ckdev-mutate not installed here; anchors themselves are checked by check-mutation-tree.sh)")
