@@ -441,7 +441,7 @@ fn list_apps_text(object: &Map<String, Value>, apps: &[Value]) -> String {
             ));
         } else {
             out.push_str(&format!(
-                "{} installed apps that are not running are not shown; call list_apps with text_filter to find one by name or bundle id.\n",
+                "{} installed apps that are not running are not shown; call list_apps with text_filter to find one by name or app id.\n",
                 installed.len()
             ));
         }
@@ -819,6 +819,17 @@ mod tests {
 
     fn fact_lines(reply: Value) -> Vec<String> {
         facts(reply.as_object().unwrap(), None, true)
+    }
+
+    #[test]
+    fn an_omitted_installed_app_list_suggests_a_platform_neutral_app_id() {
+        let reply = json!({
+            "apps": [{"name": "a".repeat(INSTALLED_NAMES_MAX_BYTES + 1), "running": false}],
+        });
+        assert_eq!(
+            body(reply.as_object().unwrap()).unwrap(),
+            "No running app is listed.\n1 installed apps that are not running are not shown; call list_apps with text_filter to find one by name or app id.\n"
+        );
     }
 
     #[test]

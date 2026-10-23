@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(
             texts(&result),
             [
-                "No running app is listed.\n400 installed apps that are not running are not shown; call list_apps with text_filter to find one by name or bundle id.\n",
+                "No running app is listed.\n400 installed apps that are not running are not shown; call list_apps with text_filter to find one by name or app id.\n",
                 "Not every installed app could be read in time, so the installed list is partial."
             ]
         );

@@ -41,14 +41,15 @@ they ship as one module with two capability families.
 - Profile management: named browser profiles with isolated storage, so an
   agent's research session and a logged-in workflow session are different
   identities by construction.
-- Needs no TCC ceremony — the walking skeleton lands here.
+- On macOS, browser automation needs no Transparency, Consent, and Control
+  (TCC) permission prompt.
 
 **Computer plane (the escalation).**
 - Screen capture (full screen, window, region) and synthetic input (pointer,
   keyboard) via macOS Accessibility, extended by app-targeted primitives
   (window enumeration, frontmost app, AX-tree queries) where structure beats
   pixels — the same structured-first principle as the browser plane.
-- TCC-gated: the module owns the grant ceremony UX (prompt attribution,
+- On macOS, TCC-gated: the module owns the grant ceremony UX (prompt attribution,
   detection of missing grants, honest typed errors instead of silent black
   screenshots).
 - Machine-scoped and therefore the most dangerous surface in the fleet;
@@ -78,12 +79,12 @@ they ship as one module with two capability families.
 
 - Supervised subc module (`cerebellum` in subc.jsonc, binary `ck-cerebellum`),
   spawn-attested, wire v2, health v2 (insulated lane, mechanical gauges: CDP
-  session liveness, browser process state, TCC grant status, oldest in-flight
+  session liveness, browser process state, TCC grant status on macOS, oldest in-flight
   action age).
 - Capability manifest declares the tool families; `execution_mode` honest per
   tool (reads `pure`, actions `unfenceable` — there is no undo for a click).
 - Storage via cortexkit-store (profiles registry, grant ledger, action audit
-  journal); config at `~/.config/cortexkit/cerebellum.jsonc`.
+  journal); config at `~/.config/cortexkit/cerebellum.jsonc` on macOS and Linux.
 - Screenshot payloads ride the existing 64 MiB frame budget; live viewing /
   streaming surfaces (for the Cortex app's supervised-session view) are a
   later lane on the existing subscribe machinery.

@@ -407,6 +407,9 @@ async fn a_timed_out_exclusion_tool_is_a_typed_refusal() {
             reason != "timed_out",
             "{reason}: {remedy}"
         );
+        if reason == "timed_out" {
+            assert!(remedy.ends_with("on this computer"), "{remedy}");
+        }
         assert!(fixture.fs.contents().is_empty());
         assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
     }

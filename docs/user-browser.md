@@ -52,6 +52,8 @@ content might load later. They do not change site consent or add automatic retri
 
 ## Development installation in normal Chrome
 
+The installation and signing steps below are for macOS.
+
 Use an unpacked extension for development. Branded Chrome 137 and later ignores
 `--load-extension`; do not use that switch to install into your normal browser.
 
@@ -92,6 +94,8 @@ signed Chrome with a lookalike extension. Web Store distribution is a separate
 future boundary.
 
 ## Isolated real-browser probe
+
+The real-browser probe and its signing commands below are macOS-only.
 
 The opt-in example `user_browser_probe` is for **Chrome for Testing**, not your
 normal Chrome. It must run only with the operator's approval and against its
@@ -146,7 +150,7 @@ accepted as an argument.
 **Ask the operator before this command.** Budget: **180 seconds plus up to
 3 seconds of cleanup**. It is a headed browser, launched with
 `--no-startup-window`; the harness never activates Chrome, a tab or a window,
-and never restores focus. **Chrome/macOS startup might still front a window;
+and never restores focus. **Chrome startup on macOS might still front a window;
 this harness cannot guarantee it will not. Such a change fails the probe.**
 Keep your current app and focus unchanged during the run. Foreground pid is
 sampled every 10 ms, so this is sampled evidence, not proof against an arbitrarily

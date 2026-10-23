@@ -1288,7 +1288,7 @@ impl CaptureModule {
             // A tool that did not answer says nothing about the exclusion, so
             // the caller is not sent to fix one that may already be in place.
             let remedy = match reason {
-                "timed_out" => format!("{tool} did not answer in time; nothing was captured. Retry; if it keeps happening, check {tool} on this Mac"),
+                "timed_out" => format!("{tool} did not answer in time; nothing was captured. Retry; if it keeps happening, check {tool} on this computer"),
                 _ => format!("make {tool} report {} as excluded, then retry", root.display()),
             };
             json!({

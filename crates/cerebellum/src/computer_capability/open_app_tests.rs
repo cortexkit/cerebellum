@@ -177,6 +177,7 @@ async fn open_app_refuses_unregistered_and_forbidden_schemes_by_name() {
         assert_eq!(reply["outcome"], "url_scheme_refused", "{reply}");
         assert_eq!(reply["scheme"], scheme);
         assert!(reply["remedy"].as_str().unwrap().contains(scheme));
+        assert!(reply["remedy"].as_str().unwrap().starts_with("On macOS, "));
         assert_eq!(questions, 0);
     }
     assert!(desk.state().opens.is_empty());
@@ -228,6 +229,7 @@ async fn open_app_unsigned_and_ad_hoc_bundles_refuse_before_consent() {
         }
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
         assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+        assert_eq!(reply["remedy"], "On macOS, the installed application must carry a valid, non-ad-hoc signature before it can be launched");
         assert_eq!(questions, 0);
         assert!(desk.state().opens.is_empty());
     }
@@ -244,6 +246,7 @@ async fn open_app_ambiguous_name_lists_candidates_without_launching() {
         desk.state().installed.complete = complete;
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Editor"})).await;
         assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
+        assert_eq!(reply["remedy"], "several installed applications match; use a unique app identity (a bundle id on macOS; duplicate installations must be removed or renamed)");
         assert_eq!(
             reply["installed_list"],
             if complete { "complete" } else { "partial" }
@@ -422,6 +425,10 @@ async fn open_app_partial_inventory_missing_match_discloses_unreadable_part() {
         desk.state().installed.complete = complete;
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Missing"})).await;
         assert_eq!(reply["outcome"], "no_installed_app_named", "{reply}");
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("app identity (a bundle id on macOS)"));
         assert_eq!(
             reply["installed_list"],
             if complete { "complete" } else { "partial" }

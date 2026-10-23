@@ -2931,7 +2931,7 @@ where
                 json!({"outcome":"completed", STATE_TEXT_FIELD:text, "apps":apps, "truncated":truncated,"installed_list":if installed.complete {"complete"} else {"partial"}})
             }
             Err(_) => {
-                json!({"outcome":"targets_unreadable","unreadable":{"reason":"window_list_unavailable"},"remedy":"the running applications could not be read; retry, or name an application by bundle identity"})
+                json!({"outcome":"targets_unreadable","unreadable":{"reason":"window_list_unavailable"},"remedy":"the running applications could not be read; retry, or name an application by app identity (a bundle id on macOS)"})
             }
         }
     }
@@ -3181,8 +3181,8 @@ pub(crate) fn parse_state_view(
 /// The web version is named because a browser page is driven through the
 /// browser's own debugging protocol, which keeps working while the screen is
 /// locked; the remedy is useful to someone away from the machine.
-const SCREEN_LOCKED_REMEDY: &str = "The Mac's screen is locked, and macOS hides every app's \
-     interface while it is. Try again once the screen is unlocked, or use the site's web version \
+const SCREEN_LOCKED_REMEDY: &str = "The screen is locked. On macOS, every app's interface is \
+     hidden while it is locked. Try again once the screen is unlocked, or use the site's web version \
      with browser_use, which works while the screen is locked.";
 
 /// The refusal every served row gives while the screen is locked.
@@ -3381,8 +3381,8 @@ fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<MatchedTarget,
                 "candidates": candidate_list(&named),
                 // Named rather than chosen between: picking one would act on an
                 // application the caller did not single out.
-                "remedy": "several running applications have this name; retry with the bundle \
-                           identity of the one you mean",
+                "remedy": "several running applications have this name; retry with the app \
+                           identity (a bundle id on macOS) of the one you mean",
             }));
         }
     }
@@ -3401,16 +3401,16 @@ fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<MatchedTarget,
         [] => Err(json!({
             "outcome": "no_running_app_named",
             "target": wanted,
-            "remedy": "no running application has this name or bundle identity; list_apps shows \
-                       the running applications, and any of their names or bundle identities \
-                       is a target",
+            "remedy": "no running application has this name or app identity; list_apps shows \
+                       the running applications, and any of their names or app identities \
+                       (bundle ids on macOS) is a target",
         })),
         _ => Err(json!({
             "outcome": "ambiguous_app",
             "target": wanted,
             "candidates": candidate_list(&partly),
             "remedy": "this name fits several running applications; retry with the full name or \
-                       the bundle identity of the one you mean",
+                       the app identity (a bundle id on macOS) of the one you mean",
         })),
     }
 }
@@ -3422,7 +3422,7 @@ fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<MatchedTarget,
 fn unreadable_application_reply(error: AppStateReadError) -> Value {
     let remedy = match error {
         AppStateReadError::AccessibilityNotPermitted => {
-            "this module may not read other applications' accessibility trees; the \
+            "On macOS, this module may not read other applications' accessibility trees; the \
              Accessibility permission must be granted to it again"
         }
         AppStateReadError::UnsupportedOnPlatform => "this platform has no application-state reader",
@@ -5485,6 +5485,7 @@ mod name_match_tests {
         let refusal = match_target_name("Magic", &desk()).unwrap_err();
         assert_eq!(refusal["outcome"], "ambiguous_app");
         assert_eq!(refusal["target"], "Magic");
+        assert_eq!(refusal["remedy"], "this name fits several running applications; retry with the full name or the app identity (a bundle id on macOS) of the one you mean");
         let names: Vec<_> = refusal["candidates"]
             .as_array()
             .unwrap()
@@ -5503,6 +5504,12 @@ mod name_match_tests {
                 "{wanted:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_accessibility_regrant_remedy_names_macos() {
+        let reply = unreadable_application_reply(AppStateReadError::AccessibilityNotPermitted);
+        assert_eq!(reply["remedy"], "On macOS, this module may not read other applications' accessibility trees; the Accessibility permission must be granted to it again");
     }
 
     #[test]
