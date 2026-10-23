@@ -7392,6 +7392,143 @@ mod tests {
         assert!(tight.text.len() <= 80, "{}", tight.text);
     }
 
+    /// The table and property-line filters print what they printed before row
+    /// blocks existed: a table row as one joined line, an oversized log line
+    /// as itself, a property line as one line.
+    #[test]
+    fn table_and_property_filters_match_their_golden_text() {
+        let (observation, url) = fixture_observation(OBSERVABILITY);
+        for (filter, golden) in [
+            (
+                "POST /withdraw",
+                include_str!("../fixtures/observability_filter_post_withdraw.txt"),
+            ),
+            (
+                "withdrawn_queue_depth",
+                include_str!("../fixtures/observability_filter_queue_depth.txt"),
+            ),
+            (
+                "event",
+                include_str!("../fixtures/observability_filter_event.txt"),
+            ),
+        ] {
+            let found = filtered_fixture(&observation, &url, filter, 65_536);
+            assert_eq!(found.text, golden, "text_filter {filter:?}");
+        }
+    }
+
+    /// A GitHub-like list of installed apps: each row is an image, the app's
+    /// name and a `Configure` link inside unlabelled generic containers, not
+    /// a table.
+    const GITHUB_INSTALLATIONS: &str = include_str!("../fixtures/github_installations_page.json");
+
+    /// The printed tree below the page line, split into the blocks printed
+    /// directly under it: each block is a line indented one level (two
+    /// spaces) and every deeper line after it.
+    fn top_blocks(text: &str) -> Vec<Vec<&str>> {
+        let mut blocks: Vec<Vec<&str>> = Vec::new();
+        for line in text.lines().skip(2) {
+            let indent = line.len() - line.trim_start().len();
+            if indent == 2 {
+                blocks.push(vec![line]);
+            } else {
+                assert!(indent > 2, "{line:?} is not below the page line:\n{text}");
+                blocks.last_mut().unwrap().push(line);
+            }
+        }
+        blocks
+    }
+
+    /// Every line of `block` starts with a ref the snapshot printed, so each
+    /// element in it can be clicked or zoomed.
+    fn assert_refs_printed(found: &state_text::RenderedState, block: &[&str]) {
+        for line in block {
+            let reference = line.trim_start().split(' ').next().unwrap();
+            assert!(
+                reference.starts_with('e') && found.printed_refs.contains(reference),
+                "{line:?} carries no printed ref in\n{}",
+                found.text
+            );
+        }
+    }
+
+    /// Each line of `block` without its indentation and ref.
+    fn without_refs<'a>(block: &[&'a str]) -> Vec<&'a str> {
+        block
+            .iter()
+            .map(|line| line.trim_start().split_once(' ').unwrap().1)
+            .collect()
+    }
+
+    #[test]
+    fn a_text_filter_match_on_an_app_name_prints_its_row_with_the_configure_link() {
+        let (observation, url) = fixture_observation(GITHUB_INSTALLATIONS);
+        let found = filtered_fixture(&observation, &url, "astro-alfonso", 65_536);
+        assert!(found
+            .text
+            .lines()
+            .nth(1)
+            .unwrap()
+            .ends_with(" page Installed GitHub Apps"));
+        // The image and the text both match; their shared row prints once,
+        // and no other app's row prints.
+        let blocks = top_blocks(&found.text);
+        assert_eq!(blocks.len(), 1, "{}", found.text);
+        assert_eq!(
+            without_refs(&blocks[0]),
+            [
+                "generic",
+                "generic",
+                "image astro-alfonso",
+                "text astro-alfonso",
+                "link Configure, Value: github.com/organizations/cortexkit/settings/installations/1001",
+            ],
+            "{}",
+            found.text
+        );
+        assert_refs_printed(&found, &blocks[0]);
+    }
+
+    #[test]
+    fn a_text_filter_match_on_a_row_link_prints_the_name_of_its_app() {
+        let (observation, url) = fixture_observation(GITHUB_INSTALLATIONS);
+        let found = filtered_fixture(&observation, &url, "Configure", 65_536);
+        let blocks = top_blocks(&found.text);
+        let apps = [
+            "astro-alfonso",
+            "astro-boat",
+            "cortexkit-ci",
+            "dependabot-helper",
+            "renovate-bot",
+        ];
+        assert_eq!(blocks.len(), apps.len(), "{}", found.text);
+        for (index, (block, app)) in blocks.iter().zip(apps).enumerate() {
+            let link = format!(
+                "link Configure, Value: github.com/organizations/cortexkit/settings/installations/{}",
+                1001 + index
+            );
+            let image = format!("image {app}");
+            let text = format!("text {app}");
+            assert_eq!(
+                without_refs(block),
+                ["generic", "generic", &image, &text, &link],
+                "{}",
+                found.text
+            );
+            assert_refs_printed(&found, block);
+        }
+    }
+
+    #[test]
+    fn an_unfiltered_list_page_outline_matches_its_golden_text() {
+        let (observation, url) = fixture_observation(GITHUB_INSTALLATIONS);
+        let outline = render_fixture(&observation, &url, None, 65_536).text;
+        assert_eq!(
+            outline,
+            include_str!("../fixtures/github_installations_outline.txt")
+        );
+    }
+
     #[test]
     fn x_like_outline_and_zoom_match_their_golden_text() {
         let (observation, url) = fixture_observation(X_LIKE);

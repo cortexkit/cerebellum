@@ -6024,9 +6024,12 @@ async fn handle_keyed_tool_request(
     tool_result::RESULT_BIND
         .scope(
             result_bind,
-            codemode::CALL_RECORDS.scope(
-                Arc::clone(&planes.calls),
-                handle_keyed_tool_request_inner(frame, writer, planes),
+            tool_result::SETTLEMENT_NOTE_OMITTED.scope(
+                std::cell::Cell::new(false),
+                codemode::CALL_RECORDS.scope(
+                    Arc::clone(&planes.calls),
+                    handle_keyed_tool_request_inner(frame, writer, planes),
+                ),
             ),
         )
         .await

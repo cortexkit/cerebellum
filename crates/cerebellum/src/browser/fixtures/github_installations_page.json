@@ -1,0 +1,347 @@
+{
+ "url": "https://github.com/organizations/cortexkit/settings/installations",
+ "tree": {
+  "role": "RootWebArea",
+  "name": "Installed GitHub Apps",
+  "tag": "html",
+  "children": [
+   {
+    "role": "banner",
+    "tag": "header",
+    "children": [
+     {
+      "role": "link",
+      "name": "Homepage",
+      "tag": "a",
+      "attrs": {
+       "href": "/"
+      }
+     }
+    ]
+   },
+   {
+    "role": "navigation",
+    "name": "Organization settings",
+    "tag": "nav",
+    "children": [
+     {
+      "role": "link",
+      "name": "General",
+      "tag": "a",
+      "attrs": {
+       "href": "/organizations/cortexkit/settings/profile"
+      }
+     },
+     {
+      "role": "link",
+      "name": "GitHub Apps",
+      "tag": "a",
+      "attrs": {
+       "href": "/organizations/cortexkit/settings/installations"
+      }
+     }
+    ]
+   },
+   {
+    "role": "main",
+    "tag": "main",
+    "children": [
+     {
+      "role": "heading",
+      "name": "Installed GitHub Apps",
+      "tag": "h2"
+     },
+     {
+      "role": "StaticText",
+      "name": "GitHub Apps augment and extend your workflows on GitHub.",
+      "tag": "p"
+     },
+     {
+      "role": "generic",
+      "tag": "div",
+      "attrs": {
+       "class": "Box"
+      },
+      "children": [
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "Box-row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "image",
+            "name": "astro-alfonso",
+            "tag": "img",
+            "attrs": {
+             "alt": "astro-alfonso"
+            }
+           },
+           {
+            "role": "generic",
+            "tag": "span",
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "astro-alfonso",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "link",
+            "name": "Configure",
+            "tag": "a",
+            "attrs": {
+             "href": "/organizations/cortexkit/settings/installations/1001"
+            },
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "Configure",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "Box-row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "image",
+            "name": "astro-boat",
+            "tag": "img",
+            "attrs": {
+             "alt": "astro-boat"
+            }
+           },
+           {
+            "role": "generic",
+            "tag": "span",
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "astro-boat",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "link",
+            "name": "Configure",
+            "tag": "a",
+            "attrs": {
+             "href": "/organizations/cortexkit/settings/installations/1002"
+            },
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "Configure",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "Box-row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "image",
+            "name": "cortexkit-ci",
+            "tag": "img",
+            "attrs": {
+             "alt": "cortexkit-ci"
+            }
+           },
+           {
+            "role": "generic",
+            "tag": "span",
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "cortexkit-ci",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "link",
+            "name": "Configure",
+            "tag": "a",
+            "attrs": {
+             "href": "/organizations/cortexkit/settings/installations/1003"
+            },
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "Configure",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "Box-row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "image",
+            "name": "dependabot-helper",
+            "tag": "img",
+            "attrs": {
+             "alt": "dependabot-helper"
+            }
+           },
+           {
+            "role": "generic",
+            "tag": "span",
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "dependabot-helper",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "link",
+            "name": "Configure",
+            "tag": "a",
+            "attrs": {
+             "href": "/organizations/cortexkit/settings/installations/1004"
+            },
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "Configure",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "role": "generic",
+        "tag": "div",
+        "attrs": {
+         "class": "Box-row"
+        },
+        "children": [
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "image",
+            "name": "renovate-bot",
+            "tag": "img",
+            "attrs": {
+             "alt": "renovate-bot"
+            }
+           },
+           {
+            "role": "generic",
+            "tag": "span",
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "renovate-bot",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "role": "generic",
+          "tag": "div",
+          "children": [
+           {
+            "role": "link",
+            "name": "Configure",
+            "tag": "a",
+            "attrs": {
+             "href": "/organizations/cortexkit/settings/installations/1005"
+            },
+            "children": [
+             {
+              "role": "StaticText",
+              "name": "Configure",
+              "tag": "span"
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}
