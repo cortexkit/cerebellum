@@ -4404,6 +4404,16 @@ async fn handle_management_request_observed(
             call_key,
         )
         .await;
+        // A capture cancelled before the handoff sends no reply of its own:
+        // the Cancel already chose this call's reply in its terminal arbiter.
+        // Its own `{"outcome":"cancelled"}` would otherwise replace that
+        // reply whenever it reached the route in time, so the bytes sent
+        // would depend on scheduling.
+        if reply["outcome"] == "cancelled"
+            && TerminalArbiter::current().is_some_and(|terminal| terminal.answered_by_cancel())
+        {
+            return Ok(());
+        }
         return match planes
             .browser
             .finish_reply(management::CAPTURE_LOGIN, reply)
@@ -7480,6 +7490,14 @@ async fn handle_tool_request_inner(
     ))
     .await;
     if planes.routes.get(channel, epoch).is_none() {
+        return Ok(());
+    }
+    // A Cancel already chose this call's reply in its terminal arbiter
+    // (`{"outcome":"cancelled","context":null}` before dispatch, or the
+    // uncertain-dispatch body after it). The call's own cancelled reply from
+    // its site card carries the route's context instead, so sending it would
+    // let scheduling decide which body the caller gets; send nothing.
+    if TerminalArbiter::current().is_some_and(|terminal| terminal.answered_by_cancel()) {
         return Ok(());
     }
     match result {
@@ -11600,6 +11618,147 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    /// Which part of a cancelled capture finishes first.
+    #[derive(Clone, Copy, Debug)]
+    enum CaptureCancelOrdering {
+        /// The capture's own polling notices the cancel and ends the capture
+        /// while Cingulate is still answering the card's detach.
+        CapturePollFirst,
+        /// The card wait, woken by the same cancel, ends the capture as soon
+        /// as the detach is answered, before the capture's polling runs.
+        ConsentWaitFirst,
+        /// The turn stop sends its reply when its cleanup time runs out, and
+        /// the capture ends only afterwards.
+        TurnStopFirst,
+    }
+
+    /// A capture_login cancelled while its card is open is answered with the
+    /// turn-stop vector's bytes, exactly once, whichever part of the call
+    /// finishes first, and the capture records itself as cancelled. Each
+    /// ordering is forced: the test holds Cingulate's detach reply, and time
+    /// is paused, so the capture's polling and the turn stop's cleanup
+    /// deadline run only when every task is waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering() {
+        use login_capture::test_support::fixture;
+
+        for ordering in [
+            CaptureCancelOrdering::CapturePollFirst,
+            CaptureCancelOrdering::ConsentWaitFirst,
+            CaptureCancelOrdering::TurnStopFirst,
+        ] {
+            let fixture = fixture();
+            let cingulate = ScriptedConsent::new();
+            let (detach_called, detach_started) = tokio::sync::oneshot::channel();
+            let (detach_reply, detach_response) = tokio::sync::oneshot::channel();
+            cingulate.raises("el_cap_303");
+            cingulate
+                .script
+                .then(
+                    cingulate_client::wire::CONSENT_AWAIT,
+                    cingulate_client::Reply::Hang,
+                )
+                .then(
+                    cingulate_client::wire::CONSENT_DETACH,
+                    cingulate_client::Reply::Controlled {
+                        called: detach_called,
+                        reply: detach_response,
+                    },
+                );
+            let planes = cingulate.planes(&fixture);
+            let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+            let request = capture_request_frame(303, ollama_capture_params());
+            handle_frame_for_test(request.clone(), &writer_tx, &planes)
+                .await
+                .unwrap();
+            tokio::time::timeout(HANG_GUARD, async {
+                while cingulate.methods().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the call waits on its card");
+            let cancel = crate::turn_stop_vectors::cancel(&request);
+            handle_frame_for_test(cancel.clone(), &writer_tx, &planes)
+                .await
+                .unwrap();
+            tokio::time::timeout(HANG_GUARD, detach_started)
+                .await
+                .expect("the cancel detaches the card")
+                .unwrap();
+            let detached =
+                json!({"elicitation_id": "el_cap_303", "state": "pending", "detached": true});
+            let reply = match ordering {
+                CaptureCancelOrdering::CapturePollFirst => {
+                    // Paused time moves only while every task waits, so the
+                    // capture's polling (every millisecond in this fixture)
+                    // sees the cancel before the detach is answered.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    detach_reply.send(detached).unwrap();
+                    next_frame(&mut writer_rx).await
+                }
+                CaptureCancelOrdering::ConsentWaitFirst => {
+                    // No time passes, so the polling timer cannot fire: the
+                    // answered detach is what ends the capture.
+                    detach_reply.send(detached).unwrap();
+                    next_frame(&mut writer_rx).await
+                }
+                CaptureCancelOrdering::TurnStopFirst => {
+                    let reply = next_frame(&mut writer_rx).await;
+                    assert!(
+                        planes.browser.journal_export_for_test().await.is_empty(),
+                        "the capture ended before the turn stop replied"
+                    );
+                    detach_reply.send(detached).unwrap();
+                    reply
+                }
+            };
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(
+                body,
+                json!({"context":null,"outcome":"cancelled"}),
+                "{ordering:?}"
+            );
+            crate::turn_stop_vectors::check(
+                "capture-login-card",
+                "parked awaiting the 30-minute capture card before login handoff",
+                &request,
+                &cancel,
+                Some(&reply),
+            );
+            // The capture journals how it ended as its last step, so once the
+            // entry is there the capture has finished and sent all it will.
+            let export = tokio::time::timeout(HANG_GUARD, async {
+                loop {
+                    let export = planes.browser.journal_export_for_test().await;
+                    if !export.is_empty() {
+                        break export;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the cancelled capture ends");
+            let entries = export
+                .lines()
+                .map(|line| serde_json::from_str::<journal::JournalEntry>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1, "{ordering:?}: {export}");
+            let Some(journal::JournalPayload::LoginCapture(payload)) = &entries[0].payload else {
+                panic!("{ordering:?}: a capture is journaled with its own payload: {export}");
+            };
+            assert_eq!(payload.outcome, "cancelled", "{ordering:?}");
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "{ordering:?}: a cancelled capture was answered twice"
+            );
+            assert!(fixture.fs.contents().is_empty());
+        }
     }
 
     /// Apply a late login answer through the session's next call, then check
