@@ -226,23 +226,21 @@ async fn open_grant_and_allow(planes: &Planes, corr: u64, params: Value) -> Valu
 }
 
 /// The first ref a snapshot reply's page text names: a ref is the first word
-/// of a line in the default view, and a row's `ref` in the ax view.
+/// of a line, in the default view and the ax view alike.
 fn first_ref(snapshot: &Value) -> String {
     let text = snapshot["state_text"]
         .as_str()
         .unwrap_or_else(|| panic!("no state_text: {snapshot}"));
     text.lines()
-        .find_map(|line| match serde_json::from_str::<Value>(line) {
-            Ok(row) => row["ref"].as_str().map(str::to_string),
-            Err(_) => line
-                .split_whitespace()
+        .find_map(|line| {
+            line.split_whitespace()
                 .next()
                 .filter(|word| {
                     word.len() > 1
                         && word.starts_with('e')
                         && word[1..].chars().all(|c| c.is_ascii_digit())
                 })
-                .map(str::to_string),
+                .map(str::to_string)
         })
         .unwrap_or_else(|| panic!("no ref in state_text: {snapshot}"))
 }

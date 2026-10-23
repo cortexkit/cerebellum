@@ -1,0 +1,33 @@
+[[control]]
+id = "ax-mode-text-is-not-json"
+guards = "an ax snapshot's page text is plain lines, never the JSON records it used to be"
+file = "crates/cerebellum/src/snapshot_store.rs"
+old = "line.push('\\n');"
+new = "line = format!(\"{}\\n\", serde_json::json!({\"depth\":record.depth,\"role\":record.role,\"name\":record.name,\"value\":record.value,\"ref\":record.reference})); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser::tests::ax_snapshot_state_text_is_plain_lines_not_json"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ax-mode-cut-line-ref-is-not-usable"
+guards = "a ref on an ax line that max_bytes cut is not retained, so it cannot be used"
+file = "crates/cerebellum/src/snapshot_store.rs"
+old = "rendered.cut_lines = 1;"
+new = "rendered.cut_lines = 1; rendered.printed_refs.extend(reference.map(str::to_string)); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser::tests::ax_snapshot_cut_leaves_only_printed_refs_usable"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

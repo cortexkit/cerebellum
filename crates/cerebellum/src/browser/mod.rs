@@ -3259,6 +3259,7 @@ impl BrowserPlane {
             );
             return Ok((json!({"outcome":"ref_not_found", "state_text":text}), 0));
         }
+        let mut ax_refs_withheld = false;
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
                 let rendered = state_text::render(&state_text::RenderInput {
@@ -3283,9 +3284,20 @@ impl BrowserPlane {
                 )
             }
             SnapshotKind::Ax => {
-                let (content, truncated) = snapshot_store::encode_ax_jsonl(&records, usize::MAX)
+                let rendered = snapshot_store::render_ax_text(&records, &facts, max_bytes)
                     .map_err(map_snapshot_error)?;
-                (content, truncated, AX_SCHEMA, (0, 0))
+                // A ref stays usable only if the caller was shown it. The AX
+                // view has always reported a ref it withholds this way, a
+                // folded text fragment's included, as `refs_truncated`.
+                let before = refs.len();
+                refs.retain(|record| rendered.printed_refs.contains(&record.captured.reference));
+                ax_refs_withheld = refs.len() != before;
+                (
+                    rendered.text,
+                    rendered.cut_lines > 0,
+                    AX_SCHEMA,
+                    (rendered.cut_bytes, rendered.cut_lines),
+                )
             }
             SnapshotKind::DomFull => {
                 let (markup, _) =
@@ -3331,7 +3343,7 @@ impl BrowserPlane {
             content_schema: schema,
             content,
             truncated,
-            refs_truncated,
+            refs_truncated: refs_truncated || ax_refs_withheld,
             refs,
         };
         let mut reply = snapshot_store::bounded_text_reply(
@@ -6189,9 +6201,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let row: Value =
-                serde_json::from_str(snapshot["state_text"].as_str().unwrap().trim()).unwrap();
-            names.push(row["ref"].as_str().unwrap().to_string());
+            let line = snapshot["state_text"].as_str().unwrap();
+            names.push(line.split_whitespace().next().unwrap().to_string());
         }
         assert_eq!(names, ["e1", "e2"]);
         let state = plane.state.lock().await;
@@ -6325,7 +6336,9 @@ mod tests {
                 classification: Err(crate::classification::ClassificationUnavailable::NotCaptured),
             })
             .collect();
-        let (text, _) = snapshot_store::encode_ax_jsonl(&records, usize::MAX).unwrap();
+        let text = snapshot_store::render_ax_text(&records, &HashMap::new(), usize::MAX)
+            .unwrap()
+            .text;
         for mode in [
             SnapshotKind::Actionable,
             SnapshotKind::Ax,
@@ -6365,6 +6378,123 @@ mod tests {
                 plane.finish_reply(SNAPSHOT, reply).unwrap();
             }
         }
+    }
+
+    fn ax_fixture() -> (Vec<AxRecord>, Vec<crate::snapshot_store::RefRecord>) {
+        let record = |depth, role: &str, name: &str, reference: &str| AxRecord {
+            depth,
+            role: role.into(),
+            name: name.into(),
+            value: None,
+            reference: Some(reference.into()),
+        };
+        let records = vec![
+            record(0, "RootWebArea", "Checkout", "e1"),
+            record(1, "button", "Pay now", "e2"),
+            record(1, "link", "Terms", "e3"),
+            record(1, "button", "Cancel", "e4"),
+        ];
+        let refs = records
+            .iter()
+            .map(|r| crate::snapshot_store::RefRecord {
+                frame_document: None,
+                captured: crate::snapshot_store::SnapshotRef::new(
+                    r.reference.clone().unwrap(),
+                    &r.role,
+                    &r.name,
+                    0,
+                )
+                .unwrap(),
+                frame_path: vec![],
+                backend_identity: None,
+                raw_role: None,
+                raw_name: None,
+                classification: Err(crate::classification::ClassificationUnavailable::NotCaptured),
+            })
+            .collect();
+        (records, refs)
+    }
+
+    /// An `ax` snapshot's page text reaches the model as plain lines, never
+    /// as JSON records, under the text schema.
+    #[tokio::test]
+    async fn ax_snapshot_state_text_is_plain_lines_not_json() {
+        let route = identity();
+        let plane = BrowserPlane::new();
+        plane.open_context(route.clone()).await.unwrap();
+        let (records, refs) = ax_fixture();
+        let reply = plane
+            .retain_text_snapshot(
+                &route,
+                SnapshotKind::Ax,
+                &records,
+                None,
+                refs,
+                4096,
+                Some(CommittedDocument::new("https://example.com/", 1, "loader")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["content_schema"], "ck-browser-snapshot-ax-text/v1");
+        let text = reply[state_text::STATE_TEXT_FIELD].as_str().unwrap();
+        for line in text.lines() {
+            assert!(
+                serde_json::from_str::<Value>(line.trim()).is_err() && !line.contains('{'),
+                "an ax line is JSON: {line}"
+            );
+        }
+        assert_eq!(
+            text,
+            "e1 RootWebArea Checkout\n  e2 button Pay now\n  e3 link Terms\n  e4 button Cancel\n"
+        );
+    }
+
+    /// When `max_bytes` cuts an `ax` snapshot, the refs of the lines that
+    /// printed stay usable and the refs of the cut lines do not.
+    #[tokio::test]
+    async fn ax_snapshot_cut_leaves_only_printed_refs_usable() {
+        let route = identity();
+        let plane = BrowserPlane::new();
+        plane.open_context(route.clone()).await.unwrap();
+        let (records, refs) = ax_fixture();
+        let kept = "e1 RootWebArea Checkout\n  e2 button Pay now\n";
+        let reply = plane
+            .retain_text_snapshot(
+                &route,
+                SnapshotKind::Ax,
+                &records,
+                None,
+                refs,
+                kept.len() + 4,
+                Some(CommittedDocument::new("https://example.com/", 1, "loader")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply[state_text::STATE_TEXT_FIELD], kept, "{reply}");
+        assert_eq!(reply["truncated"], true);
+        assert_eq!(reply["refs_truncated"], true);
+        assert_eq!(reply["omitted"]["state_text_lines"], 2);
+        assert_eq!(
+            reply["omitted"]["state_text_bytes"],
+            "  e3 link Terms\n  e4 button Cancel\n".len()
+        );
+        let snapshot_id = reply["snapshot_id"].as_str().unwrap();
+        let state = plane.state.lock().await;
+        let context = &state.contexts[&route.conversation_key];
+        let Some(snapshot_store::StoredSnapshot::Text(retained)) =
+            context.snapshots.get(snapshot_id)
+        else {
+            panic!("the ax snapshot is retained");
+        };
+        let usable: Vec<&str> = retained
+            .refs
+            .iter()
+            .map(|record| record.captured.reference.as_str())
+            .collect();
+        assert_eq!(usable, ["e1", "e2"]);
+        assert!(context.refs.shown("e2").is_some());
+        assert!(context.refs.shown("e3").is_none());
+        assert!(context.refs.shown("e4").is_none());
     }
 
     /// Each browser capability maps to its OWN journal capability.
