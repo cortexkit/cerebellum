@@ -227,6 +227,47 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
     response
 }
 
+/// Snapshot ids carry a random per-context nonce, so an id never repeats
+/// across browsers or module restarts and no recorded reply can reproduce one.
+/// Where the golden has a `snapshot_id`, swap the reply's id for the golden's
+/// at the two places a snapshot reply prints it: the top-level `snapshot_id`
+/// field and the `state_text` header line. Every other byte is still compared.
+fn with_golden_snapshot_id(reply: Vec<u8>, golden: &str) -> Vec<u8> {
+    let golden: Value = serde_json::from_str(golden).unwrap();
+    let Some(golden_id) = golden.get("snapshot_id").and_then(Value::as_str) else {
+        return reply;
+    };
+    let mut value: Value = serde_json::from_slice(&reply).unwrap();
+    // The swap re-serializes the reply, which is only byte-faithful when the
+    // reply's bytes are already exactly what serialization produces.
+    assert_eq!(
+        serde_json::to_vec(&value).unwrap(),
+        reply,
+        "the reply does not re-serialize to its own bytes"
+    );
+    let id = value
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .expect("the golden has a snapshot_id and the reply has none")
+        .to_string();
+    assert!(
+        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "the reply's snapshot_id is not 32 lowercase hex characters: {id}"
+    );
+    value["snapshot_id"] = json!(golden_id);
+    let text = value["state_text"]
+        .as_str()
+        .expect("a snapshot reply has state_text");
+    let (header, rest) = text
+        .split_once('\n')
+        .expect("state_text starts with a header line");
+    let site = header
+        .strip_suffix(&format!(" · snapshot {id}"))
+        .expect("the state_text header names the reply's snapshot id");
+    value["state_text"] = json!(format!("{site} · snapshot {golden_id}\n{rest}"));
+    serde_json::to_vec(&value).unwrap()
+}
+
 #[tokio::test]
 async fn own_replies_are_byte_identical_to_the_pre_user_build() {
     let cases = [
@@ -241,10 +282,16 @@ async fn own_replies_are_byte_identical_to_the_pre_user_build() {
     let goldens: Vec<String> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(goldens.len(), cases.len());
     for ((args, ready), golden) in cases.into_iter().zip(goldens) {
-        assert_eq!(reply(args.clone(), ready).await, golden.as_bytes());
+        assert_eq!(
+            with_golden_snapshot_id(reply(args.clone(), ready).await, &golden),
+            golden.as_bytes()
+        );
         let mut own = args;
         own["browser"] = json!("own");
-        assert_eq!(reply(own, ready).await, golden.as_bytes());
+        assert_eq!(
+            with_golden_snapshot_id(reply(own, ready).await, &golden),
+            golden.as_bytes()
+        );
     }
     println!("compared 10 own replies against 5 pre-user-build byte goldens");
 }
