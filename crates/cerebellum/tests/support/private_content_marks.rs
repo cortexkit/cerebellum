@@ -982,9 +982,9 @@ async fn a_stuck_write_releases_the_reply_at_its_deadline_and_fails_closed() {
 
 const ALL_SOURCES: [&str; 3] = ["person_browser", "desktop_app", "signed_in_site"];
 
-/// A store that could not be read at startup hides marks it cannot see. It is
-/// never written over; it answers everything marked until it loads, across
-/// restarts, and only a day after startup may a write replace it.
+/// A store that could not be read at startup hides marks it cannot see, and
+/// head marks never expire. It is never written over and answers everything
+/// marked until it loads, across restarts and however long that takes.
 #[tokio::test]
 async fn a_corrupt_store_is_never_written_over_and_stays_marked() {
     let scratch = Scratch::new();
@@ -1041,15 +1041,19 @@ async fn a_corrupt_store_is_never_written_over_and_stays_marked() {
         query(&planes, "earlier").await["sources"],
         json!(ALL_SOURCES)
     );
-    // A day after startup every run mark the file could hold has expired, so
-    // a write may finally replace it.
-    let day_later = wall_clock_ms() + 24 * 60 * 60 * 1000 + 1;
+    // Head marks never expire, so no amount of time makes replacing the
+    // file safe: a month later it is still untouched and still marked.
+    let month_later = wall_clock_ms() + 30 * 24 * 60 * 60 * 1000;
     planes
         .private_content
-        .mark_at("fresh", Retention::Head, Source::DesktopApp, day_later)
+        .mark_at("fresh", Retention::Head, Source::DesktopApp, month_later)
         .await;
-    let document: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
-    assert_eq!(document["version"], 2, "{document}");
+    assert_eq!(std::fs::read(scratch.path()).unwrap(), b"not json");
+    assert_eq!(
+        planes.private_content.answer(&["unknown"], month_later)["sources"],
+        json!(ALL_SOURCES)
+    );
+    assert_eq!(planes.private_content.health(), "unreadable");
 }
 
 /// A store unreadable at startup that reads on a later attempt keeps every

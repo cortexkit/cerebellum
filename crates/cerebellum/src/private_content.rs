@@ -232,9 +232,9 @@ struct State {
     failures: u64,
     /// A write failed or missed its deadline since the last successful write.
     write_failed: bool,
-    /// The file exists but could not be read. Its marks are unknown, so it is
-    /// never written over until it loads, or until 24 hours after startup,
-    /// when every run mark it could hold has expired.
+    /// The file exists but could not be read. Its marks are unknown, and
+    /// head marks never expire, so it is never written over: every query
+    /// answers marked until a retry reads it. Only an operator replaces it.
     load_failed: bool,
     /// This process's in-use marker could not be written.
     marker_missing: bool,
@@ -262,14 +262,10 @@ impl State {
         }
     }
 
-    fn load_failure_open(&self, now: u64) -> bool {
-        self.load_failed && now < self.started_ms.saturating_add(RETENTION_MS)
-    }
-
     fn fails_closed(&self, now: u64) -> bool {
         self.write_failed
             || self.marker_missing
-            || self.load_failure_open(now)
+            || self.load_failed
             || now < self.inherited_until_ms
     }
 }
@@ -363,7 +359,7 @@ impl PrivateContent {
     pub(crate) fn health(&self) -> &'static str {
         let state = self.state.lock().unwrap();
         let now = crate::wall_clock_ms();
-        if state.write_failed || state.marker_missing || state.load_failure_open(now) {
+        if state.write_failed || state.marker_missing || state.load_failed {
             "unreadable"
         } else if now < state.inherited_until_ms {
             "unclean_shutdown"
@@ -521,7 +517,7 @@ impl PrivateContent {
                             hook();
                         }
                     }
-                    let written = store.persist(failures, now);
+                    let written = store.persist(failures);
                     if written.is_err() {
                         store.extend_marker(now);
                     }
@@ -559,7 +555,7 @@ impl PrivateContent {
 
     /// Writes the current document atomically. `failures` is the failure
     /// count seen when the mark that needed this write was recorded.
-    fn persist(&self, failures: u64, now: u64) -> io::Result<()> {
+    fn persist(&self, failures: u64) -> io::Result<()> {
         let path = self.path.as_ref().expect("durable marks path");
         if self.state.lock().unwrap().load_failed {
             // The file's marks were never read. Read them now, or leave the
@@ -574,13 +570,7 @@ impl PrivateContent {
                     }
                     state.load_failed = false;
                 }
-                Err(error) if self.state.lock().unwrap().load_failure_open(now) => {
-                    return Err(error);
-                }
-                // A day after startup every run mark the unreadable file could
-                // hold has expired. Its head marks are lost: the residual risk
-                // of a file that never becomes readable again.
-                Err(_) => self.state.lock().unwrap().load_failed = false,
+                Err(error) => return Err(error),
             }
         }
         let marker_missing = self.state.lock().unwrap().marker_missing;

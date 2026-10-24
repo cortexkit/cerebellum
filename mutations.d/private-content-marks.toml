@@ -469,10 +469,16 @@ build_timeout_s = 1200
 
 [[control]]
 id = "private-never-overwrite-unread"
-guards = "a file whose marks were never read is not written over within a day of startup"
+guards = "a file whose marks were never read is never written over"
 file = "crates/cerebellum/src/private_content.rs"
-old = "Err(error) if self.state.lock().unwrap().load_failure_open(now) => {"
-new = "Err(error) if false && self.state.lock().unwrap().load_failure_open(now) => { // NON-VACUITY BREAK"
+old = '''                Err(error) => return Err(error),
+            }
+        }
+        let marker_missing'''
+new = '''                Err(_) => self.state.lock().unwrap().load_failed = false, // NON-VACUITY BREAK
+            }
+        }
+        let marker_missing'''
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -699,6 +705,28 @@ target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
 expect_red = ["private_content_marks_tests::a_version_one_store_is_read_and_rewritten_only_by_a_write"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-content-backup-catalog"
+guards = "the backup catalog declares the private-content tree portable"
+file = "engram-catalog.json"
+old = '''    },
+    {
+      "entry_id": "cerebellum/private-content-marks",
+      "class": "portable",'''
+new = '''    },
+    {
+      "entry_id": "cerebellum/private-content-marks",
+      "class": "excluded",'''
+runner = "cargo"
+package = "cerebellum-core"
+target = "--lib"
+test_file = "crates/cerebellum-core/src/engram_catalog.rs"
+select = "expected"
+expect_red = ["engram_catalog::tests::the_catalog_declares_every_tree_with_profiles_excluded_and_journal_portable"]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
