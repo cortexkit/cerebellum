@@ -471,14 +471,8 @@ build_timeout_s = 1200
 id = "private-never-overwrite-unread"
 guards = "a file whose marks were never read is never written over"
 file = "crates/cerebellum/src/private_content.rs"
-old = '''                Err(error) => return Err(error),
-            }
-        }
-        let marker_missing'''
-new = '''                Err(_) => self.state.lock().unwrap().load_failed = false, // NON-VACUITY BREAK
-            }
-        }
-        let marker_missing'''
+old = "            let loaded = load(path)?;"
+new = "            let loaded = load(path).unwrap_or(None); // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -493,8 +487,8 @@ build_timeout_s = 1200
 id = "private-retry-merges"
 guards = "a store readable on retry keeps the marks it held"
 file = "crates/cerebellum/src/private_content.rs"
-old = "                        state.document.merge(&loaded);"
-new = "                        let _ = &loaded; // NON-VACUITY BREAK"
+old = "                state.document.merge(&loaded);"
+new = "                let _ = &loaded; // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"

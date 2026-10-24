@@ -561,17 +561,13 @@ impl PrivateContent {
             // The file's marks were never read. Read them now, or leave the
             // file alone: writing this process's marks over it would erase
             // every scope it recorded.
-            match load(path) {
-                Ok(loaded) => {
-                    let mut state = self.state.lock().unwrap();
-                    if let Some(loaded) = loaded {
-                        state.document.merge(&loaded);
-                        state.persisted = loaded;
-                    }
-                    state.load_failed = false;
-                }
-                Err(error) => return Err(error),
+            let loaded = load(path)?;
+            let mut state = self.state.lock().unwrap();
+            if let Some(loaded) = loaded {
+                state.document.merge(&loaded);
+                state.persisted = loaded;
             }
+            state.load_failed = false;
         }
         let marker_missing = self.state.lock().unwrap().marker_missing;
         if marker_missing {
