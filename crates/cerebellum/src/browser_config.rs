@@ -730,7 +730,10 @@ mod tests {
         ));
         std::fs::create_dir(&root).expect("create config probe directory");
         let wrapper = root.join("wrapper");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write wrapper");
+        // Keep the interpreter alive beyond the 100 ms observation window so
+        // a quiet interval cannot masquerade as the end of the exec chain.
+        std::fs::write(&wrapper, "#!/bin/sh\n/bin/sleep 1\nexec /bin/sleep 30\n")
+            .expect("write wrapper");
         let mut permissions = std::fs::metadata(&wrapper)
             .expect("wrapper metadata")
             .permissions();
@@ -767,7 +770,9 @@ mod tests {
         ));
         std::fs::create_dir(&root).expect("create terminal config directory");
         let wrapper = root.join("terminal");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+        // A slow wrapper that reaches the pinned image within the bounded
+        // wait must not be refused just because its interpreter ran first.
+        std::fs::write(&wrapper, "#!/bin/sh\n/bin/sleep 1\nexec /bin/sleep 30\n")
             .expect("write terminal wrapper");
         let mut permissions = std::fs::metadata(&wrapper)
             .expect("terminal metadata")

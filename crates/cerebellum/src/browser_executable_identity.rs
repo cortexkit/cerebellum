@@ -415,6 +415,51 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_config_probe_deadline_reports_the_still_mismatching_image() {
+        let refusal = linux_fixture_probe_refusal("/bin/sleep", &[OsString::from("30")]);
+        assert_eq!(refusal["outcome"], "executable_identity_mismatch");
+        assert_eq!(
+            refusal["final_image_path"],
+            std::fs::canonicalize("/bin/sleep")
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            refusal["final_image_sha256"],
+            sha256_file_for_test(Path::new("/bin/sleep"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_config_probe_exit_before_a_match_has_a_distinct_reason() {
+        let refusal = linux_fixture_probe_refusal("/bin/true", &[]);
+        assert_eq!(refusal["outcome"], "identity_unverifiable");
+        assert_eq!(refusal["reason"], "ExitedBeforeFinalImage");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_fixture_probe_refusal(path: &str, arguments: &[OsString]) -> Value {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (command_child, _command_parent) = UnixStream::pair().unwrap();
+        let (_response_parent, response_child) = UnixStream::pair().unwrap();
+        let mut launcher =
+            LinuxProcessLauncher::new(command_child.as_raw_fd(), response_child.as_raw_fd());
+        validate_configured_executable_at_load(
+            &mut launcher,
+            Path::new(path),
+            arguments,
+            &[],
+            &"0".repeat(64),
+        )
+        .expect_err("unmatched image must be refused")
+    }
+
+    #[cfg(target_os = "linux")]
     fn sha256_file_for_test(path: &Path) -> String {
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(path).expect("read digest fixture");

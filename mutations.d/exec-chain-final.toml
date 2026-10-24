@@ -1,0 +1,65 @@
+[[control]]
+id = "exec-chain-quiet-window-is-not-final"
+platforms = ["linux"]
+guards = "a delayed wrapper reaches the pinned terminal image instead of being mistaken for its interpreter"
+file = "crates/cerebellum/src/browser_launch.rs"
+old = ".continue_to_next_exec_stop_with_deadline(LINUX_EXEC_CHAIN_HOP_LIMIT, deadline)"
+new = ".continue_to_next_exec_stop_with_deadline(LINUX_EXEC_CHAIN_HOP_LIMIT, deadline.min(std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser_config.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser_config::tests::config_load_accepts_a_pin_for_the_terminal_image"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn probe_configured_executable("
+before = "pub(crate) enum LinuxProbeError"
+
+[[control]]
+id = "exec-chain-wrapper-pin-names-terminal-image"
+platforms = ["linux"]
+guards = "a wrapper pin refusal names the terminal image even when its interpreter executes slowly"
+file = "crates/cerebellum/src/browser_launch.rs"
+old = ".continue_to_next_exec_stop_with_deadline(LINUX_EXEC_CHAIN_HOP_LIMIT, deadline)"
+new = ".continue_to_next_exec_stop_with_deadline(LINUX_EXEC_CHAIN_HOP_LIMIT, deadline.min(std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW)) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser_config.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser_config::tests::config_load_refuses_a_wrapper_pin_with_the_final_image_sha256"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn probe_configured_executable("
+before = "pub(crate) enum LinuxProbeError"
+
+[[control]]
+id = "exec-chain-deadline-refuses-mid-exec"
+platforms = ["linux"]
+guards = "a changed image at the deadline is unresolved, not a stable final-image mismatch"
+file = "crates/cerebellum/src/browser_launch.rs"
+old = "if current.as_ref().is_ok_and(|image| image == observed) {"
+new = "if current.as_ref().is_ok_and(|image| image == observed || image != observed) { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser_launch.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser_launch::tests::linux_probe_deadline_refuses_an_image_changed_during_exec"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn linux_probe_image_at_deadline("
+before = "impl From<PlatformLaunchError> for LinuxProbeError"
