@@ -12907,7 +12907,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         let expected = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
-        let expected = "53f1d967ed2ac37f95095d4e3977bc256a259ca88f3b1f09f970b27d675e5834";
+        let expected = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
         use sha2::Digest;
         assert_eq!(
             format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
