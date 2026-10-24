@@ -60,3 +60,25 @@ expect_red = [
 only = false
 timeout_s = 900
 build_timeout_s = 1800
+
+[[control]]
+id = "held-reply-pairs-with-tool-result-v1"
+guards = "a held envelope goes only to a route that declared both held-reply/v1 and tool-result/v1; held-reply/v1 alone never earns one"
+file = "crates/cerebellum/src/codemode.rs"
+old = """                    ) && cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                        bind.consumer_capabilities(),
+                    )"""
+new = """                    ) && bind.consumer_capabilities().is_some_and(|caps| caps.iter().any(|cap| cap == cortexkit_role_tool_provider::HELD_REPLY_V1)) // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/cerebellum/src/held_reply_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "call_mode_tests::held_reply_tests::held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in",
+    "call_mode_tests::held_reply_tests::the_four_held_reply_declaration_sets_get_exact_bodies",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
