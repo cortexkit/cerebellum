@@ -59,6 +59,11 @@ name = "background_keys_matrix"
 path = "examples/background_keys_matrix.rs"
 test = true
 
+[[example]]
+name = "disclaim_launch"
+path = "examples/disclaim_launch.rs"
+required-features = ["desk-probe"]
+
 # Framework bindings are needed only where the frameworks exist. On every other
 # host this crate compiles to nothing, so the workspace still builds and tests
 # there without them.
