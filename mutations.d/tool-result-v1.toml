@@ -76,7 +76,6 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "call_mode_tests::held_reply_tests::held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in",
     "call_mode_tests::held_reply_tests::the_four_held_reply_declaration_sets_get_exact_bodies",
 ]
 only = false
