@@ -48,6 +48,9 @@ const FIELDS: [&str; 10] = [
     "at_ms",
 ];
 const SCOPE_FIELDS: [&str; 3] = ["owner", "ref", "epoch"];
+/// The longest `session_ref` accepted. Runner refs are well under this; the
+/// cap only keeps an absurd value out of memory.
+const SESSION_REF_MAX_BYTES: usize = 256;
 const ERROR_CLASSES: [&str; 6] = [
     "provider_capacity",
     "provider_quota",
@@ -116,12 +119,14 @@ fn unsigned(object: &Map<String, Value>, field: &str, name: &str) -> Result<u64,
 pub(crate) fn parse(params: &Map<String, Value>) -> Result<TurnEnded, ParamsError> {
     unknown_field(params, &FIELDS, "")?;
     let session_ref = string(params, "session_ref", "session_ref")?;
-    // The harness runner's refs are 32 lowercase hex digits; anything else is
-    // not a session this module could ever be told about.
-    if session_ref.len() != 32
-        || !session_ref
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    // The harness runner's ref is opaque here: badges match on `scope.ref`, and
+    // this value is only carried. Its spelling belongs to the runner and has
+    // changed between runner releases, so any short printable ASCII token is
+    // taken as given. Control characters, spaces and oversized values are
+    // still refused, because no runner sends them.
+    if session_ref.is_empty()
+        || session_ref.len() > SESSION_REF_MAX_BYTES
+        || !session_ref.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(error("session_ref", "invalid_value"));
     }
@@ -289,18 +294,18 @@ mod tests {
         extra["scope"]["kind"] = json!("head");
         assert_eq!(refused(extra), ("scope.kind".into(), "unknown_field"));
         for (field, value, reason) in [
+            ("session_ref", json!(""), "invalid_value"),
             (
                 "session_ref",
-                json!("0123456789ABCDEF0123456789ABCDEF"),
+                json!("runner/harness session"),
                 "invalid_value",
             ),
-            ("session_ref", json!("0123456789abcdef"), "invalid_value"),
-            ("session_ref", json!(format!("{SESSION}0")), "invalid_value"),
             (
                 "session_ref",
-                json!("g123456789abcdef0123456789abcdef"),
+                json!("x".repeat(SESSION_REF_MAX_BYTES + 1)),
                 "invalid_value",
             ),
+            ("session_ref", json!("tab\there"), "invalid_value"),
             ("session_ref", json!(7), "wrong_type"),
             ("outcome", json!("paused"), "invalid_value"),
             ("quality", json!("certain"), "invalid_value"),
