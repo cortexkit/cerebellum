@@ -2906,7 +2906,7 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+    "computer_capability::fronting_tests::person_input_requests_restore_before_a_slow_settle_read",
 ]
 only = false
 timeout_s = 600
