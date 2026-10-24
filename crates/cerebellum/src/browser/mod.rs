@@ -6,6 +6,7 @@
 //! and final verification cannot interleave across invocations.
 
 pub(crate) mod dom_layout;
+mod dom_values;
 pub mod extraction;
 pub mod geometry;
 pub mod navigation;
