@@ -1865,6 +1865,13 @@ pub const LINUX_EXEC_CHAIN_PROBE_WINDOW: std::time::Duration =
     std::time::Duration::from_millis(100);
 
 #[cfg(target_os = "linux")]
+// A mismatching image may still be a wrapper awaiting CPU or doing startup
+// work. Give the entire walk five seconds (50 observation windows), rather
+// than declaring a quiet interpreter final after 100 ms. This caps the cost
+// of a wrong pin even when no further exec will ever arrive.
+const LINUX_EXEC_CHAIN_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(target_os = "linux")]
 pub struct LinuxProcessLauncher {
     cdp_command_read_fd: std::os::fd::RawFd,
     cdp_response_write_fd: std::os::fd::RawFd,
@@ -1907,13 +1914,14 @@ impl LinuxProcessLauncher {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         expected: &str,
-    ) -> Result<LinuxDryRunObservation, PlatformLaunchError> {
+    ) -> Result<LinuxDryRunObservation, LinuxProbeError> {
         // Finality cannot be proven while the tracee is stopped at an exec
         // event. The probe therefore watches briefly for one more event after
         // the configured digest matches; a passing probe lets that image run
         // for the observation window before terminating it.
         let mut child = self.spawn_raw(executable, arguments, environment)?;
         let generation = child.generation();
+        let deadline = std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_DEADLINE;
         let result = (|| {
             let mut observed = cerebellum_linux::executed_image_identity(generation.pid)
                 .map_err(map_linux_image_identity_error)?;
@@ -1925,9 +1933,7 @@ impl LinuxProcessLauncher {
                             LINUX_EXEC_CHAIN_HOP_LIMIT + 1,
                             std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
                         )
-                        .map_err(|error| {
-                            map_linux_process_control_error_with_chain(error, &identity_chain)
-                        })?;
+                        .map_err(|error| linux_probe_control_error(error, &identity_chain))?;
                     if let Some(next_exec) = next_exec.as_ref() {
                         identity_chain.push(linux_identity_record(next_exec));
                     }
@@ -1939,14 +1945,16 @@ impl LinuxProcessLauncher {
                     });
                 }
                 let Some(next) = child
-                    .continue_to_next_exec_stop_with_deadline(
-                        LINUX_EXEC_CHAIN_HOP_LIMIT,
-                        std::time::Instant::now() + LINUX_EXEC_CHAIN_PROBE_WINDOW,
-                    )
-                    .map_err(|error| {
-                        map_linux_process_control_error_with_chain(error, &identity_chain)
-                    })?
+                    .continue_to_next_exec_stop_with_deadline(LINUX_EXEC_CHAIN_HOP_LIMIT, deadline)
+                    .map_err(|error| linux_probe_control_error(error, &identity_chain))?
                 else {
+                    // The deadline is a refusal boundary, not proof that this
+                    // process can never exec again. Only diagnose a final-image
+                    // mismatch if the image is still the one we last observed.
+                    linux_probe_image_at_deadline(
+                        &observed,
+                        cerebellum_linux::executed_image_identity(generation.pid),
+                    )?;
                     return Ok(LinuxDryRunObservation {
                         generation: BrowserProcessGeneration::from(generation),
                         observed,
@@ -1961,15 +1969,58 @@ impl LinuxProcessLauncher {
                 chain: ExecutableIdentityChain::StoppedAtHopLimit {
                     hops: identity_chain,
                 },
-            })
+            }
+            .into())
         })();
         let termination = child
             .terminate_and_reap()
-            .map_err(map_linux_process_control_error);
+            .map_err(|error| LinuxProbeError::from(map_linux_process_control_error(error)));
         match termination {
             Ok(()) => result,
+            // The exec waiter already reaped an exited tracee; killing it now
+            // can report ESRCH, which must not hide the useful exit diagnosis.
+            Err(_) if matches!(result, Err(LinuxProbeError::ExitedBeforeFinalImage)) => result,
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinuxProbeError {
+    Launch(PlatformLaunchError),
+    ExitedBeforeFinalImage,
+    DeadlineDuringExec,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_probe_image_at_deadline(
+    observed: &cerebellum_linux::ExecutedImageIdentity,
+    current: Result<cerebellum_linux::ExecutedImageIdentity, cerebellum_linux::ImageIdentityError>,
+) -> Result<(), LinuxProbeError> {
+    if current.as_ref().is_ok_and(|image| image == observed) {
+        Ok(())
+    } else {
+        Err(LinuxProbeError::DeadlineDuringExec)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<PlatformLaunchError> for LinuxProbeError {
+    fn from(error: PlatformLaunchError) -> Self {
+        Self::Launch(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_probe_control_error(
+    error: cerebellum_linux::ProcessControlError,
+    chain: &[ExecutableIdentityRecord],
+) -> LinuxProbeError {
+    if error == cerebellum_linux::ProcessControlError::ProcessExited {
+        LinuxProbeError::ExitedBeforeFinalImage
+    } else {
+        map_linux_process_control_error_with_chain(error, chain).into()
     }
 }
 
@@ -4823,6 +4874,35 @@ mod tests {
         assert_eq!(
             map_linux_image_identity_error(cerebellum_linux::ImageIdentityError::ProcessMissing),
             PlatformLaunchError::ProcessControl
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_probe_deadline_refuses_an_image_changed_during_exec() {
+        let observed = cerebellum_linux::ExecutedImageIdentity {
+            resolved_path: "/bin/sh".into(),
+            image_sha256: "interpreter".into(),
+            build_id: None,
+        };
+        assert_eq!(
+            linux_probe_image_at_deadline(&observed, Ok(observed.clone())),
+            Ok(())
+        );
+        let changed = cerebellum_linux::ExecutedImageIdentity {
+            image_sha256: "terminal".into(),
+            ..observed.clone()
+        };
+        assert_eq!(
+            linux_probe_image_at_deadline(&observed, Ok(changed)),
+            Err(LinuxProbeError::DeadlineDuringExec)
+        );
+        assert_eq!(
+            linux_probe_image_at_deadline(
+                &observed,
+                Err(cerebellum_linux::ImageIdentityError::ProcessMissing),
+            ),
+            Err(LinuxProbeError::DeadlineDuringExec)
         );
     }
 
