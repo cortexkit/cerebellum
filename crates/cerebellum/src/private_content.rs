@@ -434,11 +434,14 @@ impl PrivateContent {
         json!({"private_content": !sources.is_empty(), "sources": sources})
     }
 
+    /// Marks one scope directly. Replies mark through `mark_delivered`.
+    #[cfg(test)]
     pub(crate) async fn mark(self: &Arc<Self>, scope: &str, retention: Retention, source: Source) {
         self.mark_at(scope, retention, source, crate::wall_clock_ms())
             .await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn mark_at(
         self: &Arc<Self>,
         scope: &str,
