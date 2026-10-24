@@ -7400,7 +7400,7 @@ mod tests {
     }
 
     /// The plain text the model reads for `reply`: every text part of its
-    /// content/v1 projection.
+    /// tool-result/v1 projection.
     fn model_text(reply: &Value) -> String {
         let encoded: Value =
             serde_json::from_slice(&crate::tool_result::encode(reply.clone()).unwrap()).unwrap();
@@ -7451,7 +7451,7 @@ mod tests {
     /// followable if the plain text it reads carries that value: the
     /// structured copy does not reach the model. This renders every browser
     /// refusal and every computer refusal that carries a remedy as the
-    /// content/v1 text and checks each `detail.<name>` the text mentions.
+    /// tool-result/v1 text and checks each `detail.<name>` the text mentions.
     #[tokio::test]
     async fn every_detail_a_remedy_names_is_printed_with_its_value() {
         let plane = BrowserPlane::new();

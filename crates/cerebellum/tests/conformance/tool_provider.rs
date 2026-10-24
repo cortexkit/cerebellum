@@ -249,7 +249,7 @@ async fn tool_provider_role_conforms_on_production_handler() {
     // Both tools serve every known mode, so no production tool can be a
     // restricted-mode probe. Unknown bind modes have separate handler tests.
     assert!(report_text.contains("SKIP call_mode_matches_catalog"));
-    assert!(report_text.contains("PASS tool_result_content_v1_valid"));
+    assert!(report_text.contains("PASS tool_result_v1_valid"));
     // The catalog serves no system-prompt text. Session actions admit only
     // reserved:prefrontal-core, whereas the suite's held-action cases need both
     // a scope owner and a distinct carrier to raise approval-gated actions.
@@ -322,7 +322,7 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
 }
 
 #[tokio::test]
-async fn content_v1_requires_route_reader_declaration() {
+async fn tool_result_v1_requires_route_reader_declaration() {
     let root = live_daemon_directory(0);
     let planes = Subject.spawn(&root).await.unwrap();
     let stamp = Subject.plain_stamp();
@@ -331,7 +331,7 @@ async fn content_v1_requires_route_reader_declaration() {
         .route_with_consumer_capabilities(
             &planes,
             &stamp,
-            &[cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()],
+            &[cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into()],
         )
         .await
         .unwrap();

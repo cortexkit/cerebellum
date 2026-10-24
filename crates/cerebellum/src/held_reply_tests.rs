@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::test_support::HANG_GUARD;
-use cortexkit_role_tool_provider::{result, CONTENT_V1_CAPABILITY, HELD_REPLY_V1};
+use cortexkit_role_tool_provider::{result, HELD_REPLY_V1, TOOL_RESULT_V1_CAPABILITY};
 use std::sync::atomic::Ordering;
 
 fn vectors() -> Value {
@@ -28,7 +28,7 @@ async fn bind_held(planes: &Planes) {
         ..
     } = &mut bind
     {
-        *consumer_capabilities = Some(vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()]);
+        *consumer_capabilities = Some(vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()]);
     }
     assert_eq!(
         exchange(planes, 0, 2, serde_json::to_value(bind).unwrap())
@@ -152,13 +152,26 @@ async fn declared_route_without_call_key_never_holds() {
 }
 
 async fn projected(
-    mut facts: AcceptedBindFacts,
+    facts: AcceptedBindFacts,
     caps: Vec<String>,
     mode: CallMode,
     tool: &str,
     keyed: bool,
     body: Value,
 ) -> Value {
+    decode(projected_frame(facts, caps, mode, tool, keyed, body).await)
+}
+
+/// The response frame `send_tool_response` emits for `body`, sent as `tool` on
+/// a route whose bind declared `caps` and whose call mode is `mode`.
+async fn projected_frame(
+    mut facts: AcceptedBindFacts,
+    caps: Vec<String>,
+    mode: CallMode,
+    tool: &str,
+    keyed: bool,
+    body: Value,
+) -> Frame {
     facts.consumer_capabilities = caps;
     facts.call_mode = mode;
     let (tx, mut rx) = mpsc::channel(1);
@@ -177,7 +190,7 @@ async fn projected(
     } else {
         send.await;
     }
-    decode(rx.recv().await.unwrap())
+    rx.recv().await.unwrap()
 }
 
 #[tokio::test]
@@ -206,7 +219,7 @@ async fn held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in
     }
     let reply = projected(
         facts,
-        vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
+        vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
         CallMode::Codemode,
         "tool.withdraw",
         true,
@@ -214,6 +227,68 @@ async fn held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in
     )
     .await;
     assert!(reply.get("held").is_none());
+}
+
+/// The body a route declaring both `tool-result/v1` and `held-reply/v1` gets
+/// for the consent question in `the_four_held_reply_declaration_sets_get_exact_bodies`.
+const HELD_ENVELOPE: &str = r#"{"content":[{"type":"text","text":"Waiting for the person to answer a consent question (ask_id gate)."}],"structuredContent":{"ask_id":"gate","kind":"website_access_in_advance","origin":"https://example.com","outcome":"consent_pending"},"held":{"reason":"consent","detail":{"ask_id":"gate","kind":"website_access_in_advance","origin":"https://example.com"}}}"#;
+
+/// The body every other route gets for that consent question: a
+/// `tool-result/v1` refusal with no `held` marker.
+const HELD_UNSUPPORTED: &str = r#"{"content":[{"type":"text","text":"Held unsupported.\nThis codemode step needs a person; the carrier cannot suspend until held-reply is supported."}],"structuredContent":{"detail":{"ask_id":"gate","origin":"https://example.com","step":"consent"},"outcome":"held_unsupported","remedy":"this codemode step needs a person; the carrier cannot suspend until held-reply is supported"},"isError":true,"errorCode":"held_unsupported"}"#;
+
+/// CONTRACT §4.1 pairs `held-reply/v1` with `tool-result/v1`: a held envelope
+/// goes only to a route that declared both. Each declaration set gets one keyed
+/// consent question on a codemode run route, and each body is pinned byte for
+/// byte.
+///
+/// The routes declaring only `held-reply/v1`, or neither name, do not get the
+/// legacy body §4.1 asks for. On a codemode run route, a question no carrier can
+/// hold becomes a `held_unsupported` refusal, and `tool_response_frame` sends
+/// that refusal as a `tool-result/v1` body on every route (`force_content`).
+/// This deviation from §4.1 is deliberate in this build; the assertions below
+/// pin it so that changing it is a visible decision.
+#[tokio::test]
+async fn the_four_held_reply_declaration_sets_get_exact_bodies() {
+    let facts = bound_run().await.routes.get(9, 3).unwrap();
+    for (label, caps, expected) in [
+        (
+            "both",
+            vec![
+                TOOL_RESULT_V1_CAPABILITY.to_string(),
+                HELD_REPLY_V1.to_string(),
+            ],
+            HELD_ENVELOPE,
+        ),
+        (
+            "tool-result/v1 only",
+            vec![TOOL_RESULT_V1_CAPABILITY.to_string()],
+            HELD_UNSUPPORTED,
+        ),
+        (
+            "held-reply/v1 only",
+            vec![HELD_REPLY_V1.to_string()],
+            HELD_UNSUPPORTED,
+        ),
+        ("neither", vec![], HELD_UNSUPPORTED),
+    ] {
+        let frame = projected_frame(
+            facts.clone(),
+            caps,
+            CallMode::Codemode,
+            "browser_use",
+            true,
+            json!({"outcome":"consent_pending","ask_id":"gate",
+                "origin":"https://example.com","kind":"website_access_in_advance"}),
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Response, "{label}");
+        assert_eq!(
+            String::from_utf8_lossy(&frame.body),
+            expected,
+            "{label}: body differs"
+        );
+    }
 }
 
 #[tokio::test]
@@ -234,7 +309,7 @@ async fn production_held_replies_round_trip_published_vectors() {
         let expected: result::ToolResult =
             serde_json::from_value(expected["body"].clone()).unwrap();
         result::validate(&expected).unwrap();
-        let reply = projected(facts.clone(), vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()], CallMode::Codemode, "browser_use", true,
+        let reply = projected(facts.clone(), vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()], CallMode::Codemode, "browser_use", true,
             json!({"outcome":outcome,"ask_id":"opaque-ask","origin":"https://example.com","expires_in_ms":60000})).await;
         assert_held(&reply, &expected.held.unwrap().reason);
         assert_eq!(reply["held"]["detail"]["expires_in_ms"], 60000);
@@ -271,7 +346,7 @@ async fn declared_terminal_refusals_never_hold() {
     ] {
         let reply = projected(
             facts.clone(),
-            vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
+            vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
             CallMode::Codemode,
             "browser_use",
             true,
@@ -614,7 +689,7 @@ async fn replay_negotiates_held_again_for_the_current_route() {
     );
     for declares_held in [false, true] {
         let mut facts = planes.routes.get(9, 3).unwrap();
-        facts.consumer_capabilities = vec![CONTENT_V1_CAPABILITY.into()];
+        facts.consumer_capabilities = vec![TOOL_RESULT_V1_CAPABILITY.into()];
         if declares_held {
             facts.consumer_capabilities.push(HELD_REPLY_V1.into());
         }

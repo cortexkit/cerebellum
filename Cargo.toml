@@ -21,12 +21,12 @@ members = [
 # Fleet crates are exact registry releases; unpublished crates use a full git
 # revision. Cargo.lock records their checksums or commits, with no sibling layout.
 [workspace.dependencies]
-subc-protocol = "=0.32.4"
-subc-transport = "=0.13.0"
+subc-protocol = "=0.33.0"
+subc-transport = "=0.14.0"
 subc-os = "=0.1.17"
 # Test-only in-process daemon and client control types.
-subc-control = "=0.32.0"
-subc-daemon = "=0.36.14"
+subc-control = "=0.33.0"
+subc-daemon = "=0.37.0"
 subc-jsonc = "=0.1.2"
 cortexkit-store-types = "=0.2.2"
 cortexkit-resource-busy = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }

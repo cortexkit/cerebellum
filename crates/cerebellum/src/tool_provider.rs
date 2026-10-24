@@ -74,7 +74,7 @@ fn definitions(browser_names: &[String], computer_names: &[String]) -> Vec<Catal
         .with_capabilities(tags)
         .with_reply(Reply::new(max_ms));
         definition.modes = Some(vec![CallMode::Classic, CallMode::Codemode, CallMode::Flow]);
-        definition.result_format = Some(ResultFormat::ContentV1);
+        definition.result_format = Some(ResultFormat::ToolResultV1);
         cortexkit_role_tool_provider::catalog::check_modes(&definition)
             .expect("only known, unique call modes are declared");
         definition.description = tool.description;
@@ -387,7 +387,7 @@ pub(crate) async fn serve(
             }
             let calls = Arc::clone(&planes.calls);
             if name == ops::LATE_RESULTS {
-                let reads_content = cortexkit_role_tool_provider::consumer_reads_content_v1(
+                let reads_content = cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
                     facts.consumer_capabilities(),
                 );
                 let request = match serde_json::from_value::<LateResultsRequest>(Value::Object(
@@ -408,7 +408,7 @@ pub(crate) async fn serve(
                 })
                 .await
                 .map_err(|error| ModuleError::Message(error.to_string()))?;
-                // Wrap results in content/v1 only for readers that declare it.
+                // Wrap results in tool-result/v1 only for readers that declare it.
                 // Store outcome/origin unchanged so legacy pulls and replays
                 // can still receive their original JSON.
                 if reads_content {

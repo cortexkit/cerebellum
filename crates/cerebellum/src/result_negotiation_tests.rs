@@ -99,7 +99,7 @@ async fn unrelated_consumer_capabilities_do_not_enable_content() {
 #[tokio::test]
 async fn declared_reader_gets_content_with_the_same_structured_reply() {
     let planes = bound_planes(Some(vec![
-        cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+        cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
     ]))
     .await;
     for (tool, main_bytes) in CASES {
@@ -115,5 +115,47 @@ async fn declared_reader_gets_content_with_the_same_structured_reply() {
                 cortexkit_role_tool_provider::result::ContentPart::Image(_)
             )));
         }
+    }
+}
+
+/// Bodies a route received at cerebellum 60488c67, when the format was still
+/// named `content/v1` and the route declared that name. Captured from the same
+/// `CASES` payloads through `send_tool_response`; see the fixture README.
+const RETIRED_NAME_BODIES: &[&[u8]] = &[
+    include_bytes!("../tests/fixtures/tool_result_v1_bodies/browser_snapshot.json"),
+    include_bytes!("../tests/fixtures/tool_result_v1_bodies/browser_screenshot.json"),
+    include_bytes!("../tests/fixtures/tool_result_v1_bodies/computer_read_state.json"),
+];
+
+/// The rename from `content/v1` to `tool-result/v1` changed only the name a
+/// route declares and the catalog lists, never the body: a reader that now
+/// declares `tool-result/v1` gets exactly the bytes a `content/v1` reader got.
+#[tokio::test]
+async fn tool_result_v1_reader_gets_the_bytes_the_retired_name_got() {
+    let planes = bound_planes(Some(vec![
+        cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
+    ]))
+    .await;
+    assert_eq!(CASES.len(), RETIRED_NAME_BODIES.len());
+    for ((tool, main_bytes), captured) in CASES.iter().zip(RETIRED_NAME_BODIES) {
+        let reply = response(&planes, tool, serde_json::from_slice(main_bytes).unwrap()).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert!(
+            reply.body.as_slice() == *captured,
+            "{tool}: tool-result/v1 body differs from the content/v1 body:\n{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+}
+
+/// The contract renamed the format with no alias, so a route that still
+/// declares the retired `content/v1` name is an undeclared route and keeps the
+/// legacy body.
+#[tokio::test]
+async fn the_retired_content_v1_name_gets_the_legacy_body() {
+    let planes = bound_planes(Some(vec!["content/v1".into()])).await;
+    for (tool, main_bytes) in CASES {
+        let reply = response(&planes, tool, serde_json::from_slice(main_bytes).unwrap()).await;
+        assert_eq!(reply.body.as_slice(), *main_bytes, "{tool}");
     }
 }
