@@ -306,9 +306,11 @@ impl PrivateContent {
                     .join("private-content")
                     .join(FILE_NAME),
             ),
+            // Without a data home nothing survives a restart, and no marker
+            // can tell the next start so: answer everything marked for good.
             None => {
                 let store = Self::in_memory();
-                store.state.lock().unwrap().load_failed = true;
+                store.state.lock().unwrap().marker_missing = true;
                 store
             }
         }
