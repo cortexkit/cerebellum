@@ -279,9 +279,9 @@ pub fn build(module_id: &str) -> ModuleManifest {
 pub(crate) fn build_provenance() -> Option<ManifestProvenance> {
     // Where the launch nonce came from (the daemon's pipe or the environment
     // copy) is a fact about this running process rather than the build, but
-    // provenance is where the daemon's census reads it. `--manifest` reports
-    // the build without starting the module, so only the registered manifest
-    // carries it.
+    // the registered manifest's provenance is where the daemon records it.
+    // `--manifest` reports the build without starting the module, so it
+    // leaves the field out.
     build_offline_provenance().map(|provenance| {
         provenance.with_launch_nonce_source(crate::launch_nonce::provenance_source())
     })
