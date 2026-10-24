@@ -793,15 +793,31 @@ fn out_of_line_test_modules_are_found_by_path() {
     assert_eq!(found, expected);
 }
 
-/// The smallest share of the workspace's non-blank source lines the skipper
-/// may read as shipped. When this was set it read 68% (96,311 of 141,567
-/// lines); a skipper that drops everything after the first test marker in
-/// each file read 49.6%, and one that drops everything reads none, so both
-/// fall below while ordinary churn in the test share stays above.
-const MIN_SHIPPED_PERCENT: usize = 60;
+/// How many non-blank lines a blind skipper reads as shipped: one that drops
+/// everything from the first test marker in a file to its end. It finds that
+/// marker the way the real skipper does, so a marker the real skipper stops
+/// seeing makes both read the whole file and closes the gap between them.
+fn blind_shipped_line_count(source: &str) -> usize {
+    let original: Vec<char> = source.chars().collect();
+    let code = code_only(&original);
+    let cut = (0..code.len())
+        .find(|&index| test_attribute_end(&code, index).is_some())
+        .unwrap_or(original.len());
+    let kept: String = original[..cut].iter().collect();
+    kept.lines().filter(|line| !line.trim().is_empty()).count()
+}
 
-/// The real tree, read whole: a skipper that has gone blind fails here even if
-/// every planted case still happened to pass.
+/// How many more percentage points of the workspace's non-blank source lines
+/// the skipper must read as shipped than the blind control does, measured on
+/// the same tree in the same run. A fixed floor on the shipped share drifted
+/// into failure as the tree's test share grew; the control moves with it.
+/// When this was set, on 255,236 non-blank lines, the skipper read 153,124
+/// (60.0%) and the blind control 102,733 (40.2%): 19.7 points apart. The
+/// margin is about half that gap. A skipper that goes blind after a file's
+/// first marker reads what the control reads, and one that drops everything
+/// reads nothing; both fall below it.
+const MIN_POINTS_ABOVE_BLIND: usize = 10;
+
 #[test]
 fn the_skipper_reads_most_of_the_real_tree_as_shipped() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -827,20 +843,29 @@ fn the_skipper_reads_most_of_the_real_tree_as_shipped() {
     let test_files = test_only_module_files(&files);
     let mut total = 0;
     let mut shipped = 0;
+    let mut blind = 0;
     for file in &files {
         let source = std::fs::read_to_string(file).expect("read a source file");
         total += source
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count();
+        // Both counts leave out-of-line test module files aside, so the two
+        // differ only in how they read inside a file.
         if !test_files.contains(file) {
             shipped += shipped_lines(&source).len();
+            blind += blind_shipped_line_count(&source);
         }
     }
     assert!(
-        total > 0 && shipped * 100 >= total * MIN_SHIPPED_PERCENT,
-        "the skipper read {shipped} of {total} non-blank lines as shipped, under \
-         {MIN_SHIPPED_PERCENT}%: it is dropping shipped code, and every scan built on \
-         it would pass while reading only part of what it guards"
+        total > 0 && shipped > 0,
+        "the skipper read nothing of the tree"
+    );
+    assert!(
+        shipped * 100 >= blind * 100 + total * MIN_POINTS_ABOVE_BLIND,
+        "the skipper read {shipped} of {total} non-blank lines as shipped, and a skipper \
+         blind after each file's first test marker read {blind}: fewer than \
+         {MIN_POINTS_ABOVE_BLIND} points apart, so it is dropping shipped code, and every \
+         scan built on it would pass while reading only part of what it guards"
     );
 }

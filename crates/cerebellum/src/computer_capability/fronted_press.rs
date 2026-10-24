@@ -399,10 +399,10 @@ where
             grant,
             Duration::from_millis(bound_ms),
             expand_menus,
-            &mut || {
+            PersonWatch::Watched(&mut || {
                 acted = acted || person_acted(self);
                 acted
-            },
+            }),
         );
         self.observed[step] = observed;
         if acted {

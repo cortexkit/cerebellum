@@ -2275,6 +2275,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::the_helper_may_use_at_most_ten_milliseconds_while_idle",
@@ -2294,6 +2295,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::the_module_may_use_at_most_ten_percent_above_the_baseline_while_idle",
@@ -2313,6 +2315,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::an_idle_counter_must_be_reported_and_must_not_move",
@@ -2332,6 +2335,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::an_idle_counter_must_be_reported_and_must_not_move",
@@ -2351,6 +2355,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::the_person_keeps_the_front_except_during_the_one_needs_front_action",
@@ -2370,6 +2375,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::the_front_check_needs_samples_before_during_and_after_one_action",
@@ -2389,6 +2395,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::the_chord_must_report_a_needs_front_front_that_was_restored",
@@ -2408,6 +2415,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::a_background_action_completes_without_fronting",
@@ -2427,6 +2435,7 @@ test_file = "crates/cerebellum/examples/app_use_desk_probe.rs"
 runner = "cargo"
 package = "cerebellum"
 target = "--example app_use_desk_probe"
+features = ["desk-probe"]
 select = "expected"
 expect_red = [
     "tests::only_the_helpers_visible_preview_width_windows_count_as_previews",
@@ -2897,7 +2906,7 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+    "computer_capability::fronting_tests::person_input_requests_restore_before_a_slow_settle_read",
 ]
 only = false
 timeout_s = 600
@@ -2924,10 +2933,10 @@ build_timeout_s = 1800
 
 [[control]]
 id = "app-use-settle-ended-by-the-person-keeps-the-seen-marks"
-guards = "a settle the person's input ended does not record the application as seen after their input, so the next person check still sees it"
+guards = "a settle the person's input ended returns before a final AX read, preserving the seen baseline and requesting restore without the read's delay"
 file = "crates/cerebellum/src/computer_capability/element_actions.rs"
-old = "        let seen = (!interrupted).then(|| SeenMarks::read(source, grant));"
-new = "        let seen = Some(SeenMarks::read(source, grant)); // NON-VACUITY BREAK"
+old = "        if interrupted {\n            return None;\n        }"
+new = "        if false && interrupted { // NON-VACUITY BREAK\n            return None;\n        }"
 edits = []
 test_file = "crates/cerebellum/src/computer_capability/fronting_tests.rs"
 runner = "cargo"
@@ -2935,7 +2944,7 @@ package = "cerebellum"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "computer_capability::fronting_tests::input_during_a_fronted_settle_keeps_the_next_press_from_acting_unseen",
+    "computer_capability::fronting_tests::person_input_requests_restore_before_a_slow_settle_read",
 ]
 only = false
 timeout_s = 600

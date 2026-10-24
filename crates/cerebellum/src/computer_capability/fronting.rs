@@ -103,9 +103,9 @@ impl FrontingLock {
 /// A send in flight to one process keeps its keys in that process, so it
 /// does not stop a front. A session-wide send, such as a takeover drag
 /// holding the mouse button, goes to whatever is under the pointer or in
-/// front, and takeover pointer actions do not take the fronting lock: until
-/// it has returned, the application fronted here could receive its drop or
-/// button-up.
+/// front. Takeover drags also hold the fronting lock from registration to
+/// discharge, so a drag cannot start between this check and the front request.
+/// This snapshot also catches quarantined per-process input.
 pub(crate) fn held_input_confirmed(held: &super::held_input::HeldInput) -> bool {
     !held.global_send_outstanding() && matches!(held.pending_release(), Ok(None))
 }

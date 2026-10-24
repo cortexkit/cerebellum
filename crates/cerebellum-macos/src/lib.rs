@@ -100,6 +100,8 @@ mod macos;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod preview_schedule;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use cursor_overlay::probe_overlay_capture_exclusion;
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
     probe_cursor_hide, probe_cursor_motion, probe_preview_hide, reduce_motion,

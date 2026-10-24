@@ -103,6 +103,9 @@ impl Outstanding {
 struct State {
     outstanding: BTreeMap<u64, Outstanding>,
     quarantined: BTreeMap<u64, HeldPress>,
+    /// Retained even for an unknown global result: only a confirmed discharge
+    /// can make it safe to front another application.
+    fronting_exclusions: BTreeMap<u64, tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// The held-input state of one plane's synthetic keyboard and mouse.
@@ -118,6 +121,27 @@ pub(crate) struct PendingRelease {
 }
 
 impl HeldInput {
+    /// Global input and application fronts share one exclusion. Take it before
+    /// registration and keep it until the worker has released its input. An
+    /// unknown result retains the exclusion in quarantine. Takeover dispatch
+    /// never fronts, so it cannot recursively acquire this lock.
+    pub(crate) async fn begin_global_send(
+        self: &Arc<Self>,
+        press: HeldPress,
+        terminal: Option<Arc<TerminalArbiter>>,
+        lock: &super::fronting::FrontingLock,
+        cancel: &crate::CancelHandle,
+    ) -> Result<SendTicket, cerebellum_computer::dispatch::FrontingStop> {
+        let exclusion = lock.take(cancel).await?;
+        let ticket = self.begin_send(press, terminal);
+        self.state
+            .lock()
+            .unwrap()
+            .fronting_exclusions
+            .insert(ticket.id, exclusion);
+        Ok(ticket)
+    }
+
     /// Track a send before it is posted. The ticket must be settled with how
     /// the send ended; dropping it unsettled counts as unknown.
     pub(crate) fn begin_send(
@@ -199,6 +223,7 @@ impl HeldInput {
         let mut state = self.state.lock().unwrap();
         for id in released {
             state.quarantined.remove(id);
+            state.fronting_exclusions.remove(id);
         }
     }
 
@@ -226,6 +251,8 @@ impl HeldInput {
         };
         if matches!(held, HeldState::Unknown) && !outstanding.discharged {
             state.quarantined.insert(id, outstanding.press);
+        } else {
+            state.fronting_exclusions.remove(&id);
         }
     }
 

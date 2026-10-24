@@ -22,6 +22,9 @@
 //! rather than 0: a run without a display must not read as a pass. A caller
 //! that accepts a skip, and reports it itself, sets
 //! `CEREBELLUM_DESK_TEST_SKIP_OK=1` to have it exit 0 instead.
+//! `CEREBELLUM_PREVIEW_HIDE_FORCE_SKIP=1` is a test-binary-only seam: it
+//! deterministically takes the no-display skip before touching AppKit, so a
+//! child process can check both exit policies without changing the desk.
 //!
 //! The preview shows a window the person had covered, so it must also stay
 //! out of screen sharing, recordings and screenshots: its sharing type is
@@ -39,6 +42,11 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn main() {
     const TEST_NAME: &str = "a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen";
+    const SKIP_TEST: &str = "a_preview_skip_is_nonzero_unless_explicitly_accepted";
+    if std::env::var_os("CEREBELLUM_PREVIEW_HIDE_FORCE_SKIP").is_some_and(|v| v == "1") {
+        println!("test {TEST_NAME} ... SKIPPED: forced no-display probe");
+        exit_skipped();
+    }
     // Honour name filters the way the standard harness would.
     let mut filters = Vec::new();
     let mut skips = Vec::new();
@@ -57,15 +65,36 @@ fn main() {
             _ => filters.push(argument),
         }
     }
-    if skips.iter().any(|skip| TEST_NAME.contains(skip.as_str()))
-        || (!filters.is_empty()
-            && !filters
-                .iter()
-                .any(|filter| TEST_NAME.contains(filter.as_str())))
-        || ignored_only
-    {
-        if list {
-            println!("0 tests, 0 benchmarks");
+    let selected = |name: &str| {
+        !ignored_only
+            && !skips.iter().any(|skip| name.contains(skip.as_str()))
+            && (filters.is_empty() || filters.iter().any(|filter| name.contains(filter.as_str())))
+    };
+    if list {
+        let mut count = 0;
+        for name in [TEST_NAME, SKIP_TEST] {
+            if selected(name) {
+                println!("{name}: test");
+                count += 1;
+            }
+        }
+        println!("\n{count} tests, 0 benchmarks");
+        return;
+    }
+    if selected(SKIP_TEST) {
+        println!("\nrunning 1 test");
+        if let Err(reason) = check_skip_exit_policy() {
+            println!("test {SKIP_TEST} ... FAILED\n{reason}");
+            println!(
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
+            );
+            std::process::exit(101);
+        }
+        println!("test {SKIP_TEST} ... ok");
+        println!("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
+    }
+    if !selected(TEST_NAME) {
+        if selected(SKIP_TEST) {
             return;
         }
         println!("\nrunning 0 tests\n");
@@ -73,11 +102,6 @@ fn main() {
             "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; \
              finished in 0.00s\n"
         );
-        return;
-    }
-    if list {
-        // As the standard harness lists: the test is not run.
-        println!("{TEST_NAME}: test\n\n1 test, 0 benchmarks");
         return;
     }
     println!("\nrunning 1 test");
@@ -109,6 +133,9 @@ fn main() {
         failures.push(
             "the preview's window can be captured by screen sharing, recordings and screenshots",
         );
+    }
+    if !probe.badge_hidden_from_capture {
+        failures.push("the badge's sharing type is not None");
     }
     if probe.liquid_glass != probe.liquid_glass_available {
         failures.push(if probe.liquid_glass_available {
@@ -162,6 +189,52 @@ fn main() {
         );
         std::process::exit(101);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn check_skip_exit_policy() -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    // Relaunched test binaries live outside the build tree. No operator state
+    // or display is needed by the forced-skip child.
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let directory = std::path::PathBuf::from(format!(
+        "/tmp/cerebellum-preview-skip-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|e| e.to_string())?;
+    let child = directory.join("preview-hide");
+    let result = (|| {
+        std::fs::copy(executable, &child).map_err(|e| e.to_string())?;
+        for accepted in [false, true] {
+            let mut command = std::process::Command::new(&child);
+            command.env("CEREBELLUM_PREVIEW_HIDE_FORCE_SKIP", "1");
+            command.env_remove("CEREBELLUM_DESK_TEST_SKIP_OK");
+            if accepted {
+                command.env("CEREBELLUM_DESK_TEST_SKIP_OK", "1");
+            }
+            let output = command.output().map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            if output.status.code() != Some(if accepted { 0 } else { 2 })
+                || !text.contains("SKIPPED: forced no-display probe")
+            {
+                return Err(format!(
+                    "skip opt-in={accepted}: status {}: {text}",
+                    output.status
+                ));
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(child);
+    let _ = std::fs::remove_dir(directory);
+    result
 }
 
 /// End a run that could not check everything. Exit code 2 marks the skip as

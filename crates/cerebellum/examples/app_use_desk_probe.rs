@@ -6,7 +6,7 @@
 //! Mac, after building the module binary it uses as the cursor helper:
 //!
 //! ```text
-//! cargo build -p cerebellum --bin ck-cerebellum --example app_use_desk_probe
+//! cargo build -p cerebellum --features desk-probe --bin ck-cerebellum --example app_use_desk_probe
 //! target/debug/examples/app_use_desk_probe --approve-desk-probe
 //! ```
 //!
@@ -780,6 +780,17 @@ mod desk {
     }
 
     pub fn run(baseline: bool) -> i32 {
+        if !baseline {
+            match cerebellum_macos::probe_overlay_capture_exclusion() {
+                Ok(()) => {
+                    println!("PASS overlay_display_capture_excludes_preview_and_badge_patterns")
+                }
+                Err(reason) => {
+                    eprintln!("FAIL overlay_display_capture_excludes_preview_and_badge_patterns: {reason}");
+                    return 1;
+                }
+            }
+        }
         println!(
             "TIME BUDGET: at most about {} s (launch {} s, covering the window up to {} s, \
              actions, two idle windows of {} s, teardown)",

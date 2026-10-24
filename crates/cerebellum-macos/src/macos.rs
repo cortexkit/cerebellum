@@ -1213,7 +1213,10 @@ fn explain_capture_failure(reason: String, locked: Option<bool>) -> CaptureError
 /// # Safety
 ///
 /// `image` must be a valid image for the duration of the call.
-unsafe fn read_pixels(image: &CGImage, owner_pid_at_capture: u32) -> Result<RawCapture, String> {
+pub(super) unsafe fn read_pixels(
+    image: &CGImage,
+    owner_pid_at_capture: u32,
+) -> Result<RawCapture, String> {
     let width = CGImage::width(Some(image));
     let height = CGImage::height(Some(image));
     let bytes_per_row = CGImage::bytes_per_row(Some(image));

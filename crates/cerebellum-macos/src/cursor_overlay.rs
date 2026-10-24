@@ -25,6 +25,10 @@ use crate::cursor_schedule::{
 pub use crate::cursor_schedule::{CursorMotion, PictureTiming};
 use crate::preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, Previews};
 
+#[cfg(feature = "desk-probe")]
+mod capture_probe;
+#[cfg(feature = "desk-probe")]
+pub use capture_probe::probe_overlay_capture_exclusion;
 // The preview's window: a child module, so it draws the badge and its chip
 // with the same private drawing code as the badge's own panel.
 mod preview_window;
@@ -1105,9 +1109,11 @@ pub struct PreviewHideProbe {
     pub non_activating: bool,
     /// It floats above normal windows (whose level is 0).
     pub level: isize,
-    /// Its sharing type is `NSWindowSharingNone`, so screen sharing,
-    /// recordings and screenshots leave out the covered window it shows.
+    /// Its sharing type is `NSWindowSharingNone`. Actual pixel exclusion is
+    /// checked separately by the manual display-capture probe.
     pub hidden_from_capture: bool,
+    /// The badge panel also requests `NSWindowSharingNone`.
+    pub badge_hidden_from_capture: bool,
     /// Its frosted pane is the system's Liquid Glass view.
     pub liquid_glass: bool,
     /// This macOS has a Liquid Glass view at all (macOS 26 and later).
@@ -1127,6 +1133,7 @@ pub fn probe_preview_hide() -> Result<PreviewHideProbe, String> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     app.finishLaunching();
     let mut previews = Previews::<PreviewWindow>::new();
+    let badge = Picture::new(mtm);
     let shown = previews.on_preview(
         OverlayPreview {
             agent: AGENT.into(),
@@ -1174,6 +1181,7 @@ pub fn probe_preview_hide() -> Result<PreviewHideProbe, String> {
             .contains(NSWindowStyleMask::NonactivatingPanel),
         level: panel.level(),
         hidden_from_capture: panel.sharingType() == NSWindowSharingType::None,
+        badge_hidden_from_capture: badge.panel.sharingType() == NSWindowSharingType::None,
         liquid_glass: facts.liquid_glass,
         liquid_glass_available: objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
     })

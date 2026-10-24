@@ -100,6 +100,97 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
             ]))
         || (path == "cerebellum-macos/src/launch.rs"
             && expression.starts_with(&["relocated_test_executable", "(", ")"]))
+        || (path == "cerebellum-macos/tests/preview_hide.rs"
+            && name == "child"
+            && preview_skip_relocation(before, binding, &expression))
+}
+
+// Integration tests cannot call launch.rs's cfg(test) relocation helper.
+// preview_hide instead copies its own binary into a private /tmp directory;
+// approve that provenance only, never an arbitrary executable named `child`.
+fn preview_skip_relocation(before: &[Token], binding: usize, expression: &[&str]) -> bool {
+    let child = ["directory", ".", "join", "(", "preview-hide", ")", ";"];
+    if !expression.starts_with(&child) {
+        return false;
+    }
+    let words: Vec<&str> = before[..binding]
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    let last_binding = |name| {
+        words
+            .windows(3)
+            .rposition(|w| w == ["let", name, "="])
+            .map(|at| &words[at + 3..])
+    };
+    let own_binary = last_binding("executable").is_some_and(|value| {
+        value.starts_with(&["std", "::", "env", "::", "current_exe", "(", ")"])
+    });
+    let private_directory = last_binding("directory").is_some_and(|value| {
+        value.starts_with(&[
+            "std",
+            "::",
+            "path",
+            "::",
+            "PathBuf",
+            "::",
+            "from",
+            "(",
+            "format",
+            "!",
+            "(",
+            "/tmp/cerebellum-preview-skip-{}-{nonce}",
+            ",",
+            "std",
+            "::",
+            "process",
+            "::",
+            "id",
+            "(",
+            ")",
+        ])
+    });
+    let create = [
+        "std",
+        "::",
+        "fs",
+        "::",
+        "DirBuilder",
+        "::",
+        "new",
+        "(",
+        ")",
+        ".",
+        "mode",
+        "(",
+        "0o700",
+        ")",
+        ".",
+        "create",
+        "(",
+        "&",
+        "directory",
+        ")",
+    ];
+    let copy = [
+        "std",
+        "::",
+        "fs",
+        "::",
+        "copy",
+        "(",
+        "executable",
+        ",",
+        "&",
+        "child",
+        ")",
+    ];
+    own_binary
+        && private_directory
+        && words.windows(create.len()).any(|w| w == create)
+        && expression[child.len()..]
+            .windows(copy.len())
+            .any(|w| w == copy)
 }
 
 fn violations(path: &str, source: &str) -> Vec<String> {
@@ -253,6 +344,52 @@ fn detects_literal_dynamic_and_barrier_browser_launches() {
         assert!(
             !violations("cerebellum/tests/planted.rs", source).is_empty(),
             "missed {source}"
+        );
+    }
+}
+
+#[test]
+fn only_the_reviewed_preview_skip_self_binary_relocation_is_allowed() {
+    let path = "cerebellum-macos/tests/preview_hide.rs";
+    let source = r#"
+        let executable = std::env::current_exe().unwrap();
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/cerebellum-preview-skip-{}-{nonce}", std::process::id()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        let child = directory.join("preview-hide");
+        std::fs::copy(executable, &child).unwrap();
+        Command::new(&child).output();
+    "#;
+    assert!(violations(path, source).is_empty());
+    assert_eq!(
+        violations("cerebellum-macos/tests/unreviewed.rs", source).len(),
+        1
+    );
+    for (old, new) in [
+        ("std::env::current_exe()", "configured_executable()"),
+        ("copy(executable, &child)", "copy(browser, &child)"),
+        ("copy(executable, &child)", "metadata(&child)"),
+        (
+            "directory.join(\"preview-hide\")",
+            "directory.join(\"browser\")",
+        ),
+        (
+            "/tmp/cerebellum-preview-skip-{}-{nonce}",
+            "/tmp/shared-{}-{nonce}",
+        ),
+        (".mode(0o700)", ".mode(0o777)"),
+        (
+            "Command::new",
+            "let child = configured_executable(); Command::new",
+        ),
+    ] {
+        let planted = source.replace(old, new);
+        assert_ne!(source, planted, "control did not mutate {old}");
+        assert_eq!(
+            violations(path, &planted).len(),
+            1,
+            "unreviewed binding escaped: {new}"
         );
     }
 }
