@@ -916,29 +916,8 @@ fn prepare_spawn(
         // Make Chrome its own responsible process (see responsibility.rs), so it
         // can't use this module's Screen Recording, Accessibility or Input
         // Monitoring grants. If that can't be done, Chrome isn't launched.
-        type SetDisclaim = unsafe extern "C" fn(*mut PosixSpawnAttr, c_int) -> c_int;
-        let result = crate::require_responsibility_disclaim(
-            || {
-                let symbol = unsafe {
-                    dlsym(
-                        (-2isize) as *mut c_void,
-                        c"responsibility_spawnattrs_setdisclaim".as_ptr(),
-                    )
-                };
-                if symbol.is_null() {
-                    None
-                } else {
-                    // SAFETY: the symbol is libSystem's
-                    // `int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *, int)`
-                    // (private header responsibility.h, the declaration Chromium
-                    // uses). `PosixSpawnAttr` is the same opaque pointer type as
-                    // `posix_spawnattr_t`, so the function type matches. The
-                    // contrast test below fails if the call doesn't take effect.
-                    Some(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(symbol) })
-                }
-            },
-            |operation| unsafe { operation(&mut attributes, 1) },
-        );
+        let result =
+            unsafe { crate::responsibility::disclaim_spawn_attributes(&mut attributes, dlsym) };
         if result.is_err() {
             let _ = unsafe { posix_spawn_file_actions_destroy(&mut actions) };
             let _ = unsafe { posix_spawnattr_destroy(&mut attributes) };

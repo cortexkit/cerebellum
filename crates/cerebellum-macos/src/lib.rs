@@ -60,6 +60,8 @@ mod input;
 mod launch;
 #[cfg(any(target_os = "macos", test))]
 mod responsibility;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use responsibility::spawn_disclaimed_and_wait;
 #[cfg(any(target_os = "macos", test))]
 pub use responsibility::{require_responsibility_disclaim, ResponsibilityDisclaimUnavailable};
 #[cfg(all(target_os = "macos", test))]

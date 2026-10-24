@@ -7,8 +7,18 @@
 //!
 //! ```text
 //! cargo build -p cerebellum --features desk-probe --bin ck-cerebellum --example app_use_desk_probe
-//! target/debug/examples/app_use_desk_probe --approve-desk-probe
+//! cargo build -p cerebellum-macos --features desk-probe --example disclaim_launch
+//! codesign --force --sign 'Apple Development: YOUR NAME (TEAMID)' --identifier ck-cerebellum target/debug/ck-cerebellum target/debug/examples/app_use_desk_probe
+//! target/debug/examples/disclaim_launch target/debug/examples/app_use_desk_probe --approve-desk-probe
 //! ```
+//!
+//! The operator signs the probe and its cursor-helper binary with their Apple
+//! Development certificate. The launcher does not pass its own permission
+//! grants to the probe: the probe must hold its own grants. Before any desk work
+//! or helper exec, the probe prints the executable that macOS holds responsible
+//! for its permission grants, then checks Accessibility, Screen Recording and
+//! Input Monitoring without prompting. A missing permission exits 2; grant it
+//! to the printed executable in System Settings before retrying.
 //!
 //! The probe is its own scratch module: it builds a computer plane in this
 //! process with an isolated journal, never talks to the running daemon, and
@@ -86,6 +96,75 @@ fn approved(arguments: impl IntoIterator<Item = String>) -> bool {
     arguments
         .into_iter()
         .any(|argument| argument == APPROVAL_FLAG)
+}
+
+const TCC_PERMISSIONS: [&str; 3] = ["Accessibility", "Screen Recording", "Input Monitoring"];
+
+/// Decide from non-prompting answers alone, without consulting macOS or
+/// attempting to obtain a missing permission.
+fn tcc_preflight_verdict(answers: [bool; 3]) -> Result<(), String> {
+    let missing = TCC_PERMISSIONS
+        .into_iter()
+        .zip(answers)
+        .filter_map(|(permission, allowed)| (!allowed).then_some(permission))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    Ok(())
+}
+
+/// No operation that could request permission may start until every preflight
+/// has passed. Keeping the operation behind the decision also protects helper
+/// execs and the baseline child, not just the main desk run.
+fn with_tcc_preflight<T>(answers: [bool; 3], operation: impl FnOnce() -> T) -> Result<T, String> {
+    tcc_preflight_verdict(answers)?;
+    Ok(operation())
+}
+
+#[cfg(target_os = "macos")]
+fn desk_preflight(operation: impl FnOnce() -> i32) -> i32 {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGPreflightListenEventAccess() -> bool;
+    }
+
+    let responsible = cerebellum_macos::responsible_process().unwrap_or_else(|| {
+        format!(
+            "<unknown responsible process; probe executable: {}>",
+            std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        )
+    });
+    println!("TCC responsible executable: {responsible}");
+    // These three calls only inspect the current grants; none requests access.
+    let answers = unsafe {
+        [
+            AXIsProcessTrusted(),
+            CGPreflightScreenCaptureAccess(),
+            CGPreflightListenEventAccess(),
+        ]
+    };
+    for (permission, allowed) in TCC_PERMISSIONS.into_iter().zip(answers) {
+        println!("TCC {permission}: {allowed}");
+    }
+    match with_tcc_preflight(answers, operation) {
+        Ok(code) => code,
+        Err(missing) => {
+            eprintln!(
+                "REFUSED: missing {missing}. Grant the missing permissions to {responsible} \
+                 in System Settings, then retry with the disclaiming launcher."
+            );
+            2
+        }
+    }
 }
 
 /// The module binary to run as the cursor helper: `ck-cerebellum` in the
@@ -278,15 +357,10 @@ fn visible_previews(windows: &[ListedWindow], helper: i32) -> usize {
 fn main() {
     // The agent cursor's transport launches its helper as this executable,
     // with no other argument and an empty environment.
-    if std::env::args()
+    let helper = std::env::args()
         .skip(1)
-        .any(|argument| argument == HELPER_FLAG)
-    {
-        #[cfg(target_os = "macos")]
-        desk::become_helper();
-        std::process::exit(1);
-    }
-    if !approved(std::env::args().skip(1)) {
+        .any(|argument| argument == HELPER_FLAG);
+    if !helper && !approved(std::env::args().skip(1)) {
         eprintln!(
             "REFUSED: this probe fronts a scratch application on the person's screen and \
              draws the agent cursor. Run it only with the person present and their approval, \
@@ -295,13 +369,23 @@ fn main() {
         std::process::exit(2);
     }
     #[cfg(target_os = "macos")]
-    std::process::exit(desk::run(
-        std::env::args()
-            .skip(1)
-            .any(|argument| argument == BASELINE_FLAG),
-    ));
+    std::process::exit(desk_preflight(|| {
+        if helper {
+            desk::become_helper();
+            1
+        } else {
+            desk::run(
+                std::env::args()
+                    .skip(1)
+                    .any(|argument| argument == BASELINE_FLAG),
+            )
+        }
+    }));
     #[cfg(not(target_os = "macos"))]
     {
+        if helper {
+            std::process::exit(1);
+        }
         eprintln!("UNMEASURABLE: macOS desk required");
         std::process::exit(2);
     }
@@ -1236,6 +1320,40 @@ mod tests {
         assert!(!approved(["--approve".to_string()]));
         assert!(!approved([HELPER_FLAG.to_string()]));
         assert!(approved(["--approve-desk-probe".to_string()]));
+    }
+
+    #[test]
+    fn tcc_preflight_refuses_every_missing_permission_before_requesting() {
+        for answers in [
+            [false, true, true],
+            [true, false, true],
+            [true, true, false],
+            [false, false, true],
+            [false, true, false],
+            [true, false, false],
+            [false, false, false],
+        ] {
+            let result: Result<(), String> = with_tcc_preflight(answers, || {
+                panic!("a requesting operation ran with missing permissions: {answers:?}")
+            });
+            let missing = result.expect_err("a false preflight must refuse");
+            for (permission, allowed) in TCC_PERMISSIONS.into_iter().zip(answers) {
+                assert_eq!(missing.contains(permission), !allowed, "{answers:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tcc_preflight_allows_the_operation_only_when_all_three_pass() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            with_tcc_preflight([true; 3], || {
+                calls.set(calls.get() + 1);
+                17
+            }),
+            Ok(17)
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
