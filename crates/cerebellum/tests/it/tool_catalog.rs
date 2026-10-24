@@ -420,6 +420,8 @@ async fn another_principals_key_is_an_unknown_call() {
 
 #[tokio::test]
 async fn withdrawal_checks_the_carriers_own_record_scope() {
+    use cerebellum::journal::call_records::{CallState, Lookup};
+
     let planes = planes(true);
     let scope = subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {
@@ -438,6 +440,23 @@ async fn withdrawal_checks_the_carriers_own_record_scope() {
         json!({"name":"browser_use","arguments":{"action":"status"},"call_key":"scoped:key"}),
     )
     .await;
+    // A reply can outrun its record worker; scope assertions need the settled refusal.
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let Lookup::Own(snapshot) = planes
+                .calls
+                .lookup("reserved:prefrontal-routing", "scoped:key")
+            else {
+                panic!("the keyed call must already have its begin record");
+            };
+            if snapshot.state != CallState::Started {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the keyed call's record settles");
     let own = exchange(
         &planes,
         9,
