@@ -573,6 +573,15 @@ mod computer {
             "{read_text}"
         );
         assert!(read_text.contains(" cell Memory 0"), "{read_text}");
+        let facts = planes.routes.get(CHANNEL, EPOCH).unwrap();
+        let scope = facts
+            .scope
+            .map(|stamp| stamp.scope_ref)
+            .unwrap_or(facts.identity.conversation_key);
+        assert_eq!(
+            crate::private_content_marks_tests::query(&planes, &scope).await,
+            json!({"private_content":true,"sources":["desktop_app"]})
+        );
         let save = id_of(&read_text, "button Save");
         let field = id_of(&read_text, "text field");
 

@@ -124,6 +124,18 @@ pub struct Phase {
     pub count: u64,
 }
 
+// A private-content mark is recorded in memory before a content reply is sent;
+// writing it to disk may delay that reply by at most this phase, which fits
+// inside the existing boundary slack. A write that misses the deadline does not
+// hold the reply: the store instead answers every privacy query as marked until
+// a later write succeeds. Covers both the wait for the single writer permit
+// and the atomic write, including a file sync and, on Unix, a directory sync.
+pub const PRIVATE_CONTENT_WRITE: Phase = Phase {
+    name: "private_content_write",
+    cap_ms: 500,
+    count: 1,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionBudget {
     pub action: &'static str,
@@ -823,11 +835,16 @@ budget!(
 );
 // An in-memory lookup and a non-blocking pipe write; nothing is stored.
 budget!(
+    MANAGEMENT_PRIVATE_CONTENT_QUERY,
+    crate::private_content::QUERY,
+    [("lookup", GRANT_LOOKUP_MS, 1)]
+);
+budget!(
     MANAGEMENT_SESSION_TURN_ENDED,
     management::SESSION_TURN_ENDED,
     [("lookup", GRANT_LOOKUP_MS, 1)]
 );
-pub const MANAGEMENT_ACTIONS: [ActionBudget; 17] = [
+pub const MANAGEMENT_ACTIONS: [ActionBudget; 18] = [
     MANAGEMENT_WOULD_ASK,
     MANAGEMENT_OPEN_TARGET,
     MANAGEMENT_LIST_APP_GRANTS,
@@ -844,6 +861,7 @@ pub const MANAGEMENT_ACTIONS: [ActionBudget; 17] = [
     MANAGEMENT_LIST_GRANTS,
     MANAGEMENT_PERMISSIONS_LIST,
     MANAGEMENT_PERMISSIONS_REVOKE,
+    MANAGEMENT_PRIVATE_CONTENT_QUERY,
     MANAGEMENT_SESSION_TURN_ENDED,
 ];
 const FLAT_MANAGEMENT_ACTIONS: [ActionBudget; 6] = [
@@ -1002,7 +1020,7 @@ const fn management_limits(
 // answer consent or complete sign-in. OPEN_GRANT, REBIND_PROFILE_ROOT and
 // CLEAR_LAUNCH_RECOVERY ask on spawned tasks after the Management reply,
 // so those replies need no park allowance.
-pub const MANAGEMENT_LIMITS: [ManagementLimits; 17] = [
+pub const MANAGEMENT_LIMITS: [ManagementLimits; 18] = [
     management_limits(MANAGEMENT_WOULD_ASK, 0, 0),
     management_limits(MANAGEMENT_OPEN_TARGET, 0, CONSENT_PARK_LIMIT_MS),
     management_limits(MANAGEMENT_LIST_APP_GRANTS, 0, 0),
@@ -1035,6 +1053,7 @@ pub const MANAGEMENT_LIMITS: [ManagementLimits; 17] = [
     management_limits(MANAGEMENT_LIST_GRANTS, 0, 0),
     management_limits(MANAGEMENT_PERMISSIONS_LIST, 0, 0),
     management_limits(MANAGEMENT_PERMISSIONS_REVOKE, 0, 0),
+    management_limits(MANAGEMENT_PRIVATE_CONTENT_QUERY, 0, 0),
     management_limits(MANAGEMENT_SESSION_TURN_ENDED, 0, 0),
 ];
 
@@ -1347,6 +1366,7 @@ mod tests {
             (MANAGEMENT_LIST_GRANTS, 2 * STORE_MS),
             (MANAGEMENT_PERMISSIONS_LIST, STORE_MS + RESOLUTION_LIMIT_MS),
             (MANAGEMENT_PERMISSIONS_REVOKE, STORE_MS),
+            (MANAGEMENT_PRIVATE_CONTENT_QUERY, GRANT_LOOKUP_MS),
             (MANAGEMENT_SESSION_TURN_ENDED, GRANT_LOOKUP_MS),
         ];
         assert_eq!(expected.len(), MANAGEMENT_ACTIONS.len());
@@ -1522,6 +1542,7 @@ mod tests {
             (management::LIST_GRANTS, 0, 0),
             (crate::permissions::LIST, 0, 0),
             (crate::permissions::REVOKE, 0, 0),
+            (crate::private_content::QUERY, 0, 0),
             (management::SESSION_TURN_ENDED, 0, 0),
         ];
         assert_eq!(expected.len(), management::OPERATIONS.len());
@@ -1581,6 +1602,14 @@ mod tests {
         assert_eq!(EGRESS_SEND_MS, write_ms + 2 * EGRESS_FLUSH_MS);
         assert_eq!(EGRESS_BUFFER, crate::EGRESS_BUFFER);
         assert_eq!(BOUNDARY_SLACK_MS, 5_000);
+        // The private-content write is spent from the boundary slack, so it
+        // must leave most of that slack for the reply itself.
+        const {
+            assert!(
+                PRIVATE_CONTENT_WRITE.cap_ms * PRIVATE_CONTENT_WRITE.count
+                    <= BOUNDARY_SLACK_MS / 10
+            )
+        };
         for workers in [
             MAX_BLOCKING_WORKERS_COMPUTER,
             MAX_BLOCKING_WORKERS_BROWSER,

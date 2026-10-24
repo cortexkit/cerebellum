@@ -2154,6 +2154,19 @@ fn close_open_handoff(
 }
 
 impl BrowserSessions {
+    /// A handoff that ends without an observed login (it expired, or the
+    /// caller closed it) may still have ended signed in: the person can finish
+    /// signing in between checks, or on a page the checks do not recognize.
+    /// Its site therefore counts as possibly signed in, so the profile's page
+    /// content counts as private. Best effort: an unrecorded login only makes
+    /// the record incomplete, and a failed write already makes the whole login
+    /// store count as signed in.
+    fn note_possible_login(&self, handoff: &Handoff) {
+        let _ = self
+            .signed_in
+            .record(&handoff.profile, &handoff.profile_name, &handoff.origin);
+    }
+
     pub fn with_signed_in_domains(
         mut self,
         signed_in: Arc<crate::browser_signed_in::SignedInDomains>,
@@ -2681,17 +2694,20 @@ impl BrowserSessions {
         let mut meta = cell.meta().map_err(|_| ResumeRefusal::NoHandoff)?;
         let handoff = meta.handoff.take().ok_or(ResumeRefusal::NoHandoff)?;
         let (closed, should_journal) = match handoff {
-            HandoffState::Open(handoff) => (
-                ClosedHandoff {
-                    outcome: if clock.now() >= handoff.expires_at {
-                        HandoffOutcome::Expired
-                    } else {
-                        HandoffOutcome::ClosedByCaller
+            HandoffState::Open(handoff) => {
+                self.note_possible_login(&handoff);
+                (
+                    ClosedHandoff {
+                        outcome: if clock.now() >= handoff.expires_at {
+                            HandoffOutcome::Expired
+                        } else {
+                            HandoffOutcome::ClosedByCaller
+                        },
+                        handoff,
                     },
-                    handoff,
-                },
-                true,
-            ),
+                    true,
+                )
+            }
             HandoffState::Closed(closed) => (closed, false),
         };
         Ok(handoff_close(&closed, should_journal))
@@ -2752,6 +2768,7 @@ impl BrowserSessions {
                 return HandoffPollResult::Gone;
             }
             if clock.now() >= handoff.expires_at {
+                self.note_possible_login(handoff);
                 return close_open_handoff(&mut meta.handoff, HandoffOutcome::Expired)
                     .map_or(HandoffPollResult::Gone, HandoffPollResult::Closed);
             }
@@ -5710,6 +5727,49 @@ mod tests {
         assert_eq!(blocked.expires_in_ms, 0);
         let resumed = sessions.resume("route", &clock).unwrap();
         assert_eq!(resumed.outcome, HandoffOutcome::Expired);
+    }
+
+    /// A handoff that ends unobserved, whether the caller closes it or it
+    /// expires, leaves its site recorded as possibly signed in.
+    #[test]
+    fn an_unobserved_handoff_ending_counts_as_a_possible_login() {
+        for expire in [false, true] {
+            let sessions = BrowserSessions::default();
+            let mut clock = FakeClock::new();
+            let _ = handoff_session(&sessions, &clock);
+            sessions
+                .signed_in
+                .initialize_profile("route", "default", "fresh", true)
+                .unwrap();
+            assert!(!sessions.signed_in.has_login_evidence("route", "default"));
+            let presented = sessions
+                .present("route", "https://login.example", 10, &clock)
+                .unwrap();
+            let outcome = if expire {
+                clock.advance(Duration::from_millis(HANDOFF_DURATION_MS));
+                match sessions.poll_handoff("route", presented.generation, 10, &clock) {
+                    HandoffPollResult::Closed(closed) => closed.outcome,
+                    other => panic!("expected a closed handoff, got {other:?}"),
+                }
+            } else {
+                sessions.resume("route", &clock).unwrap().outcome
+            };
+            assert_eq!(
+                outcome,
+                if expire {
+                    HandoffOutcome::Expired
+                } else {
+                    HandoffOutcome::ClosedByCaller
+                }
+            );
+            assert!(
+                sessions.signed_in.has_login_evidence("route", "default"),
+                "{outcome:?}"
+            );
+            assert!(sessions
+                .signed_in
+                .is_signed_in("route", "default", "https://login.example"));
+        }
     }
 
     #[test]

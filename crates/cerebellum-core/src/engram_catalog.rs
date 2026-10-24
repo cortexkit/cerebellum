@@ -253,7 +253,9 @@ mod tests {
     /// portable so it lands in every backup; engram does not capture its
     /// device-local class at all, so marking the journal device-local would drop
     /// the audit trail from backups. Restoring it onto another Mac stays an
-    /// explicit operator action.
+    /// explicit operator action. Private-content marks are portable too: a
+    /// restore must bring back head marks, which never expire, and the in-use
+    /// marker, which keeps answers marked after an unclean stop.
     #[test]
     fn the_catalog_declares_every_tree_with_profiles_excluded_and_journal_portable() {
         let descriptor = parsed();
@@ -264,7 +266,28 @@ mod tests {
             .collect();
         assert_eq!(
             by_path,
-            [("browser", Class::Excluded), ("journal", Class::Portable)]
+            [
+                ("browser", Class::Excluded),
+                ("journal", Class::Portable),
+                ("private-content", Class::Portable)
+            ]
+        );
+        // Every tree that keeps a format floor holds durable data the module
+        // writes, so each must be declared.
+        for tree in crate::format_floor::FLOOR_TREES {
+            assert!(
+                by_path.iter().any(|(path, _)| *path == tree),
+                "{tree} is written by the module but not declared"
+            );
+        }
+        let marks = &descriptor.entries[2];
+        assert!(
+            marks
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("never page or app content")),
+            "the private-content entry says it holds no content: {:?}",
+            marks.reason
         );
         let browser = &descriptor.entries[0];
         assert!(

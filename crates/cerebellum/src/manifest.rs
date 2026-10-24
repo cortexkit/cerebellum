@@ -202,6 +202,7 @@ fn management_surface() -> ProviderRole {
             ),
             (crate::permissions::LIST, "List live agent and worker permissions. Cingulate aggregator only."),
             (crate::permissions::REVOKE, "Revoke a permission by id and stop work using it. Cingulate aggregator only."),
+            (crate::private_content::QUERY, "Query scope and parent-head private-content provenance. Broca only."),
             (
                 crate::management::SESSION_TURN_ENDED,
                 "Report that a head session's turn ended, so its agent cursor badge leaves the \
@@ -446,6 +447,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
         .capabilities(Some(CapabilityDeclarations {
             provides: vec![
                 crate::permissions::CAPABILITY.to_string(),
+                crate::private_content::CAPABILITY.to_string(),
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::call_mode::CALL_MODES_CAPABILITY.to_string(),
@@ -986,6 +988,7 @@ mod tests {
                 crate::management::LIST_GRANTS,
                 crate::permissions::LIST,
                 crate::permissions::REVOKE,
+                crate::private_content::QUERY,
                 crate::management::SESSION_TURN_ENDED,
             ]
         );

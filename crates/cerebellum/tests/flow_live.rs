@@ -558,21 +558,10 @@ async fn standing_owner_grant_gets_past_consent_without_asking() {
 #[tokio::test]
 async fn wrong_carrier_broca_is_refused_by_cerebellum() {
     let fixture = Fixture::start("broca", false).await;
-    let (mut client, channel, epoch) = route(&fixture, "broca").await;
-    for (name, args) in [
-        ("browser_use", navigation()),
-        (
-            "computer_use",
-            json!({"action":"wait", "app":"com.apple.finder", "predicate":{"kind":"element_present", "element":{"Identifier":"ready"}}, "timeout_ms":250}),
-        ),
-    ] {
-        let body = call(&mut client, channel, epoch, name, args).await;
-        assert_eq!(body["outcome"], "consent_unavailable", "{body}");
-        assert_eq!(
-            body["detail"]["reason"], "flow_carrier_not_admitted",
-            "{body}"
-        );
-    }
+    let (_, reply) = fixture.open("broca", true).await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["code"], "principal_denied", "{body}");
 }
 
 #[tokio::test]

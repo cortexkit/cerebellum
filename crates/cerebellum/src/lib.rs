@@ -73,6 +73,10 @@ mod open_app_history;
 mod permission_cards;
 mod permission_scope;
 mod permissions;
+mod private_content;
+#[cfg(test)]
+#[path = "../tests/support/private_content_marks.rs"]
+mod private_content_marks_tests;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
@@ -898,7 +902,8 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 
 /// Whether the management dispatcher has an explicit arm for this operation.
 pub fn dispatchable_management_operation(name: &str) -> bool {
-    permissions::is_operation(name)
+    name == private_content::QUERY
+        || permissions::is_operation(name)
         || matches!(
             name,
             management::OPEN_TARGET
@@ -2010,6 +2015,8 @@ struct ShutdownTeardownState {
     user_browser: user_browser_bridge::UserBrowserBridge,
     sessions: browser_session::BrowserSessions,
     browser: Option<BrowserConfig>,
+    // Its in-use marker is removed last, once nothing more can be delivered.
+    private_content: Arc<private_content::PrivateContent>,
     idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     started: std::sync::atomic::AtomicBool,
     finished: tokio::sync::watch::Sender<bool>,
@@ -2032,6 +2039,7 @@ impl ShutdownTeardown {
         idle_enforcer: Option<tokio::task::JoinHandle<()>>,
         cursor: Option<computer_capability::cursor::Coordinator>,
         user_browser: user_browser_bridge::UserBrowserBridge,
+        private_content: Arc<private_content::PrivateContent>,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
@@ -2039,6 +2047,7 @@ impl ShutdownTeardown {
             user_browser,
             sessions,
             browser,
+            private_content,
             idle_enforcer: std::sync::Mutex::new(idle_enforcer),
             started: std::sync::atomic::AtomicBool::new(false),
             finished,
@@ -2074,6 +2083,10 @@ impl ShutdownTeardown {
                 if let Some(browser) = &finished.0.browser {
                     finished.0.sessions.teardown_all(browser);
                 }
+                // Serving has stopped, so no further reply can be delivered:
+                // a clean ending may now tell the next start that every mark
+                // reached disk. A crash never gets here and leaves the marker.
+                finished.0.private_content.shut_down_cleanly();
             });
         }
         // The sender lives as long as `self`, so this only returns once the
@@ -2243,6 +2256,7 @@ async fn run(
         idle_enforcer,
         planes_cursor(&planes),
         planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -2372,6 +2386,7 @@ where
         idle_enforcer,
         planes_cursor(&planes),
         planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
 }
@@ -2919,6 +2934,8 @@ pub struct Planes {
     #[cfg(all(test, target_os = "macos"))]
     computer_for_test: Option<Arc<computer_capability::ScriptedComputerPlane>>,
     pub health: Arc<HealthState>,
+    private_content: Arc<private_content::PrivateContent>,
+    signed_in: Arc<browser_signed_in::SignedInDomains>,
     cancellations: RequestCancellations,
     run_calls: codemode::RunCalls,
     browser_queue: Arc<call_queue::ConversationQueue>,
@@ -3257,7 +3274,7 @@ impl Planes {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let launch_service = None;
         let sessions = browser_session::BrowserSessions::default()
-            .with_signed_in_domains(signed_in)
+            .with_signed_in_domains(Arc::clone(&signed_in))
             .with_health(Arc::clone(&health));
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
         let browser_grants = management.browser_grants();
@@ -3313,6 +3330,11 @@ impl Planes {
             compiled_release_inputs().takeover_dispatch_review_revision;
         Self {
             health,
+            private_content: Arc::new(match journal {
+                JournalPersistence::Durable => private_content::PrivateContent::production(),
+                JournalPersistence::Isolated => private_content::PrivateContent::in_memory(),
+            }),
+            signed_in,
             routes: Arc::new(RouteBindings::new()),
             browser,
             browser_config,
@@ -3439,6 +3461,8 @@ impl Clone for Planes {
             #[cfg(all(test, target_os = "macos"))]
             computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
+            private_content: Arc::clone(&self.private_content),
+            signed_in: Arc::clone(&self.signed_in),
             cancellations: self.cancellations.clone(),
             run_calls: self.run_calls.clone(),
             browser_queue: self.browser_queue.clone(),
@@ -3636,6 +3660,7 @@ async fn handle_frame(
                     &planes.health,
                     &planes.routes,
                     Some(&planes.call_record_workers),
+                    Some(&planes.private_content),
                 )
                 .await?;
             }
@@ -3790,6 +3815,30 @@ async fn handle_route_request(
         )
         .await;
     };
+    if private_content::is_broca(&facts.principal) {
+        // Broca's privacy decision must not queue behind a browser action or
+        // consent drain. Its management route has no other authority.
+        let request: Option<Value> = serde_json::from_slice(&frame.body).ok();
+        if facts.surface != RouteSurface::Management
+            || request
+                .as_ref()
+                .and_then(|body| body.get("method"))
+                .and_then(Value::as_str)
+                != Some(private_content::QUERY)
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "principal_denied",
+                "reserved:broca may call only private_content.query",
+            )
+            .await;
+        }
+        return handle_management_request_observed(frame, writer, &facts, planes, None).await;
+    }
     if let Err(refusal) = codemode::live_head(planes, &facts) {
         return send_route_error(
             writer,
@@ -4064,6 +4113,9 @@ async fn handle_management_request_observed(
     }
     if permissions::is_operation(method) {
         return permissions::handle(&frame, writer, facts, planes, method, object).await;
+    }
+    if method == private_content::QUERY {
+        return private_content::handle(&frame, writer, facts, planes, object).await;
     }
     if method == management::SESSION_TURN_ENDED {
         return handle_session_turn_ended(
@@ -5734,6 +5786,7 @@ async fn handle_control_request(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
     call_record_workers: Option<&CallRecordWorkers>,
+    private_content: Option<&private_content::PrivateContent>,
 ) -> Result<(), ModuleError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
@@ -5775,6 +5828,17 @@ async fn handle_control_request(
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
+            if private_content::is_broca(&principal)
+                && !private_content::bind_admitted(&principal, &target)
+            {
+                return send_principal_denied(
+                    writer,
+                    frame.header.ver,
+                    frame.header.corr,
+                    &principal,
+                )
+                .await;
+            }
             let mode = call_mode
                 .clone()
                 .unwrap_or(subc_protocol::call_mode::CallMode::Classic);
@@ -5787,6 +5851,7 @@ async fn handle_control_request(
                     cerebellum_core::identity::flow_carrier_admitted(stamp, &principal)
                 })
                 && !permissions::bind_admitted(&principal, &target)
+                && !private_content::bind_admitted(&principal, &target)
             {
                 return send_principal_denied(
                     writer,
@@ -5882,7 +5947,17 @@ async fn handle_control_request(
             // Insulated health-v2 lane: the report is a mechanical mapper over
             // atomics stamped by the dispatch path. It never blocks on a lock
             // and never forms its own opinion (Health-Path-Rule-v2).
-            let report = with_process_gauges(health_state.report());
+            let mut report = with_process_gauges(health_state.report());
+            if let ModuleControlResponse::HealthCheck {
+                metrics: Some(Value::Object(metrics)),
+                ..
+            } = &mut report
+            {
+                metrics.insert(
+                    "privateContentStore".into(),
+                    json!(private_content.map_or("not_opened", |store| store.health())),
+                );
+            }
             let mut report = match call_record_workers {
                 Some(workers) => workers.health_report(report),
                 None => report,
@@ -6213,7 +6288,14 @@ async fn handle_keyed_tool_request_inner(
                         return call_context::CALL_KEY
                             .scope(
                                 call_key.clone(),
-                                send_tool_response(writer, ver, channel, epoch, corr, legacy),
+                                private_content::send_reply(
+                                    planes,
+                                    &facts,
+                                    private_content::replay_plane(&legacy),
+                                    writer,
+                                    (ver, channel, epoch, corr),
+                                    legacy,
+                                ),
                             )
                             .await;
                     }
@@ -6230,11 +6312,31 @@ async fn handle_keyed_tool_request_inner(
                         .unwrap_or(false);
                     if is_content != wants_content {
                         let legacy = result.get("structuredContent").cloned().unwrap_or(result);
-                        return send_tool_response(writer, ver, channel, epoch, corr, legacy).await;
+                        return private_content::send_reply(
+                            planes,
+                            &facts,
+                            private_content::replay_plane(&legacy),
+                            writer,
+                            (ver, channel, epoch, corr),
+                            legacy,
+                        )
+                        .await;
                     }
                 }
             }
-            return send(writer, reply.readdressed(ver, channel, epoch, corr)).await;
+            let response = reply.readdressed(ver, channel, epoch, corr);
+            if response.header.ty == FrameType::Response {
+                if let Ok(delivered) = serde_json::from_slice::<Value>(&response.body) {
+                    private_content::mark_delivered(
+                        planes,
+                        &facts,
+                        private_content::replay_plane(&delivered),
+                        &delivered,
+                    )
+                    .await;
+                }
+            }
+            return send(writer, response).await;
         }
         Begin::InFlight => {
             return send_route_error(
@@ -6736,7 +6838,15 @@ async fn handle_tool_withdraw(
             // Interruption does not undo dispatched input. Only a record that
             // merely asked a person proves the action will never run; a started
             // call keeps its honest outcome even after cancellation is fired.
-            send_tool_response(writer, ver, channel, epoch, corr, answer).await
+            private_content::send_reply(
+                planes,
+                &facts,
+                private_content::replay_plane(&answer),
+                writer,
+                (ver, channel, epoch, corr),
+                answer,
+            )
+            .await
         }
         Lookup::Unknown => {
             send_tool_response(
@@ -7201,7 +7311,15 @@ async fn handle_tool_request_inner(
         if planes.routes.get(channel, epoch).is_none() {
             return Ok(());
         }
-        return send_tool_response(writer, ver, channel, epoch, corr, result).await;
+        return private_content::send_reply(
+            planes,
+            &accepted_facts,
+            private_content::ReplyPlane::PersonBrowser,
+            writer,
+            (ver, channel, epoch, corr),
+            result,
+        )
+        .await;
     }
     let (name, arguments) = match translated.as_ref() {
         Some(flat_tools::FlatDispatch::Computer {
@@ -7430,7 +7548,17 @@ async fn handle_tool_request_inner(
             return Ok(());
         }
         return match result {
-            Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+            Ok(result) => {
+                private_content::send_reply(
+                    planes,
+                    &accepted_facts,
+                    private_content::ReplyPlane::DesktopApp,
+                    writer,
+                    (ver, channel, epoch, corr),
+                    result,
+                )
+                .await
+            }
             Err(error) => {
                 send_route_error(
                     writer,
@@ -7507,7 +7635,17 @@ async fn handle_tool_request_inner(
         return Ok(());
     }
     match result {
-        Ok(result) => send_tool_response(writer, ver, channel, epoch, corr, result).await,
+        Ok(result) => {
+            private_content::send_reply(
+                planes,
+                &accepted_facts,
+                private_content::ReplyPlane::OwnBrowser,
+                writer,
+                (ver, channel, epoch, corr),
+                result,
+            )
+            .await
+        }
         Err(error) => {
             send_route_error(
                 writer,
@@ -8117,6 +8255,17 @@ async fn send_tool_response(
     corr: u64,
     body: Value,
 ) -> Result<(), ModuleError> {
+    let response = tool_response_frame(ver, channel, epoch, corr, body)?;
+    send(writer, response).await
+}
+
+fn tool_response_frame(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Value,
+) -> Result<Frame, ModuleError> {
     let held = codemode::held(&body);
     let mut body = if held.is_some() {
         body
@@ -8156,7 +8305,7 @@ async fn send_tool_response(
         body,
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
-    send(writer, response).await
+    Ok(response)
 }
 
 /// A quarantine refusal is a result of the browser capability, checked
@@ -8524,7 +8673,7 @@ pub async fn handle_control_request_for_test(
     health_state: &Arc<HealthState>,
 ) -> Result<(), ModuleError> {
     let route_bindings = Arc::new(RouteBindings::new());
-    handle_control_request(frame, writer, health_state, &route_bindings, None).await
+    handle_control_request(frame, writer, health_state, &route_bindings, None, None).await
 }
 
 pub async fn handle_control_request_for_test_with_bindings(
@@ -8533,7 +8682,7 @@ pub async fn handle_control_request_for_test_with_bindings(
     health_state: &Arc<HealthState>,
     route_bindings: &Arc<RouteBindings>,
 ) -> Result<(), ModuleError> {
-    handle_control_request(frame, writer, health_state, route_bindings, None).await
+    handle_control_request(frame, writer, health_state, route_bindings, None, None).await
 }
 
 /// The principal a test bind carries when it stands for a session's calls:
@@ -10324,6 +10473,8 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
 
         let planes = Planes {
+            private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
@@ -11070,7 +11221,7 @@ mod tests {
             let facts = planes.routes.get(4, 1).unwrap();
             planes.routes.insert(5, 1, AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
-                Some(subc_protocol::Principal::Reserved { module_id: "broca".into() }),
+                Some(subc_protocol::Principal::Reserved { module_id: "prefrontal-routing".into() }),
                 Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),
                 None,
                 &subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },
@@ -12311,6 +12462,8 @@ mod tests {
     async fn an_unsupported_surface_is_refused_by_name() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
+            private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
@@ -12395,6 +12548,8 @@ mod tests {
     /// Planes whose only route is bound to the management surface.
     pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
         let planes = Planes {
+            private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),

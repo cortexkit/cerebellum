@@ -15,6 +15,13 @@
       "reason": "Audit journals, call records, grant stores, launch history, signed-in-domain records and the raised-card registry. Backed up so the audit trail survives a disk loss on this Mac. Grants are machine-local by design, so restoring this tree onto another Mac is an explicit operator decision, never automatic.",
       "mechanism": "filetree",
       "path": "journal"
+    },
+    {
+      "entry_id": "cerebellum/private-content-marks",
+      "class": "portable",
+      "reason": "Private-content marks hold only scope ids, sources and times, never page or app content, and are backed up so a restore after a disk loss brings back head marks, which never expire, and the in-use marker, which keeps every answer marked for a day after an unclean stop.",
+      "mechanism": "filetree",
+      "path": "private-content"
     }
   ]
 }

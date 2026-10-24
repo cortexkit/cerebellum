@@ -389,7 +389,7 @@ async fn mismatched_schema_pins_are_refused_before_dispatch() {
 #[tokio::test]
 async fn another_principals_key_is_an_unknown_call() {
     let planes = planes(true);
-    bind(&planes, 9, "broca").await;
+    bind(&planes, 9, "prefrontal-routing").await;
     bind(&planes, 10, "aft").await;
     exchange(
         &planes,
@@ -431,7 +431,7 @@ async fn withdrawal_checks_the_carriers_own_record_scope() {
     )
     .with_attributes(subc_protocol::scope::ScopeAttributes::default())
     .with_owner_authorized(true);
-    bind_with_scope(&planes, 9, "broca", Some(scope.clone())).await;
+    bind_with_scope(&planes, 9, "prefrontal-routing", Some(scope.clone())).await;
     let result = exchange(
         &planes,
         9,
@@ -451,8 +451,8 @@ async fn withdrawal_checks_the_carriers_own_record_scope() {
     );
     let mut other_scope = scope;
     other_scope.scope_ref = "scope-two".into();
-    bind_with_scope(&planes, 10, "broca", Some(other_scope)).await;
-    let other = exchange(&planes, 10, json!({"name":"tool.withdraw","arguments":{"call_key":"scoped:key","carrier":"reserved:broca"}})).await;
+    bind_with_scope(&planes, 10, "prefrontal-routing", Some(other_scope)).await;
+    let other = exchange(&planes, 10, json!({"name":"tool.withdraw","arguments":{"call_key":"scoped:key","carrier":"reserved:prefrontal-routing"}})).await;
     assert_eq!(other.header.ty, FrameType::Error);
     assert_eq!(body(&other)["code"], "withdraw_not_permitted");
 }

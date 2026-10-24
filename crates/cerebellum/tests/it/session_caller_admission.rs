@@ -221,7 +221,6 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
     vec![
         (Some(Principal::Direct), "direct"),
         (reserved("aft"), "reserved:aft"),
-        (reserved("broca"), "reserved:broca"),
         (
             reserved("prefrontal-routing"),
             "reserved:prefrontal-routing",
