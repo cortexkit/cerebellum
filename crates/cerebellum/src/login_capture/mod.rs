@@ -922,6 +922,8 @@ pub struct CaptureModule {
     /// Paths whose deletion failed, with the error kind. The residue refusal
     /// names the path from disk; this adds why the module could not remove it.
     failed_deletions: Arc<Mutex<BTreeMap<PathBuf, String>>>,
+    #[cfg(test)]
+    journal_finalization: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Everything a capture call needs from the route that made it.
@@ -995,7 +997,27 @@ impl CaptureModule {
             vault: Mutex::new(None),
             in_progress: Arc::new(Mutex::new(false)),
             failed_deletions: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            journal_finalization: Mutex::new(None),
         }
+    }
+
+    /// Register before dispatch so even a fast detached audit cannot lose its signal.
+    #[cfg(test)]
+    pub(crate) fn expect_journal_finalization(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(self
+            .journal_finalization
+            .lock()
+            .unwrap()
+            .replace(tx)
+            .is_none());
+        rx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_journal_finalization(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.journal_finalization.lock().unwrap().take()
     }
 
     /// Publish the launcher. Set after startup recovery, so a capture never

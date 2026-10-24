@@ -5552,6 +5552,8 @@ async fn capture_browser_login(
     let browser = Arc::clone(&planes.browser);
     let identity = facts.identity.clone();
     let calls = Arc::clone(&planes.calls);
+    #[cfg(test)]
+    let journal_finalization = planes.capture.take_journal_finalization();
     tokio::spawn(async move {
         let outcome = running.await;
         let ending = capture_ending(&outcome.reply);
@@ -5561,6 +5563,10 @@ async fn capture_browser_login(
         .await;
         // Audit congestion must not hold back the capture's already-known result.
         let _ = journal_capture_outcome(&browser, &identity, outcome).await;
+        #[cfg(test)]
+        if let Some(finalized) = journal_finalization {
+            let _ = finalized.send(());
+        }
     });
     json!({
         "outcome":"capture_pending", "origin":handoff.origin,
@@ -11566,6 +11572,7 @@ mod tests {
             wall_clock_ms(),
         ));
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let journal_finalized = planes.capture.expect_journal_finalization();
         let body = capture_initial_reply(
             &planes,
             &writer_tx,
@@ -11623,6 +11630,11 @@ mod tests {
             !contains_bytes(&std::fs::read(call_record_path).unwrap(), PLANTED_VALUE),
             "the call-record journal leaked it"
         );
+        // The late result deliberately precedes the detached audit write.
+        tokio::time::timeout(HANG_GUARD, journal_finalized)
+            .await
+            .expect("the capture audit finishes")
+            .expect("the capture signals its audit finalization");
         let export = planes.browser.journal_export_for_test().await;
         let entries = export
             .lines()
