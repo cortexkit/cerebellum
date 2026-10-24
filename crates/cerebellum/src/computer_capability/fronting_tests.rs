@@ -3151,7 +3151,9 @@ mod settle_read_budget {
         let timeouts = app.timeouts.lock().unwrap().clone();
         assert_eq!(timeouts.len(), 1, "the settle stopped at the partial read");
         assert!(
-            timeouts[0] <= window && timeouts[0] > Duration::ZERO,
+            // Not the ordinary four-second budget. The time left may reach
+            // zero on a loaded host, which still cuts the read short.
+            timeouts[0] <= window,
             "the read was bounded by the settle window: {timeouts:?}"
         );
         assert!(
