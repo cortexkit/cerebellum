@@ -20,7 +20,7 @@ required, and unknown fields are refused):
 
 ```json
 {"method": "session.turn_ended", "params": {
-  "session_ref": "<the runner's session ref>",
+  "session_ref": "<32 lowercase hex>",
   "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "...", "epoch": 3},
   "harness": "...", "turn_id": "...",
   "outcome": "completed" | "stopped" | "failed",
@@ -29,10 +29,7 @@ required, and unknown fields are refused):
   "source": "...", "seq": 7, "at_ms": 1700000000000}}
 ```
 
-`session_ref` is the harness runner's ref, taken as given: any non-empty string
-of at most 256 printable ASCII characters without spaces (`!` through `~`). Its
-spelling belongs to the runner and changed between runner releases; it is
-carried, never parsed or matched.
+`session_ref` is the harness runner's ref, exactly 32 lowercase hex digits.
 `turn_id` is an opaque token: any non-empty string of at most 128 printable
 ASCII characters (space through `~`). It is never parsed, stored or matched.
 `scope` is the daemon-stamped head scope that relayed calls already carry.
