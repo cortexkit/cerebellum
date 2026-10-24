@@ -1269,7 +1269,20 @@ struct ContextState {
     ended: bool,
     crashed: bool,
     next_snapshot_seed: u64,
+    /// Random bits mixed into every snapshot id this context mints. The
+    /// counter alone restarts at zero whenever the module restarts, so
+    /// without this the same conversation would mint the same ids again and
+    /// an id held from an earlier browser could name a snapshot of a
+    /// different page.
+    snapshot_nonce: u128,
     refs: refs::StableRefs,
+}
+
+/// 128 bits from the OS random source, drawn once per page context.
+fn new_snapshot_nonce() -> u128 {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("snapshot id entropy unavailable");
+    u128::from_le_bytes(bytes)
 }
 
 fn public_read_frames(
@@ -1310,16 +1323,18 @@ impl ContextState {
             ended: false,
             crashed: false,
             next_snapshot_seed: 0,
+            snapshot_nonce: new_snapshot_nonce(),
             refs: refs::StableRefs::default(),
         }
     }
     fn snapshot_id(&mut self, kind: SnapshotKind) -> String {
         self.next_snapshot_seed = self.next_snapshot_seed.saturating_add(1);
         snapshot_store::new_snapshot_id(format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{:032x}",
             self.identity.conversation_key,
             kind.as_str(),
-            self.next_snapshot_seed
+            self.next_snapshot_seed,
+            self.snapshot_nonce
         ))
     }
 }
@@ -1943,7 +1958,9 @@ impl BrowserPlane {
         // the new browser cannot inherit a previous page's observations.
         // Snapshot and ref counters carry over without their old bindings:
         // restarting either counter would mint names a caller may still hold,
-        // allowing a stale name to address a different page.
+        // allowing a stale name to address a different page. Snapshot ids
+        // also mix in the new context's random nonce, which keeps them
+        // distinct even when the module restarts and the counter is lost.
         let key = identity.conversation_key.clone();
         let next_snapshot_seed = state
             .contexts
@@ -6303,6 +6320,116 @@ mod tests {
             Err(BrowserError::StaleSnapshot {
                 reason_code: "ref_from_older_snapshot"
             })
+        ));
+    }
+
+    /// Two page contexts for one conversation never mint the same snapshot
+    /// id, although each starts its counter at zero, as every context does
+    /// after a module restart.
+    #[test]
+    fn snapshot_ids_of_two_contexts_for_one_conversation_are_disjoint() {
+        let mint = || {
+            let mut context = ContextState::new(identity());
+            let mut ids = Vec::new();
+            for _ in 0..16 {
+                for kind in [
+                    SnapshotKind::Actionable,
+                    SnapshotKind::Ax,
+                    SnapshotKind::DomFull,
+                    SnapshotKind::Screenshot,
+                ] {
+                    ids.push(context.snapshot_id(kind));
+                }
+            }
+            ids
+        };
+        let first = mint();
+        let second = mint();
+        assert!(first
+            .iter()
+            .chain(&second)
+            .all(|id| snapshot_store::valid_snapshot_id(id)));
+        let first: std::collections::BTreeSet<_> = first.into_iter().collect();
+        assert_eq!(first.len(), 64, "one context repeated its own ids");
+        let repeated: Vec<_> = second.iter().filter(|id| first.contains(*id)).collect();
+        assert!(
+            repeated.is_empty(),
+            "ids repeated across contexts: {repeated:?}"
+        );
+    }
+
+    /// A snapshot id handed out by a closed browser is refused as stale on the
+    /// browser that replaced it after a module restart, even once the new
+    /// context has taken as many snapshots as the old one.
+    #[tokio::test]
+    async fn a_snapshot_id_from_a_closed_context_is_stale_on_its_replacement() {
+        let route = identity();
+        let take_snapshots = |plane: BrowserPlane| {
+            let route = route.clone();
+            async move {
+                plane.open_context(route.clone()).await.unwrap();
+                let mut replies = Vec::new();
+                for _ in 0..4 {
+                    let (records, refs) = ax_fixture();
+                    replies.push(
+                        plane
+                            .retain_text_snapshot(
+                                &route,
+                                SnapshotKind::Ax,
+                                &records,
+                                None,
+                                refs,
+                                4096,
+                                Some(CommittedDocument::new("https://example.com/", 1, "loader")),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+                (plane, replies)
+            }
+        };
+        let (old_plane, old_replies) = take_snapshots(BrowserPlane::new()).await;
+        old_plane.end_context(&route, false).await;
+        // A fresh plane is what a module restart leaves: no memory of the
+        // previous browser, and a snapshot counter back at zero.
+        let (plane, new_replies) = take_snapshots(BrowserPlane::new()).await;
+        let click = |reply: &Value| {
+            let reference = reply[state_text::STATE_TEXT_FIELD]
+                .as_str()
+                .unwrap()
+                .lines()
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string();
+            json!({
+                "ref": reference,
+                "snapshot_id": reply["snapshot_id"],
+                "intent": "press the button",
+                "severity": severity(),
+            })
+        };
+        for old in &old_replies {
+            assert!(
+                matches!(
+                    plane.click(&route, &click(old)).await,
+                    Err(BrowserError::StaleSnapshot {
+                        reason_code: "snapshot_evicted"
+                    })
+                ),
+                "old snapshot {} was not refused as stale",
+                old["snapshot_id"]
+            );
+        }
+        // The new context's own snapshot gets past the snapshot check: the
+        // fixture's refs carry no backend node, so the click stops there.
+        let current = new_replies.last().unwrap();
+        assert!(matches!(
+            plane.click(&route, &click(current)).await,
+            Err(BrowserError::ElementIntercepted)
         ));
     }
 
