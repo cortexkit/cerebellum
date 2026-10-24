@@ -578,6 +578,8 @@ struct Tree<'a> {
     class: Vec<u8>,
     has_landmark_below: Vec<bool>,
     section: Vec<Option<usize>>,
+    /// See `Tree::wrapper_kids`.
+    wrapper_kids: std::cell::OnceCell<HashMap<(usize, &'a str), Vec<usize>>>,
 }
 
 impl<'a> Tree<'a> {
@@ -638,6 +640,7 @@ impl<'a> Tree<'a> {
             class: Vec::new(),
             has_landmark_below: Vec::new(),
             section: Vec::new(),
+            wrapper_kids: std::cell::OnceCell::new(),
         };
         tree.collapse();
         tree.classify();
@@ -1165,6 +1168,37 @@ impl<'a> Tree<'a> {
         }
     }
 
+    /// For each printed node and ignored wrapper id, the node's printed
+    /// children that the capture recorded inside that wrapper, in order: a
+    /// printed child belongs when the record-tree child of the node holding
+    /// it lists the wrapper among its ignored ancestors. Built once, on a
+    /// filter's first use, in
+    /// one pass over the printed tree, so finding a wrapper's members costs
+    /// the wrapper's size rather than a scan of every sibling: a log page can
+    /// hold thousands of texts under one container, and a broad filter
+    /// matches most of them.
+    fn wrapper_kids(&self) -> &HashMap<(usize, &'a str), Vec<usize>> {
+        self.wrapper_kids.get_or_init(|| {
+            let mut index: HashMap<(usize, &'a str), Vec<usize>> = HashMap::new();
+            for (owner, kids) in self.kids.iter().enumerate() {
+                for &kid in kids {
+                    let Some(child) = self.child_holding(owner, kid) else {
+                        continue;
+                    };
+                    for wrapper in self.ignored_ancestors(child) {
+                        let members = index.entry((owner, wrapper.as_str())).or_default();
+                        // A wrapper listed twice in one chain still holds
+                        // the node once.
+                        if members.last() != Some(&kid) {
+                            members.push(kid);
+                        }
+                    }
+                }
+            }
+            index
+        })
+    }
+
     /// The row a matching leaf `matched` prints with when no ancestor in the
     /// printed tree makes one: the smallest ignored wrapper around it whose
     /// leaves include another leaf with a letter or digit, within
@@ -1198,15 +1232,11 @@ impl<'a> Tree<'a> {
             for wrapper in self.ignored_ancestors(node) {
                 // The wrapper's printed nodes: those of the owner's children
                 // that the capture recorded inside it.
-                let roots: Vec<usize> = self.kids[owner]
-                    .iter()
-                    .copied()
-                    .filter(|&kid| {
-                        self.child_holding(owner, kid)
-                            .is_some_and(|child| self.ignored_ancestors(child).contains(wrapper))
-                    })
-                    .collect();
-                let (texts, holds_chip) = self.leaf_row_of(&roots, matched)?;
+                let roots: &[usize] = self
+                    .wrapper_kids()
+                    .get(&(owner, wrapper.as_str()))
+                    .map_or(&[], Vec::as_slice);
+                let (texts, holds_chip) = self.leaf_row_of(roots, matched)?;
                 if !texts
                     .iter()
                     .any(|(leaf, text)| *leaf != matched && text.chars().any(char::is_alphanumeric))
@@ -1218,7 +1248,7 @@ impl<'a> Tree<'a> {
                     .copied()
                     .find(|&root| root == matched || self.child_holding(root, matched).is_some())?;
                 let row = if holds_chip {
-                    FilterRow::Members(roots.clone())
+                    FilterRow::Members(roots.to_vec())
                 } else {
                     FilterRow::Joined(
                         texts
@@ -1228,7 +1258,7 @@ impl<'a> Tree<'a> {
                             .join(" "),
                     )
                 };
-                return Some((anchor, roots, row));
+                return Some((anchor, roots.to_vec(), row));
             }
             self.leaf_row(owner, matched)?;
             node = owner;
