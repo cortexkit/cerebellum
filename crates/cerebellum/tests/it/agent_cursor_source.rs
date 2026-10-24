@@ -86,7 +86,7 @@ fn declarations_are_gated(source: &str, declaration: &str, gate: &str) -> bool {
 }
 
 #[test]
-fn display_capture_probe_module_and_exports_require_the_desk_probe_feature() {
+fn single_window_capture_probe_module_and_exports_require_the_desk_probe_feature() {
     let overlay = include_str!("../../../cerebellum-macos/src/cursor_overlay.rs");
     let lib = include_str!("../../../cerebellum-macos/src/lib.rs");
     for (source, declaration, gate) in [
@@ -140,17 +140,28 @@ fn display_capture_sources(directory: &Path, found: &mut Vec<String>) {
 }
 
 #[test]
-fn display_capture_exists_only_in_the_opt_in_probe_source() {
+fn display_capture_is_absent_and_the_probe_uses_production_single_window_capture() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cerebellum-macos/src");
     let mut sources = Vec::new();
     display_capture_sources(&root, &mut sources);
-    assert_eq!(
-        sources,
-        [root
-            .join("cursor_overlay/capture_probe.rs")
-            .to_string_lossy()
-            .into_owned()],
-        "display capture escaped the opt-in probe"
+    assert!(
+        sources.is_empty(),
+        "display capture is forbidden: {sources:?}"
+    );
+    let probe = source_scan::shipped_code(include_str!(
+        "../../../cerebellum-macos/src/cursor_overlay/capture_probe.rs"
+    ));
+    assert!(
+        probe.contains("capture_window("),
+        "probe must use production's window capture"
+    );
+    assert!(
+        probe.contains("content.windows()"),
+        "probe must check the unfiltered shareable window list"
+    );
+    assert!(
+        !probe.contains("SCScreenshotManager"),
+        "probe must not implement its own capture path"
     );
     // Exercise the same recursive scan with a callable selector in a nested
     // shipped module, not just in the historically used macos.rs file.

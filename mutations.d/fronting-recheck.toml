@@ -87,10 +87,10 @@ build_timeout_s = 1800
 
 [[control]]
 id = "desk-display-capture-refuses-leaked-pattern-pixels"
-guards = "the desk capture verdict refuses either private panel pattern even when its positive capture control succeeded"
-file = "crates/cerebellum-macos/src/cursor_overlay/capture_probe.rs"
-old = "    if protected != [0, 0] {"
-new = "    if false && protected != [0, 0] { // NON-VACUITY BREAK"
+guards = "the single-window desk verdict requires private panels to be unlisted and pattern-free or refused, with constructor sharing exclusion intact"
+file = "crates/cerebellum-macos/src/cursor_overlay/preview_window.rs"
+old = "        panel.setSharingType(NSWindowSharingType::None);"
+new = "        // NON-VACUITY BREAK: panel sharing exclusion removed"
 edits = []
 test_file = "crates/cerebellum-macos/src/cursor_overlay/capture_probe.rs"
 runner = "cargo"
@@ -99,7 +99,7 @@ target = "--lib"
 features = ["desk-probe"]
 platforms = ["macos"]
 select = "expected"
-expect_red = ["cursor_overlay::capture_probe::tests::display_capture_rejects_either_private_pattern_and_requires_a_visible_control"]
+expect_red = ["cursor_overlay::capture_probe::tests::single_window_capture_rejects_listed_or_leaking_panels_and_requires_a_visible_control"]
 only = false
 timeout_s = 600
 build_timeout_s = 1800

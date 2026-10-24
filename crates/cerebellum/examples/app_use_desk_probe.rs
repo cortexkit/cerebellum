@@ -866,11 +866,11 @@ mod desk {
     pub fn run(baseline: bool) -> i32 {
         if !baseline {
             match cerebellum_macos::probe_overlay_capture_exclusion() {
-                Ok(()) => {
-                    println!("PASS overlay_display_capture_excludes_preview_and_badge_patterns")
+                Ok(report) => {
+                    println!("PASS overlay_single_window_capture_excludes_preview_and_badge_patterns: {report}")
                 }
                 Err(reason) => {
-                    eprintln!("FAIL overlay_display_capture_excludes_preview_and_badge_patterns: {reason}");
+                    eprintln!("FAIL overlay_single_window_capture_excludes_preview_and_badge_patterns: {reason}");
                     return 1;
                 }
             }

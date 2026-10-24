@@ -1,6 +1,6 @@
 [[control]]
 id = "desk-display-capture-module-needs-explicit-feature"
-guards = "the manual display-capture probe is absent unless desk-probe is enabled"
+guards = "the manual single-window capture probe is absent unless desk-probe is enabled"
 file = "crates/cerebellum-macos/src/cursor_overlay.rs"
 old = "#[cfg(feature = \"desk-probe\")]\nmod capture_probe;"
 new = "mod capture_probe; // NON-VACUITY BREAK"
@@ -10,14 +10,14 @@ runner = "cargo"
 package = "cerebellum"
 target = "--test it"
 select = "expected"
-expect_red = ["agent_cursor_source::display_capture_probe_module_and_exports_require_the_desk_probe_feature"]
+expect_red = ["agent_cursor_source::single_window_capture_probe_module_and_exports_require_the_desk_probe_feature"]
 only = false
 timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
 id = "display-capture-cannot-escape-the-probe-source"
-guards = "a display-capture selector in any other macOS source is rejected"
+guards = "a display-capture selector in any macOS source is rejected, including the opt-in probe"
 file = "crates/cerebellum-macos/src/cursor_overlay/preview_window.rs"
 old = "use std::cell::{Cell, RefCell};"
 new = "use std::cell::{Cell, RefCell};\nconst _: () = { let _ = objc2_screen_capture_kit::SCContentFilter::initWithDisplay_excludingWindows; }; // NON-VACUITY BREAK"
@@ -27,7 +27,7 @@ runner = "cargo"
 package = "cerebellum"
 target = "--test it"
 select = "expected"
-expect_red = ["agent_cursor_source::display_capture_exists_only_in_the_opt_in_probe_source"]
+expect_red = ["agent_cursor_source::display_capture_is_absent_and_the_probe_uses_production_single_window_capture"]
 only = false
 timeout_s = 600
 build_timeout_s = 1800
