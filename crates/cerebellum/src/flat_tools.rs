@@ -1383,10 +1383,7 @@ mod tests {
             let application = computer.schema["properties"][field]["description"]
                 .as_str()
                 .unwrap();
-            assert!(
-                application.contains("com.apple.calculator on macOS"),
-                "{field}"
-            );
+            assert!(application.contains("com.apple.calculator on macOS"), "{field}");
         }
     }
 
