@@ -717,7 +717,19 @@ pub fn build_manifest_with_computer_plane(
     module_id: &str,
     context: &ComputerCapabilityAdvertisementContext,
 ) -> subc_protocol::manifest::ModuleManifest {
-    let mut manifest = manifest::build(module_id);
+    build_manifest_with_computer_plane_and_provenance(
+        module_id,
+        context,
+        manifest::build_provenance(),
+    )
+}
+
+fn build_manifest_with_computer_plane_and_provenance(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) -> subc_protocol::manifest::ModuleManifest {
+    let mut manifest = manifest::build_with_provenance(module_id, provenance);
     let (declarations, outcomes) = canonical_computer_declarations(context);
     let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
         &mut manifest.provides[0]
@@ -811,13 +823,65 @@ pub fn serialize_manifest_with_browser_configuration(
     )
 }
 
+/// The registration manifest for offline `--manifest` inspection, without startup.
+///
+/// Advertisement depends on embedded build/release bindings, the target platform,
+/// `SUBC_MODULE_ID`, and the read-only XDG cerebellum config. Missing, unreadable,
+/// or invalid config uses the no-config surface. Valid browser config is parsed
+/// but its executable is never probed: runtime executable-probe refusals and
+/// `browser_surface_refused` are therefore not reported here.
+///
+/// No permission preflight, launch-nonce read, store, journal, runtime, or daemon
+/// is needed. `provenance.launch_nonce_source` is omitted because launch delivery
+/// is a runtime fact. Permission/startup readings do not affect advertisement or
+/// `computer_plane_release`; that extension contains only compiled release facts.
+pub fn manifest_for_inspection() -> Value {
+    let module_id = std::env::var(SUBC_MODULE_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+    let browser = cerebellum_core::config::config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            parse_config(&text).ok()?;
+            browser_config::parse_browser_config(&text).ok().flatten()
+        })
+        .map_or(BrowserSurface::NotConfigured, BrowserSurface::Available);
+    let context = ComputerCapabilityAdvertisementContext {
+        inputs: compiled_release_inputs(),
+        permissions: Default::default(),
+        startup: StartupCapabilityProbe::default(),
+    };
+    compose_manifest(
+        &module_id,
+        &context,
+        &browser,
+        manifest::build_offline_provenance(),
+    )
+}
+
 fn serialize_manifest_with_computer_plane_configured(
     module_id: &str,
     context: &ComputerCapabilityAdvertisementContext,
     browser_surface: &BrowserSurface,
 ) -> Value {
+    compose_manifest(
+        module_id,
+        context,
+        browser_surface,
+        manifest::build_provenance(),
+    )
+}
+
+fn compose_manifest(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+    browser_surface: &BrowserSurface,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) -> Value {
     let browser_configured = matches!(browser_surface, BrowserSurface::Available(_));
-    let mut manifest = build_manifest_with_computer_plane(module_id, context);
+    let mut manifest =
+        build_manifest_with_computer_plane_and_provenance(module_id, context, provenance);
     if browser_configured {
         let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
             &mut manifest.provides[0]
@@ -12802,6 +12866,37 @@ mod tests {
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
             vec![ComputerGateOutcome::Pass; 15]
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
+        let context = ComputerCapabilityAdvertisementContext {
+            inputs: release_inputs_from_build_bindings(fully_bound_release_bindings()),
+            permissions: Default::default(),
+            startup: StartupCapabilityProbe::default(),
+        };
+        let provenance = subc_protocol::manifest::ManifestProvenance::new()
+            .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
+            .with_wire_crate_version(Some("0.32.4".to_string()));
+        let value = compose_manifest(
+            "manifest-fixture",
+            &context,
+            &BrowserSurface::NotConfigured,
+            Some(provenance),
+        );
+        // Captured from serialize_manifest_with_computer_plane_configured at
+        // c79079d1814dcfccefbb282b67db281b2975c72b with the same fixed inputs.
+        // Separate pins retain each platform's serialized HELLO-manifest bytes.
+        #[cfg(target_os = "linux")]
+        let expected = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
+        #[cfg(target_os = "macos")]
+        let expected = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
+        use sha2::Digest;
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
+            expected
         );
     }
 

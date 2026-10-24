@@ -83,6 +83,9 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
     expression.starts_with(&["std", "::", "env", "::", "current_exe", "(", ")"])
         || (path == "cerebellum/tests/conformance.rs"
             && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum"]))
+        // Offline CLI inspection launches the module fixture, never a browser.
+        || (path == "cerebellum/tests/manifest_flag.rs"
+            && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-manifest"]))
         || (path == "cerebellum/src/browser_launch_service.rs"
             && expression.starts_with(&[
                 "crate",
@@ -286,6 +289,19 @@ fn violations(path: &str, source: &str) -> Vec<String> {
         }
     }
     found
+}
+
+#[test]
+fn manifest_cli_fixture_is_narrowly_recognized() {
+    let module = r#"let binary = support::daemon_binary("ckdev-cerebellum-manifest", fixture); Command::new(&binary);"#;
+    let browser =
+        r#"let binary = support::daemon_binary("chromium", fixture); Command::new(&binary);"#;
+    assert!(violations("cerebellum/tests/manifest_flag.rs", module).is_empty());
+    assert_eq!(
+        violations("cerebellum/tests/manifest_flag.rs", browser).len(),
+        1
+    );
+    assert_eq!(violations("cerebellum/tests/other.rs", module).len(), 1);
 }
 
 #[test]
