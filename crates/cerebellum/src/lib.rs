@@ -12898,13 +12898,12 @@ mod tests {
             &BrowserSurface::NotConfigured,
             Some(provenance),
         );
-        // Captured from serialize_manifest_with_computer_plane_configured at
-        // c79079d1814dcfccefbb282b67db281b2975c72b with the same fixed inputs.
-        // Separate pins retain each platform's serialized HELLO-manifest bytes.
-        // The macOS manifest carries computer_use's description, so its pin
-        // follows that text: 33166b72… was captured with the newer description
-        // set, and this value is for the registered set restored by ac6d1e63.
-        // Re-applying that description set on this tree reproduces 33166b72….
+        // Fixed bytes, not computed by the code under test: the Linux pin was
+        // taken from the builder HELLO used before `--manifest` shared it, with
+        // these inputs. The macOS manifest also includes computer_use's
+        // description, so its pin changes whenever that text changes; when it
+        // does, confirm the old and new builders differ only by that text
+        // before taking the new value.
         #[cfg(target_os = "linux")]
         let expected = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
