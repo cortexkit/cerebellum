@@ -3648,7 +3648,7 @@ fn invalid_wait_predicate_request() -> Value {
         "outcome": "invalid_request",
         "field": "predicate",
         "reason": "invalid_predicate",
-        "remedy": "Use <kind> Identifier=<identifier> (for example, element_present Identifier=ready) or <kind> Role:Title=<role>:<title> (for example, element_present Role:Title=AXButton:Save on macOS). For element_enabled_is, put true or false before the selector; for element_value_equals, append => <expected text>. JSON strings containing the existing predicate object are also accepted.",
+        "remedy": "Use <kind> Identifier=<identifier> (for example, element_present Identifier=ready) or <kind> Role:Title=<role>:<title> (for example, element_present Role:Title=AXButton:Save). For element_enabled_is, put true or false before the selector; for element_value_equals, append => <expected text>. JSON strings containing the existing predicate object are also accepted.",
     })
 }
 
