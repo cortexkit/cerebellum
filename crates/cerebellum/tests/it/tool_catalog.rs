@@ -177,8 +177,9 @@ async fn catalog_matches_hello_and_digest_is_stable() {
             serde_json::to_value(&tool.modes).unwrap(),
             json!(["classic", "codemode", "flow"])
         );
-        // The wire name is pinned literally: a head renders content parts only
-        // for a tool whose catalog entry carries exactly this string.
+        // The wire name is pinned literally: a tool-result/v1 reader renders
+        // content parts only for a tool whose catalog entry carries exactly
+        // this string.
         assert_eq!(
             tool.result_format.as_ref().unwrap().as_str(),
             "tool-result/v1"
