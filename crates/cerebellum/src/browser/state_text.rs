@@ -119,7 +119,21 @@ pub struct NodeFacts {
     /// chrome landmarks (see [`landmark_class`]), so markup larger than the
     /// caller's `max_bytes` can be laid out main content first.
     pub dom_markup: Option<String>,
+    /// The accessibility node ids of the element's ignored ancestors,
+    /// innermost first, up to its nearest ancestor that has a record of its
+    /// own, at most [`MAX_IGNORED_ANCESTORS`] of them. Chrome ignores a
+    /// plain `<div>` or `<span>` with nothing to announce, so a line a page
+    /// draws from such wrappers (a JSON viewer's key and value) has no record
+    /// grouping its texts; these ids still say which texts share a wrapper.
+    /// Only a text filter's row search reads them (see
+    /// `Tree::ignored_group_row`).
+    pub ignored_ancestors: Vec<String>,
 }
+
+/// The most ignored ancestors [`NodeFacts::ignored_ancestors`] keeps for one
+/// element. A row is a few texts in a few wrappers, so the innermost sixteen
+/// hold any row a filter can print; a longer chain is cut at this many.
+pub const MAX_IGNORED_ANCESTORS: usize = 16;
 
 /// Which element a zoom asked for and which element of this capture it is.
 #[derive(Debug, Clone, Copy)]
@@ -535,6 +549,13 @@ enum FilterRow {
     /// The node's printed subtree, one element per line, each with the ref it
     /// has (see `Tree::row_block`).
     Block,
+    /// These sibling subtrees, printed one element per line in the place of
+    /// the node: an ignored wrapper's row holding a key chip, whose ref a
+    /// joined line would drop (see `Tree::ignored_group_row`).
+    Members(Vec<usize>),
+    /// Nothing: the node is part of a row an earlier sibling prints (see
+    /// `Tree::ignored_group_row`).
+    Covered,
 }
 
 enum Item {
@@ -947,7 +968,13 @@ impl<'a> Tree<'a> {
         if node == 0 || self.is_landmark(node) {
             return None;
         }
-        let mut pending = vec![node];
+        self.leaf_row_of(&[node], matched)
+    }
+
+    /// `leaf_row` over several sibling subtrees taken together, as one row:
+    /// the leaves of `roots`, in order, under the same refusals and bounds.
+    fn leaf_row_of(&self, roots: &[usize], matched: usize) -> Option<(Vec<(usize, String)>, bool)> {
+        let mut pending: Vec<usize> = roots.iter().rev().copied().collect();
         let mut texts = Vec::new();
         let mut bytes = 0;
         let mut leaves = 0;
@@ -1118,6 +1145,93 @@ impl<'a> Tree<'a> {
         Some(control && label && beside_match)
     }
 
+    /// The ignored ancestors the capture recorded for `node` (see
+    /// `NodeFacts::ignored_ancestors`); empty for a node without a ref.
+    fn ignored_ancestors(&self, node: usize) -> &'a [String] {
+        self.facts(node)
+            .map_or(&[][..], |facts| facts.ignored_ancestors.as_slice())
+    }
+
+    /// The child of `owner` (in the record tree) that holds `node`, or `node`
+    /// itself when it is one.
+    fn child_holding(&self, owner: usize, node: usize) -> Option<usize> {
+        let mut current = node;
+        loop {
+            let parent = self.parent[current]?;
+            if parent == owner {
+                return Some(current);
+            }
+            current = parent;
+        }
+    }
+
+    /// The row a matching leaf `matched` prints with when no ancestor in the
+    /// printed tree makes one: the smallest ignored wrapper around it whose
+    /// leaves include another leaf with a letter or digit, within
+    /// [`ROW_LEAVES`] and [`ROW_BYTES`]. Chrome ignores the plain `<div>` and
+    /// `<span>` elements a JSON viewer draws each property line from, so the
+    /// texts of every line (`"`, `event`, `":`, `"boat_start_timeout"`) hang
+    /// off the viewer's one container, which is far too large to be a row.
+    /// The ignored ancestors the capture keeps for each element (see
+    /// `NodeFacts::ignored_ancestors`) still say which of those texts one
+    /// line's wrapper held.
+    ///
+    /// Returns the printed node the row prints in place of (the one holding
+    /// the match, so a matched key keeps its ref), every printed node the
+    /// wrapper holds, and the row. A wrapper holding a key chip (see
+    /// `is_key_chip`) prints element by element so the chip keeps its ref.
+    ///
+    /// The search goes outward one wrapper at a time, from the match's own
+    /// wrappers to those of each recorded ancestor, and stops at the first
+    /// wrapper or ancestor `leaf_row` refuses (every further one is at least
+    /// as large), at a landmark, and at the page.
+    fn ignored_group_row(&self, matched: usize) -> Option<(usize, Vec<usize>, FilterRow)> {
+        let mut node = matched;
+        loop {
+            if node == 0 || self.is_landmark(node) {
+                return None;
+            }
+            let owner = self.parent[node]?;
+            for wrapper in self.ignored_ancestors(node) {
+                // The wrapper's printed nodes: those of the owner's children
+                // that the capture recorded inside it.
+                let roots: Vec<usize> = self.kids[owner]
+                    .iter()
+                    .copied()
+                    .filter(|&kid| {
+                        self.child_holding(owner, kid)
+                            .is_some_and(|child| self.ignored_ancestors(child).contains(wrapper))
+                    })
+                    .collect();
+                let (texts, holds_chip) = self.leaf_row_of(&roots, matched)?;
+                if !texts
+                    .iter()
+                    .any(|(leaf, text)| *leaf != matched && text.chars().any(char::is_alphanumeric))
+                {
+                    continue;
+                }
+                let anchor = roots
+                    .iter()
+                    .copied()
+                    .find(|&root| root == matched || self.child_holding(root, matched).is_some())?;
+                let row = if holds_chip {
+                    FilterRow::Members(roots.clone())
+                } else {
+                    FilterRow::Joined(
+                        texts
+                            .into_iter()
+                            .map(|(_, text)| text)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
+                };
+                return Some((anchor, roots, row));
+            }
+            self.leaf_row(owner, matched)?;
+            node = owner;
+        }
+    }
+
     /// Give each match a row to print with. A match inside a row block (see
     /// `row_block`) prints that whole block. Otherwise a matching leaf gets its
     /// nearest ancestor that `leaf_row` accepts and
@@ -1126,7 +1240,9 @@ impl<'a> Tree<'a> {
     /// first ancestor `leaf_row` rejects, and never goes past the nearest
     /// accepted one, because a larger ancestor can pull in neighbouring
     /// properties. A row holding the key's chip prints element by element, so
-    /// the chip keeps its ref and can still be clicked.
+    /// the chip keeps its ref and can still be clicked. A leaf that finds no
+    /// such ancestor may still print with the texts sharing an ignored wrapper
+    /// with it (see `ignored_group_row`).
     fn collect_filter_rows(
         &self,
         node: usize,
@@ -1135,9 +1251,14 @@ impl<'a> Tree<'a> {
         rows: &mut HashMap<usize, FilterRow>,
     ) {
         let matched = self.matches(node, filters);
+        if matches!(rows.get(&node), Some(FilterRow::Covered)) {
+            // An earlier match's row already prints this subtree.
+            return;
+        }
         if let Some(block) = matched.then(|| self.row_block(node, ancestors)).flatten() {
             rows.insert(block, FilterRow::Block);
         } else if self.kids[node].is_empty() && matched {
+            let mut found = false;
             for &ancestor in ancestors.iter().rev() {
                 let Some((texts, holds_chip)) = self.leaf_row(ancestor, node) else {
                     break;
@@ -1158,7 +1279,18 @@ impl<'a> Tree<'a> {
                         )
                     };
                     rows.insert(ancestor, row);
+                    found = true;
                     break;
+                }
+            }
+            if !found {
+                if let Some((anchor, roots, row)) = self.ignored_group_row(node) {
+                    for root in roots {
+                        if root != anchor {
+                            rows.insert(root, FilterRow::Covered);
+                        }
+                    }
+                    rows.insert(anchor, row);
                 }
             }
         }
@@ -1207,6 +1339,13 @@ impl<'a> Tree<'a> {
                 self.full_lines(node, depth, out);
                 return true;
             }
+            Some(FilterRow::Members(roots)) => {
+                for &root in roots {
+                    self.full_lines(root, depth, out);
+                }
+                return true;
+            }
+            Some(FilterRow::Covered) => return false,
             None => {}
         }
         let line = self.element_text(node, self.name_chars(node));
@@ -1724,6 +1863,12 @@ mod tests {
     /// wrapper per property. Each key is a click-to-filter chip: a button
     /// named `'event':` whose texts are `'`, `event` and `':`, which is why
     /// the key's text prints as `event`. Refs follow document order.
+    ///
+    /// Cloudflare's own viewer is not built this way: Chrome exposes its key
+    /// and value spans and each line wrapper as ignored nodes, and its keys
+    /// are no buttons (see `fixtures/json_viewer_real_tree.json` and
+    /// `ignored_wrapper_viewer`). These shapes still cover a viewer whose
+    /// keys are chips and whose lines are recorded.
     fn json_viewer(shape: ValueShape) -> Vec<AxRecord> {
         let mut records = Vec::new();
         let mut push = |depth: i64, role: &str, name: &str| {
@@ -1917,6 +2062,110 @@ mod tests {
         );
     }
 
+    /// A JSON viewer as Chrome exposes it: each property line and its key
+    /// and value spans are ignored nodes, so the texts of both lines hang off
+    /// one container, and only the facts' ignored ancestors (`line-N` the
+    /// property line, `key-N` and `value-N` its spans) say which texts share
+    /// a line. With `chip`, each key is a button whose texts are recorded
+    /// below it. Refs follow document order.
+    fn ignored_wrapper_viewer(chip: bool) -> (Vec<AxRecord>, HashMap<String, NodeFacts>) {
+        let mut records = Vec::new();
+        let mut facts = HashMap::new();
+        let mut push = |depth: i64, role: &str, name: &str, ignored: &[String]| {
+            let reference = format!("e{}", records.len() + 1);
+            records.push(record(depth, role, name, Some(&reference)));
+            if !ignored.is_empty() {
+                facts.insert(
+                    reference,
+                    NodeFacts {
+                        ignored_ancestors: ignored.to_vec(),
+                        ..NodeFacts::default()
+                    },
+                );
+            }
+        };
+        push(0, "RootWebArea", "Page", &[]);
+        push(1, "main", "", &[]);
+        push(2, "generic", "", &[]);
+        for (line, (key, value)) in [("status", "status_ok"), ("region", "eu")]
+            .into_iter()
+            .enumerate()
+        {
+            let key_span = [format!("key-{line}"), format!("line-{line}")];
+            if chip {
+                push(3, "button", &format!("\"{key}\":"), &key_span);
+                push(4, "StaticText", "\"", &[]);
+                push(4, "StaticText", key, &[]);
+                push(4, "StaticText", "\":", &[]);
+            } else {
+                push(3, "StaticText", "\"", &key_span);
+                push(3, "StaticText", key, &key_span);
+                push(3, "StaticText", "\":", &key_span);
+            }
+            push(
+                3,
+                "generic",
+                "",
+                &[format!("value-{line}"), format!("line-{line}")],
+            );
+            push(4, "StaticText", &format!("\"{value}\""), &[]);
+            push(4, "StaticText", ",", &[]);
+        }
+        (records, facts)
+    }
+
+    fn filtered_with(
+        records: &[AxRecord],
+        facts: &HashMap<String, NodeFacts>,
+        text: &str,
+    ) -> RenderedState {
+        render(&RenderInput {
+            records,
+            facts,
+            filters: &Filters {
+                text: Some(text.into()),
+                roles: Vec::new(),
+            },
+            page_url: "https://dash.cloudflare.com/",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 65_536,
+        })
+    }
+
+    /// A key whose line exists only as an ignored wrapper prints that line,
+    /// joined, under the key's own ref. The value's text matches too, and the
+    /// line prints once. Without the ignored ancestors each text prints
+    /// alone, as before: nothing else marks where a line ends.
+    #[test]
+    fn a_text_filter_on_a_key_in_an_ignored_wrapper_prints_the_wrapper_line_once() {
+        let (records, facts) = ignored_wrapper_viewer(false);
+        let found = filtered_with(&records, &facts, "status");
+        assert_eq!(
+            body(&found),
+            "e1 page Page\n  e5 \" status \": \"status_ok\" ,\n"
+        );
+        assert!(found.printed_refs.contains("e5"));
+        assert_eq!(
+            body(&filtered_with(&records, &HashMap::new(), "status")),
+            "e1 page Page\n  e5 text status\n  e8 text \"status_ok\"\n"
+        );
+    }
+
+    /// A key chip inside an ignored line wrapper prints the line element by
+    /// element, so the chip keeps its ref, and the value matching too adds
+    /// nothing.
+    #[test]
+    fn a_key_chip_in_an_ignored_wrapper_prints_the_line_with_its_ref() {
+        let (records, facts) = ignored_wrapper_viewer(true);
+        let found = filtered_with(&records, &facts, "status");
+        assert_eq!(
+            body(&found),
+            "e1 page Page\n  e4 button \"status\":\n    e5 text \"\n    e6 text status\n    e7 text \":\n  e8 generic\n    e9 text \"status_ok\"\n    e10 text ,\n"
+        );
+        assert!(found.printed_refs.contains("e4"));
+        assert!(!found.text.contains("region"), "{}", found.text);
+    }
     fn zoomed(records: &[AxRecord], target: &str, max_bytes: usize) -> RenderedState {
         render(&RenderInput {
             records,

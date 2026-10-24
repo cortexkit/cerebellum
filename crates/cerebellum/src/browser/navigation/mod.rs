@@ -220,6 +220,10 @@ struct PendingAxNode {
     depth: usize,
     frame_path: Vec<String>,
     ancestors: HashSet<String>,
+    /// The node ids of this node's ignored ancestors, innermost first, up to
+    /// its nearest ancestor that is not ignored; see
+    /// `NodeFacts::ignored_ancestors`.
+    ignored_ancestors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4402,6 +4406,7 @@ where
         depth: 0,
         frame_path: Vec::new(),
         ancestors: HashSet::new(),
+        ignored_ancestors: Vec::new(),
     }];
     let mut records = Vec::new();
     let mut refs = Vec::new();
@@ -4484,12 +4489,16 @@ where
                         classification: Err(ClassificationUnavailable::NotCaptured),
                     });
                     *nth = nth.saturating_add(1);
-                    if !node.states.is_empty() || node.url.is_some() {
+                    if !node.states.is_empty()
+                        || node.url.is_some()
+                        || !pending.ignored_ancestors.is_empty()
+                    {
                         facts.insert(
                             ref_name.clone(),
                             NodeFacts {
                                 states: node.states.clone(),
                                 url: node.url.clone(),
+                                ignored_ancestors: pending.ignored_ancestors.clone(),
                                 ..NodeFacts::default()
                             },
                         );
@@ -4632,6 +4641,17 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         selected.reverse();
+        // A child of an ignored node keeps that node and the ignored nodes
+        // above it as its ignored ancestors; a child of a recorded node has
+        // none, since that node's record already groups its children.
+        let child_ignored_ancestors: Vec<String> = if node.ignored {
+            std::iter::once(node.node_id.clone())
+                .chain(pending.ignored_ancestors.iter().cloned())
+                .take(state_text::MAX_IGNORED_ANCESTORS)
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (child_id, child) in selected {
             stack.push(PendingAxNode {
                 node: Some(child),
@@ -4642,6 +4662,7 @@ where
                 depth: pending.depth + usize::from(!node.ignored),
                 frame_path: frame_path.clone(),
                 ancestors: ancestors.clone(),
+                ignored_ancestors: child_ignored_ancestors.clone(),
             });
         }
     }
@@ -5228,6 +5249,69 @@ mod tests {
             frame_id,
         ))
         .unwrap()
+    }
+
+    /// A record's facts list its ignored ancestors innermost first, up to
+    /// its nearest recorded ancestor and at most `MAX_IGNORED_ANCESTORS` of
+    /// them, while the records, their depths and refs stay as without them.
+    #[test]
+    fn records_carry_their_ignored_ancestors_innermost_first_capped() {
+        let wrappers = state_text::MAX_IGNORED_ANCESTORS + 4;
+        let mut nodes: HashMap<String, RawAxNode> = HashMap::new();
+        nodes.insert(
+            "root".into(),
+            raw_node("root", "RootWebArea", "Page", &["w0"], 1, Some("frame-own")),
+        );
+        for index in 0..wrappers {
+            let id = format!("w{index}");
+            let child = if index + 1 == wrappers {
+                "text".to_string()
+            } else {
+                format!("w{}", index + 1)
+            };
+            let mut node = ax_node(&id, "none", "", &[child.as_str()], 10 + index as u64, None);
+            node["ignored"] = Value::Bool(true);
+            nodes.insert(id, RawAxNode::from_value(&node).unwrap());
+        }
+        nodes.insert(
+            "text".into(),
+            raw_node("text", "StaticText", "deep", &[], 2, None),
+        );
+        let root = nodes["root"].clone();
+        let observation =
+            traverse_ax_tree(root, "target-own", MAX_AX_NODES, MAX_AX_DEPTH, |id, _| {
+                Ok(nodes[id]
+                    .child_ids
+                    .iter()
+                    .map(|child| nodes[child].clone())
+                    .collect())
+            })
+            .unwrap();
+        let shape: Vec<_> = observation
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.depth,
+                    record.role.as_str(),
+                    record.reference.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, "RootWebArea", Some("e1")),
+                (1, "StaticText", Some("e2"))
+            ]
+        );
+        let expected: Vec<String> = (0..wrappers)
+            .rev()
+            .take(state_text::MAX_IGNORED_ANCESTORS)
+            .map(|index| format!("w{index}"))
+            .collect();
+        assert_eq!(observation.facts["e2"].ignored_ancestors, expected);
+        assert!(!observation.facts.contains_key("e1"));
     }
 
     #[test]
@@ -7477,6 +7561,101 @@ mod tests {
             let found = filtered_fixture(&observation, &url, filter, 65_536);
             assert_eq!(found.text, golden, "text_filter {filter:?}");
         }
+    }
+
+    /// The JSON viewer on Cloudflare's Workers Observability page, captured
+    /// from Chrome for Testing (see `json_viewer_real_tree.html` beside the
+    /// capture): every key and value span and each `KeyValueNode` line is an
+    /// ignored node, so the line's texts hang off the viewer's one container.
+    const JSON_VIEWER_REAL_TREE: &str = include_str!("../fixtures/json_viewer_real_tree.json");
+
+    /// The capture taken through the same projection the person's Chrome
+    /// uses (`snapshot_from_capture`), which shares `traverse_ax_tree` with
+    /// the agent's own browser.
+    fn json_viewer_observation() -> (BrowserSnapshotObservation, String) {
+        let capture: Value = serde_json::from_str(JSON_VIEWER_REAL_TREE).unwrap();
+        let url = "https://dash.cloudflare.com/acct/workers/observability".to_string();
+        let observation = snapshot_from_capture(
+            capture["ax"]["nodes"].as_array().unwrap(),
+            capture["dom"].as_object().unwrap(),
+            "target-own",
+            capture["frameId"].as_str().unwrap(),
+            7,
+            &url,
+        )
+        .unwrap();
+        (observation, url)
+    }
+
+    #[test]
+    fn a_text_filter_on_a_key_in_the_captured_json_viewer_prints_its_line() {
+        let (observation, url) = json_viewer_observation();
+        let found = filtered_fixture(&observation, &url, "event", 65_536);
+        assert_eq!(
+            found.text,
+            include_str!("../fixtures/json_viewer_real_tree_filter_event.txt"),
+            "{}",
+            found.text
+        );
+        for line in found.text.lines().skip(1) {
+            let (reference, _) = line.trim_start().split_once(' ').unwrap();
+            if reference.starts_with('e') {
+                assert!(found.printed_refs.contains(reference), "{reference}");
+            }
+        }
+        // The joined line keeps the key's own ref.
+        let key = observation
+            .records
+            .iter()
+            .find(|record| record.reference.as_deref() == Some("e9"))
+            .unwrap();
+        assert_eq!(
+            (key.role.as_str(), key.name.as_str()),
+            ("StaticText", "event")
+        );
+        assert_eq!(
+            observation.facts["e9"].ignored_ancestors,
+            ["16", "14", "12"]
+        );
+    }
+
+    /// A match in a value, in a nested object, or on a key whose value is an
+    /// object: the value prints with its key under the value's ref, a nested
+    /// line holds only its own property, and a key opening an object prints
+    /// alone, since its only wrapper holding more is the whole viewer, over
+    /// the row bound.
+    #[test]
+    fn the_captured_json_viewer_rows_stay_one_property_line() {
+        let (observation, url) = json_viewer_observation();
+        let value = filtered_fixture(&observation, &url, "boat_start", 65_536);
+        let reference = ref_line(&value.text, "\" event \": \"boat_start_timeout\" ,")
+            .unwrap_or_else(|| panic!("{}", value.text));
+        let generic = observation
+            .records
+            .iter()
+            .position(|record| record.reference.as_deref() == Some(reference))
+            .unwrap();
+        assert_eq!(observation.records[generic].role, "generic");
+        assert_eq!(
+            observation.records[generic + 1].name,
+            "\"boat_start_timeout\""
+        );
+
+        let nested = filtered_fixture(&observation, &url, "requestId", 65_536);
+        assert!(
+            ref_line(&nested.text, "\" requestId \": \"8f2c1e0a9b7d4c36\" ,").is_some(),
+            "{}",
+            nested.text
+        );
+        assert!(!nested.text.contains("service"), "{}", nested.text);
+
+        let object = filtered_fixture(&observation, &url, "metadata", 65_536);
+        assert!(
+            ref_line(&object.text, "text $metadata").is_some(),
+            "{}",
+            object.text
+        );
+        assert!(!object.text.contains("requestId"), "{}", object.text);
     }
 
     /// A GitHub-like list of installed apps: each row is an image, the app's
