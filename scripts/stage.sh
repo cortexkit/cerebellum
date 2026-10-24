@@ -192,6 +192,23 @@ if [ "$reported_tree" != "clean" ]; then
   exit 1
 fi
 
+# The placement gate runs `--manifest` under an empty home and refuses the card
+# when the build commit it reports differs from the declared revision, so the
+# declaration below is checked against the same answer, asked the same way.
+manifest_home="$(mktemp -d /tmp/cereb-manifest.XXXXXX)"
+manifest_rev="$(env -i HOME="$manifest_home" XDG_CONFIG_HOME="$manifest_home/config" \
+  XDG_DATA_HOME="$manifest_home/data" PATH=/usr/bin:/bin "$STAGE/$DEV_NAME" --manifest |
+  python3 -c 'import json, sys; print((json.load(sys.stdin).get("provenance") or {}).get("build_git_sha") or "")' ||
+  true)"
+rm -rf "$manifest_home"
+if [ "$manifest_rev" != "$HEAD_REV" ]; then
+  echo >&2
+  echo "REFUSING TO STAGE: --manifest reports build commit '${manifest_rev:-none}'," >&2
+  echo "                   the tree is on $HEAD_REV." >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
+
 # THE SIGNATURE GATE, and it checks the property v2 is about rather than the
 # fact that signing happened. A transitioned binary's designated requirement
 # names its identifier and a certificate; an ad-hoc one names a cdhash, which
@@ -239,10 +256,16 @@ esac
 # The fleet staging card. The placement gate reads `ck-<module>.current` to
 # learn which staged artifact the owner is handing over; without it the gate
 # infers the card from mtime, which nearly placed a superseded binary once.
-# One line, shasum-shaped (sha256, card name, UTC stamp), overwritten on every
-# stage so a superseded card is superseded here too. The card itself is copied
-# beside it and its digest re-read from those bytes at rest, so the line
-# describes the file the gate will open rather than the one this script built.
+# It is written in the gate's key form, overwritten on every stage so a
+# superseded card is superseded here too:
+#   stage=<the card's path>
+#   revision=<the commit the card was built from>
+#   declared_at=<UTC time>
+# The gate compares `revision=` with the card's own `--manifest` answer, and
+# takes the bytes' identity from the `.sha256` sidecar beside the card, whose
+# digest is re-read here from the copied bytes at rest. The gate refuses when
+# two declarations for one binary disagree, so the old `cerebellum.current`
+# spelling is removed.
 FLEET_STAGING="$HOME/.local/share/cortexkit/staging"
 CARD="$DEPLOYED_NAME.$(printf '%s' "$HEAD_REV" | cut -c1-8)"
 mkdir -p "$FLEET_STAGING"
@@ -250,12 +273,13 @@ cp "$STAGE/$DEPLOYED_NAME" "$FLEET_STAGING/$CARD"
 (cd "$FLEET_STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256" \
   && shasum -a 256 -c "$CARD.sha256" >/dev/null \
   && [ "$(cut -d' ' -f1 "$CARD.sha256")" = "$(cut -d' ' -f1 "$STAGE/$DEPLOYED_NAME.sha256")" ] \
-  && printf '%s  %s  %s\n' "$(cut -d' ' -f1 "$CARD.sha256")" "$CARD" "$(date -u +%Y%m%dT%H%M%SZ)" > "$DEPLOYED_NAME.current") || {
+  && rm -f "${DEPLOYED_NAME#ck-}.current" \
+  && printf 'stage=%s\nrevision=%s\ndeclared_at=%s\n' "$FLEET_STAGING/$CARD" "$HEAD_REV" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DEPLOYED_NAME.current") || {
   echo "REFUSING: the fleet staging card does not match the staged bytes" >&2
   exit 1
 }
-# The card's readable formats travel beside it. The declaration line in
-# `.current` keeps its shasum shape, since the placement gate parses it.
+# The card's readable formats travel beside it.
 cp "$STAGE/format-versions.json" "$FLEET_STAGING/$CARD.format-versions.json"
 
 echo
