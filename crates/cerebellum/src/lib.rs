@@ -6,6 +6,12 @@
 //! conformance tests.
 
 #![forbid(unsafe_code)]
+// Proving the route dispatcher's per-request worker future Send walks a very
+// deep future type. At the default limit of 128 that proof overflowed, and
+// under incremental compilation the overflowed and recomputed answers
+// disagreed, so rustc aborted with "unstable fingerprints for
+// evaluate_obligation" until the cache was cleaned.
+#![recursion_limit = "256"]
 
 pub mod agent_grants;
 pub mod authorization;
