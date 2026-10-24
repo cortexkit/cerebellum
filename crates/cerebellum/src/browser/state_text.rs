@@ -1188,7 +1188,10 @@ impl<'a> Tree<'a> {
     fn ignored_group_row(&self, matched: usize) -> Option<(usize, Vec<usize>, FilterRow)> {
         let mut node = matched;
         loop {
-            if node == 0 || self.is_landmark(node) {
+            if node == 0 {
+                return None;
+            }
+            if self.is_landmark(node) {
                 return None;
             }
             let owner = self.parent[node]?;
