@@ -15,7 +15,7 @@
 //! <!-- navigation omitted: 41.0 KB; zoom e12 -->
 //! ```
 //!
-//! Markup within the limit is returned exactly as it was read.
+//! Form field values are masked before layout, even when the markup fits.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -103,6 +103,23 @@ impl Part<'_> {
 /// outermost content and chrome landmarks the capture read the markup of;
 /// any that cannot be found in `markup` stay where they are.
 pub fn lay_out(markup: &str, landmarks: &[DomLandmark<'_>], max_bytes: usize) -> DomLayout {
+    // Both browser adapters use this boundary, including single-element zooms.
+    // Mask landmark copies too, so locating and reordering cannot reintroduce values.
+    let markup = super::dom_values::mask_field_values(markup);
+    let masked_landmarks: Vec<_> = landmarks
+        .iter()
+        .map(|landmark| super::dom_values::mask_field_values(landmark.markup))
+        .collect();
+    let landmarks: Vec<_> = landmarks
+        .iter()
+        .zip(&masked_landmarks)
+        .map(|(landmark, markup)| DomLandmark {
+            markup,
+            ..*landmark
+        })
+        .collect();
+    let landmarks = landmarks.as_slice();
+    let markup = markup.as_ref();
     if markup.len() <= max_bytes {
         return DomLayout {
             text: markup.to_string(),
@@ -423,5 +440,82 @@ pub(super) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dom_full_masks_typed_field_values_even_when_zooming_an_input() {
+        for markup in [
+            r#"<input type="password" value="planted-secret-4927">"#,
+            r#"<input type="text" value="planted-secret-4927">"#,
+            r#"<input value="planted-secret-4927">"#,
+            r#"<input autocomplete="cc-number" value="planted-secret-4927">"#,
+            r#"<textarea>planted-secret-4927</textarea>"#,
+        ] {
+            let layout = lay_out(markup, &[], usize::MAX);
+            assert!(
+                !layout.text.contains("planted-secret-4927"),
+                "{}",
+                layout.text
+            );
+            assert!(layout.text.contains("(hidden)"), "{}", layout.text);
+        }
+    }
+
+    #[test]
+    fn dom_full_masks_hidden_input_values() {
+        let layout = lay_out(
+            r#"<input type="hidden" value="planted-hidden-token-4927">"#,
+            &[],
+            usize::MAX,
+        );
+        assert_eq!(layout.text, r#"<input type="hidden" value="(hidden)">"#);
+    }
+
+    #[test]
+    fn dom_full_preserves_fixed_values_and_non_field_secrets() {
+        let markup = concat!(
+            r#"<input type="button" value="Button"><input type="submit" value="Submit">"#,
+            r#"<input type="reset" value="Reset"><input type="image" value="Image">"#,
+            r#"<input type="checkbox" value="yes"><input type="radio" value="one">"#,
+            r#"<script>const s = '<input value="planted-secret-4927">';</script>"#,
+            r#"<!-- <input value="planted-secret-4927"> -->"#,
+            "<p>planted-secret-4927</p>",
+        );
+        assert_eq!(lay_out(markup, &[], usize::MAX).text, markup);
+    }
+
+    #[test]
+    fn dom_full_masks_body_and_landmarks_before_budgeting_without_changing_refs() {
+        let main = r#"<main><input value="planted-secret-4927"><p>Main content</p></main>"#;
+        let navigation = format!("<nav>{}</nav>", "Navigation ".repeat(100));
+        let markup = format!("<body>{navigation}{main}</body>");
+        let landmarks = [
+            DomLandmark {
+                role: "navigation",
+                reference: "e2",
+                markup: &navigation,
+            },
+            DomLandmark {
+                role: "main",
+                reference: "e7",
+                markup: main,
+            },
+        ];
+        let full = lay_out(&markup, &landmarks, usize::MAX);
+        assert!(full.text.contains(r#"<input value="(hidden)">"#));
+        for budget in 0..markup.len() {
+            let layout = lay_out(&markup, &landmarks, budget);
+            assert!(layout.text.len() <= budget);
+            assert!(!layout.text.contains("planted-secret"), "{}", layout.text);
+        }
+        let layout = lay_out(&markup, &landmarks, 300);
+        assert!(
+            layout.text.starts_with("<!-- main e7 -->\n<main>"),
+            "{}",
+            layout.text
+        );
+        assert!(layout.text.contains(r#"<input value="(hidden)">"#));
+        assert!(layout.named_refs.contains("e7"));
+        assert!(layout.named_refs.contains("e2"));
     }
 }

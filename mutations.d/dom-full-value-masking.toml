@@ -1,0 +1,41 @@
+[[control]]
+id = "dom-full-shared-field-value-mask"
+guards = "dom_full masks typed field values even when a single input is zoomed and the markup fits the budget"
+file = "crates/cerebellum/src/browser/dom_layout.rs"
+old = "let markup = super::dom_values::mask_field_values(markup);"
+new = "let markup = Cow::Borrowed(markup); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/src/browser/dom_layout.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser::dom_layout::tests::dom_full_masks_typed_field_values_even_when_zooming_an_input"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub fn lay_out("
+before = "fn cut_point("
+
+[[control]]
+id = "dom-full-hidden-input-values-are-masked"
+guards = "hidden input values are masked rather than treated as fixed button values"
+file = "crates/cerebellum/src/browser/dom_values.rs"
+old = '["button", "submit", "reset", "image", "checkbox", "radio"]'
+new = '["button", "submit", "reset", "image", "checkbox", "radio", "hidden"] // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/cerebellum/src/browser/dom_layout.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["browser::dom_layout::tests::dom_full_masks_hidden_input_values"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn fixed_input_value("
+before = "fn raw_end("
