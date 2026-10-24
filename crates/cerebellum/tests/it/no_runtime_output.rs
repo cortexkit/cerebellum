@@ -17,12 +17,18 @@ const PRINT_MACROS: &[&str] = &["println!(", "print!(", "dbg!("];
 
 /// Prints allowed outside test code, as (path from the workspace root, the
 /// text of the line, the reason).
-const ALLOWED: &[(&str, &str, &str)] = &[(
-    "crates/cerebellum/src/main.rs",
-    "println!(",
-    "`--version`, the one output the module ships; it runs before the module \
-         starts and is read by the person who asked for it",
-)];
+const ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "crates/cerebellum/src/main.rs",
+        "println!(\"{version}\");",
+        "`--version` answers before module startup, for the person inspecting the binary",
+    ),
+    (
+        "crates/cerebellum/src/main.rs",
+        "println!(\"{manifest}\");",
+        "`--manifest` answers before module startup, for the placement gate inspecting the binary",
+    ),
+];
 
 #[test]
 fn shipped_code_prints_nothing() {

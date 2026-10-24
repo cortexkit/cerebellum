@@ -9,16 +9,26 @@
 /// staging asks the bytes it is about to publish what they are, and a binary
 /// that must first connect to a daemon could not answer during staging.
 fn print_version() {
-    println!(
+    let version = format!(
         "ck-cerebellum ({}) tree={}",
         env!("CEREBELLUM_BUILD_REV"),
         env!("CEREBELLUM_BUILD_TREE")
     );
+    println!("{version}");
+}
+
+fn print_manifest() {
+    let manifest = cerebellum::manifest_for_inspection();
+    println!("{manifest}");
 }
 
 fn main() -> Result<(), cerebellum::ModuleError> {
     if std::env::args().skip(1).any(|arg| arg == "--version") {
         print_version();
+        return Ok(());
+    }
+    if std::env::args().skip(1).any(|arg| arg == "--manifest") {
+        print_manifest();
         return Ok(());
     }
     if std::env::args().skip(1).any(|arg| arg == "--agent-cursor") {

@@ -276,13 +276,17 @@ pub fn build(module_id: &str) -> ModuleManifest {
 /// The block is therefore never absent. Absence on the wire reads as
 /// `unverifiable` -- the module made no claim at all -- and this module always
 /// has at least one honest fact to state.
-fn build_provenance() -> Option<ManifestProvenance> {
+pub(crate) fn build_provenance() -> Option<ManifestProvenance> {
+    // Launch delivery is a runtime fact, not part of an offline build inspection.
+    build_offline_provenance().map(|provenance| {
+        provenance.with_launch_nonce_source(crate::launch_nonce::provenance_source())
+    })
+}
+
+pub(crate) fn build_offline_provenance() -> Option<ManifestProvenance> {
     let rev = env!("CEREBELLUM_BUILD_REV");
     let tree = env!("CEREBELLUM_BUILD_TREE");
     let build_git_sha = attestable_commit(rev, tree);
-    // Where the launch nonce came from (the daemon's pipe or the environment
-    // copy) is a fact about this running process rather than the build, but
-    // provenance is where the daemon's census reads it.
     Some(
         ManifestProvenance::new()
             .with_build_git_sha_absence_reason(
@@ -291,8 +295,7 @@ fn build_provenance() -> Option<ManifestProvenance> {
                     .then(|| build_git_sha_absence_reason(rev, tree)),
             )
             .with_build_git_sha(build_git_sha)
-            .with_wire_crate_version(Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string()))
-            .with_launch_nonce_source(crate::launch_nonce::provenance_source()),
+            .with_wire_crate_version(Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string())),
     )
 }
 
@@ -400,6 +403,21 @@ fn self_signals() -> Vec<SelfSignalDeclaration> {
 }
 
 pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> ModuleManifest {
+    build_with_browser_config_and_provenance(module_id, browser_configured, build_provenance())
+}
+
+pub(crate) fn build_with_provenance(
+    module_id: &str,
+    provenance: Option<ManifestProvenance>,
+) -> ModuleManifest {
+    build_with_browser_config_and_provenance(module_id, false, provenance)
+}
+
+fn build_with_browser_config_and_provenance(
+    module_id: &str,
+    browser_configured: bool,
+    provenance: Option<ManifestProvenance>,
+) -> ModuleManifest {
     // Built through the builder rather than a struct literal: the manifest is
     // `#[non_exhaustive]` upstream precisely so a field added there does not
     // break every module's construction site at once. `protocol_ver` and
@@ -412,7 +430,7 @@ pub fn build_with_browser_config(module_id: &str, browser_configured: bool) -> M
     // it does not open. Absence is the honest form; an old daemon that still
     // decodes them treats absence as it treated the fabricated values.
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
-        .provenance(build_provenance())
+        .provenance(provenance)
         .self_signals(Some(self_signals()))
         .provides(vec![
             ProviderRole::ToolProvider {
