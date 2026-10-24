@@ -571,7 +571,9 @@ async fn late_results_declared_pull_renders_each_ending_without_changing_storage
         10,
         reserved("prefrontal-core"),
         false,
-        Some(vec!["content/v1".into()]),
+        Some(vec![
+            cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
+        ]),
     )
     .await;
     let rendered = read(&planes, 10, None, None).await;

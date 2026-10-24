@@ -1,7 +1,7 @@
 //! What a model reads after every `browser_use` and `computer_use` action, on a
-//! route that declares it reads content/v1 results.
+//! route that declares it reads tool-result/v1 results.
 //!
-//! A content/v1 reader shows the model only a reply's text and image parts;
+//! A tool-result/v1 reader shows the model only a reply's text and image parts;
 //! the operator ruled that no JSON may reach the model that way, and a reader
 //! that finds no text shows the structured copy as JSON instead. These tests
 //! drive each action through the production frame loop and the real handlers,
@@ -18,7 +18,7 @@ const CHANNEL: u16 = 7;
 const EPOCH: u32 = 1;
 
 /// Bind the test route as a session caller whose consumer declares that it
-/// reads content/v1 results (and can relay a consent question).
+/// reads tool-result/v1 results (and can relay a consent question).
 fn bind_content_reader(planes: &Planes) {
     planes.routes.insert(
         CHANNEL,
@@ -34,7 +34,7 @@ fn bind_content_reader(planes: &Planes) {
             })),
             Some(&[
                 "elicitation".to_string(),
-                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.to_string(),
+                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.to_string(),
             ]),
             &subc_protocol::RouteTarget::ToolProvider {
                 module_id: "cerebellum".to_string(),
@@ -55,7 +55,7 @@ fn request(corr: u64, tool: &str, arguments: Value) -> Frame {
     .unwrap()
 }
 
-/// Every reply a call produced, checked: each must be a valid content/v1
+/// Every reply a call produced, checked: each must be a valid tool-result/v1
 /// result whose text passes the model-view guard. Returns the decoded results
 /// so a test can also check what a particular reply says.
 #[derive(Default)]
@@ -75,7 +75,7 @@ impl Views {
         let result: Value = serde_json::from_slice(&frame.body).unwrap();
         let typed: cortexkit_role_tool_provider::result::ToolResult =
             serde_json::from_value(result.clone())
-                .unwrap_or_else(|error| panic!("{label}: not a content/v1 result: {error}"));
+                .unwrap_or_else(|error| panic!("{label}: not a tool-result/v1 result: {error}"));
         cortexkit_role_tool_provider::result::validate(&typed).unwrap();
         for problem in crate::tool_result::model_view_problems_for_action(&result, action) {
             self.failures.push(format!("{label}: {problem}"));

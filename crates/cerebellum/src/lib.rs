@@ -6374,7 +6374,7 @@ async fn handle_keyed_tool_request_inner(
                     let wants_content = tool_result::RESULT_BIND
                         .try_with(|binding| {
                             binding.as_ref().is_some_and(|(_, bind)| {
-                                cortexkit_role_tool_provider::consumer_reads_content_v1(
+                                cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
                                     bind.consumer_capabilities(),
                                 )
                             })
@@ -8343,19 +8343,19 @@ fn tool_response_frame(
         codemode::unsupported(body)
     };
     let force_content = body["outcome"] == "held_unsupported";
-    let content_v1 = tool_result::RESULT_BIND
+    let tool_result_v1 = tool_result::RESULT_BIND
         .try_with(|binding| {
             binding.as_ref().is_some_and(|(tool, bind)| {
                 matches!(
                     tool.as_str(),
                     flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE
-                ) && cortexkit_role_tool_provider::consumer_reads_content_v1(
+                ) && cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
                     bind.consumer_capabilities(),
                 )
             })
         })
         .unwrap_or(false);
-    let body = if content_v1 || force_content {
+    let body = if tool_result_v1 || force_content {
         tool_result::encode_with_held(body, held)?
     } else {
         if codemode::active() {
@@ -12913,6 +12913,39 @@ mod tests {
             format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
             expected
         );
+    }
+
+    /// A daemon linking subc-protocol 0.32.11 must keep accepting this module's
+    /// HELLO. The 0.32.12 and 0.33 wire crates added two manifest maps
+    /// (`operation_payload`, `role_declarations`) that the older parser does
+    /// not know; both are left out of the encoding while empty. Declaring
+    /// either one would send HELLO bytes the older daemon was never tested
+    /// against, so the HELLO manifest, with and without a browser, carries
+    /// neither key.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn hello_manifest_declares_no_map_an_older_daemon_does_not_know() {
+        let context = ComputerCapabilityAdvertisementContext {
+            inputs: release_inputs_from_build_bindings(fully_bound_release_bindings()),
+            permissions: Default::default(),
+            startup: StartupCapabilityProbe::default(),
+        };
+        for surface in [
+            BrowserSurface::NotConfigured,
+            BrowserSurface::Available(browser_surface_config()),
+        ] {
+            // The same builder `send_hello` places in the HELLO body.
+            let manifest =
+                serialize_manifest_with_computer_plane_configured("cerebellum", &context, &surface);
+            let keys: Vec<&String> = manifest.as_object().unwrap().keys().collect();
+            assert!(keys.iter().any(|key| *key == "provides"), "{keys:?}");
+            for newer in ["operation_payload", "role_declarations"] {
+                assert!(
+                    !keys.iter().any(|key| *key == newer),
+                    "HELLO manifest declares `{newer}`: {keys:?}"
+                );
+            }
+        }
     }
 
     /// Every external attestation bound, as a release build supplying all of

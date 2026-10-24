@@ -1,0 +1,62 @@
+[[control]]
+id = "tool-result-v1-body-needs-route-declaration"
+guards = "a tool reply is sent as a tool-result/v1 body only on a route whose bind declared tool-result/v1; every other route, including one that declares the retired content/v1 name, keeps the legacy body"
+file = "crates/cerebellum/src/lib.rs"
+old = """                ) && cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
+                    bind.consumer_capabilities(),
+                )"""
+new = """                ) && (true || cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
+                    bind.consumer_capabilities(),
+                )) // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/cerebellum/src/result_negotiation_tests.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "result_negotiation_tests::legacy_routes_match_main_reply_bytes_including_image",
+    "result_negotiation_tests::the_retired_content_v1_name_gets_the_legacy_body",
+    "result_negotiation_tests::unrelated_consumer_capabilities_do_not_enable_content",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "late-results-wrap-needs-route-declaration"
+guards = "late_results entries are wrapped as tool-result/v1 only for a route whose bind declared tool-result/v1"
+file = "crates/cerebellum/src/tool_provider.rs"
+old = "                let reads_content = cortexkit_role_tool_provider::consumer_reads_tool_result_v1("
+new = "                let reads_content = true || cortexkit_role_tool_provider::consumer_reads_tool_result_v1( // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/tests/it/late_results.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = [
+    "late_results::late_results_undeclared_pull_preserves_legacy_bytes",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800
+
+[[control]]
+id = "catalog-declares-tool-result-v1"
+guards = "both catalog tools declare result_format tool-result/v1, the only name a head renders as content parts"
+file = "crates/cerebellum/src/tool_provider.rs"
+old = "        definition.result_format = Some(ResultFormat::ToolResultV1);"
+new = "        definition.result_format = Some(ResultFormat::from(\"content/v1\".to_string())); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/cerebellum/tests/it/tool_catalog.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--test it"
+select = "expected"
+expect_red = [
+    "tool_catalog::catalog_matches_hello_and_digest_is_stable",
+]
+only = false
+timeout_s = 900
+build_timeout_s = 1800

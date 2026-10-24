@@ -116,7 +116,7 @@ fn run_bind(scope: ScopeStamp) -> ModuleControlRequest {
         identity: subc_protocol::BindIdentity::new("/untrusted/run", "run", "misleading-session"),
         admission_facts: None,
         consumer_capabilities: Some(vec![
-            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+            cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
         ]),
         target: subc_protocol::RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),

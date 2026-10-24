@@ -86,7 +86,7 @@ async fn bind_with_scope_mode(
         scope,
         call_mode,
         Some(vec![
-            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+            cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
         ]),
     )
     .await;
@@ -177,7 +177,12 @@ async fn catalog_matches_hello_and_digest_is_stable() {
             serde_json::to_value(&tool.modes).unwrap(),
             json!(["classic", "codemode", "flow"])
         );
-        assert_eq!(tool.result_format.as_ref().unwrap().as_str(), "content/v1");
+        // The wire name is pinned literally: a head renders content parts only
+        // for a tool whose catalog entry carries exactly this string.
+        assert_eq!(
+            tool.result_format.as_ref().unwrap().as_str(),
+            "tool-result/v1"
+        );
     }
     let composition = json!({"params":{},"composition":{"opaque":{"v":3}}});
     let composed = catalog(&planes, composition.clone()).await;
@@ -605,7 +610,7 @@ async fn codemode_never_elicits_a_consent_card() {
         }),
         consumer_capabilities: Some(vec![
             "elicitation".into(),
-            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+            cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
         ]),
         scope: mode_scope(&CallMode::Codemode),
         admission_facts: Some(
@@ -681,7 +686,7 @@ async fn classic_still_elicits_a_consent_card() {
         }),
         consumer_capabilities: Some(vec![
             "elicitation".into(),
-            cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+            cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
         ]),
         scope: Some(super::support::computer::cingulate::stamp("catalog-test")),
         admission_facts: Some(
@@ -737,7 +742,7 @@ async fn call_members_cannot_enable_a_result_reader() {
         &planes,
         9,
         json!({"name":"browser_use",
-        "arguments":{"action":"status"}, "consumer_capabilities":[cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY]}),
+        "arguments":{"action":"status"}, "consumer_capabilities":[cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY]}),
     )
     .await;
     assert_eq!(response.header.ty, FrameType::Response);
@@ -761,7 +766,7 @@ async fn keyed_replays_use_the_current_routes_result_reader() {
         let declaration = |reads| {
             if reads {
                 Some(vec![
-                    cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()
+                    cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 ])
             } else {
                 None

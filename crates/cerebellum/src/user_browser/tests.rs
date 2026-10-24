@@ -4030,19 +4030,20 @@ async fn snapshot_accepts_wait_none_and_refuses_wait_settle_by_name() {
 /// The settlement note in a person's-browser read's text projection.
 const SETTLEMENT_NOTE: &str = "Page settlement was not confirmed.";
 
-/// Make channel 1's reader declare content/v1, so its replies arrive as the
+/// Make channel 1's reader declare tool-result/v1, so its replies arrive as the
 /// model reads them: text parts plus the structured reply.
-fn read_content_v1(fixture: &Fixture) {
+fn read_tool_result_v1(fixture: &Fixture) {
     let mut facts = fixture.planes.routes.get(1, 1).unwrap();
-    facts.consumer_capabilities = vec![cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into()];
+    facts.consumer_capabilities =
+        vec![cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into()];
     fixture.planes.routes.insert(1, 1, facts);
 }
 
-/// A content/v1 reply's text parts, joined.
+/// A tool-result/v1 reply's text parts, joined.
 fn content_text(result: &Value) -> String {
     result["content"]
         .as_array()
-        .unwrap_or_else(|| panic!("not a content/v1 reply: {result}"))
+        .unwrap_or_else(|| panic!("not a tool-result/v1 reply: {result}"))
         .iter()
         .filter(|part| part["type"] == "text")
         .map(|part| part["text"].as_str().unwrap())
@@ -4063,7 +4064,7 @@ fn without_snapshot_identity(reply: &Value) -> Value {
 #[tokio::test]
 async fn the_settlement_note_prints_on_a_tabs_first_read_after_each_claim() {
     let fixture = Fixture::new();
-    read_content_v1(&fixture);
+    read_tool_result_v1(&fixture);
     let claim = json!({"browser":"user","action":"claim_tab","tab":"handed"});
     let (claimed, _) = fixture.call(1, claim.clone(), "allow_30m").await;
     let tab = claimed["structuredContent"]["tab"]
@@ -4137,7 +4138,7 @@ async fn a_legacy_reader_gets_the_same_raw_reply_on_every_read_of_a_tab() {
 #[tokio::test]
 async fn concurrent_reads_omit_the_note_only_on_a_tabs_second_read() {
     let fixture = Fixture::new();
-    read_content_v1(&fixture);
+    read_tool_result_v1(&fixture);
     fixture.state.lock().unwrap().tabs.insert(
         "handed-two".into(),
         DoubleTab {

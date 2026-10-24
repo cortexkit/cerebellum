@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::test_support::HANG_GUARD;
-use cortexkit_role_tool_provider::{result, CONTENT_V1_CAPABILITY, HELD_REPLY_V1};
+use cortexkit_role_tool_provider::{result, HELD_REPLY_V1, TOOL_RESULT_V1_CAPABILITY};
 use std::sync::atomic::Ordering;
 
 fn vectors() -> Value {
@@ -28,7 +28,7 @@ async fn bind_held(planes: &Planes) {
         ..
     } = &mut bind
     {
-        *consumer_capabilities = Some(vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()]);
+        *consumer_capabilities = Some(vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()]);
     }
     assert_eq!(
         exchange(planes, 0, 2, serde_json::to_value(bind).unwrap())
@@ -206,7 +206,7 @@ async fn held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in
     }
     let reply = projected(
         facts,
-        vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
+        vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
         CallMode::Codemode,
         "tool.withdraw",
         true,
@@ -234,7 +234,7 @@ async fn production_held_replies_round_trip_published_vectors() {
         let expected: result::ToolResult =
             serde_json::from_value(expected["body"].clone()).unwrap();
         result::validate(&expected).unwrap();
-        let reply = projected(facts.clone(), vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()], CallMode::Codemode, "browser_use", true,
+        let reply = projected(facts.clone(), vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()], CallMode::Codemode, "browser_use", true,
             json!({"outcome":outcome,"ask_id":"opaque-ask","origin":"https://example.com","expires_in_ms":60000})).await;
         assert_held(&reply, &expected.held.unwrap().reason);
         assert_eq!(reply["held"]["detail"]["expires_in_ms"], 60000);
@@ -271,7 +271,7 @@ async fn declared_terminal_refusals_never_hold() {
     ] {
         let reply = projected(
             facts.clone(),
-            vec![CONTENT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
+            vec![TOOL_RESULT_V1_CAPABILITY.into(), HELD_REPLY_V1.into()],
             CallMode::Codemode,
             "browser_use",
             true,
@@ -614,7 +614,7 @@ async fn replay_negotiates_held_again_for_the_current_route() {
     );
     for declares_held in [false, true] {
         let mut facts = planes.routes.get(9, 3).unwrap();
-        facts.consumer_capabilities = vec![CONTENT_V1_CAPABILITY.into()];
+        facts.consumer_capabilities = vec![TOOL_RESULT_V1_CAPABILITY.into()];
         if declares_held {
             facts.consumer_capabilities.push(HELD_REPLY_V1.into());
         }

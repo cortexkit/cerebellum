@@ -34,7 +34,8 @@ async fn bind_run(fixture: &Fixture, held: bool) {
         .with_owner_authorized(true)
         .with_parent(Some(ScopeParent::new(core(), "card-tests", 1)))
         .with_parent_state(Some(ParentState::Linked));
-    let mut capabilities = vec![cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.to_string()];
+    let mut capabilities =
+        vec![cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.to_string()];
     if held {
         capabilities.push(cortexkit_role_tool_provider::HELD_REPLY_V1.into());
     }
@@ -127,7 +128,7 @@ fn start_run(fixture: &Fixture, args: Value, key: Option<&str>) -> Started {
     }
 }
 
-/// The user-browser reply inside the run's content-v1 tool result.
+/// The user-browser reply inside the run's tool-result/v1 result.
 fn structured(reply: &Value) -> &Value {
     &reply["structuredContent"]
 }

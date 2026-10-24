@@ -560,7 +560,7 @@ fn every_keys_outcome_survives_withholding() {
 }
 
 /// Every reply shape the inventories above build with the production
-/// builders, as a content/v1 reader would show it to a model: some plain
+/// builders, as a tool-result/v1 reader would show it to a model: some plain
 /// text, and no JSON object or array anywhere in that text. The frame-loop
 /// test in `model_view_tests` covers the replies only a live call produces.
 #[test]

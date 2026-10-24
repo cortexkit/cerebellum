@@ -241,7 +241,7 @@ pub(crate) fn encode_with_held(
         let bytes = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
         if bytes.len() < result::MAX_RESULT_BYTES {
             result::validate(&result).map_err(|problem| {
-                ModuleError::Message(format!("invalid content/v1 result: {problem}"))
+                ModuleError::Message(format!("invalid tool-result/v1 result: {problem}"))
             })?;
             return Ok(bytes);
         }
@@ -264,7 +264,7 @@ pub(crate) fn encode_with_held(
             // Invalid images were already described as undelivered in content.
             // Their original inline bytes must not bypass the total reply bound.
         } else {
-            let remedy = "the reply exceeds the content/v1 byte limit even without images; request a smaller state snapshot";
+            let remedy = "the reply exceeds the tool-result/v1 byte limit even without images; request a smaller state snapshot";
             result = ToolResult::new(vec![ContentPart::text(remedy)])
                 .with_structured_content(Map::from_iter([
                     ("outcome".into(), json!("result_too_large")),
@@ -275,7 +275,7 @@ pub(crate) fn encode_with_held(
     }
 }
 
-/// Why a content/v1 result would not give the model a plain view, or an
+/// Why a tool-result/v1 result would not give the model a plain view, or an
 /// empty list when it would. Two rules, both from how readers render a reply:
 ///
 /// * at least one text part says something, because a reader that finds no

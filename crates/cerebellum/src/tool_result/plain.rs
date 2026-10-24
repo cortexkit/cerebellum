@@ -1,6 +1,6 @@
 //! The words a model reads for one reply.
 //!
-//! A content/v1 reader shows the model only the reply's text and image parts;
+//! A tool-result/v1 reader shows the model only the reply's text and image parts;
 //! the full reply travels beside them as structured content for programs.
 //! Everything here therefore turns a reply object into plain sentences and
 //! compact `name: value` lines, and never into JSON: a model handed a JSON

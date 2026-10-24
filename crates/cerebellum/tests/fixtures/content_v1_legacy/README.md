@@ -19,10 +19,10 @@ reference-source copy was removed after capture.
 The current test installs actual route binds with neither `consumer_capabilities`
 nor `call_mode`, carries the accepted bind into the production response boundary,
 and sends the same payload through that boundary. The response boundary uses the
-contract library's `consumer_reads_content_v1` predicate. The test compares the
+contract library's `consumer_reads_tool_result_v1` predicate. The test compares the
 emitted bytes, not just parsed JSON, to these files. Separate conformance calls
 exercise the full `handle_frame_for_test` path with and without the
-`content/v1` bind declaration.
+`tool-result/v1` bind declaration.
 
 Captured SHA-256 values:
 
@@ -31,7 +31,7 @@ Captured SHA-256 values:
 - `computer_read_state.json`: `5f98fd10f96833db6ee166fcdb3e4e912fc7d8083cc0d95c4b32c6635bebd1f4`
 
 Do not regenerate these from the current projector. If `send_tool_response`
-accidentally encoded legacy callers' replies as content/v1, regenerating the
+accidentally encoded legacy callers' replies as tool-result/v1, regenerating the
 files would save those same incorrect bytes as the expectation and make the
 comparison pass. Keeping main's original bodies makes the test independent of
 the encoding branch it checks.
@@ -41,7 +41,13 @@ the encoding branch it checks.
 A provider sends the new body format only when the caller declares that it can
 decode it; otherwise the caller keeps the legacy body. This rule is defined in
 [`cortexkit-role-tool-provider` 0.7.3, CONTRACT.md §4.1](https://docs.rs/crate/cortexkit-role-tool-provider/0.7.3/source/CONTRACT.md).
-The relevant contract text is:
+The relevant contract text is quoted below. The format was named `content/v1`
+until `cortexkit-role-tool-provider` 0.13.0 renamed it `tool-result/v1`, with no
+alias; 0.13.0 CONTRACT.md §4.1 states the same rule under the new name. A route
+that still declares `content/v1` is now an undeclared route and gets these
+legacy bodies.
+
+The 0.7.3 text, under the old name:
 
 > A consumer that decodes `content/v1` result bodies declares the string
 > `content/v1` in its `route.open` `consumer_capabilities`. The daemon relays
