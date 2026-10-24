@@ -11,7 +11,7 @@ old = '''return private_content::send_reply(
             result,
         )
         .await;'''
-new = '''return send_tool_response(writer, ver, channel, epoch, corr, result).await; // NON-VACUITY BREAK'''
+new = "return send_tool_response(writer, ver, channel, epoch, corr, result).await; // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -37,7 +37,7 @@ old = '''private_content::send_reply(
                     result,
                 )
                 .await'''
-new = '''send_tool_response(writer, ver, channel, epoch, corr, result).await // NON-VACUITY BREAK'''
+new = "send_tool_response(writer, ver, channel, epoch, corr, result).await // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -61,7 +61,7 @@ old = '''private_content::send_reply(
                 result,
             )
             .await'''
-new = '''send_tool_response(writer, ver, channel, epoch, corr, result).await // NON-VACUITY BREAK'''
+new = "send_tool_response(writer, ver, channel, epoch, corr, result).await // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--test browser_own_golden"
@@ -76,8 +76,8 @@ build_timeout_s = 1200
 id = "private-content-only"
 guards = "metadata-only refusals do not mark a scope"
 file = "crates/cerebellum/src/private_content.rs"
-old = "if carries_content(reply)"
-new = "if true /* NON-VACUITY BREAK */"
+old = "let content = carries_content(reply)"
+new = "let content = true /* NON-VACUITY BREAK */ || carries_content(reply)"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -106,32 +106,16 @@ build_timeout_s = 1200
 
 [[control]]
 id = "private-head-inheritance"
-guards = "a run inherits its linked head's direct reads"
+guards = "a run's query includes the head of the run route it names"
 file = "crates/cerebellum/src/private_content.rs"
-old = ".chain(heads.iter().map(String::as_str))"
-new = ".chain(heads.iter().take(0).map(String::as_str)) /* NON-VACUITY BREAK */"
+old = ".filter(|stamp| stamp.scope_ref == scope)"
+new = ".filter(|stamp| false && stamp.scope_ref == scope) /* NON-VACUITY BREAK */"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
-expect_red = ["private_content_marks_tests::heads_mark_runs_but_runs_do_not_mark_siblings"]
-only = false
-timeout_s = 120
-build_timeout_s = 1200
-
-[[control]]
-id = "private-run-isolation"
-guards = "a run's own read never marks its head or a sibling"
-file = "crates/cerebellum/src/private_content.rs"
-old = ".map(|stamp| stamp.scope_ref.as_str())"
-new = ".map(|stamp| stamp.parent.as_ref().map_or(stamp.scope_ref.as_str(), |head| head.scope_ref.as_str())) /* NON-VACUITY BREAK */"
-runner = "cargo"
-package = "cerebellum"
-target = "--lib"
-test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
-select = "expected"
-expect_red = ["private_content_marks_tests::heads_mark_runs_but_runs_do_not_mark_siblings"]
+expect_red = ["private_content_marks_tests::run_marks_reach_their_head_and_its_other_runs"]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
@@ -140,8 +124,8 @@ build_timeout_s = 1200
 id = "private-reload"
 guards = "durable marks survive a store reload"
 file = "crates/cerebellum/src/private_content.rs"
-old = "Ok(document) => state.document = document,"
-new = "Ok(_document) => {} // NON-VACUITY BREAK"
+old = "                    state.document = document;"
+new = "                    let _ = document; // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -154,23 +138,23 @@ build_timeout_s = 1200
 
 [[control]]
 id = "private-unreadable-fails-closed"
-guards = "an unreadable marks store answers marked with every source"
+guards = "an unreadable store answers every query marked"
 file = "crates/cerebellum/src/private_content.rs"
-old = "let sources: BTreeSet<_> = if self.unreadable.load(Ordering::Acquire) {"
+old = "let sources: BTreeSet<_> = if state.fails_closed(now) {"
 new = "let sources: BTreeSet<_> = if false { // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
-expect_red = ["private_content_marks_tests::corrupt_store_fails_closed_until_a_successful_write_repairs_it"]
+expect_red = ["private_content_marks_tests::a_corrupt_store_is_never_written_over_and_stays_marked"]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
 
 [[control]]
 id = "private-retention"
-guards = "marks at least twenty-four hours old are pruned"
+guards = "run marks expire 24 hours after their latest read"
 file = "crates/cerebellum/src/private_content.rs"
 old = "now.saturating_sub(*timestamp) < RETENTION_MS"
 new = "now.saturating_sub(*timestamp) < u64::MAX /* NON-VACUITY BREAK */"
@@ -179,7 +163,7 @@ package = "cerebellum"
 target = "--lib"
 test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
 select = "expected"
-expect_red = ["private_content_marks_tests::entries_at_least_twenty_four_hours_old_are_pruned"]
+expect_red = ["private_content_marks_tests::run_marks_expire_after_a_day_but_head_marks_never_do"]
 only = false
 timeout_s = 120
 build_timeout_s = 1200
@@ -262,7 +246,7 @@ id = "private-format-floor"
 guards = "the marks writer raises its own registered format floor"
 file = "crates/cerebellum/src/private_content.rs"
 old = ".raise(PRIVATE_CONTENT_FORMAT)"
-new = ".raise(DurableFormat::new(\"private-content-broken-floor\", 1)) /* NON-VACUITY BREAK */"
+new = '.raise(DurableFormat::new("private-content-broken-floor", 1)) /* NON-VACUITY BREAK */'
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -335,7 +319,7 @@ old = '''private_content::mark_delivered(
                         &delivered,
                     )
                     .await;'''
-new = '''let _ = &delivered; // NON-VACUITY BREAK'''
+new = "let _ = &delivered; // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -350,8 +334,8 @@ build_timeout_s = 1200
 id = "private-hourly-refresh"
 guards = "a repeat mark within the hour of its persisted timestamp updates memory and writes nothing"
 file = "crates/cerebellum/src/private_content.rs"
-old = ".is_some_and(|saved| now.saturating_sub(*saved) < REFRESH_MS);"
-new = ".is_some_and(|saved| false && now.saturating_sub(*saved) < REFRESH_MS); // NON-VACUITY BREAK"
+old = "(Retention::Run, Some(saved)) => now.saturating_sub(*saved) >= REFRESH_MS,"
+new = "(Retention::Run, Some(_saved)) => true, // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -382,8 +366,8 @@ build_timeout_s = 1200
 id = "private-parent-union"
 guards = "a query naming the run's linked parent scope answers that parent's marks too"
 file = "crates/cerebellum/src/private_content.rs"
-old = "heads.push(parent.to_owned());"
-new = "let _ = parent; // NON-VACUITY BREAK"
+old = "        scopes.push(parent.to_owned());"
+new = "        let _ = parent; // NON-VACUITY BREAK"
 runner = "cargo"
 package = "cerebellum"
 target = "--lib"
@@ -411,6 +395,310 @@ expect_red = [
   "private_content_marks_tests::person_result_schema_has_no_unmarked_content_fields",
   "private_content_marks_tests::person_schema_guard_rejects_a_planted_title_field",
 ]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-run-marks-parent"
+guards = "a run's read also marks the parent its stamp names"
+file = "crates/cerebellum/src/private_content.rs"
+old = "            targets.push((parent.scope_ref.clone(), Retention::Head));"
+new = "            let _ = parent; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::run_marks_reach_their_head_and_its_other_runs"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-propagate-parent"
+guards = "a query naming a parent copies the run's marks to that parent"
+file = "crates/cerebellum/src/private_content.rs"
+old = "        planes.private_content.propagate(scope, parent, now);"
+new = "        let _ = (scope, now); // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_routeless_run_marks_the_parent_broca_names"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-run-retention-class"
+guards = "codemode runs and flows keep 24-hour marks, apart from head marks"
+file = "crates/cerebellum/src/private_content.rs"
+old = '''    if stamp.attributes.run_id.is_some()
+        || stamp.attributes.flow_id.is_some()
+        || stamp.kind == subc_protocol::scope::ScopeKind::Ephemeral
+    {'''
+new = "    if false { // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::run_marks_reach_their_head_and_its_other_runs"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-head-marks-never-expire"
+guards = "head marks are never pruned"
+file = "crates/cerebellum/src/private_content.rs"
+old = "    document.runs.retain(|_, sources| {"
+new = '''    document.heads.retain(|_, sources| { sources.retain(|_, t| now.saturating_sub(*t) < RETENTION_MS); !sources.is_empty() }); // NON-VACUITY BREAK
+    document.runs.retain(|_, sources| {'''
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::run_marks_expire_after_a_day_but_head_marks_never_do"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-never-overwrite-unread"
+guards = "a file whose marks were never read is not written over within a day of startup"
+file = "crates/cerebellum/src/private_content.rs"
+old = "Err(error) if self.state.lock().unwrap().load_failure_open(now) => {"
+new = "Err(error) if false && self.state.lock().unwrap().load_failure_open(now) => { // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_corrupt_store_is_never_written_over_and_stays_marked"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-retry-merges"
+guards = "a store readable on retry keeps the marks it held"
+file = "crates/cerebellum/src/private_content.rs"
+old = "                        state.document.merge(&loaded);"
+new = "                        let _ = &loaded; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_store_readable_on_retry_keeps_its_marks"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-inherited-marker"
+guards = "a marker left by a previous process answers everything marked"
+file = "crates/cerebellum/src/private_content.rs"
+old = "            state.inherited_until_ms = inherited;"
+new = "            state.inherited_until_ms = 0 * inherited; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = [
+  "private_content_marks_tests::a_crash_after_successful_writes_still_answers_marked",
+  "private_content_marks_tests::a_failed_write_still_answers_marked_after_a_restart",
+]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-marker-kept-after-failure"
+guards = "a clean shutdown keeps the marker after any failed write, even a repaired one"
+file = "crates/cerebellum/src/private_content.rs"
+old = "        if state.unpersisted || state.fails_closed(now) {"
+new = "        if state.fails_closed(now) { // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_stuck_write_releases_the_reply_at_its_deadline_and_fails_closed"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-marker-missing"
+guards = "a process that cannot write its marker answers everything marked"
+file = "crates/cerebellum/src/private_content.rs"
+old = "            state.marker_missing = !marker_written;"
+new = "            state.marker_missing = false && !marker_written; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_marker_that_cannot_be_written_fails_closed"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-shutdown-removes-marker"
+guards = "the shutdown teardown removes the marker after a clean run"
+file = "crates/cerebellum/src/lib.rs"
+old = "                finished.0.private_content.shut_down_cleanly();"
+new = "                let _ = &finished.0.private_content; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_clean_shutdown_removes_the_marker_and_answers_normally"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-replay-own-browser"
+guards = "a replayed own-browser reply marks as a signed-in site whatever the receiving profile"
+file = "crates/cerebellum/src/private_content.rs"
+old = '''    } else if reply.get("context").is_some() {
+        ReplyPlane::OwnBrowserReplay'''
+new = '''    } else if reply.get("context").is_some() {
+        ReplyPlane::OwnBrowser // NON-VACUITY BREAK'''
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_replayed_own_browser_reply_marks_whatever_the_receiving_profile"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-desktop-default"
+guards = "every desktop reply marks unless it is a known content-free refusal"
+file = "crates/cerebellum/src/private_content.rs"
+old = "(content || !desktop_reply_is_content_free(reply)).then_some(Source::DesktopApp)"
+new = "content.then_some(Source::DesktopApp) /* NON-VACUITY BREAK */"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::desktop_replies_mark_unless_a_known_content_free_refusal"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-desktop-field-fence"
+guards = "an allowed desktop refusal with any other field marks"
+file = "crates/cerebellum/src/private_content.rs"
+old = "                || (allowed.contains(&field.as_str())"
+new = "                || (true /* NON-VACUITY BREAK */"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::desktop_replies_mark_unless_a_known_content_free_refusal"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-desktop-detail-fence"
+guards = "an allowed desktop refusal with any other detail field marks"
+file = "crates/cerebellum/src/private_content.rs"
+old = "            detail_allowed.contains(&field.as_str()) && !value.is_object()"
+new = "            true /* NON-VACUITY BREAK */ && !value.is_object()"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::desktop_replies_mark_unless_a_known_content_free_refusal"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-missing-login-record"
+guards = "a profile with no login record counts as possibly signed in"
+file = "crates/cerebellum/src/browser_signed_in.rs"
+old = ".is_none_or(|facts| {"
+new = ".is_some_and(|facts| { // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::own_content_from_a_profile_without_a_login_record_marks"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+[control.scope]
+after = "pub(crate) fn has_login_evidence("
+before = "/// Called only for an observed handoff login"
+
+[[control]]
+id = "private-unobserved-handoff"
+guards = "an unobserved handoff ending records its site as possibly signed in"
+file = "crates/cerebellum/src/browser_session.rs"
+old = '''        let _ = self
+            .signed_in
+            .record(&handoff.profile, &handoff.profile_name, &handoff.origin);'''
+new = "        let _ = handoff; // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/src/browser_session.rs"
+select = "expected"
+expect_red = ["browser_session::tests::an_unobserved_handoff_ending_counts_as_a_possible_login"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-fresh-profile-record"
+guards = "a newly created profile gets an explicit clean login record"
+file = "crates/cerebellum/src/browser_launch_service.rs"
+old = '''                &profile_uuid,
+                freshly_created,'''
+new = '''                &profile_uuid,
+                false, // NON-VACUITY BREAK'''
+runner = "cargo"
+package = "cerebellum"
+target = "--test browser_session_wire"
+test_file = "crates/cerebellum/tests/browser_session_wire.rs"
+select = "expected"
+expect_red = ["only_profile_creation_marks_signed_in_coverage_complete"]
+only = false
+timeout_s = 120
+build_timeout_s = 1200
+
+[[control]]
+id = "private-version-one-read"
+guards = "version 1 files are still read"
+file = "crates/cerebellum/src/private_content.rs"
+old = "        Some(1) => {"
+new = "        Some(0) => { // NON-VACUITY BREAK"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+test_file = "crates/cerebellum/tests/support/private_content_marks.rs"
+select = "expected"
+expect_red = ["private_content_marks_tests::a_version_one_store_is_read_and_rewritten_only_by_a_write"]
 only = false
 timeout_s = 120
 build_timeout_s = 1200

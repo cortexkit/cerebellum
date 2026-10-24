@@ -2015,6 +2015,8 @@ struct ShutdownTeardownState {
     user_browser: user_browser_bridge::UserBrowserBridge,
     sessions: browser_session::BrowserSessions,
     browser: Option<BrowserConfig>,
+    // Its in-use marker is removed last, once nothing more can be delivered.
+    private_content: Arc<private_content::PrivateContent>,
     idle_enforcer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     started: std::sync::atomic::AtomicBool,
     finished: tokio::sync::watch::Sender<bool>,
@@ -2037,6 +2039,7 @@ impl ShutdownTeardown {
         idle_enforcer: Option<tokio::task::JoinHandle<()>>,
         cursor: Option<computer_capability::cursor::Coordinator>,
         user_browser: user_browser_bridge::UserBrowserBridge,
+        private_content: Arc<private_content::PrivateContent>,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
@@ -2044,6 +2047,7 @@ impl ShutdownTeardown {
             user_browser,
             sessions,
             browser,
+            private_content,
             idle_enforcer: std::sync::Mutex::new(idle_enforcer),
             started: std::sync::atomic::AtomicBool::new(false),
             finished,
@@ -2079,6 +2083,10 @@ impl ShutdownTeardown {
                 if let Some(browser) = &finished.0.browser {
                     finished.0.sessions.teardown_all(browser);
                 }
+                // Serving has stopped, so no further reply can be delivered:
+                // a clean ending may now tell the next start that every mark
+                // reached disk. A crash never gets here and leaves the marker.
+                finished.0.private_content.shut_down_cleanly();
             });
         }
         // The sender lives as long as `self`, so this only returns once the
@@ -2248,6 +2256,7 @@ async fn run(
         idle_enforcer,
         planes_cursor(&planes),
         planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -2377,6 +2386,7 @@ where
         idle_enforcer,
         planes_cursor(&planes),
         planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
 }

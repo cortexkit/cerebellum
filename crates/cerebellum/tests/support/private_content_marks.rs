@@ -1,7 +1,7 @@
 //! Wire admission and the content-bearing reply boundary, without live apps.
 
 use crate::*;
-use private_content::{PrivateContent, ReplyPlane, Source};
+use private_content::{PrivateContent, ReplyPlane, Retention, Source};
 use subc_protocol::scope::{ParentState, ScopeAttributes, ScopeKind, ScopeParent, ScopeStamp};
 use subc_protocol::{Principal, RouteTarget};
 
@@ -484,16 +484,28 @@ async fn unreadable_login_history_marks_own_content() {
 #[tokio::test]
 async fn content_free_refusals_and_unknown_scopes_are_unmarked() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
-    for plane in [
-        ReplyPlane::PersonBrowser,
-        ReplyPlane::DesktopApp,
-        ReplyPlane::OwnBrowser,
-    ] {
+    for plane in [ReplyPlane::PersonBrowser, ReplyPlane::OwnBrowser] {
         reply(
             &planes,
             &scoped("refused", ScopeKind::Head),
             plane,
             json!({"outcome":"refused","reason":"no_grant"}),
+        )
+        .await;
+    }
+    // Desktop replies mark unless they are refusals known to carry no app text.
+    for payload in [
+        json!({"outcome":"screen_locked","reason":"screen_locked","remedy":"unlock"}),
+        json!({"outcome":"invalid_request","field":"app","reason":"empty_value"}),
+        json!({"outcome":"blocking_capacity_exhausted",
+            "detail":{"dispatched":false,"step":"read","call":"read_state"},"remedy":"retry"}),
+        json!({"outcome":"cancelled"}),
+    ] {
+        reply(
+            &planes,
+            &scoped("refused", ScopeKind::Head),
+            ReplyPlane::DesktopApp,
+            payload,
         )
         .await;
     }
@@ -504,8 +516,11 @@ async fn content_free_refusals_and_unknown_scopes_are_unmarked() {
     assert_eq!(query(&planes, "unknown").await["private_content"], false);
 }
 
+/// A run's output returns to its head, so a run's read marks the head too,
+/// and the head's other runs inherit the mark through it. A head's own read
+/// marks all its runs.
 #[tokio::test]
-async fn heads_mark_runs_but_runs_do_not_mark_siblings() {
+async fn run_marks_reach_their_head_and_its_other_runs() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
     let first = run(&planes, "run-one", 2);
     run(&planes, "run-two", 3);
@@ -520,8 +535,15 @@ async fn heads_mark_runs_but_runs_do_not_mark_siblings() {
         query(&planes, "run-one").await["sources"],
         json!(["desktop_app"])
     );
-    assert_eq!(query(&planes, "run-two").await["private_content"], false);
-    assert_eq!(query(&planes, "head").await["private_content"], false);
+    assert_eq!(
+        query(&planes, "head").await["sources"],
+        json!(["desktop_app"])
+    );
+    assert_eq!(
+        query(&planes, "run-two").await["sources"],
+        json!(["desktop_app"])
+    );
+    assert_eq!(query(&planes, "unrelated").await["private_content"], false);
     reply(
         &planes,
         &scoped("head", ScopeKind::Head),
@@ -531,23 +553,40 @@ async fn heads_mark_runs_but_runs_do_not_mark_siblings() {
     .await;
     assert_eq!(
         query(&planes, "run-two").await["sources"],
-        json!(["person_browser"])
-    );
-    assert_eq!(
-        query(&planes, "run-one").await["sources"],
         json!(["person_browser", "desktop_app"])
     );
-    reply(
-        &planes,
-        &first,
-        ReplyPlane::PersonBrowser,
-        json!({"state_text":"same source"}),
-    )
-    .await;
+    // The run keeps its own marks 24 hours; its head keeps them for life.
+    let document = {
+        let state = planes.private_content.state_for_test();
+        (state.0, state.1)
+    };
+    assert!(document.0.contains(&"head".to_owned()), "{document:?}");
+    assert!(document.1.contains(&"run-one".to_owned()), "{document:?}");
+}
+
+/// Broca names a run's parent even when the run has no Cerebellum route. The
+/// run's marks then reach that parent, and the parent's other runs inherit.
+#[tokio::test]
+async fn a_routeless_run_marks_the_parent_broca_names() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes
+        .private_content
+        .mark("routeless-run", Retention::Run, Source::DesktopApp)
+        .await;
+    assert_eq!(query(&planes, "named-head").await["private_content"], false);
+    let ask = |scope: &str| {
+        json!({"method":private_content::QUERY,"params":{
+            "scope_ref":scope, "parent_scope_ref":"named-head"
+        }})
+    };
+    let (_, answer) = wire(&planes, facts("broca"), ask("routeless-run")).await;
+    assert_eq!(answer["sources"], json!(["desktop_app"]));
     assert_eq!(
-        query(&planes, "run-one").await["sources"],
-        json!(["person_browser", "desktop_app"])
+        query(&planes, "named-head").await["sources"],
+        json!(["desktop_app"])
     );
+    let (_, sibling) = wire(&planes, facts("broca"), ask("sibling-run")).await;
+    assert_eq!(sibling["sources"], json!(["desktop_app"]));
 }
 
 #[tokio::test]
@@ -579,7 +618,7 @@ async fn linked_parent_marks_a_run_without_a_cerebellum_route() {
     );
     planes
         .private_content
-        .mark("broca-only-run", Source::DesktopApp)
+        .mark("broca-only-run", Retention::Run, Source::DesktopApp)
         .await;
     let (_, answer) = wire(
         &planes,
@@ -677,6 +716,7 @@ async fn marks_survive_reload_and_raise_the_format_floor() {
     .await;
     let bytes = std::fs::read(scratch.path()).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("not stored"));
+    planes.private_content.shut_down_cleanly();
     planes.private_content = Arc::new(durable_store(scratch.path()));
     assert_eq!(
         query(&planes, "durable").await["sources"],
@@ -688,7 +728,7 @@ async fn marks_survive_reload_and_raise_the_format_floor() {
     .unwrap();
     assert_eq!(
         floor.get(private_content::PRIVATE_CONTENT_FORMAT.name),
-        Some(&1)
+        Some(&2)
     );
     assert!(durable_formats::readable_formats().contains(&private_content::PRIVATE_CONTENT_FORMAT));
     assert!(cerebellum_core::format_floor::FLOOR_TREES.contains(&"private-content"));
@@ -721,11 +761,18 @@ async fn repeat_marks_write_only_when_new_or_an_hour_old() {
         counter.fetch_add(1, Ordering::SeqCst);
     }));
     let now = wall_clock_ms();
-    store.mark_at("repeat", Source::PersonBrowser, now).await;
+    store
+        .mark_at("repeat", Retention::Run, Source::PersonBrowser, now)
+        .await;
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     let first = std::fs::read(scratch.path()).unwrap();
     store
-        .mark_at("repeat", Source::PersonBrowser, now + 3_599_999)
+        .mark_at(
+            "repeat",
+            Retention::Run,
+            Source::PersonBrowser,
+            now + 3_599_999,
+        )
         .await;
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -738,7 +785,12 @@ async fn repeat_marks_write_only_when_new_or_an_hour_old() {
         json!(["person_browser"])
     );
     store
-        .mark_at("repeat", Source::PersonBrowser, now + 3_600_000)
+        .mark_at(
+            "repeat",
+            Retention::Run,
+            Source::PersonBrowser,
+            now + 3_600_000,
+        )
         .await;
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -746,7 +798,12 @@ async fn repeat_marks_write_only_when_new_or_an_hour_old() {
         "the persisted timestamp, not the last read, sets the hour"
     );
     store
-        .mark_at("repeat", Source::DesktopApp, now + 3_600_001)
+        .mark_at(
+            "repeat",
+            Retention::Run,
+            Source::DesktopApp,
+            now + 3_600_001,
+        )
         .await;
     assert_eq!(
         writes.load(Ordering::SeqCst),
@@ -754,19 +811,30 @@ async fn repeat_marks_write_only_when_new_or_an_hour_old() {
         "a new source writes immediately"
     );
     store
-        .mark_at("other", Source::PersonBrowser, now + 3_600_002)
+        .mark_at(
+            "other",
+            Retention::Run,
+            Source::PersonBrowser,
+            now + 3_600_002,
+        )
         .await;
     assert_eq!(
         writes.load(Ordering::SeqCst),
         4,
         "a new scope writes immediately"
     );
+    store.shut_down_cleanly_at(now + 3_600_002);
     let reloaded = Arc::new(durable_store(scratch.path()));
     *reloaded.write_hook.lock().unwrap() = Some(Arc::new(|| {
         panic!("reload must retain persisted timestamps")
     }));
     reloaded
-        .mark_at("repeat", Source::PersonBrowser, now + 3_600_003)
+        .mark_at(
+            "repeat",
+            Retention::Run,
+            Source::PersonBrowser,
+            now + 3_600_003,
+        )
         .await;
     assert_eq!(reloaded.health(), "loaded");
 }
@@ -896,26 +964,45 @@ async fn a_stuck_write_releases_the_reply_at_its_deadline_and_fails_closed() {
         .set_write_deadline(std::time::Duration::from_secs(30));
     planes
         .private_content
-        .mark("stuck", Source::PersonBrowser)
+        .mark("stuck", Retention::Head, Source::PersonBrowser)
         .await;
     assert_eq!(query(&planes, "unknown").await["private_content"], false);
+    let document: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
+    assert!(
+        document["heads"]["second"].get("desktop_app").is_some(),
+        "the repair wrote the mark whose own write timed out: {document}"
+    );
+    // A write failed in this process, so even a clean shutdown leaves the
+    // in-use marker and the next start answers everything marked.
+    planes.private_content.shut_down_cleanly();
     let mut reloaded = isolated_test_planes(&Arc::new(HealthState::new()));
     reloaded.private_content = Arc::new(durable_store(scratch.path()));
-    assert_eq!(
-        query(&reloaded, "second").await["sources"],
-        json!(["desktop_app"])
-    );
+    assert_eq!(query(&reloaded, "unknown").await["private_content"], true);
 }
 
+const ALL_SOURCES: [&str; 3] = ["person_browser", "desktop_app", "signed_in_site"];
+
+/// A store that could not be read at startup hides marks it cannot see. It is
+/// never written over; it answers everything marked until it loads, across
+/// restarts, and only a day after startup may a write replace it.
 #[tokio::test]
-async fn corrupt_store_fails_closed_until_a_successful_write_repairs_it() {
+async fn a_corrupt_store_is_never_written_over_and_stays_marked() {
     let scratch = Scratch::new();
-    std::fs::write(scratch.path(), b"not json").unwrap();
     let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    reply(
+        &planes,
+        &scoped("earlier", ScopeKind::Head),
+        ReplyPlane::PersonBrowser,
+        json!({"state_text":"private page"}),
+    )
+    .await;
+    planes.private_content.shut_down_cleanly();
+    std::fs::write(scratch.path(), b"not json").unwrap();
     planes.private_content = Arc::new(durable_store(scratch.path()));
     assert_eq!(
         query(&planes, "unknown").await,
-        json!({"private_content":true,"sources":["person_browser","desktop_app","signed_in_site"]})
+        json!({"private_content":true,"sources":ALL_SOURCES})
     );
     assert_eq!(planes.private_content.health(), "unreadable");
     let (tx, mut rx) = mpsc::channel(1);
@@ -933,30 +1020,92 @@ async fn corrupt_store_fails_closed_until_a_successful_write_repairs_it() {
     assert_eq!(health["metrics"]["privateContentStore"], "unreadable");
     reply(
         &planes,
-        &scoped("repaired", ScopeKind::Head),
+        &scoped("later", ScopeKind::Head),
+        ReplyPlane::DesktopApp,
+        json!({"state_text":"app"}),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(scratch.path()).unwrap(),
+        b"not json",
+        "a write must not replace a file whose marks were never read"
+    );
+    assert_eq!(
+        query(&planes, "earlier").await["sources"],
+        json!(ALL_SOURCES)
+    );
+    assert_eq!(planes.private_content.health(), "unreadable");
+    planes.private_content.shut_down_cleanly();
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    assert_eq!(
+        query(&planes, "earlier").await["sources"],
+        json!(ALL_SOURCES)
+    );
+    // A day after startup every run mark the file could hold has expired, so
+    // a write may finally replace it.
+    let day_later = wall_clock_ms() + 24 * 60 * 60 * 1000 + 1;
+    planes
+        .private_content
+        .mark_at("fresh", Retention::Head, Source::DesktopApp, day_later)
+        .await;
+    let document: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
+    assert_eq!(document["version"], 2, "{document}");
+}
+
+/// A store unreadable at startup that reads on a later attempt keeps every
+/// mark it held: the retry merges before writing.
+#[tokio::test]
+async fn a_store_readable_on_retry_keeps_its_marks() {
+    let scratch = Scratch::new();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    reply(
+        &planes,
+        &scoped("earlier", ScopeKind::Head),
+        ReplyPlane::PersonBrowser,
+        json!({"state_text":"private page"}),
+    )
+    .await;
+    planes.private_content.shut_down_cleanly();
+    let good = std::fs::read(scratch.path()).unwrap();
+    std::fs::write(scratch.path(), b"not json").unwrap();
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    std::fs::write(scratch.path(), &good).unwrap();
+    reply(
+        &planes,
+        &scoped("later", ScopeKind::Head),
         ReplyPlane::DesktopApp,
         json!({"state_text":"app"}),
     )
     .await;
     assert_eq!(planes.private_content.health(), "loaded");
-    planes.private_content = Arc::new(durable_store(scratch.path()));
     assert_eq!(query(&planes, "unknown").await["private_content"], false);
     assert_eq!(
-        query(&planes, "repaired").await["sources"],
+        query(&planes, "earlier").await["sources"],
+        json!(["person_browser"])
+    );
+    assert_eq!(
+        query(&planes, "later").await["sources"],
         json!(["desktop_app"])
     );
 }
 
+/// Head marks never expire: a head keeps what it read in its context for its
+/// whole life. Run marks lapse 24 hours after their latest read.
 #[tokio::test]
-async fn entries_at_least_twenty_four_hours_old_are_pruned() {
+async fn run_marks_expire_after_a_day_but_head_marks_never_do() {
     let scratch = Scratch::new();
     let now = wall_clock_ms();
+    let day = 24 * 60 * 60 * 1000;
     std::fs::write(
         scratch.path(),
-        serde_json::to_vec(&json!({"version":1,"scopes":{
-            "expired":{"person_browser":now - 24*60*60*1000},
-            "recent":{"desktop_app":now}
-        }}))
+        serde_json::to_vec(&json!({"version":2,
+            "heads":{"old-head":{"person_browser":now - 30 * day}},
+            "runs":{
+                "expired":{"person_browser":now - day},
+                "recent":{"desktop_app":now}
+            }
+        }))
         .unwrap(),
     )
     .unwrap();
@@ -967,12 +1116,58 @@ async fn entries_at_least_twenty_four_hours_old_are_pruned() {
         query(&planes, "recent").await["sources"],
         json!(["desktop_app"])
     );
+    assert_eq!(
+        query(&planes, "old-head").await["sources"],
+        json!(["person_browser"])
+    );
     planes
         .private_content
-        .mark("new", Source::SignedInSite)
+        .mark("new", Retention::Run, Source::SignedInSite)
         .await;
     let document: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
-    assert!(document["scopes"].get("expired").is_none());
+    assert!(document["runs"].get("expired").is_none(), "{document}");
+    assert!(document["heads"].get("old-head").is_some(), "{document}");
+}
+
+/// The first stored shape is read as it is and rewritten as version 2, with
+/// the floor raised, only by the first write: until then a build that reads
+/// only version 1 can still be swapped back in.
+#[tokio::test]
+async fn a_version_one_store_is_read_and_rewritten_only_by_a_write() {
+    let scratch = Scratch::new();
+    let now = wall_clock_ms();
+    let original =
+        serde_json::to_vec(&json!({"version":1,"scopes":{"v1-scope":{"desktop_app":now - 1000}}}))
+            .unwrap();
+    std::fs::write(scratch.path(), &original).unwrap();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    assert_eq!(
+        query(&planes, "v1-scope").await["sources"],
+        json!(["desktop_app"])
+    );
+    assert_eq!(std::fs::read(scratch.path()).unwrap(), original);
+    let floor_file = scratch.0.join("private-content/format-floor.json");
+    assert!(!floor_file.exists(), "opening must not raise the floor");
+    planes
+        .private_content
+        .mark("v2-scope", Retention::Run, Source::PersonBrowser)
+        .await;
+    let document: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
+    assert_eq!(document["version"], 2);
+    assert!(
+        document["heads"]["v1-scope"].get("desktop_app").is_some(),
+        "{document}"
+    );
+    assert!(
+        document["runs"]["v2-scope"].get("person_browser").is_some(),
+        "{document}"
+    );
+    let floor = cerebellum_core::format_floor::read_floors(&floor_file).unwrap();
+    assert_eq!(
+        floor.get(private_content::PRIVATE_CONTENT_FORMAT.name),
+        Some(&2)
+    );
 }
 
 #[tokio::test]
@@ -1082,14 +1277,6 @@ async fn images_nested_reads_and_intercepted_page_names_are_content() {
         reply(&planes, &scoped(scope, ScopeKind::Head), plane, payload).await;
         assert_eq!(query(&planes, scope).await["sources"], json!([source]));
     }
-    reply(
-        &planes,
-        &scoped("unreadable", ScopeKind::Head),
-        ReplyPlane::DesktopApp,
-        json!({"state_text":computer_capability::DIFF_UNREADABLE}),
-    )
-    .await;
-    assert_eq!(query(&planes, "unreadable").await["private_content"], false);
 }
 
 #[tokio::test]
@@ -1157,7 +1344,7 @@ async fn delivered_codemode_image_withholding_does_not_mark() {
                 private_content::send_reply(
                     &planes,
                     &facts,
-                    ReplyPlane::DesktopApp,
+                    ReplyPlane::PersonBrowser,
                     &tx,
                     (PROTOCOL_VERSION, 2, 1, 1),
                     json!({"image":{"data_b64":"pixels"}}),
@@ -1216,10 +1403,14 @@ async fn replay_and_withdraw_renew_marks_for_the_receiving_scope() {
         query(&planes, "receiving-run").await["sources"],
         json!(["person_browser"])
     );
+    // The receiving run's read also marks the head both runs belong to, so
+    // the original run now inherits it through that head.
     assert_eq!(
-        query(&planes, "original-run").await["private_content"],
-        false
+        query(&planes, "head").await["sources"],
+        json!(["person_browser"])
     );
+    let own_runs = || planes.private_content.state_for_test().1;
+    assert!(!own_runs().contains(&"original-run".to_owned()));
     for _ in 0..2 {
         handle_keyed_tool_request(
             request(
@@ -1234,8 +1425,268 @@ async fn replay_and_withdraw_renew_marks_for_the_receiving_scope() {
         let answer: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
         assert_eq!(answer["answer"], "completed");
     }
+    assert!(
+        own_runs().contains(&"original-run".to_owned()),
+        "the withdraw answer marks the run that received it"
+    );
+}
+
+fn marker(scratch: &Scratch) -> PathBuf {
+    scratch
+        .0
+        .join("private-content/private-content-running.json")
+}
+
+/// A reply delivered after a failed write must not answer unmarked after a
+/// restart that reads a file missing its mark, even after a clean shutdown.
+#[tokio::test]
+async fn a_failed_write_still_answers_marked_after_a_restart() {
+    let scratch = Scratch::new();
+    // A directory where the floor file goes makes every write fail.
+    std::fs::create_dir_all(scratch.0.join("private-content/format-floor.json")).unwrap();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    reply(
+        &planes,
+        &scoped("delivered", ScopeKind::Head),
+        ReplyPlane::PersonBrowser,
+        json!({"state_text":"private page"}),
+    )
+    .await;
+    assert!(!scratch.path().exists());
+    planes.private_content.shut_down_cleanly();
+    assert!(marker(&scratch).exists(), "a failed write keeps the marker");
+    planes.private_content = Arc::new(durable_store(scratch.path()));
     assert_eq!(
-        query(&planes, "original-run").await["sources"],
+        query(&planes, "delivered").await["sources"],
+        json!(ALL_SOURCES)
+    );
+    assert_eq!(planes.private_content.health(), "unclean_shutdown");
+}
+
+/// A process that ends without its shutdown teardown may have delivered marks
+/// it never wrote, so the next start answers everything marked for a day.
+#[tokio::test]
+async fn a_crash_after_successful_writes_still_answers_marked() {
+    let scratch = Scratch::new();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    reply(
+        &planes,
+        &scoped("written", ScopeKind::Head),
+        ReplyPlane::PersonBrowser,
+        json!({"state_text":"private page"}),
+    )
+    .await;
+    assert!(scratch.path().exists());
+    assert!(marker(&scratch).exists());
+    // No shutdown: the process died.
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    assert_eq!(
+        query(&planes, "unknown").await["sources"],
+        json!(ALL_SOURCES)
+    );
+    let day_later = wall_clock_ms() + 24 * 60 * 60 * 1000 + 1;
+    assert_eq!(
+        planes.private_content.answer(&["unknown"], day_later)["private_content"],
+        false,
+        "the window ends a day after the dead process started"
+    );
+}
+
+/// The module's shutdown teardown removes the marker when every mark reached
+/// disk, and the next start answers normally.
+#[tokio::test]
+async fn a_clean_shutdown_removes_the_marker_and_answers_normally() {
+    let scratch = Scratch::new();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    reply(
+        &planes,
+        &scoped("written", ScopeKind::Head),
+        ReplyPlane::PersonBrowser,
+        json!({"state_text":"private page"}),
+    )
+    .await;
+    let teardown = ShutdownTeardown::new(
+        planes.sessions.clone(),
+        None,
+        None,
+        None,
+        planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
+    );
+    teardown.run_or_join().await;
+    assert!(!marker(&scratch).exists());
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    assert!(marker(&scratch).exists(), "the new process wrote its own");
+    assert_eq!(planes.private_content.health(), "loaded");
+    assert_eq!(query(&planes, "unknown").await["private_content"], false);
+    assert_eq!(
+        query(&planes, "written").await["sources"],
         json!(["person_browser"])
+    );
+}
+
+/// Without its in-use marker a crash could not be noticed, so a process that
+/// cannot write one answers everything marked until it can.
+#[tokio::test]
+async fn a_marker_that_cannot_be_written_fails_closed() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(marker(&scratch).join("blocked")).unwrap();
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.private_content = Arc::new(durable_store(scratch.path()));
+    assert_eq!(planes.private_content.health(), "unreadable");
+    assert_eq!(
+        query(&planes, "unknown").await["sources"],
+        json!(ALL_SOURCES)
+    );
+}
+
+/// Retained replies are found by principal and call key alone, so a reply
+/// read through a signed-in profile can be replayed on a route whose own
+/// profile is clean. It still marks as a signed-in site.
+#[tokio::test]
+async fn a_replayed_own_browser_reply_marks_whatever_the_receiving_profile() {
+    use journal::call_records::{Begin, DispatchEvidence, ScopeIdentity, Settlement};
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    let mut signed_in = scoped("route-a", ScopeKind::Head);
+    signed_in.principal = principal("basal");
+    signed_in.identity.agent_project_id = "agent-a".into();
+    let mut clean = scoped("route-b", ScopeKind::Head);
+    clean.principal = principal("basal");
+    clean.identity.agent_project_id = "agent-b".into();
+    planes.routes.insert(2, 1, signed_in.clone());
+    planes.routes.insert(3, 1, clean.clone());
+    planes
+        .signed_in
+        .initialize_profile("agent-a", "default", "uuid-a", true)
+        .unwrap();
+    planes
+        .signed_in
+        .record("agent-a", "default", "https://accounts.example.com")
+        .unwrap();
+    // An explicit record of a fresh profile: known to hold no login.
+    planes
+        .signed_in
+        .initialize_profile("agent-b", "default", "uuid-b", true)
+        .unwrap();
+    let now = wall_clock_ms();
+    let Begin::Execute(ticket) = planes.calls.begin_scoped(
+        "reserved:basal",
+        "own-replay",
+        "conversation",
+        signed_in.scope.as_ref().map(ScopeIdentity::from_stamp),
+        now,
+    ) else {
+        panic!("new call")
+    };
+    let stored = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        2,
+        1,
+        1,
+        serde_json::to_vec(
+            &json!({"outcome":"ok","context":{"profile":"default"},"state_text":"signed-in page"}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    planes.calls.settle(
+        ticket,
+        Settlement::from_reply(
+            &stored,
+            DispatchEvidence {
+                committed: true,
+                ..Default::default()
+            },
+        ),
+        now,
+    );
+    let (tx, mut rx) = mpsc::channel(8);
+    handle_keyed_tool_request(
+        request(
+            3,
+            json!({"name":"browser_use","call_key":"own-replay","arguments":{"action":"snapshot"}}),
+        ),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    let delivered: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+    assert!(
+        delivered.to_string().contains("signed-in page"),
+        "{delivered}"
+    );
+    assert_eq!(
+        query(&planes, "route-b").await["sources"],
+        json!(["signed_in_site"])
+    );
+}
+
+/// The production desktop plane delivers replies that violate their schema
+/// unchanged, so app text can sit in any field. Only known content-free
+/// refusals stay unmarked.
+#[tokio::test]
+async fn desktop_replies_mark_unless_a_known_content_free_refusal() {
+    for (scope, payload) in [
+        (
+            "app-list",
+            json!({"outcome":"ok","apps":[{"name":"Secret Mail","bundle_id":"com.example.mail"}]}),
+        ),
+        (
+            "undeclared-field",
+            json!({"outcome":"ok","window_title":"Inbox - private"}),
+        ),
+        (
+            "refusal-with-app",
+            json!({"outcome":"refused","reason":"no_grant","matched_app":"Secret Mail"}),
+        ),
+        ("no-outcome", json!({"note":"anything"})),
+        (
+            "allowed-outcome-extra-field",
+            json!({"outcome":"screen_locked","reason":"screen_locked","matched_app":"Secret Mail"}),
+        ),
+        (
+            "allowed-outcome-extra-detail",
+            json!({"outcome":"permission_missing",
+                "detail":{"permission":"accessibility","state":"denied","app":"Secret Mail"}}),
+        ),
+    ] {
+        let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+        reply(
+            &planes,
+            &scoped(scope, ScopeKind::Head),
+            ReplyPlane::DesktopApp,
+            payload,
+        )
+        .await;
+        assert_eq!(
+            query(&planes, scope).await["sources"],
+            json!(["desktop_app"]),
+            "{scope}"
+        );
+    }
+}
+
+/// A readable login store with no record for the profile does not show the
+/// profile is clean: a login the agent made by itself is never recorded.
+#[tokio::test]
+async fn own_content_from_a_profile_without_a_login_record_marks() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    let mut facts = scoped("unrecorded", ScopeKind::Head);
+    facts.identity.agent_project_id = "unrecorded-agent".into();
+    reply(
+        &planes,
+        &facts,
+        ReplyPlane::OwnBrowser,
+        json!({"state_text":"page"}),
+    )
+    .await;
+    assert_eq!(
+        query(&planes, "unrecorded").await["sources"],
+        json!(["signed_in_site"])
     );
 }
