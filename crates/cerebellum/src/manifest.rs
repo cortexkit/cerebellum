@@ -277,7 +277,10 @@ pub fn build(module_id: &str) -> ModuleManifest {
 /// `unverifiable` -- the module made no claim at all -- and this module always
 /// has at least one honest fact to state.
 pub(crate) fn build_provenance() -> Option<ManifestProvenance> {
-    // Launch delivery is a runtime fact, not part of an offline build inspection.
+    // Where the launch nonce came from (the daemon's pipe or the environment
+    // copy) is a fact about this running process rather than the build, but
+    // provenance is where the daemon's census reads it. `--manifest` inspects
+    // the build without running it, so only the registered manifest adds it.
     build_offline_provenance().map(|provenance| {
         provenance.with_launch_nonce_source(crate::launch_nonce::provenance_source())
     })
