@@ -13,12 +13,16 @@ struct TestHome(std::path::PathBuf);
 
 impl TestHome {
     fn new() -> Self {
+        // Tests run in parallel threads of one process, and the clock can return
+        // the same reading to two of them, so a counter keeps each home distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cerebellum-manifest-home-{}-{unique}",
+            "cerebellum-manifest-home-{}-{unique}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir(&path).unwrap();
