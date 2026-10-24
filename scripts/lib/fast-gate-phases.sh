@@ -41,12 +41,21 @@ run_mac_clippy() {
     echo '==> SKIP: macOS clippy (no touched macOS package)'
     return 0
   fi
-  local package
+  local package probe=0
   local args=(--locked)
-  for package in "${packages[@]}"; do args+=(-p "$package"); done
+  for package in "${packages[@]}"; do
+    args+=(-p "$package")
+    case "$package" in cerebellum|cerebellum-computer|cerebellum-macos) probe=1 ;; esac
+  done
   args+=(--all-targets -- -D warnings)
   run_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings (macOS)" \
-    cargo clippy "${args[@]}"
+    cargo clippy "${args[@]}" || return 1
+  [ "$probe" -eq 1 ] || return 0
+  # The hand-run desk probe and its screen-capture check build only with the
+  # desk-probe feature, which no other phase enables. The probe uses much of
+  # the library, so any change to these packages can break it.
+  run_phase "cargo clippy --locked -p cerebellum --example app_use_desk_probe --features desk-probe -- -D warnings (macOS)" \
+    cargo clippy --locked -p cerebellum --example app_use_desk_probe --features desk-probe -- -D warnings
 }
 
 catalogue_check_needed() {

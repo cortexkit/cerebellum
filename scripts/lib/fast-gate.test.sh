@@ -277,8 +277,9 @@ from pathlib import Path
 import sys
 calls = Path(sys.argv[1]).read_text().splitlines()
 lint = calls.index('clippy --locked -p cerebellum --all-targets -- -D warnings')
+probe = calls.index('clippy --locked -p cerebellum --example app_use_desk_probe --features desk-probe -- -D warnings')
 tests = next(i for i, line in enumerate(calls) if line.startswith('test --locked -p cerebellum --lib'))
-assert lint < tests
+assert lint < probe < tests
 PY
     [ "$?" -eq 0 ] || exit 1
     printf 'fixture\n' >crates/cerebellum/src/lib.rs
@@ -306,6 +307,7 @@ PY
     FIXTURE_CLIPPY_STATUS=31 ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-lint-failure" 2>&1
     status=$?
     [ "$status" -ne 0 ] && ! grep -q '^test ' "$CALL_LOG" &&
+      ! grep -q 'desk-probe' "$CALL_LOG" &&
       grep -Fq '(macOS) (exit 31)' "$scratch/mac-lint-failure"
   )
 }
@@ -342,7 +344,7 @@ check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mo
 check 'catalogue and every anchored path select name checks, unrelated paths do not' catalogue_selection
 check 'catalogue anchors run where the runner is installed, NOT VERIFIED otherwise; names route to their platform' catalogue_routing
 check 'anchor, name-check, and catalogue-selection errors fail the gate' catalogue_refusals
-check 'Mac clippy precedes tests, fails fast, and excludes Linux-only changes' mac_clippy_pipeline
+check 'Mac clippy, then the desk-probe build, precede tests; a lint failure stops both; Linux-only changes skip them' mac_clippy_pipeline
 check 'default mode collects both halves and reports a runner connection failure' combined_mode
 check 'default mode preserves NOT VERIFIED from the Mac half' combined_skip
 check 'default mode refuses mismatched tree fingerprints and names both' combined_mismatch
