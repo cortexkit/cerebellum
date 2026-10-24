@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Workers Observability</title>
+<!--
+  A reproduction of the JSON viewer on Cloudflare's Workers Observability
+  page, built the way React builds it: every `"{key}":` is three adjacent
+  text nodes (`"`, the key, `":`), which `outerHTML` serializes as one
+  string, and no key or value span carries a listener of its own, because
+  React delegates clicks to its root. The class names and their rules are
+  the ones the live page's markup showed, reduced to the properties that
+  decide layout. `json_viewer_real_tree.json` is this page's accessibility
+  tree and DOM as Chrome for Testing's chrome-headless-shell captured them.
+-->
+<style>
+  .flex { display: flex; }
+  .inline-flex { display: inline-flex; }
+  .block { display: block; }
+  .inline-block { display: inline-block; }
+  .relative { position: relative; }
+  .absolute { position: absolute; }
+  .flex-1 { flex: 1 1 0%; }
+  .flex-shrink-0 { flex-shrink: 0; }
+  .min-w-0 { min-width: 0; }
+  .max-w-full { max-width: 100%; }
+  .items-center { align-items: center; }
+  .self-stretch { align-self: stretch; }
+  .leading-5 { line-height: 1.25rem; }
+  .h-full { height: 100%; }
+  .pl-4\.5 { padding-left: 1.125rem; }
+  .py-1 { padding-top: .25rem; padding-bottom: .25rem; }
+  .py-0\.5 { padding-top: .125rem; padding-bottom: .125rem; }
+  .rounded { border-radius: .25rem; }
+  .text-nowrap { white-space: nowrap; }
+  .break-all { word-break: break-all; }
+  .whitespace-pre-wrap { white-space: pre-wrap; }
+  .border-l-1 { border-left-width: 1px; border-left-style: dotted; }
+  .left-0 { left: 0; }
+  .top-full { top: 100%; }
+  .mt-1 { margin-top: .25rem; }
+  .h-5\.5 { height: 1.375rem; }
+  .hover\:cursor-pointer:hover { cursor: pointer; }
+  .string-light-color { color: #0a7d32; }
+  .number-light-color { color: #1750eb; }
+</style>
+</head>
+<body>
+<main>
+  <h2>Events</h2>
+  <div id="root"></div>
+</main>
+<script>
+  // React delegates every click to the root it renders into.
+  const root = document.getElementById('root');
+  root.addEventListener('click', () => {});
+
+  function el(tag, className, ...children) {
+    const node = document.createElement(tag);
+    if (className !== null) node.className = className;
+    for (const child of children) {
+      node.append(typeof child === 'string' ? document.createTextNode(child) : child);
+    }
+    return node;
+  }
+
+  const KEY = 'inline-block py-0.5 rounded hover:bg-blue-500/30 hover:cursor-pointer transition-colors duration-400 text-nowrap';
+  const VALUE = 'inline-block rounded py-0.5 hover:bg-blue-500/30 hover:cursor-pointer transition-colors duration-400 break-all';
+
+  // The dotted guide every line starts with.
+  function guide() {
+    return el('div', 'pl-4.5 py-1 my-[0.5px] self-stretch border-l-1 border-t-0 border-r-0 border-b-0 border-dotted border-neutral-300 dark:border-neutral-700');
+  }
+
+  // `<span>"{key}":</span>&nbsp;`: React renders the quote, the key and the
+  // closing quote with its colon as three text nodes.
+  function keyPart(key) {
+    return el('span', 'flex-shrink-0 block', el('span', KEY, '"', key, '":'), '\u00a0');
+  }
+
+  function valueText(value) {
+    return typeof value === 'number'
+      ? el('span', 'number-light-color whitespace-pre-wrap', String(value))
+      : el('span', 'string-light-color whitespace-pre-wrap', JSON.stringify(value));
+  }
+
+  // One KeyValueNode line holding a string or number value.
+  function leafLine(key, value, last) {
+    const node = el('div', 'flex h-full leading-5',
+      guide(),
+      keyPart(key),
+      el('span', 'flex-1 min-w-0 inline-flex items-center',
+        el('span', 'relative inline-block max-w-full',
+          el('span', VALUE, valueText(value), el('span', '', last ? '' : ',')),
+          el('span', 'absolute left-0 top-full mt-1 h-5.5 flex items-center'))));
+    node.dataset.sentryComponent = 'KeyValueNode';
+    return node;
+  }
+
+  // One KeyValueNode line opening a nested object, its lines, and the line
+  // closing it.
+  function objectLines(key, entries, last) {
+    const open = el('div', 'flex h-full leading-5', guide(), keyPart(key),
+      el('span', 'flex-1 min-w-0 inline-flex items-center', el('span', VALUE, '{')));
+    open.dataset.sentryComponent = 'KeyValueNode';
+    const body = el('div', 'pl-4.5', ...lines(entries));
+    const close = el('div', 'flex h-full leading-5', guide(), el('span', '', '}' + (last ? '' : ',')));
+    return [open, body, close];
+  }
+
+  function lines(entries) {
+    return entries.flatMap(([key, value], index) => {
+      const last = index === entries.length - 1;
+      return value !== null && typeof value === 'object'
+        ? objectLines(key, Object.entries(value), last)
+        : [leafLine(key, value, last)];
+    });
+  }
+
+  const event = [
+    ['event', 'boat_start_timeout'],
+    ['eventType', 'fetch'],
+    ['eventSize', 1840],
+    ['$metadata', { requestId: '8f2c1e0a9b7d4c36', service: 'boat-router', level: 'warn' }],
+    ['outcome', 'ok'],
+  ];
+  root.append(el('div', 'font-mono text-sm', el('div', null, '{'), ...lines(event), el('div', null, '}')));
+</script>
+</body>
+</html>

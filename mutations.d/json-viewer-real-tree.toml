@@ -1,0 +1,65 @@
+[[control]]
+id = "ignored-wrapper-bounds-a-filter-row"
+guards = "a text_filter match that no printed ancestor gives a row prints with the smallest ignored wrapper around it holding another word, so a key in Cloudflare's JSON viewer prints with its value"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "            if !found {"
+new = "            if false && !found { // NON-VACUITY BREAK: no ignored-wrapper rows"
+edits = []
+test_file = "crates/cerebellum/src/browser/state_text.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::navigation::tests::a_text_filter_on_a_key_in_the_captured_json_viewer_prints_its_line",
+  "browser::navigation::tests::the_captured_json_viewer_rows_stay_one_property_line",
+  "browser::state_text::tests::a_key_chip_in_an_ignored_wrapper_prints_the_line_with_its_ref",
+  "browser::state_text::tests::a_text_filter_on_a_key_in_an_ignored_wrapper_prints_the_wrapper_line_once",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "fn collect_filter_rows("
+before = "fn filtered_lines("
+
+[[control]]
+id = "covered-wrapper-members-print-once"
+guards = "a match inside a wrapper row an earlier match already prints adds no second row and cannot take that row's place"
+file = "crates/cerebellum/src/browser/state_text.rs"
+old = "        if matches!(rows.get(&node), Some(FilterRow::Covered)) {"
+new = "        if false && matches!(rows.get(&node), Some(FilterRow::Covered)) { // NON-VACUITY BREAK: revisit covered nodes"
+edits = []
+test_file = "crates/cerebellum/src/browser/state_text.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::state_text::tests::a_text_filter_on_a_key_in_an_ignored_wrapper_prints_the_wrapper_line_once",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "capture-keeps-ignored-ancestors"
+guards = "traverse_ax_tree gives each record's facts the ids of its ignored ancestors up to its nearest recorded ancestor, for both browsers"
+file = "crates/cerebellum/src/browser/navigation/mod.rs"
+old = "        let child_ignored_ancestors: Vec<String> = if node.ignored {"
+new = "        let child_ignored_ancestors: Vec<String> = if false && node.ignored { // NON-VACUITY BREAK: drop the chains"
+edits = []
+test_file = "crates/cerebellum/src/browser/navigation/mod.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = [
+  "browser::navigation::tests::a_text_filter_on_a_key_in_the_captured_json_viewer_prints_its_line",
+  "browser::navigation::tests::records_carry_their_ignored_ancestors_innermost_first_capped",
+  "browser::navigation::tests::the_captured_json_viewer_rows_stay_one_property_line",
+]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
