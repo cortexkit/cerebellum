@@ -5982,19 +5982,10 @@ async fn handle_control_request(
             } else {
                 None
             };
-            // A carrier may put any session id on a run bind. Construct its
-            // identity from the admitted head instead, without consulting that id.
-            let head_identity = head.as_ref().map(|head| {
-                subc_protocol::BindIdentity::new(
-                    head.identity.project_root.to_string_lossy().into_owned(),
-                    "codemode-head",
-                    head.identity.conversation_key.clone(),
-                )
-            });
             // Retain only facts from the accepted bind. Data-plane frames inherit
             // these facts by (channel, epoch); request bodies cannot replace them.
             let mut accepted_facts = AcceptedBindFacts::from_bind(
-                head_identity.as_ref().unwrap_or(&identity),
+                &identity,
                 principal.clone(),
                 admission_facts.as_ref(),
                 consumer_capabilities.as_deref(),
@@ -8820,7 +8811,7 @@ pub fn install_browser_test_bind(
     );
 }
 
-pub fn install_browser_compatibility_test_bind(
+pub fn install_browser_unattested_project_test_bind(
     route_bindings: &Arc<RouteBindings>,
     channel: u16,
     epoch: u32,

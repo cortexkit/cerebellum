@@ -2203,7 +2203,7 @@ async fn missing_operation_authority_has_no_launch_effects() {
 }
 
 #[tokio::test]
-async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
+async fn unattested_project_cannot_reach_profile_launch() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -2211,13 +2211,14 @@ async fn project_root_compatibility_fallback_cannot_reach_profile_launch() {
         cerebellum::JournalPersistence::Isolated,
     );
     planes.launch_service = Some(launcher.clone());
-    cerebellum::install_browser_compatibility_test_bind(&planes.routes, 9, 3);
+    cerebellum::install_browser_unattested_project_test_bind(&planes.routes, 9, 3);
 
     let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["outcome"], "authorization_denied", "{body}");
     assert_eq!(body["reason"], "agent_project_id_unattested", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
 }
 
 /// Open the data-plane route `invoke_existing` uses through a real
@@ -2839,7 +2840,6 @@ fn take_profile_custody_through_an_isolated_launch_service(data_home: &std::path
             // Durable, because a durable profile is the one the operator's
             // real registry keeps, so it is the one that must not land there.
             profile_disposition: ProfileDisposition::Durable,
-            project_root: std::path::PathBuf::from("/tmp"),
             origin: Default::default(),
         },
         // The bind validator refuses an empty principal before the registry
@@ -10005,7 +10005,6 @@ fn only_profile_creation_marks_signed_in_coverage_complete() {
             agent_project_id: "legacy-agent".into(),
             session_kind: SessionKind::Primary,
             profile_disposition: ProfileDisposition::Durable,
-            project_root: "/tmp".into(),
             origin: Default::default(),
         },
         principal: Some(subc_protocol::Principal::Direct),

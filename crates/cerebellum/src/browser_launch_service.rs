@@ -3183,7 +3183,7 @@ mod executable_identity_launch_tests {
         }
     }
 
-    fn accepted_facts(project_root: &Path) -> AcceptedBindFacts {
+    fn accepted_facts(_project_root: &Path) -> AcceptedBindFacts {
         AcceptedBindFacts {
             identity: RouteIdentity {
                 witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
@@ -3191,7 +3191,6 @@ mod executable_identity_launch_tests {
                 agent_project_id: "project-1".to_string(),
                 session_kind: SessionKind::Primary,
                 profile_disposition: ProfileDisposition::Durable,
-                project_root: project_root.to_path_buf(),
                 origin: Default::default(),
             },
             principal: None,

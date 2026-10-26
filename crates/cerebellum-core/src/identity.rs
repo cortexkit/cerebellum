@@ -10,8 +10,6 @@
 //! Profile resolution is policy only. This module intentionally does not open a
 //! browser, a profile registry, or profile storage.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{BindIdentity, Principal, RouteTarget};
@@ -120,14 +118,12 @@ pub struct RouteIdentity {
     /// The wire session-id (conversation-key), read verbatim from the bind.
     pub conversation_key: String,
     /// The durable profile owner, read verbatim from accepted bind facts.
+    /// Empty when no agent project was admitted.
     pub agent_project_id: String,
     /// The alfonso-core-stamped session kind.
     pub session_kind: SessionKind,
     /// The resolved profile disposition for this session kind.
     pub profile_disposition: ProfileDisposition,
-    /// The project root remains available as routing metadata, but is not used
-    /// when an admitted agentProjectId is present.
-    pub project_root: PathBuf,
     /// The request being served under this identity, marked when a plane
     /// commits a dispatch for it. A route's stored identity carries a detached
     /// one; the tool handler gives each request's copy its own.
@@ -158,7 +154,9 @@ impl RouteIdentity {
         admission_facts: Option<&Value>,
     ) -> Self {
         let conversation_key = identity.session.clone();
-        let agent_project_id = agent_project_id_from_facts(identity, admission_facts);
+        let agent_project_id = admitted_agent_project_id(admission_facts)
+            .unwrap_or_default()
+            .to_owned();
         let session_kind = session_kind_from_facts(admission_facts);
         let profile_disposition = ProfileDisposition::for_session_kind(session_kind);
         Self {
@@ -166,7 +164,6 @@ impl RouteIdentity {
             agent_project_id,
             session_kind,
             profile_disposition,
-            project_root: identity.project_root.clone(),
             witness: crate::dispatch_witness::DispatchWitness::detached(),
             origin: crate::journal::CallOriginRecord::Absent,
         }
@@ -174,6 +171,9 @@ impl RouteIdentity {
 
     /// Compute the logical profile key without opening profile storage.
     pub fn logical_profile_key(&self) -> Option<LogicalProfileKey> {
+        if self.agent_project_id.is_empty() {
+            return None;
+        }
         match self.profile_disposition {
             ProfileDisposition::Durable => {
                 Some((self.agent_project_id.clone(), "default".to_string()))
@@ -302,8 +302,7 @@ pub struct AcceptedBindFacts {
     /// admission facts carried `agentProjectId` (stamped by the daemon's
     /// configured carrier, never by the caller), or an authorized scope stamp
     /// admitted for this route named it as `agent_id` (see [`Self::flow_id`]).
-    /// The fallback that derives a project id from the caller's project root
-    /// never counts.
+    /// Caller-supplied bind metadata never counts.
     pub agent_project_id_attested: bool,
     /// Permits durable browser profiles and reading or offering standing browser
     /// and persistent application grants for the attested agent.
@@ -590,7 +589,6 @@ impl AcceptedBindFacts {
                 agent_project_id: String::new(),
                 session_kind: SessionKind::Ephemeral,
                 profile_disposition: ProfileDisposition::None,
-                project_root: self.identity.project_root.clone(),
                 witness: self.identity.witness.clone(),
                 origin: self.identity.origin.clone(),
             },
@@ -794,26 +792,6 @@ fn admitted_agent_project_id(facts: Option<&Value>) -> Option<&str> {
     fact(facts, "agentProjectId")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-}
-
-fn agent_project_id_from_facts(identity: &BindIdentity, facts: Option<&Value>) -> String {
-    admitted_agent_project_id(facts)
-        .map(ToOwned::to_owned)
-        // Old wire fixtures predate the admitted project id. Keeping a stable
-        // project-root fallback preserves those fixtures; admitted facts always win.
-        //
-        // SAFETY OF THIS FALLBACK IS NOT LOCAL. `project_root` arrives in
-        // `BindIdentity`, which the daemon relays verbatim from the caller, so a
-        // substituted value is caller-chosen rather than attested. What keeps that
-        // out of durable storage is that both durable paths refuse a bind whose
-        // facts are not daemon-attested BEFORE reading this field:
-        // `profile::StampedBindContext::validate` and `journal_pin`'s
-        // `validate_bind_facts` each require attested provenance and a present
-        // `agent_project_id`, with no substitution of their own. This value
-        // therefore reaches only policy resolution that opens no profile storage.
-        // Extending a compatibility path to durable state means reproducing those
-        // refusals, not reusing this fallback.
-        .unwrap_or_else(|| identity.project_root.to_string_lossy().into_owned())
 }
 
 fn admitted_session_kind(facts: Option<&Value>) -> Option<SessionKind> {
@@ -1128,7 +1106,7 @@ mod tests {
         bind.project_id = Some("pj-caller-claimed".to_string());
 
         let route = RouteIdentity::from_accepted_bind(&bind, &Some(Principal::Direct), None);
-        assert_ne!(route.agent_project_id, "pj-caller-claimed");
+        assert!(route.agent_project_id.is_empty());
 
         let accepted =
             AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
@@ -1257,8 +1235,7 @@ mod tests {
     /// from a nested object or under another spelling, possibly a different
     /// schema's `projectId`, would select a profile the carrier never named.
     /// Each misplaced id must leave the bind exactly as if the fact were absent:
-    /// unattested, refused by name, and falling back to the unattested project
-    /// root that durable storage refuses.
+    /// unattested, refused by name, and without a project or logical profile key.
     #[test]
     fn a_project_id_outside_the_root_camel_case_key_is_not_admitted() {
         let (absent, absent_refusal) = launch_refusal(serde_json::json!({
@@ -1266,6 +1243,8 @@ mod tests {
             "browserControlOperations": ["browser.launch"],
         }));
         assert!(!absent.agent_project_id_attested);
+        assert!(absent.identity.agent_project_id.is_empty());
+        assert_eq!(absent.identity.logical_profile_key(), None);
         assert_eq!(absent_refusal, Some("agent_project_id_unattested"));
 
         for (shape, facts) in [
@@ -1570,6 +1549,31 @@ mod tests {
         let route = RouteIdentity::from_bind(&identity, &None);
         assert_eq!(route.session_kind, SessionKind::Primary);
         assert_eq!(route.profile_disposition, ProfileDisposition::Durable);
+    }
+
+    #[test]
+    fn unattested_bind_has_no_agent_project_or_logical_profile_key() {
+        let mut bind = bind_identity("/caller/project", "conversation-1");
+        bind.project_id = Some("pj-caller-claimed".to_string());
+
+        for admission_facts in [
+            None,
+            Some(serde_json::json!({"sessionKind": "primary"})),
+            Some(serde_json::json!({"sessionKind": "subagent"})),
+            Some(facts("", "primary")),
+        ] {
+            let route = RouteIdentity::from_accepted_bind(
+                &bind,
+                &Some(Principal::Direct),
+                admission_facts.as_ref(),
+            );
+            assert!(
+                route.agent_project_id.is_empty(),
+                "a bind without an admitted project must not use caller-chosen metadata"
+            );
+            assert_eq!(route.logical_profile_key(), None);
+            assert_eq!(route.resolve_profile().logical_profile_key, None);
+        }
     }
 
     #[test]

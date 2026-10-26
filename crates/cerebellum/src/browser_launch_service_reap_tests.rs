@@ -54,7 +54,6 @@ fn accepted() -> AcceptedBindFacts {
             agent_project_id: PROJECT.into(),
             session_kind: SessionKind::Primary,
             profile_disposition: ProfileDisposition::Durable,
-            project_root: PathBuf::from("/tmp"),
             origin: Default::default(),
         },
         principal: Some(subc_protocol::Principal::Direct),

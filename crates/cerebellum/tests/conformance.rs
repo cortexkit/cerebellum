@@ -622,13 +622,29 @@ async fn session_kind_matrix_resolves_profile_disposition() {
 async fn distinct_agent_project_ids_resolve_to_distinct_profiles() {
     use cerebellum_core::identity::RouteIdentity;
 
-    let identity_a = BindIdentity::new("/tmp/project-a", "opencode", "session-1");
-    let identity_b = BindIdentity::new("/tmp/project-b", "opencode", "session-1");
-    let route_a = RouteIdentity::from_bind(&identity_a, &None);
-    let route_b = RouteIdentity::from_bind(&identity_b, &None);
+    let identity = BindIdentity::new("/tmp/shared-project", "opencode", "session-1");
+    let route_a = RouteIdentity::from_accepted_bind(
+        &identity,
+        &None,
+        Some(&json!({"agentProjectId": "pj-a", "sessionKind": "primary"})),
+    );
+    let route_b = RouteIdentity::from_accepted_bind(
+        &identity,
+        &None,
+        Some(&json!({"agentProjectId": "pj-b", "sessionKind": "primary"})),
+    );
+    assert_eq!(
+        route_a.logical_profile_key(),
+        Some(("pj-a".to_string(), "default".to_string()))
+    );
+    assert_eq!(
+        route_b.logical_profile_key(),
+        Some(("pj-b".to_string(), "default".to_string()))
+    );
     assert_ne!(
-        route_a.agent_project_id, route_b.agent_project_id,
-        "distinct project roots resolve to distinct agent project ids"
+        route_a.logical_profile_key(),
+        route_b.logical_profile_key(),
+        "distinct admitted projects resolve to distinct profiles even with the same bind root"
     );
 }
 
