@@ -221,6 +221,19 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
             user_browser_site,
             USER_BROWSER_SITE_DEADLINE,
         ),
+        (
+            CardKind::SecretUse,
+            "secret-use.json",
+            crate::login_fill_consent::secret_use_card(
+                &crate::browser::fill::Approval {
+                    request_id: "req_golden".into(),
+                    statement_b64url: "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ".into(),
+                    expires_at_ms: 0,
+                },
+                LOGIN_CARD_LIFETIME,
+            ),
+            LOGIN_CARD_LIFETIME,
+        ),
     ]
 }
 
@@ -2002,6 +2015,10 @@ fn every_kind_has_one_subject_and_kinds_never_collide() {
         (
             CardKind::UserBrowserSite,
             subject::user_browser_site("https://a.example"),
+        ),
+        (
+            CardKind::SecretUse,
+            subject::secret_use(conversation, "req_1"),
         ),
     ];
     assert_eq!(

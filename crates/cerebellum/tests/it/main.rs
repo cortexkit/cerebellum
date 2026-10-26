@@ -40,6 +40,7 @@ mod session_caller_admission;
 mod support;
 mod tests_never_headed;
 
+mod browser_fill_login;
 mod browser_focus;
 
 mod tool_catalog;
