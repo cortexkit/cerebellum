@@ -2269,6 +2269,14 @@ pub(crate) fn question_body(
         decline: ConsentOption::decline(DENY, "Don't allow"),
         expires_in: deadline,
         material_damage: true,
+        late_execution: match need {
+            GrantNeed::App { .. } => LateExecution::Execute,
+            // Timed and standing takeover grants survive a late answer. The
+            // allow_once option is the exception: apply_answer returns Once,
+            // but the drain's apply settles without an executor, so no grant
+            // is stored and execution is reported as approved_not_executed.
+            GrantNeed::Takeover => LateExecution::Execute,
+        },
         // Both kinds hold the call that needs the grant open while the person
         // decides (up to CONSENT_PARK_LIMIT), so the agent is blocked on it.
         urgency: Urgency::High,

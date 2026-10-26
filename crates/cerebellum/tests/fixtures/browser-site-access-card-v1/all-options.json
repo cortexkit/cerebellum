@@ -16,7 +16,7 @@
     }
   ],
   "kind": "consent",
-  "late_execution": "notify_only",
+  "late_execution": "execute",
   "material_damage": true,
   "on_expiry": "deny",
   "options": [

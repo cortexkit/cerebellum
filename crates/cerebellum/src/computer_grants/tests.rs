@@ -915,6 +915,46 @@ async fn takeover_holders_elect_one_and_the_drain_winner_makes_holds_true() {
     }
 }
 
+#[tokio::test]
+async fn late_takeover_allow_once_records_no_grant_and_reports_approved_not_executed() {
+    let service = CardService::new();
+    let carrier = TestCarrier::new(&service);
+    let grants = Arc::new(ComputerGrants::in_memory());
+    let consent = context(carrier.clone()).with_park_limit(Duration::from_millis(1));
+    let result = tokio::time::timeout(
+        HANG_GUARD,
+        grants.require(&GrantNeed::Takeover, &consent, &CancelHandle::pending()),
+    )
+    .await
+    .expect("the takeover call must stop waiting before its late answer");
+    assert!(matches!(result, Err(ConsentRefusal::Pending { .. })));
+    let card = service.card(1, 1).await;
+    assert!(service.answer(
+        card.header.corr,
+        ScriptedAnswer::Answered(json!({"decision":"allow_once"}))
+    ));
+
+    let drain = crate::consent_drain::ConsentDrain::default();
+    grants.register_drain(&drain);
+    let live = carrier.live().unwrap();
+    let applied = drain.run(&carrier.desk, &live).await.unwrap();
+    assert_eq!(applied.applied, ["el_test_1"]);
+    assert!(!grants.holds(&consent.caller, &GrantNeed::Takeover));
+    assert!(!carrier.desk.has_single_use_approvals());
+    // Opening the next drain flushes the execution report queued by settlement.
+    drain.run(&carrier.desk, &live).await.unwrap();
+    let reports: Vec<_> = service
+        .calls()
+        .into_iter()
+        .filter(|(method, _)| method == wire::CONSENT_REPORT_EXECUTION)
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].1,
+        json!({"elicitation_id":"el_test_1","execution":"approved_not_executed"})
+    );
+}
+
 fn login_request(carrier: Arc<dyn QuestionCarrier>) -> LoginConsentRequest {
     let consent = context(carrier.clone());
     LoginConsentRequest {

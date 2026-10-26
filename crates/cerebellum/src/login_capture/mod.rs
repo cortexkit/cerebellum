@@ -2001,6 +2001,7 @@ pub fn consent_question(request: &CaptureRequest) -> Value {
         decline: ConsentOption::decline(DENY_DECISION, "Don't allow"),
         expires_in: crate::consent_card::LOGIN_CARD_LIFETIME,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         urgency: CAPTURE_CONSENT_URGENCY,
         // The two parts of the vault id the captured login is stored under
         // (see `CaptureRequest::credential_id`).

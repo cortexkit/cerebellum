@@ -12005,10 +12005,10 @@ mod tests {
         );
     }
 
-    /// Older consent servers receive the original thirty-minute deadline. Core
-    /// only to notify the agent when it settles.
+    /// Older consent servers receive the original thirty-minute deadline.
+    /// Late approval can authorize a matching retry, not launch a capture itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_capture_card_is_sent_for_thirty_minutes_notify_only() {
+    async fn the_capture_card_is_sent_for_thirty_minutes_with_late_execution() {
         use login_capture::test_support::fixture;
 
         let fixture = fixture();
@@ -12027,7 +12027,7 @@ mod tests {
         assert_eq!(body["outcome"], "consent_pending", "{body}");
         let asked = cingulate.cards().remove(0);
         assert_eq!(asked["expires_in_ms"], 1_800_000, "{asked}");
-        assert_eq!(asked["late_execution"], "notify_only", "{asked}");
+        assert_eq!(asked["late_execution"], "execute", "{asked}");
     }
 
     /// Unanswered, the capture call holds the card for the park (Cingulate
@@ -14425,7 +14425,7 @@ mod login_import_consent_tests {
     }
 
     #[tokio::test]
-    async fn the_import_card_is_sent_for_thirty_minutes_notify_only() {
+    async fn the_import_card_is_sent_for_thirty_minutes_with_late_execution() {
         let consent = ScriptedConsent::new();
         consent.raises("el_imp_1").unanswered("el_imp_1");
         let planes = planes(&consent);
@@ -14434,7 +14434,7 @@ mod login_import_consent_tests {
         let (asked, reply) = import(&planes, &consent, &root, &tx).await;
         let asked = asked.expect("a card was raised");
         assert_eq!(asked["expires_in_ms"], 1_800_000, "{asked}");
-        assert_eq!(asked["late_execution"], "notify_only", "{asked}");
+        assert_eq!(asked["late_execution"], "execute", "{asked}");
         assert_eq!(reply["outcome"], "consent_pending", "{reply}");
         assert_eq!(reply["ask_id"], "el_imp_1", "{reply}");
         assert_eq!(
