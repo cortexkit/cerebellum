@@ -77,7 +77,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .checked_add(Duration::from_millis(deadline_ms))
             .ok_or(NavigationDriveError::CdpFailure)?;
         self.ensure_attached(context_key, deadline, &mut clock)?;
-        self.clear_fields(context_key, fields, &mut HashSet::new(), deadline, &mut clock);
+        self.clear_fields(
+            context_key,
+            fields,
+            &mut HashSet::new(),
+            deadline,
+            &mut clock,
+        );
         Ok(())
     }
 
@@ -282,20 +288,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         for field in fields {
             if let Some(frame) = &field.frame {
                 let ms = remaining_ms(clock);
-                if !self
-                    .prepare_frame(context_key, frame, ms)
-                    .unwrap_or(false)
-                {
+                if !self.prepare_frame(context_key, frame, ms).unwrap_or(false) {
                     continue;
                 }
             } else {
                 self.active_frame = None;
             }
-            let Ok(Some(object_id)) = self.resolve_fill_node(&field.identity, runtime, deadline, clock)
+            let Ok(Some(object_id)) =
+                self.resolve_fill_node(&field.identity, runtime, deadline, clock)
             else {
                 continue;
             };
-            let _ = self.call_on_fill_node(&field.identity, &object_id, CLEAR_FILLED, deadline, clock);
+            let _ =
+                self.call_on_fill_node(&field.identity, &object_id, CLEAR_FILLED, deadline, clock);
         }
     }
 

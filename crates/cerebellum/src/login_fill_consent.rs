@@ -41,8 +41,10 @@ pub(crate) const DECLINE: &str = "deny";
 ///
 /// Built from the vault's request id and statement alone, both passed through
 /// as the vault sent them, so nothing the agent chose reaches the person's
-/// phone. Cingulate's consent kind for a secret use is not settled yet; this
-/// is the one place that builds the card, so it is the one place to change.
+/// phone. The card is an ordinary `consent` card for now: Cingulate has not
+/// yet published a dedicated card format for showing a vault statement. This
+/// is the only function that builds the card, so adopting that format later
+/// changes only this function.
 ///
 /// `late_execution` is `execute`: an approval after the call stopped waiting
 /// still takes effect, because the vault records it and releases the login
@@ -74,8 +76,10 @@ pub(crate) fn secret_use_card(approval: &Approval, lifetime: Duration) -> Value 
 /// How long the card stays open: until the vault's request expires, and no
 /// longer than a login card.
 fn card_lifetime(expires_at_ms: u64) -> Duration {
-    Duration::from_millis(expires_at_ms.saturating_sub(crate::wall_clock_ms()))
-        .clamp(Duration::from_secs(1), crate::consent_card::LOGIN_CARD_LIFETIME)
+    Duration::from_millis(expires_at_ms.saturating_sub(crate::wall_clock_ms())).clamp(
+        Duration::from_secs(1),
+        crate::consent_card::LOGIN_CARD_LIFETIME,
+    )
 }
 
 /// Late answers to approval cards need nothing stored here: the vault keeps
@@ -132,7 +136,9 @@ pub(crate) async fn serve(
     };
     let plan = match browser.plan_fill_login(identity, arguments).await {
         Ok(plan) => plan,
-        Err(error) => return browser.finish_fill_reply(browser.fill_reply(identity, Err(error)).await),
+        Err(error) => {
+            return browser.finish_fill_reply(browser.fill_reply(identity, Err(error)).await)
+        }
     };
     // The scope the call arrived on, the head's for a codemode run: the vault
     // decides who is asking from it alone.
@@ -164,7 +170,9 @@ pub(crate) async fn serve(
             ))
             .await;
         }
-        Ok(SecretUseAnswer::Refused) => Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable)),
+        Ok(SecretUseAnswer::Refused) => {
+            Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable))
+        }
         Err(SourceUnavailable) => Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable)),
     };
     browser.finish_fill_reply(browser.fill_reply(identity, result).await)
@@ -240,8 +248,10 @@ async fn approve_then_fill(
     ) else {
         return not_approved(planes, facts, &Ending::DeliveryFailed).await;
     };
-    let subject =
-        crate::cingulate_client::subject::secret_use(&identity.conversation_key, &approval.request_id);
+    let subject = crate::cingulate_client::subject::secret_use(
+        &identity.conversation_key,
+        &approval.request_id,
+    );
     let detached = crate::codemode::active();
     let raised = match planes.consent.open_card_for(live.session(), &subject) {
         Some(open) => Ok(open.elicitation_id),
@@ -285,7 +295,9 @@ async fn approve_then_fill(
                     browser.fill_planned_login(identity, plan, material).await
                 }
                 Ok(_) => Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable)),
-                Err(SourceUnavailable) => Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable)),
+                Err(SourceUnavailable) => {
+                    Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable))
+                }
             };
             let (execution, reason) = if result.is_ok() {
                 (Execution::Executed, None)
@@ -295,13 +307,17 @@ async fn approve_then_fill(
                     Some(ExecutionReason::RefusedAtDispatch),
                 )
             };
-            let _ = session.report_execution_reason(&id, execution, reason).await;
+            let _ = session
+                .report_execution_reason(&id, execution, reason)
+                .await;
             browser.finish_fill_reply(browser.fill_reply(identity, result).await)
         }
         InCall::Pending { .. } => pending().await,
         InCall::Cancelled if !draining => {
             // Stopping the call did not decline the approval.
-            let reply = browser.fill_reply(identity, Ok(json!({"outcome": "cancelled"}))).await;
+            let reply = browser
+                .fill_reply(identity, Ok(json!({"outcome": "cancelled"})))
+                .await;
             browser.finish_fill_reply(reply)
         }
         InCall::Settled(ending) => {

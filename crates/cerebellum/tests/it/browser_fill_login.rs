@@ -180,7 +180,9 @@ impl Shared {
 
 impl Page {
     fn dom(&self) -> Map<String, Value> {
-        let mut nodes = vec![json!({"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"","nodeName":"#document"})];
+        let mut nodes = vec![
+            json!({"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"","nodeName":"#document"}),
+        ];
         if !self.form_removed {
             nodes.push(json!({"nodeId":FORM,"backendNodeId":FORM,"parentId":1,"nodeType":1,"localName":"form","nodeName":"FORM","attributes":[]}));
             nodes.push(json!({"nodeId":USERNAME_NODE,"backendNodeId":USERNAME_NODE,"parentId":FORM,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type","email","autocomplete","username"]}));
@@ -256,12 +258,21 @@ impl Page {
                     self.focused = Some(node);
                     json!(true)
                 } else if function.contains("this.value.length : -1") {
-                    json!(self.values.get(&node).map_or(0, |value| value.encode_utf16().count()))
+                    json!(self
+                        .values
+                        .get(&node)
+                        .map_or(0, |value| value.encode_utf16().count()))
                 } else if function.contains("this.value = ''") {
                     self.values.insert(node, String::new());
                     json!(true)
                 } else if function.contains("isConnected") {
-                    json!(!self.form_removed && self.values.get(&node).is_some_and(|value| !value.is_empty()))
+                    json!(
+                        !self.form_removed
+                            && self
+                                .values
+                                .get(&node)
+                                .is_some_and(|value| !value.is_empty())
+                    )
                 } else {
                     json!(true)
                 };
@@ -409,7 +420,11 @@ impl OwnedBrowserProcess for Process {
                     classify_flattened_document(&dom, &identity, document_epoch, current_origin)
                         .expect("the login field classifies");
                 let reference = format!("e{node}");
-                let value = page.values.get(&node).cloned().filter(|value| !value.is_empty());
+                let value = page
+                    .values
+                    .get(&node)
+                    .cloned()
+                    .filter(|value| !value.is_empty());
                 observation.records.push(AxRecord {
                     depth: 0,
                     role: "textbox".into(),
@@ -419,8 +434,11 @@ impl OwnedBrowserProcess for Process {
                 });
                 // What the DOM says about the field now: a password input is
                 // a credential field, the same input toggled to text is not.
-                observation.facts.entry(reference.clone()).or_default().credential =
-                    Some(node == PASSWORD_NODE && page.password_type == "password");
+                observation
+                    .facts
+                    .entry(reference.clone())
+                    .or_default()
+                    .credential = Some(node == PASSWORD_NODE && page.password_type == "password");
                 observation.dom_text.as_mut().unwrap().push_str(&format!(
                     "<label>{name}<input value=\"{}\"></label>",
                     value.unwrap_or_default()
@@ -626,8 +644,12 @@ impl LoginMaterialSource for Vault {
             during();
         }
         let closed = params.as_object().is_some_and(|object| {
-            object.keys().all(|key| matches!(key.as_str(), "name" | "coverage" | "stamp" | "target"))
-        }) && params["target"].as_object().is_some_and(|target| target.len() == 1);
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "name" | "coverage" | "stamp" | "target"))
+        }) && params["target"]
+            .as_object()
+            .is_some_and(|target| target.len() == 1);
         let reply = if !closed
             || params["name"] != SECRET
             || params["target"]["origin"] != json!(state.saved_origin)
@@ -721,8 +743,8 @@ async fn test_bind_call(planes: &Planes, name: &str, arguments: Value) -> Value 
     reply_body(&rx.recv().await.unwrap())
 }
 
-/// Bind the tool route with the stamped scope of a head session that can
-/// ask a person.
+/// Bind the tool route for a primary session whose route carries a stamped
+/// agent scope (which the vault needs) and can relay a question to a person.
 async fn bind(planes: &Planes) {
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
@@ -989,9 +1011,15 @@ async fn origin_refusals_are_decided_before_the_vault_is_asked() {
         let reply = fixture.fill(otp).await;
         assert_eq!(reply["outcome"], "authorization_denied", "{name}: {reply}");
         assert_eq!(reason_code(&reply), expected, "{name}: {reply}");
-        assert!(fixture.vault.requests().is_empty(), "{name}: the vault was asked");
+        assert!(
+            fixture.vault.requests().is_empty(),
+            "{name}: the vault was asked"
+        );
         assert_eq!(fixture.page.insertions(), 0, "{name}");
-        assert!(fixture.planes.browser.result_schema_findings().is_empty(), "{name}");
+        assert!(
+            fixture.planes.browser.result_schema_findings().is_empty(),
+            "{name}"
+        );
     }
 }
 
@@ -1026,7 +1054,10 @@ async fn a_login_saved_for_another_origin_is_refused_like_an_unknown_one() {
     )
     .await;
     let wrong_origin = fixture.fill(false).await;
-    assert_eq!(wrong_origin["outcome"], "authorization_denied", "{wrong_origin}");
+    assert_eq!(
+        wrong_origin["outcome"], "authorization_denied",
+        "{wrong_origin}"
+    );
     assert_eq!(reason_code(&wrong_origin), "login_unavailable");
     let requests = fixture.vault.requests();
     assert_eq!(requests.len(), 1);
@@ -1039,7 +1070,13 @@ async fn a_login_saved_for_another_origin_is_refused_like_an_unknown_one() {
         assert_eq!(wrong_origin[key], unknown[key], "{key}");
     }
     assert_eq!(fixture.page.insertions(), 0);
-    assert!(!fixture.planes.browser.fill_window_open_for_test(&identity()).await);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
 }
 
 fn identity() -> cerebellum_core::identity::RouteIdentity {
@@ -1066,7 +1103,13 @@ async fn a_navigation_between_the_check_and_the_insertion_inserts_nothing() {
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.page.value(USERNAME_NODE), "");
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
-    assert!(!fixture.planes.browser.fill_window_open_for_test(&identity()).await);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
     assert!(!contains_password(&reply));
 }
 
@@ -1086,9 +1129,19 @@ async fn a_change_after_the_first_field_clears_it_and_fills_no_more() {
     assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
     assert_eq!(reason_code(&reply), "document_changed");
     assert_eq!(fixture.page.lock().inserted, vec![USERNAME_NODE]);
-    assert_eq!(fixture.page.value(USERNAME_NODE), "", "the username was not cleared");
+    assert_eq!(
+        fixture.page.value(USERNAME_NODE),
+        "",
+        "the username was not cleared"
+    );
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
-    assert!(!fixture.planes.browser.fill_window_open_for_test(&identity()).await);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1159,9 @@ async fn the_password_never_reaches_the_reply_journal_or_call_record() {
         Box::new(storage.clone()),
         0,
     ));
-    assert!(contains_password(&json!({"planted": format!("<{PASSWORD}>")})));
+    assert!(contains_password(
+        &json!({"planted": format!("<{PASSWORD}>")})
+    ));
 
     let arguments = fixture.fill_arguments(false).await;
     let reply = reply_body(
@@ -1122,10 +1177,17 @@ async fn the_password_never_reaches_the_reply_journal_or_call_record() {
     assert!(!contains_password(&reply), "{reply}");
 
     let journal = fixture.planes.browser.journal_export_for_test().await;
-    assert!(journal.contains("browser.snapshot"), "the journal holds this test's reads");
+    assert!(
+        journal.contains("browser.snapshot"),
+        "the journal holds this test's reads"
+    );
     assert!(!journal.contains(PASSWORD));
 
-    assert_eq!(fixture.planes.calls.record_count(), 1, "the keyed fill was recorded");
+    assert_eq!(
+        fixture.planes.calls.record_count(),
+        1,
+        "the keyed fill was recorded"
+    );
     let records = String::from_utf8_lossy(&storage.contents().unwrap_or_default()).into_owned();
     assert!(records.contains("pf:fill-1"), "{records}");
     assert!(!records.contains(PASSWORD));
@@ -1145,13 +1207,22 @@ async fn screenshots_are_refused_while_the_password_is_on_the_page() {
     let refused = fixture.screenshot().await;
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(reason_code(&refused), "filled_password_on_page");
-    assert_eq!(refused["detail"]["reason"], "a filled password is on this page");
+    assert_eq!(
+        refused["detail"]["reason"],
+        "a filled password is on this page"
+    );
     assert!(fixture.planes.browser.result_schema_findings().is_empty());
 
     fixture.page.navigate_away();
     let allowed = fixture.screenshot().await;
     assert_eq!(allowed["outcome"], "ok", "{allowed}");
-    assert!(!fixture.planes.browser.fill_window_open_for_test(&identity()).await);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
 }
 
 /// The window also ends once the page has emptied every filled field.
@@ -1159,7 +1230,10 @@ async fn screenshots_are_refused_while_the_password_is_on_the_page() {
 async fn emptied_fields_end_the_window() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
-    assert_eq!(fixture.screenshot().await["outcome"], "authorization_denied");
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
     fixture.page.lock().values.clear();
     let allowed = fixture.screenshot().await;
     assert_eq!(allowed["outcome"], "ok", "{allowed}");
@@ -1173,13 +1247,19 @@ async fn text_reads_drop_the_password_and_mask_the_filled_fields() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
     let copied = format!("Signed in with {PASSWORD}");
-    assert!(copied.contains(PASSWORD), "the page text carries a planted copy");
+    assert!(
+        copied.contains(PASSWORD),
+        "the page text carries a planted copy"
+    );
     fixture.page.lock().copied_text = Some(copied);
     for mode in ["actionable", "ax", "dom_full"] {
         let snapshot = fixture.snapshot(mode).await;
         assert!(!contains_password(&snapshot), "{mode}: {snapshot}");
         assert!(
-            snapshot["state_text"].as_str().unwrap().contains(REDACTED_PASSWORD),
+            snapshot["state_text"]
+                .as_str()
+                .unwrap()
+                .contains(REDACTED_PASSWORD),
             "{mode}: the copied text was dropped instead of redacted: {snapshot}"
         );
     }
@@ -1206,13 +1286,20 @@ async fn reads_are_refused_after_the_window_runs_out_until_the_page_navigates() 
     .await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let refused = fixture.call("browser.snapshot", json!({"mode": "ax"})).await;
+    let refused = fixture
+        .call("browser.snapshot", json!({"mode": "ax"}))
+        .await;
     assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
     assert_eq!(reason_code(&refused), "filled_login_expired");
-    assert_eq!(reason_code(&fixture.screenshot().await), "filled_login_expired");
+    assert_eq!(
+        reason_code(&fixture.screenshot().await),
+        "filled_login_expired"
+    );
 
     fixture.page.navigate_away();
-    let read = fixture.call("browser.snapshot", json!({"mode": "ax"})).await;
+    let read = fixture
+        .call("browser.snapshot", json!({"mode": "ax"}))
+        .await;
     assert_eq!(read["outcome"], "ok", "{read}");
     assert_eq!(fixture.screenshot().await["outcome"], "ok");
 }
@@ -1297,16 +1384,27 @@ async fn a_late_approval_fills_nothing_until_the_agent_calls_again() {
     );
     assert_eq!(pending["outcome"], "consent_pending", "{pending}");
     let ask_id = pending["ask_id"].as_str().unwrap().to_string();
-    assert!(fixture
-        .carrier()
-        .answer_id(&ask_id, ScriptedAnswer::Answered(json!({"decision": "allow"}))));
+    assert!(fixture.carrier().answer_id(
+        &ask_id,
+        ScriptedAnswer::Answered(json!({"decision": "allow"}))
+    ));
     // The vault records the approval from the person's signed answer.
     fixture.vault.0.lock().unwrap().approved = true;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let read = fixture.snapshot("ax").await;
-    assert_eq!(fixture.page.insertions(), 0, "a late approval filled the page");
+    assert_eq!(
+        fixture.page.insertions(),
+        0,
+        "a late approval filled the page"
+    );
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
-    assert!(!fixture.planes.browser.fill_window_open_for_test(&identity()).await);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
     assert!(!contains_password(&read));
 
     let filled = fixture.fill(false).await;
@@ -1337,7 +1435,10 @@ async fn typing_still_refuses_credential_fields() {
             assert_eq!(fixture.fill(false).await["outcome"], "ok");
         }
     }
-    assert_eq!(fixture.page.lock().inserted, vec![USERNAME_NODE, PASSWORD_NODE]);
+    assert_eq!(
+        fixture.page.lock().inserted,
+        vec![USERNAME_NODE, PASSWORD_NODE]
+    );
 }
 
 /// No plane built for a running module serves the capability: it has no

@@ -33,9 +33,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     bounded_call_reply_schema, browser_result_outcome_schema, closed_object,
-    collect_result_violations, context_result_schema, enum_schema, map_navigation_drive_error,
-    integer_schema, map_snapshot_error, refusal_detail_schema, required_string, string_array_schema,
-    string_schema, BrowserCapability, BrowserError, BrowserPlane, JournalReasonCode,
+    collect_result_violations, context_result_schema, enum_schema, integer_schema,
+    map_navigation_drive_error, map_snapshot_error, refusal_detail_schema, required_string,
+    string_array_schema, string_schema, BrowserCapability, BrowserError, BrowserPlane,
+    JournalReasonCode,
 };
 use crate::classification::{NonTypeClassificationRecord, TargetKind};
 use crate::snapshot_store::{self, BackendNodeIdentity, CommittedDocument, FrameDocument};
@@ -116,7 +117,8 @@ impl SecretUseRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceUnavailable;
 
-pub type SourceFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, SourceUnavailable>> + Send + 'a>>;
+pub type SourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, SourceUnavailable>> + Send + 'a>>;
 
 /// Where login material comes from: the vault's `secret.use`.
 ///
@@ -176,9 +178,10 @@ impl SecretUseAnswer {
         }
         match reply.get("status").and_then(Value::as_str) {
             Some("released") if reply.get("kind").and_then(Value::as_str) == Some("site_login") => {
-                let (Some(username), Some(password)) =
-                    (take_string(reply, "username"), take_string(reply, "password"))
-                else {
+                let (Some(username), Some(password)) = (
+                    take_string(reply, "username"),
+                    take_string(reply, "password"),
+                ) else {
                     return Self::Refused;
                 };
                 let totp = match reply.get("totp") {
@@ -298,7 +301,9 @@ pub enum FillOutcome {
     Filled,
     /// Nothing is left in any field: the fill stopped before inserting, or
     /// cleared what it had inserted.
-    Aborted { reason_code: &'static str },
+    Aborted {
+        reason_code: &'static str,
+    },
 }
 
 /// A field this module filled, by identity only.
@@ -344,10 +349,7 @@ pub enum FillRefusal {
     WindowExpired,
     /// The person's approval for using the login did not arrive. `asked`
     /// is false when the question could not be put to anyone.
-    ApprovalNotGiven {
-        decision: &'static str,
-        asked: bool,
-    },
+    ApprovalNotGiven { decision: &'static str, asked: bool },
 }
 
 impl FillRefusal {
@@ -504,7 +506,9 @@ fn redact_value(value: &mut Value, password: &str) {
             std::mem::swap(text, &mut redacted);
             redacted.zeroize();
         }
-        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, password)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_value(item, password)),
         Value::Object(fields) => {
             for field in fields.values_mut() {
                 redact_value(field, password);
@@ -538,7 +542,11 @@ pub(super) fn mask_filled_fields(
         let name = reference.captured.reference.clone();
         // The page text prints a field's value only for a field known not
         // to hold a credential.
-        observation.facts.entry(name.clone()).or_default().credential = Some(true);
+        observation
+            .facts
+            .entry(name.clone())
+            .or_default()
+            .credential = Some(true);
         for record in &mut observation.records {
             if record.reference.as_deref() == Some(name.as_str()) {
                 record.value = None;
@@ -775,10 +783,7 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<FillPlan, BrowserError> {
         let object = self
-            .validate_request(
-                args,
-                &["secret", "username_ref", "password_ref", "otp_ref"],
-            )
+            .validate_request(args, &["secret", "username_ref", "password_ref", "otp_ref"])
             .await?;
         let secret = required_string(object, "secret", 1, 256)?.to_owned();
         let mut wanted = vec![
@@ -789,7 +794,10 @@ impl BrowserPlane {
             wanted.push((LoginField::Otp, required_ref(object, "otp_ref")?));
         }
         for (index, (field, reference)) in wanted.iter().enumerate() {
-            if wanted[..index].iter().any(|(_, earlier)| earlier == reference) {
+            if wanted[..index]
+                .iter()
+                .any(|(_, earlier)| earlier == reference)
+            {
                 return Err(BrowserError::InvalidRequest {
                     field: field.argument().into(),
                     reason_code: "duplicate_ref",
@@ -968,21 +976,22 @@ impl BrowserPlane {
             // The values are wiped before anything else is asked of the page.
             drop(dispatch);
             let result = match outcome {
-                Ok(FillOutcome::Filled) => match operation.committed_document(&route, deadline_ms)
-                {
-                    Ok(live) if live.loader_id == expected.loader_id => {
-                        Ok((FillOutcome::Filled, live))
+                Ok(FillOutcome::Filled) => {
+                    match operation.committed_document(&route, deadline_ms) {
+                        Ok(live) if live.loader_id == expected.loader_id => {
+                            Ok((FillOutcome::Filled, live))
+                        }
+                        _ => {
+                            let _ = operation.clear_filled(&route, &cleared, deadline_ms);
+                            Ok((
+                                FillOutcome::Aborted {
+                                    reason_code: "document_changed",
+                                },
+                                expected,
+                            ))
+                        }
                     }
-                    _ => {
-                        let _ = operation.clear_filled(&route, &cleared, deadline_ms);
-                        Ok((
-                            FillOutcome::Aborted {
-                                reason_code: "document_changed",
-                            },
-                            expected,
-                        ))
-                    }
-                },
+                }
                 Ok(aborted) => Ok((aborted, expected)),
                 Err(error) => Err(error),
             };
@@ -1007,7 +1016,9 @@ impl BrowserPlane {
                 Ok(json!({"outcome": "ok", "origin": origin, "filled": names}))
             }
             (FillOutcome::Aborted { reason_code }, _) => {
-                Err(BrowserError::FillRefused(FillRefusal::Aborted { reason_code }))
+                Err(BrowserError::FillRefused(FillRefusal::Aborted {
+                    reason_code,
+                }))
             }
         }
     }
@@ -1106,13 +1117,19 @@ mod tests {
         classify_click, ElementClassificationInput, NodeIdentityInput, NonTypeClassificationInput,
     };
 
-    fn field(build: impl FnOnce(ElementClassificationInput) -> ElementClassificationInput) -> NonTypeClassificationRecord {
+    fn field(
+        build: impl FnOnce(ElementClassificationInput) -> ElementClassificationInput,
+    ) -> NonTypeClassificationRecord {
         let target = build(ElementClassificationInput::new(
             NodeIdentityInput::new("target", "frame", 7),
             TargetKind::Input,
         ));
-        classify_click(&NonTypeClassificationInput::new(1, target, "https://login.example"))
-            .unwrap()
+        classify_click(&NonTypeClassificationInput::new(
+            1,
+            target,
+            "https://login.example",
+        ))
+        .unwrap()
     }
 
     fn document(url: &str) -> CommittedDocument {
@@ -1202,7 +1219,10 @@ mod tests {
             json!({"status": "something_else"}),
         ] {
             assert!(
-                matches!(SecretUseAnswer::from_reply(refused.clone()), SecretUseAnswer::Refused),
+                matches!(
+                    SecretUseAnswer::from_reply(refused.clone()),
+                    SecretUseAnswer::Refused
+                ),
                 "{refused}"
             );
         }
@@ -1210,7 +1230,8 @@ mod tests {
 
     #[test]
     fn a_reply_is_wiped_once_its_secrets_are_taken() {
-        let mut reply = json!({"status": "released", "nested": ["secret-copy", {"deep": "secret"}]});
+        let mut reply =
+            json!({"status": "released", "nested": ["secret-copy", {"deep": "secret"}]});
         wipe(&mut reply);
         assert_eq!(reply, json!({"status": "", "nested": ["", {"deep": ""}]}));
     }
@@ -1253,7 +1274,10 @@ mod tests {
         );
         assert_eq!(
             field_origin(
-                Some(&frame("https://auth.other.example/x", "https://auth.other.example")),
+                Some(&frame(
+                    "https://auth.other.example/x",
+                    "https://auth.other.example"
+                )),
                 &page
             )
             .as_deref(),
@@ -1307,13 +1331,21 @@ mod tests {
         pending["context"] = context.clone();
         replies.push(pending);
         for refusal in [
-            FillRefusal::Origin { field: "otp_ref", reason_code: "origins_differ" },
+            FillRefusal::Origin {
+                field: "otp_ref",
+                reason_code: "origins_differ",
+            },
             FillRefusal::LoginUnavailable,
             FillRefusal::VaultUnavailable,
-            FillRefusal::Aborted { reason_code: "document_changed" },
+            FillRefusal::Aborted {
+                reason_code: "document_changed",
+            },
             FillRefusal::FilledPasswordOnPage,
             FillRefusal::WindowExpired,
-            FillRefusal::ApprovalNotGiven { decision: "declined", asked: true },
+            FillRefusal::ApprovalNotGiven {
+                decision: "declined",
+                asked: true,
+            },
         ] {
             replies.push(json!({
                 "outcome": refusal.outcome(),
@@ -1331,7 +1363,8 @@ mod tests {
     #[test]
     fn production_has_no_login_material_source() {
         assert!(PRODUCTION_LOGIN_MATERIAL_SOURCE.is_none());
-        let plane = BrowserPlane::new().with_login_material_source(production_login_material_source());
+        let plane =
+            BrowserPlane::new().with_login_material_source(production_login_material_source());
         assert_eq!(admitted(FILL_LOGIN, &plane, true), None);
     }
 }
