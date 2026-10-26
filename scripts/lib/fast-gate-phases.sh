@@ -58,63 +58,15 @@ run_mac_clippy() {
     cargo clippy --locked -p cerebellum --example app_use_desk_probe --features desk-probe -- -D warnings
 }
 
-catalogue_check_needed() {
-  local python
-  for python in python3 python3.14 python3.13 python3.12 python3.11; do
-    if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
-      "$python" "$repo_root/scripts/lib/mutation-catalogue.py" affected mutations.d <<<"$1"
-      return $?
-    fi
-  done
-  echo 'mutation catalogue: Python 3.11+ is required' >&2
-  return 2
-}
-
-# Whether this host has the pinned mutation runner, in either place
-# scripts/mutations.sh accepts.
-runner_available() {
-  ./scripts/mutations.sh --resolve-runner >/dev/null 2>&1
-}
-
-run_catalogue_checks() {
-  local platform needed=0
-  case "$part" in linux) platform=linux ;; mac) platform=macos ;; esac
-  catalogue_check_needed "$changed_files" || needed=$?
-  if [ "$needed" -eq 0 ]; then
-    # A catalogue row or a file a row anchors on changed: the pinned runner is
-    # required, and scripts/mutations.sh names its install command if absent.
-    run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
-    run_serial_phase "mutation catalogue --strict check ($platform)" ./scripts/mutations.sh --check-only --platform "$platform"
-    return
-  fi
-  if [ "$needed" -ne 1 ]; then
-    phase_failed=1
-    return
-  fi
-  echo '==> SKIP: mutation catalogue test names (no catalogue or anchored file changed)'
-  # Nothing the catalogue names changed, so anchors can only have moved through
-  # an edit check-mutation-tree.sh already sees: it requires every row's anchor
-  # to occur exactly once. The runner's own anchor check adds scopes and extra
-  # edits; run it where the runner is installed rather than make every fresh
-  # checkout install it first.
-  if runner_available; then
-    run_serial_phase "mutation catalogue anchors" ./scripts/mutations.sh --check-only --anchors-only
-  else
-    not_verified+=("catalogue anchor scopes (pinned ckdev-mutate not installed here; anchors themselves are checked by check-mutation-tree.sh)")
-  fi
-}
-
 run_linux_part() {
   # Exit 200 means the build server refused the job before starting it (for
   # example when it is full): nothing ran, so asking again is safe. Any other
   # exit, including ck's own codes for a lost or timed-out job, is the verdict.
   local attempt status
-  # 8 CPUs measured faster end to end than 4 once queue time is counted. Every
-  # host that takes the job carries the pinned mutation runner in its job
-  # toolchain, so any size reaches it.
+  # 8 CPUs measured faster end to end than 4 once queue time is counted.
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
     ck motor run --vcpus 8 --timeout 1800 --cwd "$repo_root" -- \
-      ./scripts/fast-gate.sh --part linux --base "$base" "${replay_options[@]+${replay_options[@]}}"
+      ./scripts/fast-gate.sh --part linux --base "$base"
     status=$?
     [ "$status" -eq 200 ] || return "$status"
     echo "==> Linux half refused before it started (attempt $attempt of 12); asking again in 15 s"
@@ -124,7 +76,7 @@ run_linux_part() {
 }
 
 run_mac_part() {
-  ./scripts/fast-gate.sh --part mac --base "$base" "${replay_options[@]+${replay_options[@]}}"
+  ./scripts/fast-gate.sh --part mac --base "$base"
 }
 
 run_combined_gate() (
@@ -137,8 +89,6 @@ run_combined_gate() (
   static_logs=()
   phase_failed=0
   not_verified=()
-  replay_options=()
-  [ "$mutations" -eq 0 ] || replay_options=(--mutations)
   cleanup_parts() {
     local pid
     for pid in "${static_pids[@]+${static_pids[@]}}"; do

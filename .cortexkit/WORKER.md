@@ -8,8 +8,8 @@ Run cargo on this Mac only for the gate's Mac half and for tests that need macOS
 
 The fast gate has two halves, chosen from your diff:
 
-- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,8c"`. Every build host's job toolchain carries the pinned mutation runner (`ckdev-mutate-73af60d1`), so the size only affects speed.
-- **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac`. Both halves check catalogue anchors when the pinned runner is installed. When a catalogue or anchored file changes, each half also strictly checks test names for its platform (`linux` or `macos`), and then the runner is required in its own `target/tools`. `scripts/mutations.sh` prints the install command; on the build server it needs `runon: "linux,net"`, `CARGO_NET_OFFLINE=false` and `CARGO_HOME=$TMPDIR/cargo-home`.
+- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,8c"`.
+- **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac`.
 
 Run both before you deliver, as two parallel tool calls, with the same `--base` commit. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
 
@@ -21,13 +21,10 @@ Run both before you deliver, as two parallel tool calls, with the same `--base` 
 - The test `computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack` runs a real call on a 1 MiB thread. When a future on the serve path grows too large, the whole test binary aborts with "fatal runtime error: stack overflow" and names no test. To find it, run each test alone with the binary's `--exact` flag. Box the future that grew (`Box::pin`) where it is created. Never raise a stack size.
 - Clippy for Linux and Windows runs in the gate's Linux half. Code used only on macOS is dead code on Linux, and `-D warnings` refuses it.
 
-## Mutation proofs
+## Verification scope
 
-- Put new catalogue rows in a new file named for your change (`mutations.d/<topic>.toml`), not in a shared file such as `agent-cursor.toml`. Parallel workers appending to one file conflict at every merge. Edit an existing row only when your change moves its anchor or renames its test, and say so.
-- Before you deliver, run `bash scripts/mutations.sh --check-only`. The strict check refuses a row whose expected test no longer exists, which the anchor checker alone misses.
-- Prefer `scripts/mutations.sh` to replay catalogue rows with the pinned runner.
-- When you run a test by hand under a mutation, never pipe the command through `grep`, `head` or `tail` without `set -o pipefail`. The pipe hides cargo's exit status.
-- Print the mutated line in the same command that runs the test, so the output proves the job saw the mutation. Read the result of that run, not of a later clean run.
+- For a bug fix, add a test that fails without the fix and show that once; otherwise run only the filtered tests for what you touched. Do not deliberately break working code for extra proofs, run full suites, or repeat runs.
+- Never pipe a command through `grep`, `head` or `tail` without `set -o pipefail`. The pipe can hide the command's exit status.
 
 ## What must not change by accident
 

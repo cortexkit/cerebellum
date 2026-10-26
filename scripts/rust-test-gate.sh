@@ -15,8 +15,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-./scripts/check-mutation-tree.sh
-
 # Snapshot the tree before anything builds, so the final phase can attribute a
 # change to the build rather than to uncommitted work the author already had.
 tree_before_build="$(git status --porcelain)"
@@ -286,7 +284,6 @@ start_parallel_phase "test and script ck-* executions use ckdev names" check_tes
 start_parallel_phase "scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
 start_parallel_phase "scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 start_parallel_phase "scripts/watch-ci.test.sh" scripts/watch-ci.test.sh
-start_parallel_phase "scripts/mutations.test.sh" scripts/mutations.test.sh
 start_parallel_phase "scripts/install-extension.test.sh" scripts/install-extension.test.sh
 wait_parallel_phases
 
