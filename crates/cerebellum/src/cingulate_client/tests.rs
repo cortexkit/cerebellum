@@ -353,12 +353,11 @@ fn single_use_is_negotiated_only_for_login_cards_across_all_kinds() {
 }
 
 /// The agent's next step after an option never rides the card: the card
-/// carries only the options the operator chooses between. The login import
-/// card is the one with a next step ("sign in yourself, then call present"),
-/// and it is kept for cerebellum's reply.
+/// carries only the options the operator chooses between. No current builder
+/// renders a next step; a body that carries one (an older or outside caller)
+/// has it moved off the card and kept for cerebellum's reply.
 #[test]
 fn no_card_carries_a_next_step() {
-    let mut saw_a_step = false;
     for (kind, name, body, deadline) in todays_cards() {
         let request = request_for(kind, &body, deadline);
         assert!(
@@ -381,12 +380,7 @@ fn no_card_carries_a_next_step() {
             steps_after, steps_before,
             "{name}: next steps for the reply"
         );
-        saw_a_step |= !steps_after.is_empty();
     }
-    assert!(
-        saw_a_step,
-        "no builder renders a next step any more; check this test still bites"
-    );
 }
 
 /// Each kind's request, pinned as the exact bytes sent. `SHA256SUMS` beside

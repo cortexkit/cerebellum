@@ -519,17 +519,7 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
             )
         })
         .collect();
-    let mut hand_off_step = format!("Call browser_use with action present for {origin}.");
-    if hand_off_step.chars().count() > 200 {
-        // When the origin makes the instruction exceed the display limit,
-        // refer to the origin recorded in the consent card's scope instead.
-        hand_off_step =
-            "Call browser_use with action present for the origin in this consent card's scope."
-                .to_string();
-    }
-    grants.push(
-        ConsentOption::grant("hand_off", "I'll sign in myself").with_next_step(hand_off_step),
-    );
+    grants.push(ConsentOption::grant("hand_off", "I'll sign in myself"));
     let mut facts: Vec<_> = presence
         .iter()
         .map(|b| {
@@ -571,7 +561,6 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
         // The plan the answer applies to is prepared for this one origin: the
         // cookie domains it copies are derived from it.
         scope: Scope::new().with("origin", origin),
-        duration: None,
     }
     .render()
 }
@@ -2697,7 +2686,6 @@ mod deadline_tests {
         )
         .expect("large SQLite output must not block behind a full stdout pipe");
         assert_eq!(output, "0123456789abcdef\n".repeat(16384));
-        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

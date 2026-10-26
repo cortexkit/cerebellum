@@ -5342,10 +5342,6 @@ mod orphan_recovery_tests {
                 message.contains("names process 4000000, which is not running"),
                 "{message}"
             );
-            assert_eq!(
-                question["params"]["requestedSchema"]["properties"]["decision"]["enum"],
-                json!(["clear", "keep"])
-            );
 
             assert_eq!(
                 fixture

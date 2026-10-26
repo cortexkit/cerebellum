@@ -8464,7 +8464,6 @@ pub enum ModuleError {
     Message(String),
     Json(serde_json::Error),
     Config(ConfigError),
-    BrowserConfig(BrowserConfigError),
 }
 
 impl std::fmt::Display for ModuleError {
@@ -8473,7 +8472,6 @@ impl std::fmt::Display for ModuleError {
             Self::Message(m) => write!(f, "{m}"),
             Self::Json(e) => write!(f, "json: {e}"),
             Self::Config(e) => write!(f, "config: {e}"),
-            Self::BrowserConfig(e) => write!(f, "config: {e}"),
         }
     }
 }

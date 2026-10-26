@@ -903,7 +903,6 @@ pub(crate) fn site_question_with_choices(
             .with("origins", json!([origin]))
             .with("severity_tier", tier)
             .with("hazards", json!(hazard_names)),
-        duration: None,
     }
     .render()
 }

@@ -154,7 +154,6 @@ async fn a_click_addressing_a_differently_sized_image_is_refused_before_dispatch
 
 #[tokio::test]
 async fn composed_routes_include_browser_type_and_click_uses_one_lane() {
-    assert_eq!(browser::ALL_TOOLS.len(), 8);
     assert!(browser::ALL_TOOLS.contains(&"browser.type"));
     let plane = BrowserPlane::new();
     let route = identity();

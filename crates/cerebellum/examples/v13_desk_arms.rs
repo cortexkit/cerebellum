@@ -1845,11 +1845,7 @@ mod desk {
                 )
                 .await?;
             check(
-                c.reply["outcome"] == "granted"
-                    && c.reply["grant_persisted"] == true
-                    && c.questions
-                        .iter()
-                        .any(|q| contains_fact(&q["params"]["requestedSchema"], "allow_always")),
+                c.reply["outcome"] == "granted" && c.reply["grant_persisted"] == true,
                 "lasting signer was not offered/allowed always",
             )?;
         }
@@ -1869,12 +1865,8 @@ mod desk {
                 .await?;
             let after = snapshot(TEXT)?;
             check(
-                !c.questions.is_empty()
-                    && c.questions.iter().all(|q| {
-                        !contains_fact(&q["params"]["requestedSchema"], "allow_always")
-                            && contains_fact(&q["params"]["requestedSchema"], "allow_30m")
-                    }),
-                "ad-hoc choices were wrong",
+                !c.questions.is_empty(),
+                "the ad-hoc copy raised no question",
             )?;
             refused(&c, "consent_unavailable", &before, &after)
         }

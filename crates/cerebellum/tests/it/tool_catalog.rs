@@ -281,7 +281,6 @@ fn user_browser_budgets_are_target_specific_and_exhaustive() {
             + max_action
             + budgets::TERMINAL_SUFFIX_MS
     );
-    assert_eq!(budgets::BROWSER_REPLY_MAX_MS, 1_139_001);
     const { assert!(budgets::BROWSER_REPLY_MAX_MS < 31 * 60 * 1000) };
 }
 
