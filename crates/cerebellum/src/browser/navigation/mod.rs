@@ -2,6 +2,7 @@ mod capture;
 #[cfg(test)]
 mod classification_golden;
 mod classification_index;
+mod fill;
 mod frames;
 mod scroll;
 mod typing;

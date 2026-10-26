@@ -30,6 +30,7 @@ fn every_worker_card_kind_has_only_thirty_minute_or_single_use_options() {
         (CardKind::ProfileReidentification, vec!["allow", "deny"]),
         (CardKind::StuckProfileClearance, vec!["clear", "keep"]),
         (CardKind::UserBrowserSite, vec!["allow_30m", "deny"]),
+        (CardKind::SecretUse, vec!["allow", "deny"]),
     ];
     assert_eq!(cards.len(), CardKind::ALL.len());
     assert_eq!(expected.len(), CardKind::ALL.len());

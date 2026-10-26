@@ -112,7 +112,7 @@ fn exported_permission_cards_match_goldens_and_fail_closed() {
     let write = std::env::var_os("CEREBELLUM_WRITE_AGENT_PERMISSION_CARDS").is_some();
     let mut sums = String::new();
     let cards = exported();
-    assert_eq!(cards.len(), 30);
+    assert_eq!(cards.len(), 32);
     for (name, card) in cards {
         assert_eq!(
             card.params.get("single_use") == Some(&serde_json::Value::Bool(true)),

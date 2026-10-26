@@ -2352,6 +2352,42 @@ impl OwnedBrowserProcess for ProductionProcess {
             .type_classified(context_key, target, text, clear_first, deadline_ms)
     }
 
+    fn fill_login(
+        &mut self,
+        context_key: &str,
+        dispatch: &crate::browser::fill::FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FillOutcome, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .fill_login(context_key, dispatch, deadline_ms)
+    }
+
+    fn clear_filled(
+        &mut self,
+        context_key: &str,
+        fields: &[crate::browser::fill::FilledField],
+        deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .clear_filled(context_key, fields, deadline_ms)
+    }
+
+    fn filled_fields_state(
+        &mut self,
+        context_key: &str,
+        fields: &[crate::browser::fill::FilledField],
+        deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FilledFieldsState, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .filled_fields_state(context_key, fields, deadline_ms)
+    }
+
     fn generation_matches(&self) -> bool {
         self.process.as_ref().is_some_and(|process| {
             let generation = process.generation();

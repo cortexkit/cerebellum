@@ -1383,4 +1383,31 @@ mod every_card_kind {
         assert_eq!(params["late_execution"], "execute");
         assert_golden("user-browser-site.json", &params);
     }
+
+    /// The vault's approval card carries the vault's request id and statement
+    /// unchanged and nothing else the caller chose.
+    #[test]
+    fn secret_use_card_carries_only_the_vault_request() {
+        let approval = crate::browser::fill::Approval {
+            request_id: "req_golden".into(),
+            statement_b64url: "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ".into(),
+            expires_at_ms: 0,
+        };
+        let params = as_sent(
+            CardKind::SecretUse,
+            crate::login_fill_consent::secret_use_card(&approval, LOGIN_CARD_LIFETIME),
+            LOGIN_CARD_LIFETIME,
+        )
+        .params;
+        assert_card(
+            "secret use",
+            &params,
+            "high",
+            json!({
+                "vault_request_id": "req_golden",
+                "statement_b64url": "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ",
+            }),
+        );
+        assert_golden("secret-use.json", &params);
+    }
 }

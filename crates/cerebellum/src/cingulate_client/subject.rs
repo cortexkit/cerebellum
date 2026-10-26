@@ -132,6 +132,12 @@ pub fn stuck_profile_clearance(agent_project_id: &str, sequence: u64) -> String 
     ]))
 }
 
+/// `CardKind::SecretUse`: one vault request to release a saved login, in one
+/// conversation.
+pub fn secret_use(conversation_key: &str, request_id: &str) -> String {
+    encode(json!(["secret_use", conversation_key, request_id]))
+}
+
 /// `CardKind::UserBrowserSite`: one site in the person's own browser.
 pub fn user_browser_site(origin: &str) -> String {
     encode(json!(["user_browser_site", origin]))

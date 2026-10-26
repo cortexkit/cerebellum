@@ -58,6 +58,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
+# Login material for browser.fill_login is held only in zeroizing buffers.
+# Already in the lock through subc-presence; pinned to the same release.
+zeroize = "=1.9.1"
 # The tool-provider/v1 contract supplies catalog, pin and late-result types.
 # The conformance companion shares the production protocol version so catalog,
 # schema-pin and late-result checks use the same wire types.
