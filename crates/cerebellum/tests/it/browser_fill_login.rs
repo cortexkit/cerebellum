@@ -1042,6 +1042,17 @@ fn contains_password(value: &Value) -> bool {
     value.to_string().contains(PASSWORD)
 }
 
+fn vault_approval_answer(request_id: &str, decision: &str) -> ScriptedAnswer {
+    let mut answer =
+        json!({"decision": decision, "items": [{"request_id": request_id, "decision": decision}]});
+    if decision == "allow" {
+        answer["duration"] = json!("hour");
+        answer["envelope_sha256"] =
+            json!("7bcd68a3ec5698ad9c9d11e0efa1d67ef7e7aa6ee18c56d963d5f6b18014f180");
+    }
+    ScriptedAnswer::Answered(json!({"secret_use_answer": answer}))
+}
+
 fn reason_code(reply: &Value) -> &str {
     reply["detail"]["reason_code"].as_str().unwrap_or_default()
 }
@@ -1120,9 +1131,10 @@ async fn real_source_fills_and_handles_golden_approval_and_refusal() {
             Some(source.clone()),
         )
         .await;
-        fixture
-            .carrier()
-            .queue(ScriptedAnswer::Answered(json!({"decision": "deny"})));
+        fixture.carrier().queue(vault_approval_answer(
+            "01HF7YAT000000000000000001",
+            "decline",
+        ));
         let reply = fixture.fill(true).await;
         match case {
             0 => {
@@ -1140,8 +1152,10 @@ async fn real_source_fills_and_handles_golden_approval_and_refusal() {
                 ))
                 .unwrap();
                 assert_eq!(
-                    questions[0]["params"]["scope"]["statement_b64url"],
-                    golden["statement_b64url"]
+                    questions[0]["params"],
+                    json!({"kind": "secret_use", "secret_use": {"items": [{
+                        "request_id": golden["request_id"], "statement_b64url": golden["statement_b64url"],
+                    }]}})
                 );
                 assert_eq!(fixture.page.insertions(), 0);
             }
@@ -1926,7 +1940,7 @@ async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
     .await;
     fixture
         .carrier()
-        .queue(ScriptedAnswer::Answered(json!({"decision": "allow"})));
+        .queue(vault_approval_answer("req_vault_1", "allow"));
     let reply = fixture.fill(false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
@@ -1934,11 +1948,10 @@ async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
     assert_eq!(questions.len(), 1, "{questions:?}");
     let card = &questions[0]["params"];
     assert_eq!(
-        card["scope"],
-        json!({"vault_request_id": "req_vault_1", "statement_b64url": "eyJsb2dpbiI6IndvcmstbG9naW4ifQ"}),
+        card,
+        &json!({"kind": "secret_use", "secret_use": {"items": [{"request_id": "req_vault_1", "statement_b64url": "eyJsb2dpbiI6IndvcmstbG9naW4ifQ"}]}}),
         "{card}"
     );
-    assert_eq!(card["late_execution"], "execute");
     assert!(!card.to_string().contains(PASSWORD));
     assert_eq!(fixture.vault.requests().len(), 2);
 }
@@ -1955,12 +1968,92 @@ async fn a_declined_approval_fills_nothing() {
     .await;
     fixture
         .carrier()
-        .queue(ScriptedAnswer::Answered(json!({"decision": "deny"})));
+        .queue(vault_approval_answer("req_vault_1", "decline"));
     let reply = fixture.fill(false).await;
     assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
     assert_eq!(reply["detail"]["decision"], "declined", "{reply}");
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.vault.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn dedicated_approval_requires_the_capability_and_maps_filing_refusals() {
+    for (code, reason, outcome) in [
+        (
+            None,
+            "secret_use_approval_unsupported",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_request_conflict"),
+            "elicitation_request_conflict",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_requester_refused"),
+            "elicitation_requester_refused",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_expired"),
+            "login_approval_not_given",
+            "authorization_denied",
+        ),
+    ] {
+        let fixture = fixture(
+            Page::default(),
+            VaultState {
+                needs_approval: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let carrier = fixture.carrier();
+        if let Some(code) = code {
+            carrier.refuse_next_request(code);
+        } else {
+            carrier.without_secret_use_approval();
+        }
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], outcome, "{reply}");
+        assert_eq!(reason_code(&reply), reason, "{reply}");
+        if code.is_none() {
+            assert!(reply["detail"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("secret-use-approval/v1"));
+            assert!(carrier
+                .calls()
+                .iter()
+                .all(|(method, _)| method != "consent.request"));
+        }
+        if code == Some("elicitation_expired") {
+            assert_eq!(reply["detail"]["decision"], "no_answer");
+        }
+        assert_eq!(fixture.vault.requests().len(), 1);
+        assert_eq!(fixture.page.insertions(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_generic_allow_never_retries_the_vault_or_fills_a_login() {
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            needs_approval: true,
+            approves_when_asked: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .carrier()
+        .queue(ScriptedAnswer::Answered(json!({"decision": "allow"})));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reply["detail"]["decision"], "no_answer", "{reply}");
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert_eq!(fixture.page.insertions(), 0);
 }
 
 /// An approval given after the call stopped waiting fills nothing; the
@@ -1986,10 +2079,9 @@ async fn a_late_approval_fills_nothing_until_the_agent_calls_again() {
     );
     assert_eq!(pending["outcome"], "consent_pending", "{pending}");
     let ask_id = pending["ask_id"].as_str().unwrap().to_string();
-    assert!(fixture.carrier().answer_id(
-        &ask_id,
-        ScriptedAnswer::Answered(json!({"decision": "allow"}))
-    ));
+    assert!(fixture
+        .carrier()
+        .answer_id(&ask_id, vault_approval_answer("req_vault_1", "allow")));
     // The vault records the approval from the person's signed answer.
     fixture.vault.0.lock().unwrap().approved = true;
     tokio::time::sleep(Duration::from_millis(200)).await;

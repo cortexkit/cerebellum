@@ -16,3 +16,16 @@ The upstream login request omits the optional coverage. Cerebellum always sends
 encoder fixture: explicit coverage and serde_json Value map order within the
 unchanged stamp. It is not presented as an upstream golden. Its SHA-256 is
 `eea1867444e6e0e5c82009947397d8814985fe59d07b7fa88b8a9bba09a106b5`. Tests pin both byte sequences separately.
+
+## Dedicated Cingulate approval
+
+`secret-approval-v1.json` is the byte-identical public deterministic vault corpus
+vendored by Cingulate tag `secret-use-approval-v1` at `ed52285`, originally from
+Claustrum tag `secret-approval-vectors-v1` (`cefc5c7041ffe93d17c4fcc80e5847260f3ad121`).
+Its SHA-256 is `efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27`.
+Its private-key fields are published test keys, not production credentials.
+
+`consent.request.secret_use.json` is the exact closed filing body for the corpus's
+`approval` statement. The consent-card golden contains the same body in pretty
+JSON. There are no filer-controlled display fields or expiry overrides; Cingulate
+0.12.0 supplies those from the statement after advertising `secret-use-approval/v1`.

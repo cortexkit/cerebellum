@@ -1160,6 +1160,7 @@ mod every_card_kind {
                         option_group: true,
                         single_use,
                         no_expiry: false,
+                        secret_use_approval: true,
                     });
             let params = &negotiated.params;
             assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
@@ -1388,25 +1389,28 @@ mod every_card_kind {
     /// unchanged and nothing else the caller chose.
     #[test]
     fn secret_use_card_carries_only_the_vault_request() {
+        use sha2::{Digest, Sha256};
+        let source = include_bytes!("../tests/vectors/secret-use-v1/secret-approval-v1.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(source)),
+            "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27"
+        );
+        let vector: Value = serde_json::from_slice(source).unwrap();
+        let statement = &vector["vectors"][0]["statements"][0];
         let approval = crate::browser::fill::Approval {
-            request_id: "req_golden".into(),
-            statement_b64url: "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ".into(),
+            request_id: statement["request_id"].as_str().unwrap().into(),
+            statement_b64url: statement["statement_b64url"].as_str().unwrap().into(),
             expires_at_ms: 0,
         };
         let params = as_sent(
             CardKind::SecretUse,
-            crate::login_fill_consent::secret_use_card(&approval, LOGIN_CARD_LIFETIME),
+            crate::login_fill_consent::secret_use_card(&approval),
             LOGIN_CARD_LIFETIME,
         )
         .params;
-        assert_card(
-            "secret use",
-            &params,
-            "high",
-            json!({
-                "vault_request_id": "req_golden",
-                "statement_b64url": "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ",
-            }),
+        assert_eq!(
+            serde_json::to_vec(&params).unwrap(),
+            include_bytes!("../tests/vectors/secret-use-v1/consent.request.secret_use.json")
         );
         assert_golden("secret-use.json", &params);
     }

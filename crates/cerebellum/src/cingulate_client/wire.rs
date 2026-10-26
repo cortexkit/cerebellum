@@ -137,6 +137,8 @@ pub enum RefusalCode {
     NotOwner,
     NotFound,
     InvalidExecution,
+    RequestConflict,
+    Expired,
     /// A code this client does not know. Read as a failure of the call,
     /// never as a grant.
     Unknown(String),
@@ -161,6 +163,8 @@ impl RefusalCode {
             "elicitation_not_owner" => Self::NotOwner,
             "elicitation_not_found" => Self::NotFound,
             "elicitation_invalid_execution" => Self::InvalidExecution,
+            "elicitation_request_conflict" => Self::RequestConflict,
+            "elicitation_expired" => Self::Expired,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -221,6 +225,61 @@ pub struct Record {
 }
 
 impl Record {
+    /// A dedicated answer must name the one vault request this card filed.
+    /// A generic Allow, a missing item, or a mismatched request_id never grants
+    /// it. Allows also require a recognized duration and envelope-hash shape.
+    pub fn secret_use_decision(&self, request_id: &str) -> Option<&'static str> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Answer {
+            decision: String,
+            duration: Option<String>,
+            items: Vec<Item>,
+            envelope_sha256: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Item {
+            request_id: String,
+            decision: String,
+        }
+        let answer: Answer =
+            serde_json::from_value(self.raw.get("secret_use_answer")?.clone()).ok()?;
+        let [item] = answer.items.as_slice() else {
+            return None;
+        };
+        if item.request_id != request_id || !matches!(item.decision.as_str(), "allow" | "decline") {
+            return None;
+        }
+        match answer.decision.as_str() {
+            "allow"
+                if matches!(
+                    answer.duration.as_deref(),
+                    Some("once" | "hour" | "session" | "permanent")
+                ) && answer.envelope_sha256.as_deref().is_some_and(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) =>
+            {
+                Some(if item.decision == "allow" {
+                    "allow"
+                } else {
+                    "decline"
+                })
+            }
+            "decline"
+                if item.decision == "decline"
+                    && answer.duration.is_none()
+                    && answer.envelope_sha256.is_none() =>
+            {
+                Some("decline")
+            }
+            _ => None,
+        }
+    }
+
     pub fn parse(value: Value) -> Option<Self> {
         let object: &Map<String, Value> = value.as_object()?;
         let elicitation_id = object.get("elicitation_id")?.as_str()?.to_string();

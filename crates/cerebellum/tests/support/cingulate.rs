@@ -51,6 +51,7 @@ struct ScriptState {
     request_error: Option<cerebellum::cingulate_client::route::CallError>,
     defer_awaits: bool,
     deferred: Vec<tokio::sync::oneshot::Sender<()>>,
+    secret_use_unsupported: bool,
 }
 #[allow(dead_code)]
 impl ScriptedCarrier {
@@ -90,6 +91,10 @@ impl ScriptedCarrier {
     pub fn refuse_next_request(&self, code: &str) {
         self.state.lock().unwrap().request_error =
             Some(cerebellum::cingulate_client::double::refusal(code));
+    }
+
+    pub fn without_secret_use_approval(&self) {
+        self.state.lock().unwrap().secret_use_unsupported = true;
     }
 
     pub fn queue(&self, outcome: ScriptedAnswer) {
@@ -307,7 +312,11 @@ impl cerebellum::cingulate_client::route::CingulateOpener for FixtureOpener {
 fn fixture_record(id: &str, outcome: ScriptedAnswer) -> Value {
     match outcome {
         ScriptedAnswer::Answered(body) => {
-            json!({"elicitation_id":id,"state":"answered","answered_choice_id":body["decision"]})
+            if let Some(answer) = body.get("secret_use_answer") {
+                json!({"elicitation_id":id,"state":"answered","secret_use_answer":answer})
+            } else {
+                json!({"elicitation_id":id,"state":"answered","answered_choice_id":body["decision"]})
+            }
         }
         ScriptedAnswer::NoAnswer => json!({"elicitation_id":id,"state":"expired"}),
         ScriptedAnswer::NotPutToAnyone => json!({"elicitation_id":id,"state":"not_put_to_anyone"}),
@@ -321,6 +330,7 @@ impl cerebellum::cingulate_client::route::CingulateRoute for FixtureRoute {
             option_group: true,
             single_use: false,
             no_expiry: false,
+secret_use_approval: !self.0.lock().unwrap().secret_use_unsupported,
         })
     }
     fn call<'a>(

@@ -281,14 +281,20 @@ pub enum FillRefusal {
     VaultUnavailable,
     /// The page changed or insertion could not be confirmed. Reads remain
     /// protected even if rollback could not reach the renderer.
-    Aborted { reason_code: &'static str },
+    Aborted {
+        reason_code: &'static str,
+    },
     /// A screenshot of a tab holding a filled password.
     FilledPasswordOnPage,
     /// A read of a tab whose filled login has outlived its window.
     WindowExpired,
     /// The person's approval for using the login did not arrive. `asked`
     /// is false when the question could not be put to anyone.
-    ApprovalNotGiven { decision: &'static str, asked: bool },
+    ApprovalNotGiven {
+        decision: &'static str,
+        asked: bool,
+    },
+    ApprovalServiceRefused(crate::cingulate_client::desk::SecretUseRefusal),
 }
 
 impl FillRefusal {
@@ -297,6 +303,7 @@ impl FillRefusal {
             Self::VaultUnavailable => "internal_error",
             Self::Aborted { .. } => "stale_snapshot",
             Self::ApprovalNotGiven { asked: false, .. } => "consent_unavailable",
+            Self::ApprovalServiceRefused(_) => "consent_unavailable",
             Self::Origin { .. }
             | Self::LoginUnavailable
             | Self::FilledPasswordOnPage
@@ -315,6 +322,7 @@ impl FillRefusal {
             Self::WindowExpired => "reload or navigate the page itself before reading it again",
             Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
             Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call browser.fill_login again when the person is available",
+            Self::ApprovalServiceRefused(_) => "the dedicated vault approval could not be filed; update Cingulate or report the refusal before retrying",
         }
     }
 
@@ -339,6 +347,17 @@ impl FillRefusal {
                 "reason_code": "login_approval_not_given",
                 "decision": decision,
             }),
+            Self::ApprovalServiceRefused(reason) => match reason {
+                crate::cingulate_client::desk::SecretUseRefusal::MissingCapability => {
+                    json!({"reason_code": "secret_use_approval_unsupported", "reason": "Cingulate does not advertise secret-use-approval/v1"})
+                }
+                crate::cingulate_client::desk::SecretUseRefusal::RequestConflict => {
+                    json!({"reason_code": "elicitation_request_conflict"})
+                }
+                crate::cingulate_client::desk::SecretUseRefusal::RequesterRefused => {
+                    json!({"reason_code": "elicitation_requester_refused"})
+                }
+            },
         }
     }
 }

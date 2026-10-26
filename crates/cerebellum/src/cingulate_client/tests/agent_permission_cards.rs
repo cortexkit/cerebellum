@@ -89,6 +89,7 @@ fn exported() -> Vec<(String, CardRequest)> {
                         option_group: true,
                         single_use: true,
                         no_expiry: false,
+                        secret_use_approval: false,
                     },
                 );
                 result.push((
@@ -119,39 +120,47 @@ fn exported_permission_cards_match_goldens_and_fail_closed() {
             name.ends_with("-single-use.json"),
             "{name}"
         );
-        assert_eq!(card.params["default"], card.decline_id, "{name}");
-        assert_eq!(card.params["on_expiry"], "deny", "{name}");
-        crate::consent_card::core_verdict(&card.params)
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        let options = card.params["options"].as_array().unwrap();
-        let safe = options
-            .iter()
-            .filter(|o| o["effect"] == "grant" && o["group"] != "danger")
-            .count();
-        assert!(safe > 0, "{name}");
-        for option in options {
-            let id = option["id"].as_str().unwrap();
-            if id.starts_with("computer_") || id.starts_with("allow_all_sites_") {
-                assert_eq!(option["group"], "danger", "{name}: {id}");
-            }
-            if option["group"] == "danger" {
-                assert!(
-                    option["detail"]
-                        .as_str()
-                        .is_some_and(|detail| !detail.trim().is_empty()),
-                    "{name}: {id} needs a danger explanation"
-                );
-                assert_eq!(
-                    option["detail"],
-                    if id.starts_with("computer_") {
-                        "Covers every app, including taking over your mouse and keyboard."
-                    } else {
-                        "Covers every public site. Sign-in and payment pages still ask."
-                    }
-                );
-            }
-            if name.starts_with("worker-") {
-                assert!(!id.contains("always"), "{name}: {id}");
+        if card.kind == CardKind::SecretUse {
+            let expected: Value = serde_json::from_slice(include_bytes!(
+                "../../../tests/vectors/secret-use-v1/consent.request.secret_use.json"
+            ))
+            .unwrap();
+            assert_eq!(card.params, expected, "{name}");
+        } else {
+            assert_eq!(card.params["default"], card.decline_id, "{name}");
+            assert_eq!(card.params["on_expiry"], "deny", "{name}");
+            crate::consent_card::core_verdict(&card.params)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let options = card.params["options"].as_array().unwrap();
+            let safe = options
+                .iter()
+                .filter(|o| o["effect"] == "grant" && o["group"] != "danger")
+                .count();
+            assert!(safe > 0, "{name}");
+            for option in options {
+                let id = option["id"].as_str().unwrap();
+                if id.starts_with("computer_") || id.starts_with("allow_all_sites_") {
+                    assert_eq!(option["group"], "danger", "{name}: {id}");
+                }
+                if option["group"] == "danger" {
+                    assert!(
+                        option["detail"]
+                            .as_str()
+                            .is_some_and(|detail| !detail.trim().is_empty()),
+                        "{name}: {id} needs a danger explanation"
+                    );
+                    assert_eq!(
+                        option["detail"],
+                        if id.starts_with("computer_") {
+                            "Covers every app, including taking over your mouse and keyboard."
+                        } else {
+                            "Covers every public site. Sign-in and payment pages still ask."
+                        }
+                    );
+                }
+                if name.starts_with("worker-") {
+                    assert!(!id.contains("always"), "{name}: {id}");
+                }
             }
         }
         let bytes = format!("{}\n", serde_json::to_string_pretty(&card.params).unwrap());

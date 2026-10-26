@@ -29,7 +29,7 @@ use super::wire::{self, Record};
 // Every card kind, as the production builders render it
 // ---------------------------------------------------------------------------
 
-/// The call key every golden card carries as its `requester_ref`.
+/// The call key generic golden cards carry as their `requester_ref`.
 const GOLDEN_CALL_KEY: &str = "pf:card-golden";
 
 /// One card of each kind, built by the production builder with the deadline
@@ -224,14 +224,23 @@ fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Du
         (
             CardKind::SecretUse,
             "secret-use.json",
-            crate::login_fill_consent::secret_use_card(
-                &crate::browser::fill::Approval {
-                    request_id: "req_golden".into(),
-                    statement_b64url: "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ".into(),
-                    expires_at_ms: 0,
-                },
-                LOGIN_CARD_LIFETIME,
-            ),
+            crate::login_fill_consent::secret_use_card(&crate::browser::fill::Approval {
+                request_id: serde_json::from_str::<Value>(include_str!(
+                    "../../tests/vectors/secret-use-v1/secret-approval-v1.json"
+                ))
+                .unwrap()["vectors"][0]["statements"][0]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                statement_b64url: serde_json::from_str::<Value>(include_str!(
+                    "../../tests/vectors/secret-use-v1/secret-approval-v1.json"
+                ))
+                .unwrap()["vectors"][0]["statements"][0]["statement_b64url"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                expires_at_ms: 0,
+            }),
             LOGIN_CARD_LIFETIME,
         ),
     ]
@@ -284,14 +293,17 @@ const REQUEST_KEYS: [&str; 23] = [
 ];
 const OPTION_KEYS: [&str; 5] = ["id", "label", "effect", "detail", "group"];
 
-/// Every kind maps to a kind-`consent` request Cingulate's closed decoder
+/// Every generic card maps to a kind-`consent` request Cingulate's closed decoder
 /// accepts, and differs from the card the reverse elicitation lane sent only
 /// by what Cingulate's closed format requires: no `requestedSchema`, no
 /// `call_key`, no option `next_step`, and the call key as `requester_ref`.
 /// So every field the phone renders is unchanged.
 #[test]
-fn every_card_kind_shows_the_phone_what_it_showed_before() {
-    for (kind, name, body, deadline) in todays_cards() {
+fn every_generic_card_kind_shows_the_phone_what_it_showed_before() {
+    for (kind, name, body, deadline) in todays_cards()
+        .into_iter()
+        .filter(|(kind, ..)| *kind != CardKind::SecretUse)
+    {
         let request = request_for(kind, &body, deadline);
         let params = request.params.as_object().unwrap();
         assert_eq!(params["kind"], wire::KIND_CONSENT, "{name}");
@@ -347,6 +359,7 @@ fn single_use_is_negotiated_only_for_login_cards_across_all_kinds() {
                     option_group: true,
                     single_use: true,
                     no_expiry: false,
+                    secret_use_approval: true,
                 },
             ] {
                 let card = request_for(kind, &body, deadline).for_features(features);
@@ -379,8 +392,8 @@ fn no_card_carries_a_next_step() {
         );
         let steps_before: Vec<(String, String)> = body["params"]["options"]
             .as_array()
-            .unwrap()
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|option| {
                 Some((
                     option["id"].as_str()?.to_string(),
@@ -689,6 +702,7 @@ async fn single_use_login_answers_stay_attached_and_timeouts_detach_before_pendi
         option_group: true,
         single_use: true,
         no_expiry: false,
+        secret_use_approval: true,
     });
 
     let cingulate = ScriptedCingulate::new();
@@ -2056,4 +2070,5 @@ fn every_kind_has_one_subject_and_kinds_never_collide() {
 mod agent_permission_cards;
 mod features;
 mod no_expiry;
+mod secret_use;
 mod worker_options;

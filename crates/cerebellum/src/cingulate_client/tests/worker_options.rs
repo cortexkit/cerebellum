@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn every_worker_card_kind_has_only_thirty_minute_or_single_use_options() {
+fn generic_worker_card_kinds_have_only_thirty_minute_or_single_use_options() {
     let facts = crate::tests::management_bound_planes(1, 1)
         .routes
         .get(1, 1)
@@ -30,11 +30,13 @@ fn every_worker_card_kind_has_only_thirty_minute_or_single_use_options() {
         (CardKind::ProfileReidentification, vec!["allow", "deny"]),
         (CardKind::StuckProfileClearance, vec!["clear", "keep"]),
         (CardKind::UserBrowserSite, vec!["allow_30m", "deny"]),
-        (CardKind::SecretUse, vec!["allow", "deny"]),
     ];
     assert_eq!(cards.len(), CardKind::ALL.len());
-    assert_eq!(expected.len(), CardKind::ALL.len());
-    for (kind, _, body, deadline) in cards {
+    assert_eq!(expected.len(), CardKind::ALL.len() - 1);
+    for (kind, _, body, deadline) in cards
+        .into_iter()
+        .filter(|(kind, ..)| *kind != CardKind::SecretUse)
+    {
         let card = consent_request(kind, &body, deadline, None, None, None).unwrap();
         let ids: Vec<_> = card.params["options"]
             .as_array()

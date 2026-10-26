@@ -2,8 +2,8 @@
 //!
 //! The browser, computer and login card builders render a `{"params": ...}`
 //! body. This adapter preserves the phone's display text and choices while
-//! converting those params to Cingulate's generic consent request, whose schema
-//! rejects unknown fields. The differences:
+//! converting ordinary kinds to Cingulate's generic consent request, whose schema
+//! rejects unknown fields. For those kinds the differences are:
 //!
 //! - `expires_in_ms` preserves the legacy deadline for older servers. Feature
 //!   negotiation removes it only when Cingulate advertises no-expiry support;
@@ -18,6 +18,10 @@
 //!   instruction to the agent, not a choice for the operator, and Cingulate
 //!   refuses unknown option keys. It is kept here, by option id, for
 //!   cerebellum's reply to the agent.
+//!
+//! SecretUse instead carries the dedicated `secret_use` body untouched. Its
+//! statement determines display and expiry; none of the generic fields above
+//! may be added to that filing.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,7 +30,8 @@ use serde_json::Value;
 
 use super::wire;
 
-/// The card families cerebellum raises, all as kind `consent`.
+/// Local card families. SecretUse files `kind: "secret_use"`; the others file
+/// generic `kind: "consent"` cards.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -96,7 +101,8 @@ pub struct CardRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotACard(pub &'static str);
 
-/// Turn a rendered card body into a Cingulate request.
+/// Turn a rendered card body into a Cingulate request. Dedicated SecretUse
+/// bodies are validated and passed through without any generic metadata.
 ///
 /// `at_console` is the answering-machine constraint Cingulate defines: the
 /// card can then be answered only at the daemon's own console. Production
@@ -117,6 +123,44 @@ pub fn consent_request(
         .and_then(Value::as_object)
         .cloned()
         .ok_or(NotACard("the body has no params object"))?;
+    if kind == CardKind::SecretUse {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Filing {
+            kind: String,
+            secret_use: Items,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Items {
+            items: Vec<Item>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Item {
+            request_id: String,
+            statement_b64url: String,
+        }
+        let filing: Filing = serde_json::from_value(Value::Object(params.clone()))
+            .map_err(|_| NotACard("invalid secret_use body"))?;
+        if filing.kind != "secret_use"
+            || filing.secret_use.items.len() != 1
+            || filing
+                .secret_use
+                .items
+                .iter()
+                .any(|item| item.request_id.is_empty() || item.statement_b64url.is_empty())
+        {
+            return Err(NotACard("invalid secret_use item"));
+        }
+        return Ok(CardRequest {
+            kind,
+            params: Value::Object(params),
+            grant_ids: vec!["allow".into()],
+            decline_id: "decline".into(),
+            next_steps: BTreeMap::new(),
+        });
+    }
     if params.get("kind").and_then(Value::as_str) != Some(wire::KIND_CONSENT) {
         return Err(NotACard("the body is not a consent card"));
     }
@@ -195,7 +239,7 @@ pub fn consent_request(
     })
 }
 
-/// The fields of a card the operator's phone renders, in a form two cards
+/// The fields of a generic consent card the operator's phone renders, in a form two cards
 /// can be compared by. Cingulate's phone projection carries the request's
 /// display fields unchanged, so equal projections are equal phone cards.
 pub fn phone_visible(params: &Value) -> Value {

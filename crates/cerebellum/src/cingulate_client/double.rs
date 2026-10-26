@@ -120,6 +120,7 @@ impl ScriptedCingulate {
             option_group: true,
             single_use: false,
             no_expiry: false,
+            secret_use_approval: true,
         }));
         service
     }

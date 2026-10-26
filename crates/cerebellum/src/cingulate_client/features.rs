@@ -8,6 +8,8 @@ pub struct CingulateFeatures {
     /// Older servers require a deadline and reject execution reason codes.
     /// Only an advertised capability permits either new wire shape.
     pub no_expiry: bool,
+    /// Dedicated vault-backed approvals; a generic consent answer is not a grant.
+    pub secret_use_approval: bool,
 }
 
 pub(crate) fn negotiated(reported: Option<CingulateFeatures>) -> CingulateFeatures {
@@ -48,6 +50,15 @@ pub(crate) fn from_catalog(body: &[u8]) -> Option<CingulateFeatures> {
                         .any(|capability| capability == "consent-no-expiry/v1")
                 })
         }),
+        secret_use_approval: modules.iter().any(|module| {
+            module.module_id == "cingulate"
+                && module.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|capability| capability == "secret-use-approval/v1")
+                })
+        }),
     })
 }
 
@@ -86,6 +97,11 @@ pub(crate) async fn discover(stream: &mut tokio::net::TcpStream) -> Option<Cingu
 
 impl super::card::CardRequest {
     pub(crate) fn for_features(mut self, features: CingulateFeatures) -> Self {
+        if self.kind == super::card::CardKind::SecretUse {
+            // Leave dedicated filings unchanged: generic expiry, single-use,
+            // and option-group transformations are not part of their contract.
+            return self;
+        }
         let single_use = features.single_use
             && matches!(
                 self.kind,
