@@ -31,10 +31,6 @@ pub(crate) struct ConsentOption {
     /// option id; display text does not decide what is authorized.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
-    /// What the agent should do after a late answer instead of retrying the
-    /// original call. Omitted when retrying that call is the right next step.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_step: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group: Option<&'static str>,
 }
@@ -53,7 +49,6 @@ impl ConsentOption {
             label: label.into(),
             effect: Effect::Grant,
             detail: None,
-            next_step: None,
             group: None,
         }
     }
@@ -63,10 +58,6 @@ impl ConsentOption {
     }
     pub fn danger(mut self) -> Self {
         self.group = Some("danger");
-        self
-    }
-    pub fn with_next_step(mut self, next_step: impl Into<String>) -> Self {
-        self.next_step = Some(next_step.into());
         self
     }
     pub fn decline(id: impl Into<String>, label: impl Into<String>) -> DeclineOption {
@@ -167,7 +158,6 @@ pub(crate) struct ConsentCard {
     pub late_execution: LateExecution,
     pub urgency: Urgency,
     pub scope: Scope,
-    pub duration: Option<Value>,
 }
 
 impl ConsentCard {
@@ -179,32 +169,20 @@ impl ConsentCard {
     /// turns those params into the `consent.request` sent to Cingulate.
     pub fn render(self) -> Value {
         let default = &self.decline.id;
-        let ids: Vec<_> = self
-            .grants
-            .iter()
-            .map(|o| &o.id)
-            .chain(std::iter::once(&self.decline.id))
-            .collect();
         let options: Vec<_> = self
             .grants
             .iter()
             .map(|o| json!(o))
             .chain(std::iter::once(json!(self.decline)))
             .collect();
-        let mut params = json!({
+        let params = json!({
             "kind": "consent", "title": self.title, "prompt": self.prompt,
             "target": self.target, "facts": self.facts, "options": options,
             "default": default, "on_expiry": "deny", "urgency": self.urgency,
             "scope": self.scope,
             "expires_in_ms": self.expires_in.as_millis() as u64,
-            "material_damage": self.material_damage, "late_execution": self.late_execution,
-            "requestedSchema": {"type": "object", "properties": {
-                "decision": {"type": "string", "enum": ids}
-            }, "required": ["decision"], "additionalProperties": false}
+            "material_damage": self.material_damage, "late_execution": self.late_execution
         });
-        if let Some(duration) = self.duration {
-            params["duration"] = duration;
-        }
         json!({ "params": params })
     }
 }
@@ -225,10 +203,6 @@ pub(crate) fn assert_contract(body: &Value, ids: &[&str], decline: &str) {
     );
     assert_eq!(p["default"], decline);
     assert_eq!(p["on_expiry"], "deny");
-    assert_eq!(
-        p["requestedSchema"]["properties"]["decision"]["enum"],
-        json!(ids)
-    );
     for option in p["options"].as_array().unwrap() {
         assert_eq!(
             option["effect"],
@@ -353,9 +327,10 @@ fn core_decode_strings(value: &Value, keys: &[&str], optional: bool) -> Result<(
 /// from Cingulate commit 6bb5f4d. Historical Prefrontal request vectors also
 /// remain checked so the legacy renderer's field shapes do not regress.
 ///
-/// This is not Cingulate's production validator. It checks both the renderer's
-/// legacy fields (`requestedSchema`, `call_key`, `next_step`) and the mapped
-/// wire's fields (`requester_ref`, `binding`, `at_console`).
+/// This is not Cingulate's production validator. It checks both the legacy
+/// fields core still accepts (`requestedSchema`, `call_key`, `next_step`),
+/// which the renderer no longer produces, and the mapped wire's fields
+/// (`requester_ref`, `binding`, `at_console`).
 #[cfg(test)]
 pub(crate) fn core_verdict(params: &Value) -> Result<(), CoreRefusal> {
     // Decoding: shape, unknown and missing fields, and types.
@@ -550,7 +525,6 @@ mod tests {
             late_execution: LateExecution::NotifyOnly,
             urgency: Urgency::Normal,
             scope: Scope::new().with("takeover", "machine"),
-            duration: None,
         }
     }
     #[test]
@@ -584,11 +558,10 @@ mod tests {
 
     #[test]
     fn call_key_and_next_step_are_optional_strings_in_the_closed_card_schema() {
-        let body = card(vec![ConsentOption::grant("allow", "Allow").with_next_step(
-            "Call browser_use with action present for https://example.test.",
-        )])
-        .render();
+        let body = card(vec![ConsentOption::grant("allow", "Allow")]).render();
         let mut params = body["params"].clone();
+        params["options"][0]["next_step"] =
+            json!("Call browser_use with action present for https://example.test.");
         params["call_key"] = json!("pf:schema");
         assert_eq!(core_verdict(&params), Ok(()));
         params["call_key"] = json!(7);
@@ -814,17 +787,6 @@ mod every_card_kind {
             stripped, unkeyed.params,
             "{kind:?}: the call key changed the rest of the card"
         );
-        // `next_steps` holds, by option id, what the agent is told to do after
-        // that option is chosen (such as "call present"). Cingulate refuses it
-        // on the card, so cerebellum puts it in its own reply to the agent,
-        // where it must read as one short sentence.
-        for step in keyed.next_steps.values() {
-            assert!(!step.trim().is_empty() && step.chars().count() <= 200);
-            assert!(
-                !step.contains(['\n', '\r']),
-                "next_step must be one sentence"
-            );
-        }
         keyed
     }
 
@@ -1164,38 +1126,7 @@ mod every_card_kind {
             if let Some(golden) = golden {
                 assert_golden(golden, params);
             }
-            // The "sign in yourself" option tells the agent to call present
-            // next. That instruction goes in cerebellum's reply to the agent,
-            // never on the card.
-            assert_eq!(
-                request.next_steps,
-                std::collections::BTreeMap::from([(
-                    "hand_off".to_string(),
-                    "Call browser_use with action present for https://x.com.".to_string()
-                )]),
-                "{case}: next steps"
-            );
         }
-    }
-
-    #[tokio::test]
-    async fn login_import_hand_off_for_a_long_origin_keeps_a_bounded_next_step() {
-        let origin = format!(
-            "https://{}.{}.{}.test",
-            "a".repeat(60),
-            "b".repeat(60),
-            "c".repeat(60)
-        );
-        let body = crate::login_import::import_question(&origin, &origin[8..], &[]);
-        let request = as_sent(CardKind::LoginImport, body, super::LOGIN_CARD_LIFETIME);
-        let params = &request.params;
-        let step = request.next_steps["hand_off"].as_str();
-        assert_eq!(
-            step,
-            "Call browser_use with action present for the origin in this consent card's scope."
-        );
-        assert!(step.chars().count() <= 200);
-        assert_eq!(params["scope"]["origin"], origin);
     }
 
     #[tokio::test]

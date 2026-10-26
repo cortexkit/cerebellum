@@ -2281,7 +2281,6 @@ pub(crate) fn question_body(
         // decides (up to CONSENT_PARK_LIMIT), so the agent is blocked on it.
         urgency: Urgency::High,
         scope: grant_scope(need, identity),
-        duration: None,
     }
     .render()
 }

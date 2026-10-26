@@ -2008,7 +2008,6 @@ pub fn consent_question(request: &CaptureRequest) -> Value {
         scope: Scope::new()
             .with("credential_domain", request.credential_domain.as_str())
             .with("account", request.account.as_str()),
-        duration: None,
     }
     .render()
 }

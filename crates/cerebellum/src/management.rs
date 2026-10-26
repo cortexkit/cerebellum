@@ -2249,7 +2249,6 @@ pub(crate) fn browser_grant_question(
         late_execution: LateExecution::Execute,
         urgency,
         scope: browser_grant_scope(origins, hazards, severity),
-        duration: None,
     }
     .render()
 }
@@ -2299,7 +2298,6 @@ pub(crate) fn profile_root_rebind_question(root_path: &str, preview: &RebindRepo
         // waiting for the answer, so no tool call is blocked on the person.
         urgency: Urgency::Normal,
         scope: profile_root_rebind_scope(preview),
-        duration: None,
     }
     .render()
 }
@@ -2376,7 +2374,6 @@ pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
         scope: Scope::new()
             .with("profile_uuid", preview.profile_uuid.as_str())
             .with("sequence", preview.sequence),
-        duration: None,
     }
     .render()
 }

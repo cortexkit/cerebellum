@@ -115,10 +115,6 @@ name = "live_launch"
 test = true
 
 [[example]]
-name = "live_login"
-test = true
-
-[[example]]
 name = "live_interrupt"
 test = true
 
@@ -128,10 +124,6 @@ test = true
 
 [[example]]
 name = "live_ax_actions"
-test = true
-
-[[example]]
-name = "live_discord_task"
 test = true
 
 [[example]]
