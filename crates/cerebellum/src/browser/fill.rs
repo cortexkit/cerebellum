@@ -593,17 +593,33 @@ fn redact_string(text: &mut String, secret: &str) {
         decoded.push(ch);
         at += length;
     }
-    let matches: Vec<_> = decoded
+    let mut matches: Vec<_> = text
         .match_indices(secret)
-        .filter_map(|(start, _)| {
-            let first = ranges.binary_search_by_key(&start, |range| range.0).ok()?;
-            let end = start + secret.len();
-            let last = ranges
-                .partition_point(|range| range.0 < end)
-                .checked_sub(1)?;
-            Some(ranges[first].1..ranges[last].2)
-        })
+        .map(|(start, _)| start..start + secret.len())
         .collect();
+    matches.extend(decoded.match_indices(secret).filter_map(|(start, _)| {
+        let first = ranges.binary_search_by_key(&start, |range| range.0).ok()?;
+        let end = start + secret.len();
+        let last = ranges
+            .partition_point(|range| range.0 < end)
+            .checked_sub(1)?;
+        Some(ranges[first].1..ranges[last].2)
+    }));
+    // Literal entity syntax can itself be part of a password. Search the raw
+    // text too, merging overlaps with the decoded matches before replacing.
+    matches.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in matches {
+        if let Some(previous) = merged
+            .last_mut()
+            .filter(|previous| previous.end >= range.start)
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let matches = merged;
     if !matches.is_empty() {
         // The retained allocation never contains the removed bytes, even in
         // spare capacity left behind by an in-place replacement.
@@ -1506,6 +1522,16 @@ mod tests {
                 "state_text": format!("a {REDACTED_PASSWORD} b {REDACTED_PASSWORD}"),
                 "nested": [{"name": REDACTED_PASSWORD}, 3, "clean"],
             })
+        );
+    }
+
+    #[test]
+    fn literal_entity_spellings_in_a_secret_are_redacted_raw_and_encoded() {
+        let mut value = json!(["P&amp;Q", "P&amp;amp;Q", "P&#38;amp;Q"]);
+        redact_value(&mut value, "P&amp;Q");
+        assert_eq!(
+            value,
+            json!([REDACTED_PASSWORD, REDACTED_PASSWORD, REDACTED_PASSWORD])
         );
     }
 

@@ -2307,7 +2307,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 None,
                 clock,
             )?;
-            return required_result_string(&result, "outerHTML");
+            return required_result_string(&result, "outerHTML")
+                .map_err(|error| error.at_step("DOM.getOuterHTML"));
         }
         let frame = self
             .active_frame

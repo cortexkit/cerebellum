@@ -1450,7 +1450,7 @@ async fn navigation_reply_releases_quarantine_only_after_main_loader_replacement
     .await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let arguments = |url: String| json!({"url":url,"wait":"none","read_page":false,"severity":{"tier":1,"credential":false,"financial":false}});
+    let arguments = |url: String| json!({"url":url,"intent":"navigate the test page","wait":"none","read_page":false,"severity":{"tier":1,"credential":false,"financial":false}});
     let same_document = fixture
         .call(
             "browser.navigate",
