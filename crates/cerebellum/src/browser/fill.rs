@@ -1098,3 +1098,240 @@ pub fn validate_fill_login_result(result: &Value) -> Result<(), CapabilityResult
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classification::{
+        classify_click, ElementClassificationInput, NodeIdentityInput, NonTypeClassificationInput,
+    };
+
+    fn field(build: impl FnOnce(ElementClassificationInput) -> ElementClassificationInput) -> NonTypeClassificationRecord {
+        let target = build(ElementClassificationInput::new(
+            NodeIdentityInput::new("target", "frame", 7),
+            TargetKind::Input,
+        ));
+        classify_click(&NonTypeClassificationInput::new(1, target, "https://login.example"))
+            .unwrap()
+    }
+
+    fn document(url: &str) -> CommittedDocument {
+        CommittedDocument {
+            url: url.into(),
+            entry_id: 1,
+            history: vec![1],
+            current_index: 0,
+            loader_id: "loader".into(),
+        }
+    }
+
+    fn frame(url: &str, origin: &str) -> FrameDocument {
+        FrameDocument {
+            navigation_revision: 0,
+            frame_id: "child".into(),
+            parent_id: Some("main".into()),
+            session_id: "session".into(),
+            loader_id: "child-loader".into(),
+            url: url.into(),
+            origin: origin.into(),
+        }
+    }
+
+    #[test]
+    fn the_request_is_exactly_the_vaults_closed_shape() {
+        let request = SecretUseRequest {
+            name: "work".into(),
+            stamp: json!({"scope_ref": "sc_head"}),
+            origin: "https://login.example".into(),
+        };
+        assert_eq!(
+            request.params(),
+            json!({
+                "name": "work",
+                "coverage": "scope",
+                "stamp": {"scope_ref": "sc_head"},
+                "target": {"origin": "https://login.example"},
+            })
+        );
+    }
+
+    #[test]
+    fn released_approval_and_refused_answers_read_as_the_vault_sends_them() {
+        let SecretUseAnswer::Released(material) = SecretUseAnswer::from_reply(json!({
+            "status": "released", "kind": "site_login",
+            "username": "u", "password": "p", "totp": "123456",
+        })) else {
+            panic!("a released login");
+        };
+        assert_eq!(
+            (
+                material.username.as_str(),
+                material.password.as_str(),
+                material.totp.as_deref().map(String::as_str)
+            ),
+            ("u", "p", Some("123456"))
+        );
+        assert!(!format!("{material:?}").contains("123456"));
+        let SecretUseAnswer::Released(without) = SecretUseAnswer::from_reply(json!({
+            "status": "released", "kind": "site_login", "username": "u", "password": "p",
+        })) else {
+            panic!("a released login without a code");
+        };
+        assert!(without.totp.is_none());
+        let SecretUseAnswer::ApprovalRequired(approval) = SecretUseAnswer::from_reply(json!({
+            "status": "approval_required", "request_id": "req_1",
+            "statement_b64url": "c3Q", "expires_at_ms": 9,
+        })) else {
+            panic!("an approval request");
+        };
+        assert_eq!(
+            approval,
+            Approval {
+                request_id: "req_1".into(),
+                statement_b64url: "c3Q".into(),
+                expires_at_ms: 9
+            }
+        );
+        for refused in [
+            json!({"error": {"code": "not_found", "class": "refused"}}),
+            json!({"error": {"code": "not_granted", "class": "refused"}}),
+            json!({"status": "released", "kind": "api_key", "username": "u", "password": "p"}),
+            json!({"status": "released", "kind": "site_login", "password": "p"}),
+            json!({"status": "released", "kind": "site_login", "username": "u", "password": "p", "totp": 1}),
+            json!({"status": "approval_required", "request_id": "req_1"}),
+            json!({"status": "something_else"}),
+        ] {
+            assert!(
+                matches!(SecretUseAnswer::from_reply(refused.clone()), SecretUseAnswer::Refused),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_is_wiped_once_its_secrets_are_taken() {
+        let mut reply = json!({"status": "released", "nested": ["secret-copy", {"deep": "secret"}]});
+        wipe(&mut reply);
+        assert_eq!(reply, json!({"status": "", "nested": ["", {"deep": ""}]}));
+    }
+
+    #[test]
+    fn field_kinds_follow_the_typing_refusals_classification() {
+        let password = field(|f| f.input_type("password").password(true));
+        let email = field(|f| f.input_type("email"));
+        let username = field(|f| f.input_type("text").autocomplete(["username"]));
+        let plain = field(|f| f.input_type("text"));
+        let code = field(|f| f.input_type("text").autocomplete(["one-time-code"]));
+        assert_eq!(check_field_kind(LoginField::Password, &password), Ok(()));
+        assert_eq!(
+            check_field_kind(LoginField::Password, &username),
+            Err("not_a_password_field")
+        );
+        assert_eq!(check_field_kind(LoginField::Username, &email), Ok(()));
+        assert_eq!(check_field_kind(LoginField::Username, &username), Ok(()));
+        assert_eq!(
+            check_field_kind(LoginField::Username, &plain),
+            Err("not_a_username_field")
+        );
+        assert_eq!(
+            check_field_kind(LoginField::Username, &password),
+            Err("not_a_username_field")
+        );
+        assert_eq!(check_field_kind(LoginField::Otp, &code), Ok(()));
+        assert_eq!(
+            check_field_kind(LoginField::Otp, &plain),
+            Err("not_a_one_time_code_field")
+        );
+    }
+
+    #[test]
+    fn a_fields_origin_is_its_own_frames_and_must_be_https() {
+        let page = document("https://login.example/signin");
+        assert_eq!(
+            field_origin(None, &page).as_deref(),
+            Ok("https://login.example")
+        );
+        assert_eq!(
+            field_origin(
+                Some(&frame("https://auth.other.example/x", "https://auth.other.example")),
+                &page
+            )
+            .as_deref(),
+            Ok("https://auth.other.example")
+        );
+        assert_eq!(
+            field_origin(None, &document("http://login.example/")),
+            Err("origin_not_https")
+        );
+        for (url, origin) in [
+            ("https://auth.other.example/x", "null"),
+            ("about:srcdoc", "https://login.example"),
+            ("data:text/html,x", "null"),
+            ("blob:https://login.example/1", "https://login.example"),
+        ] {
+            assert_eq!(
+                field_origin(Some(&frame(url, origin)), &page),
+                Err("origin_opaque"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_replaces_every_copy_in_every_string() {
+        let mut value = json!({
+            "state_text": "a pw1 b pw1",
+            "nested": [{"name": "pw1"}, 3, "clean"],
+        });
+        redact_value(&mut value, "pw1");
+        assert_eq!(
+            value,
+            json!({
+                "state_text": format!("a {REDACTED_PASSWORD} b {REDACTED_PASSWORD}"),
+                "nested": [{"name": REDACTED_PASSWORD}, 3, "clean"],
+            })
+        );
+    }
+
+    #[test]
+    fn every_fill_reply_is_declared_by_the_fill_schema() {
+        let context = json!({
+            "profile_uuid": null, "profile_name": null,
+            "session_kind_effective": "primary", "profile_disposition": "durable",
+        });
+        let mut replies = vec![
+            json!({"outcome": "ok", "origin": "https://login.example", "filled": ["username", "password"], "context": context}),
+            json!({"outcome": "cancelled", "context": context}),
+        ];
+        let mut pending = crate::cingulate_client::desk::pending_reply("el_1");
+        pending["context"] = context.clone();
+        replies.push(pending);
+        for refusal in [
+            FillRefusal::Origin { field: "otp_ref", reason_code: "origins_differ" },
+            FillRefusal::LoginUnavailable,
+            FillRefusal::VaultUnavailable,
+            FillRefusal::Aborted { reason_code: "document_changed" },
+            FillRefusal::FilledPasswordOnPage,
+            FillRefusal::WindowExpired,
+            FillRefusal::ApprovalNotGiven { decision: "declined", asked: true },
+        ] {
+            replies.push(json!({
+                "outcome": refusal.outcome(),
+                "remedy": refusal.remedy(),
+                "detail": refusal.detail(),
+                "context": context,
+            }));
+        }
+        for reply in replies {
+            assert_eq!(validate_fill_login_result(&reply), Ok(()), "{reply}");
+        }
+        assert!(validate_fill_login_result(&json!({"outcome": "ok", "password": "x"})).is_err());
+    }
+
+    #[test]
+    fn production_has_no_login_material_source() {
+        assert!(PRODUCTION_LOGIN_MATERIAL_SOURCE.is_none());
+        let plane = BrowserPlane::new().with_login_material_source(production_login_material_source());
+        assert_eq!(admitted(FILL_LOGIN, &plane, true), None);
+    }
+}
