@@ -337,7 +337,11 @@ impl crate::management::TargetResolver for Running {
 }
 
 fn app_planes() -> Planes {
-    let mut planes = crate::tests::management_bound_planes(1, 1);
+    let mut planes = crate::tests::management_bound_planes_with_admission_facts(
+        1,
+        1,
+        Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
+    );
     planes.management = Arc::new(crate::management::ManagementPlane::new(Arc::new(Running)));
     CardService::install(planes, 1, 1)
 }

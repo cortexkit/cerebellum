@@ -5853,9 +5853,10 @@ mod tests {
     /// declare, then click ref `e2` through the serving boundary. The grant
     /// covers the page at tier 4 and discloses no hazard.
     async fn click_reply(refs: Vec<RefRecord>, severity: Value) -> Value {
-        let route = cerebellum_core::identity::RouteIdentity::from_bind(
+        let route = cerebellum_core::identity::RouteIdentity::from_accepted_bind(
             &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
+            Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
         );
         let grants =
             crate::authorization::GrantStore::new([crate::authorization::ActionGrant::new(
@@ -6301,9 +6302,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_point_click_requires_live_observation_before_computing_severity() {
-        let route = cerebellum_core::identity::RouteIdentity::from_bind(
+        let route = cerebellum_core::identity::RouteIdentity::from_accepted_bind(
             &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
+            Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
         );
         let plane = crate::browser::BrowserPlane::new().with_result_schema_enforcement(
             crate::computer_capability::ResultSchemaEnforcement::Withhold,
