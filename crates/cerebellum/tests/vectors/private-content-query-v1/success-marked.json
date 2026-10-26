@@ -1,0 +1,24 @@
+{
+  "case": "success-marked",
+  "contract": "private-content-query-v1",
+  "principal": "reserved:broca",
+  "reply": {
+    "body_length": 53,
+    "body_utf8": "{\"private_content\":true,\"sources\":[\"signed_in_site\"]}",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "350000000201020900010000000b000000000000007b22707269766174655f636f6e74656e74223a747275652c22736f7572636573223a5b227369676e65645f696e5f73697465225d7d"
+  },
+  "request": {
+    "body_length": 72,
+    "body_utf8": "{\"method\":\"private_content.query\",\"params\":{\"scope_ref\":\"test-session\"}}",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "480000000200020900010000000b000000000000007b226d6574686f64223a22707269766174655f636f6e74656e742e7175657279222c22706172616d73223a7b2273636f70655f726566223a22746573742d73657373696f6e227d7d"
+  },
+  "state": "the snapshotted scope read a signed-in page"
+}
