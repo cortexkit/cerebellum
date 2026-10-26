@@ -46,10 +46,12 @@ pub enum CardKind {
     StuckProfileClearance,
     /// Access to one site in the person's own signed-in browser.
     UserBrowserSite,
+    /// The vault's request to release a saved login to `browser.fill_login`.
+    SecretUse,
 }
 
 impl CardKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::WebsiteAccessInCall,
         Self::WebsiteAccessInAdvance,
         Self::AppControl,
@@ -59,6 +61,7 @@ impl CardKind {
         Self::ProfileReidentification,
         Self::StuckProfileClearance,
         Self::UserBrowserSite,
+        Self::SecretUse,
     ];
 
     /// Whether an approval of this card is consumed once rather than becoming

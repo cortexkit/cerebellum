@@ -19,6 +19,7 @@ mod blocking_permits;
 pub mod browser;
 pub mod browser_config;
 mod browser_consent;
+mod login_fill_consent;
 pub mod browser_crash_reports;
 pub mod browser_executable_identity;
 pub mod browser_launch;
@@ -1161,7 +1162,8 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
     let known_browser_name = browser_session::CONTROL_TOOLS.contains(&name)
         || browser::ALL_TOOLS.contains(&name)
         || name == flat_tools::BROWSER_USE
-        || name == crate::browser_type::BROWSER_TYPE_TOOL;
+        || name == crate::browser_type::BROWSER_TYPE_TOOL
+        || name == browser::fill::FILL_LOGIN;
     if !known_browser_name {
         // A current vocabulary row this build does not serve is withheld on
         // purpose; a retired computer capability, like any invented name, is
@@ -3157,6 +3159,7 @@ impl Planes {
             .computer_grants()
             .register_drain(&self.consent_drain);
         browser_consent::register(&self);
+        login_fill_consent::register(&self);
         user_browser::register(&self);
         self
     }
@@ -3359,7 +3362,8 @@ impl Planes {
                         journal_retention_bytes: BROWSER_DRIVE_JOURNAL_BYTES,
                         journal_max_entry_bytes: BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES,
                     },
-                ),
+                )
+                .with_login_material_source(browser::fill::production_login_material_source()),
             )
         } else {
             // The action surface is unavailable without browser configuration,
@@ -7156,7 +7160,12 @@ async fn handle_tool_request_inner(
     // Route admission is completed before decoding capability arguments.
     // Admitted routes may proceed to their handlers; denied routes perform no
     // reservation, context lookup, grant lookup, or CDP work.
-    let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some());
+    // `browser.fill_login` is served only by a plane that was given a source
+    // of login material, which no plane built for a running module is yet.
+    let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some())
+        .or_else(|| {
+            browser::fill::admitted(name, &planes.browser, planes.browser_config.is_some())
+        });
     let Some(capability_name) = known_capability else {
         if name == flat_tools::BROWSER_USE {
             return tool_provider::send_error(
@@ -7662,6 +7671,56 @@ async fn handle_tool_request_inner(
     // reply BODY of `{"outcome": "unknown_method"}` -- no `context`, which
     // `reply_schema` makes required, so it would have failed its own schema had
     // anything validated it. That helper is gone; nothing else called it.
+    if name == browser::fill::FILL_LOGIN {
+        // A fill marks the dispatch commitment before its first CDP command,
+        // so an unmarked witness proves nothing reached the page.
+        call.commit_point_follows();
+        let result = Box::pin(login_fill_consent::serve(
+            planes,
+            &accepted_facts,
+            (channel, epoch, corr),
+            arguments,
+            BROWSER_CONSENT_PARK_LIMIT
+                .try_with(|limit| *limit)
+                .unwrap_or(Duration::from_secs(120)),
+        ))
+        .await;
+        if planes.routes.get(channel, epoch).is_none() {
+            return Ok(());
+        }
+        if TerminalArbiter::current().is_some_and(|terminal| terminal.answered_by_cancel()) {
+            return Ok(());
+        }
+        return match result {
+            Ok(result) => {
+                private_content::send_reply(
+                    planes,
+                    &accepted_facts,
+                    private_content::ReplyPlane::OwnBrowser,
+                    writer,
+                    (ver, channel, epoch, corr),
+                    result,
+                )
+                .await
+            }
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    browser::RESULT_SCHEMA_VIOLATION_CODE,
+                    &format!(
+                        "the capability reply violated its frozen result schema ({error}); the \
+                         operation may already have completed, so do not retry it based on this \
+                         response"
+                    ),
+                )
+                .await
+            }
+        };
+    }
     let Some(capability) = browser::BrowserCapability::parse(name) else {
         let withheld = CapabilityWithheld::Unknown;
         return send_route_error(

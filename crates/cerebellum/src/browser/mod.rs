@@ -8,6 +8,7 @@
 pub(crate) mod dom_layout;
 mod dom_values;
 pub mod extraction;
+pub mod fill;
 pub mod geometry;
 pub mod navigation;
 mod refs;
@@ -285,6 +286,9 @@ pub enum BrowserError {
     /// The browser session table's lock is poisoned, so whether a session
     /// exists is unknown and no browser action can be admitted.
     SessionStateUnavailable,
+    /// A refusal of `browser.fill_login`, or of a read of a tab holding a
+    /// filled login.
+    FillRefused(fill::FillRefusal),
 }
 
 impl BrowserError {
@@ -319,6 +323,7 @@ impl BrowserError {
             Self::ZoomStepFailure { .. } => "zoom_not_ready",
             Self::Internal { .. } | Self::CdpStepFailure { .. } => "internal_error",
             Self::SessionStateUnavailable => "internal_failure",
+            Self::FillRefused(refusal) => refusal.outcome(),
         }
     }
     /// Tell a caller which action can change this refusal, or explicitly when none exists.
@@ -426,6 +431,7 @@ impl BrowserError {
             Self::SessionStateUnavailable => {
                 "no caller remedy: report this module failure with its stage; the browser session state is unreadable until the module restarts"
             }
+            Self::FillRefused(refusal) => refusal.remedy(),
         }
     }
 
@@ -585,6 +591,7 @@ impl BrowserError {
                 viewport_refusal_detail("point_outside_viewport", *refusal)
             }
             Self::BrowserCrashed => json!({"reason_code":"browser_crashed"}),
+            Self::FillRefused(refusal) => refusal.detail(),
         })
     }
 }
@@ -1276,6 +1283,8 @@ struct ContextState {
     /// different page.
     snapshot_nonce: u128,
     refs: refs::StableRefs,
+    /// Set while a login filled into this tab is still on its page.
+    fill_window: Option<fill::FillWindow>,
 }
 
 /// 128 bits from the OS random source, drawn once per page context.
@@ -1325,6 +1334,7 @@ impl ContextState {
             next_snapshot_seed: 0,
             snapshot_nonce: new_snapshot_nonce(),
             refs: refs::StableRefs::default(),
+            fill_window: None,
         }
     }
     fn snapshot_id(&mut self, kind: SnapshotKind) -> String {
@@ -1468,6 +1478,11 @@ pub struct BrowserPlane {
     )>,
     result_schema_enforcement: ResultSchemaEnforcement,
     result_schema_findings: StdMutex<BTreeMap<CapabilityResultValidationError, u64>>,
+    /// Where `browser.fill_login` gets login material; `None` leaves it
+    /// unserved. See `fill::PRODUCTION_LOGIN_MATERIAL_SOURCE`.
+    login_material: Option<Arc<dyn fill::LoginMaterialSource>>,
+    /// How long a tab stays in its window after a login fill at most.
+    fill_window_cap: Duration,
 }
 
 impl Default for BrowserPlane {
@@ -1559,6 +1574,8 @@ impl BrowserPlane {
             session_gate: None,
             result_schema_enforcement: ResultSchemaEnforcement::DetectOnly,
             result_schema_findings: StdMutex::new(BTreeMap::new()),
+            login_material: None,
+            fill_window_cap: fill::FILL_WINDOW,
         }
     }
 
@@ -1988,6 +2005,8 @@ impl BrowserPlane {
             if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
                 context.ended = true;
                 context.crashed = crashed;
+                // The tab is gone, and the filled password with it.
+                context.fill_window = None;
                 context.snapshots.begin_teardown();
                 let _ = context.snapshots.complete_teardown();
                 context.refs.prune_shown(&context.snapshots);
@@ -2084,7 +2103,11 @@ impl BrowserPlane {
             self.terminal_on_error(identity, capability, start, error)
                 .await;
         }
-        self.result(identity, result).await
+        let mut reply = self.result(identity, result).await;
+        // Every reply about a tab in a fill window loses the filled password,
+        // whichever page text it carries.
+        self.redact_filled_password(identity, &mut reply).await;
+        reply
     }
 
     /// Serve one browser capability and certify its completed reply before it
@@ -2958,11 +2981,20 @@ impl BrowserPlane {
         else {
             return Err(BrowserError::NoSession);
         };
-        let (mut session_operation, source_document) = self
+        let (session_operation, source_document) = self
             .read_live_document(identity, session_operation, deadline_ms)
             .await?;
         let baseline_read = self
             .authorize_read(identity, BrowserCapability::Snapshot, &source_document.url)
+            .await?;
+        let (mut session_operation, fill_mask) = self
+            .fill_window_gate(
+                identity,
+                session_operation,
+                &source_document,
+                deadline_ms,
+                fill::WindowRead::Text,
+            )
             .await?;
         let route = identity.conversation_key.clone();
         let (operation, frames) = tokio::task::spawn_blocking(move || {
@@ -3118,6 +3150,9 @@ impl BrowserPlane {
             live_after,
         )
         .await?;
+        if let Some(filled) = &fill_mask {
+            fill::mask_filled_fields(&mut observation, filled);
+        }
         if frames_omitted > 0 {
             let note = "embedded frame from a local, private or opaque origin omitted; it needs site permission";
             observation.records.push(AxRecord {
@@ -3894,7 +3929,7 @@ impl BrowserPlane {
         };
         // As for a snapshot: pixels of an authenticated page are a read of it,
         // so the grant consulted is the one for where the page is now.
-        let (mut session_operation, source_document) = self
+        let (session_operation, source_document) = self
             .read_live_document(identity, session_operation, deadline_ms)
             .await?;
         self.authorize_read(
@@ -3903,6 +3938,15 @@ impl BrowserPlane {
             &source_document.url,
         )
         .await?;
+        let (mut session_operation, _) = self
+            .fill_window_gate(
+                identity,
+                session_operation,
+                &source_document,
+                deadline_ms,
+                fill::WindowRead::Screenshot,
+            )
+            .await?;
         let route = identity.conversation_key.clone();
         let (operation, frames) = tokio::task::spawn_blocking(move || {
             let frames = session_operation.frame_documents(&route, deadline_ms);
@@ -6064,6 +6108,9 @@ fn journal_outcome(error: &BrowserError) -> Outcome {
         BrowserError::CommandTimeout { .. }
         | BrowserError::TypeNotReady { .. }
         | BrowserError::NavigateNotReady { .. } => Outcome::InvalidRequest,
+        // Screenshot and read refusals of a tab in a fill window are
+        // decided before any journal entry is reserved; a fill writes none.
+        BrowserError::FillRefused(_) => Outcome::Denied,
     }
 }
 /// One journal capability per browser capability, with no collapsing.
@@ -7240,10 +7287,11 @@ mod tests {
             BrowserError::BrowserCrashed => "BrowserCrashed",
             BrowserError::Internal { .. } => "Internal",
             BrowserError::SessionStateUnavailable => "SessionStateUnavailable",
+            BrowserError::FillRefused(_) => "FillRefused",
         }
     }
 
-    const BROWSER_ERROR_VARIANTS: usize = 32;
+    const BROWSER_ERROR_VARIANTS: usize = 33;
 
     /// A sample of every `BrowserError` variant, with one more sample for
     /// each case `remedy` words differently (a reason code, a sent flag, a
@@ -7380,6 +7428,29 @@ mod tests {
             },
             BrowserError::SessionStateUnavailable,
         ];
+        for refusal in [
+            fill::FillRefusal::Origin {
+                field: "password_ref",
+                reason_code: "origin_not_https",
+            },
+            fill::FillRefusal::LoginUnavailable,
+            fill::FillRefusal::VaultUnavailable,
+            fill::FillRefusal::Aborted {
+                reason_code: "document_changed",
+            },
+            fill::FillRefusal::FilledPasswordOnPage,
+            fill::FillRefusal::WindowExpired,
+            fill::FillRefusal::ApprovalNotGiven {
+                decision: "declined",
+                asked: true,
+            },
+            fill::FillRefusal::ApprovalNotGiven {
+                decision: "no_agent_session",
+                asked: false,
+            },
+        ] {
+            errors.push(BrowserError::FillRefused(refusal));
+        }
         for cause in [
             Cause::NotCaptured,
             Cause::TargetNotInDocument { backend_node_id: 7 },

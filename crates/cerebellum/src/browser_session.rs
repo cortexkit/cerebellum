@@ -809,6 +809,39 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
+    /// Re-check each login field's kind and frame and then insert its value,
+    /// all through the process-owned CDP connection. A field already filled
+    /// when a later check fails is cleared before this returns.
+    fn fill_login(
+        &mut self,
+        _context_key: &str,
+        _dispatch: &crate::browser::fill::FillDispatch,
+        _deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FillOutcome, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Empty login fields this module filled. A field that is gone, or whose
+    /// frame has gone, needs nothing and is skipped.
+    fn clear_filled(
+        &mut self,
+        _context_key: &str,
+        _fields: &[crate::browser::fill::FilledField],
+        _deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
+    /// Report whether any login field this module filled still holds a value.
+    fn filled_fields_state(
+        &mut self,
+        _context_key: &str,
+        _fields: &[crate::browser::fill::FilledField],
+        _deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FilledFieldsState, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     fn generation_matches(&self) -> bool;
 
     /// Send the paired release of every press this session's driver recorded
@@ -2082,6 +2115,42 @@ impl OperationGuard {
         self.drive(
             |error| error,
             |process| process.type_classified(context_key, target, text, clear_first, deadline_ms),
+        )
+    }
+
+    pub(crate) fn fill_login(
+        &mut self,
+        context_key: &str,
+        dispatch: &crate::browser::fill::FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FillOutcome, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.fill_login(context_key, dispatch, deadline_ms),
+        )
+    }
+
+    pub(crate) fn clear_filled(
+        &mut self,
+        context_key: &str,
+        fields: &[crate::browser::fill::FilledField],
+        deadline_ms: u64,
+    ) -> Result<(), NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.clear_filled(context_key, fields, deadline_ms),
+        )
+    }
+
+    pub(crate) fn filled_fields_state(
+        &mut self,
+        context_key: &str,
+        fields: &[crate::browser::fill::FilledField],
+        deadline_ms: u64,
+    ) -> Result<crate::browser::fill::FilledFieldsState, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.filled_fields_state(context_key, fields, deadline_ms),
         )
     }
 
