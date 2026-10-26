@@ -105,6 +105,8 @@ impl Browser {
             .cloned()
             .unwrap_or((1, "about:blank".to_string()));
         CommittedDocument {
+            security_origin: cerebellum::classification::canonical_origin_from_url(&url)
+                .unwrap_or_else(|| "null".into()),
             url,
             entry_id,
             history: entries.iter().map(|entry| entry.0).collect(),

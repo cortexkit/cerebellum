@@ -400,6 +400,8 @@ impl CommittedPage {
         let history = self.0.lock().unwrap();
         let (entry_id, url, loader_id) = history.entries[history.current].clone();
         CommittedDocument {
+            security_origin: cerebellum::classification::canonical_origin_from_url(&url)
+                .unwrap_or_else(|| "null".into()),
             url,
             entry_id,
             history: history.entries.iter().map(|entry| entry.0).collect(),

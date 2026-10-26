@@ -146,6 +146,13 @@ pub fn committed_document_from(
         .to_string();
     Some(crate::snapshot_store::CommittedDocument {
         url,
+        security_origin: frame_tree
+            .get("frameTree")?
+            .get("frame")?
+            .get("securityOrigin")
+            .and_then(Value::as_str)
+            .unwrap_or("null")
+            .to_owned(),
         entry_id: ids[current_index],
         history: ids,
         current_index,
@@ -588,6 +595,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline_ms,
             Some((0, "null")),
             None,
+            &[],
             &mut clock,
         )?;
         Ok(observation.refs.iter().any(|reference| {
@@ -630,7 +638,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
-        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, &mut clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, &[], &mut clock)
     }
 
     pub fn snapshot_classified(
@@ -648,7 +656,31 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline_ms,
             Some((document_epoch, current_origin)),
             None,
+            &[],
             &mut clock,
+        )
+    }
+
+    /// Capture with a mandatory per-call identity mask, including DOM markup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_protected(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: Option<&RefRecord>,
+        epoch: u64,
+        origin: &str,
+        filled: &[BackendNodeIdentity],
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.snapshot_with_clock(
+            context,
+            mode,
+            deadline_ms,
+            Some((epoch, origin)),
+            reference,
+            filled,
+            &mut SystemNavigationClock,
         )
     }
 
@@ -670,6 +702,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline_ms,
             Some((document_epoch, current_origin)),
             Some(reference),
+            &[],
             &mut SystemNavigationClock,
         )
     }
@@ -888,7 +921,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
-        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, clock)
+        self.snapshot_with_clock(context_key, mode, deadline_ms, None, None, &[], clock)
     }
 
     #[cfg(test)]
@@ -1827,6 +1860,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snapshot_with_clock<C: NavigationClock>(
         &mut self,
         context_key: &str,
@@ -1834,6 +1868,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         classification_context: Option<(u64, &str)>,
         subtree: Option<&RefRecord>,
+        filled: &[BackendNodeIdentity],
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         if self.read_frames.is_some() {
@@ -1843,6 +1878,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 deadline_ms,
                 classification_context,
                 subtree,
+                filled,
                 clock,
             );
         }
@@ -1853,6 +1889,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             classification_context,
             subtree,
             subtree.is_some(),
+            filled,
             clock,
         )
     }
@@ -1866,6 +1903,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         classification_context: Option<(u64, &str)>,
         subtree: Option<&RefRecord>,
         bounded: bool,
+        filled: &[BackendNodeIdentity],
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         if mode == SnapshotKind::Screenshot {
@@ -1905,7 +1943,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // A page-wide bounded prefix can omit the requested element entirely.
         // Resolve its backend identity directly so unrelated siblings consume
         // neither the traversal budget nor the output cap.
-        let root = if let Some(reference) = subtree {
+        let mut root = if let Some(reference) = subtree {
             let identity = reference.backend_identity.as_ref().ok_or_else(|| {
                 NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
             })?;
@@ -1957,6 +1995,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     classification_context,
                     None,
                     bounded,
+                    filled,
                     clock,
                 );
             };
@@ -1990,9 +2029,33 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             required_ax_node(&root_result, "node")
                 .map_err(|error| error.at_step("Accessibility.getRootAXNode"))?
         };
+        let protected: HashSet<u64> = filled
+            .iter()
+            .filter(|identity| identity.target_id == attachment.target_id)
+            .filter(|identity| {
+                self.frame_documents
+                    .iter()
+                    .find(|frame| frame.frame_id == identity.frame_id)
+                    .is_none_or(|frame| frame.session_id == attachment.session_id)
+            })
+            .map(|identity| identity.backend_node_id)
+            .collect();
+        let mask_ax = |node: &mut RawAxNode| {
+            if node
+                .backend_node_id
+                .is_some_and(|id| protected.contains(&id))
+            {
+                node.name.clear();
+                node.value = None;
+                // An ignored or role-mutated input need not receive a ref.
+                // Suppress its editor subtree before AX projection loses identity.
+                node.child_ids.clear();
+            }
+        };
+        mask_ax(&mut root);
         let root_backend_id = root.backend_node_id;
         let session_id = attachment.session_id.clone();
-        let bulk = if self.prefer_bulk_ax {
+        let bulk = if self.prefer_bulk_ax && filled.is_empty() {
             self.bulk_ax_capture(
                 &attachment,
                 &root,
@@ -2029,8 +2092,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         None,
                         clock,
                     )?;
-                    required_ax_nodes(&result)
-                        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))
+                    let mut nodes = required_ax_nodes(&result)
+                        .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
+                    for node in &mut nodes {
+                        mask_ax(node);
+                    }
+                    Ok(nodes)
                 },
             )
             .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
@@ -2139,21 +2206,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     super::zoom::enclosing_element(dom, backend).map_err(|_| {
                         NavigationDriveError::CdpFailure.at_step("DOM.getFlattenedDocument")
                     })?;
-                let outer = self.command(
-                    "DOM.getOuterHTML",
-                    Some(
-                        serde_json::json!({"backendNodeId":backend})
-                            .as_object()
-                            .unwrap()
-                            .clone(),
-                    ),
-                    Some(attachment.session_id.clone()),
-                    snapshot_step_deadline(deadline, bounded, clock.now()),
-                    None,
+                let markup = self.masked_outer_html(
+                    &attachment,
+                    serde_json::json!({"backendNodeId":backend}),
+                    filled,
+                    deadline,
                     clock,
                 )?;
-                let markup = required_result_string(&outer, "outerHTML")
-                    .map_err(|error| error.at_step("DOM.getOuterHTML"))?;
                 observation.dom_text = Some(format!(
                     "{}{markup}",
                     kind.map(|kind| {
@@ -2213,30 +2272,110 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.querySelector"))?;
                 // A non-HTML document (for example SVG) need not have a body.
                 let node_id = if body_id == 0 { document_id } else { body_id };
-                let outer_html = self.command(
-                    "DOM.getOuterHTML",
-                    Some(
-                        serde_json::json!({"nodeId":node_id})
-                            .as_object()
-                            .unwrap()
-                            .clone(),
-                    ),
-                    Some(attachment.session_id.clone()),
+                observation.dom_text = Some(self.masked_outer_html(
+                    &attachment,
+                    serde_json::json!({"nodeId":node_id}),
+                    filled,
                     deadline,
-                    None,
                     clock,
-                )?;
-                observation.dom_text = Some(
-                    required_result_string(&outer_html, "outerHTML")
-                        .map_err(|error| error.at_step("DOM.getOuterHTML"))?,
-                );
+                )?);
             }
-            self.read_landmark_markup(&mut observation, &attachment.session_id, deadline, clock);
+            self.read_landmark_markup(&mut observation, &attachment, filled, deadline, clock)?;
         }
 
         timings.body_ms = body_started.elapsed().as_millis();
         self.last_snapshot_timings = Some(timings);
         Ok(observation)
+    }
+
+    /// Serialize a clone with protected nodes masked by object identity. The
+    /// original page is never mutated, and a failed mask refuses the capture.
+    fn masked_outer_html<C: NavigationClock>(
+        &mut self,
+        attachment: &AttachedTarget,
+        node: Value,
+        filled: &[BackendNodeIdentity],
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<String, NavigationDriveError> {
+        if filled.is_empty() {
+            let result = self.command(
+                "DOM.getOuterHTML",
+                node.as_object().cloned(),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            return required_result_string(&result, "outerHTML");
+        }
+        let frame = self
+            .active_frame
+            .as_ref()
+            .map(|frame| frame.frame_id.clone())
+            .or_else(|| filled.first().map(|identity| identity.frame_id.clone()))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let world = self.command(
+            "Page.createIsolatedWorld",
+            serde_json::json!({"frameId":frame,"worldName":"cortexkit-login-capture"})
+                .as_object()
+                .cloned(),
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        let context = world
+            .get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        let ids: Vec<_> = filled
+            .iter()
+            .filter(|identity| identity.target_id == attachment.target_id)
+            .filter(|identity| {
+                self.frame_documents
+                    .iter()
+                    .find(|frame| frame.frame_id == identity.frame_id)
+                    .is_none_or(|frame| frame.session_id == attachment.session_id)
+            })
+            .cloned()
+            .collect();
+        let mut resolve = |mut params: Map<String, Value>| -> Result<String, NavigationDriveError> {
+            params.insert("executionContextId".into(), context.into());
+            let result = self.command(
+                "DOM.resolveNode",
+                Some(params),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            result
+                .get("object")
+                .and_then(|object| object.get("objectId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(NavigationDriveError::CdpFailure)
+        };
+        let root = resolve(
+            node.as_object()
+                .cloned()
+                .ok_or(NavigationDriveError::CdpFailure)?,
+        )?;
+        let mut args = Vec::new();
+        for identity in ids {
+            args.push(serde_json::json!({"objectId":resolve(serde_json::json!({"backendNodeId":identity.backend_node_id}).as_object().unwrap().clone())?}));
+        }
+        let result = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":root,"functionDeclaration":super::dom_values::MASK_IDENTITIES,"arguments":args,"returnByValue":true}).as_object().cloned(), Some(attachment.session_id.clone()), deadline, None, clock)?;
+        if result.contains_key("exceptionDetails") {
+            return Err(NavigationDriveError::CdpFailure);
+        }
+        result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(NavigationDriveError::CdpFailure)
     }
 
     /// Read the outerHTML of each outermost content and chrome landmark into
@@ -2250,13 +2389,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     fn read_landmark_markup<C: NavigationClock>(
         &mut self,
         observation: &mut BrowserSnapshotObservation,
-        session_id: &str,
+        attachment: &AttachedTarget,
+        filled: &[BackendNodeIdentity],
         deadline: Instant,
         clock: &mut C,
-    ) {
+    ) -> Result<(), NavigationDriveError> {
         let landmarks = dom_landmark_nodes(observation);
         if landmarks.is_empty() {
-            return;
+            return Ok(());
         }
         let backend_ids: Vec<u64> = landmarks.iter().map(|(_, id)| *id).collect();
         let Ok(pushed) = self.command(
@@ -2267,12 +2407,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .unwrap()
                     .clone(),
             ),
-            Some(session_id.to_string()),
+            Some(attachment.session_id.clone()),
             deadline,
             None,
             clock,
         ) else {
-            return;
+            return Ok(());
         };
         let node_ids: Vec<u64> = pushed
             .get("nodeIds")
@@ -2283,26 +2423,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if node_id == 0 {
                 continue;
             }
-            let Ok(reply) = self.command(
-                "DOM.getOuterHTML",
-                Some(
-                    serde_json::json!({ "nodeId": node_id })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-                Some(session_id.to_string()),
+            let markup = match self.masked_outer_html(
+                attachment,
+                serde_json::json!({"nodeId":node_id}),
+                filled,
                 deadline,
-                None,
                 clock,
-            ) else {
-                return;
-            };
-            let Ok(markup) = required_result_string(&reply, "outerHTML") else {
-                return;
+            ) {
+                Ok(markup) => markup,
+                Err(error) if !filled.is_empty() => return Err(error),
+                Err(_) => return Ok(()),
             };
             observation.facts.entry(reference).or_default().dom_markup = Some(markup);
         }
+        Ok(())
     }
 
     fn load_in_background_tab_with_clock<C: NavigationClock>(
@@ -5135,6 +5269,7 @@ mod tests {
                 120_000,
                 Some((7, "https://page.example")),
                 Some(&reference),
+                &[],
                 &mut clock,
             )
             .unwrap();
@@ -5833,6 +5968,7 @@ mod tests {
                 1_000,
                 context,
                 None,
+                &[],
                 &mut FakeClock::new(),
             )
             .expect("the AX tree is coherent")
@@ -6375,6 +6511,7 @@ mod tests {
                 1_000,
                 Some((7, "https://login.example")),
                 None,
+                &[],
                 &mut FakeClock::new(),
             )
             .unwrap();
@@ -7385,6 +7522,7 @@ mod tests {
                 1000,
                 Some((7, &url)),
                 None,
+                &[],
                 &mut FakeClock::new(),
             )
             .unwrap();
@@ -8203,6 +8341,7 @@ mod tests {
                 1000,
                 None,
                 Some(&reference),
+                &[],
                 &mut FakeClock::new(),
             )
             .unwrap();
@@ -9667,6 +9806,7 @@ mod signed_in_page_read_tests {
                 5_000,
                 Some((1, before.url.as_str())),
                 None,
+                &[],
                 clock,
             )
             .expect("the capture reads the page");

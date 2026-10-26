@@ -671,6 +671,35 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
+    /// A protected capture must mask by backend identity before serialization.
+    /// Legacy adapters may capture only when there are no protected nodes.
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_protected(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: Option<&crate::snapshot_store::RefRecord>,
+        epoch: u64,
+        origin: &str,
+        filled: &[crate::snapshot_store::BackendNodeIdentity],
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        if !filled.is_empty() {
+            return Err(NavigationDriveError::Unavailable);
+        }
+        match reference {
+            Some(reference) => self.snapshot_subtree_classified(
+                context,
+                mode,
+                reference,
+                epoch,
+                origin,
+                deadline_ms,
+            ),
+            None => self.snapshot_classified(context, mode, epoch, origin, deadline_ms),
+        }
+    }
+
     /// Enumerate identities without returning frame content.
     fn frame_documents(
         &mut self,
@@ -1924,6 +1953,46 @@ impl OperationGuard {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn snapshot_protected(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: Option<&crate::snapshot_store::RefRecord>,
+        epoch: u64,
+        origin: &str,
+        filled: &[crate::snapshot_store::BackendNodeIdentity],
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        if filled.is_empty() {
+            return match reference {
+                Some(reference) => self.snapshot_subtree_classified(
+                    context,
+                    mode,
+                    reference,
+                    epoch,
+                    origin,
+                    deadline_ms,
+                ),
+                None => self.snapshot_classified(context, mode, epoch, origin, deadline_ms),
+            };
+        }
+        self.drive(
+            |error| error,
+            |driver| {
+                driver.snapshot_protected(
+                    context,
+                    mode,
+                    reference,
+                    epoch,
+                    origin,
+                    filled,
+                    deadline_ms,
+                )
+            },
+        )
+    }
+
     pub(crate) fn snapshot_classified(
         &mut self,
         context_key: &str,
@@ -2139,18 +2208,6 @@ impl OperationGuard {
         self.drive(
             |error| error,
             |process| process.clear_filled(context_key, fields, deadline_ms),
-        )
-    }
-
-    pub(crate) fn filled_fields_state(
-        &mut self,
-        context_key: &str,
-        fields: &[crate::browser::fill::FilledField],
-        deadline_ms: u64,
-    ) -> Result<crate::browser::fill::FilledFieldsState, NavigationDriveError> {
-        self.drive(
-            |error| error,
-            |process| process.filled_fields_state(context_key, fields, deadline_ms),
         )
     }
 

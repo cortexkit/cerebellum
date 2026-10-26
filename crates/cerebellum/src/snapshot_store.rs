@@ -173,6 +173,30 @@ pub struct RefRecord {
 }
 
 impl RefRecord {
+    pub(crate) fn redact(&mut self, redact: &dyn Fn(&mut String)) {
+        redact(&mut self.captured.name);
+        redact(&mut self.captured.role);
+        for text in [&mut self.raw_name, &mut self.raw_role]
+            .into_iter()
+            .flatten()
+        {
+            redact(text);
+        }
+        if let Some(frame) = &mut self.frame_document {
+            redact(&mut frame.url);
+        }
+        if let Ok(classification) = &mut self.classification {
+            for token in &mut classification.target_autocomplete_tokens {
+                redact(token);
+            }
+            for control in &mut classification.associated_form_controls {
+                for token in &mut control.autocomplete_tokens {
+                    redact(token);
+                }
+            }
+        }
+    }
+
     pub fn fallback_key(&self) -> FallbackKey {
         FallbackKey {
             frame_path: self.frame_path.clone(),
@@ -244,6 +268,8 @@ impl AxRecord {
 pub struct CommittedDocument {
     /// The committed main-frame URL.
     pub url: String,
+    /// The browser's actual security origin, including opaque origins.
+    pub security_origin: String,
     /// The browser's unique id for the current history entry
     /// (`Page.getNavigationHistory`). Every committed navigation that adds
     /// or replaces an entry changes it, including a same-document one such as
@@ -266,6 +292,7 @@ impl CommittedDocument {
     pub fn new(url: impl Into<String>, entry_id: i64, loader_id: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            security_origin: "null".into(),
             entry_id,
             history: vec![entry_id],
             current_index: 0,
@@ -288,6 +315,20 @@ pub struct TextSnapshot {
     pub truncated: bool,
     pub refs_truncated: bool,
     pub refs: Vec<RefRecord>,
+}
+
+impl TextSnapshot {
+    /// Sanitize before the store or reply encoder clones any captured text.
+    pub(crate) fn redact(&mut self, redact: &dyn Fn(&mut String)) {
+        redact(&mut self.content);
+        redact(&mut self.source_origin);
+        if let Some(document) = &mut self.source_document {
+            redact(&mut document.url);
+        }
+        for reference in &mut self.refs {
+            reference.redact(redact);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

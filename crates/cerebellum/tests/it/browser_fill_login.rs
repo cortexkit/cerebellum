@@ -102,6 +102,14 @@ struct FrameSpec {
 
 struct Page {
     main_url: String,
+    main_opaque: bool,
+    adopted_owner: bool,
+    mutate_before_set: bool,
+    fail_after_password: bool,
+    resolve_fails: bool,
+    snapshot_delay: Duration,
+    real_dom_capture: bool,
+    frame_generation: u64,
     /// Bumped by every cross-document navigation.
     document: u64,
     frame: Option<FrameSpec>,
@@ -129,6 +137,14 @@ impl Default for Page {
     fn default() -> Self {
         Self {
             main_url: format!("{SITE}/signin"),
+            main_opaque: false,
+            adopted_owner: false,
+            mutate_before_set: false,
+            fail_after_password: false,
+            resolve_fails: false,
+            snapshot_delay: Duration::ZERO,
+            real_dom_capture: false,
+            frame_generation: 1,
             document: 1,
             frame: None,
             form_in: Place::Main,
@@ -163,6 +179,8 @@ impl Shared {
         page.document += 1;
         page.main_url = format!("{SITE}/home");
         page.form_removed = true;
+        page.values.clear();
+        page.copied_text = None;
     }
 
     fn value(&self, node: u64) -> String {
@@ -170,11 +188,7 @@ impl Shared {
     }
 
     fn insertions(&self) -> usize {
-        self.lock()
-            .commands
-            .iter()
-            .filter(|method| *method == "Input.insertText")
-            .count()
+        self.lock().inserted.len()
     }
 }
 
@@ -199,14 +213,14 @@ impl Page {
             "id": MAIN,
             "loaderId": format!("loader-{}", self.document),
             "url": self.main_url,
-            "securityOrigin": origin,
+            "securityOrigin": if self.main_opaque { "null" } else { origin.as_str() },
             "mimeType": "text/html",
         }});
         if let Some(frame) = &self.frame {
             let mut child = json!({
                 "id": LOGIN_FRAME,
                 "parentId": MAIN,
-                "loaderId": "frame-loader-1",
+                "loaderId": format!("frame-loader-{}", self.frame_generation),
                 "url": frame.url,
                 "mimeType": "text/html",
             });
@@ -244,8 +258,30 @@ impl Page {
                 self.focused = params["backendNodeId"].as_u64();
                 json!({})
             }
+            "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+            "DOM.describeNode" => {
+                let in_frame = self.form_in == Place::Frame;
+                json!({"node":{"nodeType":9,"frameId":if self.adopted_owner {"adopted-frame"} else if in_frame { LOGIN_FRAME } else { MAIN },
+                    "documentURL":if self.adopted_owner {"about:blank"} else if in_frame {&self.frame.as_ref().unwrap().url} else {&self.main_url}}})
+            }
+            "Accessibility.getRootAXNode" => {
+                json!({"node":{"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Login"},"backendDOMNodeId":1,"frameId":MAIN}})
+            }
+            "Accessibility.getChildAXNodes" => json!({"nodes":[]}),
+            "DOM.getDocument" => json!({"root":{"nodeId":1}}),
+            "DOM.pushNodesByBackendIdsToFrontend" => json!({"nodeIds":[1]}),
+            "DOM.querySelector" => json!({"nodeId":1}),
+            "DOM.getOuterHTML" => {
+                json!({"outerHTML":"<body><input type=button value=IDENTITY-MASK-CANARY></body>"})
+            }
             "DOM.resolveNode" => {
-                let node = params["backendNodeId"].as_u64().unwrap_or_default();
+                if self.resolve_fails {
+                    return Err("transport unavailable");
+                }
+                let node = params["backendNodeId"]
+                    .as_u64()
+                    .or_else(|| params["nodeId"].as_u64())
+                    .unwrap_or_default();
                 if self.form_removed && field(node) {
                     return Err("No node with given id found");
                 }
@@ -254,7 +290,37 @@ impl Page {
             "Runtime.callFunctionOn" => {
                 let node = Self::object_node(params).ok_or("Cannot find context")?;
                 let function = params["functionDeclaration"].as_str().unwrap_or_default();
-                let value = if function.contains("this.select()") {
+                if function == "function() { return this.ownerDocument; }" {
+                    return Ok(json!({"result":{"objectId":"document-owner"}}));
+                }
+                let value = if function.contains("protectedNodes") {
+                    assert!(params["arguments"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|arg| arg["objectId"] == format!("node-{USERNAME_NODE}")));
+                    json!("<body><input type=button></body>")
+                } else if function.contains("Object.getOwnPropertyDescriptor") {
+                    assert!(function.contains("this.ownerDocument !== doc"));
+                    assert!(function.contains("this.isConnected"));
+                    assert!(function.contains("this.type !== expectedType"));
+                    assert!(function.contains("JSON.stringify(tokens)"));
+                    assert!(function.contains("dispatchEvent(new win.Event('input'"));
+                    assert!(function.contains("dispatchEvent(new win.Event('change'"));
+                    if self.mutate_before_set {
+                        return Ok(json!({"result":{"value":false}}));
+                    }
+                    let text = params["arguments"][4]["value"].as_str().unwrap().to_owned();
+                    self.values.insert(node, text);
+                    self.inserted.push(node);
+                    if self.navigate_after_first_insert && self.inserted.len() == 1 {
+                        self.document += 1;
+                    }
+                    if self.fail_after_password && node == PASSWORD_NODE {
+                        return Err("timeout after setting password");
+                    }
+                    json!(true)
+                } else if function.contains("this.select()") {
                     self.focused = Some(node);
                     json!(true)
                 } else if function.contains("this.value.length : -1") {
@@ -263,6 +329,9 @@ impl Page {
                         .get(&node)
                         .map_or(0, |value| value.encode_utf16().count()))
                 } else if function.contains("this.value = ''") {
+                    if self.fail_after_password {
+                        return Err("cleanup unavailable");
+                    }
                     self.values.insert(node, String::new());
                     json!(true)
                 } else if function.contains("isConnected") {
@@ -345,6 +414,26 @@ impl Process {
 }
 
 impl OwnedBrowserProcess for Process {
+    fn navigate(
+        &mut self,
+        _: &str,
+        url: &str,
+        _: cerebellum::browser_session::NavigationWait,
+        _: u64,
+        tracker: &mut cerebellum::browser::Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        if url.contains('#') {
+            self.page.lock().main_url = url.into();
+            tracker.main_frame_navigated_within_document(url.into());
+        } else {
+            self.page.navigate_away();
+            self.page.lock().main_url = url.into();
+            tracker.main_frame_navigated(Some(MAIN.into()), url.into());
+        }
+        tracker.load(std::time::Instant::now());
+        Ok(())
+    }
+
     fn committed_document(
         &mut self,
         context_key: &str,
@@ -473,6 +562,35 @@ impl OwnedBrowserProcess for Process {
         Ok(observation)
     }
 
+    fn snapshot_protected(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: Option<&RefRecord>,
+        epoch: u64,
+        origin: &str,
+        filled: &[BackendNodeIdentity],
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        let (delay, real_dom) = {
+            let page = self.page.lock();
+            (page.snapshot_delay, page.real_dom_capture)
+        };
+        std::thread::sleep(delay);
+        if real_dom && mode == SnapshotKind::DomFull {
+            return self.driver.snapshot_protected(
+                context,
+                mode,
+                reference,
+                epoch,
+                origin,
+                filled,
+                deadline_ms,
+            );
+        }
+        self.snapshot_classified(context, mode, epoch, origin, deadline_ms)
+    }
+
     fn screenshot(
         &mut self,
         _: &str,
@@ -598,6 +716,7 @@ impl BrowserSessionLauncher for Launcher {
 /// `approval_required`, or one `{error}` for unknown, ungranted and
 /// wrong-origin requests alike.
 struct VaultState {
+    password: String,
     saved_origin: String,
     totp: bool,
     needs_approval: bool,
@@ -615,6 +734,7 @@ struct VaultState {
 impl Default for VaultState {
     fn default() -> Self {
         Self {
+            password: PASSWORD.into(),
             saved_origin: SITE.into(),
             totp: false,
             needs_approval: false,
@@ -668,7 +788,7 @@ impl LoginMaterialSource for Vault {
                 "status": "released",
                 "kind": "site_login",
                 "username": USERNAME,
-                "password": PASSWORD,
+                "password": state.password,
             });
             if state.totp {
                 released["totp"] = json!(TOTP);
@@ -885,6 +1005,23 @@ fn named_ref(snapshot: &Value, name: &str) -> String {
                 .map_or(line_name, |(line_name, _)| line_name);
             (line_name == name).then(|| reference.to_string())
         })
+        .or_else(|| {
+            // Identity masking clears names after a fill; this fixture's
+            // username and password remain the first two textbox identities.
+            let index = match name {
+                "Email" => 0,
+                "Password" => 1,
+                _ => return None,
+            };
+            snapshot["state_text"]
+                .as_str()?
+                .lines()
+                .filter(|line| line.contains(" textbox"))
+                .nth(index)?
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| panic!("no line named {name}: {snapshot}"))
 }
 
@@ -894,15 +1031,6 @@ fn contains_password(value: &Value) -> bool {
 
 fn reason_code(reply: &Value) -> &str {
     reply["detail"]["reason_code"].as_str().unwrap_or_default()
-}
-
-fn line_for<'a>(snapshot: &'a Value, name: &str) -> &'a str {
-    snapshot["state_text"]
-        .as_str()
-        .unwrap()
-        .lines()
-        .find(|line| line.contains(&format!("textbox {name}")))
-        .unwrap_or_else(|| panic!("no {name} line: {snapshot}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1231,9 @@ async fn a_navigation_between_the_check_and_the_insertion_inserts_nothing() {
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.page.value(USERNAME_NODE), "");
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
+    // The window is installed before dispatch and stays until a read
+    // confirms main-frame document replacement.
+    assert_eq!(fixture.snapshot("ax").await["outcome"], "ok");
     assert!(
         !fixture
             .planes
@@ -1135,6 +1266,7 @@ async fn a_change_after_the_first_field_clears_it_and_fills_no_more() {
         "the username was not cleared"
     );
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
+    assert_eq!(fixture.snapshot("ax").await["outcome"], "ok");
     assert!(
         !fixture
             .planes
@@ -1225,9 +1357,9 @@ async fn screenshots_are_refused_while_the_password_is_on_the_page() {
     );
 }
 
-/// The window also ends once the page has emptied every filled field.
+/// Empty fields do not prove that script copies have disappeared.
 #[tokio::test]
-async fn emptied_fields_end_the_window() {
+async fn emptied_fields_keep_the_window() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
     assert_eq!(
@@ -1235,8 +1367,8 @@ async fn emptied_fields_end_the_window() {
         "authorization_denied"
     );
     fixture.page.lock().values.clear();
-    let allowed = fixture.screenshot().await;
-    assert_eq!(allowed["outcome"], "ok", "{allowed}");
+    let refused = fixture.screenshot().await;
+    assert_eq!(refused["outcome"], "authorization_denied", "{refused}");
 }
 
 /// Reads keep working in every mode. Text a page script copied into the
@@ -1263,15 +1395,19 @@ async fn text_reads_drop_the_password_and_mask_the_filled_fields() {
             "{mode}: the copied text was dropped instead of redacted: {snapshot}"
         );
     }
-    // The username is not a secret the redaction knows, so only masking by
-    // node identity keeps its value off the page text.
+    // Filled nodes stay masked even after their input type changes.
     let ax = fixture.snapshot("ax").await;
-    assert!(!line_for(&ax, "Email").contains("Value:"), "{ax}");
+    assert!(
+        !ax["state_text"].as_str().unwrap().contains("Value:"),
+        "{ax}"
+    );
 
     fixture.page.lock().password_type = "text".into();
     let toggled = fixture.snapshot("ax").await;
-    let password_line = line_for(&toggled, "Password");
-    assert!(!password_line.contains("Value:"), "{toggled}");
+    assert!(
+        !toggled["state_text"].as_str().unwrap().contains("Value:"),
+        "{toggled}"
+    );
     assert!(!contains_password(&toggled));
     assert!(fixture.planes.browser.result_schema_findings().is_empty());
 }
@@ -1304,9 +1440,306 @@ async fn reads_are_refused_after_the_window_runs_out_until_the_page_navigates() 
     assert_eq!(fixture.screenshot().await["outcome"], "ok");
 }
 
+#[tokio::test]
+async fn navigation_reply_releases_quarantine_only_after_main_loader_replacement() {
+    let fixture = fixture_with_window(
+        Page::default(),
+        VaultState::default(),
+        Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let arguments = |url: String| json!({"url":url,"wait":"none","read_page":false,"severity":{"tier":1,"credential":false,"financial":false}});
+    let same_document = fixture
+        .call(
+            "browser.navigate",
+            arguments(format!("{SITE}/signin#fragment")),
+        )
+        .await;
+    assert_eq!(
+        reason_code(&same_document),
+        "filled_login_expired",
+        "{same_document}"
+    );
+    let replaced = fixture
+        .call("browser.navigate", arguments(format!("{SITE}/home")))
+        .await;
+    assert_eq!(replaced["outcome"], "ok", "{replaced}");
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The person's approval
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn adopted_owner_frame_is_refused_before_insertion() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    let page = fixture.page.clone();
+    fixture.vault.0.lock().unwrap().during_request =
+        Some(Box::new(move || page.lock().adopted_owner = true));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reason_code(&reply), "owner_frame_changed", "{reply}");
+    assert_eq!(fixture.page.insertions(), 0);
+}
+
+#[tokio::test]
+async fn insertion_revalidates_on_the_node_without_focus_commands() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    let page = fixture.page.clone();
+    fixture.vault.0.lock().unwrap().during_request =
+        Some(Box::new(move || page.lock().mutate_before_set = true));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reason_code(&reply), "fill_insert_not_ready", "{reply}");
+    assert_eq!(fixture.page.insertions(), 0);
+    assert!(!fixture
+        .page
+        .lock()
+        .commands
+        .iter()
+        .any(|method| matches!(method.as_str(), "DOM.focus" | "Input.insertText")));
+}
+
+#[tokio::test]
+async fn partial_fill_with_failed_cleanup_keeps_protection() {
+    let fixture = fixture(
+        Page {
+            fail_after_password: true,
+            ..Default::default()
+        },
+        VaultState::default(),
+    )
+    .await;
+    let reply = fixture.fill(false).await;
+    assert_ne!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+    assert!(
+        fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    fixture.page.lock().copied_text = Some(PASSWORD.into());
+    assert!(!contains_password(&fixture.snapshot("ax").await));
+}
+
+#[tokio::test]
+async fn successive_fills_keep_every_released_secret() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    fixture.vault.0.lock().unwrap().password = "second-password-canary".into();
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    fixture.page.lock().copied_text = Some(format!("{PASSWORD} second-password-canary"));
+    let reply = fixture.snapshot("ax").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(!contains_password(&reply), "{reply}");
+    assert!(
+        !reply.to_string().contains("second-password-canary"),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_crossing_the_cap_refuses_at_retention_and_output() {
+    let fixture = fixture_with_window(
+        Page::default(),
+        VaultState::default(),
+        Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    {
+        let mut page = fixture.page.lock();
+        page.snapshot_delay = Duration::from_millis(400);
+        page.copied_text = Some(PASSWORD.into());
+    }
+    let reply = fixture.call("browser.snapshot", json!({"mode":"ax"})).await;
+    assert_eq!(reason_code(&reply), "filled_login_expired", "{reply}");
+    assert!(!contains_password(&reply));
+}
+
+#[tokio::test]
+async fn unreadable_or_removed_fields_never_end_protection() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    fixture.page.lock().resolve_fails = true;
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    {
+        let mut page = fixture.page.lock();
+        page.resolve_fails = false;
+        page.form_removed = true;
+        page.copied_text = Some(PASSWORD.into());
+    }
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    let reply = fixture.snapshot("ax").await;
+    assert!(!contains_password(&reply));
+    assert!(reply["state_text"]
+        .as_str()
+        .unwrap()
+        .contains(REDACTED_PASSWORD));
+}
+
+#[tokio::test]
+async fn subframe_navigation_keeps_parent_copies_redacted_and_the_tab_quarantined() {
+    let fixture = fixture(
+        Page {
+            form_in: Place::Frame,
+            frame: Some(FrameSpec {
+                url: format!("{FRAME_SITE}/signin"),
+                security_origin: Some(FRAME_SITE.into()),
+            }),
+            ..Default::default()
+        },
+        VaultState {
+            saved_origin: FRAME_SITE.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    {
+        let mut page = fixture.page.lock();
+        page.frame_generation += 1;
+        page.values.clear();
+        page.copied_text = Some(format!("Parent copied {PASSWORD}"));
+    }
+    let parent = fixture.snapshot("ax").await;
+    assert!(!contains_password(&parent), "{parent}");
+    assert!(parent["state_text"]
+        .as_str()
+        .unwrap()
+        .contains(REDACTED_PASSWORD));
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    fixture.page.navigate_away();
+    assert_eq!(fixture.screenshot().await["outcome"], "ok");
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
+}
+
+#[test]
+fn resolve_node_transport_failure_is_indeterminate_not_empty() {
+    let page = Shared::new(Page {
+        resolve_fails: true,
+        ..Default::default()
+    });
+    let mut driver = CdpNavigationDriver::new(
+        Pipe {
+            page,
+            reads: VecDeque::new(),
+        },
+        CdpTransport::new(),
+        CdpFrameDecoder::default(),
+    );
+    let state = driver.filled_fields_state(
+        CONVERSATION,
+        &[cerebellum::browser::fill::FilledField {
+            identity: BackendNodeIdentity::new(TARGET, MAIN, PASSWORD_NODE).unwrap(),
+            frame: None,
+        }],
+        1_000,
+    );
+    assert!(
+        state.is_err(),
+        "unreadable node was classified as {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn echoes_of_username_totp_and_entity_encoded_password_are_redacted() {
+    let password = "entity&<>\"'password";
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            totp: true,
+            password: password.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(fixture.fill(true).await["outcome"], "ok");
+    fixture.page.lock().copied_text = Some(format!(
+        "{USERNAME} {TOTP} entity&amp;&lt;&gt;&quot;&#39;password"
+    ));
+    for mode in ["ax", "actionable", "dom_full"] {
+        let reply = fixture.snapshot(mode).await;
+        let text = reply.to_string();
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        for secret in [
+            USERNAME,
+            TOTP,
+            password,
+            "entity&amp;&lt;&gt;&quot;&#39;password",
+        ] {
+            assert!(!text.contains(secret), "{mode}: {reply}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn opaque_main_document_refuses_before_vault_access() {
+    let fixture = fixture(
+        Page {
+            main_opaque: true,
+            ..Default::default()
+        },
+        VaultState::default(),
+    )
+    .await;
+    let reply = fixture.fill(false).await;
+    assert_eq!(reason_code(&reply), "origin_opaque", "{reply}");
+    assert!(fixture.vault.requests().is_empty());
+    assert_eq!(fixture.page.insertions(), 0);
+}
+
+#[tokio::test]
+async fn dom_full_capture_masks_type_mutated_nodes_by_identity() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    fixture.page.lock().real_dom_capture = true;
+    let reply = fixture.snapshot("dom_full").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(
+        !reply.to_string().contains("IDENTITY-MASK-CANARY"),
+        "{reply}"
+    );
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("type=button"),
+        "{reply}"
+    );
+}
 
 /// `approval_required` files one card carrying the vault's request id and
 /// statement unchanged; approved while the call waits, the vault is asked
