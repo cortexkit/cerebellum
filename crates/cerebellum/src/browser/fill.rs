@@ -25,7 +25,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -299,8 +299,8 @@ pub struct FillDispatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillOutcome {
     Filled,
-    /// Nothing is left in any field: the fill stopped before inserting, or
-    /// cleared what it had inserted.
+    /// Insertion did not complete. The protection window remains installed
+    /// because page script may have copied a value before rollback.
     Aborted {
         reason_code: &'static str,
     },
@@ -340,8 +340,8 @@ pub enum FillRefusal {
     LoginUnavailable,
     /// The vault could not be asked.
     VaultUnavailable,
-    /// The page changed between the checks and the insertion; nothing was
-    /// left in any field.
+    /// The page changed or insertion could not be confirmed. Reads remain
+    /// protected even if rollback could not reach the renderer.
     Aborted { reason_code: &'static str },
     /// A screenshot of a tab holding a filled password.
     FilledPasswordOnPage,
@@ -371,9 +371,9 @@ impl FillRefusal {
             Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh browser.snapshot",
             Self::LoginUnavailable => "this agent cannot use a saved login of that name on this site; check the name with the person, or ask them to share the login with this agent for this site",
             Self::VaultUnavailable => "the vault could not be reached; retry later, and report it if it persists",
-            Self::Aborted { .. } => "the page changed before the login went in, and nothing was left in its fields; take a fresh browser.snapshot and call browser.fill_login again",
-            Self::FilledPasswordOnPage => "read this page with browser.snapshot instead; screenshots of it are refused until it navigates to another document or its filled fields are emptied",
-            Self::WindowExpired => "navigate this tab to another page, or submit its form, before reading it again",
+            Self::Aborted { .. } => "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
+            Self::FilledPasswordOnPage => "read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself",
+            Self::WindowExpired => "reload or navigate the page itself before reading it again",
             Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
             Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call browser.fill_login again when the person is available",
         }
@@ -410,22 +410,22 @@ impl FillRefusal {
 
 /// A tab's state after a login was filled into it.
 ///
-/// The window lasts until the page commits another document, every filled
-/// field is empty or removed, the tab or its session closes, or
-/// [`FILL_WINDOW`] passes. While it lasts, screenshots of the tab are refused,
-/// and text read from it has the filled fields masked and every copy of the
-/// password removed; the password is kept, zeroizing, for that removal only.
-/// When the time runs out the password is wiped, and reads of the tab are
-/// refused until it navigates.
+/// Empty or removed fields do not prove that page-script copies disappeared.
+/// Only main-frame document replacement or context/tab/session closure ends
+/// protection: subframe navigation cannot erase copies in other frames.
+/// At the cap the redaction material is wiped and the window becomes a
+/// quarantine: all reads refuse until document replacement.
 pub(super) struct FillWindow {
     /// The main-frame document the login was filled into.
     document: CommittedDocument,
     fields: Vec<FilledField>,
     /// Emptied, and so wiped, when the window ends or its time runs out.
-    password: Arc<StdMutex<Option<Zeroizing<String>>>>,
+    password: Arc<RedactionMaterial>,
     filled_at: Instant,
     cap: Duration,
 }
+
+type RedactionMaterial = StdMutex<Option<Vec<Zeroizing<String>>>>;
 
 impl fmt::Debug for FillWindow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -441,15 +441,15 @@ impl FillWindow {
     fn open(
         document: CommittedDocument,
         fields: Vec<FilledField>,
-        password: Zeroizing<String>,
+        password: Vec<Zeroizing<String>>,
         cap: Duration,
     ) -> Self {
         let password = Arc::new(StdMutex::new(Some(password)));
-        // Wipe the password when the time runs out even if nothing reads the
+        // Wipe all released material when the time runs out even if nothing reads the
         // tab again. The task holds only a weak handle, so a window that
         // ended earlier is not kept alive by it.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let slot: Weak<StdMutex<Option<Zeroizing<String>>>> = Arc::downgrade(&password);
+            let slot = Arc::downgrade(&password);
             runtime.spawn(async move {
                 tokio::time::sleep(cap).await;
                 if let Some(slot) = slot.upgrade() {
@@ -470,15 +470,61 @@ impl FillWindow {
         self.filled_at.elapsed() >= self.cap
     }
 
-    /// Remove every exact copy of the password from the strings in `value`.
-    fn redact(&self, value: &mut Value) {
+    pub(super) fn main_document_replaced(&self, live: &CommittedDocument) -> bool {
+        self.document.loader_id != live.loader_id
+    }
+
+    fn extend(
+        &mut self,
+        fields: Vec<FilledField>,
+        secrets: Vec<Zeroizing<String>>,
+    ) -> Result<(), BrowserError> {
+        let mut guard = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.timed_out() || guard.is_none() {
+            return Err(BrowserError::FillRefused(FillRefusal::WindowExpired));
+        }
+        self.fields.extend(fields);
+        guard
+            .as_mut()
+            .expect("checked redaction material")
+            .extend(secrets);
+        Ok(())
+    }
+
+    /// Hold the material lock through redaction, so expiry cannot wipe it
+    /// between checking the cap and sanitizing the retained/output bytes.
+    pub(super) fn with_redactor<T>(
+        &self,
+        use_redactor: impl FnOnce(&dyn Fn(&mut String)) -> T,
+    ) -> Result<T, BrowserError> {
         let guard = self
             .password
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(password) = guard.as_ref().filter(|password| !password.is_empty()) {
-            redact_value(value, password);
+        if self.timed_out() || guard.is_none() {
+            return Err(BrowserError::FillRefused(FillRefusal::WindowExpired));
         }
+        let result = use_redactor(&|text| {
+            for secret in guard
+                .as_ref()
+                .expect("checked redaction material")
+                .iter()
+                .filter(|secret| !secret.is_empty())
+            {
+                redact_string(text, secret);
+            }
+        });
+        if self.timed_out() {
+            return Err(BrowserError::FillRefused(FillRefusal::WindowExpired));
+        }
+        Ok(result)
+    }
+
+    fn redact(&self, value: &mut Value) -> Result<(), BrowserError> {
+        self.with_redactor(|redact| redact_json(value, redact))
     }
 }
 
@@ -488,7 +534,7 @@ impl Drop for FillWindow {
     }
 }
 
-fn take_password(slot: &StdMutex<Option<Zeroizing<String>>>) {
+fn take_password(slot: &RedactionMaterial) {
     drop(
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -499,19 +545,104 @@ fn take_password(slot: &StdMutex<Option<Zeroizing<String>>>) {
 /// What a password is replaced with in text leaving this module.
 pub const REDACTED_PASSWORD: &str = "[filled password]";
 
+#[cfg(test)]
 fn redact_value(value: &mut Value, password: &str) {
-    match value {
-        Value::String(text) if text.contains(password) => {
-            let mut redacted = text.replace(password, REDACTED_PASSWORD);
-            std::mem::swap(text, &mut redacted);
-            redacted.zeroize();
+    redact_json(value, &|text| redact_string(text, password));
+}
+
+fn redact_string(text: &mut String, secret: &str) {
+    if secret.is_empty() {
+        return;
+    }
+    // Decode one HTML entity layer only for matching, retaining the original
+    // byte ranges so unrelated markup stays byte-identical. Numeric and named
+    // spellings (and mixed raw/encoded copies) share the same comparison.
+    let mut decoded = Zeroizing::new(String::new());
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let entity = rest.strip_prefix('&').and_then(|rest| {
+            let end = rest.find(';').filter(|end| *end <= 12)?;
+            let name = &rest[..end];
+            let ch = match name {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                _ => {
+                    let number = name.strip_prefix('#')?;
+                    let code = match number
+                        .strip_prefix('x')
+                        .or_else(|| number.strip_prefix('X'))
+                    {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => number.parse().ok()?,
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((ch, end + 2))
+        });
+        let (ch, length) = entity.unwrap_or_else(|| {
+            let ch = rest.chars().next().expect("nonempty remainder");
+            (ch, ch.len_utf8())
+        });
+        ranges.push((decoded.len(), at, at + length));
+        decoded.push(ch);
+        at += length;
+    }
+    let mut matches: Vec<_> = text
+        .match_indices(secret)
+        .map(|(start, _)| start..start + secret.len())
+        .collect();
+    matches.extend(decoded.match_indices(secret).filter_map(|(start, _)| {
+        let first = ranges.binary_search_by_key(&start, |range| range.0).ok()?;
+        let end = start + secret.len();
+        let last = ranges
+            .partition_point(|range| range.0 < end)
+            .checked_sub(1)?;
+        Some(ranges[first].1..ranges[last].2)
+    }));
+    // Literal entity syntax can itself be part of a password. Search the raw
+    // text too, merging overlaps with the decoded matches before replacing.
+    matches.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in matches {
+        if let Some(previous) = merged
+            .last_mut()
+            .filter(|previous| previous.end >= range.start)
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
         }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| redact_value(item, password)),
+    }
+    let matches = merged;
+    if !matches.is_empty() {
+        // The retained allocation never contains the removed bytes, even in
+        // spare capacity left behind by an in-place replacement.
+        let mut redacted = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for range in matches {
+            redacted.push_str(&text[cursor..range.start]);
+            redacted.push_str(REDACTED_PASSWORD);
+            cursor = range.end;
+        }
+        redacted.push_str(&text[cursor..]);
+        let mut old = std::mem::replace(text, redacted);
+        old.zeroize();
+    }
+}
+
+fn redact_json(value: &mut Value, redact: &dyn Fn(&mut String)) {
+    match value {
+        Value::String(text) => redact(text),
+        Value::Array(items) => items.iter_mut().for_each(|item| redact_json(item, redact)),
         Value::Object(fields) => {
             for field in fields.values_mut() {
-                redact_value(field, password);
+                redact_json(field, redact);
             }
         }
         _ => {}
@@ -531,6 +662,7 @@ pub(super) fn mask_filled_fields(
     observation: &mut crate::browser::navigation::BrowserSnapshotObservation,
     filled: &[BackendNodeIdentity],
 ) {
+    let mut protected = std::collections::HashSet::new();
     for reference in &observation.refs {
         if !reference
             .backend_identity
@@ -540,6 +672,7 @@ pub(super) fn mask_filled_fields(
             continue;
         }
         let name = reference.captured.reference.clone();
+        protected.insert(name.clone());
         // The page text prints a field's value only for a field known not
         // to hold a credential.
         observation
@@ -550,7 +683,32 @@ pub(super) fn mask_filled_fields(
         for record in &mut observation.records {
             if record.reference.as_deref() == Some(name.as_str()) {
                 record.value = None;
+                record.name.clear();
             }
+        }
+    }
+    let mut protected_depth = None;
+    observation.records.retain(|record| {
+        if protected_depth.is_some_and(|depth| record.depth <= depth) {
+            protected_depth = None;
+        }
+        if record
+            .reference
+            .as_ref()
+            .is_some_and(|reference| protected.contains(reference))
+        {
+            protected_depth = Some(record.depth);
+        } else if protected_depth.is_some()
+            && matches!(record.role.as_str(), "StaticText" | "InlineTextBox")
+        {
+            return false;
+        }
+        true
+    });
+    for reference in &mut observation.refs {
+        if protected.contains(&reference.captured.reference) {
+            reference.captured.name.clear();
+            reference.raw_name = None;
         }
     }
 }
@@ -607,64 +765,86 @@ impl BrowserPlane {
         BrowserError,
     > {
         let key = identity.conversation_key.clone();
-        let fields = {
+        {
             let mut state = self.state.lock().await;
             let Some(context) = state.contexts.get_mut(&key) else {
-                return Ok((operation, None));
+                return Err(BrowserError::NoSession);
             };
+            if context.ended {
+                return Err(BrowserError::NoSession);
+            }
             let Some(window) = context.fill_window.as_ref() else {
                 return Ok((operation, None));
             };
-            if window.document.loader_id != live.loader_id {
-                // Another document: the filled form is gone with the old one.
+            if window.main_document_replaced(live) {
                 context.fill_window = None;
                 return Ok((operation, None));
             }
-            if window.timed_out() {
-                take_password(&window.password);
-                return Err(BrowserError::FillRefused(FillRefusal::WindowExpired));
-            }
-            window.fields.clone()
-        };
+        }
         let route = key.clone();
-        let checked = fields.clone();
-        let (operation, filled) = tokio::task::spawn_blocking(move || {
+        let (operation, frames) = tokio::task::spawn_blocking(move || {
             let mut operation = operation;
-            let filled = operation.filled_fields_state(&route, &checked, deadline_ms);
-            (operation, filled)
+            let frames = operation.frame_documents(&route, deadline_ms);
+            (operation, frames)
         })
         .await
         .map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
-        // A field whose state could not be read counts as still filled.
-        if matches!(filled, Ok(FilledFieldsState::AllEmptyOrGone)) {
-            let mut state = self.state.lock().await;
-            if let Some(context) = state.contexts.get_mut(&key) {
-                context.fill_window = None;
-            }
+        let mut state = self.state.lock().await;
+        let context = state
+            .contexts
+            .get_mut(&key)
+            .filter(|context| !context.ended)
+            .ok_or(BrowserError::NoSession)?;
+        let Some(window) = context.fill_window.as_mut() else {
             return Ok((operation, None));
+        };
+        // FrameDocument comparison includes loader, session, origin and parent.
+        // A successful frame-tree read lets us detect subframe replacement or removal;
+        // a failed transport proves neither and leaves every field protected.
+        if let Ok(frames) = frames {
+            window.fields.retain(|field| {
+                field
+                    .frame
+                    .as_ref()
+                    .is_none_or(|expected| frames.iter().any(|live| live.same_document(expected)))
+            });
+            // Only node identities expire here. Script copies can outlive a
+            // subframe in its parent, so the tab's redaction and cap remain.
         }
+        window.with_redactor(|_| ())?;
         if read == WindowRead::Screenshot {
             return Err(BrowserError::FillRefused(FillRefusal::FilledPasswordOnPage));
         }
         Ok((
             operation,
-            Some(fields.into_iter().map(|field| field.identity).collect()),
+            Some(
+                window
+                    .fields
+                    .iter()
+                    .map(|field| field.identity.clone())
+                    .collect(),
+            ),
         ))
     }
 
-    /// Remove the filled password from a reply leaving this module for a tab
+    /// Remove every released login value from a reply leaving this module for a tab
     /// in a fill window.
-    pub(super) async fn redact_filled_password(&self, identity: &RouteIdentity, reply: &mut Value) {
+    pub(super) async fn redact_filled_password(
+        &self,
+        identity: &RouteIdentity,
+        reply: &mut Value,
+    ) -> Result<(), BrowserError> {
         let state = self.state.lock().await;
         if let Some(window) = state
             .contexts
             .get(&identity.conversation_key)
             .and_then(|context| context.fill_window.as_ref())
         {
-            window.redact(reply);
+            window.redact(reply)?;
         }
+        Ok(())
     }
 }
 
@@ -732,10 +912,13 @@ fn check_field_kind(
 /// The https origin of the frame holding a field. `frame` is the field's
 /// frame document, `None` for a field in the main frame, whose document is
 /// `document`. `Err` is the refusal's reason code.
-fn field_origin(
+pub(super) fn field_origin(
     frame: Option<&FrameDocument>,
     document: &CommittedDocument,
 ) -> Result<String, &'static str> {
+    if crate::classification::canonical_grant_origin(&document.security_origin).is_none() {
+        return Err("origin_opaque");
+    }
     let url = frame.map_or(document.url.as_str(), |frame| frame.url.as_str());
     match url
         .split_once(':')
@@ -749,9 +932,10 @@ fn field_origin(
         _ => return Err("origin_opaque"),
     }
     let origin = crate::classification::canonical_origin_from_url(url).ok_or("origin_opaque")?;
-    if let Some(frame) = frame {
-        // A sandboxed frame keeps its https URL but has an opaque origin.
-        if crate::classification::canonical_grant_origin(&frame.origin).as_deref()
+    {
+        // A sandboxed document keeps its https URL but has an opaque origin.
+        let actual_origin = frame.map_or(document.security_origin.as_str(), |frame| &frame.origin);
+        if crate::classification::canonical_grant_origin(actual_origin).as_deref()
             != Some(origin.as_str())
         {
             return Err("origin_opaque");
@@ -895,7 +1079,7 @@ impl BrowserPlane {
 
     /// Check the fields again on the live page and insert the login. The
     /// material is consumed: every buffer holding it is wiped when this
-    /// returns, except the password kept for the tab's fill window.
+    /// returns, except the material kept for the tab's fill window redaction.
     pub(crate) async fn fill_planned_login(
         &self,
         identity: &RouteIdentity,
@@ -903,6 +1087,17 @@ impl BrowserPlane {
         mut material: LoginMaterial,
     ) -> Result<Value, BrowserError> {
         let _lane = self.lane(&identity.conversation_key).await;
+        {
+            let state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get(&identity.conversation_key)
+                .filter(|context| !context.ended)
+                .ok_or(BrowserError::NoSession)?;
+            if let Some(window) = &context.fill_window {
+                window.with_redactor(|_| ())?;
+            }
+        }
         if let Some((sessions, clock, _)) = &self.session_gate {
             if let Some(handoff) =
                 sessions.human_in_control(&identity.conversation_key, clock.as_ref())
@@ -942,7 +1137,7 @@ impl BrowserPlane {
                 value,
             });
         }
-        let password = Zeroizing::new(std::mem::take(&mut *material.password));
+        let secrets = targets.iter().map(|target| target.value.clone()).collect();
         drop(material);
         let filled: Vec<FilledField> = targets
             .iter()
@@ -960,6 +1155,25 @@ impl BrowserPlane {
         let operation = self
             .admit_operation(identity, BrowserCapability::Type)?
             .ok_or(BrowserError::NoSession)?;
+        {
+            let mut state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get_mut(&identity.conversation_key)
+                .filter(|context| !context.ended)
+                .ok_or(BrowserError::NoSession)?;
+            match context.fill_window.as_mut() {
+                Some(window) => window.extend(filled.clone(), secrets)?,
+                None => {
+                    context.fill_window = Some(FillWindow::open(
+                        document.clone(),
+                        filled.clone(),
+                        secrets,
+                        self.fill_window_cap,
+                    ))
+                }
+            }
+        }
         // The dispatch commitment, reached before the first CDP command of
         // the fill: a reply without it means nothing reached the page.
         identity.witness.mark_committed();
@@ -982,7 +1196,7 @@ impl BrowserPlane {
                             Ok((FillOutcome::Filled, live))
                         }
                         _ => {
-                            let _ = operation.clear_filled(&route, &cleared, deadline_ms);
+                            let _ = operation.clear_filled(&route, &cleared, 1_000);
                             Ok((
                                 FillOutcome::Aborted {
                                     reason_code: "document_changed",
@@ -1003,16 +1217,7 @@ impl BrowserPlane {
         })?;
         operation.finish();
         match result.map_err(map_navigation_drive_error)? {
-            (FillOutcome::Filled, live) => {
-                let mut state = self.state.lock().await;
-                if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-                    context.fill_window = Some(FillWindow::open(
-                        live,
-                        filled,
-                        password,
-                        self.fill_window_cap,
-                    ));
-                }
+            (FillOutcome::Filled, _) => {
                 Ok(json!({"outcome": "ok", "origin": origin, "filled": names}))
             }
             (FillOutcome::Aborted { reason_code }, _) => {
@@ -1116,6 +1321,7 @@ mod tests {
     use crate::classification::{
         classify_click, ElementClassificationInput, NodeIdentityInput, NonTypeClassificationInput,
     };
+    use crate::snapshot_store::{AxRecord, SnapshotKind};
 
     fn field(
         build: impl FnOnce(ElementClassificationInput) -> ElementClassificationInput,
@@ -1134,6 +1340,8 @@ mod tests {
 
     fn document(url: &str) -> CommittedDocument {
         CommittedDocument {
+            security_origin: crate::classification::canonical_origin_from_url(url)
+                .unwrap_or_else(|| "null".into()),
             url: url.into(),
             entry_id: 1,
             history: vec![1],
@@ -1315,6 +1523,222 @@ mod tests {
                 "nested": [{"name": REDACTED_PASSWORD}, 3, "clean"],
             })
         );
+    }
+
+    #[test]
+    fn literal_entity_spellings_in_a_secret_are_redacted_raw_and_encoded() {
+        let mut value = json!(["P&amp;Q", "P&amp;amp;Q", "P&#38;amp;Q"]);
+        redact_value(&mut value, "P&amp;Q");
+        assert_eq!(
+            value,
+            json!([REDACTED_PASSWORD, REDACTED_PASSWORD, REDACTED_PASSWORD])
+        );
+    }
+
+    fn protected_field(node: u64) -> FilledField {
+        FilledField {
+            identity: BackendNodeIdentity::new("target", "frame", node).unwrap(),
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn cumulative_windows_keep_all_nodes_and_cannot_replace_expired_quarantine() {
+        let mut window = FillWindow::open(
+            document("https://login.example"),
+            vec![protected_field(1)],
+            vec![Zeroizing::new("first-secret".into())],
+            Duration::from_secs(60),
+        );
+        window
+            .extend(
+                vec![protected_field(2)],
+                vec![Zeroizing::new("second-secret".into())],
+            )
+            .unwrap();
+        assert_eq!(window.fields, vec![protected_field(1), protected_field(2)]);
+        let mut reply = json!(["first-secret", "second-secret"]);
+        window.redact(&mut reply).unwrap();
+        assert_eq!(reply, json!([REDACTED_PASSWORD, REDACTED_PASSWORD]));
+        window.filled_at = Instant::now() - Duration::from_secs(61);
+        assert!(window
+            .extend(
+                vec![protected_field(3)],
+                vec![Zeroizing::new("third".into())]
+            )
+            .is_err());
+        assert_eq!(window.fields.len(), 2);
+    }
+
+    #[test]
+    fn wiped_redaction_material_refuses_instead_of_returning_plaintext() {
+        let window = FillWindow::open(
+            document("https://login.example"),
+            vec![protected_field(1)],
+            vec![Zeroizing::new("secret".into())],
+            Duration::from_secs(60),
+        );
+        take_password(&window.password);
+        let mut reply = json!({"state_text":"secret"});
+        assert!(matches!(
+            window.redact(&mut reply),
+            Err(BrowserError::FillRefused(FillRefusal::WindowExpired))
+        ));
+    }
+
+    fn route() -> RouteIdentity {
+        RouteIdentity::from_bind(
+            &subc_protocol::BindIdentity::new("/test/project", "test", "fill-hardening"),
+            &Some(subc_protocol::Principal::Direct),
+        )
+    }
+
+    #[tokio::test]
+    async fn retained_snapshots_and_pinned_ref_names_are_already_redacted() {
+        let plane = BrowserPlane::new();
+        let identity = route();
+        plane.open_context(identity.clone()).await.unwrap();
+        {
+            let mut state = plane.state.lock().await;
+            state
+                .contexts
+                .get_mut(&identity.conversation_key)
+                .unwrap()
+                .fill_window = Some(FillWindow::open(
+                document("https://login.example"),
+                vec![protected_field(1)],
+                vec![Zeroizing::new("retained-secret".into())],
+                Duration::from_secs(60),
+            ));
+        }
+        let records = vec![AxRecord {
+            depth: 0,
+            role: "button".into(),
+            name: "retained-secret".into(),
+            value: None,
+            reference: Some("e1".into()),
+        }];
+        let refs = vec![crate::snapshot_store::RefRecord {
+            captured: crate::snapshot_store::SnapshotRef::new("e1", "button", "retained-secret", 0)
+                .unwrap(),
+            backend_identity: None,
+            frame_document: None,
+            frame_path: vec![],
+            raw_role: None,
+            raw_name: Some("retained-secret".into()),
+            classification: Err(crate::classification::ClassificationUnavailable::NotCaptured),
+        }];
+        let reply = plane
+            .retain_text_snapshot(
+                &identity,
+                SnapshotKind::Ax,
+                &records,
+                None,
+                refs,
+                4096,
+                Some(document("https://login.example")),
+            )
+            .await
+            .unwrap();
+        let mut state = plane.state.lock().await;
+        let context = state.contexts.get_mut(&identity.conversation_key).unwrap();
+        let id = reply["snapshot_id"].as_str().unwrap();
+        let pinned = context
+            .snapshots
+            .pin_text(id, context.epoch.value())
+            .unwrap();
+        assert!(!pinned.content.contains("retained-secret"));
+        assert!(pinned.content.contains(REDACTED_PASSWORD));
+        assert_eq!(pinned.refs[0].captured.name, REDACTED_PASSWORD);
+        assert_eq!(pinned.refs[0].raw_name.as_deref(), Some(REDACTED_PASSWORD));
+        context.snapshots.unpin(id);
+    }
+
+    #[tokio::test]
+    async fn an_ended_context_refuses_before_consuming_planned_material() {
+        let plane = BrowserPlane::new();
+        let identity = route();
+        plane.open_context(identity.clone()).await.unwrap();
+        plane.end_context(&identity, false).await;
+        let plan = FillPlan {
+            secret: "login".into(),
+            origin: "https://login.example".into(),
+            document: document("https://login.example"),
+            fields: vec![PlannedField {
+                field: LoginField::Otp,
+                identity: protected_field(1).identity,
+                classification: field(|f| f.input_type("text").autocomplete(["one-time-code"])),
+                frame: None,
+            }],
+        };
+        let result = plane
+            .fill_planned_login(
+                &identity,
+                plan,
+                LoginMaterial {
+                    username: Zeroizing::new("username".into()),
+                    password: Zeroizing::new("password".into()),
+                    totp: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(BrowserError::NoSession)), "{result:?}");
+        assert!(!plane.fill_window_open_for_test(&identity).await);
+    }
+
+    #[test]
+    fn identity_mask_clears_ax_names_values_and_inner_text_for_any_role() {
+        let identity = BackendNodeIdentity::new("target", "frame", 1).unwrap();
+        let mut observation = crate::browser::navigation::BrowserSnapshotObservation {
+            records: vec![
+                AxRecord {
+                    depth: 0,
+                    role: "region".into(),
+                    name: "new page value".into(),
+                    value: Some("new page value".into()),
+                    reference: Some("e1".into()),
+                },
+                AxRecord {
+                    depth: 1,
+                    role: "StaticText".into(),
+                    name: "new page value".into(),
+                    value: None,
+                    reference: None,
+                },
+                AxRecord {
+                    depth: 0,
+                    role: "StaticText".into(),
+                    name: "unrelated".into(),
+                    value: None,
+                    reference: None,
+                },
+            ],
+            dom_text: None,
+            refs: vec![crate::snapshot_store::RefRecord {
+                captured: crate::snapshot_store::SnapshotRef::new(
+                    "e1",
+                    "region",
+                    "new page value",
+                    0,
+                )
+                .unwrap(),
+                backend_identity: Some(identity.clone()),
+                frame_document: None,
+                frame_path: vec![],
+                raw_role: None,
+                raw_name: Some("new page value".into()),
+                classification: Err(crate::classification::ClassificationUnavailable::NotCaptured),
+            }],
+            facts: Default::default(),
+            ax_truncated: false,
+            refs_truncated: false,
+        };
+        mask_filled_fields(&mut observation, &[identity]);
+        assert_eq!(observation.records.len(), 2);
+        assert!(observation.records[0].name.is_empty());
+        assert!(observation.records[0].value.is_none());
+        assert_eq!(observation.records[1].name, "unrelated");
+        assert!(observation.refs[0].captured.name.is_empty());
     }
 
     #[test]

@@ -2200,6 +2200,22 @@ impl OwnedBrowserProcess for ProductionProcess {
             .and_then(|driver| driver.point_frame_document())
     }
 
+    fn snapshot_protected(
+        &mut self,
+        context: &str,
+        mode: SnapshotKind,
+        reference: Option<&crate::snapshot_store::RefRecord>,
+        epoch: u64,
+        origin: &str,
+        filled: &[crate::snapshot_store::BackendNodeIdentity],
+        deadline_ms: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .snapshot_protected(context, mode, reference, epoch, origin, filled, deadline_ms)
+    }
+
     fn snapshot_classified(
         &mut self,
         context_key: &str,

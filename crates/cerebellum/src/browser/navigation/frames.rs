@@ -279,6 +279,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn snapshot_all_frames<C: NavigationClock>(
         &mut self,
         context: &str,
@@ -286,6 +287,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         classification: Option<(u64, &str)>,
         subtree: Option<&RefRecord>,
+        filled: &[BackendNodeIdentity],
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
         let allowed = self
@@ -338,6 +340,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     deadline_ms,
                     classification,
                     None,
+                    filled,
                     clock,
                 );
             }
@@ -369,6 +372,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .unwrap_or(deadline_ms),
                 epoch.map(|e| (e, main.origin.as_str())),
                 subtree,
+                filled,
                 clock,
             )?;
             for reference in &mut observation.refs {
@@ -489,6 +493,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     epoch.map(|e| (e, frame.origin.as_str())),
                     None,
                     subtree.is_some(),
+                    filled,
                     clock,
                 )?;
                 let remaining_nodes = MAX_AX_NODES.saturating_sub(observation.records.len());

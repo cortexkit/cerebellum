@@ -3,6 +3,27 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+/// Runs in an isolated world on the capture root. Object arguments identify
+/// filled nodes even after their input type or ARIA role changes.
+pub(super) const MASK_IDENTITIES: &str = r#"function(...filled) {
+    const protectedNodes = new Set(filled);
+    // An inert document avoids running page custom-element constructors.
+    const inert = this.ownerDocument.implementation.createHTMLDocument('');
+    const copy = inert.importNode(this, true);
+    function mask(original, clone) {
+        if (protectedNodes.has(original)) {
+            if (clone.nodeType === 1) {
+                for (const attr of ['value', 'aria-label', 'title']) clone.removeAttribute(attr);
+                clone.textContent = '';
+            }
+            return;
+        }
+        for (let i = 0; i < original.childNodes.length; i++) mask(original.childNodes[i], clone.childNodes[i]);
+    }
+    mask(this, copy);
+    return copy.outerHTML;
+}"#;
+
 struct Attribute<'a> {
     name: &'a str,
     value: &'a str,

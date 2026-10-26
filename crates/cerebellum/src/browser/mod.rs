@@ -2106,7 +2106,9 @@ impl BrowserPlane {
         let mut reply = self.result(identity, result).await;
         // Every reply about a tab in a fill window loses the filled password,
         // whichever page text it carries.
-        self.redact_filled_password(identity, &mut reply).await;
+        if let Err(error) = self.redact_filled_password(identity, &mut reply).await {
+            reply = self.result(identity, Err(error)).await;
+        }
         reply
     }
 
@@ -2613,9 +2615,9 @@ impl BrowserPlane {
             return Err(BrowserError::NoSession);
         };
         self.commit(identity, BrowserCapability::Navigate).await?;
-        let tracker = {
+        let (tracker, has_fill_window) = {
             let mut state = self.state.lock().await;
-            let tracker = {
+            let (tracker, has_fill_window) = {
                 let context = state
                     .contexts
                     .entry(identity.conversation_key.clone())
@@ -2625,14 +2627,14 @@ impl BrowserPlane {
                     .replace(DocumentTransition::TopLevelDocumentReplaced);
                 context.tracker = Tracker::default();
                 context.tracker.token("navigation_started");
-                context.tracker.clone()
+                (context.tracker.clone(), context.fill_window.is_some())
             };
             Self::op(
                 &mut state,
                 &identity.conversation_key,
                 Operation::CdpNavigate,
             );
-            tracker
+            (tracker, has_fill_window)
         };
         let deadline_ms = self
             .session_gate
@@ -2650,13 +2652,22 @@ impl BrowserPlane {
                 deadline_ms,
                 &mut tracker,
             );
-            (session_operation, tracker, result)
+            // A navigation request is not proof of document replacement. Only
+            // the browser's live loader can release an expired quarantine.
+            let live = if result.is_ok() && has_fill_window {
+                session_operation
+                    .committed_document(&route_key, deadline_ms)
+                    .ok()
+            } else {
+                None
+            };
+            (session_operation, tracker, result, live)
         })
         .await
         .map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
-        let (session_operation, tracker, drive_result) = driven;
+        let (session_operation, tracker, drive_result, live) = driven;
         session_operation.finish();
         {
             let mut state = self.state.lock().await;
@@ -2665,6 +2676,14 @@ impl BrowserPlane {
                 .get_mut(&identity.conversation_key)
                 .ok_or(BrowserError::NoSession)?;
             context.tracker = tracker.clone();
+            if live.as_ref().is_some_and(|live| {
+                context
+                    .fill_window
+                    .as_ref()
+                    .is_some_and(|window| window.main_document_replaced(live))
+            }) {
+                context.fill_window = None;
+            }
         }
         drive_result.map_err(map_navigation_drive_error)?;
 
@@ -3060,25 +3079,17 @@ impl BrowserPlane {
 
         let route_key = identity.conversation_key.clone();
         let authorized_url = source_document.url.clone();
+        let capture_mask = fill_mask.clone();
         let driven = tokio::task::spawn_blocking(move || {
-            let result = if let Some(reference) = zoom_reference.as_ref() {
-                session_operation.snapshot_subtree_classified(
-                    &route_key,
-                    kind,
-                    reference,
-                    document_epoch,
-                    &authorized_url,
-                    deadline_ms,
-                )
-            } else {
-                session_operation.snapshot_classified(
-                    &route_key,
-                    kind,
-                    document_epoch,
-                    &authorized_url,
-                    deadline_ms,
-                )
-            };
+            let result = session_operation.snapshot_protected(
+                &route_key,
+                kind,
+                zoom_reference.as_ref(),
+                document_epoch,
+                &authorized_url,
+                capture_mask.as_deref().unwrap_or_default(),
+                deadline_ms,
+            );
             // Read which document the page shows once the capture has
             // returned, on the same admitted operation, so nothing this module
             // issues can sit between the capture and this check.
@@ -3276,6 +3287,34 @@ impl BrowserPlane {
         let mut records = records.to_vec();
         let mut facts = facts.clone();
         let mut refs = refs;
+        let mut dom_text = dom_text.map(str::to_owned);
+        if let Some(window) = &context.fill_window {
+            window.with_redactor(|redact| {
+                for record in &mut records {
+                    redact(&mut record.name);
+                    if let Some(value) = &mut record.value {
+                        redact(value);
+                    }
+                }
+                for reference in &mut refs {
+                    reference.redact(redact);
+                }
+                for fact in facts.values_mut() {
+                    for text in [&mut fact.url, &mut fact.placeholder, &mut fact.dom_markup]
+                        .into_iter()
+                        .flatten()
+                    {
+                        redact(text);
+                    }
+                    for text in &mut fact.states {
+                        redact(text);
+                    }
+                }
+                if let Some(text) = &mut dom_text {
+                    redact(text);
+                }
+            })?;
+        }
         context.refs.assign(
             &mut records,
             &mut refs,
@@ -3353,8 +3392,10 @@ impl BrowserPlane {
                 )
             }
             SnapshotKind::DomFull => {
-                let (markup, _) =
-                    snapshot_store::encode_dom_text(dom_text.unwrap_or_default(), usize::MAX);
+                let (markup, _) = snapshot_store::encode_dom_text(
+                    dom_text.as_deref().unwrap_or_default(),
+                    usize::MAX,
+                );
                 // Landmarks in document order, each with the markup the
                 // capture read for it; only a dom_full capture reads any.
                 let landmarks: Vec<dom_layout::DomLandmark<'_>> = records
@@ -3399,6 +3440,9 @@ impl BrowserPlane {
             refs_truncated: refs_truncated || ax_refs_withheld,
             refs,
         };
+        if let Some(window) = &context.fill_window {
+            window.with_redactor(|redact| snapshot.redact(redact))?;
+        }
         let mut reply = snapshot_store::bounded_text_reply(
             &mut snapshot,
             max_bytes,
@@ -3406,6 +3450,9 @@ impl BrowserPlane {
             BrowserContextResult::from_identity(identity).json(),
         );
         let ref_count = snapshot.refs.len();
+        if let Some(window) = &context.fill_window {
+            window.with_redactor(|_| ())?;
+        }
         context
             .snapshots
             .retain_text(snapshot)
