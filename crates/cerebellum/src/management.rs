@@ -2246,6 +2246,7 @@ pub(crate) fn browser_grant_question(
         decline: ConsentOption::decline(BROWSER_GRANT_DECLINE, "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         urgency,
         scope: browser_grant_scope(origins, hazards, severity),
         duration: None,
@@ -2293,6 +2294,7 @@ pub(crate) fn profile_root_rebind_question(root_path: &str, preview: &RebindRepo
         decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         // Asked ahead: the management call replies consent_pending without
         // waiting for the answer, so no tool call is blocked on the person.
         urgency: Urgency::Normal,
@@ -2364,6 +2366,7 @@ pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
         decline: ConsentOption::decline("keep", "Keep it locked"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         // Asked ahead: the management call replies consent_pending without
         // waiting for the answer, so no tool call is blocked on the person.
         urgency: Urgency::Normal,

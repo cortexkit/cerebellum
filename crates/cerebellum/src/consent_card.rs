@@ -141,6 +141,20 @@ impl Scope {
     }
 }
 
+/// Whether an approval after the in-call wait can still take effect.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LateExecution {
+    /// Runs held work or records approval for a matching retry.
+    Execute,
+    /// Records and reports the answer without authorizing any work.
+    #[allow(
+        dead_code,
+        reason = "Every current card can still apply a late approval."
+    )]
+    NotifyOnly,
+}
+
 pub(crate) struct ConsentCard {
     pub title: String,
     pub prompt: String,
@@ -150,6 +164,7 @@ pub(crate) struct ConsentCard {
     pub decline: DeclineOption,
     pub expires_in: Duration,
     pub material_damage: bool,
+    pub late_execution: LateExecution,
     pub urgency: Urgency,
     pub scope: Scope,
     pub duration: Option<Value>,
@@ -182,7 +197,7 @@ impl ConsentCard {
             "default": default, "on_expiry": "deny", "urgency": self.urgency,
             "scope": self.scope,
             "expires_in_ms": self.expires_in.as_millis() as u64,
-            "material_damage": self.material_damage, "late_execution": "notify_only",
+            "material_damage": self.material_damage, "late_execution": self.late_execution,
             "requestedSchema": {"type": "object", "properties": {
                 "decision": {"type": "string", "enum": ids}
             }, "required": ["decision"], "additionalProperties": false}
@@ -532,6 +547,7 @@ mod tests {
             decline: ConsentOption::decline("deny", "Don't allow"),
             expires_in: Duration::from_secs(300),
             material_damage: true,
+            late_execution: LateExecution::NotifyOnly,
             urgency: Urgency::Normal,
             scope: Scope::new().with("takeover", "machine"),
             duration: None,
@@ -555,6 +571,15 @@ mod tests {
     fn default_is_the_decline_not_a_grant() {
         let body = card(vec![ConsentOption::grant("allow", "Allow")]).render();
         assert_contract(&body, &["allow", "deny"], "deny");
+    }
+
+    #[test]
+    fn late_execution_renders_the_builders_explicit_choice() {
+        let mut execute = card(vec![ConsentOption::grant("allow", "Allow")]);
+        execute.late_execution = LateExecution::Execute;
+        assert_eq!(execute.render()["params"]["late_execution"], "execute");
+        let notify = card(vec![ConsentOption::grant("allow", "Allow")]);
+        assert_eq!(notify.render()["params"]["late_execution"], "notify_only");
     }
 
     #[test]
@@ -846,76 +871,99 @@ mod every_card_kind {
 
     fn assert_card(kind: &str, params: &Value, urgency: &str, scope: Value) {
         assert_cingulate_accepts(kind, params);
+        assert_eq!(
+            params["late_execution"], "execute",
+            "{kind}: late_execution"
+        );
         assert_eq!(params["urgency"], urgency, "{kind}: urgency");
         assert_eq!(params["scope"], scope, "{kind}: scope");
     }
 
-    #[tokio::test]
-    async fn browser_site_access_cards_decode_in_core() {
+    fn assert_browser_site_access_card(kind: CardKind, urgency: Urgency, wire: &str, golden: &str) {
         use crate::management::BrowserGrantChoice;
         let origins = vec!["https://example.com".to_string()];
         let hazards = vec![HazardClass::CredentialFormSubmit.as_str().to_string()];
-        for (path, kind, urgency, wire, golden) in [
-            (
-                "asked ahead by open_grant",
-                CardKind::WebsiteAccessInAdvance,
-                Urgency::Normal,
-                "normal",
-                "website-access-in-advance.json",
-            ),
-            (
-                "held open in the browser call",
-                CardKind::WebsiteAccessInCall,
-                Urgency::High,
-                "high",
-                "website-access-in-call.json",
-            ),
+        for choices in [
+            &[BrowserGrantChoice::SiteThirtyMinutes][..],
+            &[
+                BrowserGrantChoice::SiteThirtyMinutes,
+                BrowserGrantChoice::OriginAlways,
+            ][..],
         ] {
-            for choices in [
-                &[BrowserGrantChoice::SiteThirtyMinutes][..],
-                &[
-                    BrowserGrantChoice::SiteThirtyMinutes,
-                    BrowserGrantChoice::OriginAlways,
-                ][..],
-            ] {
-                let body = crate::management::browser_grant_question(
-                    &origins,
-                    &hazards,
-                    Severity::new(4, true, false),
-                    urgency,
-                    choices,
-                );
-                let params = as_sent(kind, body, crate::management::PHONE_CONSENT_DEADLINE).params;
-                assert_card(
-                    path,
-                    &params,
-                    wire,
-                    json!({"origins": origins, "tier": 4, "hazards": hazards}),
-                );
-                if choices.len() == 2 {
-                    assert_golden(golden, &params);
-                }
+            let body = crate::management::browser_grant_question(
+                &origins,
+                &hazards,
+                Severity::new(4, true, false),
+                urgency,
+                choices,
+            );
+            let params = as_sent(kind, body, crate::management::PHONE_CONSENT_DEADLINE).params;
+            assert_card(
+                golden,
+                &params,
+                wire,
+                json!({"origins": origins, "tier": 4, "hazards": hazards}),
+            );
+            if choices.len() == 2 {
+                assert_golden(golden, &params);
             }
         }
-        let body = crate::management::browser_grant_question(
-            &origins,
-            &[],
-            Severity::new(2, false, false),
-            Urgency::Normal,
-            &[BrowserGrantChoice::SiteThirtyMinutes],
+    }
+
+    #[test]
+    fn browser_site_access_in_call_card_decodes_in_core() {
+        assert_browser_site_access_card(
+            CardKind::WebsiteAccessInCall,
+            Urgency::High,
+            "high",
+            "website-access-in-call.json",
         );
-        let params = as_sent(
+    }
+
+    #[test]
+    fn browser_site_access_in_advance_card_decodes_in_core() {
+        assert_browser_site_access_card(
             CardKind::WebsiteAccessInAdvance,
-            body,
-            crate::management::PHONE_CONSENT_DEADLINE,
-        )
-        .params;
-        assert_card(
-            "no hazards",
-            &params,
+            Urgency::Normal,
             "normal",
-            json!({"origins": origins, "tier": 2}),
+            "website-access-in-advance.json",
         );
+    }
+
+    #[test]
+    fn public_browser_site_access_cards_decode_in_core() {
+        let origins = vec!["https://example.com".to_string()];
+        for (kind, urgency, wire) in [
+            (CardKind::WebsiteAccessInCall, Urgency::High, "high"),
+            (CardKind::WebsiteAccessInAdvance, Urgency::Normal, "normal"),
+        ] {
+            let severity = Severity::new(2, false, false);
+            let choices = crate::management::offered_browser_grant_choices(
+                &origins,
+                &Default::default(),
+                severity,
+                true,
+            );
+            let body = crate::management::browser_grant_question(
+                &origins,
+                &[],
+                severity,
+                urgency,
+                &choices,
+            );
+            let params = as_sent(kind, body, crate::management::PHONE_CONSENT_DEADLINE).params;
+            assert_card(
+                "public sites",
+                &params,
+                wire,
+                json!({"origins": origins, "tier": 2}),
+            );
+            assert!(params["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["id"] == "allow_all_sites_30m"));
+        }
     }
 
     /// The site-access card for each option set it can offer, pinned as the
@@ -1043,6 +1091,7 @@ mod every_card_kind {
             )
             .params;
             assert_cingulate_accepts(name, &sent);
+            assert_eq!(sent["late_execution"], "execute", "{name}: late_execution");
             assert_eq!(
                 sent["options"], params["options"],
                 "{name}: Cingulate is offered other options than the card"
@@ -1111,7 +1160,7 @@ mod every_card_kind {
             let request = as_sent(CardKind::LoginImport, body, super::LOGIN_CARD_LIFETIME);
             let params = &request.params;
             assert_card(case, params, "high", json!({"origin": "https://x.com"}));
-            assert_login_card_life(case, params);
+            assert_login_card_life(case, &request);
             if let Some(golden) = golden {
                 assert_golden(golden, params);
             }
@@ -1158,26 +1207,41 @@ mod every_card_kind {
             login_url: "https://ollama.com/signin".into(),
         };
         let body = crate::login_capture::consent_question(&request);
-        let params = as_sent(CardKind::LoginCapture, body, super::LOGIN_CARD_LIFETIME).params;
+        let card = as_sent(CardKind::LoginCapture, body, super::LOGIN_CARD_LIFETIME);
+        let params = &card.params;
         assert_card(
             "capture_login",
-            &params,
+            params,
             "high",
             json!({"credential_domain": "ollama.com", "account": "work"}),
         );
-        assert_login_card_life("capture_login", &params);
-        assert_golden("login-capture.json", &params);
+        assert_login_card_life("capture_login", &card);
+        assert_golden("login-capture.json", params);
     }
 
-    /// The original deadline is retained for older consent servers. Core
-    /// only notifies the agent when the card settles; the capability never
-    /// runs on a late answer by itself, it waits for the agent's retry.
-    fn assert_login_card_life(kind: &str, params: &Value) {
-        assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
-        assert_eq!(
-            params["late_execution"], "notify_only",
-            "{kind}: late_execution"
-        );
+    /// Late login approval authorizes a matching retry, with or without the
+    /// negotiated single-use wire flag. It never launches login work by itself.
+    fn assert_login_card_life(kind: &str, card: &CardRequest) {
+        for single_use in [false, true] {
+            let negotiated =
+                card.clone()
+                    .for_features(crate::cingulate_client::features::CingulateFeatures {
+                        option_group: true,
+                        single_use,
+                        no_expiry: false,
+                    });
+            let params = &negotiated.params;
+            assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
+            assert_eq!(
+                params["single_use"].as_bool(),
+                single_use.then_some(true),
+                "{kind}: single_use"
+            );
+            assert_eq!(
+                params["late_execution"], "execute",
+                "{kind}: late_execution, single_use={single_use}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1385,6 +1449,7 @@ mod every_card_kind {
         )
         .params;
         assert_cingulate_accepts("user-browser site", &params);
+        assert_eq!(params["late_execution"], "execute");
         assert_golden("user-browser-site.json", &params);
     }
 }

@@ -563,6 +563,7 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
         decline: ConsentOption::decline(IMPORT_DECLINE, "Don't allow"),
         expires_in: crate::consent_card::LOGIN_CARD_LIFETIME,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         // The import call waits on the answer (up to
         // `computer_grants::CONSENT_PARK_LIMIT`), so the agent is blocked
         // until the person decides or that wait ends.

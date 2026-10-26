@@ -208,11 +208,14 @@ This is distinct from the call's bounded wait for an unanswered card ending
 normally, which replies
 `consent_pending` with `ask_id` and the import/capture-specific pending fields.
 
-Capture and import cards have a **30-minute lifetime** and `notify_only` late
+Capture and import cards have a **30-minute lifetime** and `execute` late
 execution. They remain answerable after the call stops (unless separately
 withdrawn, expired, or invalidated by scope/session teardown). A late approval
 is remembered and is **single-use on a matching retry**: it is consumed once,
-not a standing permission, and does not execute anything by itself. Capture
+not a standing permission, and does not execute anything by itself. `execute`
+declares that the late approval can still take effect on a matching retry,
+not that Cingulate runs the action. This holds both with and without the
+negotiated `single_use` wire flag. Capture
 matching includes its capture parameters; import matching includes the origin,
 destination executable, and a rechecked source browser. Changed arguments do
 not inherit the approval.

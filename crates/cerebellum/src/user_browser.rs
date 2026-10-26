@@ -896,6 +896,7 @@ pub(crate) fn site_question_with_choices(
         decline: ConsentOption::decline(SITE_DENY, "Don't allow"),
         expires_in: CONSENT_DEADLINE,
         material_damage: true,
+        late_execution: LateExecution::Execute,
         urgency: Urgency::High,
         scope: Scope::new()
             .with("browser", "user")

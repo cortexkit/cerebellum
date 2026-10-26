@@ -1,0 +1,20 @@
+[[control]]
+id = "app-control-declares-effective-late-approval"
+guards = "app-control cards declare execute because late approval can record a grant for the next call"
+file = "crates/cerebellum/src/computer_grants.rs"
+old = "GrantNeed::App { .. } => LateExecution::Execute,"
+new = "GrantNeed::App { .. } => LateExecution::NotifyOnly,"
+edits = []
+test_file = "crates/cerebellum/src/consent_card.rs"
+runner = "cargo"
+package = "cerebellum"
+target = "--lib"
+select = "expected"
+expect_red = ["consent_card::every_card_kind::app_control_cards_decode_in_core"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "pub(crate) fn question_body("
+before = "fn grant_scope("
