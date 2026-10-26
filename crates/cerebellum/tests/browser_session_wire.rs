@@ -112,9 +112,10 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
 }
 
 fn route_identity() -> RouteIdentity {
-    RouteIdentity::from_bind(
+    RouteIdentity::from_accepted_bind(
         &BindIdentity::new("/test/project", "test", "test-session".to_string()),
         &Some(Principal::Direct),
+        Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
     )
 }
 
@@ -2218,6 +2219,37 @@ async fn unattested_project_cannot_reach_profile_launch() {
     assert_eq!(body["outcome"], "authorization_denied", "{body}");
     assert_eq!(body["reason"], "agent_project_id_unattested", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    assert!(launcher.effects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_attested_project_refuses_launch_with_a_typed_reason() {
+    let launcher = Arc::new(RecordingLauncher {
+        profile_service: Some(
+            cerebellum::browser_launch_service::ProductionLaunchService::open(
+                config(),
+                cerebellum::JournalPersistence::Isolated,
+            ),
+        ),
+        ..RecordingLauncher::default()
+    });
+    let mut planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    let mut stamp = admission_stamp();
+    stamp.attributes.agent_id = Some(String::new());
+    let bound = bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    assert_eq!(bound.header.ty, FrameType::Response);
+
+    let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["outcome"], "authorization_denied", "{body}");
+    assert_eq!(body["reason"], "agent_project_id_unattested", "{body}");
+    assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    assert!(launcher.profile_directories.lock().unwrap().is_empty());
     assert!(launcher.effects.lock().unwrap().is_empty());
 }
 

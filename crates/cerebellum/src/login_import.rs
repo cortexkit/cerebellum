@@ -1369,7 +1369,11 @@ mod tests {
         );
         let profile = root.path().join("managed/profile");
         fs::create_dir_all(&profile).unwrap();
-        let mut planes = crate::tests::management_bound_planes(4, 1);
+        let mut planes = crate::tests::management_bound_planes_with_admission_facts(
+            4,
+            1,
+            Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
+        );
         let mut facts = planes.routes.get(4, 1).unwrap();
         facts.identity.profile_disposition = cerebellum_core::identity::ProfileDisposition::Durable;
         let config = crate::browser_config::BrowserConfig {

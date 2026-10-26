@@ -41,9 +41,10 @@ async fn browser_dispatch_commit_refuses_a_row_revoked_after_authorization() {
         )
         .unwrap();
     let plane = BrowserPlane::new();
-    let identity = RouteIdentity::from_bind(
+    let identity = RouteIdentity::from_accepted_bind(
         &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
         &Some(subc_protocol::Principal::Direct),
+        Some(&serde_json::json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
     );
     crate::grant_enforcement::scope(crate::CancelHandle::pending(), async {
         crate::grant_enforcement::track(&used);

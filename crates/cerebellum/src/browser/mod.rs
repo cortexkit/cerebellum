@@ -6741,9 +6741,10 @@ mod tests {
     }
 
     fn identity() -> RouteIdentity {
-        RouteIdentity::from_bind(
+        RouteIdentity::from_accepted_bind(
             &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
+            Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
         )
     }
 

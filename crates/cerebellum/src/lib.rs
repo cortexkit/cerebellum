@@ -8035,6 +8035,18 @@ async fn handle_browser_control(
             if let Some(invalid) = browser_session::validate_empty_object(arguments) {
                 return invalid;
             }
+            // An admitted route can still carry an empty agent project ID, and
+            // login import relaunches bypass the usual tool-call admission check.
+            // Refuse before allocating a browser or opening profile storage.
+            if accepted.identity.agent_project_id.is_empty() {
+                let refusal =
+                    cerebellum_core::identity::ControlOperationRefusal::AgentProjectIdUnattested;
+                return json!({
+                    "outcome": "authorization_denied",
+                    "reason": refusal.reason_code(),
+                    "remedy": accepted.control_refusal_remedy(refusal),
+                });
+            }
             if accepted.identity.profile_disposition == ProfileDisposition::None {
                 return json!({"outcome": "no_profile", "profile_disposition": "none"});
             }
@@ -10378,7 +10390,11 @@ mod tests {
         let browser = browser_plane_with_shared_grants_for_test(management.browser_grants());
         let route = RouteIdentity {
             conversation_key: "conversation".to_string(),
-            ..RouteIdentity::from_bind(&bind_identity_for_test(), &Some(Principal::Direct))
+            ..RouteIdentity::from_accepted_bind(
+                &bind_identity_for_test(),
+                &Some(Principal::Direct),
+                Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
+            )
         };
         browser.open_context(route.clone()).await.unwrap();
         let submit = crate::classification::ElementClassificationInput::new(
@@ -12612,6 +12628,14 @@ mod tests {
 
     /// Planes whose only route is bound to the management surface.
     pub(super) fn management_bound_planes(channel: u16, epoch: u32) -> Planes {
+        management_bound_planes_with_admission_facts(channel, epoch, None)
+    }
+
+    pub(super) fn management_bound_planes_with_admission_facts(
+        channel: u16,
+        epoch: u32,
+        admission_facts: Option<&Value>,
+    ) -> Planes {
         let planes = Planes {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
@@ -12659,7 +12683,7 @@ mod tests {
             AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
                 session_caller_principal_for_test(),
-                None,
+                admission_facts,
                 None,
                 &subc_protocol::RouteTarget::ManagementSurface {
                     module_id: "cerebellum".to_string(),
@@ -14156,7 +14180,11 @@ mod drain_tests {
     #[tokio::test]
     async fn drain_does_not_wait_on_a_person() {
         let mut planes = computer_grants::tests::CardService::install(
-            super::tests::management_bound_planes(1, 1),
+            super::tests::management_bound_planes_with_admission_facts(
+                1,
+                1,
+                Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
+            ),
             1,
             1,
         );
@@ -15568,8 +15596,11 @@ mod browser_login_fact_tests {
             Some(Arc::clone(&signed_in)),
         );
         let bind = subc_protocol::BindIdentity::new("/test/project", "test", "import-facts");
-        let mut identity = RouteIdentity::from_bind(&bind, &None);
-        identity.agent_project_id = "agent".into();
+        let identity = RouteIdentity::from_accepted_bind(
+            &bind,
+            &None,
+            Some(&json!({"agentProjectId": "agent", "sessionKind": "primary"})),
+        );
         for ending in ["denied", "hand_off", "transfer_failed"] {
             let result =
                 login_import::ImportResult::refusal("https://login.example.com", ending, "retry");

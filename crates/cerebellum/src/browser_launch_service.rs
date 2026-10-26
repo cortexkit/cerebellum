@@ -531,6 +531,15 @@ impl ProductionLaunchService {
         {
             return Err(json!({"outcome": "no_profile", "profile_disposition": "none"}));
         }
+        if accepted.identity.agent_project_id.is_empty() {
+            let refusal =
+                cerebellum_core::identity::ControlOperationRefusal::AgentProjectIdUnattested;
+            return Err(json!({
+                "outcome": "authorization_denied",
+                "reason": refusal.reason_code(),
+                "remedy": accepted.control_refusal_remedy(refusal),
+            }));
+        }
         let context =
             stamped_context(accepted).map_err(|_| json!({"outcome": "authorization_denied"}))?;
         if context.profile_disposition() == crate::profile::ProfileDisposition::None {
@@ -3209,6 +3218,37 @@ mod executable_identity_launch_tests {
     }
 
     #[test]
+    fn an_empty_project_is_refused_by_name_before_profile_custody() {
+        let config = BrowserConfig {
+            executable_path: None,
+            expected_identity: None,
+            launch_handshake_deadline_ms: 100,
+            termination_grace_period_ms: 100,
+            browser_idle_timeout_ms: 30_000,
+            browser_exit_observation_deadline_ms: 100,
+            navigation_settle_deadline_ms: 1_000,
+        };
+        let service = ProductionLaunchService::open_with_recovery(
+            config,
+            ProfileStateRoot::for_persistence(crate::JournalPersistence::Isolated),
+            |_, _| (None, None, Vec::new()),
+        );
+        let mut accepted = accepted_facts(Path::new("/tmp"));
+        accepted.identity.agent_project_id.clear();
+
+        let refusal = service
+            .take_and_return_profile_custody(&accepted, "empty-project")
+            .unwrap_err();
+
+        assert_eq!(refusal["outcome"], "authorization_denied", "{refusal}");
+        assert_eq!(
+            refusal["reason"], "agent_project_id_unattested",
+            "{refusal}"
+        );
+        assert!(refusal["remedy"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
     fn launch_reports_missing_expected_identity_by_stage() {
         let executable = UnsignedExecutable::new();
         let config = BrowserConfig {
@@ -4677,7 +4717,6 @@ mod orphan_recovery_tests {
                     agent_project_id: PROJECT.to_string(),
                     session_kind: SessionKind::Primary,
                     profile_disposition: ProfileDisposition::Durable,
-                    project_root: PathBuf::from("/tmp"),
                     origin: Default::default(),
                 },
                 principal: Some(subc_protocol::Principal::Direct),
