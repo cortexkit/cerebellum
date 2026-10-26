@@ -53,25 +53,6 @@
     }
   ],
   "prompt": "Let the agent use its own browser on example.com to read pages and click.",
-  "requestedSchema": {
-    "additionalProperties": false,
-    "properties": {
-      "decision": {
-        "enum": [
-          "allow_30m",
-          "allow_origin_always",
-          "allow_all_sites_30m",
-          "allow_all_sites_always",
-          "deny"
-        ],
-        "type": "string"
-      }
-    },
-    "required": [
-      "decision"
-    ],
-    "type": "object"
-  },
   "scope": {
     "origins": [
       "https://example.com"

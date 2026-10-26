@@ -39,23 +39,6 @@
     }
   ],
   "prompt": "Let the agent use its own browser on 10.0.0.5 to read pages and click.",
-  "requestedSchema": {
-    "additionalProperties": false,
-    "properties": {
-      "decision": {
-        "enum": [
-          "allow_30m",
-          "allow_origin_always",
-          "deny"
-        ],
-        "type": "string"
-      }
-    },
-    "required": [
-      "decision"
-    ],
-    "type": "object"
-  },
   "scope": {
     "origins": [
       "http://10.0.0.5"
