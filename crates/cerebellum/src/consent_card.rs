@@ -763,14 +763,14 @@ mod every_card_kind {
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
     use std::sync::Arc;
 
-    /// The key of the agent's tool call that raised a card. The pinned files
-    /// carry this one as their `requester_ref`.
+    /// The key of the agent's tool call that raised a generic card. Generic
+    /// pinned files carry this one as their `requester_ref`.
     const GOLDEN_CALL_KEY: &str = "pf:card-golden";
 
     /// The `consent.request` production sends to Cingulate for `body`, as
     /// raised by a tool call whose key is [`GOLDEN_CALL_KEY`]. Also checks
-    /// that a call without a key sends the same request minus
-    /// `requester_ref`.
+    /// that generic calls without a key omit `requester_ref`, while dedicated
+    /// SecretUse filings never carry one even when the call has a key.
     fn as_sent(kind: CardKind, body: Value, deadline: Duration) -> CardRequest {
         let unkeyed = consent_request(kind, &body, deadline, None, None, None)
             .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
@@ -780,7 +780,11 @@ mod every_card_kind {
         );
         let keyed = consent_request(kind, &body, deadline, Some(GOLDEN_CALL_KEY), None, None)
             .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
-        assert_eq!(keyed.params["requester_ref"], GOLDEN_CALL_KEY);
+        if kind == CardKind::SecretUse {
+            assert!(keyed.params.get("requester_ref").is_none());
+        } else {
+            assert_eq!(keyed.params["requester_ref"], GOLDEN_CALL_KEY);
+        }
         let mut stripped = keyed.params.clone();
         stripped.as_object_mut().unwrap().remove("requester_ref");
         assert_eq!(
@@ -1160,6 +1164,7 @@ mod every_card_kind {
                         option_group: true,
                         single_use,
                         no_expiry: false,
+                        secret_use_approval: true,
                     });
             let params = &negotiated.params;
             assert_eq!(params["expires_in_ms"], 1_800_000, "{kind}: expires_in_ms");
@@ -1388,25 +1393,28 @@ mod every_card_kind {
     /// unchanged and nothing else the caller chose.
     #[test]
     fn secret_use_card_carries_only_the_vault_request() {
+        use sha2::{Digest, Sha256};
+        let source = include_bytes!("../tests/vectors/secret-use-v1/secret-approval-v1.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(source)),
+            "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27"
+        );
+        let vector: Value = serde_json::from_slice(source).unwrap();
+        let statement = &vector["vectors"][0]["statements"][0];
         let approval = crate::browser::fill::Approval {
-            request_id: "req_golden".into(),
-            statement_b64url: "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ".into(),
+            request_id: statement["request_id"].as_str().unwrap().into(),
+            statement_b64url: statement["statement_b64url"].as_str().unwrap().into(),
             expires_at_ms: 0,
         };
         let params = as_sent(
             CardKind::SecretUse,
-            crate::login_fill_consent::secret_use_card(&approval, LOGIN_CARD_LIFETIME),
+            crate::login_fill_consent::secret_use_card(&approval),
             LOGIN_CARD_LIFETIME,
         )
         .params;
-        assert_card(
-            "secret use",
-            &params,
-            "high",
-            json!({
-                "vault_request_id": "req_golden",
-                "statement_b64url": "eyJzdGF0ZW1lbnQiOiJnb2xkZW4ifQ",
-            }),
+        assert_eq!(
+            serde_json::to_vec(&params).unwrap(),
+            include_bytes!("../tests/vectors/secret-use-v1/consent.request.secret_use.json")
         );
         assert_golden("secret-use.json", &params);
     }

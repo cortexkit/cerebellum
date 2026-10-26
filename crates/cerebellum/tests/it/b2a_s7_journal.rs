@@ -552,6 +552,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
         (Capability::Present, "browser.present"),
         (Capability::ImportLogin, "browser.import_login"),
         (Capability::CaptureLogin, "browser.capture_login"),
+        (Capability::FillLogin, "browser.fill_login"),
     ];
 
     let mut seen = std::collections::BTreeSet::new();
@@ -562,7 +563,7 @@ fn no_two_browser_capabilities_share_a_journal_name() {
             "{name} is claimed by more than one capability"
         );
     }
-    assert_eq!(seen.len(), 10, "a capability was added without a name here");
+    assert_eq!(seen.len(), 11, "a capability was added without a name here");
 }
 
 #[test]
@@ -790,4 +791,14 @@ fn login_capture_records_decode_as_their_own_payload() {
     // Untagged payloads decode as the first shape that fits; a capture must
     // not be mistaken for a handoff or an import on the way back in.
     assert_eq!(entry.payload, Some(JournalPayload::LoginCapture(payload)));
+}
+
+#[test]
+fn v9_fill_fixture_reads_back_byte_for_byte_as_its_own_payload() {
+    let fixture = include_str!("../fixtures/browser-journal-v9.jsonl");
+    let entry: JournalEntry = serde_json::from_str(fixture.trim()).unwrap();
+    assert_eq!(entry.format_version, "ck-browser-journal/v9");
+    assert_eq!(entry.capability, Some(Capability::FillLogin));
+    assert!(matches!(entry.payload, Some(JournalPayload::LoginFill(_))));
+    assert_eq!(entry.export_line(), fixture);
 }

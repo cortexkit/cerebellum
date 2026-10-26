@@ -795,7 +795,11 @@ impl LoginMaterialSource for Vault {
             }
             released
         };
-        Box::pin(async move { Ok(reply) })
+        Box::pin(async move {
+            Ok(cerebellum::browser::fill::SecretUseAnswer::from_wire(
+                zeroize::Zeroizing::new(serde_json::to_vec(&json!({"result": reply})).unwrap()),
+            ))
+        })
     }
 }
 
@@ -815,6 +819,15 @@ fn fixture(page: Page, vault: VaultState) -> impl std::future::Future<Output = F
 }
 
 async fn fixture_with_window(page: Page, vault: VaultState, window: Duration) -> Fixture {
+    fixture_with_source(page, vault, window, None).await
+}
+
+async fn fixture_with_source(
+    page: Page,
+    vault: VaultState,
+    window: Duration,
+    source: Option<Arc<dyn LoginMaterialSource>>,
+) -> Fixture {
     let page = Shared::new(page);
     let vault = Vault(Arc::new(Mutex::new(vault)));
     let mut planes = permission_support::planes(
@@ -835,7 +848,7 @@ async fn fixture_with_window(page: Page, vault: VaultState, window: Duration) ->
             .ok()
             .expect("the fixture owns its browser plane")
             .with_grants_installed(grants)
-            .with_login_material_source(Some(Arc::new(vault.clone())))
+            .with_login_material_source(Some(source.unwrap_or_else(|| Arc::new(vault.clone()))))
             .with_fill_window_for_test(window),
     );
     let launched = test_bind_call(&planes, "browser.launch", json!({})).await;
@@ -1029,6 +1042,17 @@ fn contains_password(value: &Value) -> bool {
     value.to_string().contains(PASSWORD)
 }
 
+fn vault_approval_answer(request_id: &str, decision: &str) -> ScriptedAnswer {
+    let mut answer =
+        json!({"decision": decision, "items": [{"request_id": request_id, "decision": decision}]});
+    if decision == "allow" {
+        answer["duration"] = json!("hour");
+        answer["envelope_sha256"] =
+            json!("7bcd68a3ec5698ad9c9d11e0efa1d67ef7e7aa6ee18c56d963d5f6b18014f180");
+    }
+    ScriptedAnswer::Answered(json!({"secret_use_answer": answer}))
+}
+
 fn reason_code(reply: &Value) -> &str {
     reply["detail"]["reason_code"].as_str().unwrap_or_default()
 }
@@ -1036,6 +1060,140 @@ fn reason_code(reply: &Value) -> &str {
 // ---------------------------------------------------------------------------
 // Filling
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn real_source_fills_and_handles_golden_approval_and_refusal() {
+    use cerebellum::login_capture::secret_use::VaultLoginSource;
+    use cerebellum::login_capture::vault::{BoxFuture, CookieVault, VaultReachError, VaultRoute};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Script {
+        replies: Mutex<VecDeque<&'static [u8]>>,
+        requests: Mutex<Vec<Value>>,
+        opened: AtomicUsize,
+        closed: AtomicUsize,
+    }
+    struct ScriptVault(Arc<Script>);
+    struct Route(Arc<Script>);
+    impl Drop for Route {
+        fn drop(&mut self) {
+            self.0.closed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl CookieVault for ScriptVault {
+        fn open(&self) -> BoxFuture<'_, Result<Box<dyn VaultRoute>, VaultReachError>> {
+            self.0.opened.fetch_add(1, Ordering::SeqCst);
+            let route: Box<dyn VaultRoute> = Box::new(Route(self.0.clone()));
+            Box::pin(async { Ok(route) })
+        }
+    }
+    impl VaultRoute for Route {
+        fn call<'a>(
+            &'a mut self,
+            body: &'a [u8],
+        ) -> BoxFuture<'a, Result<Vec<u8>, VaultReachError>> {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            self.0.requests.lock().unwrap().push(request);
+            let golden = self
+                .0
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one reply per call");
+            let mut reply = b"{\"result\":".to_vec();
+            reply.extend_from_slice(golden);
+            reply.push(b'}');
+            Box::pin(async { Ok(reply) })
+        }
+    }
+    let script = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([
+            include_bytes!("../vectors/secret-use-v1/use.result.released.site_login.json")
+                .as_slice(),
+            include_bytes!("../vectors/secret-use-v1/use.result.approval_required.json").as_slice(),
+            include_bytes!("../vectors/secret-use-v1/error.result.json").as_slice(),
+        ])),
+        requests: Mutex::new(Vec::new()),
+        opened: AtomicUsize::new(0),
+        closed: AtomicUsize::new(0),
+    });
+    let source = Arc::new(VaultLoginSource::new(
+        Arc::new(ScriptVault(script.clone())),
+        HANG_GUARD,
+    ));
+    for case in 0..3 {
+        let fixture = fixture_with_source(
+            Page::default(),
+            VaultState::default(),
+            Duration::from_secs(600),
+            Some(source.clone()),
+        )
+        .await;
+        fixture.carrier().queue(vault_approval_answer(
+            "01HF7YAT000000000000000001",
+            "decline",
+        ));
+        let reply = fixture.fill(true).await;
+        match case {
+            0 => {
+                assert_eq!(reply["outcome"], "ok", "{reply}");
+                assert_eq!(fixture.page.value(USERNAME_NODE), "alice");
+                assert_eq!(fixture.page.value(PASSWORD_NODE), "correct horse");
+                assert_eq!(fixture.page.value(OTP_NODE), "123456");
+            }
+            1 => {
+                assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+                let questions = fixture.carrier().questions();
+                assert_eq!(questions.len(), 1);
+                let golden: Value = serde_json::from_slice(include_bytes!(
+                    "../vectors/secret-use-v1/use.result.approval_required.json"
+                ))
+                .unwrap();
+                assert_eq!(
+                    questions[0]["params"],
+                    json!({"kind": "secret_use", "secret_use": {"items": [{
+                        "request_id": golden["request_id"], "statement_b64url": golden["statement_b64url"],
+                    }]}})
+                );
+                assert_eq!(fixture.page.insertions(), 0);
+            }
+            _ => {
+                assert_eq!(reason_code(&reply), "login_unavailable", "{reply}");
+                assert_eq!(fixture.page.insertions(), 0);
+                assert!(fixture.carrier().questions().is_empty());
+            }
+        }
+        for secret in ["alice", "correct horse", "123456"] {
+            assert!(!reply.to_string().contains(secret));
+        }
+        let journal = fixture.planes.browser.journal_export_for_test().await;
+        let entries: Vec<Value> = journal
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry["capability"] == "browser.fill_login")
+            .collect();
+        assert_eq!(entries.len(), 1, "{journal}");
+        assert_eq!(entries[0]["payload"]["outcome"], reply["outcome"]);
+        assert_eq!(entries[0]["payload"]["origin"], SITE);
+        for secret in ["alice", "correct horse", "123456"] {
+            assert!(!journal.contains(secret));
+        }
+        assert_eq!(script.opened.load(Ordering::SeqCst), case + 1);
+        assert_eq!(script.closed.load(Ordering::SeqCst), case + 1);
+    }
+    assert!(script.replies.lock().unwrap().is_empty());
+    for request in script.requests.lock().unwrap().iter() {
+        assert_eq!(
+            request,
+            &json!({"method": "secret.use", "params": {
+                "name": SECRET, "coverage": "scope", "stamp": serde_json::to_value(stamp(AGENT)).unwrap(),
+                "target": {"origin": SITE},
+            }})
+        );
+    }
+}
 
 /// The vault is asked once, in its own closed shape, for the origin read from
 /// the page and the scope stamped on the route; the reply names the fields
@@ -1285,7 +1443,14 @@ async fn a_change_after_the_first_field_clears_it_and_fills_no_more() {
 /// hold this test's records.
 #[tokio::test]
 async fn the_password_never_reaches_the_reply_journal_or_call_record() {
-    let mut fixture = fixture(Page::default(), VaultState::default()).await;
+    let mut fixture = fixture(
+        Page::default(),
+        VaultState {
+            totp: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let storage = cerebellum::journal::call_records::InMemoryCallRecordStorage::new();
     fixture.planes.calls = Arc::new(cerebellum::journal::call_records::CallRecords::open(
         Box::new(storage.clone()),
@@ -1295,7 +1460,7 @@ async fn the_password_never_reaches_the_reply_journal_or_call_record() {
         &json!({"planted": format!("<{PASSWORD}>")})
     ));
 
-    let arguments = fixture.fill_arguments(false).await;
+    let arguments = fixture.fill_arguments(true).await;
     let reply = reply_body(
         &fixture
             .send(
@@ -1314,6 +1479,24 @@ async fn the_password_never_reaches_the_reply_journal_or_call_record() {
         "the journal holds this test's reads"
     );
     assert!(!journal.contains(PASSWORD));
+    let fills: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|entry| entry["capability"] == "browser.fill_login")
+        .collect();
+    assert_eq!(fills.len(), 1, "one fill entry per call: {journal}");
+    assert_eq!(fills[0]["format_version"], "ck-browser-journal/v9");
+    assert_eq!(
+        fills[0]["payload"],
+        json!({"outcome": "ok", "origin": SITE, "filled": ["username", "password", "otp"]})
+    );
+    for secret in [USERNAME, PASSWORD, TOTP] {
+        assert!(
+            format!("{journal}{secret}").contains(secret),
+            "the scan detects a planted copy"
+        );
+        assert!(!journal.contains(secret), "material leaked into journal");
+    }
 
     assert_eq!(
         fixture.planes.calls.record_count(),
@@ -1757,7 +1940,7 @@ async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
     .await;
     fixture
         .carrier()
-        .queue(ScriptedAnswer::Answered(json!({"decision": "allow"})));
+        .queue(vault_approval_answer("req_vault_1", "allow"));
     let reply = fixture.fill(false).await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
@@ -1765,11 +1948,10 @@ async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
     assert_eq!(questions.len(), 1, "{questions:?}");
     let card = &questions[0]["params"];
     assert_eq!(
-        card["scope"],
-        json!({"vault_request_id": "req_vault_1", "statement_b64url": "eyJsb2dpbiI6IndvcmstbG9naW4ifQ"}),
+        card,
+        &json!({"kind": "secret_use", "secret_use": {"items": [{"request_id": "req_vault_1", "statement_b64url": "eyJsb2dpbiI6IndvcmstbG9naW4ifQ"}]}}),
         "{card}"
     );
-    assert_eq!(card["late_execution"], "execute");
     assert!(!card.to_string().contains(PASSWORD));
     assert_eq!(fixture.vault.requests().len(), 2);
 }
@@ -1786,12 +1968,121 @@ async fn a_declined_approval_fills_nothing() {
     .await;
     fixture
         .carrier()
-        .queue(ScriptedAnswer::Answered(json!({"decision": "deny"})));
+        .queue(vault_approval_answer("req_vault_1", "decline"));
     let reply = fixture.fill(false).await;
     assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
     assert_eq!(reply["detail"]["decision"], "declined", "{reply}");
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.vault.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn dedicated_approval_requires_the_capability_and_maps_filing_refusals() {
+    for (code, reason, outcome) in [
+        (
+            None,
+            "secret_use_approval_unsupported",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_request_conflict"),
+            "elicitation_request_conflict",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_invalid_request"),
+            "elicitation_invalid_request",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_requester_refused"),
+            "elicitation_requester_refused",
+            "consent_unavailable",
+        ),
+        (
+            Some("elicitation_expired"),
+            "login_approval_not_given",
+            "authorization_denied",
+        ),
+    ] {
+        let fixture = fixture(
+            Page::default(),
+            VaultState {
+                needs_approval: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let carrier = fixture.carrier();
+        if let Some(code) = code {
+            carrier.refuse_next_request(code);
+        } else {
+            carrier.without_secret_use_approval();
+        }
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], outcome, "{reply}");
+        assert_eq!(reason_code(&reply), reason, "{reply}");
+        if code.is_none() {
+            assert!(reply["detail"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("secret-use-approval/v1"));
+            assert!(carrier
+                .calls()
+                .iter()
+                .all(|(method, _)| method != "consent.request"));
+        }
+        if code == Some("elicitation_expired") {
+            assert_eq!(reply["detail"]["decision"], "no_answer");
+        }
+        assert_eq!(fixture.vault.requests().len(), 1);
+        assert_eq!(fixture.page.insertions(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_generic_allow_never_retries_the_vault_or_fills_a_login() {
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            needs_approval: true,
+            approves_when_asked: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .carrier()
+        .queue(ScriptedAnswer::Answered(json!({"decision": "allow"})));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reply["detail"]["decision"], "no_answer", "{reply}");
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert_eq!(fixture.page.insertions(), 0);
+}
+
+#[tokio::test]
+async fn a_dedicated_allow_cannot_fill_unless_the_vault_releases_material() {
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            needs_approval: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .carrier()
+        .queue(vault_approval_answer("req_vault_1", "allow"));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reason_code(&reply), "login_unavailable", "{reply}");
+    assert_eq!(
+        fixture.vault.requests().len(),
+        2,
+        "allow only cues a vault retry"
+    );
+    assert_eq!(fixture.page.insertions(), 0);
 }
 
 /// An approval given after the call stopped waiting fills nothing; the
@@ -1817,10 +2108,9 @@ async fn a_late_approval_fills_nothing_until_the_agent_calls_again() {
     );
     assert_eq!(pending["outcome"], "consent_pending", "{pending}");
     let ask_id = pending["ask_id"].as_str().unwrap().to_string();
-    assert!(fixture.carrier().answer_id(
-        &ask_id,
-        ScriptedAnswer::Answered(json!({"decision": "allow"}))
-    ));
+    assert!(fixture
+        .carrier()
+        .answer_id(&ask_id, vault_approval_answer("req_vault_1", "allow")));
     // The vault records the approval from the person's signed answer.
     fixture.vault.0.lock().unwrap().approved = true;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1874,12 +2164,11 @@ async fn typing_still_refuses_credential_fields() {
     );
 }
 
-/// No plane built for a running module serves the capability: it has no
-/// source of login material until the vault is wired in.
+/// Test construction installs no live source; production startup installs the
+/// real source, but the rollout switch still refuses it before vault I/O.
 #[tokio::test]
 async fn production_planes_do_not_serve_fill_login() {
-    assert!(cerebellum::browser::fill::PRODUCTION_LOGIN_MATERIAL_SOURCE.is_none());
-    assert!(cerebellum::browser::fill::production_login_material_source().is_none());
+    const { assert!(!cerebellum::browser::fill::FILL_LOGIN_ENABLED) };
     let (tx, mut rx) = mpsc::channel(4);
     cerebellum::handle_tool_request_for_test(
         tool_frame(
@@ -1893,4 +2182,25 @@ async fn production_planes_do_not_serve_fill_login() {
     .unwrap();
     let refused: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
     assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
+    let source = cerebellum::browser::fill::production_login_material_source(
+        std::path::PathBuf::from("must-not-read-this-connection-file"),
+        "cerebellum".into(),
+    );
+    let fixture = fixture_with_source(
+        Page::default(),
+        VaultState::default(),
+        Duration::from_secs(600),
+        Some(source),
+    )
+    .await;
+    let arguments = fixture.fill_arguments(false).await;
+    let frame = fixture
+        .send(
+            json!({"name": "browser.fill_login", "arguments": arguments}),
+            None,
+        )
+        .await;
+    let refused: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
+    assert_eq!(fixture.page.insertions(), 0);
 }

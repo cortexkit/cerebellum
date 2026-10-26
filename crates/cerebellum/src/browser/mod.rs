@@ -1248,7 +1248,8 @@ pub fn journal_action(capability: JournalCapability) -> Option<JournalAction> {
         | JournalCapability::WaitFor
         | JournalCapability::Present
         | JournalCapability::ImportLogin
-        | JournalCapability::CaptureLogin => return None,
+        | JournalCapability::CaptureLogin
+        | JournalCapability::FillLogin => return None,
     })
 }
 
@@ -1822,6 +1823,25 @@ impl BrowserPlane {
             Some(store) => store.commit_login_capture(journal_identity(identity), payload),
             // An enabled mode that opened no store is a journal that cannot
             // record; the caller refuses rather than acting unrecorded.
+            None => Err(JournalError::internal_failure()),
+        }
+    }
+
+    /// Record one fill result using only its non-material metadata.
+    pub(crate) async fn journal_login_fill(
+        &self,
+        identity: &RouteIdentity,
+        payload: journal::LoginFillPayload,
+    ) -> Result<(), JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        match journal.store.as_mut() {
+            Some(store) => store.commit_login_fill(journal_identity(identity), payload),
             None => Err(JournalError::internal_failure()),
         }
     }

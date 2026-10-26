@@ -1,0 +1,1 @@
+{"name":"login","coverage":"scope","stamp":{"attributes":{"agent_id":"agent-A"},"kind":"worker","owner":{"kind":"reserved","module_id":"prefrontal-core"},"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"H","scope_epoch":7},"parent_state":"linked","ref":"W","scope_epoch":7},"target":{"origin":"https://x.test"}}

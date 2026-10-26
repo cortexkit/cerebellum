@@ -16,7 +16,8 @@ use super::reservation::ReservationHandle;
 use super::{
     Capability, GoverningObservation, GrantDecision, HandoffJournalOutcome, HandoffPayload,
     JournalConfig, JournalEntry, JournalError, JournalIdentity, JournalPayload,
-    LoginCapturePayload, LoginImportPayload, Outcome, Phase, SessionKind, FORMAT_VERSION,
+    LoginCapturePayload, LoginFillPayload, LoginImportPayload, Outcome, Phase, SessionKind,
+    FORMAT_VERSION,
 };
 
 /// Test-only fault schedule retained by the browser compatibility surface.
@@ -443,6 +444,33 @@ impl JournalStore {
         self.commit_reserved_policy(handle, entry.export_line().into_bytes())
     }
 
+    pub fn commit_login_fill(
+        &mut self,
+        identity: JournalIdentity,
+        payload: LoginFillPayload,
+    ) -> Result<(), JournalError> {
+        let handle = self.reserve_policy_event(&identity)?;
+        let entry = JournalEntry {
+            format_version: super::FILL_LOGIN_FORMAT_VERSION.to_string(),
+            sequence: handle.sequence(),
+            phase: Phase::Dispatched,
+            identity,
+            capability: Some(Capability::FillLogin),
+            intent_redacted: None,
+            requested_severity: None,
+            effective_severity: None,
+            grant_decision: GrantDecision::not_reached(),
+            governing_observation: GoverningObservation::observation_not_required(),
+            action: None,
+            locator: None,
+            snapshot_ids: Vec::new(),
+            outcome: Some(Outcome::Success),
+            payload: Some(JournalPayload::LoginFill(payload)),
+            detail: None,
+        };
+        self.commit_reserved_policy(handle, entry.export_line().into_bytes())
+    }
+
     pub fn commit_policy_event(&mut self, mut entry: JournalEntry) -> Result<(), JournalError> {
         let identity = entry.identity.clone();
         let handle = self.reserve_policy_event(&identity)?;
@@ -495,5 +523,110 @@ pub struct PurgeReport {
 impl From<&JournalEntry> for Vec<u8> {
     fn from(entry: &JournalEntry) -> Self {
         entry.export_line().into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod fill_format_tests {
+    use super::*;
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn identity() -> JournalIdentity {
+        JournalIdentity {
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
+            principal: "direct:fixture".into(),
+            conversation_key: "fill-fixture".into(),
+            agent_project_id: "project".into(),
+            session_kind: SessionKind::Primary,
+            profile_uuid: None,
+            profile_name: None,
+            origin: Default::default(),
+        }
+    }
+
+    #[test]
+    fn fill_v9_is_lazy_and_keeps_ordinary_entry_bytes_unchanged() {
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "cerebellum-fill-floor-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let floor = scratch.0.join("format-floor.json");
+        let storage = FilesystemJournalStorage::new(scratch.0.join("browser.json"))
+            .with_format_floor(FormatFloor::at(&floor));
+        let mut journal = JournalStore::open(
+            JournalConfig {
+                journal_retention_bytes: 1_000_000,
+                journal_max_entry_bytes: 100_000,
+            },
+            CoreJournalConfig {
+                journal_retention_bytes: 1_000_000,
+                journal_max_entry_bytes: 100_000,
+            },
+            BrowserJournalStorage::Filesystem(storage),
+        )
+        .unwrap();
+        assert_eq!(
+            read_floors(&floor).unwrap().get("browser-journal-entry"),
+            None
+        );
+        journal
+            .commit_login_capture(
+                identity(),
+                LoginCapturePayload {
+                    origin: "https://x.test".into(),
+                    holder: "reserved:insula".into(),
+                    credential_id: "cookie:x.test:work".into(),
+                    bytes: 0,
+                    outcome: "expired".into(),
+                    deletion_succeeded: None,
+                },
+            )
+            .unwrap();
+        let before = journal.export();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(before.trim()).unwrap()["format_version"],
+            "ck-browser-journal/v7"
+        );
+        assert_eq!(
+            read_floors(&floor).unwrap().get("browser-journal-entry"),
+            None
+        );
+        let payload = LoginFillPayload {
+            origin: Some("https://x.test".into()),
+            outcome: "ok".into(),
+            filled: vec![
+                super::super::LoginFillField::Username,
+                super::super::LoginFillField::Password,
+                super::super::LoginFillField::Otp,
+            ],
+        };
+        journal
+            .commit_login_fill(identity(), payload.clone())
+            .unwrap();
+        let after = journal.export();
+        assert!(after.starts_with(&before));
+        assert_eq!(
+            read_floors(&floor).unwrap().get("browser-journal-entry"),
+            Some(&9)
+        );
+        let line = after.lines().last().unwrap();
+        let entry: JournalEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.format_version, "ck-browser-journal/v9");
+        assert_eq!(entry.capability, Some(Capability::FillLogin));
+        assert_eq!(entry.payload, Some(JournalPayload::LoginFill(payload)));
+        assert!(entry.action.is_none());
+        assert_eq!(entry.export_line().trim(), line);
+        assert_eq!(
+            super::super::EXPORT_FORMAT_VERSION,
+            "ck-browser-journal-export/v9"
+        );
     }
 }

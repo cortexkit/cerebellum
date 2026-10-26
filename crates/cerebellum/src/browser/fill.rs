@@ -24,6 +24,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -47,26 +48,20 @@ use cerebellum_core::identity::RouteIdentity;
 
 pub const FILL_LOGIN: &str = "browser.fill_login";
 
-/// Where production gets login material from. While this is `None`,
-/// `browser.fill_login` is refused in production as `capability_not_admitted`:
-/// no plane built for a running module has a source, and only a plane that
-/// has one serves the capability. Tests install a source of their own with
-/// [`BrowserPlane::with_login_material_source`].
-///
-/// Setting it to the vault's source enables the capability. Before that:
-/// - the browser journal needs a `browser.fill_login` capability, minted as a
-///   new journal format revision, recording the outcome, the origin and the
-///   names of the filled fields, never their values. Until then a fill writes
-///   no journal entry;
-/// - the card registry needs a rollback check: approval cards of kind
-///   `secret_use` are written to the stored registry, so it must be confirmed
-///   that the previous release reads a registry holding a kind it does not
-///   know. While this is `None` no such card can be written.
-pub const PRODUCTION_LOGIN_MATERIAL_SOURCE: Option<fn() -> Arc<dyn LoginMaterialSource>> = None;
+/// Production admission remains off until the security audit and phone approval
+/// support are complete. Tests can still install a source on an isolated plane.
+pub const FILL_LOGIN_ENABLED: bool = false;
+
+/// The live vault source. Construction does no I/O; admission remains separate.
+pub const PRODUCTION_LOGIN_MATERIAL_SOURCE: fn(PathBuf, String) -> Arc<dyn LoginMaterialSource> =
+    crate::login_capture::secret_use::production_source;
 
 /// The source a plane built for a running module is given.
-pub fn production_login_material_source() -> Option<Arc<dyn LoginMaterialSource>> {
-    PRODUCTION_LOGIN_MATERIAL_SOURCE.map(|make| make())
+pub fn production_login_material_source(
+    path: PathBuf,
+    module_id: String,
+) -> Arc<dyn LoginMaterialSource> {
+    PRODUCTION_LOGIN_MATERIAL_SOURCE(path, module_id)
 }
 
 /// `name`, when it is `browser.fill_login` and this plane serves it.
@@ -75,7 +70,13 @@ pub fn admitted<'a>(
     plane: &BrowserPlane,
     browser_configured: bool,
 ) -> Option<&'a str> {
-    (name == FILL_LOGIN && browser_configured && plane.login_material.is_some()).then_some(name)
+    (name == FILL_LOGIN
+        && browser_configured
+        && plane
+            .login_material
+            .as_ref()
+            .is_some_and(|source| source.enabled()))
+    .then_some(name)
 }
 
 /// How long after a fill the tab stays in its window at most.
@@ -118,15 +119,20 @@ impl SecretUseRequest {
 pub struct SourceUnavailable;
 
 pub type SourceFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Value, SourceUnavailable>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<SecretUseAnswer, SourceUnavailable>> + Send + 'a>>;
 
 /// Where login material comes from: the vault's `secret.use`.
 ///
-/// The reply is the vault's answer as it arrived. [`SecretUseAnswer::from_reply`]
-/// moves the secret strings out of it into zeroizing buffers and wipes what
-/// is left, so the source should hand over the reply and keep no copy.
+/// Sources decode directly into zeroizing material, never a JSON `Value` holding
+/// ordinary secret strings, and retain no copy after handing over the answer.
 pub trait LoginMaterialSource: Send + Sync {
     fn secret_use(&self, request: &SecretUseRequest) -> SourceFuture<'_>;
+
+    /// Isolated test sources are admitted; the production source uses the
+    /// rollout switch even when it has already been installed on a plane.
+    fn enabled(&self) -> bool {
+        true
+    }
 }
 
 /// A released login. Every value is wiped when this is dropped.
@@ -164,76 +170,9 @@ pub enum SecretUseAnswer {
 }
 
 impl SecretUseAnswer {
-    /// Read the vault's reply, taking its secret strings into zeroizing
-    /// buffers and wiping every string left in it before it is dropped.
-    pub fn from_reply(mut reply: Value) -> Self {
-        let answer = Self::read(&mut reply);
-        wipe(&mut reply);
-        answer
-    }
-
-    fn read(reply: &mut Value) -> Self {
-        if reply.get("error").is_some() {
-            return Self::Refused;
-        }
-        match reply.get("status").and_then(Value::as_str) {
-            Some("released") if reply.get("kind").and_then(Value::as_str) == Some("site_login") => {
-                let (Some(username), Some(password)) = (
-                    take_string(reply, "username"),
-                    take_string(reply, "password"),
-                ) else {
-                    return Self::Refused;
-                };
-                let totp = match reply.get("totp") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(_)) => take_string(reply, "totp"),
-                    Some(_) => return Self::Refused,
-                };
-                Self::Released(LoginMaterial {
-                    username,
-                    password,
-                    totp,
-                })
-            }
-            Some("approval_required") => {
-                let text = |key: &str| reply.get(key).and_then(Value::as_str).map(str::to_owned);
-                match (
-                    text("request_id"),
-                    text("statement_b64url"),
-                    reply.get("expires_at_ms").and_then(Value::as_u64),
-                ) {
-                    (Some(request_id), Some(statement_b64url), Some(expires_at_ms))
-                        if !request_id.is_empty() && !statement_b64url.is_empty() =>
-                    {
-                        Self::ApprovalRequired(Approval {
-                            request_id,
-                            statement_b64url,
-                            expires_at_ms,
-                        })
-                    }
-                    _ => Self::Refused,
-                }
-            }
-            _ => Self::Refused,
-        }
-    }
-}
-
-fn take_string(reply: &mut Value, key: &str) -> Option<Zeroizing<String>> {
-    match reply.get_mut(key) {
-        Some(Value::String(value)) => Some(Zeroizing::new(std::mem::take(value))),
-        _ => None,
-    }
-}
-
-/// Zero every string in `value`, so a reply dropped after its secrets were
-/// taken (or never taken, for a reply this module refused) leaves nothing.
-fn wipe(value: &mut Value) {
-    match value {
-        Value::String(text) => text.zeroize(),
-        Value::Array(items) => items.iter_mut().for_each(wipe),
-        Value::Object(fields) => fields.values_mut().for_each(wipe),
-        _ => {}
+    /// Decode the closed vault reply without allocating ordinary secret strings.
+    pub fn from_wire(reply: Zeroizing<Vec<u8>>) -> Self {
+        crate::login_capture::secret_use::decode_reply(&reply)
     }
 }
 
@@ -342,14 +281,20 @@ pub enum FillRefusal {
     VaultUnavailable,
     /// The page changed or insertion could not be confirmed. Reads remain
     /// protected even if rollback could not reach the renderer.
-    Aborted { reason_code: &'static str },
+    Aborted {
+        reason_code: &'static str,
+    },
     /// A screenshot of a tab holding a filled password.
     FilledPasswordOnPage,
     /// A read of a tab whose filled login has outlived its window.
     WindowExpired,
     /// The person's approval for using the login did not arrive. `asked`
     /// is false when the question could not be put to anyone.
-    ApprovalNotGiven { decision: &'static str, asked: bool },
+    ApprovalNotGiven {
+        decision: &'static str,
+        asked: bool,
+    },
+    ApprovalServiceRefused(crate::cingulate_client::desk::SecretUseRefusal),
 }
 
 impl FillRefusal {
@@ -358,6 +303,7 @@ impl FillRefusal {
             Self::VaultUnavailable => "internal_error",
             Self::Aborted { .. } => "stale_snapshot",
             Self::ApprovalNotGiven { asked: false, .. } => "consent_unavailable",
+            Self::ApprovalServiceRefused(_) => "consent_unavailable",
             Self::Origin { .. }
             | Self::LoginUnavailable
             | Self::FilledPasswordOnPage
@@ -376,6 +322,7 @@ impl FillRefusal {
             Self::WindowExpired => "reload or navigate the page itself before reading it again",
             Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
             Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call browser.fill_login again when the person is available",
+            Self::ApprovalServiceRefused(_) => "the dedicated vault approval could not be filed; update Cingulate or report the refusal before retrying",
         }
     }
 
@@ -400,6 +347,20 @@ impl FillRefusal {
                 "reason_code": "login_approval_not_given",
                 "decision": decision,
             }),
+            Self::ApprovalServiceRefused(reason) => match reason {
+                crate::cingulate_client::desk::SecretUseRefusal::MissingCapability => {
+                    json!({"reason_code": "secret_use_approval_unsupported", "reason": "Cingulate does not advertise secret-use-approval/v1"})
+                }
+                crate::cingulate_client::desk::SecretUseRefusal::InvalidRequest => {
+                    json!({"reason_code": "elicitation_invalid_request"})
+                }
+                crate::cingulate_client::desk::SecretUseRefusal::RequestConflict => {
+                    json!({"reason_code": "elicitation_request_conflict"})
+                }
+                crate::cingulate_client::desk::SecretUseRefusal::RequesterRefused => {
+                    json!({"reason_code": "elicitation_requester_refused"})
+                }
+            },
         }
     }
 }
@@ -1323,6 +1284,12 @@ mod tests {
     };
     use crate::snapshot_store::{AxRecord, SnapshotKind};
 
+    fn answer(value: Value) -> SecretUseAnswer {
+        SecretUseAnswer::from_wire(Zeroizing::new(
+            serde_json::to_vec(&json!({"result": value})).unwrap(),
+        ))
+    }
+
     fn field(
         build: impl FnOnce(ElementClassificationInput) -> ElementClassificationInput,
     ) -> NonTypeClassificationRecord {
@@ -1382,7 +1349,7 @@ mod tests {
 
     #[test]
     fn released_approval_and_refused_answers_read_as_the_vault_sends_them() {
-        let SecretUseAnswer::Released(material) = SecretUseAnswer::from_reply(json!({
+        let SecretUseAnswer::Released(material) = answer(json!({
             "status": "released", "kind": "site_login",
             "username": "u", "password": "p", "totp": "123456",
         })) else {
@@ -1397,13 +1364,13 @@ mod tests {
             ("u", "p", Some("123456"))
         );
         assert!(!format!("{material:?}").contains("123456"));
-        let SecretUseAnswer::Released(without) = SecretUseAnswer::from_reply(json!({
+        let SecretUseAnswer::Released(without) = answer(json!({
             "status": "released", "kind": "site_login", "username": "u", "password": "p",
         })) else {
             panic!("a released login without a code");
         };
         assert!(without.totp.is_none());
-        let SecretUseAnswer::ApprovalRequired(approval) = SecretUseAnswer::from_reply(json!({
+        let SecretUseAnswer::ApprovalRequired(approval) = answer(json!({
             "status": "approval_required", "request_id": "req_1",
             "statement_b64url": "c3Q", "expires_at_ms": 9,
         })) else {
@@ -1427,21 +1394,10 @@ mod tests {
             json!({"status": "something_else"}),
         ] {
             assert!(
-                matches!(
-                    SecretUseAnswer::from_reply(refused.clone()),
-                    SecretUseAnswer::Refused
-                ),
+                matches!(answer(refused.clone()), SecretUseAnswer::Refused),
                 "{refused}"
             );
         }
-    }
-
-    #[test]
-    fn a_reply_is_wiped_once_its_secrets_are_taken() {
-        let mut reply =
-            json!({"status": "released", "nested": ["secret-copy", {"deep": "secret"}]});
-        wipe(&mut reply);
-        assert_eq!(reply, json!({"status": "", "nested": ["", {"deep": ""}]}));
     }
 
     #[test]
@@ -1785,10 +1741,14 @@ mod tests {
     }
 
     #[test]
-    fn production_has_no_login_material_source() {
-        assert!(PRODUCTION_LOGIN_MATERIAL_SOURCE.is_none());
+    fn production_switch_refuses_even_with_the_real_source_installed() {
+        const { assert!(!FILL_LOGIN_ENABLED) };
         let plane =
-            BrowserPlane::new().with_login_material_source(production_login_material_source());
+            BrowserPlane::new().with_login_material_source(Some(production_login_material_source(
+                PathBuf::from("unread-connection-file"),
+                "cerebellum".into(),
+            )));
+        assert!(plane.login_material.is_some());
         assert_eq!(admitted(FILL_LOGIN, &plane, true), None);
     }
 }

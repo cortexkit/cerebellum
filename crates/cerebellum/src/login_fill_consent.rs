@@ -25,61 +25,22 @@ use crate::cingulate_client::desk::{
     Apply, ApplyFailed, Ending, InCall, LetGo, NoCard, RaisedCard,
 };
 use crate::cingulate_client::wire::{Execution, ExecutionReason, Record};
-use crate::consent_card::{
-    ConsentCard, ConsentOption, LateExecution, Scope, Target, TargetKind, Urgency,
-};
 use crate::consent_drain::{AppliedSettlement, ConsentEffects};
 use crate::{AcceptedBindFacts, Planes};
 use cerebellum_computer::platform::vocabulary::CapabilityResultValidationError;
 
-/// The card's approving option.
-pub(crate) const APPROVE: &str = "allow";
 /// The card's declining option, which is also its default.
-pub(crate) const DECLINE: &str = "deny";
+pub(crate) const DECLINE: &str = "decline";
 
 /// The approval card for one vault request.
 ///
-/// Built from the vault's request id and statement alone, both passed through
-/// as the vault sent them, so nothing the agent chose reaches the person's
-/// phone. The card is an ordinary `consent` card for now: Cingulate has not
-/// yet published a dedicated card format for showing a vault statement. This
-/// is the only function that builds the card, so adopting that format later
-/// changes only this function.
-///
-/// `late_execution` is `execute`: an approval after the call stopped waiting
-/// still takes effect, because the vault records it and releases the login
-/// on the agent's next call.
-pub(crate) fn secret_use_card(approval: &Approval, lifetime: Duration) -> Value {
-    ConsentCard {
-        title: "Use a saved login".into(),
-        prompt: "An agent asks to sign in with a login saved in your vault. The vault's statement \
-                 names the login, the site and the agent."
-            .into(),
-        target: Target {
-            kind: TargetKind::Site,
-            label: "Saved login".into(),
-        },
-        facts: Vec::new(),
-        grants: vec![ConsentOption::grant(APPROVE, "Allow")],
-        decline: ConsentOption::decline(DECLINE, "Deny"),
-        expires_in: lifetime,
-        material_damage: false,
-        late_execution: LateExecution::Execute,
-        urgency: Urgency::High,
-        scope: Scope::new()
-            .with("vault_request_id", approval.request_id.clone())
-            .with("statement_b64url", approval.statement_b64url.clone()),
-    }
-    .render()
-}
-
-/// How long the card stays open: until the vault's request expires, and no
-/// longer than a login card.
-fn card_lifetime(expires_at_ms: u64) -> Duration {
-    Duration::from_millis(expires_at_ms.saturating_sub(crate::wall_clock_ms())).clamp(
-        Duration::from_secs(1),
-        crate::consent_card::LOGIN_CARD_LIFETIME,
-    )
+/// The dedicated kind permits only the vault's bytes. Cingulate derives its
+/// display and expiry from the statement, and the phone grants at the vault
+/// before answering this card. No generic Allow can release a login.
+pub(crate) fn secret_use_card(approval: &Approval) -> Value {
+    json!({"params": {"kind": "secret_use", "secret_use": {"items": [{
+        "request_id": approval.request_id, "statement_b64url": approval.statement_b64url,
+    }]}}})
 }
 
 /// Late answers to approval cards need nothing stored here: the vault keeps
@@ -115,10 +76,7 @@ async fn ask(
     source: &dyn LoginMaterialSource,
     request: &SecretUseRequest,
 ) -> Result<SecretUseAnswer, SourceUnavailable> {
-    source
-        .secret_use(request)
-        .await
-        .map(SecretUseAnswer::from_reply)
+    source.secret_use(request).await
 }
 
 /// Serve one `browser.fill_login` call.
@@ -128,6 +86,70 @@ pub(crate) async fn serve(
     request: (u16, u32, u64),
     arguments: &Value,
     park_limit: Duration,
+) -> Result<Value, CapabilityResultValidationError> {
+    let mut origin = None;
+    let reply = Box::pin(serve_inner(
+        planes,
+        facts,
+        request,
+        arguments,
+        park_limit,
+        &mut origin,
+    ))
+    .await;
+    let outcome = reply
+        .as_ref()
+        .ok()
+        .and_then(|reply| reply["outcome"].as_str())
+        .unwrap_or("internal_failure")
+        .to_string();
+    let filled = reply
+        .as_ref()
+        .ok()
+        .and_then(|reply| reply["filled"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|field| match field.as_str()? {
+            "username" => Some(crate::journal::LoginFillField::Username),
+            "password" => Some(crate::journal::LoginFillField::Password),
+            "otp" => Some(crate::journal::LoginFillField::Otp),
+            _ => None,
+        })
+        .collect();
+    if let Err(error) = planes
+        .browser
+        .journal_login_fill(
+            &facts.identity,
+            crate::journal::LoginFillPayload {
+                outcome,
+                origin,
+                filled,
+            },
+        )
+        .await
+    {
+        return planes.browser.finish_fill_reply(
+            planes
+                .browser
+                .fill_reply(
+                    &facts.identity,
+                    Err(BrowserError::Internal {
+                        reason_code: error.reason_code,
+                    }),
+                )
+                .await,
+        );
+    }
+    reply
+}
+
+async fn serve_inner(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    request: (u16, u32, u64),
+    arguments: &Value,
+    park_limit: Duration,
+    origin: &mut Option<String>,
 ) -> Result<Value, CapabilityResultValidationError> {
     let browser = &planes.browser;
     let identity = &facts.identity;
@@ -140,6 +162,7 @@ pub(crate) async fn serve(
             return browser.finish_fill_reply(browser.fill_reply(identity, Err(error)).await)
         }
     };
+    *origin = Some(plan.origin.clone());
     // The scope the call arrived on, the head's for a codemode run: the vault
     // decides who is asking from it alone.
     let Some(stamp) = facts
@@ -196,6 +219,9 @@ async fn not_approved(
     facts: &AcceptedBindFacts,
     ending: &Ending,
 ) -> Result<Value, CapabilityResultValidationError> {
+    if let Ending::NoCard(NoCard::SecretUseRefused(reason)) = ending {
+        return refuse(planes, facts, FillRefusal::ApprovalServiceRefused(*reason)).await;
+    }
     refuse(
         planes,
         facts,
@@ -237,12 +263,21 @@ async fn approve_then_fill(
         Ok(session) => session,
         Err(error) => return not_approved(planes, facts, &Ending::of_refusal(&error)).await,
     };
-    let lifetime = card_lifetime(approval.expires_at_ms);
+    if !session.supports_secret_use_approval() {
+        return refuse(
+            planes,
+            facts,
+            FillRefusal::ApprovalServiceRefused(
+                crate::cingulate_client::desk::SecretUseRefusal::MissingCapability,
+            ),
+        )
+        .await;
+    }
     let Ok(card) = consent_request(
         CardKind::SecretUse,
-        &secret_use_card(&approval, lifetime),
-        lifetime,
-        crate::call_context::current_call_key().as_deref(),
+        &secret_use_card(&approval),
+        Duration::ZERO,
+        None,
         None,
         None,
     ) else {

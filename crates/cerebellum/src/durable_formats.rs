@@ -10,6 +10,8 @@
 //! The browser journal also has a floored reason for public-web actions allowed
 //! by risk policy without asking a person. That reason must not be interpreted
 //! by an older deployment as a person's approval.
+//! Fill-login entries also have a floor for their closed capability/payload
+//! vocabulary; the floor rises only when the first such entry is written.
 //! Other write-only formats need no reader floor: the custody event log,
 //! profile-root rebind log, and opaque legacy browser entries.
 
@@ -31,7 +33,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         crate::browser_launch::LAUNCH_ENTRY_FORMAT,
         crate::browser_launch::LAUNCH_RECOVERY_CLEAR_FORMAT,
         cerebellum_computer::audit::COMPUTER_ENTRY_FORMAT,
-        crate::journal::BASELINE_ENTRY_FORMAT,
+        crate::journal::FILL_LOGIN_ENTRY_FORMAT,
         crate::journal::call_records::CALL_RECORD_FORMAT,
         crate::cingulate_client::desk::CINGULATE_RAISED_FORMAT,
         // Under `browser/`.

@@ -61,14 +61,20 @@ pub enum Ending {
     DeliveryFailed,
     /// Cerebellum withdrew the card.
     Withdrawn,
-    /// No card could be raised for this call at all, for a reason that is
-    /// not about Cingulate or the person: see [`NoCard`].
+    /// No card could be filed for this call: see [`NoCard`].
     NoCard(NoCard),
 }
 
-/// Why no card can be raised for a call. Each is one row of the
-/// `consent_unavailable` reply the flows give, with its own reason and
-/// remedy, and in none of them is a route to Cingulate used to ask anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretUseRefusal {
+    MissingCapability,
+    InvalidRequest,
+    RequestConflict,
+    RequesterRefused,
+}
+
+/// Why no card can be filed for a call. Each has its own reason and remedy;
+/// none permits a fallback to a different kind of approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoCard {
     /// The call came from no agent session that could raise a card: an
@@ -88,6 +94,8 @@ pub enum NoCard {
     /// The call is no longer held: its reply was already decided or its
     /// route unbound, so there is nobody to reply to.
     CallEnded,
+    /// The dedicated vault-approval filing was refused or not negotiated.
+    SecretUseRefused(SecretUseRefusal),
 }
 
 impl NoCard {
@@ -110,6 +118,18 @@ impl NoCard {
             Self::ScopeEnded => Some("scope_ended"),
             Self::RegistryUnreadable => Some("consent_registry_unreadable"),
             Self::CallEnded => None,
+            Self::SecretUseRefused(SecretUseRefusal::MissingCapability) => {
+                Some("secret_use_approval_unsupported")
+            }
+            Self::SecretUseRefused(SecretUseRefusal::InvalidRequest) => {
+                Some("elicitation_invalid_request")
+            }
+            Self::SecretUseRefused(SecretUseRefusal::RequestConflict) => {
+                Some("elicitation_request_conflict")
+            }
+            Self::SecretUseRefused(SecretUseRefusal::RequesterRefused) => {
+                Some("elicitation_requester_refused")
+            }
         }
     }
 
@@ -127,6 +147,7 @@ impl NoCard {
                 Some("the consent registry file is newer or damaged; update cerebellum")
             }
             Self::CallEnded => None,
+            Self::SecretUseRefused(_) => Some("Cingulate must advertise secret-use-approval/v1 and admit the dedicated vault approval; update Cingulate or report the refusal"),
         }
     }
 }
@@ -168,13 +189,16 @@ impl Ending {
                 // The card is gone from this requester's view: acknowledged,
                 // past retention, or not this session's. Nothing can be
                 // concluded about a choice.
-                RefusalCode::NotOwner | RefusalCode::NotFound => Self::NoAnswer,
+                RefusalCode::NotOwner | RefusalCode::NotFound | RefusalCode::Expired => {
+                    Self::NoAnswer
+                }
                 RefusalCode::UnknownMethod
                 | RefusalCode::ConsentUnavailable
                 | RefusalCode::AccessUnavailable
                 | RefusalCode::StoreError
                 | RefusalCode::Cancelled
                 | RefusalCode::InvalidExecution
+                | RefusalCode::RequestConflict
                 | RefusalCode::Unknown(_) => Self::DeliveryFailed,
             },
         }
@@ -183,6 +207,21 @@ impl Ending {
     /// The ending a settled record stands for, read against the card it
     /// answers. `None` while the card is still pending.
     pub fn of_record(record: &Record, card: &RaisedCard) -> Option<Self> {
+        if card.kind == CardKind::SecretUse && record.state == CardState::Answered {
+            return Some(
+                match super::subject::secret_use_request_id(&card.subject)
+                    .and_then(|id| record.secret_use_decision(&id))
+                {
+                    Some("allow") => Self::Granted {
+                        choice_id: "allow".into(),
+                    },
+                    Some("decline") => Self::Declined {
+                        choice_id: "decline".into(),
+                    },
+                    _ => Self::NoAnswer,
+                },
+            );
+        }
         Some(match record.state {
             CardState::Pending => return None,
             CardState::Answered => match record.answered_choice_id.clone() {
@@ -396,9 +435,9 @@ pub trait RegistryStore: Send + Sync {
 /// The registry file's name under the module's journal directory.
 pub const CINGULATE_RAISED_FILE: &str = "cingulate_raised.json";
 
-/// The highest registry file version this build reads, and the one it
-/// writes.
-pub const CINGULATE_RAISED_VERSION: u64 = 2;
+/// The highest registry version this build reads. Writes use v3 only when a
+/// SecretUse card is present; ordinary v1/v2 saves remain byte-compatible.
+pub const CINGULATE_RAISED_VERSION: u64 = 3;
 
 /// The registry file's durable format (name and version). Every format this
 /// module writes is recorded in the operator's format-floor file before its
@@ -482,7 +521,9 @@ impl RegistryStore for FileRegistryStore {
         // rolling back to a build without it stays a plain binary swap. Once
         // the file is written, the floor must record its format, or the
         // install-time check could accept a build that cannot read it.
-        let version = if cards.iter().any(|card| !card.lifecycle.is_empty()) {
+        let version = if cards.iter().any(|card| card.kind == CardKind::SecretUse) {
+            3
+        } else if cards.iter().any(|card| !card.lifecycle.is_empty()) {
             2
         } else {
             1
@@ -1029,18 +1070,46 @@ impl DeskSession<'_> {
         Ok(record)
     }
 
+    pub(crate) fn supports_secret_use_approval(&self) -> bool {
+        super::features::negotiated(self.route.features()).secret_use_approval
+    }
+
     /// Raise `card` about `subject` and remember it. Returns the card's
     /// elicitation id, the ask id the agent is given.
     pub async fn raise(&mut self, card: CardRequest, subject: &str) -> Result<String, Ending> {
         if !self.live.is_held() {
             return Err(Ending::NoCard(NoCard::CallEnded));
         }
-        let card = card.for_features(super::features::negotiated(self.route.features()));
+        let features = super::features::negotiated(self.route.features());
+        let secret_use = card.kind == CardKind::SecretUse;
+        if secret_use && !features.secret_use_approval {
+            return Err(Ending::NoCard(NoCard::SecretUseRefused(
+                SecretUseRefusal::MissingCapability,
+            )));
+        }
+        let card = card.for_features(features);
         let result = self
             .route
             .call(wire::CONSENT_REQUEST, card.params.clone())
             .await
-            .map_err(|error| Ending::of_refusal(&error))?;
+            .map_err(|error| match &error {
+                CallError::Refused(refusal)
+                    if secret_use && refusal.code == RefusalCode::InvalidRequest =>
+                {
+                    Ending::NoCard(NoCard::SecretUseRefused(SecretUseRefusal::InvalidRequest))
+                }
+                CallError::Refused(refusal)
+                    if secret_use && refusal.code == RefusalCode::RequestConflict =>
+                {
+                    Ending::NoCard(NoCard::SecretUseRefused(SecretUseRefusal::RequestConflict))
+                }
+                CallError::Refused(refusal)
+                    if secret_use && refusal.code == RefusalCode::RequesterRefused =>
+                {
+                    Ending::NoCard(NoCard::SecretUseRefused(SecretUseRefusal::RequesterRefused))
+                }
+                _ => Ending::of_refusal(&error),
+            })?;
         let elicitation_id = result
             .get("elicitation_id")
             .and_then(Value::as_str)

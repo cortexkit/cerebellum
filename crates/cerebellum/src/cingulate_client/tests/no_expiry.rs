@@ -19,6 +19,7 @@ fn features(enabled: bool) -> CingulateFeatures {
         option_group: true,
         single_use: false,
         no_expiry: enabled,
+        secret_use_approval: false,
     }
 }
 fn saved_card(kind: CardKind) -> RaisedCard {
@@ -73,9 +74,12 @@ fn published_no_expiry_corpus_is_byte_pinned() {
 }
 
 #[tokio::test]
-async fn mutation_expiry_is_omitted_only_for_advertised_peers_on_every_card() {
+async fn mutation_expiry_is_omitted_only_for_advertised_peers_on_every_generic_card() {
     for enabled in [false, true] {
-        for (kind, name, body, deadline) in todays_cards() {
+        for (kind, name, body, deadline) in todays_cards()
+            .into_iter()
+            .filter(|(kind, ..)| *kind != CardKind::SecretUse)
+        {
             let peer = ScriptedCingulate::new();
             peer.report_features(Some(features(enabled)));
             peer.then(wire::CONSENT_REQUEST, created());
@@ -575,9 +579,12 @@ async fn a_dead_sessions_report_uses_any_live_call_but_agent_b_cannot_apply_agen
 }
 
 #[tokio::test(start_paused = true)]
-async fn every_120_second_give_up_detaches_including_a_hung_await_and_user_browser_hold() {
+async fn every_generic_120_second_give_up_detaches_including_a_hung_await_and_user_browser_hold() {
     for enabled in [false, true] {
-        for kind in CardKind::ALL {
+        for kind in CardKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != CardKind::SecretUse)
+        {
             for hangs in [false, true] {
                 let peer = ScriptedCingulate::new();
                 peer.report_features(Some(features(enabled)));
@@ -652,5 +659,61 @@ fn registry_upgrade_is_lazy_and_an_interrupted_dispatch_becomes_unknown() {
             execution: Execution::OutcomeUnknown,
             reason: None
         })
+    );
+}
+
+#[test]
+fn secret_use_raises_the_registry_floor_only_on_its_first_save() {
+    use cerebellum_core::format_floor::read_floors;
+    let scratch = Scratch::new("secret-use-lazy");
+    let store = scratch.store();
+    assert!(store.load().unwrap().is_empty());
+    assert!(!scratch.floor().exists());
+    for expected in [1, 2] {
+        let mut ordinary = saved_card(CardKind::LoginImport);
+        if expected == 1 {
+            ordinary.lifecycle = CardLifecycle::default();
+        }
+        store.save(&[ordinary]).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&before).unwrap()["version"],
+            expected
+        );
+        assert_eq!(
+            read_floors(&scratch.floor())
+                .unwrap()
+                .get("cingulate-raised"),
+            Some(&expected)
+        );
+        let loaded = store.load().unwrap();
+        store.save(&loaded).unwrap();
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            before,
+            "ordinary save changed bytes"
+        );
+    }
+    let mut secret = saved_card(CardKind::SecretUse);
+    secret.lifecycle = CardLifecycle::default();
+    store.save(&[secret]).unwrap();
+    let saved = std::fs::read(store.path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&saved).unwrap()["version"],
+        3
+    );
+    assert_eq!(
+        read_floors(&scratch.floor())
+            .unwrap()
+            .get("cingulate-raised"),
+        Some(&3)
+    );
+    assert_eq!(store.load().unwrap()[0].kind, CardKind::SecretUse);
+    store.save(&[]).unwrap();
+    assert_eq!(
+        read_floors(&scratch.floor())
+            .unwrap()
+            .get("cingulate-raised"),
+        Some(&3)
     );
 }

@@ -197,6 +197,7 @@ impl CingulateRoute for ServiceRoute {
             option_group: true,
             single_use: false,
             no_expiry: false,
+            secret_use_approval: false,
         })
     }
     fn call<'a>(

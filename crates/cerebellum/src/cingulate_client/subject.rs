@@ -138,6 +138,12 @@ pub fn secret_use(conversation_key: &str, request_id: &str) -> String {
     encode(json!(["secret_use", conversation_key, request_id]))
 }
 
+pub(crate) fn secret_use_request_id(subject: &str) -> Option<String> {
+    let parts: Vec<String> = serde_json::from_str(subject).ok()?;
+    let [family, _, request_id] = <[String; 3]>::try_from(parts).ok()?;
+    (family == "secret_use").then_some(request_id)
+}
+
 /// `CardKind::UserBrowserSite`: one site in the person's own browser.
 pub fn user_browser_site(origin: &str) -> String {
     encode(json!(["user_browser_site", origin]))

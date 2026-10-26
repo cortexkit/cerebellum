@@ -33,15 +33,18 @@ impl BrowserJournalCodec {
         Ok(EncodedJournalState {
             durable_bytes: bytes.to_vec(),
             accounted_serialized_size: bytes.len() as u64,
-            codec_version: if serde_json::from_slice::<serde_json::Value>(bytes)
+            codec_version: match serde_json::from_slice::<serde_json::Value>(bytes)
                 .ok()
-                .is_some_and(|entry| entry["format_version"] == super::BASELINE_FORMAT_VERSION)
+                .and_then(|entry| entry["format_version"].as_str().map(str::to_owned))
             {
-                super::BASELINE_FORMAT_VERSION
-            } else {
-                BROWSER_CODEC_VERSION
-            }
-            .to_string(),
+                Some(version)
+                    if version == super::BASELINE_FORMAT_VERSION
+                        || version == super::FILL_LOGIN_FORMAT_VERSION =>
+                {
+                    version
+                }
+                _ => BROWSER_CODEC_VERSION.to_string(),
+            },
         })
     }
 }
@@ -102,9 +105,7 @@ impl PlaneJournalCodec for BrowserJournalCodec {
         Self::encoded(&input.dispatch_material)
     }
 
-    /// Browser entries are carried as opaque bytes and exported as written;
-    /// nothing in this module decodes them again, so no build can fail on a
-    /// newer one and none is floored.
+    /// Legacy entries remain opaque. New vocabularies choose their floor below.
     fn entry_format(&self) -> Option<cerebellum_core::format_floor::DurableFormat> {
         None
     }
@@ -113,10 +114,13 @@ impl PlaneJournalCodec for BrowserJournalCodec {
         &self,
         codec_version: &str,
     ) -> Option<cerebellum_core::format_floor::DurableFormat> {
-        // Only public_web_baseline entries need the v8 decision vocabulary.
-        // Keeping ordinary entries at v7 lets older binaries serve them without
-        // rewriting the journal or advancing its format floor.
-        (codec_version == super::BASELINE_FORMAT_VERSION).then_some(super::BASELINE_ENTRY_FORMAT)
+        // Raise only when the new vocabulary is actually written, preserving
+        // plain binary rollback for installations that have not used it.
+        match codec_version {
+            super::BASELINE_FORMAT_VERSION => Some(super::BASELINE_ENTRY_FORMAT),
+            super::FILL_LOGIN_FORMAT_VERSION => Some(super::FILL_LOGIN_ENTRY_FORMAT),
+            _ => None,
+        }
     }
 }
 
