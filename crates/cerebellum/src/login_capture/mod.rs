@@ -47,6 +47,7 @@ use crate::cingulate_client::desk::{Ending, NoCard};
 use crate::computer_grants::{ComputerGrants, LoginAnswer, LoginConsent, LoginConsentRequest};
 use crate::journal::LoginCapturePayload;
 
+pub mod secret_use;
 pub mod vault;
 pub mod vault_wire;
 

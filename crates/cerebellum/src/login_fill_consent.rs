@@ -115,10 +115,7 @@ async fn ask(
     source: &dyn LoginMaterialSource,
     request: &SecretUseRequest,
 ) -> Result<SecretUseAnswer, SourceUnavailable> {
-    source
-        .secret_use(request)
-        .await
-        .map(SecretUseAnswer::from_reply)
+    source.secret_use(request).await
 }
 
 /// Serve one `browser.fill_login` call.
@@ -128,6 +125,70 @@ pub(crate) async fn serve(
     request: (u16, u32, u64),
     arguments: &Value,
     park_limit: Duration,
+) -> Result<Value, CapabilityResultValidationError> {
+    let mut origin = None;
+    let reply = Box::pin(serve_inner(
+        planes,
+        facts,
+        request,
+        arguments,
+        park_limit,
+        &mut origin,
+    ))
+    .await;
+    let outcome = reply
+        .as_ref()
+        .ok()
+        .and_then(|reply| reply["outcome"].as_str())
+        .unwrap_or("internal_failure")
+        .to_string();
+    let filled = reply
+        .as_ref()
+        .ok()
+        .and_then(|reply| reply["filled"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|field| match field.as_str()? {
+            "username" => Some(crate::journal::LoginFillField::Username),
+            "password" => Some(crate::journal::LoginFillField::Password),
+            "otp" => Some(crate::journal::LoginFillField::Otp),
+            _ => None,
+        })
+        .collect();
+    if let Err(error) = planes
+        .browser
+        .journal_login_fill(
+            &facts.identity,
+            crate::journal::LoginFillPayload {
+                outcome,
+                origin,
+                filled,
+            },
+        )
+        .await
+    {
+        return planes.browser.finish_fill_reply(
+            planes
+                .browser
+                .fill_reply(
+                    &facts.identity,
+                    Err(BrowserError::Internal {
+                        reason_code: error.reason_code,
+                    }),
+                )
+                .await,
+        );
+    }
+    reply
+}
+
+async fn serve_inner(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    request: (u16, u32, u64),
+    arguments: &Value,
+    park_limit: Duration,
+    origin: &mut Option<String>,
 ) -> Result<Value, CapabilityResultValidationError> {
     let browser = &planes.browser;
     let identity = &facts.identity;
@@ -140,6 +201,7 @@ pub(crate) async fn serve(
             return browser.finish_fill_reply(browser.fill_reply(identity, Err(error)).await)
         }
     };
+    *origin = Some(plan.origin.clone());
     // The scope the call arrived on, the head's for a codemode run: the vault
     // decides who is asking from it alone.
     let Some(stamp) = facts

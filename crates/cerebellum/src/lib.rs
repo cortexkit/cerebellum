@@ -2247,6 +2247,15 @@ async fn run(
             config.connection_file_path.clone(),
             config.module_id.clone(),
         )));
+    planes.browser = Arc::new(
+        Arc::try_unwrap(planes.browser)
+            .ok()
+            .expect("startup owns the browser plane")
+            .with_login_material_source(Some(browser::fill::production_login_material_source(
+                config.connection_file_path.clone(),
+                config.module_id.clone(),
+            ))),
+    );
     prepare(&mut planes);
     // Test entry points never bind the operator's runtime socket. Failure to
     // bind the extension listener leaves the Chrome extension disconnected;
@@ -3362,8 +3371,7 @@ impl Planes {
                         journal_retention_bytes: BROWSER_DRIVE_JOURNAL_BYTES,
                         journal_max_entry_bytes: BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES,
                     },
-                )
-                .with_login_material_source(browser::fill::production_login_material_source()),
+                ),
             )
         } else {
             // The action surface is unavailable without browser configuration,

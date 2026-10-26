@@ -44,7 +44,8 @@ pub mod store;
 pub use cerebellum_core::journal::CallOriginRecord;
 use serde::{Deserialize, Serialize};
 
-/// The literal `format_version` carried by every journal entry.
+/// The default journal entry `format_version`. Public-web-baseline entries use
+/// v8 and fill entries use v9 instead.
 ///
 /// v7 added the optional `identity.origin` member: the caller behind a relayed
 /// call. Entries of v3 through v6 still decode as [`JournalEntry`].
@@ -52,9 +53,13 @@ pub const FORMAT_VERSION: &str = "ck-browser-journal/v7";
 pub const BASELINE_FORMAT_VERSION: &str = "ck-browser-journal/v8";
 pub const BASELINE_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
     cerebellum_core::format_floor::DurableFormat::new("browser-journal-entry", 8);
+/// Only fill entries use v9; ordinary writes keep their existing bytes and floor.
+pub const FILL_LOGIN_FORMAT_VERSION: &str = "ck-browser-journal/v9";
+pub const FILL_LOGIN_ENTRY_FORMAT: cerebellum_core::format_floor::DurableFormat =
+    cerebellum_core::format_floor::DurableFormat::new("browser-journal-entry", 9);
 
 /// The export `format_version` reported by the administration export surface.
-pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v7";
+pub const EXPORT_FORMAT_VERSION: &str = "ck-browser-journal-export/v9";
 
 /// The greatest sequence the allocator may hand out (`9007199254740991`).
 ///
@@ -176,6 +181,8 @@ pub enum Capability {
     // only who will hold the login, for which site, and how it ended.
     #[serde(rename = "browser.capture_login")]
     CaptureLogin,
+    #[serde(rename = "browser.fill_login")]
+    FillLogin,
 }
 
 impl Capability {
@@ -192,6 +199,7 @@ impl Capability {
             Self::Present => "browser.present",
             Self::ImportLogin => "browser.import_login",
             Self::CaptureLogin => "browser.capture_login",
+            Self::FillLogin => "browser.fill_login",
         }
     }
 
@@ -262,6 +270,26 @@ pub enum JournalPayload {
     Handoff(HandoffPayload),
     LoginImport(LoginImportPayload),
     LoginCapture(LoginCapturePayload),
+    LoginFill(LoginFillPayload),
+}
+
+/// The only facts retained about a fill. Field names are a closed enum so a
+/// caller cannot accidentally record a field's value in their place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginFillPayload {
+    pub outcome: String,
+    /// Absent if the page was refused before its field origin was established.
+    pub origin: Option<String>,
+    pub filled: Vec<LoginFillField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginFillField {
+    Username,
+    Password,
+    Otp,
 }
 
 /// The eight B1 capability names that may appear as a policy-event

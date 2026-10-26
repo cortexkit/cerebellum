@@ -396,9 +396,9 @@ pub trait RegistryStore: Send + Sync {
 /// The registry file's name under the module's journal directory.
 pub const CINGULATE_RAISED_FILE: &str = "cingulate_raised.json";
 
-/// The highest registry file version this build reads, and the one it
-/// writes.
-pub const CINGULATE_RAISED_VERSION: u64 = 2;
+/// The highest registry version this build reads. Writes use v3 only when a
+/// SecretUse card is present; ordinary v1/v2 saves remain byte-compatible.
+pub const CINGULATE_RAISED_VERSION: u64 = 3;
 
 /// The registry file's durable format (name and version). Every format this
 /// module writes is recorded in the operator's format-floor file before its
@@ -482,7 +482,9 @@ impl RegistryStore for FileRegistryStore {
         // rolling back to a build without it stays a plain binary swap. Once
         // the file is written, the floor must record its format, or the
         // install-time check could accept a build that cannot read it.
-        let version = if cards.iter().any(|card| !card.lifecycle.is_empty()) {
+        let version = if cards.iter().any(|card| card.kind == CardKind::SecretUse) {
+            3
+        } else if cards.iter().any(|card| !card.lifecycle.is_empty()) {
             2
         } else {
             1

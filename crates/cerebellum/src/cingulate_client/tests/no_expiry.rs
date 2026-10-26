@@ -654,3 +654,59 @@ fn registry_upgrade_is_lazy_and_an_interrupted_dispatch_becomes_unknown() {
         })
     );
 }
+
+#[test]
+fn secret_use_raises_the_registry_floor_only_on_its_first_save() {
+    use cerebellum_core::format_floor::read_floors;
+    let scratch = Scratch::new("secret-use-lazy");
+    let store = scratch.store();
+    assert!(store.load().unwrap().is_empty());
+    assert!(!scratch.floor().exists());
+    for expected in [1, 2] {
+        let mut ordinary = saved_card(CardKind::LoginImport);
+        if expected == 1 {
+            ordinary.lifecycle = CardLifecycle::default();
+        }
+        store.save(&[ordinary]).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&before).unwrap()["version"],
+            expected
+        );
+        assert_eq!(
+            read_floors(&scratch.floor())
+                .unwrap()
+                .get("cingulate-raised"),
+            Some(&expected)
+        );
+        let loaded = store.load().unwrap();
+        store.save(&loaded).unwrap();
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            before,
+            "ordinary save changed bytes"
+        );
+    }
+    let mut secret = saved_card(CardKind::SecretUse);
+    secret.lifecycle = CardLifecycle::default();
+    store.save(&[secret]).unwrap();
+    let saved = std::fs::read(store.path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&saved).unwrap()["version"],
+        3
+    );
+    assert_eq!(
+        read_floors(&scratch.floor())
+            .unwrap()
+            .get("cingulate-raised"),
+        Some(&3)
+    );
+    assert_eq!(store.load().unwrap()[0].kind, CardKind::SecretUse);
+    store.save(&[]).unwrap();
+    assert_eq!(
+        read_floors(&scratch.floor())
+            .unwrap()
+            .get("cingulate-raised"),
+        Some(&3)
+    );
+}

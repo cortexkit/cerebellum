@@ -1903,7 +1903,7 @@ async fn the_registry_file_is_versioned_and_survives_a_restart() {
 #[tokio::test]
 async fn an_unreadable_registry_is_refused_and_never_overwritten() {
     for (name, bytes) in [
-        ("newer", br#"{"version":3,"cards":[]}"#.to_vec()),
+        ("newer", br#"{"version":4,"cards":[]}"#.to_vec()),
         ("damaged", b"{not json".to_vec()),
         ("unversioned", b"[]".to_vec()),
     ] {
