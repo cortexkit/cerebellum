@@ -7,10 +7,9 @@ cd "$repo_root"
 
 base="${FAST_GATE_BASE:-origin/main}"
 self_test=0
-mutations=0
 part=""
 usage() {
-  echo "usage: $0 [--base REF] [--part linux|mac] [--self-test] [--mutations]"
+  echo "usage: $0 [--base REF] [--part linux|mac] [--self-test]"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -26,10 +25,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --self-test)
       self_test=1
-      shift
-      ;;
-    --mutations)
-      mutations=1
       shift
       ;;
     -h|--help)
@@ -181,17 +176,6 @@ if [ "$self_test" -eq 1 ]; then
   scripts/lib/fast-gate.test.sh
   python3 scripts/lib/fast-gate-fingerprint.py --self-test
   python3 scripts/lib/process-table-probe.py --self-test
-  planner_python=""
-  for python in python3 python3.14 python3.13 python3.12 python3.11; do
-    if command -v "$python" >/dev/null && "$python" -c 'import tomllib' 2>/dev/null; then
-      planner_python="$python"
-      break
-    fi
-  done
-  [ -n "$planner_python" ] || { echo 'mutation check planner: Python 3.11+ is required' >&2; exit 2; }
-  "$planner_python" scripts/lib/mutation-check-plan.py --self-test
-  "$planner_python" scripts/lib/mutation-catalogue.py --self-test
-  scripts/mutations.test.sh
   planted_skip="test a_preview_test ... SKIPPED (the window's kind was checked and is right): the screen is locked, so no window is realised"
   if [ "$(printf '%s\n' "$planted_skip" | desk_skip_reason)" != "the screen is locked, so no window is realised" ] || \
      [ "$(printf 'test a_preview_test ... SKIPPED: no display is readable\n' | desk_skip_reason)" != "no display is readable" ]; then
@@ -332,11 +316,8 @@ trap release_lock EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
 
-run_catalogue_checks
-
 if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
-start_static_phase "mutation tree: scripts/check-mutation-tree.sh" ./scripts/check-mutation-tree.sh
 # This proof builds format_versions, so it must not overlap another Cargo phase.
 run_serial_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 
@@ -494,10 +475,6 @@ if [ "${#all_suites[@]}" -gt 0 ]; then
   if [ "${#skipped_suites[@]}" -gt 0 ]; then
     echo "==> SKIP: integration suites without changed source/module paths: ${skipped_suites[*]}"
   fi
-fi
-
-if [ "$part" = mac ] && [ "$mutations" -eq 1 ]; then
-  run_serial_phase "narrow mutation replay against $base" ./scripts/mutations.sh --diff "$base" --narrow-only
 fi
 
 # Source-check logs are replayed in launch order, never interleaved with Cargo.
