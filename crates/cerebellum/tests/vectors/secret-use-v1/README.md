@@ -29,3 +29,15 @@ Its private-key fields are published test keys, not production credentials.
 `approval` statement. The consent-card golden contains the same body in pretty
 JSON. There are no filer-controlled display fields or expiry overrides; Cingulate
 0.12.0 supplies those from the statement after advertising `secret-use-approval/v1`.
+
+## Filer replies (Cingulate v1.1)
+
+The eight `filer-*.json` files are untouched samples from Cingulate tag
+`secret-use-approval-v1.1` at `133351a`. Each wraps the exact method, params,
+and handler reply envelope produced by Cingulate's stamped filer path. They
+were generated as `reserved:aft`; the dedicated contract also admits
+`reserved:cerebellum`. Their complete file bytes, including whitespace, are
+SHA-256 pinned individually in the decoder tests. The partial sample records
+one allowed item and the omitted envelope item's effective decline. Cerebellum
+still files exactly one item per fill call; the answer decoder selects that
+request's effective decision rather than treating a card-level Allow as a grant.

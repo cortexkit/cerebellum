@@ -68,6 +68,7 @@ pub enum Ending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretUseRefusal {
     MissingCapability,
+    InvalidRequest,
     RequestConflict,
     RequesterRefused,
 }
@@ -119,6 +120,9 @@ impl NoCard {
             Self::CallEnded => None,
             Self::SecretUseRefused(SecretUseRefusal::MissingCapability) => {
                 Some("secret_use_approval_unsupported")
+            }
+            Self::SecretUseRefused(SecretUseRefusal::InvalidRequest) => {
+                Some("elicitation_invalid_request")
             }
             Self::SecretUseRefused(SecretUseRefusal::RequestConflict) => {
                 Some("elicitation_request_conflict")
@@ -1089,6 +1093,11 @@ impl DeskSession<'_> {
             .call(wire::CONSENT_REQUEST, card.params.clone())
             .await
             .map_err(|error| match &error {
+                CallError::Refused(refusal)
+                    if secret_use && refusal.code == RefusalCode::InvalidRequest =>
+                {
+                    Ending::NoCard(NoCard::SecretUseRefused(SecretUseRefusal::InvalidRequest))
+                }
                 CallError::Refused(refusal)
                     if secret_use && refusal.code == RefusalCode::RequestConflict =>
                 {

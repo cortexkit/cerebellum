@@ -351,6 +351,9 @@ impl FillRefusal {
                 crate::cingulate_client::desk::SecretUseRefusal::MissingCapability => {
                     json!({"reason_code": "secret_use_approval_unsupported", "reason": "Cingulate does not advertise secret-use-approval/v1"})
                 }
+                crate::cingulate_client::desk::SecretUseRefusal::InvalidRequest => {
+                    json!({"reason_code": "elicitation_invalid_request"})
+                }
                 crate::cingulate_client::desk::SecretUseRefusal::RequestConflict => {
                     json!({"reason_code": "elicitation_request_conflict"})
                 }

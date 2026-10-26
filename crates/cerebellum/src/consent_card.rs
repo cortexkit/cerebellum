@@ -763,14 +763,14 @@ mod every_card_kind {
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
     use std::sync::Arc;
 
-    /// The key of the agent's tool call that raised a card. The pinned files
-    /// carry this one as their `requester_ref`.
+    /// The key of the agent's tool call that raised a generic card. Generic
+    /// pinned files carry this one as their `requester_ref`.
     const GOLDEN_CALL_KEY: &str = "pf:card-golden";
 
     /// The `consent.request` production sends to Cingulate for `body`, as
     /// raised by a tool call whose key is [`GOLDEN_CALL_KEY`]. Also checks
-    /// that a call without a key sends the same request minus
-    /// `requester_ref`.
+    /// that generic calls without a key omit `requester_ref`, while dedicated
+    /// SecretUse filings never carry one even when the call has a key.
     fn as_sent(kind: CardKind, body: Value, deadline: Duration) -> CardRequest {
         let unkeyed = consent_request(kind, &body, deadline, None, None, None)
             .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
@@ -780,7 +780,11 @@ mod every_card_kind {
         );
         let keyed = consent_request(kind, &body, deadline, Some(GOLDEN_CALL_KEY), None, None)
             .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"));
-        assert_eq!(keyed.params["requester_ref"], GOLDEN_CALL_KEY);
+        if kind == CardKind::SecretUse {
+            assert!(keyed.params.get("requester_ref").is_none());
+        } else {
+            assert_eq!(keyed.params["requester_ref"], GOLDEN_CALL_KEY);
+        }
         let mut stripped = keyed.params.clone();
         stripped.as_object_mut().unwrap().remove("requester_ref");
         assert_eq!(

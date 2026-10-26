@@ -225,7 +225,8 @@ pub struct Record {
 }
 
 impl Record {
-    /// A dedicated answer must name the one vault request this card filed.
+    /// Select the effective answer for one vault request, including a declined
+    /// item omitted from a batch's allow envelope.
     /// A generic Allow, a missing item, or a mismatched request_id never grants
     /// it. Allows also require a recognized duration and envelope-hash shape.
     pub fn secret_use_decision(&self, request_id: &str) -> Option<&'static str> {
@@ -245,12 +246,21 @@ impl Record {
         }
         let answer: Answer =
             serde_json::from_value(self.raw.get("secret_use_answer")?.clone()).ok()?;
-        let [item] = answer.items.as_slice() else {
-            return None;
-        };
-        if item.request_id != request_id || !matches!(item.decision.as_str(), "allow" | "decline") {
+        if answer.items.is_empty()
+            || answer.items.len() > 16
+            || answer.items.iter().enumerate().any(|(index, item)| {
+                !matches!(item.decision.as_str(), "allow" | "decline")
+                    || answer.items[..index]
+                        .iter()
+                        .any(|previous| previous.request_id == item.request_id)
+            })
+        {
             return None;
         }
+        let item = answer
+            .items
+            .iter()
+            .find(|item| item.request_id == request_id)?;
         match answer.decision.as_str() {
             "allow"
                 if matches!(
@@ -270,7 +280,7 @@ impl Record {
                 })
             }
             "decline"
-                if item.decision == "decline"
+                if answer.items.iter().all(|item| item.decision == "decline")
                     && answer.duration.is_none()
                     && answer.envelope_sha256.is_none() =>
             {

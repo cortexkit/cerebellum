@@ -1990,6 +1990,11 @@ async fn dedicated_approval_requires_the_capability_and_maps_filing_refusals() {
             "consent_unavailable",
         ),
         (
+            Some("elicitation_invalid_request"),
+            "elicitation_invalid_request",
+            "consent_unavailable",
+        ),
+        (
             Some("elicitation_requester_refused"),
             "elicitation_requester_refused",
             "consent_unavailable",
@@ -2053,6 +2058,30 @@ async fn a_generic_allow_never_retries_the_vault_or_fills_a_login() {
     assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
     assert_eq!(reply["detail"]["decision"], "no_answer", "{reply}");
     assert_eq!(fixture.vault.requests().len(), 1);
+    assert_eq!(fixture.page.insertions(), 0);
+}
+
+#[tokio::test]
+async fn a_dedicated_allow_cannot_fill_unless_the_vault_releases_material() {
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            needs_approval: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .carrier()
+        .queue(vault_approval_answer("req_vault_1", "allow"));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+    assert_eq!(reason_code(&reply), "login_unavailable", "{reply}");
+    assert_eq!(
+        fixture.vault.requests().len(),
+        2,
+        "allow only cues a vault retry"
+    );
     assert_eq!(fixture.page.insertions(), 0);
 }
 
