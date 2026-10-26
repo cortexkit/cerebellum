@@ -1,0 +1,24 @@
+{
+  "case": "success-unmarked",
+  "contract": "private-content-query-v1",
+  "principal": "reserved:broca",
+  "reply": {
+    "body_length": 38,
+    "body_utf8": "{\"private_content\":false,\"sources\":[]}",
+    "channel": 9,
+    "corr": 12,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "260000000201020900010000000c000000000000007b22707269766174655f636f6e74656e74223a66616c73652c22736f7572636573223a5b5d7d"
+  },
+  "request": {
+    "body_length": 74,
+    "body_utf8": "{\"method\":\"private_content.query\",\"params\":{\"scope_ref\":\"unmarked-scope\"}}",
+    "channel": 9,
+    "corr": 12,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "4a0000000200020900010000000c000000000000007b226d6574686f64223a22707269766174655f636f6e74656e742e7175657279222c22706172616d73223a7b2273636f70655f726566223a22756e6d61726b65642d73636f7065227d7d"
+  },
+  "state": "no scope read private content"
+}
