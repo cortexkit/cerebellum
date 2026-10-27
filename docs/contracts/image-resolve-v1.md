@@ -26,7 +26,7 @@ when the reply is built:
 The value is `ih` followed by 32 lowercase hex characters: 16 bytes from the
 operating system's random source
 (`crates/cerebellum/src/image_handles.rs`, `new_handle`). The field sits beside
-the reply's existing image fields. `image.id`/`image_id` and `snapshot_id` stay
+the reply's existing image fields. `image.image_id` and `snapshot_id` stay
 as they are: they are guessable or keep no bytes, so they never resolve.
 
 A handle is minted only when the capturing route carries a scope stamp. Its
