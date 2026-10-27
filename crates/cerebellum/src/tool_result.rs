@@ -787,6 +787,123 @@ mod tests {
             .contains("Input was dispatched to the person's browser."));
     }
 
+    /// A person-check reply names the signal that stopped it. The first case
+    /// is the shape a `type` returns when the epoch moves after its focus step.
+    #[test]
+    fn a_person_check_reply_names_the_signal_that_moved() {
+        const DISPATCHED_REMEDY: &str = "Input was dispatched and may have taken effect. Do not repeat this action; take a fresh read before deciding what to do next.";
+        let epoch = |cause: &str| json!({"check":"interaction_epoch","cause":cause});
+        for (outcome, dispatched, remedy, detail, expected) in [
+            (
+                "outcome_unknown",
+                true,
+                DISPATCHED_REMEDY,
+                epoch("input.keydown.main"),
+                vec![
+                    "Outcome unknown.",
+                    DISPATCHED_REMEDY,
+                    "Input was dispatched to the person's browser.",
+                    "Reason: state changed by person.",
+                    "Signal: input.keydown.main (a trusted keydown event in the main frame, outside the agent's own input).",
+                ],
+            ),
+            (
+                "refused",
+                false,
+                "read again",
+                epoch("input.pointerdown.subframe"),
+                vec![
+                    "Refused.",
+                    "Read again.",
+                    "Reason: state changed by person.",
+                    "Signal: input.pointerdown.subframe (a trusted pointerdown event in a child frame, outside the agent's own input).",
+                ],
+            ),
+            (
+                "refused",
+                false,
+                "read again",
+                epoch("navigation.main"),
+                vec![
+                    "Refused.",
+                    "Read again.",
+                    "Reason: state changed by person.",
+                    "Signal: navigation.main (a navigation of the main frame the agent did not start).",
+                ],
+            ),
+            (
+                "refused",
+                false,
+                "read again",
+                epoch("unrecognized"),
+                vec![
+                    "Refused.",
+                    "Read again.",
+                    "Reason: state changed by person.",
+                    "Signal: unrecognized (the extension sent a code outside the known vocabulary).",
+                ],
+            ),
+            (
+                "outcome_unknown",
+                true,
+                DISPATCHED_REMEDY,
+                epoch("unknown"),
+                vec![
+                    "Outcome unknown.",
+                    DISPATCHED_REMEDY,
+                    "Input was dispatched to the person's browser.",
+                    "Reason: state changed by person.",
+                    "Signal: unknown (the extension did not say what moved the interaction epoch).",
+                ],
+            ),
+            (
+                "outcome_unknown",
+                true,
+                DISPATCHED_REMEDY,
+                json!({"check":"committed_document","history_entry_changed":true,"history_index_changed":true,"history_length_changed":true,"url_changed":true,"loader_changed":false}),
+                vec![
+                    "Outcome unknown.",
+                    DISPATCHED_REMEDY,
+                    "Input was dispatched to the person's browser.",
+                    "Reason: state changed by person.",
+                    "Signal: committed_document (the tab's committed document changed: history entry, history position, history length, URL).",
+                ],
+            ),
+        ] {
+            let reply = json!({
+                "browser":"user","outcome":outcome,"reason":"state_changed_by_person",
+                "remedy":remedy,"input_dispatched":dispatched,"detail":detail
+            });
+            let result = decoded(reply.clone());
+            assert_eq!(texts(&result), [expected.join("\n")], "{reply}");
+            assert!(model_view_problems(&result).is_empty(), "{result}");
+        }
+    }
+
+    /// A navigation whose page read was stopped by a person check says so
+    /// beside its committed outcome, with the signal that stopped the read.
+    #[test]
+    fn a_refused_page_read_after_navigation_names_its_signal() {
+        let result = decoded(json!({
+            "browser":"user","outcome":"ok","tab":"tab-1",
+            "read_page":{
+                "browser":"user","outcome":"refused","reason":"state_changed_by_person",
+                "remedy":"read again","input_dispatched":false,
+                "detail":{"check":"interaction_epoch","cause":"input.wheel.main"}
+            }
+        }));
+        assert_eq!(
+            texts(&result),
+            [[
+                "The page read was not taken: state changed by person.",
+                "Read again.",
+                "Signal: input.wheel.main (a trusted wheel event in the main frame, outside the agent's own input).",
+                "tab: tab-1",
+            ]
+            .join("\n")]
+        );
+    }
+
     #[test]
     fn nested_user_navigate_read_is_visible_with_its_snapshot_handle() {
         let result = decoded(json!({

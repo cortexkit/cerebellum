@@ -273,12 +273,80 @@ fn image_caption(object: &Map<String, Value>) -> Option<String> {
     Some(caption)
 }
 
+/// What a person's-browser cause code means, in words. The code comes from the
+/// extension's closed vocabulary: `input.<event>.<main|subframe>` for a
+/// trusted page input event that fell outside the agent's own input windows,
+/// `navigation.<main|subframe>` for a navigation the agent did not start,
+/// `unrecognized` when the extension sent a code outside that vocabulary, and
+/// `unknown` when it sent none. `None` for any other text.
+fn cause_meaning(code: &str) -> Option<String> {
+    let frame = |kind: &str| match kind {
+        "main" => Some("the main frame"),
+        "subframe" => Some("a child frame"),
+        _ => None,
+    };
+    Some(match code.split('.').collect::<Vec<_>>().as_slice() {
+        ["input", event, kind] => format!(
+            "a trusted {event} event in {}, outside the agent's own input",
+            frame(kind)?
+        ),
+        ["navigation", kind] => {
+            format!("a navigation of {} the agent did not start", frame(kind)?)
+        }
+        ["unrecognized"] => "the extension sent a code outside the known vocabulary".into(),
+        ["unknown"] => "the extension did not say what moved the interaction epoch".into(),
+        _ => return None,
+    })
+}
+
+/// Which person check stopped a person's-browser action, from the `detail` of
+/// a `state_changed_by_person` reply: the extension's code for what last moved
+/// the tab's interaction epoch, or which parts of the tab's committed document
+/// changed. Without this line a model cannot tell a person's input from the
+/// page reacting to the agent's own input. `None` for any other detail.
+fn signal_line(detail: &Map<String, Value>) -> Option<String> {
+    match text(detail, "check")? {
+        "interaction_epoch" => {
+            let cause = text(detail, "cause").unwrap_or("unknown");
+            Some(match cause_meaning(cause) {
+                Some(meaning) => format!("Signal: {cause} ({meaning})."),
+                None => format!("Signal: {cause}."),
+            })
+        }
+        "committed_document" => {
+            let changed = [
+                ("history_entry_changed", "history entry"),
+                ("history_index_changed", "history position"),
+                ("history_length_changed", "history length"),
+                ("url_changed", "URL"),
+                ("loader_changed", "document loader"),
+            ]
+            .into_iter()
+            .filter(|(key, _)| detail.get(*key).and_then(Value::as_bool) == Some(true))
+            .map(|(_, part)| part)
+            .collect::<Vec<_>>();
+            Some(if changed.is_empty() {
+                "Signal: committed_document (the tab's committed document changed).".into()
+            } else {
+                format!(
+                    "Signal: committed_document (the tab's committed document changed: {}).",
+                    changed.join(", ")
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// What a refusal's `detail` adds that a model can act on. The rest of it
 /// (internal step names, node ids, classifier facts) is diagnostics for
 /// programs and stays structured.
 fn detail_lines(detail: &Map<String, Value>, remedy: Option<&str>, lines: &mut Vec<String>) {
     if let Some(reason) = text(detail, "reason") {
         lines.push(format!("Reason: {}.", words(reason)));
+    }
+    if let Some(signal) = signal_line(detail) {
+        lines.push(signal);
     }
     match (text(detail, "field"), text(detail, "reason_code")) {
         (Some(field), Some(code)) => lines.push(format!("Field {field}: {}.", words(code))),
@@ -355,6 +423,8 @@ fn detail_lines(detail: &Map<String, Value>, remedy: Option<&str>, lines: &mut V
         "grant_request",
         "dispatched",
         "held_state",
+        "check",
+        "cause",
     ];
     for (key, value) in detail {
         if said.contains(&key.as_str())
@@ -638,6 +708,27 @@ pub(super) fn facts(
         }
     }
     let read_page = object.get("read_page").and_then(Value::as_object);
+    // A navigation that committed reports a page read it could not take
+    // beside its own outcome, so say why the read is missing, what to do
+    // instead, and which person check stopped it, if one did.
+    if let Some(read) =
+        read_page.filter(|read| text(read, "outcome").is_some_and(|code| !super::is_success(code)))
+    {
+        let why = text(read, "reason")
+            .or_else(|| text(read, "outcome"))
+            .unwrap_or_default();
+        lines.push(format!("The page read was not taken: {}.", words(why)));
+        if let Some(remedy) = text(read, "remedy").filter(|remedy| !remedy.trim().is_empty()) {
+            lines.push(sentence(remedy));
+        }
+        if let Some(signal) = read
+            .get("detail")
+            .and_then(Value::as_object)
+            .and_then(signal_line)
+        {
+            lines.push(signal);
+        }
+    }
     let snapshot_id = text(object, "snapshot_id")
         .or_else(|| read_page.and_then(|read_page| text(read_page, "snapshot_id")));
     if let Some(snapshot) = snapshot_id {
