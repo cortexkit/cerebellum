@@ -3117,8 +3117,10 @@ mod settle_read_budget {
             Duration::from_millis(200),
             false,
             PersonWatch::NotWatched,
+            None,
         )
-        .expect("the changed application is observed");
+        .expect("the changed application is observed")
+        .read;
         assert_eq!(
             *app.timeouts.lock().unwrap(),
             [ReadBounds::default().timeout],
@@ -3148,6 +3150,7 @@ mod settle_read_budget {
             window,
             false,
             PersonWatch::Watched(&mut || false),
+            None,
         );
         assert!(observed.is_none(), "a partial read is not shown");
         let timeouts = app.timeouts.lock().unwrap().clone();
