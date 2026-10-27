@@ -1457,6 +1457,34 @@ where
             // tree is read shows up at the next action rather than passing
             // as something this read showed.
             let seen = SeenMarks::read(source.as_ref(), &read_grant);
+            // A window that shows only its own buttons is usually a WebKit
+            // page still being built: wait once and read that window again.
+            // The wait is skipped when it would run past the call's work
+            // deadline; the re-reads together are held to the tree read's
+            // allowance and to that deadline. Runs on the tree as read: the
+            // full tree for a full read, the zoomed subtree for a zoomed
+            // read, in both cases before any filter narrows what is shown,
+            // so a narrowed read gets the same recovery as a full one.
+            let reread_shell = |raw: &mut RawAppState| {
+                raw.reread_shell_windows(
+                    source.as_ref(),
+                    &read_grant,
+                    RereadTiming {
+                        phase: std::time::Duration::from_millis(crate::budgets::AX_TREE_PHASE_MS),
+                        now: &std::time::Instant::now,
+                        call_end: read_work.deadline(),
+                    },
+                    |delay| {
+                        if read_work.stopped()
+                            || std::time::Instant::now() + delay >= read_work.deadline()
+                        {
+                            return false;
+                        }
+                        std::thread::sleep(delay);
+                        !read_work.stopped()
+                    },
+                );
+            };
             let raw = if let Some((_, element)) = read_zoom_element {
                 match source.element_facts(&element) {
                     Ok(facts) if facts.pid.is_none_or(|pid| pid == read_grant.pid) => source
@@ -1466,6 +1494,13 @@ where
                             ReadBounds::default(),
                             expand_menus,
                         )
+                        .map(|mut zoomed| {
+                            // A zoom into a window whose page is still building
+                            // re-reads like a full read; any other zoomed
+                            // subtree is no shell window, so this is free.
+                            reread_shell(&mut zoomed);
+                            zoomed
+                        })
                         .map_err(|error| match error {
                             ElementReadError::Gone => StateReadFailure::ZoomGone,
                             ElementReadError::Unreadable => StateReadFailure::ZoomUnreadable,
@@ -1480,31 +1515,7 @@ where
                     source.read_app_state(&read_grant, ReadBounds::default())
                 };
                 raw.map(|mut raw| {
-                    // A window that shows only its own buttons is usually a
-                    // WebKit page still being built: wait once and read that
-                    // window again. The wait is skipped when it would run past
-                    // the call's work deadline; the re-reads together are held
-                    // to the tree read's allowance and to that deadline.
-                    raw.reread_shell_windows(
-                        source.as_ref(),
-                        &read_grant,
-                        RereadTiming {
-                            phase: std::time::Duration::from_millis(
-                                crate::budgets::AX_TREE_PHASE_MS,
-                            ),
-                            now: &std::time::Instant::now,
-                            call_end: read_work.deadline(),
-                        },
-                        |delay| {
-                            if read_work.stopped()
-                                || std::time::Instant::now() + delay >= read_work.deadline()
-                            {
-                                return false;
-                            }
-                            std::thread::sleep(delay);
-                            !read_work.stopped()
-                        },
-                    );
+                    reread_shell(&mut raw);
                     raw
                 })
                 .map_err(StateReadFailure::Application)
@@ -1691,6 +1702,19 @@ where
         }
         if unpopulated > 0 {
             rendered.text.push_str("Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n");
+        }
+        // A filtered read that matched nothing on an incomplete read says
+        // so: matching content may sit behind the part that could not be
+        // read, so the empty result must not certify that nothing matches.
+        // Appended after the render, like the note above, so no filter can
+        // remove either line.
+        if !rendered.filter_matched
+            && (!parsed.role_filter.is_empty() || parsed.text_filter.is_some())
+            && !observed.complete
+        {
+            rendered
+                .text
+                .push_str("no matches; the page content isn't readable yet.\n");
         }
         if !rendered.zoom_found {
             if !observed.complete && matches!(zoom, Some(Zoom::Element(_))) {
