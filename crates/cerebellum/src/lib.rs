@@ -10750,6 +10750,7 @@ mod tests {
 
         let planes = Planes {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            image_handles: Arc::new(image_handles::ImageHandles::default()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
@@ -12746,6 +12747,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
         let planes = Planes {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            image_handles: Arc::new(image_handles::ImageHandles::default()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
@@ -12841,6 +12843,7 @@ mod tests {
     ) -> Planes {
         let planes = Planes {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
+            image_handles: Arc::new(image_handles::ImageHandles::default()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),

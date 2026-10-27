@@ -280,3 +280,6 @@ impl ImageHandles {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
+
+#[cfg(test)]
+mod tests;
