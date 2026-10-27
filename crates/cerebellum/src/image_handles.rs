@@ -200,8 +200,11 @@ fn reply_image(reply: &Value) -> Option<Image<'_>> {
 }
 
 /// The in-memory handle store. One per module process.
+///
+/// Public because the wire fixtures under `tests/` capture real frames and
+/// need to see what the store holds; nothing outside this module builds one.
 #[derive(Default)]
-pub(crate) struct ImageHandles {
+pub struct ImageHandles {
     state: Mutex<Handles>,
 }
 
@@ -230,6 +233,8 @@ impl ImageHandles {
             expires_ms: capture.now_ms.saturating_add(LIFETIME.as_millis() as u64),
         };
         self.lock().insert(handle.clone(), entry);
+        // A codemode run's result carries no image bytes, so its screenshot
+        // handle is the only copy of them; any other reply still has its own.
         Some(handle)
     }
 
@@ -237,7 +242,7 @@ impl ImageHandles {
     /// private_content computes, or `None` for a handle that is unknown,
     /// expired or belongs to another scope. The three are one answer on
     /// purpose: telling them apart would say whether a handle exists.
-    pub(crate) fn resolve(&self, handle: &str, scopes: &[&str], now_ms: u64) -> Option<Value> {
+    pub fn resolve(&self, handle: &str, scopes: &[&str], now_ms: u64) -> Option<Value> {
         if !is_handle(handle) {
             return None;
         }
@@ -269,8 +274,8 @@ impl ImageHandles {
         self.lock().end_conversation(conversation);
     }
 
-    #[cfg(test)]
-    pub(crate) fn held(&self) -> usize {
+    /// How many handles the store holds.
+    pub fn held(&self) -> usize {
         self.lock().entries.len()
     }
 

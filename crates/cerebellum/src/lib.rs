@@ -6160,6 +6160,12 @@ async fn send_session_caller_not_admitted(
     send(writer, frame).await
 }
 
+/// The wall clock the handle fixtures read, so their clock matches the one
+/// minting used.
+pub fn wall_clock_ms_for_test() -> u64 {
+    wall_clock_ms()
+}
+
 fn wall_clock_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6173,6 +6179,15 @@ fn wall_clock_ms() -> u64 {
 /// A route without a scope stamp gets no handle, and the field is omitted: the
 /// resolver authorizes by scope, so nothing could ever fetch those bytes. A
 /// reply whose image is missing or unreadable is left as it is.
+impl Planes {
+    /// The screenshot handle store. Public so the wire fixtures can mint a
+    /// handle without a screen capture; production reaches it through
+    /// `mint_image_handle`.
+    pub fn image_handle_store(&self) -> &image_handles::ImageHandles {
+        &self.image_handles
+    }
+}
+
 fn mint_image_handle(
     planes: &Planes,
     facts: &AcceptedBindFacts,
@@ -6189,6 +6204,25 @@ fn mint_image_handle(
     if let Some(handle) = planes.image_handles.mint(reply, &capture) {
         reply["image_handle"] = json!(handle);
     }
+}
+
+/// `mint_image_handle` with an explicit capture scope, for the wire fixtures:
+/// they mint a handle for a scope they choose instead of a bound route.
+pub fn mint_image_handle_for_test(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    scope_ref: &str,
+    mut reply: Value,
+) -> Value {
+    let capture = image_handles::Capture {
+        scope_ref: scope_ref.to_owned(),
+        conversation_key: facts.identity.conversation_key.clone(),
+        now_ms: wall_clock_ms(),
+    };
+    if let Some(handle) = planes.image_handles.mint(&reply, &capture) {
+        reply["image_handle"] = json!(handle);
+    }
+    reply
 }
 
 /// `image.resolve`: the bytes a screenshot handle stands for.

@@ -35,6 +35,7 @@ mod no_runtime_output;
 mod once_dispatch_token_site;
 mod one_launch_nonce_reader;
 mod one_lease_clock;
+mod image_resolve_v1;
 mod private_content_query_v1;
 mod private_data_write_scan;
 mod profile_root_rebind;

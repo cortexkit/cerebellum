@@ -463,6 +463,34 @@ mod tests {
         assert_eq!(result["structuredContent"], reply);
     }
 
+    /// A screenshot handle names the very bytes a codemode result must leave
+    /// out, so it has to survive both result formats: the tool-result/v1
+    /// structured content, and the plain reply the codemode path sends.
+    #[tokio::test]
+    async fn a_screenshot_handle_survives_a_codemode_result() {
+        let mut reply = read_state_reply();
+        reply["image_handle"] = json!("ih0123456789abcdef0123456789abcdef");
+        let handle = reply["image_handle"].clone();
+        let decoded = crate::codemode::CALL_DETAIL
+            .scope(
+                std::cell::RefCell::new(Some(json!({"action": "read_state"}))),
+                async move { decoded(reply) },
+            )
+            .await;
+        assert!(
+            decoded["structuredContent"]["image"].get("data_b64").is_none(),
+            "{decoded}"
+        );
+        assert_eq!(
+            decoded["structuredContent"]["image_handle"], handle,
+            "a program reaches its screenshot only through this handle"
+        );
+        assert_eq!(
+            decoded["structuredContent"]["image"]["delivery_reason"],
+            "codemode"
+        );
+    }
+
     #[test]
     fn refusal_has_error_code_and_verbatim_remedy() {
         let result = decoded(

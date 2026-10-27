@@ -1,0 +1,25 @@
+{
+  "case": "success",
+  "contract": "image-resolve-v1",
+  "handle": "ih0123456789abcdef0123456789abcdef",
+  "principal": "reserved:broca",
+  "reply": {
+    "body_length": 131,
+    "body_utf8": "{\"bytes\":\"iVBORw0KGgoAAAANSUhEUg==\",\"mime\":\"image/png\",\"sha256\":\"02a3e298f1533f62558c58e4c70edcab9af5a50d62d925fd5390942020fb0fb8\"}",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "type": "Response",
+    "wire_hex": "830000000201020900010000000b000000000000007b226279746573223a226956424f5277304b47676f414141414e5355684555673d3d222c226d696d65223a22696d6167652f706e67222c22736861323536223a2230326133653239386631353333663632353538633538653463373065646361623961663561353064363264393235666435333930393432303230666230666238227d"
+  },
+  "request": {
+    "body_length": 109,
+    "body_utf8": "{\"method\":\"image.resolve\",\"params\":{\"handle\":\"ih0123456789abcdef0123456789abcdef\",\"scope_ref\":\"vector-head\"}}",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "6d0000000200020900010000000b000000000000007b226d6574686f64223a22696d6167652e7265736f6c7665222c22706172616d73223a7b2268616e646c65223a2269683031323334353637383961626364656630313233343536373839616263646566222c2273636f70655f726566223a22766563746f722d68656164227d7d"
+  },
+  "state": "a screenshot handle resolves to exactly the bytes the reply carried"
+}
