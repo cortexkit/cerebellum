@@ -2086,3 +2086,81 @@ async fn a_loading_tauri_window_read_again_shows_its_page() {
     assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
     assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
 }
+
+/// A filtered read that leaves matches out for the outline budget still
+/// prints the loading note: the note is appended after the render, no filter
+/// removes it, and the capped render leaves room for it below the reply
+/// bound.
+#[tokio::test]
+async fn a_filtered_read_over_budget_still_prints_the_loading_note_within_budget() {
+    let buttons: Vec<RawElement> = (0..200)
+        .map(|index| {
+            RawElement::fixture(10_000 + index, "AXButton").titled(&format!(
+                "Oct 27 15:10 · STABLE · Prompt: 22,674 / 1,048,576 (2.2% of window) · Cached event {index:03} with extra text to pass two hundred characters {extra}",
+                extra = "x".repeat(60)
+            ))
+        })
+        .collect();
+    let big = RawElement::fixture(100, "AXWindow")
+        .titled("Big")
+        .with_children(vec![
+            RawElement::fixture(101, "AXGroup").with_children(buttons)
+        ]);
+    let source = FixtureSource::new(vec![big, loading_tauri_window()]);
+    let management = granted_management().await;
+    let plane = plane(source);
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXButton"]}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    let tree = reply["state_text"].as_str().unwrap();
+    let count_line = tree
+        .lines()
+        .find(|line| line.contains("not shown; add text_filter"))
+        .unwrap_or_else(|| panic!("no count line in\n{tree}"))
+        .to_string();
+    let omitted: usize = count_line
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .expect("the count line names a number");
+    assert_eq!(
+        count_line,
+        format!(
+            "{omitted} more buttons not shown; add text_filter, or zoom into a container without a filter to see them all."
+        )
+    );
+    // Two hundred long buttons plus the shell window's three controls.
+    let shown = tree
+        .lines()
+        .filter(|line| line.contains(" button") && !line.contains("not shown"))
+        .count();
+    assert_eq!(
+        shown + omitted,
+        203,
+        "{shown} shown, {omitted} omitted:\n{tree}"
+    );
+    assert!(
+        tree.contains(INCOMPLETE_NOTE),
+        "the loading note was lost over budget:\n{tree}"
+    );
+    assert!(tree.ends_with(INCOMPLETE_LINE), "{tree}");
+    assert!(
+        tree.len() <= cerebellum_computer::app_state::render::MAX_STATE_TEXT_BYTES,
+        "{} bytes",
+        tree.len()
+    );
+    assert_eq!(
+        reply["truncation"]["omitted_elements"].as_u64(),
+        Some(omitted as u64),
+        "{reply}"
+    );
+    assert!(plane.result_schema_findings().is_empty());
+}

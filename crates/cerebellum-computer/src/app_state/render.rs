@@ -1438,12 +1438,75 @@ pub fn single_filter_match<'a>(
     (count == 1).then_some(candidate).flatten()
 }
 
+/// What a filtered read calls the matches it leaves out: the role's plural
+/// when exactly one role is asked for (`buttons`), otherwise `matches`.
+/// A text-only search has no role to name, and several roles share none.
+fn filter_noun(roles: &[String]) -> String {
+    if let [only] = roles {
+        let mut wanted = only.trim().to_string();
+        if wanted.len() > 2 && wanted[..2].eq_ignore_ascii_case("ax") {
+            wanted = wanted[2..].to_string();
+        }
+        let wanted = wanted.trim();
+        if !wanted.is_empty() {
+            let mut words = String::new();
+            let mut previous_lower = false;
+            for character in wanted.chars() {
+                if character.is_whitespace() {
+                    if !words.is_empty() && !words.ends_with(' ') {
+                        words.push(' ');
+                    }
+                    previous_lower = false;
+                    continue;
+                }
+                if !character.is_ascii_alphanumeric() {
+                    continue;
+                }
+                if character.is_ascii_uppercase() && previous_lower {
+                    words.push(' ');
+                }
+                previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
+                words.push(character.to_ascii_lowercase());
+            }
+            let words = words.trim().to_string();
+            if !words.is_empty() {
+                return plural(&words);
+            }
+        }
+    }
+    "matches".to_string()
+}
+
 fn count_unnumbered(node: &ObservedNode) -> usize {
     if node.hazard {
         return 0;
     }
     usize::from(node.element_id.is_none())
         + node.children.iter().map(count_unnumbered).sum::<usize>()
+}
+
+/// Unnumbered elements a filtered read could not show because the session map
+/// was full, counting only what the filter asks for. A window filter lists
+/// windows, so file rows that went unnumbered are not "left out" matches;
+/// only unnumbered windows are. Hazard items are never shown, so they are
+/// never counted here either, matching [`count_unnumbered`].
+fn count_matching_unnumbered(node: &ObservedNode, request: &StateRequest<'_>) -> usize {
+    if node.hazard {
+        return 0;
+    }
+    let mut count = 0;
+    if node.element_id.is_none()
+        && role_matches(&node.description, request.roles)
+        && text_matches(&node.description, request.text)
+    {
+        count += 1;
+    }
+    count
+        + node
+            .children
+            .iter()
+            .map(|child| count_matching_unnumbered(child, request))
+            .sum::<usize>()
 }
 
 fn find_node<'a>(nodes: &'a [ObservedNode], id: &str) -> Option<&'a ObservedNode> {
@@ -1533,8 +1596,46 @@ pub fn render_state_bounded(
             collect_matches(view, 0, request, &mut found);
         }
         filter_matched = !found.is_empty();
+        // A filtered read shares the outline's byte budget, so a dashboard
+        // of hundreds of matching buttons stops after a few kilobytes
+        // instead of filling the whole reply. Ancestor lines place each
+        // shown match and count against the same budget, and what is left
+        // out is a count of matches, not lines. Capping here leaves tens of
+        // kilobytes below the reply bound for the disclosure below and for
+        // the loading note the serve layer appends after the render.
+        let total_matches = found
+            .iter()
+            .filter(|(_, view)| {
+                role_matches(&view.node.description, request.roles)
+                    && text_matches(&view.node.description, request.text)
+            })
+            .count();
+        let mut shown_matches = 0usize;
+        let mut omitted_matches = 0usize;
+        let noun = filter_noun(request.roles);
         for (depth, view) in found {
+            let is_match = role_matches(&view.node.description, request.roles)
+                && text_matches(&view.node.description, request.text);
+            let (line_text, _) = view.line();
+            let mut line_len = line_text.len();
+            if is_closed_menu(view.node) && view.children.is_empty() {
+                line_len += format!("  [{} children; closed]", view.node.menu_child_count).len();
+            }
+            let cost = 2 * depth + line_len + 1;
+            if out.over_outline_budget(cost) || out.text.len() + cost > out.limit {
+                omitted_matches = total_matches - shown_matches;
+                break;
+            }
             out.element(depth, view);
+            if is_match {
+                shown_matches += 1;
+            }
+        }
+        if omitted_matches > 0 {
+            out.omitted = omitted_matches;
+            out.text.push_str(&format!(
+                "{omitted_matches} more {noun} not shown; add text_filter, or zoom into a container without a filter to see them all.\n"
+            ));
         }
     } else if let Some(zoom) = request.zoom {
         let expand = match zoom {
@@ -1596,14 +1697,25 @@ pub fn render_state_bounded(
         }
     }
 
-    if out.omitted > 0 && (request.narrows() || request.zoom.is_some()) {
+    // A pure zoom keeps the full reply bound: zooming is how a caller reads
+    // everything inside one container, so it is not held to the outline's
+    // smaller budget. A zoom that also filters is a filtered read above and
+    // already disclosed its count there.
+    if out.omitted > 0 && request.zoom.is_some() && !request.narrows() {
         out.text.push_str(&format!(
             "… {} elements cut; narrow the zoom or filters\n",
             out.omitted
         ));
     }
 
-    let unnumbered: usize = roots.iter().map(count_unnumbered).sum();
+    let unnumbered: usize = if request.narrows() {
+        roots
+            .iter()
+            .map(|root| count_matching_unnumbered(root, request))
+            .sum()
+    } else {
+        roots.iter().map(count_unnumbered).sum()
+    };
     let omitted = out.omitted + unnumbered;
     let truncation = if omitted > 0 {
         Some(Truncation {

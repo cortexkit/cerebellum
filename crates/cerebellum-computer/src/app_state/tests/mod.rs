@@ -6,7 +6,8 @@ use super::image::{
 };
 use super::render::{
     is_session_ending_title, one_line, render_state, single_filter_match, ObservedNode,
-    StateHeader, StateRequest, TruncationReason, Zoom, MAX_LABEL_CHARS, MAX_STATE_TEXT_BYTES,
+    StateHeader, StateRequest, TruncationReason, Zoom, MAX_LABEL_CHARS, MAX_OUTLINE_BYTES,
+    MAX_STATE_TEXT_BYTES,
 };
 use super::session::{AppStateSessions, ElementResolution, StateDiff, MAX_SESSION_ELEMENTS};
 use super::source::{ElementValue, FixtureElementToken, RawAppState, RawElement};
@@ -651,6 +652,196 @@ fn elements_past_the_map_cap_are_omitted_and_counted() {
     // more were dropped for the byte bound.
     assert!(truncation.omitted_elements >= 11, "{truncation:?}");
     assert!(rendered.text.len() <= MAX_STATE_TEXT_BYTES);
+}
+
+/// A filtered read of two hundred long-labelled buttons stops at the
+/// outline's byte budget instead of printing every match: the reply stays
+/// far below the reply bound and its last line names exactly how many
+/// matches were left out.
+#[test]
+fn a_filtered_read_with_two_hundred_long_labels_stops_at_the_outline_budget() {
+    let sessions = AppStateSessions::with_run_tag("kq");
+    let buttons: Vec<RawElement> = (0..200)
+        .map(|index| {
+            RawElement::fixture(1_000 + index, "AXButton").titled(&format!(
+                "Oct 27 15:10 · STABLE · Prompt: 22,674 / 1,048,576 (2.2% of window) · Cached event {index:03} with extra text to pass two hundred characters for truncation testing {extra}",
+                extra = "x".repeat(60)
+            ))
+        })
+        .collect();
+    let observed = read(
+        &sessions,
+        &state(vec![RawElement::fixture(1, "AXWindow")
+            .titled("Dashboard")
+            .with_children(vec![
+                RawElement::fixture(2, "AXGroup").with_children(buttons)
+            ])]),
+    );
+    let roles = vec!["AXButton".to_string()];
+    let rendered = render_state(
+        &HEADER,
+        &observed.roots,
+        &StateRequest {
+            roles: &roles,
+            ..Default::default()
+        },
+    );
+    // Far below the reply bound: the outline's few kilobytes, not the tens
+    // of kilobytes two hundred long labels would take in full.
+    assert!(
+        rendered.text.len() <= MAX_STATE_TEXT_BYTES,
+        "{} bytes",
+        rendered.text.len()
+    );
+    assert!(
+        rendered.text.len() < MAX_OUTLINE_BYTES + 1024,
+        "{} bytes, the outline budget was not applied",
+        rendered.text.len()
+    );
+    let shown = rendered
+        .text
+        .lines()
+        .filter(|line| line.contains(" button Oct"))
+        .count();
+    assert!(shown > 0 && shown < 200, "{shown} of 200 shown");
+    let truncation = rendered.truncation.expect("the cap is disclosed");
+    assert_eq!(truncation.reason, TruncationReason::ElementCapReached);
+    assert_eq!(
+        shown + truncation.omitted_elements,
+        200,
+        "the disclosure names exactly what was left out"
+    );
+    let last = rendered.text.lines().last().expect("a count line");
+    assert_eq!(
+        last,
+        &format!(
+            "{} more buttons not shown; add text_filter, or zoom into a container without a filter to see them all.",
+            truncation.omitted_elements
+        )
+    );
+    // Long labels are still shortened where they are shown.
+    assert!(
+        rendered.text.contains('…'),
+        "labels were not shortened:\n{}",
+        rendered.text
+    );
+}
+
+/// A small filtered read prints exactly what it always did: one line per
+/// match under its labelled ancestors, with no count line.
+#[test]
+fn a_small_filtered_read_prints_exactly_as_before() {
+    let sessions = AppStateSessions::new();
+    let observed = read(&sessions, &state(vec![window()]));
+    let roles = vec!["button".to_string(), "AXCheckBox".to_string()];
+    let by_role = rendered(
+        &observed,
+        &StateRequest {
+            roles: &roles,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        by_role,
+        format!(
+            "{} window Discord\n  {} button Send\n  {} check box Mute\n",
+            id_of(&observed, "Discord"),
+            id_of(&observed, "Send"),
+            id_of(&observed, "Mute")
+        )
+    );
+    let full = render_state(
+        &HEADER,
+        &observed.roots,
+        &StateRequest {
+            roles: &roles,
+            ..Default::default()
+        },
+    );
+    assert_eq!(full.truncation, None);
+    assert!(!full.text.contains("not shown"));
+}
+
+/// A window filter lists every window even when each window holds a large
+/// subtree: the hundreds of file rows beneath the windows are not matches,
+/// so they spend none of the filtered budget and are not counted as left
+/// out. Unnumbered file rows (the session map filled elsewhere) are not
+/// counted either; only unnumbered windows would be.
+#[test]
+fn a_window_filter_lists_every_window_despite_large_subtrees() {
+    let sessions = AppStateSessions::with_run_tag("kq");
+    let large_window = |token: u64, title: &str| {
+        let buttons: Vec<RawElement> = (0..200)
+            .map(|index| {
+                RawElement::fixture(token * 1_000 + index, "AXButton").titled(&format!(
+                    "Oct 27 file {index:03} with a long accessible name to make the subtree large {extra}",
+                    extra = "y".repeat(120)
+                ))
+            })
+            .collect();
+        RawElement::fixture(token, "AXWindow")
+            .titled(title)
+            .with_children(vec![
+                RawElement::fixture(token + 500, "AXGroup").with_children(buttons)
+            ])
+    };
+    let observed = read(
+        &sessions,
+        &state(vec![
+            large_window(10, "Recents"),
+            large_window(20, "Downloads"),
+        ]),
+    );
+    let roles = vec!["AXWindow".to_string()];
+    let request = StateRequest {
+        roles: &roles,
+        ..Default::default()
+    };
+    let rendered = render_state(&HEADER, &observed.roots, &request);
+    assert!(
+        rendered.text.contains("window Recents"),
+        "front window missing:\n{}",
+        rendered.text
+    );
+    assert!(
+        rendered.text.contains("window Downloads"),
+        "behind window missing:\n{}",
+        rendered.text
+    );
+    assert_eq!(rendered.truncation, None, "non-matching rows were counted");
+    assert!(!rendered.text.contains("not shown"));
+
+    // The session map filled elsewhere, so every file row went unnumbered
+    // while both windows kept their ids. The filter still lists both windows
+    // with no truncation: unnumbered non-matching rows are not left-out
+    // matches.
+    let mut roots = observed.roots.clone();
+    fn unnumber_buttons(nodes: &mut [ObservedNode]) {
+        for node in nodes {
+            if node.description.role.as_deref() == Some("AXButton") {
+                node.element_id = None;
+            }
+            unnumber_buttons(&mut node.children);
+        }
+    }
+    unnumber_buttons(&mut roots);
+    let rerendered = render_state(&HEADER, &roots, &request);
+    assert!(
+        rerendered.text.contains("window Recents"),
+        "front window missing after unnumbering:\n{}",
+        rerendered.text
+    );
+    assert!(
+        rerendered.text.contains("window Downloads"),
+        "behind window missing after unnumbering:\n{}",
+        rerendered.text
+    );
+    assert_eq!(
+        rerendered.truncation, None,
+        "unnumbered non-matching rows were counted: {:?}",
+        rerendered.truncation
+    );
+    assert!(!rerendered.text.contains("not shown"));
 }
 
 // ---------------------------------------------------------------------------
