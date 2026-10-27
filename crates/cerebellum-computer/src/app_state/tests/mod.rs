@@ -1162,6 +1162,142 @@ fn a_window_with_only_its_controls_and_title_is_an_empty_shell() {
     ));
 }
 
+/// The Magic Context dashboard's first two reads after a restart, a Tauri
+/// (WebKit) window whose page was not exposed yet, exactly as they printed:
+/// the window's own buttons and the menu bars, nothing else. The ids skip 2,
+/// 5 and 7 because three elements of the window were read but not printed.
+const LOADING_TAURI_FULL_READ: &str = "\
+Magic Context Dashboard · window \"Magic Context\"
+km1 window (main, focused) Magic Context
+  km3 close button
+  km4 full screen button
+  km6 minimize button
+km8 menu bar
+  km9 menu bar item Apple  [21 children; closed]
+  km11 menu bar item Magic Context Dashboard  [9 children; closed]
+  km13 menu bar item Edit  [11 children; closed]
+km15 menu bar
+  km16 menu bar item  [4 children; closed]
+";
+
+/// The same window read with `role_filter: ["AXButton"]`.
+const LOADING_TAURI_BUTTON_READ: &str = "\
+Magic Context Dashboard · window \"Magic Context\"
+km1 window (main, focused) Magic Context
+  km3 close button
+  km4 full screen button
+  km6 minimize button
+";
+
+/// Window trees that print exactly as [`LOADING_TAURI_FULL_READ`]: the
+/// renderer prints no unnamed empty container, no unnamed container that
+/// only wraps others, and no text repeating the window's title, so each of
+/// these is what the window could have held. The window's buttons sit
+/// inside an unnamed group beside an empty one; the window holds unknown and
+/// generic elements and a title text named by its description; or the
+/// full-screen button holds an empty group. Each is followed by the
+/// application's two menu bars.
+fn loading_tauri_reads() -> Vec<(&'static str, Vec<RawElement>)> {
+    let shape = |name: &'static str, children: Vec<RawElement>| {
+        let mut window = RawElement::fixture(1, "AXWindow")
+            .titled("Magic Context")
+            .with_subrole("AXStandardWindow")
+            .with_children(children);
+        window.main_window = true;
+        window.focused_window = true;
+        let closed = |token: u64, title: &str, items: usize| {
+            let mut menu = RawElement::fixture(token + 1, "AXMenu");
+            menu.closed_menu_children = items;
+            RawElement::fixture(token, "AXMenuBarItem")
+                .titled(title)
+                .with_children(vec![menu])
+        };
+        let menu_bar = RawElement::fixture(20, "AXMenuBar").with_children(vec![
+            closed(21, "Apple", 21),
+            closed(23, "Magic Context Dashboard", 9),
+            closed(25, "Edit", 11),
+        ]);
+        let extras = RawElement::fixture(27, "AXMenuBar").with_children(vec![closed(28, "", 4)]);
+        (name, vec![window, menu_bar, extras])
+    };
+    let mut described_title = RawElement::fixture(7, "AXStaticText");
+    described_title.description = Some("Magic Context".into());
+    vec![
+        shape(
+            "buttons inside an unnamed group",
+            vec![RawElement::fixture(2, "AXGroup").with_children(vec![
+                window_control(3, "AXCloseButton"),
+                window_control(4, "AXFullScreenButton"),
+                RawElement::fixture(5, "AXGroup"),
+                window_control(6, "AXMinimizeButton"),
+                window_title(7, "Magic Context"),
+            ])],
+        ),
+        shape(
+            "unknown and generic elements beside the buttons",
+            vec![
+                RawElement::fixture(2, "AXUnknown"),
+                window_control(3, "AXCloseButton"),
+                window_control(4, "AXFullScreenButton"),
+                RawElement::fixture(5, "AXGenericElement"),
+                window_control(6, "AXMinimizeButton"),
+                described_title,
+            ],
+        ),
+        shape(
+            "a button holding an empty group",
+            vec![
+                RawElement::fixture(2, "AXGroup"),
+                window_control(3, "AXCloseButton"),
+                window_control(4, "AXFullScreenButton")
+                    .with_children(vec![RawElement::fixture(5, "AXGroup")]),
+                window_control(6, "AXMinimizeButton"),
+                window_title(7, "Magic Context"),
+            ],
+        ),
+    ]
+}
+
+/// A window whose read prints nothing but its own buttons is an empty shell,
+/// whatever unprinted elements hold or sit beside those buttons and whatever
+/// the application's menu bars hold: the shell check and the renderer agree
+/// on what is page content. Each fixture first proves it prints exactly what
+/// the live read printed.
+#[test]
+fn a_window_printing_only_its_buttons_is_an_empty_shell_whatever_it_holds_unprinted() {
+    use super::source::is_empty_shell_window;
+    let header = StateHeader {
+        app_name: "Magic Context Dashboard",
+        focused_element_id: None,
+    };
+    let buttons = ["AXButton".to_string()];
+    for (name, roots) in loading_tauri_reads() {
+        let mut raw = state(roots);
+        let read = AppStateSessions::with_run_tag("km").observe(CONVERSATION, &grant(), &raw);
+        assert_eq!(
+            render_state(&header, &read.roots, &StateRequest::default()).text,
+            LOADING_TAURI_FULL_READ,
+            "{name}"
+        );
+        assert_eq!(
+            render_state(
+                &header,
+                &read.roots,
+                &StateRequest {
+                    roles: &buttons,
+                    ..Default::default()
+                },
+            )
+            .text,
+            LOADING_TAURI_BUTTON_READ,
+            "{name}"
+        );
+        assert!(is_empty_shell_window(&raw.roots[0]), "{name}");
+        assert_eq!(raw.mark_unpopulated_content(), 1, "{name}");
+        assert_eq!(raw.unreadable_subtrees, 1, "{name}");
+    }
+}
+
 /// Any child but a standard window's own buttons, its title and empty
 /// layout means the window shows content: a dialog's buttons, a blank
 /// document's text area, a text that is not the title, and any button of a
@@ -1200,6 +1336,20 @@ fn windows_with_any_other_child_are_never_empty_shells() {
     let mut dialog = standard(vec![window_control(4, "AXCloseButton")]);
     dialog.subrole = Some("AXDialog".into());
     assert!(!is_empty_shell_window(&dialog));
+    // Wrapping changes none of this: a page button beside the window's own
+    // buttons in an unnamed group is content, and a dialog's close button is
+    // no chrome however it is wrapped.
+    let wrapped_page_button =
+        standard(vec![RawElement::fixture(2, "AXGroup").with_children(vec![
+            window_control(4, "AXCloseButton"),
+            RawElement::fixture(3, "AXButton").titled("Refresh"),
+        ])]);
+    assert!(!is_empty_shell_window(&wrapped_page_button));
+    let mut wrapped_dialog =
+        standard(vec![RawElement::fixture(2, "AXGroup")
+            .with_children(vec![window_control(4, "AXCloseButton")])]);
+    wrapped_dialog.subrole = Some("AXDialog".into());
+    assert!(!is_empty_shell_window(&wrapped_dialog));
 }
 
 /// The re-reads of empty-shell windows in one call share one allowance: each

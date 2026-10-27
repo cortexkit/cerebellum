@@ -250,50 +250,78 @@ pub struct RereadTiming<'a> {
 /// WebKit exposes exactly this while it is still building a page's
 /// accessibility tree.
 ///
-/// Any other child makes the window not a shell, whatever it is: a dialog's
-/// own buttons, an empty text area of a blank document, a button with no
-/// title. Only window chrome and empty layout are taken for missing content.
+/// The window's buttons and title count as chrome wherever they sit beneath
+/// the window, not only as its direct children: an application may wrap them
+/// in an unnamed group, and a button may carry an empty element of its own.
+/// Layout means groups, generic and unknown elements, layout areas and
+/// items (the container roles the renderer looks through when they carry no
+/// name), scroll areas, split groups and web areas; any of these counts as
+/// layout whatever its label, and is looked through to what it holds. The
+/// title text is matched on the label the renderer gives it, whichever
+/// attribute holds it.
+/// So a standard window whose read prints nothing but its own buttons is
+/// taken for a shell.
+///
+/// Any other element makes the window not a shell, whatever it is: a
+/// dialog's own buttons, an empty text area of a blank document, a button
+/// with no title. Only window chrome and empty layout are taken for missing
+/// content.
 pub fn is_empty_shell_window(node: &RawElement) -> bool {
-    fn content(node: &RawElement) -> bool {
-        !matches!(
-            node.role.as_deref(),
-            Some("AXWindow" | "AXGroup" | "AXScrollArea" | "AXSplitGroup" | "AXWebArea")
-        ) || node.children.iter().any(content)
-    }
     if node.role.as_deref() != Some("AXWindow") {
         return false;
     }
     // A dialog, sheet-like or floating window's few buttons may be all it
     // has, so only a standard window's chrome is set aside.
     let standard = matches!(node.subrole.as_deref(), None | Some("AXStandardWindow"));
-    let title = node.title.as_deref().unwrap_or("").trim();
-    let chrome = |child: &RawElement| {
-        standard
-            && child.children.is_empty()
-            && match child.role.as_deref() {
-                Some("AXButton") => matches!(
-                    child.subrole.as_deref(),
+    let window_names: Vec<String> = [
+        super::render::one_line(node.title.as_deref().unwrap_or("")),
+        super::render::one_line(&super::render::describe(node).label),
+    ]
+    .into_iter()
+    .filter(|name| !name.is_empty())
+    .collect();
+    let content = |element: &RawElement| shows_content(element, standard, &window_names);
+    !node.children.iter().any(content)
+}
+
+/// Whether `node`, beneath a window, shows anything but that window's chrome
+/// and empty layout (see [`is_empty_shell_window`]). `standard` says whether
+/// the window is a standard one, whose buttons and title count as chrome;
+/// `window_names` are the one-line forms of the window's title and label.
+fn shows_content(node: &RawElement, standard: bool, window_names: &[String]) -> bool {
+    match node.role.as_deref() {
+        // One of the window's own buttons, together with anything it holds:
+        // what is inside a close or full-screen button is still that button.
+        Some("AXButton")
+            if standard
+                && matches!(
+                    node.subrole.as_deref(),
                     Some(
                         "AXCloseButton"
                             | "AXMinimizeButton"
                             | "AXZoomButton"
                             | "AXFullScreenButton"
                     )
-                ),
-                Some("AXStaticText") => {
-                    let text = match &child.value {
-                        ElementValue::Text(text) => text.as_str(),
-                        _ => child.title.as_deref().unwrap_or(""),
-                    };
-                    !title.is_empty() && text.trim() == title
-                }
-                _ => false,
-            }
-    };
-    !node
-        .children
-        .iter()
-        .any(|child| !chrome(child) && content(child))
+                ) =>
+        {
+            false
+        }
+        Some("AXStaticText") => {
+            let text = super::render::one_line(&super::render::describe(node).label);
+            !(standard && node.children.is_empty() && window_names.iter().any(|name| *name == text))
+        }
+        Some(
+            "AXGroup" | "AXGenericElement" | "AXUnknown" | "AXLayoutArea" | "AXLayoutItem"
+            | "AXScrollArea" | "AXSplitGroup" | "AXWebArea",
+        ) => node
+            .children
+            .iter()
+            .any(|child| shows_content(child, standard, window_names)),
+        // A window attached beneath this one shows content unless it is a
+        // shell itself, judged by its own kind and title.
+        Some("AXWindow") => !is_empty_shell_window(node),
+        _ => true,
+    }
 }
 
 /// The bounds one read is held to.

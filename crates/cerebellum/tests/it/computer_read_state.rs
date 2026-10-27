@@ -1595,15 +1595,23 @@ fn populated_window() -> RawElement {
 struct ShellSource {
     first: RawElement,
     reread: RawElement,
+    /// Top-level elements the application read returns after the window,
+    /// such as the application's menu bars.
+    others: Vec<RawElement>,
     app_reads: AtomicUsize,
     window_reads: AtomicUsize,
 }
 
 impl ShellSource {
     fn new(first: RawElement, reread: RawElement) -> Arc<Self> {
+        Self::with_others(first, reread, Vec::new())
+    }
+
+    fn with_others(first: RawElement, reread: RawElement, others: Vec<RawElement>) -> Arc<Self> {
         Arc::new(Self {
             first,
             reread,
+            others,
             app_reads: AtomicUsize::new(0),
             window_reads: AtomicUsize::new(0),
         })
@@ -1621,7 +1629,9 @@ impl AppStateSource for ShellSource {
             // A shell mid-build already carries the subtree the platform
             // reader could not open yet; count it, as a live reader does.
             unreadable_subtrees: unreadable_count(&self.first),
-            roots: vec![self.first.clone()],
+            roots: std::iter::once(self.first.clone())
+                .chain(self.others.iter().cloned())
+                .collect(),
             focused: None,
             read_bound_reached: false,
         })
@@ -1643,6 +1653,13 @@ impl AppStateSource for ShellSource {
             roots: vec![self.reread.clone()],
             focused: None,
             read_bound_reached: false,
+        })
+    }
+
+    fn element_facts(&self, _element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        Ok(ElementFacts {
+            pid: Some(grant().pid),
+            ..Default::default()
         })
     }
 }
@@ -1898,4 +1915,174 @@ async fn a_window_with_content_is_not_read_again() {
     assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
     assert_eq!(source.app_reads.load(Ordering::SeqCst), 1);
     assert_eq!(source.window_reads.load(Ordering::SeqCst), 0);
+}
+
+/// The Magic Context dashboard's window as its first reads after a restart
+/// found it: the window's own buttons and title inside an unnamed group,
+/// beside an empty group, with no page. It prints only the three buttons.
+fn loading_tauri_window() -> RawElement {
+    let control =
+        |token, subrole: &str| RawElement::fixture(token, "AXButton").with_subrole(subrole);
+    let mut title = RawElement::fixture(7, "AXStaticText");
+    title.value = ElementValue::Text("Magic Context".into());
+    let mut window = RawElement::fixture(1, "AXWindow")
+        .titled("Magic Context")
+        .with_subrole("AXStandardWindow")
+        .with_children(vec![RawElement::fixture(2, "AXGroup").with_children(vec![
+            control(3, "AXCloseButton"),
+            control(4, "AXFullScreenButton"),
+            RawElement::fixture(5, "AXGroup"),
+            control(6, "AXMinimizeButton"),
+            title,
+        ])]);
+    window.main_window = true;
+    window.focused_window = true;
+    window
+}
+
+/// The dashboard's two menu bars, every menu closed.
+fn loading_tauri_menu_bars() -> Vec<RawElement> {
+    let closed = |token: u64, title: &str, items: usize| {
+        let mut menu = RawElement::fixture(token + 1, "AXMenu");
+        menu.closed_menu_children = items;
+        RawElement::fixture(token, "AXMenuBarItem")
+            .titled(title)
+            .with_children(vec![menu])
+    };
+    vec![
+        RawElement::fixture(20, "AXMenuBar").with_children(vec![
+            closed(21, "Apple", 21),
+            closed(23, "Magic Context Dashboard", 9),
+            closed(25, "Edit", 11),
+        ]),
+        RawElement::fixture(27, "AXMenuBar").with_children(vec![closed(28, "", 4)]),
+    ]
+}
+
+/// The line every read of a window still showing no page ends with.
+const INCOMPLETE_LINE: &str = "Accessibility content incomplete: a window or web area exposes only an empty shell; it may still be loading. Read again.\n";
+
+/// `body` with its ids written with the run tag `tag`, from the live reads,
+/// whose run tag was `km`.
+fn with_run_tag(body: &str, tag: &str) -> String {
+    body.replace("km", tag)
+}
+
+/// The live read of the loading dashboard with no filter, after its header.
+const LOADING_FULL_BODY: &str = "\
+km1 window (main, focused) Magic Context
+  km3 close button
+  km4 full screen button
+  km6 minimize button
+km8 menu bar
+  km9 menu bar item Apple  [21 children; closed]
+  km11 menu bar item Magic Context Dashboard  [9 children; closed]
+  km13 menu bar item Edit  [11 children; closed]
+km15 menu bar
+  km16 menu bar item  [4 children; closed]
+";
+
+/// The live read of the loading dashboard filtered to buttons, after its
+/// header.
+const LOADING_BUTTONS_BODY: &str = "\
+km1 window (main, focused) Magic Context
+  km3 close button
+  km4 full screen button
+  km6 minimize button
+";
+
+/// One call on `plane` in the shared conversation, which must complete with
+/// a reply its schema declares.
+async fn serve_completed(
+    plane: &Plane,
+    management: &Arc<ManagementPlane>,
+    arguments: Value,
+) -> Value {
+    let reply = serve(
+        plane,
+        management,
+        "conversation-1",
+        no_relay(),
+        arguments,
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+    reply
+}
+
+/// The header and the body of a reply's state text, and the run tag its
+/// first id carries.
+fn split_read(reply: &Value) -> (String, String, String) {
+    let text = reply["state_text"].as_str().unwrap();
+    let (header, body) = text.split_once('\n').unwrap();
+    let tag = id_on_line(body)[..2].to_owned();
+    (header.to_owned(), body.to_owned(), tag)
+}
+
+/// The dashboard's window that printed only its buttons and menu bars, with
+/// no word that its page was missing, is now read once more and, still
+/// showing no page, prints exactly what it printed live plus the line that
+/// the page is not loaded yet: with no filter, filtered to buttons, and
+/// zoomed into the window.
+#[tokio::test]
+async fn a_loading_tauri_window_is_read_again_and_disclosed_under_any_filter_or_zoom() {
+    let management = granted_management().await;
+    let source = ShellSource::with_others(
+        loading_tauri_window(),
+        loading_tauri_window(),
+        loading_tauri_menu_bars(),
+    );
+    let plane = plane(source.clone());
+    let served = |arguments: Value| serve_completed(&plane, &management, arguments);
+
+    let reply = served(json!({"target": TARGET_BUNDLE_ID})).await;
+    let (header, body, tag) = split_read(&reply);
+    assert!(header.ends_with(" · window \"Magic Context\""), "{header}");
+    assert_eq!(
+        body,
+        with_run_tag(LOADING_FULL_BODY, &tag) + INCOMPLETE_LINE
+    );
+    assert_eq!(reply["unreadable_subtrees"], 1);
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
+
+    let reply = served(json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXButton"]})).await;
+    let (_, body, tag) = split_read(&reply);
+    assert_eq!(
+        body,
+        with_run_tag(LOADING_BUTTONS_BODY, &tag) + INCOMPLETE_LINE
+    );
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 2);
+
+    let window_id = format!("{tag}1");
+    let reply = served(json!({"target": TARGET_BUNDLE_ID, "zoom": window_id})).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(tree.ends_with(INCOMPLETE_LINE), "{tree}");
+    // The zoom reads the window, then reads it once more.
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 4);
+    assert_eq!(source.app_reads.load(Ordering::SeqCst), 2);
+}
+
+/// The same window whose page appears by the time it is read again is shown
+/// with its page, and with no note.
+#[tokio::test]
+async fn a_loading_tauri_window_read_again_shows_its_page() {
+    let source = ShellSource::with_others(
+        loading_tauri_window(),
+        populated_window(),
+        loading_tauri_menu_bars(),
+    );
+    let reply = read_shell(&source).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    line_with(tree, "button Refresh");
+    assert!(
+        tree.lines()
+            .next()
+            .unwrap()
+            .ends_with(" · window \"Magic Context\" · tauri://localhost"),
+        "{tree}"
+    );
+    assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
 }
