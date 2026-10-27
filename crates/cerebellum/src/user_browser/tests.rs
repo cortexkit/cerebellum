@@ -2362,7 +2362,10 @@ async fn user_scroll_reports_where_the_page_went_in_plain_text() {
             "allow_30m",
         )
         .await;
-    let tab = claimed["structuredContent"]["tab"].as_str().unwrap().to_owned();
+    let tab = claimed["structuredContent"]["tab"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     fixture.snapshot(1, &tab, "allow_30m").await;
     let (reply, _) = fixture.call(1, page_scroll(&tab, "down"), "").await;
     let text = content_text(&reply);
