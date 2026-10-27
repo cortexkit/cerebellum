@@ -1912,7 +1912,7 @@ fn v31_changes_only_read_states_image_handle() {
     );
 }
 
-/// The shipped artifact with v30's addition taken back out, from the recreated
+/// The shipped artifact with v30's addition taken back out from the recreated
 /// v30: the `authorization_denied` outcome at the end of every row's outcome
 /// enum but `list_apps`'s, and the sentence describing it at the end of that
 /// row's outcome description. Each removal asserts what it removes was there,
