@@ -608,6 +608,18 @@ impl Fixture {
 
     /// The reply to a started call. Nothing but the reply may reach the
     /// call's route: no consent question travels back along it.
+    /// The reply frame itself, for a test that needs its structured reply
+    /// rather than the model-facing wrapper.
+    async fn finish_frame(&self, mut started: Started) -> Frame {
+        let frame = tokio::time::timeout(HANG_GUARD, started.replies.recv())
+            .await
+            .expect("bounded tool invocation")
+            .expect("tool response");
+        assert_eq!(frame.header.corr, started.corr);
+        started.task.await.unwrap();
+        frame
+    }
+
     async fn finish(&self, mut started: Started) -> Value {
         let frame = tokio::time::timeout(HANG_GUARD, started.replies.recv())
             .await
@@ -4183,4 +4195,41 @@ async fn concurrent_reads_omit_the_note_only_on_a_tabs_second_read() {
     assert!(content_text(&other).contains(SETTLEMENT_NOTE), "{other}");
     assert_eq!(again["structuredContent"]["settled"], false);
     assert_eq!(other["structuredContent"]["settled"], false);
+}
+
+/// The person's-browser screenshot leaves with a handle whose bytes are exactly
+/// the PNG the reply carried, and that handle resolves.
+#[tokio::test]
+async fn a_person_browser_screenshot_carries_a_resolvable_handle() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let frame = fixture
+        .finish_frame(fixture.start(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab}),
+            "allow_30m",
+        ))
+        .await;
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    // The route's reply may be a tool-result wrapper; the screenshot is its
+    // structured content.
+    let reply = reply.get("structuredContent").cloned().unwrap_or(reply);
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let handle = reply["image_handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no handle on the screenshot: {reply}"))
+        .to_owned();
+    let shown = cerebellum_core::serde_base64::decode(reply["image"]["data_b64"].as_str().unwrap())
+        .unwrap();
+    // The fixture binds its routes under this stamp's scope ref.
+    let scope = crate::computer_grants::tests::stamp("test-project").scope_ref;
+    let resolved = fixture
+        .planes
+        .image_handles
+        .resolve(&handle, &[scope.as_str()], crate::wall_clock_ms())
+        .unwrap_or_else(|| panic!("the handle did not resolve"));
+    let head_length = u32::from_be_bytes(resolved.body[..4].try_into().unwrap()) as usize;
+    let head: Value = serde_json::from_slice(&resolved.body[4..4 + head_length]).unwrap();
+    assert_eq!(head["content_type"], "image/png");
+    assert_eq!(&resolved.body[4 + head_length..], shown.as_slice());
 }

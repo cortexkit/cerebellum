@@ -2431,3 +2431,54 @@ pub fn v30_from_v29(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The description `computer.read_state`'s `image_handle` carries from
+/// revision 31 on: what the handle is for, how long it lasts, and when a
+/// capture has none.
+pub const V31_IMAGE_HANDLE_DESCRIPTION: &str = "Handle of the `image` this reply carries; pass it to a model call instead of the image bytes. It resolves to exactly these bytes, as `image.resolve`, for 15 minutes, for this conversation's scope and the scope that captured it. Absent when the capture's route carried no scope stamp, because nothing could resolve it.";
+
+/// The `image_handle` field revision 31 adds to `computer.read_state`: a
+/// codemode program cannot return a screenshot's bytes, so it passes this
+/// handle to a model call and Broca fetches the bytes with `image.resolve`.
+///
+/// The handle is exactly 34 characters (`ih` and 32 hex digits). It is spelled
+/// with length bounds rather than a pattern because the runtime result-schema
+/// reader implements no pattern, and would refuse the whole artifact over one.
+///
+/// Optional rather than required: a capture on a route with no scope stamp has
+/// no scope that could resolve it, and omits the field.
+pub fn v31_read_state_image_handle_field() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 34,
+        "maxLength": 34,
+        "description": V31_IMAGE_HANDLE_DESCRIPTION,
+    })
+}
+
+/// Revision 31 gives `computer.read_state` a handle for its image.
+///
+/// Before it, a codemode program that read a window received a screenshot it
+/// could not pass anywhere: the bytes are far larger than a program's result.
+/// The handle names the same bytes so Broca can fetch them by scope.
+///
+/// Only `read_state`'s `result_schema` changes: no request schema, no row key
+/// and no other row field moves, so the advertised tool and `validate_row` do
+/// not change.
+pub fn v31_from_v30(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        if row["capability_id"] != "computer.read_state" {
+            continue;
+        }
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        assert!(
+            properties
+                .insert("image_handle".into(), v31_read_state_image_handle_field())
+                .is_none(),
+            "read_state already declares image_handle"
+        );
+    }
+    next
+}

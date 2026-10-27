@@ -23,10 +23,21 @@ tokio::task_local! {
     pub(crate) static SETTLEMENT_NOTE_OMITTED: Cell<bool>;
     /// A background-mode explanation for this call's text, never structured content.
     pub(crate) static APP_USE_NOTE: RefCell<Option<String>>;
+    /// Why this call's screenshot has no handle, for its text only: the bytes
+    /// were returned, but too large for `image.resolve` to send back in one
+    /// frame. The structured reply says the same through its own rule.
+    pub(crate) static IMAGE_HANDLE_NOTE: RefCell<Option<String>>;
 }
 
 pub(crate) fn app_use_note(note: String) {
     let _ = APP_USE_NOTE.try_with(|slot| *slot.borrow_mut() = Some(note));
+}
+
+/// Records, for this one call, that a reply's screenshot is too large to have
+/// a handle. The reply itself already omits the field; this only adds the line
+/// the model reads.
+pub(crate) fn image_handle_note(note: String) {
+    let _ = IMAGE_HANDLE_NOTE.try_with(|slot| *slot.borrow_mut() = Some(note));
 }
 
 /// Leave the "Page settlement was not confirmed." lines out of the text of
@@ -175,6 +186,13 @@ fn project(reply: Value) -> ToolResult {
     let projected_image = object.get("image").map(image_projection);
     let mut facts = plain::facts(object, login_notice(object), settlement_note(object));
     if let Some(note) = APP_USE_NOTE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
+        facts.push(note);
+    }
+    if let Some(note) = IMAGE_HANDLE_NOTE
         .try_with(|slot| slot.borrow().clone())
         .ok()
         .flatten()
@@ -461,6 +479,36 @@ mod tests {
             json!({"type":"image", "data":"AA==", "mimeType":"image/png", "width":12, "height":8, "id":"image-1", "alt":"Image image-1 was not delivered: image_delivery_unavailable"})
         );
         assert_eq!(result["structuredContent"], reply);
+    }
+
+    /// A screenshot handle names the very bytes a codemode result must leave
+    /// out, so it has to survive both result formats: the tool-result/v1
+    /// structured content, and the plain reply the codemode path sends.
+    #[tokio::test]
+    async fn a_screenshot_handle_survives_a_codemode_result() {
+        let mut reply = read_state_reply();
+        reply["image_handle"] = json!("ih0123456789abcdef0123456789abcdef");
+        let handle = reply["image_handle"].clone();
+        let decoded = crate::codemode::CALL_DETAIL
+            .scope(
+                std::cell::RefCell::new(Some(json!({"action": "read_state"}))),
+                async move { decoded(reply) },
+            )
+            .await;
+        assert!(
+            decoded["structuredContent"]["image"]
+                .get("data_b64")
+                .is_none(),
+            "{decoded}"
+        );
+        assert_eq!(
+            decoded["structuredContent"]["image_handle"], handle,
+            "a program reaches its screenshot only through this handle"
+        );
+        assert_eq!(
+            decoded["structuredContent"]["image"]["delivery_reason"],
+            "codemode"
+        );
     }
 
     #[test]

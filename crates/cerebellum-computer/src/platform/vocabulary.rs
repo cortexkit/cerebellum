@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v30";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v31";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v30.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v31.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "b0b9b5aab421dd5c5380ddfef0580168f485af8bc44a3b7991898b96d144a906";
+    "bfd49ebcfc9166f1ed41754ea7b9a18606567e046c1c2f6e8a9bce1ba2d07943";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -562,6 +562,8 @@ fn validate_runtime_result_schema(
                 | "description"
                 | "enum"
                 | "items"
+                | "maxLength"
+                | "minLength"
                 | "properties"
                 | "required"
                 | "type"
@@ -597,7 +599,10 @@ fn validate_runtime_result_schema(
                     | "type"
             ),
             "array" => matches!(keyword.as_str(), "description" | "enum" | "items" | "type"),
-            _ => matches!(keyword.as_str(), "description" | "enum" | "type"),
+            _ => matches!(
+                keyword.as_str(),
+                "description" | "enum" | "maxLength" | "minLength" | "type"
+            ),
         };
         if !applicable {
             return Err(CapabilityResultValidationError::MalformedArtifact(format!(

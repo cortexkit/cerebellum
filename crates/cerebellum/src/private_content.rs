@@ -745,6 +745,16 @@ fn retention(stamp: &subc_protocol::scope::ScopeStamp) -> Retention {
     }
 }
 
+/// The scope a screenshot capture on `facts` belongs to, or `None` when the
+/// route carries no scope stamp.
+///
+/// A capture made under a scope is resolvable by that scope's union, and by
+/// nothing else; a route without a stamp names no scope, so its captures get
+/// no handle: one minted there could never be resolved.
+pub(crate) fn capture_scope(facts: &AcceptedBindFacts) -> Option<String> {
+    facts.scope.as_ref().map(|stamp| stamp.scope_ref.clone())
+}
+
 /// The scopes a reply delivered to `facts` marks: the calling scope, and the
 /// parent it names. A run's or flow's output returns to the agent that started
 /// it, so that agent's scope holds the content too, and its other runs inherit
@@ -902,6 +912,27 @@ pub(crate) async fn handle(
             .await
         }
     };
+    let scopes = scope_union(planes, scope, parent);
+    let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let reply = planes
+        .private_content
+        .answer(&scopes, crate::wall_clock_ms());
+    crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await
+}
+
+/// The scopes a query for `scope` covers.
+///
+/// Both Broca operations answer from this one union: `private_content.query`
+/// asks whether any of these scopes read private content, and `image.resolve`
+/// lets a handle captured under any of them be fetched. Keeping it in one
+/// place means a handle's reach and a mark's reach cannot drift apart.
+///
+/// The union is the requested scope; for every route bound with that scope ref
+/// whose linked head still resolves, that head's scope; and the parent Broca
+/// names, for a run that never opened a cerebellum route (for example, source
+/// pasted after a head's read). A run's marks are copied to that named parent
+/// on the way, so its other runs inherit them.
+pub(crate) fn scope_union(planes: &Planes, scope: &str, parent: Option<&str>) -> Vec<String> {
     let now = crate::wall_clock_ms();
     let runs: Vec<_> = planes
         .routes
@@ -927,13 +958,9 @@ pub(crate) async fn handle(
             scopes.push(parent.scope_ref.clone());
         }
     }
-    // Broca knows the linked parent even when the run never opened a
-    // Cerebellum route (for example, source pasted after a head's read).
     if let Some(parent) = parent {
         planes.private_content.propagate(scope, parent, now);
         scopes.push(parent.to_owned());
     }
-    let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let reply = planes.private_content.answer(&scopes, now);
-    crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await
+    scopes
 }

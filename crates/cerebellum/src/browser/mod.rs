@@ -5001,6 +5001,7 @@ fn screenshot_properties() -> Value {
         "input_rect":closed_object(json!({"x_input_css":number_schema(),"y_input_css":number_schema(),"width_input_css":number_schema(),"height_input_css":number_schema()}), &["x_input_css", "y_input_css", "width_input_css", "height_input_css"]),
         "device_scale_factor":number_schema(),
         "visual_viewport_scale":number_schema(),
+        "image_handle":string_schema(),
     })
 }
 
@@ -5823,6 +5824,10 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
                 "truncated":boolean_schema(), "refs_truncated":boolean_schema(),
                 "omitted_frames":integer_schema(), "frame_note":string_schema(),
                 "image":closed_object(json!({"mime":string_schema(),"data_b64":string_schema(),"width_px":integer_schema(),"height_px":integer_schema()}), &["mime","data_b64","width_px","height_px"]),
+                // Present when this screenshot's bytes can be resolved by
+                // `image.resolve`; absent when they are too large to send back
+                // in one reply frame.
+                "image_handle":string_schema(),
                 "image_width_px":integer_schema(), "image_height_px":integer_schema(),
                 "popup_activated_briefly":boolean_schema(),
                 // A committed navigation whose landing page has no
