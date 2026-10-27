@@ -81,6 +81,7 @@ const COMMON_OUTCOMES: &[&str] = &[
     "blocking_capacity_exhausted",
     "config_invalid",
     "not_fronted",
+    "authorization_denied",
 ];
 
 const BOUNDED_OUTCOMES: &[&str] = &[
@@ -275,6 +276,7 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
             cerebellum_computer::app_state::person::PersonChange::InputSeen,
         )),
         screen_locked_reply(),
+        keystrokes::refused_before_posting(operator_apps::refusal()),
         synthetic_success_reply("pid_structural", false, "effect_indeterminate", None),
         synthetic_wire_envelope(json!({})),
         // These inline serving replies have no separate builder. The private-input

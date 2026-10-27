@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v29";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v30";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v29.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v30.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "f82a0c2d60923f20ce5db0f55948309c492da536a73a253336c12e1ce2af699c";
+    "b0b9b5aab421dd5c5380ddfef0580168f485af8bc44a3b7991898b96d144a906";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1233,6 +1233,31 @@ mod tests {
                 }),
             );
             assert_eq!(withheld(id, &reply), Vec::new(), "{id}");
+        }
+    }
+
+    #[test]
+    fn an_operator_app_refusal_passes_on_every_row_but_list_apps() {
+        for id in artifact_row_ids() {
+            let reply = with_keystroke_envelope(
+                &id,
+                serde_json::json!({
+                    "outcome": "authorization_denied",
+                    "reason": "operator_app_blocked",
+                    "remedy": "ask the person to act in the app themselves",
+                }),
+            );
+            if id == "computer.list_apps" {
+                // list_apps leaves those applications out of its list.
+                assert_eq!(
+                    withheld(&id, &reply),
+                    vec![CapabilityResultViolation::EnumMismatch {
+                        path: "$.outcome".into(),
+                    }]
+                );
+            } else {
+                assert_eq!(withheld(&id, &reply), Vec::new(), "{id}");
+            }
         }
     }
 

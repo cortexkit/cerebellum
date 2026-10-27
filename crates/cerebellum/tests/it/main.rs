@@ -17,6 +17,7 @@ mod c1_s6_integration;
 mod computer_consent;
 mod computer_cursor_arrival;
 mod computer_element_actions;
+mod computer_operator_apps;
 mod computer_person_changes;
 mod computer_read_state;
 mod computer_result_schema;

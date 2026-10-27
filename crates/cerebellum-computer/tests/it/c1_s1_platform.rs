@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v29.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v30.json");
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -777,7 +777,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v27_from_v26(&generated, historical_revision(27).as_str().unwrap());
     let generated =
         vocabulary_mint::v28_from_v27(&generated, historical_revision(28).as_str().unwrap());
-    let generated = vocabulary_mint::v29_from_v28(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v29_from_v28(&generated, historical_revision(29).as_str().unwrap());
+    let generated = vocabulary_mint::v30_from_v29(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1761,13 +1763,13 @@ fn v28_changes_only_result_schemas() {
     );
 }
 
-/// The shipped artifact with v29's one addition taken back out: the
+/// v29 with its one addition taken back out: the
 /// `target_not_read` reason at the end of each fronting row's
 /// `fronting.not_fronted_reason`. Each removal asserts the reason was there,
 /// so a v29 that stopped adding it to any fronting row is caught here as
 /// well as by the digest.
 fn recreated_v28() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v29();
     vocabulary["revision"] = historical_revision(28);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
@@ -1805,7 +1807,7 @@ fn v29_only_adds_the_target_not_read_reason_to_the_recreated_v28() {
 #[test]
 fn v29_changes_only_the_not_fronted_reasons() {
     let previous = recreated_v28();
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let current = recreated_v29();
     let previous_rows = previous["rows"].as_array().unwrap();
     let current_rows = current["rows"].as_array().unwrap();
     assert_eq!(previous_rows.len(), current_rows.len());
@@ -1824,6 +1826,88 @@ fn v29_changes_only_the_not_fronted_reasons() {
             }
         }
         assert_eq!(before, after, "{id} changed outside not_fronted_reason");
+    }
+    let mut previous = previous;
+    let mut current = current;
+    previous.as_object_mut().unwrap().remove("rows");
+    current.as_object_mut().unwrap().remove("rows");
+    previous["revision"] = current["revision"].clone();
+    assert_eq!(
+        previous, current,
+        "a document field other than revision changed"
+    );
+}
+
+/// The shipped artifact with v30's addition taken back out: the
+/// `authorization_denied` outcome at the end of every row's outcome enum but
+/// `list_apps`'s, and the sentence describing it at the end of that row's
+/// outcome description. Each removal asserts what it removes was there, so a
+/// v30 that stopped adding it to any row is caught here as well as by the
+/// digest.
+fn recreated_v29() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(29);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        let outcome = &mut row["result_schema"]["properties"]["outcome"];
+        let choices = outcome["enum"].as_array_mut().unwrap();
+        if capability == "computer.list_apps" {
+            assert!(
+                !choices.contains(&json!(vocabulary_mint::AUTHORIZATION_DENIED)),
+                "list_apps leaves operator apps out rather than refusing"
+            );
+            continue;
+        }
+        assert_eq!(
+            choices.pop().unwrap(),
+            vocabulary_mint::AUTHORIZATION_DENIED,
+            "{capability}"
+        );
+        let description = outcome["description"].as_str().unwrap();
+        let earlier = description
+            .strip_suffix(vocabulary_mint::OPERATOR_APP_BLOCKED_DESCRIPTION)
+            .and_then(|rest| rest.strip_suffix(' '))
+            .unwrap_or_else(|| panic!("{capability} does not describe authorization_denied"))
+            .to_string();
+        outcome["description"] = json!(earlier);
+    }
+    vocabulary
+}
+
+/// The recreated v29 is byte for byte the v29 that shipped: its digest is
+/// the one v29's mirrors and source lock carried.
+#[test]
+fn v30_only_adds_the_operator_app_refusal_to_the_recreated_v29() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v29()).unwrap()),
+        "f82a0c2d60923f20ce5db0f55948309c492da536a73a253336c12e1ce2af699c"
+    );
+}
+
+/// v30 changes nothing outside the rows' `result_schema`s, and inside them
+/// only the `outcome` enum and its description. The advertised
+/// `computer_use` definition is built from each row's `request_schema`, so
+/// those keep their exact bytes.
+#[test]
+fn v30_changes_only_the_outcomes() {
+    let previous = recreated_v29();
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let previous_rows = previous["rows"].as_array().unwrap();
+    let current_rows = current["rows"].as_array().unwrap();
+    assert_eq!(previous_rows.len(), current_rows.len());
+    for (before, after) in previous_rows.iter().zip(current_rows) {
+        let id = after["capability_id"].as_str().unwrap();
+        assert_eq!(
+            canonical_json_bytes(&before["request_schema"]).unwrap(),
+            canonical_json_bytes(&after["request_schema"]).unwrap(),
+            "{id} request_schema"
+        );
+        let mut before = before.clone();
+        let mut after = after.clone();
+        for row in [&mut before, &mut after] {
+            row["result_schema"]["properties"]["outcome"] = json!({});
+        }
+        assert_eq!(before, after, "{id} changed outside its outcome");
     }
     let mut previous = previous;
     let mut current = current;
