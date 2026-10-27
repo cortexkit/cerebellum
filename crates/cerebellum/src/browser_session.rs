@@ -2455,14 +2455,17 @@ impl BrowserSessions {
             let outcome = match pending.outcome {
                 Some(outcome) => outcome,
                 None => {
-                    pending.cleanup.prove_profile_unused().map_err(|remedy| refusal(
-                        CleanupStage::Reap, format!("{remedy}; then retry browser.close for this session or browser.launch")
-                    ))?;
+                    pending.cleanup.prove_profile_unused().map_err(|remedy| {
+                        refusal(
+                            CleanupStage::Reap,
+                            format!("{remedy}; then retry close for this session or launch"),
+                        )
+                    })?;
                     if let Some(process) = pending.process.as_mut() {
                         process.wait_until_reaped().map_err(|failure| {
                             let mut reply = refusal(
                                 CleanupStage::Reap,
-                                "the proven-exited browser could not be reaped; retry browser.close or browser.launch".into(),
+                                "the proven-exited browser could not be reaped; retry close or launch".into(),
                             );
                             failure.write_detail(&mut reply);
                             reply
@@ -2474,7 +2477,7 @@ impl BrowserSessions {
                         .set_terminal_outcome(BrowserSessionTerminalOutcome::Closed);
                     let outcome = pending.cleanup.after_proven_exit().map_err(|stage| refusal(
                         stage, if stage == CleanupStage::RecordTerminalization {
-                            "the launch journal could not be settled; check its storage, then retry browser.close or browser.launch".into()
+                            "the launch journal could not be settled; check its storage, then retry close or launch".into()
                         } else {
                             "profile cleanup failed after launch settlement; restart the module to finish registry and custody recovery before relaunching".into()
                         }
@@ -3031,7 +3034,7 @@ impl BrowserSessions {
                     status["remedy"] = json!(format!(
                         "a browser operation ({call}) is still running after its call ended; \
                          other calls on this session are refused as target_busy until it ends; \
-                         browser.close ends it"
+                         close ends it"
                     ));
                 } else if !cell.watch.held().is_empty() {
                     status["remedy"] = json!(HELD_INPUT_REMEDY);
@@ -5027,10 +5030,7 @@ mod tests {
         assert_eq!(session.close()["outcome"], "cleanup_failure");
         let retry = session.close();
         assert_eq!(retry["detail"], json!({"step": "generation_unverified"}));
-        assert!(retry["remedy"]
-            .as_str()
-            .unwrap()
-            .contains("retry browser.close"));
+        assert!(retry["remedy"].as_str().unwrap().contains("retry close"));
         assert!(matches!(
             session
                 .sessions

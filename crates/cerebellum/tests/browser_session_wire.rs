@@ -2996,7 +2996,10 @@ async fn present_fronts_then_marks_human_in_control() {
     let blocked = invoke_existing(&planes, 20, "browser.snapshot", json!({})).await;
     let blocked: Value = serde_json::from_slice(&blocked.body).unwrap();
     assert_eq!(blocked["outcome"], "human_in_control", "{blocked}");
-    assert_eq!(blocked["remedy"], "browser.resume", "{blocked}");
+    assert_eq!(
+        blocked["remedy"], "resume, then retry the browser action",
+        "{blocked}"
+    );
     assert_eq!(
         blocked["origin"], "https://landed.example:8443",
         "{blocked}"

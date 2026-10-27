@@ -2408,7 +2408,7 @@ fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
             "outcome": "refused",
             "reason": "possibly_managed_path",
             "unaccounted": unaccounted,
-            "remedy": "the operator must move or account for these directories before the root can be re-identified; browser.rebind_profile_root will never adopt them",
+            "remedy": "the operator must move or account for these directories before the root can be re-identified; rebind_profile_root will never adopt them",
         }),
         RebindRefusal::RootUnstable => json!({
             "outcome": "refused",

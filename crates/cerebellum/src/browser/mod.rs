@@ -346,43 +346,43 @@ impl BrowserError {
             Self::SeverityBelowFloor { .. } => {
                 "resubmit with detail.required as the severity; a grant must cover that severity for this target"
             }
-            Self::NoSession => "call browser.launch, then retry the browser action",
+            Self::NoSession => "launch the browser, then retry the browser action",
             Self::BrowserLaunchPending => {
-                "poll browser.status until the session is ready, then retry the browser action"
+                "poll status until the session is ready, then retry the browser action"
             }
-            Self::HumanInControl { .. } => "browser.resume",
+            Self::HumanInControl { .. } => "resume, then retry the browser action",
             Self::StaleSnapshot {
                 reason_code: "ref_from_older_snapshot",
             } => {
                 "this ref came from an older snapshot without browser node identity; omit zoom to read the current outline"
             }
             Self::StaleSnapshot { .. } => {
-                "call browser.snapshot again and use only its new snapshot_id and refs"
+                "take a snapshot again and use only its new snapshot_id and refs"
             }
             Self::PageChangedSinceSnapshot { .. } => {
-                "take a fresh browser.snapshot (or browser.screenshot for click_point) of the page as it is now and act on its snapshot_id; if detail.live_origin is not granted, that read needs browser.open_grant for it first"
+                "take a fresh snapshot (or screenshot for click_point) of the page as it is now and act on its snapshot_id; if detail.live_origin is not granted, that read needs open_grant for it first"
             }
             Self::RefNotFound { .. } => {
                 "choose a ref listed in the snapshot identified by snapshot_id"
             }
             Self::RefAmbiguous { .. } => {
-                "take a fresh browser.snapshot and choose a ref that identifies exactly one current element"
+                "take a fresh snapshot and choose a ref that identifies exactly one current element"
             }
             Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::TargetNotInDocument { .. }) => "the hit node is outside the classified document; take a fresh frame-aware snapshot; if its frame remains unavailable, report the missing frame classification cause",
             Self::ClassificationUnavailable(crate::classification::ClassificationUnavailable::NotCaptured) => "take a new snapshot to capture target classification before clicking",
             Self::ClassificationUnavailable(_) => "the browser could not supply complete DOM classification; retry a fresh snapshot after the page finishes loading; if it persists, report the named classification cause",
             Self::ElementIntercepted | Self::Intercepted(_) => {
-                "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position"
+                "take a fresh snapshot and choose a ref that currently exposes a clickable position"
             }
             Self::OutsideViewportAfterScroll { .. } => {
-                "take a fresh browser.snapshot and choose a ref whose resolved point can enter the visual viewport"
+                "take a fresh snapshot and choose a ref whose resolved point can enter the visual viewport"
             }
             Self::PointOutsideViewport { .. } => {
-                "call browser.screenshot again and choose a point inside its current visual viewport"
+                "take a screenshot again and choose a point inside its current visual viewport"
             }
             Self::InvalidCoordinates { reason } => reason.remedy(),
             Self::ImageTooLarge { .. } => {
-                "use browser.snapshot for a text observation, or reduce the viewport before capturing another image"
+                "use snapshot for a text observation, or reduce the viewport before capturing another image"
             }
             // The bare form is only produced when the grant selected for this
             // action changed before it was committed. Nothing about what a new
@@ -417,10 +417,10 @@ impl BrowserError {
                 "inspect detail.error_text and choose a reachable destination or retry when that browser error is transient"
             }
             Self::PageNavigatedDuringRead { .. } => {
-                "read the page again with browser.snapshot or browser.screenshot; if it stays on detail.live_origin, that read needs browser.open_grant for detail.live_origin first"
+                "read the page again with snapshot or screenshot; if it stays on detail.live_origin, that read needs open_grant for detail.live_origin first"
             }
             Self::NotSettled { .. } => {
-                "call browser.snapshot to re-observe the page before depending on its current state"
+                "take a snapshot to re-observe the page before depending on its current state"
             }
             Self::BrowserCrashed => {
                 "no caller remedy in v1: this module does not reconnect a crashed browser"
@@ -630,7 +630,7 @@ fn grant_remedy(attempted_origin: &str, required: crate::authorization::Severity
     } else if !grant_can_name_origin(attempted_origin) {
         "no grant can name detail.attempted_origin; navigate to an http or https page, then retry"
     } else {
-        "call browser.open_grant with the arguments in detail.grant_request, then retry"
+        "call open_grant with the arguments in detail.grant_request, then retry"
     }
 }
 
@@ -751,7 +751,7 @@ fn navigation_reply(tracker: &Tracker, should_settle: bool) -> Value {
     let mut response = if should_settle && !tracker.settled {
         json!({
             "outcome":"not_settled",
-            "remedy":"call browser.snapshot to re-observe the page before depending on its current state",
+            "remedy":"take a snapshot to re-observe the page before depending on its current state",
             "url_final":tracker.url_final,
             "lifecycle":tracker.lifecycle,
         })
@@ -1085,13 +1085,13 @@ impl LateEvent {
         match self {
             Self::DownloadBlocked => "choose an in-page action that does not start a download",
             Self::JsDialogDismissed => {
-                "call browser.snapshot and continue from the page state after the dialog was dismissed"
+                "take a snapshot and continue from the page state after the dialog was dismissed"
             }
             Self::NavigationPolicyRejected { .. } => {
                 "navigate to an http or https URL allowed by browser policy"
             }
             Self::AuthorizationDenied { .. } => {
-                "call browser.open_grant to mint a grant covering this action, then retry"
+                "call open_grant to mint a grant covering this action, then retry"
             }
         }
     }
@@ -7047,13 +7047,13 @@ mod tests {
                 "no_session",
                 BrowserError::NoSession,
                 "no_session",
-                "call browser.launch, then retry the browser action",
+                "launch the browser, then retry the browser action",
             ),
             (
                 "browser_launch_pending",
                 BrowserError::BrowserLaunchPending,
                 "browser_launch_pending",
-                "poll browser.status until the session is ready, then retry the browser action",
+                "poll status until the session is ready, then retry the browser action",
             ),
             (
                 "stale_snapshot",
@@ -7061,7 +7061,7 @@ mod tests {
                     reason_code: "document_epoch_changed",
                 },
                 "stale_snapshot",
-                "call browser.snapshot again and use only its new snapshot_id and refs",
+                "take a snapshot again and use only its new snapshot_id and refs",
             ),
             (
                 "ref_not_found",
@@ -7075,13 +7075,13 @@ mod tests {
                 "ref_ambiguous",
                 BrowserError::RefAmbiguous { candidate_count: 2 },
                 "ref_ambiguous",
-                "take a fresh browser.snapshot and choose a ref that identifies exactly one current element",
+                "take a fresh snapshot and choose a ref that identifies exactly one current element",
             ),
             (
                 "element_intercepted",
                 BrowserError::ElementIntercepted,
                 "element_intercepted",
-                "take a fresh browser.snapshot and choose a ref that currently exposes a clickable position",
+                "take a fresh snapshot and choose a ref that currently exposes a clickable position",
             ),
             (
                 "coordinates_out_of_bounds",
@@ -7130,7 +7130,7 @@ mod tests {
                     bound_bytes: 10,
                 },
                 "image_too_large",
-                "use browser.snapshot for a text observation, or reduce the viewport before capturing another image",
+                "use snapshot for a text observation, or reduce the viewport before capturing another image",
             ),
             (
                 "authorization_denied",
@@ -7147,7 +7147,7 @@ mod tests {
                     required_hazards: Default::default(),
                 },
                 "authorization_denied",
-                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+                "call open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "no_grant_for_action",
@@ -7156,7 +7156,7 @@ mod tests {
                     required: crate::authorization::Severity::new(4, true, false),
                 },
                 "authorization_denied",
-                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+                "call open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "grant_severity_insufficient",
@@ -7166,7 +7166,7 @@ mod tests {
                     granted_ceilings: vec![crate::authorization::Severity::new(2, false, false)],
                 },
                 "authorization_denied",
-                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+                "call open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "grant_severity_insufficient_beyond_any_grant",
@@ -7188,7 +7188,7 @@ mod tests {
                     required_hazards: [HazardClass::CredentialFormSubmit].into(),
                 },
                 "hazard_not_disclosed",
-                "call browser.open_grant with the arguments in detail.grant_request, then retry",
+                "call open_grant with the arguments in detail.grant_request, then retry",
             ),
             (
                 "severity_below_floor",
@@ -7222,7 +7222,7 @@ mod tests {
                     live_origin: "https://elsewhere.test".to_string(),
                 },
                 "page_navigated_during_read",
-                "read the page again with browser.snapshot or browser.screenshot; if it stays on detail.live_origin, that read needs browser.open_grant for detail.live_origin first",
+                "read the page again with snapshot or screenshot; if it stays on detail.live_origin, that read needs open_grant for detail.live_origin first",
             ),
             (
                 "page_changed_since_snapshot",
@@ -7231,7 +7231,7 @@ mod tests {
                     live_origin: "https://elsewhere.test".to_string(),
                 },
                 "stale_snapshot",
-                "take a fresh browser.snapshot (or browser.screenshot for click_point) of the page as it is now and act on its snapshot_id; if detail.live_origin is not granted, that read needs browser.open_grant for it first",
+                "take a fresh snapshot (or screenshot for click_point) of the page as it is now and act on its snapshot_id; if detail.live_origin is not granted, that read needs open_grant for it first",
             ),
             (
                 "not_settled",
@@ -7242,7 +7242,7 @@ mod tests {
                     deadline_ms: 1_000,
                 },
                 "not_settled",
-                "call browser.snapshot to re-observe the page before depending on its current state",
+                "take a snapshot to re-observe the page before depending on its current state",
             ),
             (
                 "browser_crashed",
@@ -7295,7 +7295,7 @@ mod tests {
             ),
             (
                 LateEvent::JsDialogDismissed,
-                "call browser.snapshot and continue from the page state after the dialog was dismissed",
+                "take a snapshot and continue from the page state after the dialog was dismissed",
             ),
             (
                 LateEvent::NavigationPolicyRejected {
@@ -7307,7 +7307,7 @@ mod tests {
                 LateEvent::AuthorizationDenied {
                     reason: "no_grant".to_string(),
                 },
-                "call browser.open_grant to mint a grant covering this action, then retry",
+                "call open_grant to mint a grant covering this action, then retry",
             ),
         ];
 
@@ -7318,6 +7318,52 @@ mod tests {
                 "wrong remedy for {event:?}"
             );
         }
+    }
+
+    /// Agents call the flat `browser_use` tool, whose actions are `launch`,
+    /// `snapshot` and the like: no agent tool is named `browser.<x>`. Every
+    /// rendered `BrowserError` remedy must therefore name the flat action in
+    /// plain words instead of the granular capability id.
+    #[tokio::test]
+    async fn every_browser_error_remedy_names_no_granular_browser_id() {
+        fn has_granular_id(remedy: &str) -> bool {
+            let mut rest = remedy;
+            while let Some(at) = rest.find("browser.") {
+                rest = &rest[at + "browser.".len()..];
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_ascii_lowercase())
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let plane = BrowserPlane::new();
+        let identity = identity();
+        let mut sampled = std::collections::BTreeSet::new();
+        for error in every_browser_error() {
+            // Fill-login refusals keep their own wording in browser/fill.rs,
+            // which names the saved-login flow the agent is already in.
+            if matches!(error, BrowserError::FillRefused(_)) {
+                continue;
+            }
+            let name = format!("{error:?}");
+            sampled.insert(browser_error_variant(&error));
+            let reply = plane.result(&identity, Err(error)).await;
+            let remedy = reply["remedy"].as_str().unwrap_or("");
+            assert!(
+                !has_granular_id(remedy),
+                "{name}: the remedy names a granular browser id no agent tool provides: {remedy}"
+            );
+        }
+        assert_eq!(
+            sampled.len(),
+            BROWSER_ERROR_VARIANTS - 1,
+            "scan every non-fill BrowserError variant: {sampled:?}"
+        );
     }
 
     /// One name per `BrowserError` variant. The match has no catch-all, so a

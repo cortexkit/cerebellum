@@ -10877,7 +10877,7 @@ mod tests {
         );
         assert_eq!(
             result["remedy"],
-            "call browser.open_grant with the arguments in detail.grant_request, then retry",
+            "call open_grant with the arguments in detail.grant_request, then retry",
             "{result}"
         );
         assert_eq!(

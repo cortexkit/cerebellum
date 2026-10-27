@@ -320,7 +320,7 @@ impl FailedReapFixture {
             "{result}"
         );
         assert!(
-            result["remedy"].as_str().unwrap().contains("browser.close"),
+            result["remedy"].as_str().unwrap().contains("retry close"),
             "{result}"
         );
         assert!(self.active());
