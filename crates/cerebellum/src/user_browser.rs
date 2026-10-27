@@ -1162,6 +1162,7 @@ struct Plan {
     frame_mappings: Vec<FrameMapping>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plan(
     bridge: &UserBrowserBridge,
     route: Route,
