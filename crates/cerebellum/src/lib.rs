@@ -9262,23 +9262,19 @@ pub async fn handle_tool_request_for_test_with_planes_scoped(
             facts.with_scope(Some(stamp)),
         );
     }
-    Box::pin(
-        tool_result::RESULT_BIND.scope(
-            None,
-            tool_result::SETTLEMENT_NOTE_OMITTED.scope(
-                std::cell::Cell::new(false),
-                tool_result::IMAGE_HANDLE_NOTE.scope(
+    Box::pin(tool_result::RESULT_BIND.scope(
+        None,
+        tool_result::SETTLEMENT_NOTE_OMITTED.scope(
+            std::cell::Cell::new(false),
+            tool_result::IMAGE_HANDLE_NOTE.scope(
+                std::cell::RefCell::new(None),
+                tool_result::APP_USE_NOTE.scope(
                     std::cell::RefCell::new(None),
-                    tool_result::APP_USE_NOTE.scope(
-                        std::cell::RefCell::new(None),
-                        handle_tool_request_for_test_with_existing_planes(
-                            frame, writer, planes,
-                        ),
-                    ),
+                    handle_tool_request_for_test_with_existing_planes(frame, writer, planes),
                 ),
             ),
         ),
-    )
+    ))
     .await
 }
 

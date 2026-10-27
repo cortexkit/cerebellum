@@ -15,7 +15,14 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v30.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v31.json");
+/// The digests of the v30 and v31 artifacts this build no longer ships but
+/// keeps as history: v30 adds the operator-app refusal, v31 adds the image
+/// handle.
+const V30_ARTIFACT_SHA256: &str =
+    "b0b9b5aab421dd5c5380ddfef0580168f485af8bc44a3b7991898b96d144a906";
+const V31_ARTIFACT_SHA256: &str =
+    "bfd49ebcfc9166f1ed41754ea7b9a18606567e046c1c2f6e8a9bce1ba2d07943";
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -115,6 +122,22 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
             )
         {
             assert_eq!(hex_digest(&bytes), V13_ARTIFACT_SHA256);
+            continue;
+        }
+        // Every other revision's artifact is history too, and is pinned the
+        // same way rather than read as a live mirror: only the newest file
+        // may name the current revision.
+        if path.starts_with("crates/cerebellum-computer/resources/computer_action_vocabulary")
+            && !path.ends_with(format!("{COMPUTER_ACTION_VOCABULARY_REVISION}.json").as_str())
+        {
+            let expected = if path.ends_with("v30.json") {
+                V30_ARTIFACT_SHA256
+            } else if path.ends_with("v31.json") {
+                V31_ARTIFACT_SHA256
+            } else {
+                panic!("{path} is a vocabulary artifact with no pinned digest")
+            };
+            assert_eq!(hex_digest(&bytes), expected, "{path}");
             continue;
         }
         for (offset, _) in bytes
@@ -1965,7 +1988,7 @@ fn v30_only_adds_the_operator_app_refusal_to_the_recreated_v29() {
 #[test]
 fn v30_changes_only_the_outcomes() {
     let previous = recreated_v29();
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let current = recreated_v30();
     let previous_rows = previous["rows"].as_array().unwrap();
     let current_rows = current["rows"].as_array().unwrap();
     assert_eq!(previous_rows.len(), current_rows.len());

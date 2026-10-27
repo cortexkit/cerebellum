@@ -111,7 +111,6 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
     rx.recv().await.unwrap()
 }
 
-
 fn route_identity() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
         &BindIdentity::new("/test/project", "test", "test-session".to_string()),
@@ -10271,12 +10270,15 @@ async fn an_own_browser_screenshot_carries_a_resolvable_handle() {
         .as_str()
         .unwrap_or_else(|| panic!("no handle on the screenshot: {reply}"))
         .to_owned();
-    let shown =
-        cerebellum_core::serde_base64::decode(reply["image"]["data_b64"].as_str().unwrap())
-            .unwrap();
+    let shown = cerebellum_core::serde_base64::decode(reply["image"]["data_b64"].as_str().unwrap())
+        .unwrap();
     let resolved = planes
         .image_handle_store()
-        .resolve(&handle, &["screenshot-scope"], cerebellum::wall_clock_ms_for_test())
+        .resolve(
+            &handle,
+            &["screenshot-scope"],
+            cerebellum::wall_clock_ms_for_test(),
+        )
         .unwrap_or_else(|| panic!("the handle did not resolve"));
     let head_length = u32::from_be_bytes(resolved.body[..4].try_into().unwrap()) as usize;
     let head: Value = serde_json::from_slice(&resolved.body[4..4 + head_length]).unwrap();
