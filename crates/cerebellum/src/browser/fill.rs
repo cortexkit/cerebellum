@@ -315,14 +315,14 @@ impl FillRefusal {
 
     pub(super) fn remedy(self) -> &'static str {
         match self {
-            Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh browser.snapshot",
+            Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh snapshot",
             Self::LoginUnavailable => "this agent cannot use a saved login of that name on this site; check the name with the person, or ask them to share the login with this agent for this site",
             Self::VaultUnavailable => "the vault could not be reached; retry later, and report it if it persists",
             Self::Aborted { .. } => "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
-            Self::FilledPasswordOnPage => "read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself",
+            Self::FilledPasswordOnPage => "take a snapshot to read this page instead; screenshots are refused until you reload or navigate the page itself",
             Self::WindowExpired => "reload or navigate the page itself before reading it again",
-            Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
-            Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call browser.fill_login again when the person is available",
+            Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call fill_login again only if they change their mind",
+            Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call fill_login again when the person is available",
             Self::ApprovalServiceRefused(_) => "the dedicated vault approval could not be filed; update Cingulate or report the refusal before retrying",
         }
     }
@@ -1723,6 +1723,53 @@ mod tests {
         assert!(observation.records[0].value.is_none());
         assert_eq!(observation.records[1].name, "unrelated");
         assert!(observation.refs[0].captured.name.is_empty());
+    }
+
+    /// Agents call the fill through the flat `browser_use` tool, so a fill
+    /// remedy names its flat actions (snapshot, fill_login) and never a
+    /// granular capability such as `browser.snapshot`.
+    #[test]
+    fn fill_remedies_name_flat_actions() {
+        let refusals = [
+            FillRefusal::Origin {
+                field: "otp_ref",
+                reason_code: "origins_differ",
+            },
+            FillRefusal::LoginUnavailable,
+            FillRefusal::VaultUnavailable,
+            FillRefusal::Aborted {
+                reason_code: "document_changed",
+            },
+            FillRefusal::FilledPasswordOnPage,
+            FillRefusal::WindowExpired,
+            FillRefusal::ApprovalNotGiven {
+                decision: "declined",
+                asked: true,
+            },
+            FillRefusal::ApprovalNotGiven {
+                decision: "timeout",
+                asked: false,
+            },
+            FillRefusal::ApprovalServiceRefused(
+                crate::cingulate_client::desk::SecretUseRefusal::MissingCapability,
+            ),
+        ];
+        for refusal in refusals {
+            assert!(
+                !refusal.remedy().contains("browser."),
+                "{refusal:?}: {}",
+                refusal.remedy()
+            );
+        }
+        assert!(FillRefusal::FilledPasswordOnPage
+            .remedy()
+            .starts_with("take a snapshot"));
+        assert!(FillRefusal::ApprovalNotGiven {
+            decision: "declined",
+            asked: true,
+        }
+        .remedy()
+        .contains("call fill_login again"));
     }
 
     #[test]

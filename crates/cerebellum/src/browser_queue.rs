@@ -132,7 +132,7 @@ struct SessionCall {
 /// Capabilities that drive the session's browser. Other calls that share
 /// the lane (launch, grants, the person's own browser) are not refused for a
 /// quarantined session.
-const SESSION_CAPABILITIES: [&str; 12] = [
+const SESSION_CAPABILITIES: [&str; 13] = [
     crate::browser::NAVIGATE,
     crate::browser::SNAPSHOT,
     crate::browser::CLICK,
@@ -141,6 +141,7 @@ const SESSION_CAPABILITIES: [&str; 12] = [
     crate::browser::SCROLL,
     crate::browser::CLICK_POINT,
     crate::browser::WAIT_FOR,
+    crate::browser::fill::FILL_LOGIN,
     crate::browser_session::BROWSER_CLOSE,
     crate::management::PRESENT,
     crate::management::RESUME,
@@ -477,6 +478,20 @@ mod tests {
     use super::*;
     use crate::call_queue::ConversationQueue;
 
+    /// A queue refusal is certified against the refused capability's own
+    /// result schema: the fill's, or the advertised browser vocabulary's.
+    fn validate(
+        capability: &str,
+        body: &Value,
+    ) -> Result<(), cerebellum_computer::platform::vocabulary::CapabilityResultValidationError>
+    {
+        if capability == crate::browser::fill::FILL_LOGIN {
+            crate::browser::fill::validate_fill_login_result(body)
+        } else {
+            crate::browser::validate_browser_result(capability, body)
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stuck_browser_holder_expires_queued_call_without_dispatch() {
         assert_eq!(QUEUE_WAIT_LIMIT, Duration::from_secs(180));
@@ -537,6 +552,7 @@ mod tests {
             crate::browser::TYPE,
             crate::browser::SCREENSHOT,
             crate::browser::CLICK_POINT,
+            crate::browser::fill::FILL_LOGIN,
             crate::browser_session::BROWSER_CLOSE,
         ] {
             assert_eq!(plane_capability(capability), Some((capability, true)));
@@ -550,7 +566,7 @@ mod tests {
                 assert_eq!(refusal.code(), "target_busy");
                 let (named, body) = refusal.response_body().unwrap();
                 assert_eq!(named, capability);
-                crate::browser::validate_browser_result(capability, &body)
+                validate(capability, &body)
                     .unwrap_or_else(|error| panic!("{capability}: {error} in {body}"));
                 assert_eq!(body["outcome"], "target_busy");
                 assert_eq!(body["detail"]["dispatched"], false);
@@ -591,7 +607,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("nothing was dispatched"));
-            crate::browser::validate_browser_result(capability, &body)
+            validate(capability, &body)
                 .unwrap_or_else(|error| panic!("{capability}: {error} in {body}"));
         }
     }

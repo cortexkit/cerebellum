@@ -7396,7 +7396,9 @@ async fn handle_tool_request_inner(
     // Admitted routes may proceed to their handlers; denied routes perform no
     // reservation, context lookup, grant lookup, or CDP work.
     // `browser.fill_login` is served only by a plane that was given a source
-    // of login material, which no plane built for a running module is yet.
+    // of login material. With the rollout switch on, startup gives a running
+    // module's plane the live vault source; planes built for tests get none
+    // unless a test installs one.
     let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some())
         .or_else(|| {
             browser::fill::admitted(name, &planes.browser, planes.browser_config.is_some())
@@ -8734,7 +8736,14 @@ async fn send_queue_refusal(
             body["browser"] = json!("user");
             return send_tool_response(writer, ver, channel, epoch, corr, body).await;
         }
-        if let Ok(body) = planes.browser.finish_reply(capability, body) {
+        // A login fill has its own result schema, outside the advertised
+        // browser vocabulary, so its refusal is certified against that.
+        let finished = if capability == browser::fill::FILL_LOGIN {
+            planes.browser.finish_fill_reply(body)
+        } else {
+            planes.browser.finish_reply(capability, body)
+        };
+        if let Ok(body) = finished {
             return send_tool_response(writer, ver, channel, epoch, corr, body).await;
         }
     }

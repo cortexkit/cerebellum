@@ -1297,7 +1297,7 @@ mod tests {
         let refusal = |outcome: &str, remedy: &str, detail: Value| json!({"outcome": outcome, "remedy": remedy, "detail": detail, "context": context});
         let screenshot_refused = refusal(
             "authorization_denied",
-            "read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself",
+            "take a snapshot to read this page instead; screenshots are refused until you reload or navigate the page itself",
             json!({"reason_code": "filled_password_on_page", "reason": "a filled password is on this page"}),
         );
         let window_expired = refusal(
@@ -1320,7 +1320,7 @@ mod tests {
             (
                 refusal(
                     "authorization_denied",
-                    "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh browser.snapshot",
+                    "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh snapshot",
                     json!({"field": "otp_ref", "reason_code": "origins_differ"}),
                 ),
                 vec!["Authorization denied.", "Field otp_ref: origins differ."],
@@ -1352,7 +1352,7 @@ mod tests {
             (
                 refusal(
                     "authorization_denied",
-                    "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
+                    "the person did not approve using this saved login; call fill_login again only if they change their mind",
                     json!({"reason_code": "login_approval_not_given", "decision": "declined"}),
                 ),
                 vec!["Reason: login approval not given."],
@@ -1369,7 +1369,7 @@ mod tests {
                 screenshot_refused,
                 vec![
                     "Authorization denied.",
-                    "Read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself.",
+                    "Take a snapshot to read this page instead; screenshots are refused until you reload or navigate the page itself.",
                     "Reason: a filled password is on this page.",
                 ],
             ),
