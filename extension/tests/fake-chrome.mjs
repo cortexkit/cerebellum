@@ -18,10 +18,13 @@ export function fakeChrome() {
   const tabData = new Map([[1, { id: 1, windowId: 3, groupId: -1, active: true }], [2, { id: 2, windowId: 3, groupId: -1, active: false }]]);
   const groups = new Map();
   const store = {};
+  const localStore = {};
   const observations = new Map();
   const sentinels = new Map();
   let nextDocument = 0;
   let nextTab = 10;
+  // Chrome gives every new group a fresh id; the first one here is 7.
+  let nextGroup = 7;
   const ports = [];
   const chrome = {
     calls, tabData, groups, observations, ports, sentinels,
@@ -36,7 +39,18 @@ export function fakeChrome() {
         return port;
       },
     },
-    storage: { session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } } },
+    storage: {
+      session: { async get(key) { return { [key]: store[key] }; }, async set(value) { Object.assign(store, value); } },
+      local: {
+        async get(key) { return { [key]: structuredClone(localStore[key]) }; },
+        async set(value) { Object.assign(localStore, structuredClone(value)); },
+        async remove(key) { delete localStore[key]; },
+      },
+    },
+    localStore,
+    // Chrome clears storage.session when the extension is reloaded, updated or
+    // disabled, and when the browser restarts; storage.local stays.
+    clearSession() { for (const key of Object.keys(store)) delete store[key]; },
     permissions: { async contains(options) { calls.push(["hostPermission", options]); return true; } },
     tabs: {
       onUpdated: new Event(), onMoved: new Event(), onRemoved: new Event(), onReplaced: new Event(), onActivated: new Event(), onCreated: new Event(),
@@ -55,7 +69,7 @@ export function fakeChrome() {
         return { ...tab };
       },
       async group({ tabIds, groupId }) {
-        const id = groupId ?? 7;
+        const id = groupId ?? nextGroup++;
         if (!groups.has(id)) groups.set(id, { id, windowId: tabData.get(tabIds[0]).windowId });
         for (const tabId of tabIds) {
           tabData.get(tabId).groupId = id; tabData.get(tabId).windowId = groups.get(id).windowId;

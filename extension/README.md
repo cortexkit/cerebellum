@@ -23,7 +23,14 @@ logging, page-text persistence or background debugger attachment.
    immediately; stale handles/input refuse. Hand-over never activates another tab.
 
 Only the recorded group id is trusted; renaming another group to Agent does not
-make it eligible. The extension does not list/read/drive outside tab contents.
+make it eligible. The group record lives in `chrome.storage.session`, which Chrome
+clears when the extension is reloaded or updated, and a copy in `chrome.storage.local`.
+After a reload the extension re-adopts its own group only if the recorded id,
+window, title (Agent), colour (blue) and at least one recorded member tab still
+match; its members come back as unclaimed handed tabs with new handles. A record
+that does not match is deleted and the group is left alone. A browser start
+discards the record, because ids restart then; tabs must be handed over again.
+The extension does not list/read/drive outside tab contents.
 It remembers only active tab/window **ids** for the popup exception below. It
 refuses hand-over across windows rather than moving the person's active tab;
 move a tab into the Agent group's window first. Agent-created tabs open with

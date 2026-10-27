@@ -1,6 +1,12 @@
 import { Refusal } from "./errors.mjs";
 
 const STORAGE_KEY = "agentGroup";
+// chrome.storage.session is cleared when the extension is reloaded, updated
+// or disabled, so a copy of the group record also lives in storage.local.
+// It lets a reloaded extension recognise the Agent group it made before.
+const LOCAL_KEY = "agentGroupRecord";
+const GROUP_TITLE = "Agent";
+const GROUP_COLOR = "blue";
 
 export class AgentTabs {
   constructor(chrome, onWithdraw = () => {}, onAdopt = async () => {}) {
@@ -13,11 +19,16 @@ export class AgentTabs {
     this.creations = new Set();
     this.joining = new Set();
     this.adopting = new Map();
+    this.browserStarted = false;
+    this.readopted = false;
     this.ready = this.restore();
   }
 
   async restore() {
     const saved = (await this.chrome.storage.session.get(STORAGE_KEY))[STORAGE_KEY];
+    // Only a session store that was never written means a fresh extension
+    // load; an explicit null means this load already has no group.
+    if (saved === undefined) return this.readopt();
     if (!saved) return;
     try {
       const group = await this.chrome.tabGroups.get(saved.id);
@@ -32,11 +43,68 @@ export class AgentTabs {
     }
   }
 
+  // Re-adopt, after an extension reload, the Agent group this extension made
+  // before. Group, window and tab ids are unique only within one browser run,
+  // so the record is accepted only if the group still has the recorded id,
+  // window, title and colour, and still holds at least one tab the record
+  // names. A browser start discards the record (see startedBrowser), because
+  // ids restart and a person's own group could then match it by chance.
+  // Handover survives the reload, claims do not: every current member
+  // becomes an unclaimed handed tab with a new handle, including a tab the
+  // person dragged in while the extension was down. A record that does not
+  // match is deleted; the group it named is the person's and is left alone.
+  async readopt() {
+    const record = (await this.chrome.storage.local.get(LOCAL_KEY))[LOCAL_KEY];
+    if (!record) return;
+    let members = [];
+    try {
+      const group = await this.chrome.tabGroups.get(record.id);
+      if (group.windowId === record.windowId && group.title === GROUP_TITLE && group.color === GROUP_COLOR) {
+        members = await this.chrome.tabs.query({ groupId: record.id, windowId: record.windowId });
+      }
+    } catch { members = []; }
+    const recorded = new Set(Array.isArray(record.members) ? record.members : []);
+    if (this.browserStarted || !members.some(tab => recorded.has(tab.id))) {
+      this.adoptionDecision("none", "reload", this.browserStarted ? "browser_started" : "record_mismatch");
+      await this.chrome.storage.local.remove(LOCAL_KEY);
+      return;
+    }
+    this.group = { id: record.id, windowId: record.windowId };
+    this.readopted = true;
+    for (const tab of members) this.tabs.set(tab.id, { handle: crypto.randomUUID(), kind: "handed" });
+    this.adoptionDecision("none", "reload", "readopted_group");
+    await this.save();
+  }
+
+  // Called on chrome.runtime.onStartup. After a browser start the stored
+  // record's ids may name a different group, so it is discarded, and a group
+  // re-adopted from it in this worker before the event arrived is dropped
+  // again without touching the group itself.
+  async startedBrowser() {
+    this.browserStarted = true;
+    await this.ready;
+    if (this.readopted) {
+      this.readopted = false;
+      for (const tabId of [...this.tabs.keys()]) this.withdraw(tabId);
+      this.group = null;
+      await this.save();
+    }
+    await this.chrome.storage.local.remove(LOCAL_KEY);
+  }
+
   async save() {
-    await this.chrome.storage.session.set({ [STORAGE_KEY]: this.group && {
-      ...this.group,
-      kinds: Object.fromEntries([...this.tabs].map(([id, tab]) => [id, tab.kind])),
-    } });
+    // Written on every membership change, so the stored record never names
+    // a tab the person has taken back.
+    const members = [...this.tabs.keys()];
+    await Promise.all([
+      this.chrome.storage.session.set({ [STORAGE_KEY]: this.group && {
+        ...this.group,
+        kinds: Object.fromEntries([...this.tabs].map(([id, tab]) => [id, tab.kind])),
+      } }),
+      this.group
+        ? this.chrome.storage.local.set({ [LOCAL_KEY]: { ...this.group, members } })
+        : this.chrome.storage.local.remove(LOCAL_KEY),
+    ]);
   }
 
   async eligible(tabId) {
@@ -71,7 +139,7 @@ export class AgentTabs {
     if (this.group && joining.windowId !== this.group.windowId) throw new Refusal("agent_group_other_window", "move the tab to the Agent group's window before handing it over");
     if (!this.group) {
       const id = await this.chrome.tabs.group({ tabIds: [tabId] });
-      const group = await this.chrome.tabGroups.update(id, { title: "Agent", color: "blue" });
+      const group = await this.chrome.tabGroups.update(id, { title: GROUP_TITLE, color: GROUP_COLOR });
       this.group = { id, windowId: group.windowId };
     } else {
       await this.chrome.tabs.group({ groupId: this.group.id, tabIds: [tabId] });

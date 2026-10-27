@@ -42,7 +42,11 @@ export function start(chrome) {
   };
   chrome.runtime.onInstalled.addListener(() => { void menu().catch(() => {}); });
   chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === "agent-reconnect") bridge.connect(); });
-  chrome.runtime.onStartup.addListener(() => bridge.connect());
+  chrome.runtime.onStartup.addListener(() => {
+    // A browser start invalidates the stored Agent group record (tabs.mjs).
+    void tabs.startedBrowser().catch(() => {});
+    bridge.connect();
+  });
   void tabs.ready.then(async () => {
     // Remember ids so a script popup that steals focus can return the person to
     // their previous tab/window. No outside URL, title or page text is retained.
