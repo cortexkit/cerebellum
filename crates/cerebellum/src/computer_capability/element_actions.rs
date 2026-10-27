@@ -1140,8 +1140,54 @@ pub(crate) enum PersonWatch<'a> {
     Watched(&'a mut dyn FnMut() -> bool),
 }
 
+/// The element an action pressed, watched while the settle waits.
+///
+/// Some applications show a press on the pressed element itself a frame or
+/// two after they redraw something else (a tab's value turns true after the
+/// focus moved). Watching the element's own line lets the settle wait for
+/// that, rather than stopping at the first redraw and replying before the
+/// press shows.
+#[derive(Clone, Copy)]
+pub(crate) struct PressedElement<'a> {
+    /// The element's id in the conversation's session, which names its line
+    /// in the read taken before the press.
+    pub(crate) element_id: &'a str,
+    pub(crate) handle: &'a ElementHandle,
+}
+
+/// How far an action reply's "no change" can be trusted when its diff shows
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyDiff {
+    /// The settle ran its whole bound without seeing a difference, and the
+    /// last read was complete and equal to the read before the action.
+    Confirmed,
+    /// The settle stopped early on a difference the diff does not show, or
+    /// its last read was partial: the effect may still be arriving.
+    Unconfirmed,
+    /// The pressed element's own line changed, but the read the diff comes
+    /// from does not show its new line.
+    PressedElementChanged,
+}
+
+/// What a settle saw after an action: the read the reply's diff comes from,
+/// and how far an empty diff in it can be trusted.
+#[derive(Debug, Clone)]
+pub(crate) struct SettledView {
+    pub(crate) read: SessionRead,
+    pub(crate) empty_diff: EmptyDiff,
+}
+
 /// Wait for an effect without moving the baseline during polling. Only the
-/// final read becomes the baseline and the conversation's last-seen focus.
+/// final read becomes the baseline and the conversation's last-seen focus,
+/// so the reply's diff is always against the read taken before the action.
+///
+/// Without a pressed element to watch, the settle stops at the first read
+/// that differs from that baseline. With one whose line the baseline holds,
+/// it reads that element alone before each whole read, stops as soon as the
+/// element's own line has changed, and otherwise stops on a difference only
+/// once two reads in a row show the same tree: a redraw elsewhere can come a
+/// frame before the press shows on the element.
 ///
 /// With [`PersonWatch::Watched`], the settle returns without another read
 /// once the person has acted. There is no final diff after interruption: an
@@ -1151,6 +1197,7 @@ pub(crate) enum PersonWatch<'a> {
 /// four-second read budget, and a read that stops at that bound is partial:
 /// it is neither shown nor adopted as the baseline, and the settle returns
 /// `None` (no diff) rather than a wrong diff.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn settle_and_observe_view(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
@@ -1159,18 +1206,32 @@ pub(crate) fn settle_and_observe_view(
     bound: Duration,
     expand_menus: bool,
     mut watch: PersonWatch<'_>,
-) -> Option<SessionRead> {
+    pressed: Option<PressedElement<'_>>,
+) -> Option<SettledView> {
     let deadline = Instant::now() + bound;
     let watched = matches!(watch, PersonWatch::Watched(_));
     let mut person_acted = || match &mut watch {
         PersonWatch::NotWatched => false,
         PersonWatch::Watched(acted) => acted(),
     };
+    let before = sessions.latest(conversation_key, grant);
+    let had_baseline = before.is_some();
+    // The pressed element's line in the read before the press. Without it
+    // there is nothing to compare the element against, so it is not watched.
+    let pressed_before = pressed.and_then(|pressed| {
+        let line = line_signature(&before.as_ref()?.roots, pressed.element_id)?;
+        Some((pressed, line))
+    });
+    let mut previous_tree: Option<Vec<(u64, String)>> = None;
     loop {
         let interrupted = person_acted();
         if interrupted {
             return None;
         }
+        let pressed_changed = pressed_before.as_ref().is_some_and(|(pressed, line)| {
+            pressed_line_now(source, grant, pressed.handle, deadline)
+                .is_some_and(|now| now != *line)
+        });
         let seen = SeenMarks::read(source, grant);
         let bounds = if watched {
             ReadBounds {
@@ -1194,19 +1255,107 @@ pub(crate) fn settle_and_observe_view(
             // adopted as before.
             Ok(read) if watched && read.read_bound_reached => return None,
             Ok(read) => {
-                if Instant::now() >= deadline
-                    || sessions.differs_from_baseline(conversation_key, grant, &read)
-                {
+                let at_deadline = Instant::now() >= deadline;
+                let differs = sessions.differs_from_baseline(conversation_key, grant, &read);
+                let tree = pressed_before.is_some().then(|| tree_lines(&read));
+                let stopped_changing = differs && tree.is_some() && tree == previous_tree;
+                let done = at_deadline
+                    || pressed_changed
+                    || if pressed_before.is_some() {
+                        stopped_changing
+                    } else {
+                        differs
+                    };
+                if done {
                     let observed = sessions.observe(conversation_key, grant, &read);
                     sessions.remember_seen(conversation_key, grant, seen);
-                    return Some(observed);
+                    let pressed_shown = pressed_before.as_ref().is_some_and(|(pressed, _)| {
+                        let id = pressed.element_id;
+                        observed.diff.changed.iter().any(|changed| changed == id)
+                            || observed.diff.added.iter().any(|added| added == id)
+                    });
+                    let empty_diff = if pressed_changed && !pressed_shown {
+                        EmptyDiff::PressedElementChanged
+                    } else if !read.is_complete() {
+                        EmptyDiff::Unconfirmed
+                    } else if !had_baseline {
+                        // With no earlier read the diff is empty by
+                        // construction; a complete read is all there is.
+                        EmptyDiff::Confirmed
+                    } else if at_deadline && !differs && !pressed_changed {
+                        EmptyDiff::Confirmed
+                    } else {
+                        EmptyDiff::Unconfirmed
+                    };
+                    return Some(SettledView {
+                        read: observed,
+                        empty_diff,
+                    });
                 }
+                previous_tree = tree;
             }
             // Nothing could be read, so nothing is known about what changed.
             Err(_) => return None,
         }
         std::thread::sleep(SETTLE_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
+}
+
+/// The line signature an element had in a read, found by its id.
+fn line_signature(
+    roots: &[cerebellum_computer::app_state::render::ObservedNode],
+    element_id: &str,
+) -> Option<String> {
+    let mut stack: Vec<_> = roots.iter().collect();
+    while let Some(node) = stack.pop() {
+        if node.element_id.as_deref() == Some(element_id) {
+            return Some(node.description.signature());
+        }
+        stack.extend(&node.children);
+    }
+    None
+}
+
+/// The pressed element's line as it reads now, from a read of that element
+/// alone (no children), bounded by the time left in the settle. `None` when
+/// the time is up or the element cannot be read.
+fn pressed_line_now(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
+    handle: &ElementHandle,
+    deadline: Instant,
+) -> Option<String> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return None;
+    }
+    let bounds = ReadBounds {
+        max_elements: 1,
+        max_depth: 0,
+        timeout,
+    };
+    let read = source
+        .read_element_state(grant, handle, bounds, false)
+        .ok()?;
+    let element = read.roots.first()?;
+    Some(cerebellum_computer::app_state::render::describe(element).signature())
+}
+
+/// Every element of a read with its line, in reading order: two reads with
+/// the same lines show the same tree, so the application has stopped
+/// changing between them.
+fn tree_lines(read: &cerebellum_computer::app_state::source::RawAppState) -> Vec<(u64, String)> {
+    let mut lines = Vec::new();
+    let mut stack: Vec<_> = read.roots.iter().rev().collect();
+    while let Some(element) = stack.pop() {
+        lines.push((
+            element.handle.identity_hash(),
+            cerebellum_computer::app_state::render::describe(element).signature(),
+        ));
+        stack.extend(element.children.iter().rev());
+    }
+    lines.push((read.unreadable_subtrees as u64, String::new()));
+    lines
 }
 
 /// What an action reply says when the application could not be read after
@@ -1216,24 +1365,43 @@ const DIFF_UNREADABLE: &str =
     "The application could not be read after the action, so what changed is unknown; \
      read_state to see its state.\n";
 
+/// The line the read grammar gives a diff with nothing in it. Kept only when
+/// the settle confirmed it ([`EmptyDiff::Confirmed`]).
+pub(crate) const NO_CHANGE_SEEN: &str = "No change seen since the last read.\n";
+
+/// What an empty diff says instead when the settle could not confirm that
+/// nothing changed: it stopped on a difference the diff does not show, or
+/// its last read was partial.
+pub(crate) const CHANGE_UNCONFIRMED: &str =
+    "No change confirmed yet: the application was still updating, or could not be read in \
+     full, when this reply was taken, so the action's effect may not show here yet. \
+     read_state again before acting or pressing again.\n";
+
+/// What a reply adds when the pressed element's own line changed but the
+/// read its diff comes from does not show the new line.
+pub(crate) const PRESSED_ELEMENT_CHANGED: &str =
+    "The pressed element's own state changed, but the read after the press did not show \
+     its new line. read_state to see it before acting or pressing again.\n";
+
 /// Add what an action changed to its reply, as text in the read grammar,
 /// with the cap's disclosure, the focused element and how much of the read
 /// behind it could not be opened.
 #[cfg(test)]
-pub(crate) fn add_diff(reply: &mut Value, observed: Option<&SessionRead>) {
+pub(crate) fn add_diff(reply: &mut Value, observed: Option<&SettledView>) {
     add_diff_view(reply, observed, &super::StateView::default());
 }
 
 pub(crate) fn add_diff_view(
     reply: &mut Value,
-    observed: Option<&SessionRead>,
+    settled: Option<&SettledView>,
     view: &super::StateView,
 ) {
-    let Some(observed) = observed else {
+    let Some(settled) = settled else {
         reply[STATE_TEXT_FIELD] = json!(DIFF_UNREADABLE);
         reply["unreadable_subtrees"] = json!(1);
         return;
     };
+    let observed = &settled.read;
     use cerebellum_computer::app_state::render::{render_change_report, StateHeader};
     let rendered = render_change_report(
         &StateHeader {
@@ -1247,7 +1415,24 @@ pub(crate) fn add_diff_view(
     if view.zoom.is_some() {
         reply["zoom_found"] = json!(rendered.zoom_found);
     }
-    reply[STATE_TEXT_FIELD] = json!(rendered.text);
+    let mut text = rendered.text;
+    if rendered.kind == "diff" {
+        // "No change seen" is a claim that the read after the action equals
+        // the read before it; it stays only where the settle confirmed that.
+        let empty = text.starts_with(NO_CHANGE_SEEN);
+        match (settled.empty_diff, empty) {
+            (EmptyDiff::Confirmed, _) => {}
+            (EmptyDiff::Unconfirmed, true) => {
+                text.replace_range(..NO_CHANGE_SEEN.len(), CHANGE_UNCONFIRMED);
+            }
+            (EmptyDiff::PressedElementChanged, true) => {
+                text.replace_range(..NO_CHANGE_SEEN.len(), PRESSED_ELEMENT_CHANGED);
+            }
+            (EmptyDiff::PressedElementChanged, false) => text.push_str(PRESSED_ELEMENT_CHANGED),
+            (EmptyDiff::Unconfirmed, false) => {}
+        }
+    }
+    reply[STATE_TEXT_FIELD] = json!(text);
     if let Some(truncation) = rendered.truncation {
         reply["truncation"] = json!({
             "reason": truncation.reason.as_str(),
@@ -1409,6 +1594,9 @@ where
         let mut reply = json!({"outcome":"completed"});
         let mut acted = false;
         let mut unreadable = false;
+        // Whether any step's own settle left its effect unconfirmed: the
+        // combined diff below can then not claim that nothing changed either.
+        let mut step_empty_diff = EmptyDiff::Confirmed;
         // A batch brings its application forward at most once: the step that
         // needs it fronts, presses the rest of the batch with the application
         // in front, and makes one restore decision after the last of them.
@@ -1469,6 +1657,15 @@ where
                 let success = reply["outcome"] == "completed";
                 acted |= success;
                 unreadable |= success && reply[STATE_TEXT_FIELD] == DIFF_UNREADABLE;
+                let step_text = reply[STATE_TEXT_FIELD].as_str().unwrap_or_default();
+                if success && step_text.contains(PRESSED_ELEMENT_CHANGED) {
+                    step_empty_diff = EmptyDiff::PressedElementChanged;
+                } else if success
+                    && step_text.starts_with(CHANGE_UNCONFIRMED)
+                    && step_empty_diff == EmptyDiff::Confirmed
+                {
+                    step_empty_diff = EmptyDiff::Unconfirmed;
+                }
                 steps.push(json!({
                     "step": step + 1,
                     "element_id": parsed.element_ids[step],
@@ -1494,7 +1691,19 @@ where
                     after
                 };
                 reply.as_object_mut().unwrap().remove("truncation");
-                add_diff_view(&mut reply, Some(&combined), &parsed.view);
+                let empty_diff = if step_empty_diff == EmptyDiff::Confirmed && !combined.complete {
+                    EmptyDiff::Unconfirmed
+                } else {
+                    step_empty_diff
+                };
+                add_diff_view(
+                    &mut reply,
+                    Some(&SettledView {
+                        read: combined,
+                        empty_diff,
+                    }),
+                    &parsed.view,
+                );
             }
         }
         reply["steps"] = json!(steps);
@@ -1840,6 +2049,7 @@ where
                     settle,
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                     PersonWatch::NotWatched,
+                    None,
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
@@ -2201,6 +2411,10 @@ where
                         view.zoom.as_deref(),
                     ),
                     PersonWatch::NotWatched,
+                    Some(PressedElement {
+                        element_id: &element_id,
+                        handle: &handle,
+                    }),
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }

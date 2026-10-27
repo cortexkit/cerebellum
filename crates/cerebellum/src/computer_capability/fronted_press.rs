@@ -174,7 +174,7 @@ where
     /// reports `PersonCheckUnreadable`; this says which stop it was.
     never_read: bool,
     press_replies: Vec<Option<Value>>,
-    observed: Vec<Option<SessionRead>>,
+    observed: Vec<Option<SettledView>>,
     /// A settle ended on the person's input, so the conversation's last-seen
     /// marks must stay from before it.
     person_input_in_settle: bool,
@@ -397,6 +397,10 @@ where
             self.grant,
         );
         let expand_menus = self.expand_menus;
+        // Copied out of the host so the person check below can borrow the
+        // host mutably while the pressed step is held.
+        let steps = self.steps;
+        let pressed = &steps[step];
         let mut acted = false;
         let observed = settle_and_observe_view(
             source,
@@ -408,6 +412,10 @@ where
             PersonWatch::Watched(&mut || {
                 acted = acted || person_acted(self);
                 acted
+            }),
+            Some(PressedElement {
+                element_id: &pressed.element_id,
+                handle: &pressed.handle,
             }),
         );
         self.observed[step] = observed;

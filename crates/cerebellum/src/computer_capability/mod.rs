@@ -99,6 +99,8 @@ mod fronting;
 mod fronting_tests;
 pub mod image_freshness;
 pub(crate) mod operator_confirm;
+#[cfg(test)]
+mod settle_tests;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
 use read_image::ImageReadPlan;
@@ -2759,6 +2761,7 @@ where
                     settle,
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                     element_actions::PersonWatch::NotWatched,
+                    None,
                 );
                 element_actions::add_diff_view(&mut finished, observed.as_ref(), &view);
                 finished
