@@ -2390,3 +2390,44 @@ pub fn v29_from_v28(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// The outcome v30 appends to every row but `list_apps`: the action was
+/// aimed at an application no agent may use.
+pub const AUTHORIZATION_DENIED: &str = "authorization_denied";
+
+/// What v30 appends to each of those rows' outcome description, separated
+/// from the existing text by one space.
+pub const OPERATOR_APP_BLOCKED_DESCRIPTION: &str = "authorization_denied with reason operator_app_blocked means the target is an application that confirms the person's own actions, such as the Alfonso app or iPhone Mirroring, which no agent may read or act in; nothing was read, posted or asked, and the person has to act in that application themselves.";
+
+/// Revision 30 refuses every action aimed at an application that confirms
+/// the person's own actions. A request from the Alfonso desktop app, or from
+/// the phone paired with it, counts as the person's own action only while no
+/// agent can drive those apps, so each row that names or reaches an
+/// application can answer `authorization_denied`, with `reason`
+/// `operator_app_blocked`, before any grant is looked up or anyone asked.
+/// `list_apps` leaves those applications out of its list instead, so it
+/// gains nothing.
+///
+/// Only `result_schema`s change, and inside them only the `outcome` enum and
+/// its description: no request schema, no row key and no other row field
+/// moves, so the advertised tool and `validate_row` do not change.
+pub fn v30_from_v29(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        if capability == "computer.list_apps" {
+            continue;
+        }
+        let outcome = &mut row["result_schema"]["properties"]["outcome"];
+        let choices = outcome["enum"].as_array_mut().unwrap();
+        assert!(
+            !choices.contains(&json!(AUTHORIZATION_DENIED)),
+            "{capability}"
+        );
+        choices.push(json!(AUTHORIZATION_DENIED));
+        let description = outcome["description"].as_str().unwrap();
+        outcome["description"] = json!(format!("{description} {OPERATOR_APP_BLOCKED_DESCRIPTION}"));
+    }
+    next
+}

@@ -304,7 +304,9 @@ mod wire {
             reply["outcome"], "not_running",
             "the live control must reach lookup: {reply}"
         );
-        assert_eq!(lookups, 1);
+        // The check for an application no agent may use resolves the
+        // target once before the action's own lookup does.
+        assert_eq!(lookups, 2);
     }
 
     #[tokio::test]

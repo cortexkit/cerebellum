@@ -105,6 +105,8 @@ mod keystrokes;
 mod open_app;
 #[cfg(test)]
 mod open_app_tests;
+mod operator_apps;
+pub use operator_apps::ExecutableReader;
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
@@ -510,9 +512,12 @@ pub struct ResultSchemaFinding {
     pub occurrences: u64,
 }
 
-/// The typed detail retained when the session floor refuses a key chord.
+/// The typed detail retained when the plane refuses a call before acting:
+/// the session floor refusing a key chord, or a call aimed at an application
+/// no agent may use.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerRefusalReason {
+    /// The refused chord; empty for a refusal that is not about a chord.
     pub chord: String,
     pub reason: String,
 }
@@ -548,6 +553,10 @@ where
     /// Where application state is read from: the platform's accessibility
     /// reader in a running module, a fixture in tests.
     app_state_source: Arc<dyn AppStateSource>,
+    /// How the executable a resolved process runs is read, for refusing the
+    /// applications no agent may use: the platform's reading in a running
+    /// module, a fixture in tests.
+    process_executable: ExecutableReader,
     launch_history: Arc<crate::open_app_history::LaunchHistory>,
     image_freshness_source: Arc<dyn ImageFreshnessSource>,
     result_schema_enforcement: ResultSchemaEnforcement,
@@ -673,6 +682,7 @@ where
             permissions: crate::default_computer_context().startup.permissions,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
+            process_executable: Arc::new(operator_apps::native_executable),
             launch_history: Arc::new(crate::open_app_history::LaunchHistory::in_memory()),
             image_freshness_source: Arc::new(NativeImageFreshnessSource),
             result_schema_enforcement,
@@ -801,6 +811,20 @@ where
     /// Read application state from `source` instead of the platform's reader.
     pub fn with_app_state_source(mut self, source: Arc<dyn AppStateSource>) -> Self {
         self.app_state_source = source;
+        self
+    }
+
+    /// Read the executable each resolved process runs through `reader`
+    /// instead of the platform, so a test can say which executable a
+    /// fixture process runs.
+    pub fn with_process_executable_reader(
+        mut self,
+        reader: impl Fn(&cerebellum_computer::platform::ProcessGrant) -> Option<String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.process_executable = Arc::new(reader);
         self
     }
 
@@ -1059,6 +1083,22 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(app_use::call_mode());
+                        // Before any action's own work: an application no
+                        // agent may use is refused here, ahead of every grant
+                        // lookup, question and read. After the screen-lock
+                        // refusal, which must come before any application is
+                        // resolved.
+                        if let Some(refused) =
+                            Box::pin(self.operator_app_refusal(capability, arguments, &context))
+                                .await
+                        {
+                            return match capability.0 {
+                                Served::Type | Served::Keys => synthetic_wire_envelope(
+                                    keystrokes::refused_before_posting(refused),
+                                ),
+                                _ => refused,
+                            };
+                        }
                         // Boxed where it is built: the match holds every
                         // action's future, and wrapping it unboxed in the
                         // call-front tracking would copy it into this block's
@@ -2857,11 +2897,18 @@ where
             Err(refusal) => return refusal,
         };
         let source = self.app_state_source.clone();
+        let executable = Arc::clone(&self.process_executable);
         let listed = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
             let mut running = source.running_apps()?;
             let mut installed = source
                 .installed_apps(std::time::Duration::from_secs(2).saturating_sub(start.elapsed()));
+            // The applications no agent may use are left out of the list
+            // rather than refusing all of it.
+            running.retain(|app| !operator_apps::running_app_blocked(app, &executable));
+            installed
+                .apps
+                .retain(|app| !operator_apps::installed_app_blocked(app));
             let filter = filter.as_deref();
             running.retain(|app| listed_by_filter(filter, &app.name, &app.bundle_identity));
             installed

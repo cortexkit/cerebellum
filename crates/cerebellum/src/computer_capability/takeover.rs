@@ -421,7 +421,7 @@ where
             .await
         {
             Ok(placed) => placed,
-            Err(refusal) => return refusal,
+            Err(refusal) => return self.placement_refused(grantee, &request, refusal).await,
         };
         let takeover = match management
             .computer_grants()
@@ -456,7 +456,7 @@ where
                     target = placed_target;
                     action = placed_action;
                 }
-                Err(refusal) => return refusal,
+                Err(refusal) => return self.placement_refused(grantee, &request, refusal).await,
             }
         }
         let admission = takeover.admission().clone();
@@ -486,6 +486,26 @@ where
             .await;
         admission.decorate(&mut reply);
         reply
+    }
+
+    /// A placement's refusal, recorded in the refusal ring when it refused
+    /// an application no agent may use, addressed as the request named it.
+    async fn placement_refused(
+        &self,
+        grantee: &str,
+        request: &TakeoverRequest,
+        refusal: Value,
+    ) -> Value {
+        if !super::operator_apps::is_refusal(&refusal) {
+            return refusal;
+        }
+        let claimed = match request {
+            TakeoverRequest::Move { image_id, .. } | TakeoverRequest::Drag { image_id, .. } => {
+                image_id
+            }
+            TakeoverRequest::Scroll { target, .. } => target,
+        };
+        self.operator_app_refused(grantee, claimed).await
     }
 
     /// The containment target of a request and the pointer action to post.
@@ -537,6 +557,7 @@ where
         let hit_management = Arc::clone(management);
         let hit_image = image.clone();
         let hit_points = desktop_points.clone();
+        let lookup = self.operator_lookup(management);
         let placed = tokio::task::spawn_blocking(move || {
             // The real pointer reaches whichever window is on top at a point,
             // which may be another window than the image shows, of this
@@ -551,7 +572,18 @@ where
                 hit_points
                     .iter()
                     .map(|point| {
+                        // The pointer lands in whichever application is
+                        // under the point, so that application is refused
+                        // here if no agent may use it, before its grant is
+                        // looked up.
                         application_under(source.as_ref(), &hit_management, &hit_image, *point)
+                            .and_then(|owner| {
+                                if lookup.process_blocked(&owner, Vec::new()) {
+                                    Err(super::operator_apps::refusal())
+                                } else {
+                                    Ok(owner)
+                                }
+                            })
                     })
                     .collect::<Vec<_>>()
             })
