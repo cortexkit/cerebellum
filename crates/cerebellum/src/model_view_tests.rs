@@ -185,7 +185,7 @@ async fn every_browser_action_reads_as_plain_words() {
         .expect("the snapshot call produced a tool result");
     assert_eq!(
         snapshot,
-        "No session.\nCall browser.launch, then retry the browser action.\nReason: no browser session is open."
+        "No session.\nLaunch the browser, then retry the browser action.\nReason: no browser session is open."
     );
     assert!(
         views.results.len() >= browser_calls().len() - 2,

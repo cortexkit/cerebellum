@@ -620,7 +620,7 @@ fn hash_only_registry_refuses_with_the_migration_reason_until_rebound_to_facts()
     assert!(
         wire["remedy"]
             .as_str()
-            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")),
+            .is_some_and(|remedy| remedy.contains("rebind_profile_root")),
         "{wire}"
     );
 

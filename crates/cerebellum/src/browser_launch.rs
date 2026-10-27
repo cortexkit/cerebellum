@@ -647,11 +647,11 @@ impl RecoveryPendingReason {
             Self::TerminationFailed | Self::GenerationUnobservable => {
                 "a browser from before the module restarted may still be running on this \
                  profile; the next module start retries; if it persists, an operator can clear \
-                 it with browser.clear_launch_recovery"
+                 it with clear_launch_recovery"
             }
             Self::AttestationUntrusted => {
                 "the module can't prove a browser from before its restart is gone; an operator \
-                 must check and clear it with browser.clear_launch_recovery"
+                 must check and clear it with clear_launch_recovery"
             }
         }
     }
@@ -4984,7 +4984,7 @@ impl BrowserLaunchOutcome {
             Self::RegistryProfileBusy => json!({
                 "outcome": "profile_busy",
                 "reason_code": "registry_profile_busy",
-                "remedy": "the profile registry still has an attachment whose owner is live or cannot be proven gone; close its browser session, or have an operator check supervisor liveness and custody journal access, then retry browser.launch",
+                "remedy": "the profile registry still has an attachment whose owner is live or cannot be proven gone; close its browser session, or have an operator check supervisor liveness and custody journal access, then launch the browser to retry",
             }),
             Self::ResourceBusy { detail } => {
                 detail
@@ -5058,7 +5058,7 @@ mod profile_registry_outcome_tests {
         assert_eq!(
             replaced["remedy"],
             "the browser root directory was replaced or restored (its inode differs from the \
-             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             recorded one); run rebind_profile_root to re-identify it; that operation \
              will itself refuse and name any directory the registry did not mint"
         );
 
@@ -5072,7 +5072,7 @@ mod profile_registry_outcome_tests {
         );
         assert!(hash_only["remedy"]
             .as_str()
-            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")));
+            .is_some_and(|remedy| remedy.contains("rebind_profile_root")));
 
         // A filesystem without birth time is not an identity change, so its
         // refusal must not tell the operator to rebind as the fix.
@@ -5095,7 +5095,7 @@ mod profile_registry_outcome_tests {
         assert_eq!(
             possibly_managed["remedy"],
             "move or account for the unaccounted profile directories before running \
-             browser.rebind_profile_root; the rebind operation will not adopt them"
+             rebind_profile_root; the rebind operation will not adopt them"
         );
 
         let malformed = BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
@@ -5687,6 +5687,76 @@ mod launch_outcome_schema_tests {
         // three cleanup stages, plus the fleet resource refusal and the registry
         // attachment refusal: 30. A lower count means a rendering was dropped.
         assert_eq!(checked, 30);
+    }
+
+    /// Agents call the flat `browser_use` tool: no agent tool is named
+    /// `browser.<x>`. Every launch refusal they can read must therefore name
+    /// the flat action in plain words instead of the granular capability id.
+    /// This scans every `BrowserLaunchOutcome` rendering, which also covers
+    /// the registry-root remedies it delegates to `profile`.
+    #[test]
+    fn every_launch_outcome_remedy_names_no_granular_browser_id() {
+        fn has_granular_id(remedy: &str) -> bool {
+            let mut rest = remedy;
+            while let Some(at) = rest.find("browser.") {
+                rest = &rest[at + "browser.".len()..];
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_ascii_lowercase())
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // One seed per variant, as above; `renderings_of` refuses to compile
+        // if a variant is missing from its match.
+        let seeds = [
+            BrowserLaunchOutcome::RegistryProfileBusy,
+            BrowserLaunchOutcome::ResourceBusy {
+                detail: cortexkit_resource_busy::ResourceBusy::new(
+                    "browser_profile",
+                    cortexkit_resource_busy::Holder::head(),
+                    1,
+                    2,
+                ),
+            },
+            BrowserLaunchOutcome::ProfileBusy {
+                holder_id: serde_json::from_value(json!("seed")).expect("holder id"),
+            },
+            BrowserLaunchOutcome::ProfileRecoveryPending {
+                reason: RecoveryPendingReason::AttestationUntrusted,
+            },
+            BrowserLaunchOutcome::ProfileGrantRequired,
+            BrowserLaunchOutcome::ProfileRegistryUntrustedRoot {
+                reason: UntrustworthyRegistryReason::MalformedRegistry,
+            },
+            BrowserLaunchOutcome::ProfileStorageUnavailable {
+                reason_code: "seed",
+            },
+            BrowserLaunchOutcome::InternalFailure {
+                reason_code: "seed",
+            },
+            BrowserLaunchOutcome::CleanupFailure {
+                stage: LaunchCleanupStage::CustodyRelease,
+            },
+        ];
+        let mut checked = 0;
+        for seed in &seeds {
+            for outcome in renderings_of(seed) {
+                let reply = outcome.as_json();
+                if let Some(remedy) = reply.get("remedy").and_then(Value::as_str) {
+                    assert!(
+                        !has_granular_id(remedy),
+                        "{outcome:?}: the remedy names a granular browser id no agent tool provides: {remedy}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10, "only {checked} remedies scanned");
     }
 
     /// Platform launch refusals reach the caller through the launch service's

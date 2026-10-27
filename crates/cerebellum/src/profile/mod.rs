@@ -1308,35 +1308,35 @@ pub const fn untrustworthy_registry_remedy(
     match reason {
         UntrustworthyRegistryReason::ManagedRootInodeChanged => Some(
             "the browser root directory was replaced or restored (its inode differs from the \
-             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             recorded one); run rebind_profile_root to re-identify it; that operation \
              will itself refuse and name any directory the registry did not mint",
         ),
         UntrustworthyRegistryReason::ManagedRootBirthTimeChanged => Some(
             "the browser root directory was recreated (its creation time differs from the \
-             recorded one); run browser.rebind_profile_root to re-identify it; that operation \
+             recorded one); run rebind_profile_root to re-identify it; that operation \
              will itself refuse and name any directory the registry did not mint",
         ),
         UntrustworthyRegistryReason::ManagedRootPathChanged => Some(
             "the browser root is reached through a different canonical path than the recorded \
-             one (it or a parent was moved); run browser.rebind_profile_root to re-identify it; \
+             one (it or a parent was moved); run rebind_profile_root to re-identify it; \
              that operation will itself refuse and name any directory the registry did not mint",
         ),
         UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts => Some(
             "the registry predates the fact-based root identity: it holds only a hash that \
              included a device number which changes across reboots, so it cannot be checked; \
-             run browser.rebind_profile_root once to record the root's path, inode, and birth \
+             run rebind_profile_root once to record the root's path, inode, and birth \
              time; that operation will itself refuse and name any directory the registry did \
              not mint",
         ),
         UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable => Some(
             "the filesystem holding the browser root cannot report a directory birth time, so \
              the root cannot be identified; move the browser root to a filesystem that reports \
-             birth time (APFS, ext4, btrfs, xfs); browser.rebind_profile_root names the root \
+             birth time (APFS, ext4, btrfs, xfs); rebind_profile_root names the root \
              path and refuses for the same reason",
         ),
         UntrustworthyRegistryReason::PossiblyManagedPath => Some(
             "move or account for the unaccounted profile directories before running \
-             browser.rebind_profile_root; the rebind operation will not adopt them",
+             rebind_profile_root; the rebind operation will not adopt them",
         ),
         UntrustworthyRegistryReason::LockContentionWithoutOwnerProof => None,
         UntrustworthyRegistryReason::MalformedRegistry => None,

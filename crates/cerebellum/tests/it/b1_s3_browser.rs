@@ -1702,7 +1702,7 @@ async fn click_point_outside_the_current_viewport_is_typed_and_dispatches_nothin
     assert_eq!(result["detail"]["viewport"]["width_css"], 40.0);
     assert!(result["remedy"]
         .as_str()
-        .is_some_and(|remedy| remedy.contains("browser.screenshot")));
+        .is_some_and(|remedy| remedy.contains("screenshot")));
     assert!(plane.operation_log().await.iter().all(|(_, operation)| {
         !matches!(
             operation,
@@ -3229,7 +3229,7 @@ async fn an_unscrollable_click_names_the_viewport_and_refuses_without_input() {
     assert_eq!(result["detail"]["viewport"]["height_css"], 713.0);
     assert!(result["remedy"]
         .as_str()
-        .is_some_and(|remedy| remedy.contains("fresh browser.snapshot")));
+        .is_some_and(|remedy| remedy.contains("fresh snapshot")));
     assert!(input_events.lock().unwrap().is_empty());
     assert!(plane.operation_log().await.iter().all(|(_, operation)| {
         !matches!(
