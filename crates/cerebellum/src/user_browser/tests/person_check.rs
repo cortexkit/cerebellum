@@ -67,6 +67,55 @@ async fn each_page_reaction_to_focus_names_its_own_cause() {
     }
 }
 
+/// The text a model reads for a type stopped by a page reaction names the
+/// signal that stopped it, as the structured `detail` does: without that line
+/// a model cannot tell a person's input from the page reacting to its own.
+#[tokio::test]
+async fn a_stopped_type_prints_the_signal_that_stopped_it() {
+    for (reaction, signal) in [
+        (
+            PageReaction::ExecCommand,
+            "Signal: input.input.main (a trusted input event in the main frame, outside the agent's own input).",
+        ),
+        (
+            PageReaction::ReplaceState,
+            "Signal: committed_document (the tab's committed document changed: history entry).",
+        ),
+        (
+            PageReaction::PushState,
+            "Signal: committed_document (the tab's committed document changed: history entry, history position, history length, URL).",
+        ),
+        (
+            PageReaction::PersonKey,
+            "Signal: input.keydown.main (a trusted keydown event in the main frame, outside the agent's own input).",
+        ),
+        (
+            PageReaction::ForeignCause,
+            "Signal: unrecognized (the extension sent a code outside the known vocabulary).",
+        ),
+    ] {
+        let (reply, _) = type_into_reacting_field(reaction).await;
+        let encoded: Value =
+            serde_json::from_slice(&crate::tool_result::encode(reply.clone()).unwrap()).unwrap();
+        let text = encoded["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = [
+            "Outcome unknown.",
+            "Input was dispatched and may have taken effect. Do not repeat this action; take a fresh read before deciding what to do next.",
+            "Input was dispatched to the person's browser.",
+            "Reason: state changed by person.",
+            signal,
+        ]
+        .join("\n");
+        assert_eq!(text, expected, "{reaction:?}: {reply}");
+    }
+}
+
 #[tokio::test]
 async fn a_type_without_page_reaction_inserts_its_text() {
     let fixture = Fixture::new();
