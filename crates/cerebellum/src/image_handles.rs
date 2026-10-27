@@ -26,6 +26,51 @@ pub(crate) const LIFETIME: Duration = Duration::from_secs(15 * 60);
 pub(crate) const PER_SCOPE_LIMIT: usize = 8;
 /// The most screenshot bytes all handles together may hold.
 pub(crate) const TOTAL_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+/// The largest image, in encoded bytes, that a handle is minted for: 4 MiB
+/// minus a 64 KiB allowance for the reply's head JSON, the frame header and
+/// base64 growth. A resolve sends the image as raw bytes, so what has to fit
+/// the daemon's per-frame cap is the head plus the image, not an encoding of
+/// it.
+///
+/// This is the same number BROCA's `MAX_REFERENCE_IMAGE_BYTES` holds; this
+/// module may not depend on BROCA's crate, so the value is restated here and
+/// a test pins both the arithmetic and the published number.
+pub const IMAGE_HANDLE_MAX_BYTES: usize = 4 * 1024 * 1024 - 64 * 1024;
+
+/// How the body of a successful resolve is laid out: a big-endian length of the
+/// head JSON, then the head JSON, then the image's own bytes.
+///
+/// The field names are BROCA's model-batch §13.1 vocabulary, kept here in one
+/// place so a rename is one edit.
+pub(crate) const HEAD_CONTENT_TYPE: &str = "content_type";
+pub(crate) const HEAD_SHA256: &str = "sha256";
+pub(crate) const HEAD_LENGTH: &str = "length";
+
+/// A resolve reply: the frame's body and whether it is a binary frame.
+pub struct Resolved {
+    pub body: Vec<u8>,
+    pub binary: bool,
+}
+
+/// The body of a successful resolve: `u32` head length, the head JSON, then
+/// the image's own encoded bytes.
+fn binary_body(content_type: &str, sha256: &str, bytes: &[u8]) -> Vec<u8> {
+    let head = json!({
+        HEAD_CONTENT_TYPE: content_type,
+        HEAD_SHA256: sha256,
+        HEAD_LENGTH: bytes.len(),
+    });
+    let head = serde_json::to_vec(&head).expect("a resolve head serializes");
+    let mut body = Vec::with_capacity(4 + head.len() + bytes.len());
+    body.extend_from_slice(&(head.len() as u32).to_be_bytes());
+    body.extend_from_slice(&head);
+    body.extend_from_slice(bytes);
+    body
+}
+
+/// The largest body a resolve frame can carry before its 21-byte frame header
+/// puts the delivered frame over the daemon's 4 MiB cap.
+pub const MAX_RESOLVE_BODY_BYTES: usize = 4 * 1024 * 1024 - 21;
 
 /// The wire operation Broca calls.
 pub(crate) const RESOLVE: &str = "image.resolve";
@@ -216,7 +261,10 @@ impl ImageHandles {
     pub(crate) fn mint(&self, reply: &Value, capture: &Capture) -> Option<String> {
         let image = reply_image(reply)?;
         let decoded = cerebellum_core::serde_base64::decode(image.data_b64).ok()?;
-        if decoded.is_empty() {
+        // A resolve has to fit one reply frame, and it carries these exact
+        // bytes: an image over the limit gets no handle rather than a smaller
+        // copy of itself, because a handle must resolve to what was returned.
+        if decoded.is_empty() || decoded.len() > IMAGE_HANDLE_MAX_BYTES {
             return None;
         }
         let sha256 = Sha256::digest(&decoded)
@@ -242,7 +290,7 @@ impl ImageHandles {
     /// private_content computes, or `None` for a handle that is unknown,
     /// expired or belongs to another scope. The three are one answer on
     /// purpose: telling them apart would say whether a handle exists.
-    pub fn resolve(&self, handle: &str, scopes: &[&str], now_ms: u64) -> Option<Value> {
+    pub fn resolve(&self, handle: &str, scopes: &[&str], now_ms: u64) -> Option<Resolved> {
         if !is_handle(handle) {
             return None;
         }
@@ -261,11 +309,10 @@ impl ImageHandles {
         if !authorized {
             return None;
         }
-        Some(json!({
-            "mime": entry.mime,
-            "sha256": entry.sha256,
-            "bytes": cerebellum_core::serde_base64::encode(&entry.bytes),
-        }))
+        Some(Resolved {
+            body: binary_body(entry.mime, &entry.sha256, &entry.bytes),
+            binary: true,
+        })
     }
 
     /// Drops every handle captured under `conversation`. Called when the

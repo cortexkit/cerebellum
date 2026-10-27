@@ -246,6 +246,10 @@ const PERSON_METADATA: &[&str] = &[
     "tabs.[].claim",
     "tabs.[].interaction_epoch",
     "snapshot_id",
+    // An opaque handle for the screenshot this reply already carries, not page
+    // text: the bytes it names came in the same reply, which marks on its own.
+    "image_handle",
+    "read_page.image_handle",
     "truncated",
     "refs_truncated",
     "omitted_frames",

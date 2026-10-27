@@ -27,7 +27,8 @@ The value is `ih` followed by 32 lowercase hex characters: 16 bytes from the
 operating system's random source
 (`crates/cerebellum/src/image_handles.rs`, `new_handle`). The field sits beside
 the reply's existing image fields. `image.image_id` and `snapshot_id` stay
-as they are: they are guessable or keep no bytes, so they never resolve.
+as they are: they are guessable or keep no bytes, so they never resolve. An
+image over the size limit below gets no handle.
 
 A handle is minted only when the capturing route carries a scope stamp. Its
 `scope_ref` is recorded with the bytes, and it is the scope a resolve has to be
@@ -81,17 +82,50 @@ frame body takes only `method` and `params`, as for `private_content.query`.
 
 ## Success
 
-The reply is a `Response` frame whose body is bare — exactly this object, with
-no `result` wrapper and none of `outcome`, `context`, or `session`:
+The reply is a **binary** `Response` frame: its `flags` byte carries
+`FLAG_BINARY` (bit 0, `subc-protocol` 0.33.0), so the body is raw bytes rather
+than JSON. The body is laid out as
 
-```json
-{"mime":"image/png","sha256":"<64 lowercase hex>","bytes":"<standard base64>"}
+```
+u32 big-endian head length | head JSON | the image's own encoded bytes
 ```
 
-- `mime` is `image/png` or `image/jpeg`, the mime the capture reply declared.
-- `bytes` is the standard, padded RFC 4648 base64 of exactly the bytes that
-  capture reply carried.
-- `sha256` is the SHA-256 of those decoded bytes.
+The head is a closed object with exactly these members, which are BROCA
+model-batch §13.1's names:
+
+```json
+{"content_type":"image/png","sha256":"<64 lowercase hex>","length":<byte count>}
+```
+
+- `content_type` is `image/png` or `image/jpeg`, the mime the capture reply
+  declared.
+- The image bytes after the head are exactly the bytes the capture reply
+  carried, encoded (PNG or JPEG) as the capture produced them; nothing is
+  downscaled, re-encoded or otherwise rewritten, because a handle must resolve
+  to what the agent was shown.
+- `sha256` is the SHA-256 of those image bytes, and `length` is their count in
+  bytes. Both describe what follows the head, not the body or the frame.
+
+A fixture that needs the exact bytes is in
+[`crates/cerebellum/tests/vectors/image-resolve-v1/success.bin`](../../crates/cerebellum/tests/vectors/image-resolve-v1/success.bin),
+with its SHA-256 in the case file beside it.
+
+## How large a resolve can be
+
+A resolve has to leave as one frame, and the daemon refuses a delivered frame
+over 4 MiB. A handle is therefore minted only for an image of at most
+**4,128,768 bytes** (`crates/cerebellum/src/image_handles.rs`,
+`IMAGE_HANDLE_MAX_BYTES`): 4 MiB (4,194,304) minus a 64 KiB (65,536)
+allowance, which covers the frame's 21-byte header, the four-byte head length,
+and the head JSON itself. The head is at most about 150 bytes, so the allowance
+is far larger than the head can be.
+
+The number is the same one BROCA's `MAX_REFERENCE_IMAGE_BYTES`
+(`cortexkit_model_batch::image`) holds; cerebellum does not depend on that
+crate, so it carries its own constant and a test pins both the value and the
+arithmetic. An image over the limit gets no `image_handle`: the reply omits the
+field, and on tool-result routes its text says the screenshot is too large for
+a handle and to take a viewport screenshot instead.
 
 ## Refusal
 
@@ -106,13 +140,12 @@ carrying exactly this body:
 `session`. The goldens pin the exact bytes.)
 
 Unknown handles, expired handles and handles captured under a scope outside the
-caller's union all get this one body, byte for byte. The store makes the shape
-of the handle cost the same as one map probe, and compares every scope in the
-union without an early exit, so the work it does does not announce which case it
-is in either. `detail.field` is always `handle`; there is no reason code,
-because a reason code would say which of the three happened. A caller with the
-reply bytes cannot tell the three apart, and a handle that does not resolve
-tells it nothing about whether one does.
+caller's union all get this one body, byte for byte. Refusals are JSON in a `Response` frame, never an `Error` frame: SUBC's
+contract says so too, so a malformed request and a handle that does not resolve
+are told apart by body shape, not by frame type. `detail.field` is always
+`handle`; there is no reason code, because a reason code would say which of the
+three happened. A caller with the reply bytes cannot tell them apart, and a
+handle that does not resolve tells it nothing about whether one does.
 
 A malformed request is refused the same way `private_content.query` refuses one:
 

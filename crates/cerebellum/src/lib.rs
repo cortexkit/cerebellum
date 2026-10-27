@@ -6237,22 +6237,52 @@ fn mint_image_handle(planes: &Planes, facts: &AcceptedBindFacts, reply: &mut Val
     }
 }
 
+/// The line the model reads when its screenshot has no handle: the bytes were
+/// returned, but a resolve has to send them back in one frame and they are
+/// larger than that frame allows. The image itself is never re-encoded for
+/// this: a handle must resolve to exactly the bytes the agent was shown.
+const NO_HANDLE_NOTE: &str =
+    "This screenshot is too large to be resolved by handle; take a viewport screenshot instead.";
+
+/// Whether `reply` carries a screenshot that `mint_image_handle` left without
+/// one only because it is over the size limit. A reply that got a handle, or
+/// that has no image at all, is not this.
+fn should_say_no_handle(reply: &Value) -> bool {
+    if reply.get("image_handle").is_some() {
+        return false;
+    }
+    reply
+        .pointer("/image/data_b64")
+        .and_then(Value::as_str)
+        .is_some_and(|data| {
+            cerebellum_core::serde_base64::decode(data)
+                .is_ok_and(|bytes| bytes.len() > image_handles::IMAGE_HANDLE_MAX_BYTES)
+        })
+}
+
 /// `mint_image_handle` with an explicit capture scope, for the wire fixtures:
 /// they mint a handle for a scope they choose instead of a bound route.
 pub fn mint_image_handle_for_test(
     planes: &Planes,
     facts: &AcceptedBindFacts,
     scope_ref: &str,
-    mut reply: Value,
+    reply: Value,
 ) -> Value {
-    let capture = image_handles::Capture {
-        scope_ref: scope_ref.to_owned(),
-        conversation_key: facts.identity.conversation_key.clone(),
-        now_ms: wall_clock_ms(),
-    };
-    if let Some(handle) = planes.image_handles.mint(&reply, &capture) {
-        reply["image_handle"] = json!(handle);
-    }
+    // Mint through the production path, with the capture scope the fixture
+    // chose, so a fixture cannot testify to a handle production would not mint.
+    let facts = facts.clone().with_scope(Some(
+        subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".to_owned(),
+            },
+            scope_ref,
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true),
+    ));
+    let mut reply = reply;
+    mint_image_handle(planes, &facts, &mut reply);
     reply
 }
 
@@ -6310,18 +6340,36 @@ async fn handle_image_resolve(
     };
     let scopes = private_content::scope_union(planes, scope, parent);
     let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let reply = planes
+    let resolved = planes
         .image_handles
-        .resolve(handle, &scopes, wall_clock_ms())
-        .unwrap_or_else(|| {
-            json!({
-                "outcome": image_handles::UNAVAILABLE,
-                "context": null,
-                "session": null,
-                "detail": {"field": "handle"},
-            })
+        .resolve(handle, &scopes, wall_clock_ms());
+    // A refusal stays a JSON body in a Response frame, the same shape
+    // private_content refuses with: Broca reads anything carrying `outcome` as
+    // a refusal, and an error frame would be a different contract.
+    debug_assert!(resolved
+        .as_ref()
+        .is_none_or(|resolved| resolved.body.len() <= image_handles::MAX_RESOLVE_BODY_BYTES));
+    let Some(resolved) = resolved else {
+        let refusal = json!({
+            "outcome": image_handles::UNAVAILABLE,
+            "context": null,
+            "session": null,
+            "detail": {"field": "handle"},
         });
-    send_tool_response(writer, ver, channel, epoch, corr, reply).await
+        return send_tool_response(writer, ver, channel, epoch, corr, refusal).await;
+    };
+    let flags = Flags::new(resolved.binary, subc_protocol::Priority::Interactive, false);
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        channel,
+        epoch,
+        corr,
+        resolved.body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
 }
 
 /// A tool-route request, with its optional `call_key` handled before the call
@@ -6369,13 +6417,16 @@ async fn handle_keyed_tool_request(
             result_bind,
             tool_result::SETTLEMENT_NOTE_OMITTED.scope(
                 std::cell::Cell::new(false),
-                tool_result::APP_USE_NOTE.scope(
+                tool_result::IMAGE_HANDLE_NOTE.scope(
                     std::cell::RefCell::new(None),
-                    codemode::CALL_RECORDS.scope(
-                        Arc::clone(&planes.calls),
-                        computer_capability::operator_confirm::CALL.scope(
-                            operator_call,
-                            handle_keyed_tool_request_inner(frame, writer, planes),
+                    tool_result::APP_USE_NOTE.scope(
+                        std::cell::RefCell::new(None),
+                        codemode::CALL_RECORDS.scope(
+                            Arc::clone(&planes.calls),
+                            computer_capability::operator_confirm::CALL.scope(
+                                operator_call,
+                                handle_keyed_tool_request_inner(frame, writer, planes),
+                            ),
                         ),
                     ),
                 ),
@@ -7575,6 +7626,9 @@ async fn handle_tool_request_inner(
         )
         .await;
         mint_image_handle(planes, &accepted_facts, &mut result);
+        if should_say_no_handle(&result) {
+            tool_result::image_handle_note(NO_HANDLE_NOTE.to_owned());
+        }
         if planes.routes.get(channel, epoch).is_none() {
             return Ok(());
         }
@@ -7889,6 +7943,9 @@ async fn handle_tool_request_inner(
                 // by, so a program can pass it to a model call.
                 let mut result = result;
                 mint_image_handle(planes, &accepted_facts, &mut result);
+                if should_say_no_handle(&result) {
+                    tool_result::image_handle_note(NO_HANDLE_NOTE.to_owned());
+                }
                 private_content::send_reply(
                     planes,
                     &accepted_facts,
@@ -7961,6 +8018,13 @@ async fn handle_tool_request_inner(
     }
     match result {
         Ok(result) => {
+            // A browser screenshot leaves with a handle its bytes resolve by,
+            // so a program can pass it to a model call.
+            let mut result = result;
+            mint_image_handle(planes, &accepted_facts, &mut result);
+            if should_say_no_handle(&result) {
+                tool_result::image_handle_note(NO_HANDLE_NOTE.to_owned());
+            }
             private_content::send_reply(
                 planes,
                 &accepted_facts,
@@ -9163,6 +9227,59 @@ pub async fn handle_frame_for_test(
     planes: &Planes,
 ) -> Result<bool, ModuleError> {
     handle_frame(frame, writer, planes).await
+}
+
+/// The tool path with a route stamped `scope_ref`, for fixtures whose captures
+/// have to mint screenshot handles.
+pub async fn handle_tool_request_for_test_with_planes_scoped(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    scope_ref: &str,
+) -> Result<(), ModuleError> {
+    install_test_bind(&planes.routes, &frame);
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".to_owned(),
+        },
+        scope_ref,
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_owner_authorized(true)
+    .with_attributes(
+        subc_protocol::scope::ScopeAttributes::new()
+            .with_agent_id(Some("test-project".into()))
+            .with_delegates(true),
+    );
+    if let Some(facts) = planes
+        .routes
+        .accepted_bind_for_test(frame.header.channel, frame.header.epoch)
+    {
+        planes.routes.insert_for_test(
+            frame.header.channel,
+            frame.header.epoch,
+            facts.with_scope(Some(stamp)),
+        );
+    }
+    Box::pin(
+        tool_result::RESULT_BIND.scope(
+            None,
+            tool_result::SETTLEMENT_NOTE_OMITTED.scope(
+                std::cell::Cell::new(false),
+                tool_result::IMAGE_HANDLE_NOTE.scope(
+                    std::cell::RefCell::new(None),
+                    tool_result::APP_USE_NOTE.scope(
+                        std::cell::RefCell::new(None),
+                        handle_tool_request_for_test_with_existing_planes(
+                            frame, writer, planes,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    .await
 }
 
 pub async fn handle_tool_request_for_test_with_planes(

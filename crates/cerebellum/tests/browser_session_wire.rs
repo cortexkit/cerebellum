@@ -111,6 +111,7 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
     rx.recv().await.unwrap()
 }
 
+
 fn route_identity() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
         &BindIdentity::new("/test/project", "test", "test-session".to_string()),
@@ -3160,6 +3161,27 @@ fn base64_decoded_strings(text: &str) -> Vec<String> {
 
 fn session_lock_refusal() -> Value {
     json!({"outcome": "internal_failure", "stage": "browser_session_lock"})
+}
+
+async fn response_body_scoped(
+    planes: &Planes,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    scope_ref: &str,
+) -> Value {
+    let (tx, mut rx) = mpsc::channel(4);
+    cerebellum::handle_tool_request_for_test_with_planes_scoped(
+        request(corr, name, arguments),
+        &tx,
+        planes,
+        scope_ref,
+    )
+    .await
+    .unwrap();
+    let response = rx.recv().await.unwrap();
+    assert_eq!(response.header.ty, FrameType::Response);
+    serde_json::from_slice(&response.body).unwrap()
 }
 
 async fn response_body(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Value {
@@ -10230,3 +10252,36 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
 
 #[path = "it/agent_holder_enforcement.rs"]
 mod agent_holder_enforcement;
+
+/// The own-browser screenshot leaves with a handle whose bytes are exactly the
+/// PNG the reply carried, and that handle resolves under the capturing scope.
+#[tokio::test]
+async fn an_own_browser_screenshot_carries_a_resolvable_handle() {
+    let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
+    let reply = response_body_scoped(
+        &planes,
+        40,
+        "browser.screenshot",
+        json!({}),
+        "screenshot-scope",
+    )
+    .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let handle = reply["image_handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no handle on the screenshot: {reply}"))
+        .to_owned();
+    let shown =
+        cerebellum_core::serde_base64::decode(reply["image"]["data_b64"].as_str().unwrap())
+            .unwrap();
+    let resolved = planes
+        .image_handle_store()
+        .resolve(&handle, &["screenshot-scope"], cerebellum::wall_clock_ms_for_test())
+        .unwrap_or_else(|| panic!("the handle did not resolve"));
+    let head_length = u32::from_be_bytes(resolved.body[..4].try_into().unwrap()) as usize;
+    let head: Value = serde_json::from_slice(&resolved.body[4..4 + head_length]).unwrap();
+    assert_eq!(head["content_type"], "image/png");
+    assert_eq!(head["length"], shown.len());
+    assert_eq!(&resolved.body[4 + head_length..], shown.as_slice());
+    let _ = &launcher;
+}

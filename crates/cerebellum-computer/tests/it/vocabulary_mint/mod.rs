@@ -2472,9 +2472,7 @@ pub fn v31_from_v30(previous: &Value, revision: &str) -> Value {
         if row["capability_id"] != "computer.read_state" {
             continue;
         }
-        let properties = row["result_schema"]["properties"]
-            .as_object_mut()
-            .unwrap();
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
         assert!(
             properties
                 .insert("image_handle".into(), v31_read_state_image_handle_field())

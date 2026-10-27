@@ -23,10 +23,21 @@ tokio::task_local! {
     pub(crate) static SETTLEMENT_NOTE_OMITTED: Cell<bool>;
     /// A background-mode explanation for this call's text, never structured content.
     pub(crate) static APP_USE_NOTE: RefCell<Option<String>>;
+    /// Why this call's screenshot has no handle, for its text only: the bytes
+    /// were returned, but too large for `image.resolve` to send back in one
+    /// frame. The structured reply says the same through its own rule.
+    pub(crate) static IMAGE_HANDLE_NOTE: RefCell<Option<String>>;
 }
 
 pub(crate) fn app_use_note(note: String) {
     let _ = APP_USE_NOTE.try_with(|slot| *slot.borrow_mut() = Some(note));
+}
+
+/// Records, for this one call, that a reply's screenshot is too large to have
+/// a handle. The reply itself already omits the field; this only adds the line
+/// the model reads.
+pub(crate) fn image_handle_note(note: String) {
+    let _ = IMAGE_HANDLE_NOTE.try_with(|slot| *slot.borrow_mut() = Some(note));
 }
 
 /// Leave the "Page settlement was not confirmed." lines out of the text of
@@ -175,6 +186,13 @@ fn project(reply: Value) -> ToolResult {
     let projected_image = object.get("image").map(image_projection);
     let mut facts = plain::facts(object, login_notice(object), settlement_note(object));
     if let Some(note) = APP_USE_NOTE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
+        facts.push(note);
+    }
+    if let Some(note) = IMAGE_HANDLE_NOTE
         .try_with(|slot| slot.borrow().clone())
         .ok()
         .flatten()

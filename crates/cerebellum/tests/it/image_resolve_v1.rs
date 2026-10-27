@@ -100,45 +100,79 @@ fn recorded(text: &str, handle: &str) -> String {
 }
 
 /// Compare a captured exchange with its pinned file. With
-/// `CEREBELLUM_WRITE_IMAGE_RESOLVE_VECTORS` set, rewrite the file and the
+/// `CEREBELLUM_WRITE_IMAGE_RESOLVE_VECTORS` set, rewrite the files and the
 /// checksums first, for a deliberate contract change.
+///
+/// A JSON reply is pinned in the case file itself. A binary reply — a
+/// successful resolve — has no text body to pin there: its body goes to
+/// `{case}.bin` byte for byte, and the case file names that file and its
+/// digest, next to the frame's own fields.
 fn check(case: &str, state: &str, handle: &str, request: &Frame, reply: &Frame) {
     assert_eq!(reply.header.ty, FrameType::Response);
+    let reply_body_bytes = reply.body.clone();
     let request_body = recorded(std::str::from_utf8(&request.body).unwrap(), handle);
-    let reply_body = recorded(std::str::from_utf8(&reply.body).unwrap(), handle);
     let mut request_bytes = request.header.encode().to_vec();
     request_bytes.extend_from_slice(request_body.as_bytes());
+    let request = json!({
+        "type": format!("{:?}", request.header.ty),
+        "channel": request.header.channel, "epoch": request.header.epoch,
+        "corr": request.header.corr, "body_length": request_body.len(),
+        "body_utf8": request_body, "wire_hex": hex(&request_bytes),
+    });
     let mut reply_bytes = reply.header.encode().to_vec();
-    reply_bytes.extend_from_slice(reply_body.as_bytes());
+    let binary = reply.header.flags.is_binary();
+    let reply_common = json!({
+        "type": format!("{:?}", reply.header.ty),
+        "flags": reply.header.flags.0,
+        "channel": reply.header.channel, "epoch": reply.header.epoch,
+        "corr": reply.header.corr, "body_length": reply_body_bytes.len(),
+    });
+    // Bodies are compared and written under one lock, so parallel cases never
+    // publish checksums describing a half-written sibling.
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write = WRITE.lock().unwrap();
+    let dir = directory();
+    let write = std::env::var_os("CEREBELLUM_WRITE_IMAGE_RESOLVE_VECTORS").is_some();
+    let reply = if binary {
+        reply_bytes.extend_from_slice(&reply_body_bytes);
+        let body_path = dir.join(format!("{case}.bin"));
+        if write {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&body_path, &reply_body_bytes).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&body_path).unwrap(),
+            reply_body_bytes,
+            "{case} binary body changed"
+        );
+        let mut reply = reply_common;
+        reply["binary"] = json!(true);
+        reply["body_file"] = json!(format!("{case}.bin"));
+        reply["body_sha256"] = json!(hex(&Sha256::digest(&reply_body_bytes)));
+        reply["wire_hex"] = json!(hex(&reply_bytes));
+        reply
+    } else {
+        let reply_body = recorded(std::str::from_utf8(&reply_body_bytes).unwrap(), handle);
+        reply_bytes.extend_from_slice(reply_body.as_bytes());
+        let mut reply = reply_common;
+        reply["body_utf8"] = json!(reply_body);
+        reply["wire_hex"] = json!(hex(&reply_bytes));
+        reply
+    };
     let value = json!({
         "contract": "image-resolve-v1", "case": case, "state": state,
         "principal": "reserved:broca",
         "handle": RECORDED_HANDLE,
-        "request": {
-            "type": format!("{:?}", request.header.ty),
-            "channel": request.header.channel, "epoch": request.header.epoch,
-            "corr": request.header.corr, "body_length": request_body.len(),
-            "body_utf8": request_body, "wire_hex": hex(&request_bytes),
-        },
-        "reply": {
-            "type": format!("{:?}", reply.header.ty),
-            "channel": reply.header.channel, "epoch": reply.header.epoch,
-            "corr": reply.header.corr, "body_length": reply_body.len(),
-            "body_utf8": reply_body, "wire_hex": hex(&reply_bytes),
-        },
+        "request": request,
+        "reply": reply,
     });
     assert!(
         !value.to_string().contains(handle),
         "{case} still names the fixture's random handle"
     );
     let bytes = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
-    let dir = directory();
     let path = dir.join(format!("{case}.json"));
-    // Parallel cases must not publish checksums describing a half-written
-    // sibling.
-    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _write = WRITE.lock().unwrap();
-    if std::env::var_os("CEREBELLUM_WRITE_IMAGE_RESOLVE_VECTORS").is_some() {
+    if write {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         std::fs::write(dir.join("SHA256SUMS"), sums()).unwrap();
@@ -267,20 +301,26 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
         .await
         .unwrap();
     let reply = output.recv().await.unwrap();
-    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(
+        reply.header.flags.is_binary(),
+        "a resolve success is a binary frame"
+    );
     let expected_sha256: String = Sha256::digest(FIXTURE_BYTES)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
+    // `u32` big-endian head length, the head JSON, then the image's own bytes.
+    let head_length = u32::from_be_bytes(reply.body[..4].try_into().unwrap()) as usize;
+    let head: Value = serde_json::from_slice(&reply.body[4..4 + head_length]).unwrap();
     assert_eq!(
-        body,
+        head,
         json!({
-            "mime": "image/png",
+            "content_type": "image/png",
             "sha256": expected_sha256,
-            "bytes": cerebellum_core::serde_base64::encode(FIXTURE_BYTES),
+            "length": FIXTURE_BYTES.len(),
         })
     );
-    assert!(!suspicious_path(&String::from_utf8_lossy(&reply.body)));
+    assert_eq!(&reply.body[4 + head_length..], FIXTURE_BYTES);
     check(
         "success",
         "a screenshot handle resolves to exactly the bytes the reply carried",
@@ -365,6 +405,7 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
         [
             "README.md",
             "image-unavailable.json",
+            "success.bin",
             "success.json",
             "unknown-field.json"
         ]

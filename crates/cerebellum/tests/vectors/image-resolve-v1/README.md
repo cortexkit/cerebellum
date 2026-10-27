@@ -8,7 +8,13 @@ under the scope the query names; the capture is a fixed sixteen-byte fixture
 image, so no Screen Recording permission, installed application, window server
 or real screenshot is required.
 
-Each file contains:
+A successful resolve is a binary frame, so its body is pinned in
+`success.bin`, byte for byte; `success.json` names that file and its SHA-256
+(`reply.body_file`, `reply.body_sha256`) beside the frame's own fields, because
+the body is not text and cannot live in a JSON file. Every other case is JSON
+in its own file.
+
+Each JSON file contains:
 
 - `contract`: always `image-resolve-v1`;
 - `case`: which exchange this is;
@@ -17,7 +23,8 @@ Each file contains:
 - `handle`: the fixed handle the corpus records, standing in for the random
   one the fixture minted;
 - `request`: the management-route request frame;
-- `reply`: the request's terminal `Response` frame.
+- `reply`: the request's terminal `Response` frame — `body_utf8` for a JSON
+  body, or `body_file`/`body_sha256`/`binary`/`flags` for the binary one.
 
 A handle is 16 random bytes by design, so the corpus cannot pin the one a run
 minted. The fixture's handle is replaced, everywhere it appears, by a fixed
