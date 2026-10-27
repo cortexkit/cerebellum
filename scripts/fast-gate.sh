@@ -73,7 +73,7 @@ if [ "$self_test" -eq 0 ]; then
       exit 2
     fi
     echo "==> FAST GATE PART: mac (remote macOS VM dispatch)"
-    run_mac_part
+    run_mac_remote_part
     exit $?
   fi
   if [ -z "$part" ]; then

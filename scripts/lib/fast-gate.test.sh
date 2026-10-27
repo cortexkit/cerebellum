@@ -119,9 +119,11 @@ mac_remote_dispatch() {
   base=fixture
   repo_root="$scratch/fake-root"
   ck() { printf '%s\n' "$@" >"$scratch/argv"; }
-  run_mac_part
-  # The VM is fixed-size and offline: platform macos, no --vcpus, no --net.
+  run_mac_remote_part
+  # The VM is fixed-size and offline: platform macos, a 60 min timeout to fit
+  # a cold full-half run, no --vcpus, no --net.
   grep -Fxq -- --platform "$scratch/argv" && grep -Fxq macos "$scratch/argv" && \
+    grep -Fxq -- --timeout "$scratch/argv" && grep -Fxq 3600 "$scratch/argv" && \
     grep -Fxq -- --part "$scratch/argv" && grep -Fxq mac "$scratch/argv" && \
     grep -Fxq -- --vm "$scratch/argv" && grep -Fxq fixture "$scratch/argv" && \
     ! grep -Fxq -- --vcpus "$scratch/argv" && ! grep -Fxq -- --net "$scratch/argv"
@@ -161,7 +163,7 @@ import sys
 log = Path(sys.argv[1]).read_text()
 assert log.index('linux whole log') < log.index('mac whole log')
 assert '==> FAIL: Linux half (ck motor run) (exit 200)' in log
-assert '==> PASS: macOS half (ck motor run --platform macos)' in log
+assert '==> PASS: macOS half (local)' in log
 assert "git rev-parse origin/main" in log and "--part linux --base <commit>" in log
 assert 'FAST GATE FAILED:' in log
 PY
@@ -340,7 +342,7 @@ check 'a readable process table leaves library tests unchanged' readable_process
 check '--part linux selects the remote Linux lane' linux_mode
 check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
 check '--part mac --vm defers desk phases with NOT VERIFIED; --remote/--vm reject anything but --part mac' remote_vm_arg_validation
-check '--part mac --remote dispatches to the macOS VM without vcpus or net' mac_remote_dispatch
+check '--part mac --remote dispatches to the macOS VM with a 60 min timeout, without vcpus or net' mac_remote_dispatch
 check '--vm defers exactly the window-server desk suites' vm_local_only_predicate
 check 'Mac clippy, then the desk-probe build, precede tests; a lint failure stops both; Linux-only changes skip them' mac_clippy_pipeline
 check 'the VM form builds and unit-tests but defers the desk suite and probe build as NOT VERIFIED' mac_vm_pipeline

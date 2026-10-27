@@ -85,15 +85,27 @@ run_linux_part() {
 }
 
 run_mac_part() {
-  # Remote Mac half, mirroring run_linux_part: the heavy work runs on MOTOR's
-  # macOS VM and this host only streams its log. Exit 200 means MOTOR refused
-  # the job before starting it (for example the runner was unreachable or
-  # busy): nothing ran, so asking again is safe. Any other exit, including
-  # ck's own codes for a lost or timed-out job, is the verdict. The VM is a
-  # fixed-size offline macOS worker, so neither --vcpus nor --net is passed.
+  ./scripts/fast-gate.sh --part mac --base "$base"
+}
+
+run_mac_remote_part() {
+  # Opt-in remote Mac half: the heavy work runs on MOTOR's macOS VM and this
+  # host only streams its log. Exit 200 means MOTOR refused the job before
+  # starting it (for example the runner was unreachable or busy): nothing ran,
+  # so asking again is safe. Any other exit, including ck's own codes for a
+  # lost or timed-out job, is the verdict. The VM is a fixed-size offline
+  # macOS worker, so neither --vcpus nor --net is passed.
+  #
+  # Measured 2026-10-27 on a branch of this gate: a scripts-only diff passed
+  # the remote half in 48 s end to end (job 01a17e6a), while a Rust diff hit
+  # the 30 min job timeout with the lib tests still running (job 01a17e6b;
+  # clippy alone took 83 s where the local Mac half takes about 200 s for a
+  # similar diff). A cold 4-vCPU VM builds roughly ten times slower, so the
+  # combined gate keeps the local Mac half by default and this stays opt-in
+  # until the VM builds warm. The 60 min timeout fits a cold full-half run.
   local attempt status
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    ck motor run --platform macos --timeout 1800 --cwd "$repo_root" -- \
+    ck motor run --platform macos --timeout 3600 --cwd "$repo_root" -- \
       ./scripts/fast-gate.sh --part mac --vm --base "$base"
     status=$?
     [ "$status" -eq 200 ] || return "$status"
@@ -161,14 +173,14 @@ run_combined_gate() (
   trap 'exit 130' INT
   trap 'exit 143' TERM HUP QUIT
   start_static_phase 'Linux half (ck motor run)' run_linux_part
-  start_static_phase 'macOS half (ck motor run --platform macos)' run_mac_part
+  start_static_phase 'macOS half (local)' run_mac_part
   local part_logs=("${static_logs[@]}")
   wait_static_phases
   if ! python3 "$repo_root/scripts/lib/fast-gate-fingerprint.py" --compare "${part_logs[@]}"; then
     phase_failed=1
   fi
   if [ "$phase_failed" -ne 0 ]; then
-    echo "fast gate: both halves are required. In a worker sandbox, take the base commit with 'git rev-parse origin/main', then run scripts/fast-gate.sh --part linux --base <commit> with bash runon (linux,8c), and scripts/fast-gate.sh --part mac --vm --base <commit> with bash runon (macos)." >&2
+    echo "fast gate: both halves are required. In a worker sandbox, take the base commit with 'git rev-parse origin/main', then run scripts/fast-gate.sh --part linux --base <commit> with bash runon, and scripts/fast-gate.sh --part mac --base <commit> locally." >&2
   fi
   finish_gate
 )
