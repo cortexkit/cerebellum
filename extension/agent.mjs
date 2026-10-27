@@ -76,7 +76,13 @@ export class Agent {
     const active = [...this.active];
     for (const state of active) state.cancelled = true;
     await Promise.all(active.map(state => this.detach(state)));
-    for (const key of new Set(this.claims.values())) await this.release(key);
+    // A dropped native port ends claims, not handovers. Handed tabs stay in
+    // the recorded Agent group with their handles, so a reconnect lists them
+    // as unclaimed and an agent re-claims. Only the person gives tabs back
+    // (drag-out, close, toolbar toggle), or a tab whose recorded group no
+    // longer resolves is withdrawn on its next membership check.
+    this.claims.clear();
+    this.blankNavigations.clear();
     probeReadDiagnostic("baseline_cleared", { reason: "disconnected", baselineCount: this.baselines.size });
     this.baselines.clear();
   }

@@ -191,6 +191,32 @@ test("restart clears baselines even when interaction epoch happens to match", as
   assert.equal(inputs(f.chrome).length, 0);
 });
 
+test("disconnect keeps handed tabs grouped and unclaimed for reconnect", async () => {
+  const f = await setup();
+  const handle = f.record.handle;
+  const state = await f.agent.prepare(route, f.cdp([read]), 50);
+  assert.equal(state.attached, true);
+  const detaches = () => f.chrome.calls.filter(call => call[0] === "detach").length;
+  const before = detaches();
+  await f.agent.disconnect();
+  assert.equal(state.attached, false);
+  assert.ok(detaches() > before);
+  assert.equal(f.agent.claims.size, 0);
+  assert.equal(f.tabs.tabs.get(2)?.handle, handle);
+  assert.equal(f.tabs.tabs.get(2)?.kind, "handed");
+  assert.equal(f.chrome.tabData.get(2).groupId, f.tabs.group.id);
+  f.agent.connect(51);
+  const status = await f.run({ version: 2, action: "status" });
+  assert.deepEqual(status.tabs, [{ tab: handle, claimed: false, handed: true, interaction_epoch: 0 }]);
+  const claimed = await f.run({ version: 2, action: "claim_tab", tab: handle });
+  assert.equal(claimed.tab, handle);
+  assert.equal((await f.run({ version: 2, action: "status" })).tabs[0].claimed, true);
+  await f.tabs.toggle(2);
+  assert.equal(f.chrome.tabData.get(2).groupId, -1);
+  assert.equal(f.tabs.tabs.has(2), false);
+  assert.equal(f.agent.claims.has(2), false);
+});
+
 test("missing frame coverage cannot establish an input baseline", async () => {
   const f = await setup();
   f.chrome.webNavigation.getAllFrames = async () => [{ frameId: 0 }, { frameId: 5 }];
