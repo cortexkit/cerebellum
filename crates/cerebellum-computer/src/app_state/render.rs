@@ -1298,6 +1298,11 @@ pub struct RenderedState {
     pub truncation: Option<Truncation>,
     /// Whether the element or menu bar `zoom` named was in the read.
     pub zoom_found: bool,
+    /// Whether a narrowed request (a role or text filter) matched at least
+    /// one shown element. False for reads that were not narrowed, and for
+    /// narrowed reads whose filter matched nothing, so the caller can say
+    /// that instead of printing an empty list.
+    pub filter_matched: bool,
     /// Whether at least one element line in `text` is marked disabled. An
     /// element left out by a filter, a zoom, a summary or the byte bound
     /// does not count.
@@ -1521,11 +1526,13 @@ pub fn render_state_bounded(
     let mut scope = scope;
     scope.sort_by_key(|view| region_priority(view.node));
 
+    let mut filter_matched = false;
     if request.narrows() {
         let mut found = Vec::new();
         for view in &scope {
             collect_matches(view, 0, request, &mut found);
         }
+        filter_matched = !found.is_empty();
         for (depth, view) in found {
             out.element(depth, view);
         }
@@ -1619,6 +1626,7 @@ pub fn render_state_bounded(
         text: out.text,
         truncation,
         zoom_found,
+        filter_matched,
         shows_disabled: out.disabled_shown,
     }
 }

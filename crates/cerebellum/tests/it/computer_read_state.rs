@@ -1618,9 +1618,11 @@ impl AppStateSource for ShellSource {
     ) -> Result<RawAppState, AppStateReadError> {
         self.app_reads.fetch_add(1, Ordering::SeqCst);
         Ok(RawAppState {
+            // A shell mid-build already carries the subtree the platform
+            // reader could not open yet; count it, as a live reader does.
+            unreadable_subtrees: unreadable_count(&self.first),
             roots: vec![self.first.clone()],
             focused: None,
-            unreadable_subtrees: 0,
             read_bound_reached: false,
         })
     }
@@ -1637,9 +1639,9 @@ impl AppStateSource for ShellSource {
             return Err(ElementReadError::Gone);
         }
         Ok(RawAppState {
+            unreadable_subtrees: unreadable_count(&self.reread),
             roots: vec![self.reread.clone()],
             focused: None,
-            unreadable_subtrees: 0,
             read_bound_reached: false,
         })
     }
@@ -1698,6 +1700,193 @@ async fn a_window_still_a_shell_when_read_again_is_disclosed_as_incomplete() {
     assert_eq!(reply["unreadable_subtrees"], 1);
     assert_eq!(source.app_reads.load(Ordering::SeqCst), 1);
     assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
+}
+
+async fn read_shell_filtered(source: &Arc<ShellSource>, arguments: Value) -> Value {
+    let management = granted_management().await;
+    let plane = plane(source.clone());
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        arguments,
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(plane.result_schema_findings().is_empty());
+    reply
+}
+
+/// A filtered read of a page still loading must never show only the window's
+/// own controls with no word that the page content is still missing: with
+/// the page on the re-read the filtered page buttons print, and with the
+/// window still a shell the incomplete-content note prints, a line no filter
+/// removes.
+#[tokio::test]
+async fn a_filtered_shell_read_shows_the_page_or_the_note_never_only_controls() {
+    let arguments = || json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXButton"]});
+    let source = ShellSource::new(shell_window(), populated_window());
+    let reply = read_shell_filtered(&source, arguments()).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    // The re-read ran on the full tree before the filter narrowed it: the
+    // page button from beneath the web area prints.
+    line_with(tree, "button Refresh");
+    assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 1);
+
+    let source = ShellSource::new(shell_window(), shell_window());
+    let reply = read_shell_filtered(&source, arguments()).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(tree.contains(INCOMPLETE_NOTE), "{tree}");
+}
+
+/// A shell the reader already flagged as unreadable still carries the
+/// subtree the platform could not open, so marking it adds no new gap. The
+/// reply must still disclose that the page content is incomplete, and must
+/// not count the shell twice.
+#[tokio::test]
+async fn a_shell_already_flagged_unreadable_is_still_disclosed() {
+    let mut unreadable_shell = shell_window();
+    unreadable_shell.unreadable_children = 1;
+    let source = ShellSource::new(unreadable_shell.clone(), unreadable_shell);
+    let reply = read_shell_filtered(
+        &source,
+        json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXButton"]}),
+    )
+    .await;
+    let tree = reply["state_text"].as_str().unwrap();
+    // Only the window's own controls match the filter, but the note no
+    // filter removes is there too.
+    line_with(tree, "close button");
+    assert!(tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(reply["unreadable_subtrees"], 1);
+}
+
+const NO_MATCH_NOTE: &str = "no matches; the page content isn't readable yet";
+
+/// A filtered read that matches nothing on a page whose content is unreadable
+/// says so instead of printing an empty list; on a readable page the bare
+/// header stands, certifying the absence.
+#[tokio::test]
+async fn a_filtered_read_with_no_matches_on_an_unreadable_page_says_so() {
+    let arguments = || json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXTextField"]});
+    let mut unreadable_shell = shell_window();
+    unreadable_shell.unreadable_children = 1;
+    let source = ShellSource::new(unreadable_shell.clone(), unreadable_shell);
+    let reply = read_shell_filtered(&source, arguments()).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(tree.contains(NO_MATCH_NOTE), "{tree}");
+
+    let source = ShellSource::new(populated_window(), populated_window());
+    let reply = read_shell_filtered(&source, arguments()).await;
+    let tree = reply["state_text"].as_str().unwrap();
+    assert!(!tree.contains(NO_MATCH_NOTE), "{tree}");
+}
+
+/// A reader for the zoom retry: the application read exposes the page, while
+/// reads of the window hand out the shell first and the page only when the
+/// window is read again.
+struct ZoomShellSource {
+    window_reads: AtomicUsize,
+}
+
+impl ZoomShellSource {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            window_reads: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl AppStateSource for ZoomShellSource {
+    fn read_app_state(
+        &self,
+        _target: &ProcessGrant,
+        _bounds: ReadBounds,
+    ) -> Result<RawAppState, AppStateReadError> {
+        Ok(RawAppState {
+            roots: vec![populated_window()],
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn read_element_state(
+        &self,
+        _target: &ProcessGrant,
+        element: &ElementHandle,
+        _bounds: ReadBounds,
+        _expand_menus: bool,
+    ) -> Result<RawAppState, ElementReadError> {
+        if !element.same_element(populated_window().handle.as_ref()) {
+            return Err(ElementReadError::Gone);
+        }
+        let window = if self.window_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            shell_window()
+        } else {
+            populated_window()
+        };
+        Ok(RawAppState {
+            roots: vec![window],
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn element_facts(&self, _element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+        Ok(ElementFacts {
+            pid: Some(grant().pid),
+            ..Default::default()
+        })
+    }
+}
+
+/// A zoom into a window whose page is still building gets the same bounded
+/// re-read as a full read: the zoomed call shows the page, with no note that
+/// anything is missing.
+#[tokio::test]
+async fn a_zoom_into_a_shell_window_is_read_again() {
+    let management = granted_management().await;
+    let source = ZoomShellSource::new();
+    let plane = plane(source.clone());
+    // The filtered read numbers the window, printing its line as the
+    // ancestor of its matching buttons.
+    let filtered = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "role_filter": ["AXButton"]}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(filtered["outcome"], "completed", "{filtered}");
+    let tree = filtered["state_text"].as_str().unwrap();
+    let window = tree
+        .lines()
+        .skip(1)
+        .find(|line| line.contains("window Magic Context"))
+        .unwrap_or_else(|| panic!("no window line in\n{tree}"));
+    let window_id = id_on_line(window).to_owned();
+
+    let reply = serve(
+        &plane,
+        &management,
+        "conversation-1",
+        no_relay(),
+        json!({"target": TARGET_BUNDLE_ID, "zoom": window_id}),
+        InMemoryCaptureBackend::default(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    let tree = reply["state_text"].as_str().unwrap();
+    line_with(tree, "button Refresh");
+    assert!(!tree.contains(INCOMPLETE_NOTE), "{tree}");
+    assert_eq!(source.window_reads.load(Ordering::SeqCst), 2);
 }
 
 /// A window whose first read already shows content is never read again.

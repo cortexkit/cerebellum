@@ -115,24 +115,39 @@ impl RawAppState {
     /// Empty web areas and windows holding only layout shells or their own
     /// window controls (see [`is_empty_shell_window`]) cannot prove that
     /// their content is absent. WebKit can expose these shells before its
-    /// accessibility tree is populated. Mark the gap before filtering, so a
-    /// no-match result does not certify that a control is missing.
+    /// accessibility tree is populated, sometimes with a subtree the reader
+    /// could not open yet. Mark the gap before filtering, so a no-match
+    /// result does not certify that a control is missing.
+    ///
+    /// Returns how many such shells are still present, whether this call
+    /// marked them or the reader had already flagged them as unreadable:
+    /// either way the page's content is still missing from the read. Only
+    /// newly marked ones raise the unreadable count, so a shell the reader
+    /// already counted is not counted twice.
     pub fn mark_unpopulated_content(&mut self) -> usize {
-        fn mark(node: &mut RawElement) -> usize {
+        fn mark(node: &mut RawElement, fresh: &mut usize) -> usize {
             let shell = (node.role.as_deref() == Some("AXWebArea") && node.children.is_empty())
                 || is_empty_shell_window(node);
             if shell {
                 if node.unreadable_children == 0 {
                     node.unreadable_children = 1;
-                    return 1;
+                    *fresh += 1;
                 }
-                return 0;
+                return 1;
             }
-            node.children.iter_mut().map(mark).sum()
+            node.children
+                .iter_mut()
+                .map(|child| mark(child, fresh))
+                .sum()
         }
-        let gaps = self.roots.iter_mut().map(mark).sum();
-        self.unreadable_subtrees += gaps;
-        gaps
+        let mut fresh = 0;
+        let shells: usize = self
+            .roots
+            .iter_mut()
+            .map(|root| mark(root, &mut fresh))
+            .sum();
+        self.unreadable_subtrees += fresh;
+        shells
     }
 
     /// Read each top-level window that is an empty shell (see
