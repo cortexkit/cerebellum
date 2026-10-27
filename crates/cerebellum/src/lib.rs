@@ -1510,6 +1510,26 @@ impl RouteBindings {
         self.get(channel, epoch)
     }
 
+    /// Record a route's facts without a control bind, for fixtures that need a
+    /// head or run route under an exact scope the control path would have to
+    /// mint first.
+    #[doc(hidden)]
+    pub fn insert_for_test(&self, channel: u16, epoch: u32, facts: AcceptedBindFacts) {
+        self.insert(channel, epoch, facts);
+    }
+
+    /// Every route's scope stamp, for fixtures that must see what a union
+    /// walks.
+    #[doc(hidden)]
+    pub fn scope_stamps_for_test(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|facts| facts.scope.clone())
+            .collect()
+    }
+
     fn remove(&self, channel: u16, epoch: u32) -> Option<AcceptedBindFacts> {
         let facts = self.inner.write().ok().and_then(|mut routes| {
             self.bind_order
@@ -6158,6 +6178,17 @@ async fn send_session_caller_not_admitted(
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
+}
+
+/// The scope union `image.resolve` and `private_content.query` share, for
+/// fixtures checking that one reaches what the other would.
+#[doc(hidden)]
+pub fn private_content_scope_union_for_test(
+    planes: &Planes,
+    scope: &str,
+    parent: Option<&str>,
+) -> Vec<String> {
+    private_content::scope_union(planes, scope, parent)
 }
 
 /// The wall clock the handle fixtures read, so their clock matches the one

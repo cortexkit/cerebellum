@@ -928,11 +928,11 @@ pub(crate) async fn handle(
 /// lets a handle captured under any of them be fetched. Keeping it in one
 /// place means a handle's reach and a mark's reach cannot drift apart.
 ///
-/// The union is the requested scope; the head of every live run with that
-/// scope ref, as the route table resolves it, and each such run's parent; and
-/// the parent Broca names, for a run that never opened a cerebellum route (for
-/// example, source pasted after a head's read). A run's marks are copied to
-/// that named parent on the way, so its other runs inherit them.
+/// The union is the requested scope; for every route bound with that scope ref
+/// whose linked head still resolves, that head's scope; and the parent Broca
+/// names, for a run that never opened a cerebellum route (for example, source
+/// pasted after a head's read). A run's marks are copied to that named parent
+/// on the way, so its other runs inherit them.
 pub(crate) fn scope_union(planes: &Planes, scope: &str, parent: Option<&str>) -> Vec<String> {
     let now = crate::wall_clock_ms();
     let runs: Vec<_> = planes

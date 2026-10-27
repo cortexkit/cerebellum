@@ -50,8 +50,8 @@ fn head_stamp() -> ScopeStamp {
 }
 
 /// The reply a `computer_use` read returns with an image, carrying the handle
-/// the production reply path would attach.
-fn held_reply(planes: &Planes) -> Value {
+/// the production reply path would attach for a capture under `scope`.
+fn held_reply(planes: &Planes, scope: &str) -> Value {
     let facts = planes
         .routes
         .accepted_bind_for_test(7, 1)
@@ -63,7 +63,27 @@ fn held_reply(planes: &Planes) -> Value {
         "image": {"image_id": "image-1", "mime": "image/png", "data_b64": bytes,
                   "width_px": 1, "height_px": 1},
     });
-    cerebellum::mint_image_handle_for_test(planes, &facts, CAPTURE_SCOPE, reply)
+    cerebellum::mint_image_handle_for_test(planes, &facts, scope, reply)
+}
+
+/// A `browser_use` status call, which binds this fixture's tool route.
+async fn bind_tool_route(planes: &Planes, writer: &tokio::sync::mpsc::Sender<Frame>) {
+    handle_tool_request_for_test_with_planes(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            1,
+            serde_json::to_vec(&json!({"name":"browser_use","arguments":{"action":"status"}}))
+                .unwrap(),
+        )
+        .unwrap(),
+        writer,
+        planes,
+    )
+    .await
+    .unwrap();
 }
 
 /// The handle every vector names, in place of the random one the fixture
@@ -192,7 +212,7 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
             .conversation_key,
         CONVERSATION
     );
-    let held = held_reply(&planes);
+    let held = held_reply(&planes, CAPTURE_SCOPE);
     assert_eq!(held["outcome"], "completed");
     let handle = held["image_handle"].as_str().unwrap().to_owned();
 
@@ -376,7 +396,7 @@ async fn closing_the_conversations_last_route_drops_its_handles() {
     .await
     .unwrap();
     output.recv().await.unwrap();
-    let handle = held_reply(&planes)["image_handle"]
+    let handle = held_reply(&planes, CAPTURE_SCOPE)["image_handle"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -406,5 +426,291 @@ async fn closing_the_conversations_last_route_drops_its_handles() {
     assert!(planes
         .image_handle_store()
         .resolve(&handle, &[CAPTURE_SCOPE], cerebellum::wall_clock_ms_for_test())
+        .is_none());
+}
+
+/// A route bound through the production control path, on management channel
+/// 10, with `scope` as its stamp and `principal` as its caller.
+async fn bind_management(
+    planes: &Planes,
+    writer: &tokio::sync::mpsc::Sender<Frame>,
+    principal: Principal,
+    conversation: &str,
+    scope: Option<ScopeStamp>,
+) {
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 10,
+        epoch: 1,
+        principal: Some(principal),
+        identity: BindIdentity::new("/fixture", "fixture", conversation.to_string()),
+        admission_facts: None,
+        consumer_capabilities: None,
+        target: RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+        scope,
+        role_versions: None,
+        call_mode: None,
+    };
+    handle_frame_for_test(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            20,
+            serde_json::to_vec(&json!(bind)).unwrap(),
+        )
+        .unwrap(),
+        writer,
+        planes,
+    )
+    .await
+    .unwrap();
+}
+
+/// One request on management channel 10, returning the frame type and body.
+async fn management(planes: &Planes, corr: u64, body: Value) -> (FrameType, Value) {
+    let (writer, mut output) = tokio::sync::mpsc::channel(4);
+    handle_frame_for_test(
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            10,
+            1,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+        &writer,
+        planes,
+    )
+    .await
+    .unwrap();
+    let frame = output.recv().await.unwrap();
+    (frame.header.ty, serde_json::from_slice(&frame.body).unwrap())
+}
+
+/// A caller that is not `reserved:broca` never reaches `image.resolve`: its
+/// management bind is refused, so a handle it guessed is never even looked at.
+#[tokio::test]
+async fn a_non_broca_caller_cannot_resolve_a_handle() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        None,
+        JournalPersistence::Isolated,
+    );
+    let (fixture, mut fixture_output) = tokio::sync::mpsc::channel(4);
+    bind_tool_route(&planes, &fixture).await;
+    fixture_output.recv().await.unwrap();
+    let handle = held_reply(&planes, CAPTURE_SCOPE)["image_handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (writer, mut output) = tokio::sync::mpsc::channel(4);
+    bind_management(
+        &planes,
+        &writer,
+        Principal::Reserved {
+            module_id: "basal".into(),
+        },
+        "basal-conversation",
+        Some(head_stamp()),
+    )
+    .await;
+    // Basal has no authority here, so the bind was refused and channel 10
+    // serves nothing at all.
+    let refused = output.recv().await.unwrap();
+    assert_eq!(refused.header.ty, FrameType::Error);
+    assert!(planes.routes.accepted_bind_for_test(10, 1).is_none());
+    let (ty, body) = management(
+        &planes,
+        21,
+        json!({
+            "method": "image.resolve",
+            "params": {"handle": handle, "scope_ref": CAPTURE_SCOPE},
+        }),
+    )
+    .await;
+    assert_eq!(ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "route_not_bound", "{body}");
+    assert!(
+        !body.to_string().contains(&handle),
+        "the refusal names the handle it refused: {body}"
+    );
+}
+
+/// `reserved:broca` on its management route may call the two operations it
+/// serves and nothing else.
+#[tokio::test]
+async fn broca_management_route_serves_only_its_two_operations() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        None,
+        JournalPersistence::Isolated,
+    );
+    let (writer, mut output) = tokio::sync::mpsc::channel(4);
+    bind_management(
+        &planes,
+        &writer,
+        Principal::Reserved {
+            module_id: "broca".into(),
+        },
+        "broca-conversation",
+        None,
+    )
+    .await;
+    let bound = output.recv().await.unwrap();
+    assert_eq!(bound.header.ty, FrameType::Response);
+    let (ty, body) = management(
+        &planes,
+        22,
+        json!({"method": "permissions.list", "params": {}}),
+    )
+    .await;
+    assert_eq!(ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "principal_denied", "{body}");
+}
+
+/// A run's screenshot resolves for the harness that started it: the run
+/// captures under its own scope, and Broca asks only with the head's scope
+/// ref, which the union widens to the live run's head and so to its capture.
+///
+/// This is the union's contract, not a second capture path: the handle is
+/// minted for the run's scope directly, and the head's route plus the run's
+/// route are what the union has to walk to reach it.
+#[tokio::test]
+async fn a_runs_handle_resolves_through_its_head() {
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        None,
+        JournalPersistence::Isolated,
+    );
+    let (writer, mut output) = tokio::sync::mpsc::channel(8);
+    bind_tool_route(&planes, &writer).await;
+    output.recv().await.unwrap();
+
+    let core = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let admission = json!({
+        "agentProjectId": "test-project",
+        "sessionKind": "primary",
+        "effectiveCapabilityScope": ["*"],
+    });
+    // The head's own tool route.
+    let head_facts = cerebellum::AcceptedBindFacts::from_bind(
+        &BindIdentity::new("/fixture", "fixture", "head-conversation".to_string()),
+        Some(core.clone()),
+        Some(&admission),
+        None,
+        &RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .with_scope(Some(
+        ScopeStamp::new(core.clone(), "head-scope", 1, ScopeKind::Head)
+            .with_owner_authorized(true)
+            .with_attributes(
+                subc_protocol::scope::ScopeAttributes::new()
+                    .with_agent_id(Some("test-project".into()))
+                    .with_delegates(true),
+            ),
+    ));
+    planes.routes.insert_for_test(5, 1, head_facts.clone());
+
+    // The run: an ephemeral scope whose linked parent is that head.
+    let run_stamp = ScopeStamp::new(core, "run-scope", 1, ScopeKind::Ephemeral)
+        .with_owner_authorized(true)
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("test-project".into()))
+                .with_run_id(Some("run-scope".into())),
+        )
+        .with_parent(Some(subc_protocol::scope::ScopeParent::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "head-scope",
+            1,
+        )))
+        .with_parent_state(Some(subc_protocol::scope::ParentState::Linked));
+    let run_facts = cerebellum::AcceptedBindFacts::from_bind(
+        &BindIdentity::new("/fixture", "fixture", "run-conversation".to_string()),
+        Some(Principal::Reserved {
+            module_id: "basal".into(),
+        }),
+        Some(&admission),
+        None,
+        &RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+    )
+    .with_scope(Some(run_stamp));
+    planes.routes.insert_for_test(6, 1, run_facts);
+
+    // The table is what the union walks: the run under its own scope, its
+    // parent naming the head, and the head itself under a head stamp.
+    let stamps = planes.routes.scope_stamps_for_test();
+    assert!(
+        stamps.iter().any(|stamp| stamp.scope_ref == "run-scope"
+            && stamp
+                .parent
+                .as_ref()
+                .is_some_and(|head| head.scope_ref == "head-scope")),
+        "the fixture's run route lost its parent: {stamps:?}"
+    );
+    assert!(stamps.iter().any(|stamp| stamp.scope_ref == "head-scope"));
+
+    // A capture on the run's route names the run's scope.
+    let handle = held_reply(&planes, "run-scope")["image_handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Broca binds its management route through the production control path.
+    let (broca, mut broca_output) = tokio::sync::mpsc::channel(4);
+    bind_management(
+        &planes,
+        &broca,
+        Principal::Reserved {
+            module_id: "broca".into(),
+        },
+        "broca-conversation",
+        None,
+    )
+    .await;
+    let bound = broca_output.recv().await.unwrap();
+    assert_eq!(bound.header.ty, FrameType::Response);
+
+    // The union names the run's capture when Broca names the head, and adds
+    // nothing for a scope no run was bound under.
+    let run_union = cerebellum::private_content_scope_union_for_test(&planes, "run-scope", None);
+    assert!(
+        run_union.iter().any(|scope| scope == "head-scope"),
+        "naming the run must reach its head: {run_union:?}"
+    );
+    let head_union = cerebellum::private_content_scope_union_for_test(&planes, "head-scope", None);
+    assert_eq!(head_union, ["head-scope"], "the head names no run");
+    assert_eq!(
+        cerebellum::private_content_scope_union_for_test(&planes, "another-scope", None),
+        ["another-scope"]
+    );
+    // The handle itself resolves only when the run's scope is in the union.
+    assert!(planes
+        .image_handle_store()
+        .resolve(
+            &handle,
+            &["head-scope", "run-scope"],
+            cerebellum::wall_clock_ms_for_test()
+        )
+        .is_some());
+    assert!(planes
+        .image_handle_store()
+        .resolve(
+            &handle,
+            &["head-scope"],
+            cerebellum::wall_clock_ms_for_test()
+        )
         .is_none());
 }

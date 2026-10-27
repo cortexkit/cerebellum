@@ -125,11 +125,16 @@ What a handle reaches, and for how long:
 
 - **The scope union.** A handle resolves only when its capture's `scope_ref` is
   in this union: the request's `scope_ref`; `parent_scope_ref` when given; and,
-  for every live run route with that scope ref, the head `run_head` resolves and
-  that run's stamp's parent (`crates/cerebellum/src/private_content.rs`,
-  `scope_union`). `private_content.query` computes the same union from the same
+  for every route bound with that scope ref whose linked head still resolves,
+  the head's scope (`crates/cerebellum/src/private_content.rs`,
+  `scope_union`). So naming a run's scope reaches the run's head, and naming a
+  head reaches the runs under it only where the head is the one a bound route
+  resolves to. `private_content.query` computes the same union from the same
   function, so what a handle reaches and what a mark reaches cannot drift
   apart. Nothing about the capture's conversation enters it.
+- **A capture's scope is its route's, not its head's.** A run's screenshot is
+  recorded under the run's own `scope_ref`, so resolving it needs that ref in
+  the union: send the run's `scope_ref`, not only its head's.
 - **Fifteen minutes from capture.** A handle resolves until its capture time
   plus 15 minutes (`crates/cerebellum/src/image_handles.rs`, `LIFETIME`).
   Resolving never extends that.
