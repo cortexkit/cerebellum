@@ -173,13 +173,15 @@ test("duplicate invocation and duplicate Dispatch are never executed twice", asy
   assert.equal(f.chrome.calls.filter(call => call[0] === "cdp").length, before);
 });
 
-test("Goodbye releases handed claims without closing outside tabs", async t => {
+test("Goodbye releases handed claims and keeps the tab grouped", async t => {
   const f = await native(t);
+  const handle = f.record.handle;
   f.send(0, { type: "goodbye", route });
   await turn();
   assert.equal(f.chrome.tabData.has(1), true);
   assert.equal(f.chrome.tabData.has(2), true);
-  assert.equal(f.chrome.tabData.get(2).groupId, -1);
+  assert.equal(f.chrome.tabData.get(2).groupId, f.tabs.group.id);
+  assert.equal(f.tabs.tabs.get(2)?.handle, handle);
   assert.equal(f.agent.claims.size, 0);
 });
 
