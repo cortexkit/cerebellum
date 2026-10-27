@@ -308,7 +308,7 @@ fn shows_content(node: &RawElement, standard: bool, window_names: &[String]) -> 
         }
         Some("AXStaticText") => {
             let text = super::render::one_line(&super::render::describe(node).label);
-            !(standard && node.children.is_empty() && window_names.iter().any(|name| *name == text))
+            !(standard && node.children.is_empty() && window_names.contains(&text))
         }
         Some(
             "AXGroup" | "AXGenericElement" | "AXUnknown" | "AXLayoutArea" | "AXLayoutItem"
