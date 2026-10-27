@@ -56,6 +56,7 @@ pub mod durable_formats;
 mod egress;
 pub mod flat_tools;
 mod grant_enforcement;
+mod image_handles;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
@@ -968,6 +969,7 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 /// Whether the management dispatcher has an explicit arm for this operation.
 pub fn dispatchable_management_operation(name: &str) -> bool {
     name == private_content::QUERY
+        || name == image_handles::RESOLVE
         || permissions::is_operation(name)
         || matches!(
             name,
@@ -3010,6 +3012,8 @@ pub struct Planes {
     computer_for_test: Option<Arc<computer_capability::ScriptedComputerPlane>>,
     pub health: Arc<HealthState>,
     private_content: Arc<private_content::PrivateContent>,
+    /// Screenshot bytes a codemode program may hand to Broca by handle.
+    image_handles: Arc<image_handles::ImageHandles>,
     signed_in: Arc<browser_signed_in::SignedInDomains>,
     cancellations: RequestCancellations,
     operator_confirm: Arc<computer_capability::operator_confirm::Wire>,
@@ -3411,6 +3415,7 @@ impl Planes {
                 JournalPersistence::Durable => private_content::PrivateContent::production(),
                 JournalPersistence::Isolated => private_content::PrivateContent::in_memory(),
             }),
+            image_handles: Arc::new(image_handles::ImageHandles::default()),
             signed_in,
             routes: Arc::new(RouteBindings::new()),
             browser,
@@ -3540,6 +3545,7 @@ impl Clone for Planes {
             computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
             private_content: Arc::clone(&self.private_content),
+            image_handles: Arc::clone(&self.image_handles),
             signed_in: Arc::clone(&self.signed_in),
             cancellations: self.cancellations.clone(),
             operator_confirm: self.operator_confirm.clone(),
@@ -3678,6 +3684,7 @@ async fn handle_frame(
                         if last_route {
                             planes.management.end_conversation(conversation_key);
                             planes.calls.end_conversation(conversation_key);
+                            planes.image_handles.end_conversation(conversation_key);
                         }
                         if let Some(config) = planes.browser_config.as_ref() {
                             planes.sessions.teardown_route(
@@ -3697,6 +3704,7 @@ async fn handle_frame(
                             // Held reply bodies are a memory bound, not a
                             // permission: they go with the last route as always.
                             planes.calls.end_conversation(conversation_key);
+                            planes.image_handles.end_conversation(conversation_key);
                         }
                         let key = scope_watch::ScopeKey::from_stamp(stamp);
                         if planes.scopes.note_closed(&key, conversation_key) {
@@ -3901,12 +3909,12 @@ async fn handle_route_request(
         // Broca's privacy decision must not queue behind a browser action or
         // consent drain. Its management route has no other authority.
         let request: Option<Value> = serde_json::from_slice(&frame.body).ok();
+        let method = request
+            .as_ref()
+            .and_then(|body| body.get("method"))
+            .and_then(Value::as_str);
         if facts.surface != RouteSurface::Management
-            || request
-                .as_ref()
-                .and_then(|body| body.get("method"))
-                .and_then(Value::as_str)
-                != Some(private_content::QUERY)
+            || !matches!(method, Some(private_content::QUERY) | Some(image_handles::RESOLVE))
         {
             return send_route_error(
                 writer,
@@ -3915,7 +3923,7 @@ async fn handle_route_request(
                 epoch,
                 corr,
                 "principal_denied",
-                "reserved:broca may call only private_content.query",
+                "reserved:broca may call only private_content.query and image.resolve",
             )
             .await;
         }
@@ -4198,6 +4206,9 @@ async fn handle_management_request_observed(
     }
     if method == private_content::QUERY {
         return private_content::handle(&frame, writer, facts, planes, object).await;
+    }
+    if method == image_handles::RESOLVE {
+        return handle_image_resolve(&frame, writer, planes, object).await;
     }
     if method == management::SESSION_TURN_ENDED {
         return handle_session_turn_ended(
@@ -6156,6 +6167,98 @@ fn wall_clock_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Adds the image handle a screenshot reply's bytes are resolvable by, for a
+/// capture made on the route described by `facts`.
+///
+/// A route without a scope stamp gets no handle, and the field is omitted: the
+/// resolver authorizes by scope, so nothing could ever fetch those bytes. A
+/// reply whose image is missing or unreadable is left as it is.
+fn mint_image_handle(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    reply: &mut Value,
+) {
+    let Some(scope_ref) = private_content::capture_scope(facts) else {
+        return;
+    };
+    let capture = image_handles::Capture {
+        scope_ref,
+        conversation_key: facts.identity.conversation_key.clone(),
+        now_ms: wall_clock_ms(),
+    };
+    if let Some(handle) = planes.image_handles.mint(reply, &capture) {
+        reply["image_handle"] = json!(handle);
+    }
+}
+
+/// `image.resolve`: the bytes a screenshot handle stands for.
+///
+/// Broca calls this to fetch the screenshot a codemode program passed by
+/// handle, because the bytes are far larger than a program's result may carry.
+/// Only `reserved:broca` on a management surface reaches it, checked by the
+/// route dispatcher before this runs.
+///
+/// A handle that is unknown, expired, or belongs to a scope outside the
+/// caller's union all get one identical refusal body, and the store does the
+/// same work for each, so the reply never says whether a handle exists.
+async fn handle_image_resolve(
+    frame: &Frame,
+    writer: &mpsc::Sender<Frame>,
+    planes: &Planes,
+    request: &serde_json::Map<String, Value>,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params = request.get("params").and_then(Value::as_object);
+    let parsed = (|| {
+        let params = params.ok_or(("params", "wrong_type"))?;
+        // Largest frame first, so a query naming an unusual key is refused for
+        // that key rather than for whichever key happened to come first.
+        if let Some(field) = params
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "handle" | "scope_ref" | "parent_scope_ref"))
+            .max()
+        {
+            return Err((field.as_str(), "unknown_field"));
+        }
+        let text = |field: &'static str| match params.get(field) {
+            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.as_str())),
+            Some(Value::String(_)) => Err((field, "empty_value")),
+            Some(_) => Err((field, "wrong_type")),
+            None => Ok(None),
+        };
+        let handle = text("handle")?.ok_or(("handle", "missing_field"))?;
+        let scope = text("scope_ref")?.ok_or(("scope_ref", "missing_field"))?;
+        let parent = text("parent_scope_ref")?;
+        Ok((handle, scope, parent))
+    })();
+    let (handle, scope, parent) = match parsed {
+        Ok(parsed) => parsed,
+        Err((field, reason)) => {
+            return send_invalid_request_response(writer, ver, channel, epoch, corr, field, reason)
+                .await
+        }
+    };
+    let scopes = private_content::scope_union(planes, scope, parent);
+    let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let reply = planes
+        .image_handles
+        .resolve(handle, &scopes, wall_clock_ms())
+        .unwrap_or_else(|| {
+            json!({
+                "outcome": image_handles::UNAVAILABLE,
+                "context": null,
+                "session": null,
+                "detail": {"field": "handle"},
+            })
+        });
+    send_tool_response(writer, ver, channel, epoch, corr, reply).await
+}
+
 /// A tool-route request, with its optional `call_key` handled before the call
 /// itself is.
 ///
@@ -7393,7 +7496,10 @@ async fn handle_tool_request_inner(
                 .await
             }
         };
-        let result = user_browser::serve(
+        // A person's-browser screenshot leaves with a handle its bytes resolve
+        // by, so a program can pass it to a model call. A refusal carries no
+        // image, so minting leaves it as it is.
+        let mut result = user_browser::serve(
             planes,
             &accepted_facts,
             writer,
@@ -7403,6 +7509,7 @@ async fn handle_tool_request_inner(
             arguments,
         )
         .await;
+        mint_image_handle(planes, &accepted_facts, &mut result);
         if planes.routes.get(channel, epoch).is_none() {
             return Ok(());
         }
@@ -7644,6 +7751,10 @@ async fn handle_tool_request_inner(
         }
         return match result {
             Ok(result) => {
+                // The read's screenshot is thousands of bytes no program can
+                // return, so it also leaves with a handle Broca can resolve.
+                let mut result = result;
+                mint_image_handle(planes, &accepted_facts, &mut result);
                 private_content::send_reply(
                     planes,
                     &accepted_facts,
@@ -7709,6 +7820,10 @@ async fn handle_tool_request_inner(
         }
         return match result {
             Ok(result) => {
+                // A browser screenshot leaves with a handle its bytes resolve
+                // by, so a program can pass it to a model call.
+                let mut result = result;
+                mint_image_handle(planes, &accepted_facts, &mut result);
                 private_content::send_reply(
                     planes,
                     &accepted_facts,
@@ -8446,6 +8561,8 @@ fn tool_response_frame(
         tool_result::encode_with_held(body, held)?
     } else {
         if codemode::active() {
+            // The image handle names the same bytes, so programmes this reply
+            // can return a handle without the image being a round trip.
             if let Some(image) = body.get_mut("image").and_then(Value::as_object_mut) {
                 image.remove("data_b64");
             }

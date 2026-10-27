@@ -779,7 +779,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v28_from_v27(&generated, historical_revision(28).as_str().unwrap());
     let generated =
         vocabulary_mint::v29_from_v28(&generated, historical_revision(29).as_str().unwrap());
-    let generated = vocabulary_mint::v30_from_v29(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v30_from_v29(&generated, historical_revision(30).as_str().unwrap());
+    let generated = vocabulary_mint::v31_from_v30(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1838,14 +1840,86 @@ fn v29_changes_only_the_not_fronted_reasons() {
     );
 }
 
-/// The shipped artifact with v30's addition taken back out: the
-/// `authorization_denied` outcome at the end of every row's outcome enum but
-/// `list_apps`'s, and the sentence describing it at the end of that row's
-/// outcome description. Each removal asserts what it removes was there, so a
-/// v30 that stopped adding it to any row is caught here as well as by the
+/// The shipped artifact with v31's one addition taken back out:
+/// `computer.read_state`'s `image_handle`. The removal asserts the field was
+/// there, so a v31 that stopped adding it is caught here as well as by the
+/// digest.
+fn recreated_v30() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(30);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        let capability = row["capability_id"].as_str().unwrap().to_string();
+        let properties = row["result_schema"]["properties"].as_object_mut().unwrap();
+        if capability == "computer.read_state" {
+            assert_eq!(
+                properties.remove("image_handle"),
+                Some(vocabulary_mint::v31_read_state_image_handle_field()),
+                "{capability}.image_handle"
+            );
+        } else {
+            assert!(!properties.contains_key("image_handle"), "{capability}");
+        }
+    }
+    vocabulary
+}
+
+/// The recreated v30 is byte for byte the v30 that shipped: its digest is the
+/// one v30's mirrors and source lock carried.
+#[test]
+fn v31_only_adds_read_states_image_handle_to_the_recreated_v30() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v30()).unwrap()),
+        "b0b9b5aab421dd5c5380ddfef0580168f485af8bc44a3b7991898b96d144a906"
+    );
+}
+
+/// v31 changes nothing outside the rows' `result_schema`s, and inside them
+/// only `read_state`'s new `image_handle`. The advertised `computer_use`
+/// definition is built from each row's `request_schema`, so those keep their
+/// exact bytes, and every other row field is what `validate_row` checks.
+#[test]
+fn v31_changes_only_read_states_image_handle() {
+    let previous = recreated_v30();
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let previous_rows = previous["rows"].as_array().unwrap();
+    let current_rows = current["rows"].as_array().unwrap();
+    assert_eq!(previous_rows.len(), current_rows.len());
+    for (before, after) in previous_rows.iter().zip(current_rows) {
+        let id = after["capability_id"].as_str().unwrap();
+        assert_eq!(
+            canonical_json_bytes(&before["request_schema"]).unwrap(),
+            canonical_json_bytes(&after["request_schema"]).unwrap(),
+            "{id} request_schema"
+        );
+        let mut before = before.clone();
+        let mut after = after.clone();
+        for row in [&mut before, &mut after] {
+            row["result_schema"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("image_handle");
+        }
+        assert_eq!(before, after, "{id} changed outside image_handle");
+    }
+    let mut previous = previous;
+    let mut current = current;
+    previous.as_object_mut().unwrap().remove("rows");
+    current.as_object_mut().unwrap().remove("rows");
+    previous["revision"] = current["revision"].clone();
+    assert_eq!(
+        previous, current,
+        "a document field other than revision changed"
+    );
+}
+
+/// The shipped artifact with v30's addition taken back out, from the recreated
+/// v30: the `authorization_denied` outcome at the end of every row's outcome
+/// enum but `list_apps`'s, and the sentence describing it at the end of that
+/// row's outcome description. Each removal asserts what it removes was there,
+/// so a v30 that stopped adding it to any row is caught here as well as by the
 /// digest.
 fn recreated_v29() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v30();
     vocabulary["revision"] = historical_revision(29);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
