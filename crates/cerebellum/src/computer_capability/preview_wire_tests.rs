@@ -146,7 +146,7 @@ impl super::app_use::ConfigFiles for FixedConfig {
 }
 
 fn app_use_file(mode: AppUse) -> super::app_use::LiveAppUse {
-    super::app_use::LiveAppUse::new(
+    let live = super::app_use::LiveAppUse::new(
         Some(PathBuf::from(
             "/fixture/home/.config/cortexkit/cerebellum.jsonc",
         )),
@@ -154,7 +154,9 @@ fn app_use_file(mode: AppUse) -> super::app_use::LiveAppUse {
             AppUse::Foreground => r#"{"computer_use":{"app_use":"foreground"}}"#,
             AppUse::Background => r#"{"computer_use":{"app_use":"background"}}"#,
         })),
-    )
+    );
+    live.approve_fixture();
+    live
 }
 
 struct Rig {

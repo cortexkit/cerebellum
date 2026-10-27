@@ -2,8 +2,8 @@
 //!
 //! Every other key in `~/.config/cortexkit/cerebellum.jsonc` takes effect only
 //! at startup. `app_use` is read again while the module runs, so a person who
-//! switches between background and foreground use sees the change on the next
-//! `computer_use` call without restarting anything.
+//! switches to background sees the change on the next call. Foreground use
+//! additionally needs the person's operator confirmation, held only in memory.
 //!
 //! The cost of that is one `stat` of the config file per call. When the file's
 //! modification time is the one seen last time, the mode read last time is used
@@ -112,6 +112,7 @@ pub(crate) struct LiveAppUse {
     /// Held across the `stat` and any re-read, so two calls arriving together
     /// parse a changed file once rather than twice.
     state: StdMutex<State>,
+    approval: super::app_use_approval::Approval,
 }
 
 struct State {
@@ -125,6 +126,7 @@ struct State {
 impl LiveAppUse {
     pub(crate) fn new(path: Option<PathBuf>, files: Arc<dyn ConfigFiles>) -> Self {
         Self {
+            approval: super::app_use_approval::Approval::default(),
             state: StdMutex::new(State {
                 path,
                 files,
@@ -141,10 +143,12 @@ impl LiveAppUse {
     /// Every call foreground, whatever any config file says: for tests about
     /// the on-screen badge, which background mode never draws.
     pub(crate) fn foreground_for_test() -> Self {
-        Self::new(
+        let mut live = Self::new(
             Some(PathBuf::from("/fixed/app_use/foreground.jsonc")),
             Arc::new(ForegroundFile),
-        )
+        );
+        live.approval = super::app_use_approval::Approval::foreground_fixture();
+        live
     }
 
     /// Read the person's config file, `config_path()`, from the next call on.
@@ -155,6 +159,7 @@ impl LiveAppUse {
         state.path = cerebellum_core::config::config_path();
         state.files = Arc::new(NativeConfigFiles);
         state.last = None;
+        self.approval.observe(None);
     }
 
     /// The file calls are read from, if any.
@@ -172,7 +177,23 @@ impl LiveAppUse {
     /// The mode for the call about to run.
     pub(crate) fn current(&self) -> Result<AppUse, ConfigInvalid> {
         let mut state = self.lock();
-        let State { path, files, last } = &mut *state;
+        let outcome = Self::read(&mut state);
+        self.approval.observe(outcome.as_ref().ok().copied());
+        outcome
+    }
+
+    pub(crate) async fn approved_mode(&self, mode: AppUse, cancel: &crate::CancelHandle) -> AppUse {
+        self.approval.resolve(mode, cancel).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn approve_fixture(&self) {
+        let _ = self.current();
+        self.approval.approve_fixture();
+    }
+
+    fn read(state: &mut State) -> Result<AppUse, ConfigInvalid> {
+        let State { path, files, last } = state;
         let Some(path) = path.as_deref() else {
             return Ok(AppUse::Background);
         };
@@ -661,6 +682,30 @@ mod serve_tests {
         })
     }
 
+    #[tokio::test]
+    async fn an_unapproved_foreground_setting_reaches_serve_only_as_background() {
+        let (live, files) = live();
+        files.write(at(1), FOREGROUND);
+        let plane = plane(live);
+        let (management, _) = management();
+        let note = crate::tool_result::APP_USE_NOTE
+            .scope(std::cell::RefCell::new(None), async {
+                serve(&plane, &management, "computer.wait", wait_arguments()).await;
+                crate::tool_result::APP_USE_NOTE
+                    .with(|note| note.borrow().clone())
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(
+            *plane.app_use_seen_for_test.lock().unwrap(),
+            [Some(AppUse::Background)]
+        );
+        assert!(
+            note.contains("unsupported"),
+            "a call without a daemon carrier explains the fallback"
+        );
+    }
+
     /// Every served row, `wait`, `list_apps` and the three takeover actions
     /// included, refuses before lookup, journaling or any work while the file
     /// does not parse.
@@ -720,6 +765,8 @@ mod serve_tests {
         assert_eq!(seen(), [Some(AppUse::Background)], "no file is background");
 
         files.write(at(1), FOREGROUND);
+        // This test isolates reloads; supply operator approval explicitly.
+        plane.app_use.approve_fixture();
         serve(&plane, &management, "computer.wait", wait_arguments()).await;
         assert_eq!(seen().last(), Some(&Some(AppUse::Foreground)));
 
@@ -733,6 +780,7 @@ mod serve_tests {
         assert_eq!(seen().last(), Some(&Some(AppUse::Background)));
 
         files.write(at(4), FOREGROUND);
+        plane.app_use.approve_fixture();
         serve(&plane, &management, "computer.wait", wait_arguments()).await;
         files.delete();
         serve(&plane, &management, "computer.wait", wait_arguments()).await;
@@ -761,6 +809,7 @@ mod serve_tests {
             at(1),
             r#"{"computer_use":{"agent_cursor":false,"app_use":"foreground"}}"#,
         );
+        plane.app_use.approve_fixture();
         serve(&plane, &management, "computer.wait", wait_arguments()).await;
         assert_eq!(
             plane.app_use_seen_for_test.lock().unwrap().as_slice(),
