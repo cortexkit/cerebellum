@@ -118,6 +118,30 @@ test("an OOPIF stub is replaced rather than duplicated by its session tree", asy
   assert.equal(reply.frame_mappings[1].unreadable_reason, undefined);
 });
 
+test("a ref scroll runs in the ref's child session and reads the page position at the root", async () => {
+  const f = await framed();
+  // Input needs every live frame observed. The fake answers sentinel
+  // messages by frame, so route the fixture's document ids to its frames,
+  // observe the child, and take the read that sets the input baseline.
+  f.chrome.tabData.get(2).documentId = "main-doc";
+  const message = f.chrome.tabs.sendMessage;
+  f.chrome.tabs.sendMessage = (tabId, body, options) => message(tabId, body, options?.documentId === "child-doc" ? { frameId: 17 } : options);
+  await f.chrome.scripting.executeScript({ target: { tabId: 2, frameIds: [17] } });
+  const epoch = (await f.fresh()).interaction_epoch;
+  assert.ok(f.agent.baselines.has(2));
+  const { frame_id, loader_id, session_id } = f.scope;
+  const metrics = { method: "Page.getLayoutMetrics", params: {} };
+  const scroll = { method: "DOM.scrollIntoViewIfNeeded", params: { backendNodeId: 42 } };
+  const reply = await f.run({ ...f.cdp([metrics, { ...scroll, frame_id, loader_id, session_id }, metrics]), interaction_epoch: epoch });
+  assert.equal(reply.interaction_epoch, epoch);
+  const sent = method => f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === method);
+  assert.deepEqual(sent(scroll.method).map(call => [call[1], call[3]]), [[{ tabId: 2, sessionId: "ephemeral-child-session" }, scroll.params]]);
+  assert.deepEqual(sent(metrics.method).map(call => call[1]), [{ tabId: 2 }, { tabId: 2 }]);
+  // A ref from a document the child has since replaced is never scrolled.
+  await assert.rejects(f.run({ ...f.cdp([metrics, { ...scroll, frame_id, loader_id: "old-loader", session_id }, metrics]), interaction_epoch: epoch }), { reason: "frame_stale" });
+  assert.equal(sent(scroll.method).length, 1);
+});
+
 test("same-origin child commands stay on the root target", async () => {
   const f = await framed(false);
   const { frame_id, loader_id, session_id } = f.scope;

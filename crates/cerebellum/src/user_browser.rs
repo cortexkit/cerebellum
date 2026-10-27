@@ -567,6 +567,27 @@ impl UserBrowser {
         Ok(snapshot.clone())
     }
 
+    /// The newest read (snapshot or screenshot) this route took of `tab` on
+    /// this connection. A page scroll names no ref, so it acts under this
+    /// read: it refuses if the person has used the page since.
+    fn latest_read(&self, route: Route, tab: &str, connection: u64) -> Result<Snapshot, Value> {
+        let state = self.state();
+        state
+            .snapshot_order
+            .iter()
+            .rev()
+            .filter_map(|id| state.snapshots.get(id))
+            .find(|snapshot| {
+                snapshot.route == route && snapshot.tab == tab && snapshot.connection == connection
+            })
+            .cloned()
+            .ok_or_else(|| {
+                let mut reply = refusal("fresh_read_required");
+                reply["remedy"] = json!("Take a snapshot of this tab first; a scroll acts only on a page read since the person last used it.");
+                reply
+            })
+    }
+
     fn retain(&self, id: String, snapshot: Snapshot) {
         let mut state = self.state();
         if state.ended_routes.contains(&snapshot.route)
@@ -1149,6 +1170,7 @@ async fn plan(
     interaction: Option<u64>,
     cancel: &CancelHandle,
     commands: Vec<Value>,
+    scroll_is_input: bool,
 ) -> Result<Plan, Value> {
     if !crate::grant_enforcement::commit_current() {
         return Err(refusal("grant_revoked"));
@@ -1166,6 +1188,11 @@ async fn plan(
                     || method == "DOM.focus"
                     || method == "Runtime.callFunctionOn"
                     || method == "Emulation.setFocusEmulationEnabled"
+                    // A click scrolls its target into view only to measure
+                    // it, before any input. For a scroll action, scrolling
+                    // is the action itself, so once Chrome has done it the
+                    // call has had its effect.
+                    || (scroll_is_input && method == "DOM.scrollIntoViewIfNeeded")
             })
         })
         .collect();
@@ -1316,6 +1343,7 @@ async fn document(
             command("Page.getNavigationHistory", json!({})),
             command("Page.getFrameTree", json!({})),
         ],
+        false,
     )
     .await?;
     let history = plan.results[0]
@@ -1550,9 +1578,6 @@ fn note_settlement_once(target: &UserBrowser, reply: &Value) {
 }
 
 fn validate(action: &str, args: &Value) -> Result<(), Value> {
-    if action == "scroll" {
-        return Err(refusal("unsupported_on_user_browser"));
-    }
     let object = args
         .as_object()
         .ok_or_else(|| invalid("arguments", "wrong_type"))?;
@@ -1562,7 +1587,14 @@ fn validate(action: &str, args: &Value) -> Result<(), Value> {
     }
     if matches!(
         action,
-        "navigate" | "snapshot" | "screenshot" | "click" | "type" | "click_point" | "claim_tab"
+        "navigate"
+            | "snapshot"
+            | "screenshot"
+            | "scroll"
+            | "click"
+            | "type"
+            | "click_point"
+            | "claim_tab"
     ) {
         fields.insert("tab".into(), json!({"type":"string","minLength":1}));
     }
@@ -1634,9 +1666,20 @@ fn validate(action: &str, args: &Value) -> Result<(), Value> {
     }
     if matches!(
         action,
-        "navigate" | "snapshot" | "screenshot" | "click" | "type" | "click_point"
+        "navigate" | "snapshot" | "screenshot" | "scroll" | "click" | "type" | "click_point"
     ) {
         required.push("tab");
+    }
+    // As on browser:own, a scroll either brings one printed ref into view or
+    // moves the page by a direction (and optional amount), never both.
+    if action == "scroll" {
+        if object.contains_key("ref") {
+            if object.contains_key("direction") || object.contains_key("amount") {
+                return Err(invalid("direction", "unsupported_value"));
+            }
+        } else if !object.contains_key("direction") {
+            return Err(invalid("direction", "missing_field"));
+        }
     }
     for field in required {
         if !object.contains_key(field) {
@@ -2077,6 +2120,7 @@ impl Context<'_> {
             interaction,
             &self.cancel,
             commands,
+            self.action == "scroll",
         )
         .await
     }
@@ -2443,6 +2487,9 @@ async fn serve_inner(
             None
         };
         return capture(&context, tab, args, &observed, &once, zoom.as_ref()).await;
+    }
+    if action == "scroll" {
+        return scroll(&context, tab, args, &current).await;
     }
     input(&context, tab, action, args, &current).await
 }
@@ -3942,6 +3989,253 @@ async fn input(
     }
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"input_dispatched":dispatched,"connection_epoch":context.connection,"interaction_epoch":landed.interaction});
     if popup {
+        reply["popup_activated_briefly"] = json!(true);
+    }
+    Ok(reply)
+}
+
+/// Where the top document is scrolled, from a `Page.getLayoutMetrics`
+/// result, in CSS pixels.
+struct PagePosition {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    content_height: f64,
+}
+
+fn page_position(metrics: &Value) -> Result<PagePosition, Value> {
+    let number = |value: &Value| {
+        value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .ok_or_else(|| refusal("viewport_not_ready"))
+    };
+    let viewport = &metrics["cssLayoutViewport"];
+    Ok(PagePosition {
+        x: number(&viewport["pageX"])?,
+        y: number(&viewport["pageY"])?,
+        width: number(&viewport["clientWidth"])?,
+        height: number(&viewport["clientHeight"])?,
+        content_height: number(&metrics["cssContentSize"]["height"])?,
+    })
+}
+
+/// The backend node id of the document's root element (`<html>`), from a
+/// depth-1 `DOM.getFlattenedDocument` result.
+fn document_element(flattened: &Value) -> Result<u64, Value> {
+    let nodes = flattened["nodes"]
+        .as_array()
+        .ok_or_else(|| refusal("no_geometry"))?;
+    let document = nodes
+        .iter()
+        .find(|node| node["nodeType"] == 9 && node.get("parentId").is_none())
+        .and_then(|node| node["nodeId"].as_u64())
+        .ok_or_else(|| refusal("no_geometry"))?;
+    nodes
+        .iter()
+        .find(|node| node["nodeType"] == 1 && node["parentId"] == document)
+        .and_then(|node| node["backendNodeId"].as_u64())
+        .ok_or_else(|| refusal("no_geometry"))
+}
+
+/// The plain-text report of a scroll: what was asked, where the page moved,
+/// and whether the page grew taller, as an infinite feed does when it loads
+/// more posts.
+fn scroll_report(
+    asked: &str,
+    page_scroll: bool,
+    before: &PagePosition,
+    after: &PagePosition,
+) -> String {
+    let mut lines = vec![asked.to_owned()];
+    if (after.x, after.y) == (before.x, before.y) {
+        lines.push(format!(
+            "The page did not move from x {:.0}, y {:.0}.",
+            before.x, before.y
+        ));
+        lines.push(if page_scroll {
+            "It may already be at its end in that direction, or its content scrolls inside an element; scroll a ref in that element into view instead.".into()
+        } else {
+            "The element was already in view, or it scrolls inside an embedded frame or element.".to_owned()
+        });
+    } else {
+        lines.push(format!(
+            "The page moved from x {:.0}, y {:.0} to x {:.0}, y {:.0}; the viewport is {:.0} x {:.0} px.",
+            before.x, before.y, after.x, after.y, after.width, after.height
+        ));
+    }
+    if after.content_height > before.content_height {
+        lines.push(format!(
+            "The page grew from {:.0} to {:.0} px tall during the scroll: more content loaded.",
+            before.content_height, after.content_height
+        ));
+    } else if after.content_height < before.content_height {
+        lines.push(format!(
+            "The page shrank from {:.0} to {:.0} px tall during the scroll.",
+            before.content_height, after.content_height
+        ));
+    } else {
+        lines.push(format!(
+            "The page is {:.0} px tall, unchanged so far; content it loads after the scroll shows on the next read.",
+            after.content_height
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Scroll a claimed tab: bring a printed ref into view, or move the page by
+/// `direction` and `amount` CSS pixels (600 when omitted), as browser:own
+/// does.
+///
+/// Chrome acknowledges synthetic wheel and gesture input to a background
+/// page without moving it (the own browser found this, and scrolls with a
+/// native call instead), and the person's Agent-group tabs are usually in
+/// the background. Both forms therefore use `DOM.scrollIntoViewIfNeeded`,
+/// which Chrome performs in the page itself, with no page-supplied
+/// JavaScript and no trusted input events for the interaction observer to
+/// count as the person's. A page scroll asks the document's root element to
+/// show a viewport-sized rectangle offset by the amount from what is shown
+/// now. Chrome aligns that rectangle with the viewport, which moves the page
+/// by the amount, stopping at its ends. The rectangle is placed relative to
+/// the root element's box, which starts at the document's origin unless the
+/// page gives `<html>` a margin; the reply reports where the page actually
+/// ended up.
+///
+/// A scroll only changes what is shown, so like browser:own it needs the
+/// page's tier-1 site grant, the one a snapshot uses. Like other input it
+/// acts only under the agent's last read of the tab, so a page the person
+/// has used since refuses.
+async fn scroll(
+    context: &Context<'_>,
+    tab: &str,
+    args: &Value,
+    current: &Document,
+) -> Result<Value, Value> {
+    let reference = args["ref"].as_str();
+    let snapshot = match reference {
+        Some(_) => context
+            .target()
+            .snapshot(context.route, tab, context.connection, args)?,
+        None => context
+            .target()
+            .latest_read(context.route, tab, context.connection)?,
+    };
+    if !current.observer_available || snapshot.observer_continuity != current.observer_continuity {
+        return Err(observer_unavailable());
+    }
+    bind_observer_continuity(snapshot.observer_continuity);
+    if snapshot.document != current.committed {
+        return Err(document_moved(
+            false,
+            &snapshot.document,
+            &current.committed,
+        ));
+    }
+    if snapshot.interaction != current.interaction {
+        return Err(epoch_moved(false, current.interaction_cause.as_deref()));
+    }
+    let site = origin(&current.committed.url)?;
+    context
+        .authorize(
+            &site,
+            Severity::new(authorization::OBSERVE, false, false),
+            BTreeSet::new(),
+        )
+        .await?;
+    let interaction = Some(snapshot.interaction);
+    let metrics = || command("Page.getLayoutMetrics", json!({}));
+    // Once the scroll step has run, any later failure still reports that
+    // the page may have moved.
+    let scrolled = |reply: Value| prior_input(reply, true);
+    let (asked, before, after, plan) = if let Some(reference) = reference {
+        let shown = snapshot
+            .refs
+            .get(reference)
+            .ok_or_else(|| refusal("ref_scope_mismatch"))?;
+        let frame = &shown.frame;
+        if let Some(reason) = current.unreadable_frames.get(&frame.frame_id) {
+            return Err(reason.refusal());
+        }
+        if !current.frames.iter().any(|live| live.same_document(frame)) {
+            return Err(refusal("frame_changed"));
+        }
+        // The ref can be in an embedded frame, so only the scroll step is
+        // sent to the ref's frame; the page position either side of it is
+        // the top document's.
+        let mut step = command(
+            "DOM.scrollIntoViewIfNeeded",
+            json!({"backendNodeId":shown.identity.backend_node_id}),
+        );
+        step["frame_id"] = json!(frame.frame_id);
+        step["loader_id"] = json!(frame.loader_id);
+        step["session_id"] = json!(frame.session_id);
+        let plan = context
+            .cdp(tab, interaction, vec![metrics(), step, metrics()])
+            .await?;
+        let before = page_position(&plan.results[0]).map_err(scrolled)?;
+        let after = page_position(&plan.results[2]).map_err(scrolled)?;
+        (
+            format!("Scrolled {reference} into view."),
+            before,
+            after,
+            plan,
+        )
+    } else {
+        let read = context
+            .cdp(
+                tab,
+                interaction,
+                vec![
+                    command("DOM.enable", json!({})),
+                    command(
+                        "DOM.getFlattenedDocument",
+                        json!({"depth":1,"pierce":false}),
+                    ),
+                    metrics(),
+                ],
+            )
+            .await?;
+        let root = document_element(&read.results[1])?;
+        let before = page_position(&read.results[2])?;
+        let direction = args["direction"].as_str().unwrap_or_default();
+        let amount = args["amount"].as_u64().unwrap_or(600);
+        let distance = amount as f64;
+        let (dx, dy) = match direction {
+            "up" => (0.0, -distance),
+            "down" => (0.0, distance),
+            "left" => (-distance, 0.0),
+            "right" => (distance, 0.0),
+            _ => return Err(invalid("direction", "unsupported_value")),
+        };
+        let rect = json!({"x":before.x + dx,"y":before.y + dy,"width":before.width,"height":before.height});
+        let plan = context
+            .cdp(
+                tab,
+                interaction,
+                vec![
+                    command(
+                        "DOM.scrollIntoViewIfNeeded",
+                        json!({"backendNodeId":root,"rect":rect}),
+                    ),
+                    metrics(),
+                ],
+            )
+            .await?;
+        let after = page_position(&plan.results[1]).map_err(scrolled)?;
+        (
+            format!("Scrolled {direction} {amount} px."),
+            before,
+            after,
+            plan,
+        )
+    };
+    let mut reply = json!({
+        "browser":"user","outcome":"ok","tab":tab,"input_dispatched":true,
+        "connection_epoch":context.connection,"interaction_epoch":plan.interaction,
+        "state_text":scroll_report(&asked, reference.is_none(), &before, &after),
+    });
+    if plan.popup {
         reply["popup_activated_briefly"] = json!(true);
     }
     Ok(reply)

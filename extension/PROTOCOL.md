@@ -308,7 +308,17 @@ const HAS_FOCUS = "function() { return this.ownerDocument.hasFocus() && this.get
 `Emulation.setFocusEmulationEnabled` emulates document focus for clicking and
 typing, not tab/window activation. A mouse gesture's plan enables it before the
 press/release pair; the debugger detaches between plans. `DOM.focus` focuses the typed element;
-both methods are input-guarded. The stricter user-
+both methods are input-guarded. The browser adapter's `scroll` action is also a
+`cdp` plan, not a separate extension action: a ref scroll sends
+`DOM.scrollIntoViewIfNeeded` for that node in its verified frame, and a page
+scroll sends it for the root element with a `rect` the size of the viewport,
+offset by the requested amount, so Chrome scrolls the page natively. Chrome
+acknowledges synthetic wheel input to a background tab without moving it, so
+scrolling does not use `Input.dispatchMouseEvent`. Unscoped
+`Page.getLayoutMetrics` steps before and after report the top page's position
+and content height. The scroll dispatches no input events, and the plan is
+input-guarded like any other, so it requires the last read's interaction epoch
+and never moves it. The stricter user-
 frame filter, site/redirect authorization and risk classifier remain the adapter's
 responsibility, not raw-CDP permission conferred by a plan.
 

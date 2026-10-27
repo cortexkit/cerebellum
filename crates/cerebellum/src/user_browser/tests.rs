@@ -104,6 +104,13 @@ struct DoubleState {
     viewport_changed: bool,
     clipped_click: bool,
     scrolled: bool,
+    /// How far down the top document is scrolled, in CSS pixels.
+    scroll_y: f64,
+    /// The top document's height in CSS pixels; 5000 when unset.
+    page_height: Option<f64>,
+    /// The page loads 1000 px more content whenever it is scrolled, as an
+    /// infinite feed does.
+    grow_on_scroll: bool,
     /// Chrome's CDP error for the next plan command with this method.
     fail_method: Option<(&'static str, i64, String)>,
     /// The "Go" button has no type attribute and no form, like the button in
@@ -979,6 +986,19 @@ fn execute(
             }
             "DOM.scrollIntoViewIfNeeded" => {
                 state.scrolled = true;
+                let height = state.page_height.unwrap_or(5000.0);
+                let target = match command["params"].get("rect") {
+                    // The root element sits at the document's origin, and
+                    // Chrome aligns a viewport-sized rectangle with the
+                    // 100 px viewport.
+                    Some(rect) => rect["y"].as_f64().unwrap(),
+                    // A ref element 300 px below the top of the viewport.
+                    None => state.scroll_y + 300.0,
+                };
+                state.scroll_y = target.clamp(0.0, height - 100.0);
+                if state.grow_on_scroll {
+                    state.page_height = Some(height + 1000.0);
+                }
                 json!({})
             }
             "DOM.getContentQuads" if state.clipped_click => {
@@ -1005,7 +1025,9 @@ fn execute(
                 if state.clipped_click {
                     json!({"layoutViewport":{"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800},"visualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":1800,"clientWidth":1200,"clientHeight":800,"scale":1},"cssLayoutViewport":{"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400},"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":900,"clientWidth":600,"clientHeight":400,"scale":1}})
                 } else {
-                    json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1}})
+                    json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1},
+                        "cssLayoutViewport":{"pageX":0,"pageY":state.scroll_y,"clientWidth":100,"clientHeight":100},
+                        "cssContentSize":{"x":0,"y":0,"width":100,"height":state.page_height.unwrap_or(5000.0)}})
                 }
             }
             "Page.captureScreenshot" => {
@@ -2258,19 +2280,188 @@ async fn screenshot_returns_a_liftable_image_object_without_flat_base64() {
     assert!(crate::browser::validate_user_browser_result("screenshot", &flat).is_err());
 }
 
+/// The `DOM.scrollIntoViewIfNeeded` steps the double ran, in order.
+fn scroll_steps(fixture: &Fixture) -> Vec<Value> {
+    sent(fixture, "cdp")
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().unwrap().clone())
+        .filter(|step| step["method"] == "DOM.scrollIntoViewIfNeeded")
+        .collect()
+}
+
+fn page_scroll(tab: &str, direction: &str) -> Value {
+    json!({"browser":"user","action":"scroll","tab":tab,"direction":direction})
+}
+
+/// A page scroll moves the person's page by the amount through the root
+/// element, without page JavaScript or input events, under the site grant
+/// the snapshot already holds. Its reply says where the page went and that
+/// the page grew, and the agent can scroll again and read again without a
+/// person check refusing, because its own scroll is not the person's input.
 #[tokio::test]
-async fn scroll_on_user_browser_is_typed_unsupported_without_extension_commands() {
+async fn user_scroll_moves_the_page_and_the_next_read_still_works() {
     let fixture = Fixture::new();
+    fixture.state.lock().unwrap().grow_on_scroll = true;
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let mut down = page_scroll(&tab, "down");
+    down["amount"] = json!(400);
+    let (reply, cards) = fixture.call(1, down, "").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(
+        cards.is_empty(),
+        "the snapshot's grant covers a scroll: {cards:?}"
+    );
+    assert_eq!(reply["input_dispatched"], true, "{reply}");
+    assert_eq!(reply["interaction_epoch"], 1, "{reply}");
+    assert!(crate::browser::validate_user_browser_result("scroll", &reply).is_ok());
+    assert_eq!(
+        reply["state_text"],
+        "Scrolled down 400 px.\nThe page moved from x 0, y 0 to x 0, y 400; the viewport is 100 x 100 px.\nThe page grew from 5000 to 6000 px tall during the scroll: more content loaded."
+    );
+    let steps = scroll_steps(&fixture);
+    assert_eq!(steps.len(), 1);
+    // The root element (the double's first element under the document)
+    // shows a viewport-sized rectangle 400 px further down.
+    assert_eq!(
+        steps[0]["params"],
+        json!({"backendNodeId":2,"rect":{"x":0.0,"y":400.0,"width":100.0,"height":100.0}})
+    );
+    assert!(steps[0].get("frame_id").is_none());
+
+    // A second scroll needs no new read, and the default amount is 600.
+    let (up, _) = fixture.call(1, page_scroll(&tab, "up"), "").await;
+    assert_eq!(up["outcome"], "ok", "{up}");
+    assert!(
+        up["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("The page moved from x 0, y 400 to x 0, y 0;"),
+        "{up}"
+    );
+    assert_eq!(
+        scroll_steps(&fixture)[1]["params"]["rect"]["y"],
+        json!(-200.0)
+    );
+
+    let (again, cards) = fixture.snapshot(1, &tab, "").await;
+    assert_eq!(again["outcome"], "ok", "{again}");
+    assert!(cards.is_empty(), "{cards:?}");
+}
+
+/// The model reads a scroll's report as plain sentences, not JSON.
+#[tokio::test]
+async fn user_scroll_reports_where_the_page_went_in_plain_text() {
+    let fixture = Fixture::new();
+    read_tool_result_v1(&fixture);
+    let (claimed, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"claim_tab","tab":"handed"}),
+            "allow_30m",
+        )
+        .await;
+    let tab = claimed["structuredContent"]["tab"].as_str().unwrap().to_owned();
+    fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, page_scroll(&tab, "down"), "").await;
+    let text = content_text(&reply);
+    for line in [
+        "Scrolled down 600 px.",
+        "The page moved from x 0, y 0 to x 0, y 600; the viewport is 100 x 100 px.",
+        "The page is 5000 px tall, unchanged so far; content it loads after the scroll shows on the next read.",
+        "Input was dispatched to the person's browser.",
+    ] {
+        assert!(text.contains(line), "{line} missing from: {text}");
+    }
+    assert!(!text.contains('{'), "{text}");
+}
+
+/// A ref scroll sends only the scroll step to the ref's frame and reads the
+/// top page's position either side of it, in one plan.
+#[tokio::test]
+async fn user_scroll_brings_a_ref_into_view_in_its_frame() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let go = reference(&snapshot, "Go");
     let (reply, _) = fixture
         .call(
             1,
-            json!({"browser":"user","action":"scroll","direction":"down"}),
-            "deny",
+            json!({"browser":"user","action":"scroll","tab":tab,"ref":go}),
+            "",
         )
         .await;
-    assert_eq!(reply["outcome"], "refused", "{reply}");
-    assert_eq!(reply["reason"], "unsupported_on_user_browser", "{reply}");
-    assert!(fixture.state.lock().unwrap().commands.is_empty());
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["input_dispatched"], true, "{reply}");
+    assert_eq!(
+        reply["state_text"],
+        format!("Scrolled {go} into view.\nThe page moved from x 0, y 0 to x 0, y 300; the viewport is 100 x 100 px.\nThe page is 5000 px tall, unchanged so far; content it loads after the scroll shows on the next read.")
+    );
+    let plan = sent(&fixture, "cdp").last().unwrap().clone();
+    let steps = plan["commands"].as_array().unwrap();
+    let methods: Vec<_> = steps
+        .iter()
+        .map(|step| step["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "Page.getLayoutMetrics",
+            "DOM.scrollIntoViewIfNeeded",
+            "Page.getLayoutMetrics"
+        ]
+    );
+    assert_eq!(steps[1]["params"], json!({"backendNodeId":3}));
+    assert_eq!(steps[1]["frame_id"], "main");
+    assert!(steps[0].get("frame_id").is_none() && steps[2].get("frame_id").is_none());
+    assert_eq!(plan["interaction_epoch"], 1);
+}
+
+/// Each refusal comes before any scroll is sent: arguments that mix the two
+/// forms or name neither, a tab never read, a page the person used since the
+/// read, and a tab another route holds.
+#[tokio::test]
+async fn user_scroll_refuses_before_scrolling() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (mixed, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"scroll","tab":tab,"ref":"e1","direction":"down"}),
+            "",
+        )
+        .await;
+    assert_eq!(mixed["outcome"], "invalid_request", "{mixed}");
+    assert_eq!(mixed["detail"]["field"], "direction", "{mixed}");
+    let (neither, _) = fixture
+        .call(1, json!({"browser":"user","action":"scroll","tab":tab}), "")
+        .await;
+    assert_eq!(
+        neither["detail"]["reason_code"], "missing_field",
+        "{neither}"
+    );
+    let (unread, _) = fixture.call(1, page_scroll(&tab, "down"), "").await;
+    assert_eq!(unread["reason"], "fresh_read_required", "{unread}");
+    assert_eq!(unread["input_dispatched"], false, "{unread}");
+
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .tabs
+        .get_mut(&tab)
+        .unwrap()
+        .interaction += 1;
+    let (person, _) = fixture.call(1, page_scroll(&tab, "down"), "").await;
+    assert_eq!(person["reason"], "state_changed_by_person", "{person}");
+    assert_eq!(person["detail"]["check"], "interaction_epoch", "{person}");
+    let (other, _) = fixture.call(2, page_scroll(&tab, "down"), "").await;
+    assert_eq!(other["outcome"], "refused", "{other}");
+    assert_eq!(other["reason"], "tab_not_claimed_by_route", "{other}");
+    assert!(scroll_steps(&fixture).is_empty());
 }
 
 #[tokio::test]

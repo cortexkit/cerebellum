@@ -227,6 +227,7 @@ fn user_browser_budgets_are_target_specific_and_exhaustive() {
         ("snapshot", 128_000, 5, 1),
         ("screenshot", 112_000, 4, 1),
         ("navigate", 158_000, 5, 1),
+        ("scroll", 108_000, 3, 1),
         ("click", 192_000, 9, 3),
         ("click_point", 208_000, 10, 3),
         ("type", 270_000, 15, 1),
@@ -255,7 +256,6 @@ fn user_browser_budgets_are_target_specific_and_exhaustive() {
     }
     for action in [
         "launch",
-        "scroll",
         "present",
         "resume",
         "import_login",
