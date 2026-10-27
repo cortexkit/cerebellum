@@ -203,6 +203,7 @@ fn sums() -> String {
         .collect()
 }
 
+/// Whether `text` names a machine-local path, which no vector may carry.
 fn suspicious_path(text: &str) -> bool {
     ["/Users/", "/private/", "/tmp/", "/.t/"]
         .iter()
@@ -321,6 +322,9 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
         })
     );
     assert_eq!(&reply.body[4 + head_length..], FIXTURE_BYTES);
+    assert!(!suspicious_path(&String::from_utf8_lossy(
+        &reply.body[4..4 + head_length]
+    )));
     check(
         "success",
         "a screenshot handle resolves to exactly the bytes the reply carried",
