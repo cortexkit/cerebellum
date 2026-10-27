@@ -51,6 +51,15 @@ run_mac_clippy() {
   run_phase "cargo clippy --locked ${packages[*]} --all-targets -- -D warnings (macOS)" \
     cargo clippy "${args[@]}" || return 1
   [ "$probe" -eq 1 ] || return 0
+  if [ "${vm:-0}" -eq 1 ]; then
+    # The desk probe is a hand-run, person-present flow: build the helper,
+    # sign it with the operator's Apple Development identity, and run it on
+    # an unlocked desk. The VM has none of that, so its build is verified
+    # where it runs, never here, and the skip is named rather than silent.
+    echo '==> SKIP: desk-probe example clippy in the macOS VM (local only)'
+    not_verified+=("desk-probe example clippy not run in the macOS VM (needs the operator signing identity and a desk; run it locally: bash scripts/fast-gate.sh --part mac --base ${base:-<commit>})")
+    return 0
+  fi
   # The hand-run desk probe and its screen-capture check build only with the
   # desk-probe feature, which no other phase enables. The probe uses much of
   # the library, so any change to these packages can break it.
@@ -77,6 +86,69 @@ run_linux_part() {
 
 run_mac_part() {
   ./scripts/fast-gate.sh --part mac --base "$base"
+}
+
+run_mac_remote_part() {
+  # Opt-in remote Mac half: the heavy work runs on MOTOR's macOS VM and this
+  # host only streams its log. Exit 200 means MOTOR refused the job before
+  # starting it (for example the runner was unreachable or busy): nothing ran,
+  # so asking again is safe. Any other exit, including ck's own codes for a
+  # lost or timed-out job, is the verdict. The VM is a fixed-size offline
+  # macOS worker, so neither --vcpus nor --net is passed.
+  #
+  # Measured 2026-10-27 on a branch of this gate: a scripts-only diff passed
+  # the remote half in 48 s end to end (job 01a17e6a), while a Rust diff hit
+  # the 30 min job timeout with the lib tests still running (job 01a17e6b;
+  # clippy alone took 83 s where the local Mac half takes about 200 s for a
+  # similar diff). A cold 4-vCPU VM builds roughly ten times slower, so the
+  # combined gate keeps the local Mac half by default and this stays opt-in
+  # until the VM builds warm. The 60 min timeout fits a cold full-half run.
+  local attempt status
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    ck motor run --platform macos --timeout 3600 --cwd "$repo_root" -- \
+      ./scripts/fast-gate.sh --part mac --vm --base "$base"
+    status=$?
+    [ "$status" -eq 200 ] || return "$status"
+    echo "==> macOS VM half refused before it started (attempt $attempt of 12); asking again in 15 s"
+    sleep 15
+  done
+  return 200
+}
+
+# Every phase of --part mac, and where the macOS-VM form (--vm) runs it. The
+# VM is a headless macOS worker: it has the toolchain, ad-hoc codesign and
+# FSEvents, but no desktop session, no TCC grants (Transparency, Consent, and
+# Control: the macOS privacy permissions covering Accessibility, Screen
+# Recording, and Input Monitoring), no launchd agents, and no Apple
+# Development signing identity.
+#
+# - tree fingerprint: runs in VM (pure python over the snapshot).
+# - macOS clippy on the touched macOS packages: runs in VM (pure compilation;
+#   --all-targets also compiles the desk test targets below, so skipping their
+#   execution loses no compile coverage).
+# - desk-probe example clippy: LOCAL ONLY (needs the operator signing
+#   identity and a desk; the VM form reports NOT VERIFIED, never a silent skip).
+# - touched --lib tests: run in VM. The launch_recovery_clear subtests read the
+#   process table; where that table is unreadable the gate already skips them
+#   with a NOT VERIFIED line (see configure_lib_tests).
+# - touched integration suites: run in VM, EXCEPT the window-server desk tests
+#   below, which are LOCAL ONLY: without a window-server session they cannot
+#   check what they promise (the preview and cursor hide, cursor motion
+#   framing, and the source-rect capture), so the VM form reports each as NOT
+#   VERIFIED with the local command instead of running it.
+vm_local_only_suites=(
+  cerebellum-macos:preview_hide
+  cerebellum-macos:cursor_hide
+  cerebellum-macos:cursor_motion
+  cerebellum-macos:source_rect_pattern
+)
+
+is_vm_local_only_suite() {
+  local wanted="$1" suite
+  for suite in "${vm_local_only_suites[@]}"; do
+    [ "$suite" = "$wanted" ] && return 0
+  done
+  return 1
 }
 
 run_combined_gate() (

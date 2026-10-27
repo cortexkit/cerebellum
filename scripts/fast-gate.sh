@@ -8,8 +8,10 @@ cd "$repo_root"
 base="${FAST_GATE_BASE:-origin/main}"
 self_test=0
 part=""
+remote=0
+vm=0
 usage() {
-  echo "usage: $0 [--base REF] [--part linux|mac] [--self-test]"
+  echo "usage: $0 [--base REF] [--part linux|mac] [--remote] [--vm] [--self-test]"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -22,6 +24,14 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$2" in linux|mac) part="$2" ;; *) usage >&2; exit 2 ;; esac
       shift 2
+      ;;
+    --remote)
+      remote=1
+      shift
+      ;;
+    --vm)
+      vm=1
+      shift
       ;;
     --self-test)
       self_test=1
@@ -41,6 +51,31 @@ done
 
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
 if [ "$self_test" -eq 0 ]; then
+  # --remote and --vm select the macOS-VM form of --part mac: --remote sends
+  # it to the VM from here, --vm executes it inside the VM. Anything else with
+  # either flag is a usage error, reported before anything is verified.
+  if [ "$remote" -eq 1 ] && [ "$vm" -eq 1 ]; then
+    echo "fast gate: --remote and --vm cannot be combined" >&2
+    usage >&2
+    exit 2
+  fi
+  if { [ "$remote" -eq 1 ] || [ "$vm" -eq 1 ]; } && [ "$part" != mac ]; then
+    echo "fast gate: --remote and --vm select the macOS-VM form of --part mac" >&2
+    usage >&2
+    exit 2
+  fi
+  if [ "$remote" -eq 1 ]; then
+    # The VM's snapshot carries commits but no branch or remote refs, so
+    # resolve the base to a commit where the ref exists: here.
+    if ! base="$(GIT_OPTIONAL_LOCKS=0 git rev-parse --verify "${base}^{commit}" 2>/dev/null)"; then
+      echo "fast gate: base does not resolve here; nothing has been verified." >&2
+      echo "Take the base commit with 'git rev-parse origin/main', then pass '--part mac --remote --base <that commit>'." >&2
+      exit 2
+    fi
+    echo "==> FAST GATE PART: mac (remote macOS VM dispatch)"
+    run_mac_remote_part
+    exit $?
+  fi
   if [ -z "$part" ]; then
     run_combined_gate
     exit $?
@@ -444,6 +479,11 @@ if [ "${#suites[@]}" -gt 0 ]; then
     target="${suite#*:}"
     if [ "$part" = linux ] && [ "$package" = cerebellum-macos ]; then
       echo "==> SKIP: $suite (macOS-only; belongs to --part mac)"
+      continue
+    fi
+    if [ "${vm:-0}" -eq 1 ] && is_vm_local_only_suite "$suite"; then
+      echo "==> SKIP: $suite (no window-server session in the macOS VM; local only)"
+      not_verified+=("$suite not executed in the macOS VM (no window-server session; run it locally: bash scripts/fast-gate.sh --part mac --base $base)")
       continue
     fi
     if is_desk_suite "$suite"; then
