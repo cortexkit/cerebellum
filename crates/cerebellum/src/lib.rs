@@ -3012,6 +3012,7 @@ pub struct Planes {
     private_content: Arc<private_content::PrivateContent>,
     signed_in: Arc<browser_signed_in::SignedInDomains>,
     cancellations: RequestCancellations,
+    operator_confirm: Arc<computer_capability::operator_confirm::Wire>,
     run_calls: codemode::RunCalls,
     browser_queue: Arc<call_queue::ConversationQueue>,
     draining: Arc<std::sync::atomic::AtomicBool>,
@@ -3500,6 +3501,7 @@ impl Planes {
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
             drain_notice: Arc::new(std::sync::OnceLock::new()),
             cancellations: RequestCancellations::default(),
+            operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             capture,
@@ -3540,6 +3542,7 @@ impl Clone for Planes {
             private_content: Arc::clone(&self.private_content),
             signed_in: Arc::clone(&self.signed_in),
             cancellations: self.cancellations.clone(),
+            operator_confirm: self.operator_confirm.clone(),
             run_calls: self.run_calls.clone(),
             browser_queue: self.browser_queue.clone(),
             draining: self.draining.clone(),
@@ -3593,7 +3596,7 @@ async fn handle_frame(
             Ok(true)
         }
         // The daemon's answer to a control request this module sent on its own
-        // connection (`scope.describe`). The daemon's requests to the module
+        // connection (`scope.describe` or `operator.confirm`). The daemon's requests to the module
         // arrive as requests, so a response or error on channel 0 can only be
         // one of these; it is handed to whoever asked, or dropped if nobody
         // still waits. Without this arm such an answer would fall to the
@@ -3602,6 +3605,9 @@ async fn handle_frame(
         // answers nothing this module sent (it never sends requests on a
         // route), so the catch-all drops those.
         FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+            if planes.operator_confirm.deliver(&frame) {
+                return Ok(true);
+            }
             let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
             let answer = if frame.header.ty == FrameType::Response {
                 scope_watch::ControlAnswer::Response(body)
@@ -6185,14 +6191,25 @@ async fn handle_keyed_tool_request(
     // Result-reader support is a route declaration, never a call argument.
     // Older cores retain their exact legacy body until they declare the reader.
     let result_bind = name.zip(bind).map(|(name, bind)| (name.to_owned(), bind));
+    let operator_call = computer_capability::operator_confirm::Call {
+        wire: Arc::clone(&planes.operator_confirm),
+        writer: writer.clone(),
+        route: (frame.header.channel, frame.header.epoch),
+    };
     tool_result::RESULT_BIND
         .scope(
             result_bind,
             tool_result::SETTLEMENT_NOTE_OMITTED.scope(
                 std::cell::Cell::new(false),
-                codemode::CALL_RECORDS.scope(
-                    Arc::clone(&planes.calls),
-                    handle_keyed_tool_request_inner(frame, writer, planes),
+                tool_result::APP_USE_NOTE.scope(
+                    std::cell::RefCell::new(None),
+                    codemode::CALL_RECORDS.scope(
+                        Arc::clone(&planes.calls),
+                        computer_capability::operator_confirm::CALL.scope(
+                            operator_call,
+                            handle_keyed_tool_request_inner(frame, writer, planes),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -10618,6 +10635,7 @@ mod tests {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
+            operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
@@ -12613,6 +12631,7 @@ mod tests {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
+            operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]
@@ -12707,6 +12726,7 @@ mod tests {
             private_content: Arc::new(private_content::PrivateContent::in_memory()),
             signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
             cancellations: RequestCancellations::default(),
+            operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(target_os = "macos")]

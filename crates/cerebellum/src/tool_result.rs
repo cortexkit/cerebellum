@@ -4,7 +4,7 @@
 use crate::ModuleError;
 use cortexkit_role_tool_provider::result::{self, ContentPart, ImageContent, ToolResult};
 use serde_json::{json, Map, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 mod plain;
 
@@ -21,6 +21,12 @@ tokio::task_local! {
     /// settlement is never observed there (see `omit_settlement_note`). The
     /// call's dispatcher opens this scope with `false` next to `RESULT_BIND`.
     pub(crate) static SETTLEMENT_NOTE_OMITTED: Cell<bool>;
+    /// A background-mode explanation for this call's text, never structured content.
+    pub(crate) static APP_USE_NOTE: RefCell<Option<String>>;
+}
+
+pub(crate) fn app_use_note(note: String) {
+    let _ = APP_USE_NOTE.try_with(|slot| *slot.borrow_mut() = Some(note));
 }
 
 /// Leave the "Page settlement was not confirmed." lines out of the text of
@@ -167,7 +173,14 @@ fn project(reply: Value) -> ToolResult {
         content.push(ContentPart::text(body));
     }
     let projected_image = object.get("image").map(image_projection);
-    let facts = plain::facts(object, login_notice(object), settlement_note(object));
+    let mut facts = plain::facts(object, login_notice(object), settlement_note(object));
+    if let Some(note) = APP_USE_NOTE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
+        facts.push(note);
+    }
     if !facts.is_empty() {
         content.push(ContentPart::text(facts.join("\n")));
     }
@@ -968,6 +981,32 @@ mod tests {
             })
             .await;
         assert!(texts(&own_result).join("\n").contains(NOTE));
+    }
+
+    #[tokio::test]
+    async fn app_use_notes_are_render_only_and_isolated_between_concurrent_calls() {
+        let reply = json!({"outcome":"ok","state_text":"Application state"});
+        let render = |note: &'static str| {
+            let reply = reply.clone();
+            APP_USE_NOTE.scope(RefCell::new(None), async move {
+                app_use_note(note.to_owned());
+                tokio::task::yield_now().await;
+                decoded(reply)
+            })
+        };
+        let (first, second) = tokio::join!(
+            render("Background: declined."),
+            render("Background: unavailable.")
+        );
+        let first_text = texts(&first).join("\n");
+        let second_text = texts(&second).join("\n");
+        assert!(first_text.contains("Background: declined."));
+        assert!(!first_text.contains("unavailable"));
+        assert!(second_text.contains("Background: unavailable."));
+        assert!(!second_text.contains("declined"));
+        assert_eq!(first["structuredContent"], reply);
+        assert_eq!(second["structuredContent"], reply);
+        assert!(!texts(&decoded(reply)).join("\n").contains("Background:"));
     }
 
     #[test]

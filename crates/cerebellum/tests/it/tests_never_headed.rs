@@ -86,6 +86,14 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         // Offline CLI inspection launches the module fixture, never a browser.
         || (path == "cerebellum/tests/manifest_flag.rs"
             && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-manifest"]))
+        // The operator-script provider requires a ckdev- copy of this test
+        // executable; neither an arbitrary binary nor a browser is admitted.
+        || (path == "cerebellum/src/computer_capability/operator_confirm_tests.rs"
+            && expression.starts_with(&[
+                "cortexkit_test_support", "::", "ckdev_binary", "(",
+                "std", "::", "env", "::", "current_exe", "(", ")",
+                ".", "unwrap", "(", ")", ")", ";",
+            ]))
         || (path == "cerebellum/src/browser_launch_service.rs"
             && expression.starts_with(&[
                 "crate",
@@ -302,6 +310,17 @@ fn manifest_cli_fixture_is_narrowly_recognized() {
         1
     );
     assert_eq!(violations("cerebellum/tests/other.rs", module).len(), 1);
+}
+
+#[test]
+fn operator_script_reexec_accepts_only_a_copy_of_its_own_test_executable() {
+    let own = r#"let binary = cortexkit_test_support::ckdev_binary(std::env::current_exe().unwrap()); Command::new(&binary);"#;
+    let other =
+        r#"let binary = cortexkit_test_support::ckdev_binary(browser); Command::new(&binary);"#;
+    let path = "cerebellum/src/computer_capability/operator_confirm_tests.rs";
+    assert!(violations(path, own).is_empty());
+    assert_eq!(violations(path, other).len(), 1);
+    assert_eq!(violations("cerebellum/tests/other.rs", own).len(), 1);
 }
 
 #[test]

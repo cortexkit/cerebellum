@@ -91,12 +91,14 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 mod app_use;
+mod app_use_approval;
 pub mod cursor;
 mod element_actions;
 mod fronting;
 #[cfg(test)]
 mod fronting_tests;
 pub mod image_freshness;
+pub(crate) mod operator_confirm;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
 use read_image::ImageReadPlan;
@@ -986,6 +988,7 @@ where
                 return self.finish_reply(capability.capability(), reply);
             }
         };
+        let app_use = self.app_use.approved_mode(app_use, &context.cancel).await;
         // Before target lookup, consent or any platform work: offering a tool
         // does not imply the startup permission readings allow it to execute.
         if let Some(reply) = permissions::refusal(capability.capability(), &self.permissions) {
