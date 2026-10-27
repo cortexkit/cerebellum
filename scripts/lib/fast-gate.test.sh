@@ -115,6 +115,40 @@ mac_mode() {
   [ "${#packages[@]}" -eq 0 ] && [ "${#lib_packages[@]}" -eq 0 ] && [ "${#suites[@]}" -eq 0 ]
 }
 
+mac_remote_dispatch() {
+  base=fixture
+  repo_root="$scratch/fake-root"
+  ck() { printf '%s\n' "$@" >"$scratch/argv"; }
+  run_mac_part
+  # The VM is fixed-size and offline: platform macos, no --vcpus, no --net.
+  grep -Fxq -- --platform "$scratch/argv" && grep -Fxq macos "$scratch/argv" && \
+    grep -Fxq -- --part "$scratch/argv" && grep -Fxq mac "$scratch/argv" && \
+    grep -Fxq -- --vm "$scratch/argv" && grep -Fxq fixture "$scratch/argv" && \
+    ! grep -Fxq -- --vcpus "$scratch/argv" && ! grep -Fxq -- --net "$scratch/argv"
+}
+
+remote_vm_arg_validation() {
+  local args status
+  for args in '--part linux --vm' '--part linux --remote' '--remote' '--vm' '--part mac --remote --vm'; do
+    # shellcheck disable=SC2086
+    "$repo_root/scripts/fast-gate.sh" $args --base HEAD >"$scratch/argv" 2>&1
+    status=$?
+    [ "$status" -eq 2 ] || { echo "wrong exit $status for: $args"; return 1; }
+    grep -Fq 'usage:' "$scratch/argv" || { echo "no usage for: $args"; return 1; }
+  done
+}
+
+vm_local_only_predicate() {
+  local suite
+  for suite in cerebellum-macos:preview_hide cerebellum-macos:cursor_hide \
+      cerebellum-macos:cursor_motion cerebellum-macos:source_rect_pattern; do
+    is_vm_local_only_suite "$suite" || { echo "not deferred: $suite"; return 1; }
+  done
+  ! is_vm_local_only_suite cerebellum-macos:it || return 1
+  ! is_vm_local_only_suite cerebellum:it || return 1
+  ! is_vm_local_only_suite cerebellum-computer:it || return 1
+}
+
 combined_mode() {
   uname() { echo Darwin; }
   base=HEAD
@@ -127,7 +161,7 @@ import sys
 log = Path(sys.argv[1]).read_text()
 assert log.index('linux whole log') < log.index('mac whole log')
 assert '==> FAIL: Linux half (ck motor run) (exit 200)' in log
-assert '==> PASS: macOS half (local)' in log
+assert '==> PASS: macOS half (ck motor run --platform macos)' in log
 assert "git rev-parse origin/main" in log and "--part linux --base <commit>" in log
 assert 'FAST GATE FAILED:' in log
 PY
@@ -215,6 +249,69 @@ PY
   )
 }
 
+mac_vm_pipeline() {
+  local fixture="$scratch/mac-vm-fixture" calls="$scratch/mac-vm-calls" status
+  mkdir -p "$fixture/scripts/lib" "$fixture/bin" \
+    "$fixture/crates/cerebellum-macos/src" "$fixture/crates/cerebellum-macos/tests"
+  cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
+  cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
+    "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
+    "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
+  printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
+  cat >"$fixture/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CALL_LOG"
+case "$1" in
+  metadata) printf '%s\n' "$FIXTURE_METADATA" ;;
+  clippy) exit "${FIXTURE_CLIPPY_STATUS:-0}" ;;
+  test) echo 'test result: ok. 1 passed; 0 failed' ;;
+esac
+SH
+  chmod +x "$fixture/bin/cargo" "$fixture/bin/uname"
+  printf 'fixture\n' >"$fixture/crates/cerebellum-macos/src/lib.rs"
+  printf 'fixture\n' >"$fixture/crates/cerebellum-macos/tests/preview_hide.rs"
+  (
+    cd "$fixture" || exit 1
+    git init -q && git config user.email fixture@example.invalid && git config user.name fixture || exit 1
+    git add . && git -c commit.gpgsign=false commit -qm fixture || exit 1
+    export CALL_LOG="$calls" PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$scratch/mac-vm-fixture-target"
+    FIXTURE_METADATA="$(python3 - <<'PY'
+from pathlib import Path
+import json
+root = Path('crates', 'cerebellum-macos')
+print(json.dumps({'packages': [{
+    'name': 'cerebellum-macos',
+    'manifest_path': str((root / 'Cargo.toml').resolve()),
+    'targets': [
+        {'name': 'cerebellum-macos', 'kind': ['lib'],
+         'src_path': str((root / 'src' / 'lib.rs').resolve())},
+        {'name': 'preview_hide', 'kind': ['test'],
+         'src_path': str((root / 'tests' / 'preview_hide.rs').resolve())},
+    ]}]}))
+PY
+)"
+    export FIXTURE_METADATA
+    printf 'changed\n' >crates/cerebellum-macos/tests/preview_hide.rs
+    # Control: the local form runs the desk suite and builds the desk probe.
+    : >"$CALL_LOG"
+    ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-vm-local" 2>&1 || exit 1
+    grep -Fq 'test --locked -p cerebellum-macos --test preview_hide' "$CALL_LOG" || exit 1
+    grep -Fq 'desk-probe' "$CALL_LOG" || exit 1
+    # VM form: the same diff skips both with NOT VERIFIED, never silently.
+    : >"$CALL_LOG"
+    ./scripts/fast-gate.sh --part mac --vm --base HEAD >"$scratch/mac-vm-remote" 2>&1 || exit 1
+    ! grep -Fq -- '--test preview_hide' "$CALL_LOG" || exit 1
+    ! grep -Fq 'desk-probe' "$CALL_LOG" || exit 1
+    grep -Fq 'clippy --locked -p cerebellum-macos --all-targets -- -D warnings' "$CALL_LOG" || exit 1
+    grep -Fq 'test --locked -p cerebellum-macos --lib' "$CALL_LOG" || exit 1
+    grep -Fq '==> SKIP: cerebellum-macos:preview_hide (no window-server session in the macOS VM; local only)' "$scratch/mac-vm-remote" || exit 1
+    grep -Fq 'NOT VERIFIED: cerebellum-macos:preview_hide not executed in the macOS VM' "$scratch/mac-vm-remote" || exit 1
+    grep -Fq 'NOT VERIFIED: desk-probe example clippy not run in the macOS VM' "$scratch/mac-vm-remote" || exit 1
+    grep -Fq 'FAST GATE FINGERPRINT: ' "$scratch/mac-vm-remote" || exit 1
+    [ "$(tail -n 1 "$scratch/mac-vm-remote")" = 'FAST GATE PASSED: every selected phase that ran is green; see the NOT VERIFIED lines above' ] || exit 1
+  )
+}
+
 combined_mismatch() {
   uname() { echo Darwin; }
   base=HEAD
@@ -242,7 +339,11 @@ check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_proce
 check 'a readable process table leaves library tests unchanged' readable_process_table
 check '--part linux selects the remote Linux lane' linux_mode
 check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
+check '--part mac --vm defers desk phases with NOT VERIFIED; --remote/--vm reject anything but --part mac' remote_vm_arg_validation
+check '--part mac --remote dispatches to the macOS VM without vcpus or net' mac_remote_dispatch
+check '--vm defers exactly the window-server desk suites' vm_local_only_predicate
 check 'Mac clippy, then the desk-probe build, precede tests; a lint failure stops both; Linux-only changes skip them' mac_clippy_pipeline
+check 'the VM form builds and unit-tests but defers the desk suite and probe build as NOT VERIFIED' mac_vm_pipeline
 check 'default mode collects both halves and reports a runner connection failure' combined_mode
 check 'default mode preserves NOT VERIFIED from the Mac half' combined_skip
 check 'default mode refuses mismatched tree fingerprints and names both' combined_mismatch
