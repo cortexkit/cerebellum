@@ -618,6 +618,27 @@ pub(super) fn facts(
             lines.push(format!("Site access is authorized for {origin}."));
         }
     }
+    // A login fill names the fields it filled and the site, never what went
+    // into them; the reply holds nothing more for the model to read.
+    if let (Some("ok"), Some(filled)) = (outcome, object.get("filled").and_then(Value::as_array)) {
+        let fields = filled
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|field| match field {
+                "otp" => "one-time code",
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        if !fields.is_empty() {
+            lines.push(match text(object, "origin") {
+                Some(origin) => format!(
+                    "Filled from the saved login on {origin}: {}.",
+                    fields.join(", ")
+                ),
+                None => format!("Filled from the saved login: {}.", fields.join(", ")),
+            });
+        }
+    }
     if text(object, "browser") != Some("user") && text(object, "outcome") == Some("ready") {
         let session = text(object, "browser_session_id").unwrap_or("unknown");
         lines.push(format!("Own browser session {session} is ready."));

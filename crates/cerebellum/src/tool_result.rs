@@ -1284,4 +1284,156 @@ mod tests {
             ["no text part says anything"]
         );
     }
+
+    /// Every reply `browser.fill_login` gives, and the refusals and reads of a
+    /// tab in its fill window, reach the model as plain lines: no JSON, no
+    /// generic fallback, and the facts the next call needs written out.
+    #[test]
+    fn fill_login_replies_and_fill_window_refusals_read_as_plain_lines() {
+        let context = json!({
+            "profile_uuid": null, "profile_name": null,
+            "session_kind_effective": "primary", "profile_disposition": "durable",
+        });
+        let refusal = |outcome: &str, remedy: &str, detail: Value| json!({"outcome": outcome, "remedy": remedy, "detail": detail, "context": context});
+        let screenshot_refused = refusal(
+            "authorization_denied",
+            "read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself",
+            json!({"reason_code": "filled_password_on_page", "reason": "a filled password is on this page"}),
+        );
+        let window_expired = refusal(
+            "authorization_denied",
+            "reload or navigate the page itself before reading it again",
+            json!({"reason_code": "filled_login_expired", "reason": "a filled password has been on this page for ten minutes"}),
+        );
+        let mut pending = crate::cingulate_client::desk::pending_reply("el_1");
+        pending["context"] = context.clone();
+        let cases = [
+            (
+                json!({"outcome": "ok", "origin": "https://login.example", "filled": ["username", "password", "otp"], "context": context}),
+                vec!["Filled from the saved login on https://login.example: username, password, one-time code."],
+            ),
+            (
+                pending,
+                vec!["Waiting for the person to answer a consent question (ask_id el_1)."],
+            ),
+            (json!({"outcome": "cancelled", "context": context}), vec!["Cancelled."]),
+            (
+                refusal(
+                    "authorization_denied",
+                    "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh browser.snapshot",
+                    json!({"field": "otp_ref", "reason_code": "origins_differ"}),
+                ),
+                vec!["Authorization denied.", "Field otp_ref: origins differ."],
+            ),
+            (
+                refusal(
+                    "authorization_denied",
+                    "this agent cannot use a saved login of that name on this site; check the name with the person, or ask them to share the login with this agent for this site",
+                    json!({"reason_code": "login_unavailable"}),
+                ),
+                vec!["Reason: login unavailable."],
+            ),
+            (
+                refusal(
+                    "internal_error",
+                    "the vault could not be reached; retry later, and report it if it persists",
+                    json!({"reason_code": "vault_unavailable"}),
+                ),
+                vec!["Internal error.", "Reason: vault unavailable."],
+            ),
+            (
+                refusal(
+                    "stale_snapshot",
+                    "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
+                    json!({"reason_code": "document_changed"}),
+                ),
+                vec!["Stale snapshot.", "Reason: document changed."],
+            ),
+            (
+                refusal(
+                    "authorization_denied",
+                    "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
+                    json!({"reason_code": "login_approval_not_given", "decision": "declined"}),
+                ),
+                vec!["Reason: login approval not given."],
+            ),
+            (
+                refusal(
+                    "consent_unavailable",
+                    "the dedicated vault approval could not be filed; update Cingulate or report the refusal before retrying",
+                    json!({"reason_code": "secret_use_approval_unsupported", "reason": "Cingulate does not advertise secret-use-approval/v1"}),
+                ),
+                vec!["Consent unavailable.", "Reason: Cingulate does not advertise secret-use-approval/v1."],
+            ),
+            (
+                screenshot_refused,
+                vec![
+                    "Authorization denied.",
+                    "Read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself.",
+                    "Reason: a filled password is on this page.",
+                ],
+            ),
+            (
+                window_expired,
+                vec![
+                    "Reload or navigate the page itself before reading it again.",
+                    "Reason: a filled password has been on this page for ten minutes.",
+                ],
+            ),
+        ];
+        for (reply, expected) in cases {
+            assert_eq!(
+                crate::browser::fill::validate_fill_login_result(&reply),
+                Ok(()),
+                "not a fill reply: {reply}"
+            );
+            let result = decoded(reply.clone());
+            assert_eq!(
+                model_view_problems_for_action(&result, "fill_login"),
+                Vec::<String>::new(),
+                "{reply}"
+            );
+            let lines = texts(&result).join("\n");
+            for line in expected {
+                assert!(
+                    lines.lines().any(|text| text == line),
+                    "{line:?} in {lines}"
+                );
+            }
+            assert_eq!(result["structuredContent"], reply);
+        }
+
+        // The flat tool's refusal of fill_login on the person's browser, as
+        // the handler sends a flat translation's refusal.
+        let user_refused = decoded(json!({
+            "outcome": "invalid_request", "context": null, "session": null,
+            "detail": {"field": "browser", "reason_code": "own_browser_only"},
+        }));
+        assert_eq!(
+            model_view_problems_for_action(&user_refused, "fill_login"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            texts(&user_refused),
+            ["Invalid request.\nField browser: own browser only."]
+        );
+
+        // A read of a tab in its window succeeds with the password replaced.
+        let redacted = decoded(json!({
+            "outcome": "ok",
+            "snapshot_id": "snap-1",
+            "state_text": format!(
+                "login.example · snapshot snap-1\ne2 textbox Password, Value: {}",
+                crate::browser::fill::REDACTED_PASSWORD
+            ),
+        }));
+        assert_eq!(
+            model_view_problems_for_action(&redacted, "snapshot"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            texts(&redacted),
+            ["login.example · snapshot snap-1\ne2 textbox Password, Value: [filled password]"]
+        );
+    }
 }

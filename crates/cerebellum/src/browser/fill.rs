@@ -48,9 +48,10 @@ use cerebellum_core::identity::RouteIdentity;
 
 pub const FILL_LOGIN: &str = "browser.fill_login";
 
-/// Production admission remains off until the security audit and phone approval
-/// support are complete. Tests can still install a source on an isolated plane.
-pub const FILL_LOGIN_ENABLED: bool = false;
+/// Production admission is on: a plane built for a running module is given
+/// the live vault source and serves `browser.fill_login`. Planes built for
+/// tests get no source unless a test installs one.
+pub const FILL_LOGIN_ENABLED: bool = true;
 
 /// The live vault source. Construction does no I/O; admission remains separate.
 pub const PRODUCTION_LOGIN_MATERIAL_SOURCE: fn(PathBuf, String) -> Arc<dyn LoginMaterialSource> =
@@ -928,7 +929,16 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<FillPlan, BrowserError> {
         let object = self
-            .validate_request(args, &["secret", "username_ref", "password_ref", "otp_ref"])
+            .validate_request(
+                args,
+                &[
+                    "secret",
+                    "username_ref",
+                    "password_ref",
+                    "otp_ref",
+                    "snapshot_id",
+                ],
+            )
             .await?;
         let secret = required_string(object, "secret", 1, 256)?.to_owned();
         let mut wanted = vec![
@@ -938,6 +948,21 @@ impl BrowserPlane {
         if object.contains_key("otp_ref") {
             wanted.push((LoginField::Otp, required_ref(object, "otp_ref")?));
         }
+        // As for browser.type: a named snapshot only chooses which elements
+        // the refs name. Every check before insertion runs the same either way.
+        let requested_snapshot = match object.get("snapshot_id") {
+            Some(_) => {
+                let id = required_string(object, "snapshot_id", 32, 32)?;
+                if !snapshot_store::valid_snapshot_id(id) {
+                    return Err(BrowserError::InvalidRequest {
+                        field: "snapshot_id".into(),
+                        reason_code: "unsupported_value",
+                    });
+                }
+                Some(id.to_owned())
+            }
+            None => None,
+        };
         for (index, (field, reference)) in wanted.iter().enumerate() {
             if wanted[..index]
                 .iter()
@@ -957,13 +982,16 @@ impl BrowserPlane {
             .filter(|context| !context.ended)
             .ok_or(BrowserError::NoSession)?;
         let password_ref = wanted[1].1;
-        let snapshot_id = context
-            .refs
-            .shown(password_ref)
-            .map(|shown| shown.snapshot_id.clone())
-            .ok_or(BrowserError::StaleSnapshot {
-                reason_code: "not_retained",
-            })?;
+        let snapshot_id = match requested_snapshot {
+            Some(id) => id,
+            None => context
+                .refs
+                .shown(password_ref)
+                .map(|shown| shown.snapshot_id.clone())
+                .ok_or(BrowserError::StaleSnapshot {
+                    reason_code: "not_retained",
+                })?,
+        };
         let snapshot = context
             .snapshots
             .pin_text(&snapshot_id, context.epoch.value())
@@ -1740,15 +1768,29 @@ mod tests {
         assert!(validate_fill_login_result(&json!({"outcome": "ok", "password": "x"})).is_err());
     }
 
+    /// The switch is on, and it admits `browser.fill_login` only together
+    /// with a source: the real one a running module's plane is given. A
+    /// plane built for tests has none, so it still does not serve the fill.
     #[test]
-    fn production_switch_refuses_even_with_the_real_source_installed() {
-        const { assert!(!FILL_LOGIN_ENABLED) };
-        let plane =
-            BrowserPlane::new().with_login_material_source(Some(production_login_material_source(
-                PathBuf::from("unread-connection-file"),
-                "cerebellum".into(),
-            )));
+    fn production_switch_admits_only_with_the_real_source_installed() {
+        const { assert!(FILL_LOGIN_ENABLED) };
+        let source = production_login_material_source(
+            PathBuf::from("unread-connection-file"),
+            "cerebellum".into(),
+        );
+        assert!(source.enabled());
+        let plane = BrowserPlane::new().with_login_material_source(Some(source));
         assert!(plane.login_material.is_some());
-        assert_eq!(admitted(FILL_LOGIN, &plane, true), None);
+        assert_eq!(admitted(FILL_LOGIN, &plane, true), Some(FILL_LOGIN));
+        // Without a configured browser there is nothing to fill into.
+        assert_eq!(admitted(FILL_LOGIN, &plane, false), None);
+
+        let test_plane = BrowserPlane::new();
+        assert!(test_plane.login_material_source().is_none());
+        assert_eq!(admitted(FILL_LOGIN, &test_plane, true), None);
+        let planes =
+            crate::isolated_test_planes(&Arc::new(cerebellum_core::health::HealthState::new()));
+        assert!(planes.browser.login_material_source().is_none());
+        assert_eq!(admitted(FILL_LOGIN, &planes.browser, true), None);
     }
 }
