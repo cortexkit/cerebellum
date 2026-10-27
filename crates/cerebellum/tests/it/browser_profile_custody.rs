@@ -336,7 +336,10 @@ fn registry_profile_busy_is_typed_with_a_recovery_remedy() {
         .as_str()
         .unwrap()
         .contains("supervisor liveness"));
-    assert!(reply["remedy"].as_str().unwrap().contains("browser.launch"));
+    assert!(reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("launch the browser"));
     assert!(profile_lock_paths(root.path()).is_empty());
     assert_eq!(profile_directory_count(root.path()), 1);
 }
@@ -1009,7 +1012,7 @@ fn registry_root_identity_refusal_is_not_reported_as_profile_storage_unavailable
         json!({
             "outcome": "profile_registry_untrusted_root",
             "reason_code": "profile_registry_managed_root_inode_changed",
-            "remedy": "the browser root directory was replaced or restored (its inode differs from the recorded one); run browser.rebind_profile_root to re-identify it; that operation will itself refuse and name any directory the registry did not mint",
+            "remedy": "the browser root directory was replaced or restored (its inode differs from the recorded one); run rebind_profile_root to re-identify it; that operation will itself refuse and name any directory the registry did not mint",
         })
     );
 
@@ -1042,7 +1045,7 @@ fn unaccounted_profile_directory_reports_why_the_root_is_untrusted() {
         json!({
             "outcome": "profile_registry_untrusted_root",
             "reason_code": "profile_registry_possibly_managed_path",
-            "remedy": "move or account for the unaccounted profile directories before running browser.rebind_profile_root; the rebind operation will not adopt them",
+            "remedy": "move or account for the unaccounted profile directories before running rebind_profile_root; the rebind operation will not adopt them",
         })
     );
 }

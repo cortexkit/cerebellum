@@ -3050,6 +3050,122 @@ async fn present_that_cannot_front_is_refused_not_presented() {
     );
 }
 
+/// Every present/resume refusal names the flat `browser_use` action the agent
+/// calls next, never the granular `browser.<x>` capability id, which no
+/// agent tool provides. Each path is driven through the real handoff calls.
+#[tokio::test]
+async fn present_and_resume_refusals_name_flat_actions() {
+    fn has_granular_id(remedy: &str) -> bool {
+        let mut rest = remedy;
+        while let Some(at) = rest.find("browser.") {
+            rest = &rest[at + "browser.".len()..];
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_lowercase())
+            {
+                return true;
+            }
+        }
+        false
+    }
+    let mut remedies = Vec::new();
+    let mut check = |name: &str, reply: &Value, outcome: &str, remedy: &str| {
+        assert_eq!(reply["outcome"], outcome, "{name}: {reply}");
+        assert_eq!(reply["remedy"], remedy, "{name}: {reply}");
+        remedies.push((name.to_string(), remedy.to_string()));
+    };
+
+    // No session was ever launched: the agent launches the browser first.
+    let planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://example.test",
+    )
+    .await;
+    check("no_session", &reply, "no_session", "launch the browser");
+
+    // A live session on another origin: the agent navigates there instead.
+    let launcher = Arc::new(RecordingLauncher::default());
+    let mut planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://elsewhere.example:8443",
+    )
+    .await;
+    check(
+        "origin_mismatch",
+        &reply,
+        "origin_mismatch",
+        "call navigate",
+    );
+
+    // An open handoff: the agent resumes it instead of presenting again.
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://landed.example:8443",
+    )
+    .await;
+    assert_eq!(reply["outcome"], "presented", "{reply}");
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://landed.example:8443",
+    )
+    .await;
+    check("handoff_open", &reply, "handoff_open", "call resume");
+
+    // A front the browser refuses: the agent presents again once it can.
+    let launcher = Arc::new(RecordingLauncher {
+        present_error: Some("fronting was refused by Chrome"),
+        ..RecordingLauncher::default()
+    });
+    let mut planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(launcher.clone());
+    launch_at(&planes, &launcher.page, "https://landed.example:8443").await;
+    let reply = cerebellum::present_browser_handoff_for_test(
+        &planes,
+        &route_identity(),
+        "https://landed.example:8443",
+    )
+    .await;
+    check("present_failed", &reply, "present_failed", "call present");
+
+    // No handoff was ever presented: the agent presents one first.
+    let planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(config()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    let reply = cerebellum::resume_browser_handoff_for_test(&planes, &route_identity()).await;
+    check("no_handoff", &reply, "no_handoff", "call present");
+
+    assert_eq!(remedies.len(), 5);
+    for (name, remedy) in remedies {
+        assert!(
+            !has_granular_id(&remedy),
+            "{name}: the remedy names a granular browser id no agent tool provides: {remedy}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn resume_closes_by_caller_and_reports_it() {
     let launcher = Arc::new(RecordingLauncher::default());
@@ -3348,7 +3464,7 @@ async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_v
     assert!(
         refusal["remedy"]
             .as_str()
-            .is_some_and(|remedy| remedy.contains("browser.rebind_profile_root")),
+            .is_some_and(|remedy| remedy.contains("rebind_profile_root")),
         "{refusal}"
     );
     // The launch slot is released, so the next attempt meets the same refusal

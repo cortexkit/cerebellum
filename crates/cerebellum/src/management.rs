@@ -2846,6 +2846,61 @@ mod tests {
         ManagementPlane::new(Arc::new(Fixed(resolution)))
     }
 
+    /// Agents call the flat `browser_use` tool: no agent tool is named
+    /// `browser.<x>`. Every rebind refusal they can read must therefore name
+    /// the operation in plain words instead of the granular capability id.
+    #[test]
+    fn every_rebind_refusal_remedy_names_no_granular_browser_id() {
+        fn has_granular_id(remedy: &str) -> bool {
+            let mut rest = remedy;
+            while let Some(at) = rest.find("browser.") {
+                rest = &rest[at + "browser.".len()..];
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_ascii_lowercase())
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // One refusal per variant; the match in `rebind_refusal_reply` has no
+        // catch-all, so a new variant does not compile until it is answered
+        // there, and this list then refuses to pass until it is sampled here.
+        let refusals = [
+            RebindRefusal::RegistryMissing,
+            RebindRefusal::MalformedRegistry,
+            RebindRefusal::UnsupportedRegistrySchema,
+            RebindRefusal::IntegrityMismatch,
+            RebindRefusal::AlreadyBound,
+            RebindRefusal::PossiblyManagedPath {
+                unaccounted: vec!["profiles/alien".to_string()],
+            },
+            RebindRefusal::RootUnstable,
+            RebindRefusal::BirthTimeUnavailable {
+                root_path: std::path::PathBuf::from("/example/root"),
+            },
+            RebindRefusal::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "probe",
+            )),
+        ];
+        let mut checked = 0;
+        for refusal in refusals {
+            let reply = rebind_refusal_reply(refusal);
+            if let Some(remedy) = reply.get("remedy").and_then(Value::as_str) {
+                assert!(
+                    !has_granular_id(remedy),
+                    "{reply}: the remedy names a granular browser id no agent tool provides"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 5, "only {checked} remedies scanned");
+    }
+
     /// The platform resolver reads a real application's signature: Finder is
     /// Apple-anchored with no Team ID, so it may be offered "always"; it
     /// satisfies its own designated requirement and not one naming another

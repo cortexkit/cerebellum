@@ -558,7 +558,7 @@ pub(super) fn facts(
         lines.push(line);
     }
     if let Some(remedy) = text(object, "remedy").filter(|remedy| !remedy.trim().is_empty()) {
-        // Some remedies are only the next call's name, `browser.launch`.
+        // Some remedies are only the next call's name, `close`.
         if remedy.trim().contains(char::is_whitespace) {
             lines.push(sentence(remedy));
         } else {

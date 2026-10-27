@@ -386,7 +386,7 @@ impl LoginImportPlan {
                         "transfer_failed",
                         Some(browser_id.to_string()),
                         0,
-                        Some("use hand_off so the person can log in through browser.present"),
+                        Some("use hand_off so the person can log in through present"),
                     ),
                 }
             }
@@ -1649,9 +1649,72 @@ mod tests {
         let (reply, status, old, events) =
             open_import_case("transfer:chrome", true, false, false).await;
         assert_eq!(reply["outcome"], "session_open");
+        assert_eq!(
+            reply["remedy"], "close",
+            "the agent closes the idle session, so the remedy names the flat close action: {reply}"
+        );
         assert_eq!(status["browser_session_id"], old);
         assert_eq!(status["outcome"], "ready");
         assert!(events.is_empty());
+    }
+
+    /// A copy that fails before anything is read reports the hand_off
+    /// remedy: the agent cannot copy from a source that is not there, so the
+    /// person hands the login over instead. The remedy names the flat
+    /// `present` action, never the granular `browser.present` capability.
+    #[test]
+    fn a_transfer_with_no_source_behind_it_reports_the_hand_off_remedy() {
+        let root = TestRoot::new("transfer-without-source");
+        let chrome = source("chrome", "Chrome", root.path());
+        let data = root.path().join("data");
+        create_store(
+            &cookie_store(&data, &chrome),
+            &[Cookie {
+                host: ".x.com",
+                name: "session",
+                path: "/",
+                persistent: true,
+                encrypted: b"secret",
+            }],
+        );
+        let profile = root.path().join("managed/profile");
+        fs::create_dir_all(&profile).unwrap();
+        let mut plan = match prepare_import(
+            "https://x.com",
+            "test-project",
+            &chrome.executable.clone(),
+            DurableProfileLocation {
+                managed_root: root.path().join("managed"),
+                profile_directory: profile,
+            },
+            ImportSettings::for_test(
+                PathBuf::from(SQLITE_PROGRAM),
+                data,
+                root.path().join("safari"),
+                vec![chrome],
+            ),
+        ) {
+            PreparedImport::Ready(plan) => plan,
+            PreparedImport::Refused(result) => {
+                panic!("a supported executable prepares an import: {result:?}")
+            }
+        };
+        // The presence advertises the copy or `decide` refuses before copying.
+        assert!(plan.permits_transfer(Some("transfer:chrome")));
+        // Remove the source behind the advertised presence, so the copy fails
+        // before reading anything.
+        plan.settings.browsers.clear();
+        let result = plan.decide(Some("transfer:chrome"));
+        assert_eq!(result.outcome, "transfer_failed", "{result:?}");
+        let remedy = result.remedy.expect("a failed transfer names its remedy");
+        assert_eq!(
+            remedy, "use hand_off so the person can log in through present",
+            "{result:?}"
+        );
+        assert!(
+            !remedy.contains("browser."),
+            "the remedy names a granular browser id no agent tool provides: {remedy}"
+        );
     }
 
     #[tokio::test]

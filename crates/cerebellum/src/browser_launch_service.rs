@@ -5063,7 +5063,7 @@ mod orphan_recovery_tests {
                         "remedy": reason.remedy(),
                     })
                 );
-                assert!(reason.remedy().contains("browser.clear_launch_recovery"));
+                assert!(reason.remedy().contains("clear_launch_recovery"));
                 assert_eq!(
                     crate::browser::validate_browser_result(
                         crate::browser_session::BROWSER_LAUNCH,

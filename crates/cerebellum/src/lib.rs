@@ -5441,7 +5441,7 @@ async fn complete_login_import(
                 return journal_login_import_result(
                     planes,
                     &facts.identity,
-                    plan.refusal("session_open", "browser.close"),
+                    plan.refusal("session_open", "close"),
                 )
                 .await;
             };
@@ -5457,7 +5457,7 @@ async fn complete_login_import(
                     return journal_login_import_result(
                         planes,
                         &facts.identity,
-                        plan.refusal("session_open", "browser.close"),
+                        plan.refusal("session_open", "close"),
                     )
                     .await
                 }
@@ -5766,23 +5766,23 @@ async fn present_browser_handoff(
     let presented = match presented {
         Ok(presented) => presented,
         Err(browser_session::PresentRefusal::NoSession) => {
-            return json!({"outcome":"no_session","remedy":"browser.launch"})
+            return json!({"outcome":"no_session","remedy":"launch the browser"})
         }
         Err(browser_session::PresentRefusal::OriginMismatch { current_origin }) => {
             return json!({
                 "outcome":"origin_mismatch",
                 "current_origin":current_origin,
-                "remedy":"browser.navigate",
+                "remedy":"call navigate",
             })
         }
         Err(browser_session::PresentRefusal::HandoffOpen) => {
-            return json!({"outcome":"handoff_open","remedy":"browser.resume"})
+            return json!({"outcome":"handoff_open","remedy":"call resume"})
         }
         Err(browser_session::PresentRefusal::PresentFailed { error_text }) => {
             return json!({
                 "outcome":"present_failed",
                 "error_text":error_text,
-                "remedy":"browser.present",
+                "remedy":"call present",
             })
         }
     };
@@ -5880,7 +5880,7 @@ async fn resume_browser_handoff(planes: &Planes, identity: &RouteIdentity) -> Va
     let close = match resumed {
         Ok(Ok(close)) => close,
         Ok(Err(browser_session::ResumeRefusal::NoHandoff)) => {
-            return json!({"outcome":"no_handoff","remedy":"browser.present"})
+            return json!({"outcome":"no_handoff","remedy":"call present"})
         }
         Err(_) => return json!({"outcome":"internal_failure"}),
     };
