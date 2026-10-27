@@ -484,6 +484,7 @@ pub(crate) enum SessionAdmission {
 /// checked before asking, so nobody is asked about a process that has gone,
 /// and again after a wait, so the action lands on the process the person
 /// agreed about.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_session_app(
     management: &ManagementPlane,
     executable: &super::ExecutableReader,
