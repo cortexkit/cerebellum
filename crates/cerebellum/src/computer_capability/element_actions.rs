@@ -484,8 +484,10 @@ pub(crate) enum SessionAdmission {
 /// checked before asking, so nobody is asked about a process that has gone,
 /// and again after a wait, so the action lands on the process the person
 /// agreed about.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_session_app(
     management: &ManagementPlane,
+    executable: &super::ExecutableReader,
     consent: &ConsentContext,
     cancel: &CancelHandle,
     bundle_identity: &str,
@@ -501,6 +503,16 @@ pub(crate) async fn admit_session_app(
     };
     if !same_process(&grant) {
         return SessionAdmission::Gone;
+    }
+    // A development build its driver may use is admitted as if an "always"
+    // app grant were held: nobody is asked and nothing is stored.
+    if super::operator_apps::admits_development_build(
+        management,
+        &consent.caller,
+        executable,
+        &grant,
+    ) {
+        return SessionAdmission::Admitted(grant, GrantAdmission::default());
     }
     let need = management.app_need(bundle_identity, &grant, management.application_name(&grant));
     let admission = match management
@@ -1533,6 +1545,7 @@ where
         }
         let (grant, admission) = match admit_session_app(
             management,
+            &self.process_executable,
             &consent,
             &cancel,
             &bundle_identity,
@@ -1625,6 +1638,7 @@ where
         }
         let (grant, admission) = match admit_session_app(
             management,
+            &self.process_executable,
             &consent,
             &cancel,
             &image.bundle_identity,
@@ -1723,6 +1737,7 @@ where
         }
         let (grant, admission) = match admit_session_app(
             management,
+            &self.process_executable,
             &consent,
             &cancel,
             &bundle_identity,
@@ -2129,6 +2144,7 @@ where
                 fronted_press::later_steps(
                     &badges,
                     management,
+                    &self.process_executable,
                     consent,
                     &grant,
                     &identity.agent_project_id,

@@ -102,6 +102,8 @@ pub(crate) mod operator_confirm;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
 use read_image::ImageReadPlan;
+#[cfg(test)]
+mod development_build_tests;
 mod held_input;
 mod keystrokes;
 mod open_app;
@@ -1331,8 +1333,8 @@ where
             clock: _,
             now_ms,
         } = context;
-        let (grant, admission) = match management
-            .admit_app(&parsed.target, &consent, &cancel)
+        let (grant, admission) = match self
+            .admit_app(management, &parsed.target, &consent, &cancel)
             .await
         {
             Ok(admitted) => admitted,
@@ -2029,7 +2031,10 @@ where
             clock: _,
             now_ms: _,
         } = context;
-        let (grant, admission) = match management.admit_app(&parsed.app, &consent, &cancel).await {
+        let (grant, admission) = match self
+            .admit_app(management, &parsed.app, &consent, &cancel)
+            .await
+        {
             Ok(admitted) => admitted,
             Err(AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
                 return cancelled_before_polling_reply(parsed.predicate)
@@ -2167,8 +2172,8 @@ where
         }
         // Keystrokes stay bound to the named application's process generation.
         let mode = DispatchMode::Background;
-        let (mut grant, mut admission) = match management
-            .admit_app(&parsed.target, &consent, &cancel)
+        let (mut grant, mut admission) = match self
+            .admit_app(management, &parsed.target, &consent, &cancel)
             .await
         {
             Ok(admitted) => admitted,
@@ -2900,7 +2905,7 @@ where
             Err(refusal) => return refusal,
         };
         let source = self.app_state_source.clone();
-        let executable = Arc::clone(&self.process_executable);
+        let lookup = self.operator_lookup(context.management, &context.consent.caller);
         let listed = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
             let mut running = source.running_apps()?;
@@ -2908,7 +2913,7 @@ where
                 .installed_apps(std::time::Duration::from_secs(2).saturating_sub(start.elapsed()));
             // The applications no agent may use are left out of the list
             // rather than refusing all of it.
-            running.retain(|app| !operator_apps::running_app_blocked(app, &executable));
+            running.retain(|app| !lookup.running_app_hidden(app));
             installed
                 .apps
                 .retain(|app| !operator_apps::installed_app_blocked(app));

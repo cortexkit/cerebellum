@@ -61,6 +61,7 @@ pub(super) struct LaterSteps {
 pub(super) fn later_steps(
     scheduler: &super::super::preview_call::Badges,
     management: &ManagementPlane,
+    executable: &super::super::ExecutableReader,
     consent: &ConsentContext,
     grant: &ProcessGrant,
     agent_project_id: &str,
@@ -68,6 +69,11 @@ pub(super) fn later_steps(
 ) -> LaterSteps {
     let grants = management.computer_grants().clone();
     let caller = consent.caller.clone();
+    // A development build its driver may use needs no grant to be held, the
+    // same as when the batch's first step was admitted.
+    let development_build = super::super::operator_apps::admits_development_build(
+        management, &caller, executable, grant,
+    );
     let need = management.app_need(
         &grant.bundle_identity,
         grant,
@@ -85,7 +91,7 @@ pub(super) fn later_steps(
         steps,
         scheduler: scheduler.clone(),
         runtime: tokio::runtime::Handle::current(),
-        admitted: Box::new(move || grants.holds(&caller, &need)),
+        admitted: Box::new(move || development_build || grants.holds(&caller, &need)),
     }
 }
 
