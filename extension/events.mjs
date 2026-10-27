@@ -76,12 +76,16 @@ export class BrowserEvents {
     });
     this.chrome.tabs.onCreated.addListener(tab => {
       if (!this.tabs.tabs.has(tab.openerTabId)) return;
-      this.notePopup(tab.id, tab.openerTabId, tab.windowId, tab.active);
+      const owner = this.popupOwner(tab.id, tab.openerTabId);
+      if (!owner) return;
+      this.notePopup(tab.id, tab.openerTabId, owner, tab.windowId, tab.active);
       void this.handleCreated(tab.id);
     });
     this.chrome.webNavigation.onCreatedNavigationTarget.addListener(info => {
       if (!this.tabs.tabs.has(info.sourceTabId)) return;
-      this.notePopup(info.tabId, info.sourceTabId);
+      const owner = this.popupOwner(info.tabId, info.sourceTabId);
+      if (!owner) return;
+      this.notePopup(info.tabId, info.sourceTabId, owner);
       void this.handleCreated(info.tabId);
     });
     this.chrome.webNavigation.onBeforeNavigate.addListener(info => {
@@ -119,7 +123,21 @@ export class BrowserEvents {
     console.info("Agent group listeners registered: tabs.onUpdated, tabs.onMoved, tabGroups.onUpdated; status reconciliation enabled");
   }
 
-  notePopup(tabId, openerTabId, windowId, activated = false) {
+  // Decide when Chrome first reports a tab opened from a group member whether
+  // agent input caused it. Only then does the pop-up path run: it groups the
+  // tab, gives it the opener's claim and restores focus. A tab the person
+  // opens from a handed tab (a link click, middle click, "open in new tab")
+  // gets none of that. If Chrome itself places it in the Agent group, it is
+  // adopted there as an unclaimed handed tab like any other tab the person
+  // drags in, and an agent must claim it with claim_tab.
+  popupOwner(tabId, openerTabId) {
+    if (this.popupSources.has(tabId)) return this.popupSources.get(tabId).owner;
+    const owner = this.agent.inputRoute(openerTabId);
+    if (!owner) this.tabs.adoptionDecision(tabId, "popup", "opened_without_agent_input");
+    return owner;
+  }
+
+  notePopup(tabId, openerTabId, owner, windowId, activated = false) {
     if (this.popupSources.has(tabId)) {
       const popup = this.popupSources.get(tabId);
       popup.activated ||= activated;
@@ -129,7 +147,7 @@ export class BrowserEvents {
     const previous = this.lastActivation?.tabId === tabId ? this.lastActivation : null;
     const restoreWindow = previous?.previousWindow ?? (this.lastFocus?.windowId === windowId ? this.lastFocus.previousWindow : this.focusedWindow);
     this.popupSources.set(tabId, {
-      openerTabId, windowId, activated: activated || !!previous,
+      openerTabId, owner, windowId, activated: activated || !!previous,
       restoreWindow,
       restoreTab: previous?.previousTab ?? this.activeTabs.get(restoreWindow),
     });
@@ -157,9 +175,15 @@ export class BrowserEvents {
     // The opener, not a page-supplied URL, determines whether popup recovery is
     // allowed. Never group, activate, or restore anything for an outside opener.
     await this.tabs.eligible(popup.openerTabId);
-    const owner = this.agent.claims.get(popup.openerTabId);
+    // The pop-up inherits the claim of the route whose input opened it, and
+    // only while that route still holds the opener. A claim that changed
+    // hands or ended since then is never copied.
+    if (this.agent.claims.get(popup.openerTabId) !== popup.owner) {
+      this.tabs.adoptionDecision(tabId, "popup", "opener_claim_changed");
+      return;
+    }
     await this.tabs.adoptPopup(tabId);
-    if (owner) this.agent.claims.set(tabId, owner);
+    this.agent.claims.set(tabId, popup.owner);
     await this.epochs.install(tabId);
     if (popup.activated) {
       this.agent.popupFlags.add(popup.openerTabId);

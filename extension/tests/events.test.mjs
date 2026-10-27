@@ -33,21 +33,37 @@ test("explicit popup open creates a background grouped tab without changing focu
   assert.equal(events.popupSources.size, 0);
 });
 
+// Runs an agent click on the claimed tab 2 and calls `whilePressed` while
+// Chrome handles the press, which is when a page script's pop-up appears.
+async function agentClick(f, whilePressed) {
+  const epoch = (await f.fresh()).interaction_epoch;
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    if (args[1] === "Input.dispatchMouseEvent" && args[2].type === "mousePressed") whilePressed();
+    return send(...args);
+  };
+  try { return await f.run(f.input(epoch)); }
+  finally { f.chrome.debugger.sendCommand = send; }
+}
+
 test("script popup joins opener group and restores remembered ids with a disclosed activation", async () => {
   const f = await setup();
   const events = listen(f);
   f.chrome.allowPopupRecovery = true;
   f.chrome.tabData.set(30, { id: 30, groupId: -1, windowId: 99, active: true });
-  f.chrome.tabs.onCreated.emit({ id: 30, openerTabId: 2, windowId: 99, active: true });
-  f.chrome.tabs.onActivated.emit({ tabId: 30, windowId: 99 });
-  f.chrome.webNavigation.onCreatedNavigationTarget.emit({ tabId: 30, sourceTabId: 2 });
+  const reply = await agentClick(f, () => {
+    f.chrome.tabs.onCreated.emit({ id: 30, openerTabId: 2, windowId: 99, active: true });
+    f.chrome.tabs.onActivated.emit({ tabId: 30, windowId: 99 });
+    f.chrome.webNavigation.onCreatedNavigationTarget.emit({ tabId: 30, sourceTabId: 2 });
+  });
   await turn();
   await Promise.all(events.popupTasks.values());
   assert.equal(f.chrome.tabData.get(30).groupId, 7);
   assert.equal(f.agent.claims.get(30), f.agent.claims.get(2));
   assert.deepEqual(f.chrome.calls.find(call => call[0] === "restoreTab"), ["restoreTab", 1, { active: true }]);
   assert.deepEqual(f.chrome.calls.find(call => call[0] === "restoreWindow"), ["restoreWindow", 3, { focused: true }]);
-  assert.equal((await f.fresh()).popup_activated_briefly, true);
+  // The activation was seen during the click, so the click's own reply discloses it.
+  assert.equal(reply.popup_activated_briefly, true);
   assert.equal((await f.fresh()).popup_activated_briefly, undefined);
   assert.equal(f.chrome.calls.some(call => call[0] === "get" && call[1] === 1), false);
 });
@@ -57,13 +73,64 @@ test("popup activation before creation retains the preceding focus ids", async (
   const events = listen(f);
   f.chrome.allowPopupRecovery = true;
   f.chrome.tabData.set(31, { id: 31, groupId: -1, windowId: 100, active: true });
-  f.chrome.tabs.onActivated.emit({ tabId: 31, windowId: 100 });
-  f.chrome.windows.onFocusChanged.emit(100);
-  f.chrome.tabs.onCreated.emit({ id: 31, openerTabId: 2, windowId: 100, active: true });
+  await agentClick(f, () => {
+    f.chrome.tabs.onActivated.emit({ tabId: 31, windowId: 100 });
+    f.chrome.windows.onFocusChanged.emit(100);
+    f.chrome.tabs.onCreated.emit({ id: 31, openerTabId: 2, windowId: 100, active: true });
+  });
   await turn();
   await Promise.all(events.popupTasks.values());
   assert.deepEqual(f.chrome.calls.find(call => call[0] === "restoreTab"), ["restoreTab", 1, { active: true }]);
   assert.deepEqual(f.chrome.calls.find(call => call[0] === "restoreWindow"), ["restoreWindow", 3, { focused: true }]);
+});
+
+test("a tab the person opens from a claimed tab joins Chrome's group unclaimed", async () => {
+  const f = await setup();
+  const events = listen(f);
+  // The person clicks a link on the claimed tab while no agent action runs.
+  // Chrome opens it beside its opener and puts it in the opener's group.
+  f.chrome.tabData.set(32, { id: 32, groupId: 7, windowId: 3, active: true });
+  f.chrome.tabs.onCreated.emit({ id: 32, openerTabId: 2, windowId: 3, active: true, groupId: 7 });
+  f.chrome.webNavigation.onCreatedNavigationTarget.emit({ tabId: 32, sourceTabId: 2 });
+  f.chrome.tabs.onActivated.emit({ tabId: 32, windowId: 3 });
+  f.chrome.tabs.onUpdated.emit(32, { groupId: 7 }, { ...f.chrome.tabData.get(32) });
+  await turn();
+  await Promise.all(events.popupTasks.values());
+  await turn();
+  assert.equal(f.agent.claims.has(32), false);
+  assert.equal(f.tabs.tabs.get(32)?.kind, "handed");
+  assert.equal(f.chrome.calls.some(call => call[0] === "restoreTab" || call[0] === "restoreWindow"), false);
+  const status = await f.run({ version: 2, action: "status" });
+  assert.deepEqual(status.tabs.map(tab => [tab.tab === f.record.handle, tab.claimed, tab.handed]), [[true, true, true], [false, false, true]]);
+  // Opening it was the person's input, not a pop-up from the agent's click.
+  assert.equal((await f.fresh()).popup_activated_briefly, undefined);
+});
+
+test("a window the person opens from a claimed tab is never grouped or claimed", async () => {
+  const f = await setup();
+  const events = listen(f);
+  f.chrome.tabData.set(33, { id: 33, groupId: -1, windowId: 101, active: true });
+  f.chrome.calls.length = 0;
+  f.chrome.tabs.onCreated.emit({ id: 33, openerTabId: 2, windowId: 101, active: true });
+  f.chrome.webNavigation.onCreatedNavigationTarget.emit({ tabId: 33, sourceTabId: 2 });
+  await turn();
+  await Promise.all(events.popupTasks.values());
+  assert.equal(f.agent.claims.has(33), false);
+  assert.equal(f.tabs.tabs.has(33), false);
+  assert.equal(f.chrome.tabData.get(33).groupId, -1);
+  assert.deepEqual(f.chrome.calls, []);
+});
+
+test("a tab opened from a claimed tab after an agent click ends is not claimed", async () => {
+  const f = await setup();
+  const events = listen(f);
+  await agentClick(f, () => {});
+  f.chrome.tabData.set(34, { id: 34, groupId: -1, windowId: 3, active: false });
+  f.chrome.tabs.onCreated.emit({ id: 34, openerTabId: 2, windowId: 3, active: false });
+  await turn();
+  await Promise.all(events.popupTasks.values());
+  assert.equal(f.agent.claims.has(34), false);
+  assert.equal(f.tabs.tabs.has(34), false);
 });
 
 test("popup from an outside opener is not listed read grouped or driven", async () => {

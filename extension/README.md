@@ -44,9 +44,12 @@ For a known new-tab link, cerebellum's user-browser adapter should issue `open_t
 by `tabs.group` keeps it background-only. `tabs.create` has no `groupId` property.
 
 A script-created `window.open`/native popup **may briefly activate** before Chrome
-notifies the extension. For an Agent-group opener only, the extension groups that
-popup, restores the remembered tab/window ids if they still exist, and marks the
-opener's CDP reply `popup_activated_briefly:true`. This recovery is a narrow exception
+notifies the extension. For a popup that an agent's input on an Agent-group opener
+caused, the extension groups that popup, gives it the opener's claim, restores the
+remembered tab/window ids if they still exist, and marks the opener's CDP reply
+`popup_activated_briefly:true`. A tab the person opens from a group member gets none
+of this; if Chrome puts it in the Agent group it is listed as an unclaimed handed tab.
+This recovery is a narrow exception
 to the otherwise strict no-focus-change rule, **not** a guarantee of zero transient
 activation. Popups from non-Agent openers are never touched. Recovery cannot restore
 a remembered tab/window that the person closed, and Chrome's event timing still

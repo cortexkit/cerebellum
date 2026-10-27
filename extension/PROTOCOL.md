@@ -361,9 +361,16 @@ It uses `tabs.create({active:false,openerTabId,windowId})` followed by
 `tabs.group({groupId,tabIds})`; `groupId` is not a tabs.create property. This path
 does not activate a tab/window.
 
-Script-created popups from an eligible opener are caught through
-`tabs.onCreated`/`webNavigation.onCreatedNavigationTarget`, grouped immediately,
-and inherit the opener's claim. If a popup activates, the extension restores the
+Script-created popups that an agent's input on a claimed opener causes are caught
+through `tabs.onCreated`/`webNavigation.onCreatedNavigationTarget`, grouped
+immediately, and inherit the claim of the route whose input opened them, only
+while that route still holds the opener. The extension attributes a new tab to
+the agent only when Chrome reports it while a CDP plan from the claiming route
+has dispatched input to the opener and is still attached. A tab the person opens
+from a group member (a link click, "open in new tab") never inherits a claim and
+is not grouped, activated or restored by the extension; if Chrome itself places
+it in the Agent group, it is adopted as an unclaimed handed tab, and an agent
+must `claim_tab` it. If a popup activates, the extension restores the
 remembered active **tab/window ids only** and returns
 `popup_activated_briefly:true` on the opener's next CDP reply. It remembers the
 initial active ids and subsequent activation/focus events, never retaining or

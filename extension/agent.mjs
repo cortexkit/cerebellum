@@ -148,6 +148,17 @@ export class Agent {
     await this.tabs.save();
   }
 
+  // The route whose CDP plan has dispatched input to tabId and is still
+  // attached there while that route holds the claim, or null. Only such a
+  // plan can have caused a pop-up from tabId; a tab opened while no agent
+  // input is in flight is the person's own action.
+  inputRoute(tabId) {
+    for (const state of this.active) {
+      if (state.tabId === tabId && state.input && state.attached && this.claims.get(tabId) === state.route) return state.route;
+    }
+    return null;
+  }
+
   alive(state) {
     if (state.cancelled || this.connectionEpoch !== state.epoch) throw new Refusal("cancelled");
   }
