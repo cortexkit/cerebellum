@@ -23,7 +23,14 @@ logging, page-text persistence or background debugger attachment.
    immediately; stale handles/input refuse. Hand-over never activates another tab.
 
 Only the recorded group id is trusted; renaming another group to Agent does not
-make it eligible. The extension does not list/read/drive outside tab contents.
+make it eligible. The group record lives in `chrome.storage.session`, which Chrome
+clears when the extension is reloaded or updated, and a copy in `chrome.storage.local`.
+After a reload the extension re-adopts its own group only if the recorded id,
+window, title (Agent), colour (blue) and at least one recorded member tab still
+match; its members come back as unclaimed handed tabs with new handles. A record
+that does not match is deleted and the group is left alone. A browser start
+discards the record, because ids restart then; tabs must be handed over again.
+The extension does not list/read/drive outside tab contents.
 It remembers only active tab/window **ids** for the popup exception below. It
 refuses hand-over across windows rather than moving the person's active tab;
 move a tab into the Agent group's window first. Agent-created tabs open with
@@ -44,9 +51,12 @@ For a known new-tab link, cerebellum's user-browser adapter should issue `open_t
 by `tabs.group` keeps it background-only. `tabs.create` has no `groupId` property.
 
 A script-created `window.open`/native popup **may briefly activate** before Chrome
-notifies the extension. For an Agent-group opener only, the extension groups that
-popup, restores the remembered tab/window ids if they still exist, and marks the
-opener's CDP reply `popup_activated_briefly:true`. This recovery is a narrow exception
+notifies the extension. For a popup that an agent's input on an Agent-group opener
+caused, the extension groups that popup, gives it the opener's claim, restores the
+remembered tab/window ids if they still exist, and marks the opener's CDP reply
+`popup_activated_briefly:true`. A tab the person opens from a group member gets none
+of this; if Chrome puts it in the Agent group it is listed as an unclaimed handed tab.
+This recovery is a narrow exception
 to the otherwise strict no-focus-change rule, **not** a guarantee of zero transient
 activation. Popups from non-Agent openers are never touched. Recovery cannot restore
 a remembered tab/window that the person closed, and Chrome's event timing still
