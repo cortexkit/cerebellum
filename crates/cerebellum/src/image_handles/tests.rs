@@ -11,7 +11,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 fn png(seed: u8, length: usize) -> (Value, Vec<u8>) {
-    let bytes: Vec<u8> = (0..length).map(|index| seed.wrapping_add(index as u8)).collect();
+    let bytes: Vec<u8> = (0..length)
+        .map(|index| seed.wrapping_add(index as u8))
+        .collect();
     let reply = json!({"image": {"mime": "image/png", "data_b64": cerebellum_core::serde_base64::encode(&bytes)}});
     (reply, bytes)
 }
@@ -78,7 +80,9 @@ fn a_handle_resolves_for_fifteen_minutes_and_not_a_millisecond_longer() {
     assert!(store
         .resolve(&handle, &["scope"], 5_000 + lifetime - 1)
         .is_some());
-    assert!(store.resolve(&handle, &["scope"], 5_000 + lifetime).is_none());
+    assert!(store
+        .resolve(&handle, &["scope"], 5_000 + lifetime)
+        .is_none());
 }
 
 #[test]
@@ -233,7 +237,9 @@ fn a_capture_reply_carries_a_handle_its_bytes_resolve_by() {
     let (mut reply, bytes) = png(5, 32);
     crate::mint_image_handle(&planes, &facts, &mut reply);
     let handle = reply["image_handle"].as_str().unwrap().to_owned();
-    let answer = planes.image_handles.resolve(&handle, &["head-scope"], wall_clock_ms());
+    let answer = planes
+        .image_handles
+        .resolve(&handle, &["head-scope"], wall_clock_ms());
     let answer = answer.unwrap();
     assert_eq!(
         cerebellum_core::serde_base64::decode(answer["bytes"].as_str().unwrap()).unwrap(),
@@ -302,7 +308,13 @@ fn ending_a_conversation_drops_its_handles() {
         )
         .unwrap();
     planes.image_handles.end_conversation("conversation");
-    assert!(planes.image_handles.resolve(&dropped, &["scope"], wall_clock_ms()).is_none());
-    assert!(planes.image_handles.resolve(&kept, &["scope"], wall_clock_ms()).is_some());
+    assert!(planes
+        .image_handles
+        .resolve(&dropped, &["scope"], wall_clock_ms())
+        .is_none());
+    assert!(planes
+        .image_handles
+        .resolve(&kept, &["scope"], wall_clock_ms())
+        .is_some());
     assert_eq!(planes.image_handles.held(), 1);
 }

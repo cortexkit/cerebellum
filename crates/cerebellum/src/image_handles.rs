@@ -192,11 +192,11 @@ fn reply_image(reply: &Value) -> Option<Image<'_>> {
     let image = reply.get("image")?.as_object()?;
     let mime = image.get("mime")?.as_str()?;
     let mime = MIME_TYPES.iter().find(|known| **known == mime)?;
-    let data_b64 = image.get("data_b64")?.as_str().filter(|data| !data.is_empty())?;
-    Some(Image {
-        mime,
-        data_b64,
-    })
+    let data_b64 = image
+        .get("data_b64")?
+        .as_str()
+        .filter(|data| !data.is_empty())?;
+    Some(Image { mime, data_b64 })
 }
 
 /// The in-memory handle store. One per module process.

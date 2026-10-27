@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 use subc_protocol::session::ModuleControlRequest;
-use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, Principal, RouteTarget};
+use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget};
 
 /// The image bytes the fixture read returns.
 const FIXTURE_BYTES: &[u8] = &[
@@ -335,7 +335,10 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
     );
 
     let never_minted = format!("ih{}", "0".repeat(32));
-    let request = resolve(14, json!({"handle": never_minted, "scope_ref": CAPTURE_SCOPE}));
+    let request = resolve(
+        14,
+        json!({"handle": never_minted, "scope_ref": CAPTURE_SCOPE}),
+    );
     handle_frame_for_test(request, &writer, &planes)
         .await
         .unwrap();
@@ -425,7 +428,11 @@ async fn closing_the_conversations_last_route_drops_its_handles() {
     );
     assert!(planes
         .image_handle_store()
-        .resolve(&handle, &[CAPTURE_SCOPE], cerebellum::wall_clock_ms_for_test())
+        .resolve(
+            &handle,
+            &[CAPTURE_SCOPE],
+            cerebellum::wall_clock_ms_for_test()
+        )
         .is_none());
 }
 
@@ -488,7 +495,10 @@ async fn management(planes: &Planes, corr: u64, body: Value) -> (FrameType, Valu
     .await
     .unwrap();
     let frame = output.recv().await.unwrap();
-    (frame.header.ty, serde_json::from_slice(&frame.body).unwrap())
+    (
+        frame.header.ty,
+        serde_json::from_slice(&frame.body).unwrap(),
+    )
 }
 
 /// A caller that is not `reserved:broca` never reaches `image.resolve`: its

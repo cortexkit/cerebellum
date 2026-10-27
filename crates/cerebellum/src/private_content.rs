@@ -752,10 +752,7 @@ fn retention(stamp: &subc_protocol::scope::ScopeStamp) -> Retention {
 /// nothing else; a route without a stamp names no scope, so its captures get
 /// no handle: one minted there could never be resolved.
 pub(crate) fn capture_scope(facts: &AcceptedBindFacts) -> Option<String> {
-    facts
-        .scope
-        .as_ref()
-        .map(|stamp| stamp.scope_ref.clone())
+    facts.scope.as_ref().map(|stamp| stamp.scope_ref.clone())
 }
 
 /// The scopes a reply delivered to `facts` marks: the calling scope, and the
@@ -917,7 +914,9 @@ pub(crate) async fn handle(
     };
     let scopes = scope_union(planes, scope, parent);
     let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let reply = planes.private_content.answer(&scopes, crate::wall_clock_ms());
+    let reply = planes
+        .private_content
+        .answer(&scopes, crate::wall_clock_ms());
     crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await
 }
 

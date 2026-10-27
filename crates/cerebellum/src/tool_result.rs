@@ -478,7 +478,9 @@ mod tests {
             )
             .await;
         assert!(
-            decoded["structuredContent"]["image"].get("data_b64").is_none(),
+            decoded["structuredContent"]["image"]
+                .get("data_b64")
+                .is_none(),
             "{decoded}"
         );
         assert_eq!(

@@ -3934,7 +3934,10 @@ async fn handle_route_request(
             .and_then(|body| body.get("method"))
             .and_then(Value::as_str);
         if facts.surface != RouteSurface::Management
-            || !matches!(method, Some(private_content::QUERY) | Some(image_handles::RESOLVE))
+            || !matches!(
+                method,
+                Some(private_content::QUERY) | Some(image_handles::RESOLVE)
+            )
         {
             return send_route_error(
                 writer,
@@ -6219,11 +6222,7 @@ impl Planes {
     }
 }
 
-fn mint_image_handle(
-    planes: &Planes,
-    facts: &AcceptedBindFacts,
-    reply: &mut Value,
-) {
+fn mint_image_handle(planes: &Planes, facts: &AcceptedBindFacts, reply: &mut Value) {
     let Some(scope_ref) = private_content::capture_scope(facts) else {
         return;
     };
