@@ -76,7 +76,13 @@ export class Agent {
     const active = [...this.active];
     for (const state of active) state.cancelled = true;
     await Promise.all(active.map(state => this.detach(state)));
-    for (const key of new Set(this.claims.values())) await this.release(key);
+    // A dropped native port ends claims, not handovers. Handed tabs stay in
+    // the recorded Agent group with their handles, so a reconnect lists them
+    // as unclaimed and an agent re-claims. Only the person gives tabs back
+    // (drag-out, close, toolbar toggle), or a tab whose recorded group no
+    // longer resolves is withdrawn on its next membership check.
+    this.claims.clear();
+    this.blankNavigations.clear();
     probeReadDiagnostic("baseline_cleared", { reason: "disconnected", baselineCount: this.baselines.size });
     this.baselines.clear();
   }
@@ -125,7 +131,21 @@ export class Agent {
     const key = routeKey(route);
     for (const state of this.active) if (state.route === key) state.cancelled = true;
     await Promise.all([...this.active].filter(state => state.route === key).map(state => this.detach(state)));
-    await this.release(key);
+    // A route close ends that route's claims, not the person's handovers.
+    // Handed tabs stay in the recorded Agent group with their handles, so a
+    // reconnecting route lists them as unclaimed and claims them again.
+    // Agent-opened tabs stay grouped too, with rotated handles, matching
+    // the explicit close action's release() behaviour.
+    for (const [tabId, owner] of [...this.claims]) {
+      if (owner !== key) continue;
+      this.claims.delete(tabId);
+      this.blankNavigations.delete(tabId);
+      probeReadDiagnostic("baseline_cleared", { tabId, reason: "released", baselinePresent: this.baselines.has(tabId) });
+      this.baselines.delete(tabId);
+      const record = this.tabs.tabs.get(tabId);
+      if (record && record.kind !== "handed") record.handle = crypto.randomUUID();
+    }
+    await this.tabs.save();
   }
 
   alive(state) {
