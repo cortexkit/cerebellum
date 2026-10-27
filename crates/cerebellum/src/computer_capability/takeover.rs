@@ -276,9 +276,15 @@ fn application_under(
 /// application, which the remedy names.
 fn require_app_grant(
     management: &ManagementPlane,
+    executable: &super::ExecutableReader,
     caller: &GrantCaller,
     grant: &ProcessGrant,
 ) -> Result<(), Value> {
+    // A development build its driver may use counts as holding an "always"
+    // app grant; the takeover grant is still required separately.
+    if super::operator_apps::admits_development_build(management, caller, executable, grant) {
+        return Ok(());
+    }
     let need = management.app_need(&grant.bundle_identity, grant, grant.bundle_identity.clone());
     if management.computer_grants().holds(caller, &need) {
         return Ok(());
@@ -557,7 +563,7 @@ where
         let hit_management = Arc::clone(management);
         let hit_image = image.clone();
         let hit_points = desktop_points.clone();
-        let lookup = self.operator_lookup(management);
+        let lookup = self.operator_lookup(management, caller);
         let placed = tokio::task::spawn_blocking(move || {
             // The real pointer reaches whichever window is on top at a point,
             // which may be another window than the image shows, of this
@@ -603,7 +609,7 @@ where
         let target = owners
             .next()
             .unwrap_or_else(|| Err(nothing_identifiable_at_point()))?;
-        require_app_grant(management, caller, &target)?;
+        require_app_grant(management, &self.process_executable, caller, &target)?;
 
         match request {
             TakeoverRequest::Drag { .. } => {

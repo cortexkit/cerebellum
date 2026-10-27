@@ -13,6 +13,24 @@
 //! The set is compiled in. No config file, setting or grant can widen or
 //! narrow it.
 //!
+//! # Development builds
+//!
+//! One exception is compiled in too. The agents in [`DEV_BUILD_DRIVERS`],
+//! which develop the Alfonso desktop app, may drive its development builds:
+//! the identities marked [`Class::DevelopmentBuild`], running with a
+//! signature that can be read and is not the released app's (Team ID
+//! [`RELEASE_TEAM_ID`]). For those agents such a build is admitted as if an
+//! "always" app grant were held for it: no card is shown and no grant is
+//! stored, and every other check of the action still runs. Every other agent
+//! is refused a development build as before. The released app and iPhone
+//! Mirroring stay refused for every agent.
+//!
+//! The exemption keys on the caller's admitted head identity, the same
+//! `agent_project_id` grants are held under, which the route's accepted bind
+//! supplies. It reads no file, environment variable or setting: an agent's
+//! shell can edit those, and an exemption it could edit would let any agent
+//! grant itself the operator's apps.
+//!
 //! # How an application is recognised
 //!
 //! An application is refused when its bundle identity, or the file name of
@@ -21,15 +39,18 @@
 //! that names a pid, its bundle identity and its start time. Bundle
 //! identities are self-declared, which is acceptable here: any application
 //! claiming one of these identities is refused, so a false claim can only
-//! fail closed.
+//! fail closed. A development build is admitted only when both its bundle
+//! identity and its executable can be read, and its signature too.
 //!
 //! When the bundle identity or the executable cannot be read, the application
 //! is refused only if one of its titles names Alfonso: the name the caller
 //! gave, the name the application runs under, or the title of its focused
 //! window. A title names Alfonso when "Alfonso" is one of its words, ignoring
 //! case ("Alfonso", "Alfonso Desktop", "alfonso-desktop"; not "Alfonsoville").
-//! Otherwise the call goes on as it would have without this check, and is
-//! answered by whatever refusal the unreadable identity leads to there.
+//! Otherwise the call goes on as it would have without this check, and any
+//! refusal the unreadable identity causes comes from the action itself. This
+//! holds for the agents in [`DEV_BUILD_DRIVERS`] too, because an application
+//! that cannot be identified could be the released app.
 
 use std::sync::Arc;
 
@@ -44,11 +65,24 @@ use cerebellum_core::clock::MonotonicClock;
 use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
 
 use super::{Servable, ServeContext, Served};
-use crate::management::ManagementPlane;
+use crate::agent_grants::GrantHolder;
+use crate::computer_grants::{ConsentContext, GrantAdmission, GrantCaller, GrantNeed};
+use crate::management::{AppRefusal, ManagementPlane};
+use crate::CancelHandle;
 
 /// The `reason` an operator-app refusal carries, beside the outcome
 /// `authorization_denied`.
 pub(crate) const OPERATOR_APP_BLOCKED: &str = "operator_app_blocked";
+
+/// The agents that may drive development builds of the Alfonso desktop app,
+/// by the admitted agent identity grants are held under. Only CKDESK, the
+/// agent that develops the app.
+pub(crate) const DEV_BUILD_DRIVERS: &[&str] = &["agent_16013c86"];
+
+/// The Apple Developer Team ID that signs the released Alfonso desktop app.
+/// A process carrying it is never taken for a development build, which is
+/// signed ad hoc.
+pub(crate) const RELEASE_TEAM_ID: &str = "5R5846NBPW";
 
 /// What part of an application's identity an entry names.
 #[derive(Debug, Clone, Copy)]
@@ -60,11 +94,23 @@ enum Identity {
     Executable(&'static str),
 }
 
-/// One application no agent may use, and the platform its identity comes
-/// from.
+/// Who may use an application an entry names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// No agent: the released Alfonso app, and iPhone Mirroring.
+    Always,
+    /// A development build of the Alfonso desktop app, which only the agents
+    /// in [`DEV_BUILD_DRIVERS`] may use, and only while it is not signed as
+    /// the released app.
+    DevelopmentBuild,
+}
+
+/// One application identity the operator-app rules cover, and the platform
+/// its identity comes from.
 #[derive(Debug, Clone, Copy)]
 struct OperatorApp {
     identity: Identity,
+    class: Class,
     /// Where this identity is used. Documentation only: every entry is
     /// checked on every platform. On macOS a target names a bundle identity
     /// and on Windows an executable file name, and an identity that belongs
@@ -74,8 +120,9 @@ struct OperatorApp {
     platform: &'static str,
 }
 
-/// The applications every `computer_use` action refuses. All comparisons
-/// ignore ASCII case: bundle identifiers are case-insensitive to macOS's
+/// The applications every `computer_use` action refuses, apart from the
+/// development builds [`DEV_BUILD_DRIVERS`] may use. All comparisons ignore
+/// ASCII case: bundle identifiers are case-insensitive to macOS's
 /// LaunchServices and file names are case-insensitive on Windows, and a
 /// lower-case spelling of one of these names is still that app on Linux.
 ///
@@ -86,35 +133,42 @@ const OPERATOR_APPS: &[OperatorApp] = &[
     // The Alfonso desktop app: today's development build.
     OperatorApp {
         identity: Identity::BundleIdentity("dev.cortexkit.alfonso"),
+        class: Class::DevelopmentBuild,
         platform: "macos",
     },
     // The Alfonso desktop app: the recommended release identifier.
     OperatorApp {
         identity: Identity::BundleIdentity("io.cortexkit.alfonso.desktop"),
+        class: Class::Always,
         platform: "macos",
     },
     // iPhone Mirroring. Through it an agent could press the buttons of the
     // Alfonso app on the person's phone.
     OperatorApp {
         identity: Identity::BundleIdentity("com.apple.ScreenContinuity"),
+        class: Class::Always,
         platform: "macos",
     },
-    // Today's executable, inside Alfonso.app.
+    // The development build's executable, inside Alfonso.app.
     OperatorApp {
         identity: Identity::Executable("alfonso-desktop"),
+        class: Class::DevelopmentBuild,
         platform: "macos",
     },
     // The recommended release executable.
     OperatorApp {
         identity: Identity::Executable("Alfonso"),
+        class: Class::Always,
         platform: "macos",
     },
     OperatorApp {
         identity: Identity::Executable("Alfonso.exe"),
+        class: Class::Always,
         platform: "windows",
     },
     OperatorApp {
         identity: Identity::Executable("alfonso"),
+        class: Class::Always,
         platform: "linux",
     },
 ];
@@ -126,14 +180,16 @@ const OPERATOR_APPS: &[OperatorApp] = &[
 #[allow(dead_code)]
 pub(crate) const OPERATOR_WEB_ORIGINS: &[&str] = &[];
 
-/// Whether `identity`, a bundle identity or an executable name or path, is
-/// one of [`OPERATOR_APPS`]. Both kinds are matched against every identity
-/// string, since a target on Windows names an executable where a target on
-/// macOS names a bundle identity.
-pub(crate) fn identity_blocked(identity: &str) -> bool {
+/// Which class of [`OPERATOR_APPS`] `identity`, a bundle identity or an
+/// executable name or path, belongs to, or `None` when it is none of them.
+/// An identity that matches entries of both classes is [`Class::Always`].
+/// Both kinds are matched against every identity string, since a target on
+/// Windows names an executable where a target on macOS names a bundle
+/// identity.
+fn identity_class(identity: &str) -> Option<Class> {
     let identity = identity.trim();
     let file_name = identity.rsplit(['/', '\\']).next().unwrap_or(identity);
-    OPERATOR_APPS.iter().any(|app| match app.identity {
+    let mut matched = OPERATOR_APPS.iter().filter(|app| match app.identity {
         Identity::BundleIdentity(blocked) => {
             identity.eq_ignore_ascii_case(blocked)
                 || (identity
@@ -142,7 +198,19 @@ pub(crate) fn identity_blocked(identity: &str) -> bool {
                     && identity.as_bytes().get(blocked.len()) == Some(&b'.'))
         }
         Identity::Executable(blocked) => file_name.eq_ignore_ascii_case(blocked),
+    });
+    let first = matched.next()?.class;
+    Some(if matched.any(|app| app.class == Class::Always) {
+        Class::Always
+    } else {
+        first
     })
+}
+
+/// Whether `identity`, a bundle identity or an executable name or path, is
+/// one of [`OPERATOR_APPS`], development builds included.
+pub(crate) fn identity_blocked(identity: &str) -> bool {
+    identity_class(identity).is_some()
 }
 
 /// Whether a title names Alfonso: "Alfonso" is one of its words, ignoring
@@ -151,6 +219,70 @@ pub(crate) fn title_names_operator_app(title: &str) -> bool {
     title
         .split(|character: char| !character.is_alphanumeric())
         .any(|word| word.eq_ignore_ascii_case("alfonso"))
+}
+
+/// Whether `caller` is one of [`DEV_BUILD_DRIVERS`].
+///
+/// Only an admitted head counts: the route's accepted bind named the agent,
+/// the daemon attested it, and the grant holder resolved from it is that
+/// agent's head. A codemode run its head admitted counts as that head, since
+/// it acts as the head. A worker does not: its holder is a worker even when
+/// it works for a driver, and attribution to an agent is not that agent's
+/// authority.
+pub(crate) fn drives_development_builds(caller: &GrantCaller) -> bool {
+    caller.durable_identity_attested
+        && matches!(
+            &caller.holder,
+            Some(GrantHolder::Head { agent_id })
+                if *agent_id == caller.agent_project_id
+                    && DEV_BUILD_DRIVERS.contains(&agent_id.as_str())
+        )
+}
+
+/// Whether a resolved process carries a signature that can be read and is
+/// not the released app's, read through the same code-signing reader the
+/// grant path checks app grants against.
+///
+/// Any sign of the release team refuses: the Team ID the signature claims,
+/// the team its designated requirement names, or satisfying the release
+/// signing requirement. An unsigned process, or one whose signature cannot
+/// be read, is refused too, since it might be the released app.
+fn signed_as_development_build(management: &ManagementPlane, grant: &ProcessGrant) -> bool {
+    let GrantNeed::App { code, .. } =
+        management.app_need(&grant.bundle_identity, grant, String::new())
+    else {
+        return false;
+    };
+    let Ok(identity) = code.identity() else {
+        return false;
+    };
+    let release = RELEASE_TEAM_ID.to_ascii_lowercase();
+    if identity
+        .team_id
+        .as_deref()
+        .is_some_and(|team| team.trim().eq_ignore_ascii_case(RELEASE_TEAM_ID))
+        || identity
+            .designated_requirement
+            .to_ascii_lowercase()
+            .contains(&release)
+    {
+        return false;
+    }
+    let release_requirement =
+        format!("anchor apple generic and certificate leaf[subject.OU] = \"{RELEASE_TEAM_ID}\"");
+    matches!(code.satisfies(&release_requirement), Ok(false))
+}
+
+/// What [`OPERATOR_APPS`] says about one sighted application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// None of them: the call goes on.
+    Ordinary,
+    /// Refused for every agent.
+    Blocked,
+    /// A development build, fully identified; whether it is refused depends
+    /// on the caller and on the process's signature.
+    DevelopmentBuild,
 }
 
 /// What a lookup learned about one application: its bundle identity and
@@ -163,25 +295,70 @@ struct Sighting {
 }
 
 impl Sighting {
-    fn blocked(&self) -> bool {
-        if self
-            .bundle_identity
-            .as_deref()
-            .is_some_and(identity_blocked)
-            || self.executable.as_deref().is_some_and(identity_blocked)
-        {
-            return true;
+    fn verdict(&self) -> Verdict {
+        let classes: Vec<Class> = [&self.bundle_identity, &self.executable]
+            .into_iter()
+            .flatten()
+            .filter_map(|identity| identity_class(identity))
+            .collect();
+        if classes.contains(&Class::Always) {
+            return Verdict::Blocked;
         }
-        (self.bundle_identity.is_none() || self.executable.is_none())
+        let partly_unreadable = self.bundle_identity.is_none() || self.executable.is_none();
+        if partly_unreadable
             && self
                 .titles
                 .iter()
                 .any(|title| title_names_operator_app(title))
+        {
+            return Verdict::Blocked;
+        }
+        if classes.contains(&Class::DevelopmentBuild) {
+            // A development build counts only when nothing about it is
+            // unknown: part of it unread could be the released app.
+            return if partly_unreadable {
+                Verdict::Blocked
+            } else {
+                Verdict::DevelopmentBuild
+            };
+        }
+        Verdict::Ordinary
+    }
+
+    /// Whether the application is refused to an agent that may not drive
+    /// development builds.
+    fn blocked(&self) -> bool {
+        self.verdict() != Verdict::Ordinary
     }
 }
 
 fn readable(identity: &str) -> Option<String> {
     Some(identity.trim().to_string()).filter(|identity| !identity.is_empty())
+}
+
+/// Whether `caller` may use the resolved process as a development build:
+/// the caller is one of [`DEV_BUILD_DRIVERS`], the process's bundle identity
+/// and executable are both read and name a development build and nothing
+/// refused to every agent, and its signature is not the released app's.
+///
+/// The grant path asks this of the process it is about to admit, so the
+/// process acted on is the one checked, whatever was checked when the call
+/// arrived.
+pub(super) fn admits_development_build(
+    management: &ManagementPlane,
+    caller: &GrantCaller,
+    executable: &ExecutableReader,
+    grant: &ProcessGrant,
+) -> bool {
+    drives_development_builds(caller)
+        && Sighting {
+            bundle_identity: readable(&grant.bundle_identity),
+            executable: executable(grant),
+            titles: Vec::new(),
+        }
+        .verdict()
+            == Verdict::DevelopmentBuild
+        && signed_as_development_build(management, grant)
 }
 
 /// The refusal every action answers for an operator app.
@@ -241,9 +418,22 @@ pub(super) struct Lookup {
     pub(super) management: Arc<ManagementPlane>,
     pub(super) source: Arc<dyn AppStateSource>,
     pub(super) executable: ExecutableReader,
+    /// Whether the caller is one of [`DEV_BUILD_DRIVERS`].
+    pub(super) drives_development_builds: bool,
 }
 
 impl Lookup {
+    /// Whether an identity the request named is refused before it is
+    /// resolved: anything in [`OPERATOR_APPS`], except that a development
+    /// build named by a driver is resolved and checked as a process.
+    fn identity_refused(&self, identity: &str) -> bool {
+        match identity_class(identity) {
+            Some(Class::Always) => true,
+            Some(Class::DevelopmentBuild) => !self.drives_development_builds,
+            None => false,
+        }
+    }
+
     /// Whether a resolved process is an operator app. `titles` are names the
     /// caller already knows it by; the application's running name and its
     /// focused window's title are added only when its identity is partly
@@ -254,15 +444,21 @@ impl Lookup {
             executable: (self.executable)(grant),
             titles: Vec::new(),
         };
-        if sighting.bundle_identity.is_some() && sighting.executable.is_some() {
-            return sighting.blocked();
+        if sighting.bundle_identity.is_none() || sighting.executable.is_none() {
+            titles.push(self.management.application_name(grant));
+            if let Ok(Some(window)) = self.source.focused_window(grant) {
+                titles.extend(window.title);
+            }
+            sighting.titles = titles;
         }
-        titles.push(self.management.application_name(grant));
-        if let Ok(Some(window)) = self.source.focused_window(grant) {
-            titles.extend(window.title);
+        match sighting.verdict() {
+            Verdict::Ordinary => false,
+            Verdict::Blocked => true,
+            Verdict::DevelopmentBuild => {
+                !(self.drives_development_builds
+                    && signed_as_development_build(&self.management, grant))
+            }
         }
-        sighting.titles = titles;
-        sighting.blocked()
     }
 
     /// Whether a target given by name or app identity is an operator app.
@@ -275,7 +471,7 @@ impl Lookup {
     /// several, is left to the action, which refuses it as not running or
     /// ambiguous.
     pub(super) fn named_blocked(&self, target: &str) -> bool {
-        if identity_blocked(target) {
+        if self.identity_refused(target) {
             return true;
         }
         let mut titles = vec![target.to_string()];
@@ -297,7 +493,7 @@ impl Lookup {
             );
             matched.bundle_identity
         };
-        if identity_blocked(&bundle_identity) {
+        if self.identity_refused(&bundle_identity) {
             return true;
         }
         match self.management.resolve_process(&bundle_identity) {
@@ -338,12 +534,43 @@ where
     S: JournalStorage + Send + 'static,
     D: PlatformDriver + 'static,
 {
-    pub(super) fn operator_lookup(&self, management: &Arc<ManagementPlane>) -> Lookup {
+    pub(super) fn operator_lookup(
+        &self,
+        management: &Arc<ManagementPlane>,
+        caller: &GrantCaller,
+    ) -> Lookup {
         Lookup {
             management: Arc::clone(management),
             source: Arc::clone(&self.app_state_source),
             executable: Arc::clone(&self.process_executable),
+            drives_development_builds: drives_development_builds(caller),
         }
+    }
+
+    /// Resolve an application and hold its app grant, as
+    /// [`ManagementPlane::admit_app`] does, except that a development build
+    /// the caller may drive is admitted at once: as if an "always" app grant
+    /// were held, so nobody is asked and nothing is stored.
+    pub(super) async fn admit_app(
+        &self,
+        management: &ManagementPlane,
+        bundle_identity: &str,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
+        if drives_development_builds(&consent.caller) {
+            if let Ok(grant) = management.resolve_process(bundle_identity) {
+                if admits_development_build(
+                    management,
+                    &consent.caller,
+                    &self.process_executable,
+                    &grant,
+                ) {
+                    return Ok((grant, GrantAdmission::default()));
+                }
+            }
+        }
+        Box::pin(management.admit_app(bundle_identity, consent, cancel)).await
     }
 
     /// The refusal for a call aimed at an operator app, or `None` when the
@@ -435,7 +662,7 @@ where
         if frontmost {
             frontmost = super::takeover::parse_request(capability.capability(), arguments).is_ok();
         }
-        let lookup = self.operator_lookup(context.management);
+        let lookup = self.operator_lookup(context.management, &context.consent.caller);
         let claimed = tokio::task::spawn_blocking(move || {
             if let Some(target) = named.iter().find(|target| lookup.named_blocked(target)) {
                 return Some(target.clone());
@@ -468,20 +695,40 @@ where
     }
 }
 
-/// Whether `list_apps` leaves a running application out. Its executable is
-/// read by pid; the entry carries no start time to compare.
-pub(super) fn running_app_blocked(app: &RunningApp, executable: &ExecutableReader) -> bool {
-    let grant = ProcessGrant {
-        pid: app.pid,
-        bundle_identity: app.bundle_identity.clone(),
-        process_generation_evidence: String::new(),
-    };
-    Sighting {
-        bundle_identity: readable(&app.bundle_identity),
-        executable: executable(&grant),
-        titles: vec![app.name.clone()],
+impl Lookup {
+    /// Whether `list_apps` leaves a running application out. Its executable
+    /// is read by pid; the entry carries no start time to compare.
+    ///
+    /// A development build is listed only to a caller that may drive it, and
+    /// only once its process is identified by its start time and passes the
+    /// same check an action on it would.
+    pub(super) fn running_app_hidden(&self, app: &RunningApp) -> bool {
+        let entry = ProcessGrant {
+            pid: app.pid,
+            bundle_identity: app.bundle_identity.clone(),
+            process_generation_evidence: String::new(),
+        };
+        let verdict = Sighting {
+            bundle_identity: readable(&app.bundle_identity),
+            executable: (self.executable)(&entry),
+            titles: vec![app.name.clone()],
+        }
+        .verdict();
+        match verdict {
+            Verdict::Ordinary => false,
+            Verdict::Blocked => true,
+            Verdict::DevelopmentBuild => {
+                !(self.drives_development_builds
+                    && self
+                        .management
+                        .process_for_pid(app.pid)
+                        .filter(|process| process.bundle_identity == app.bundle_identity)
+                        .is_some_and(|process| {
+                            !self.process_blocked(&process, vec![app.name.clone()])
+                        }))
+            }
+        }
     }
-    .blocked()
 }
 
 /// Whether an installed application is an operator app. No executable is
