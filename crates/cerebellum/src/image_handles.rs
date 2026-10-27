@@ -199,10 +199,10 @@ fn reply_image(reply: &Value) -> Option<Image<'_>> {
     Some(Image { mime, data_b64 })
 }
 
-/// The in-memory handle store. One per module process.
+/// The in-memory handle store. One per module process, built by `Planes`.
 ///
-/// Public because the wire fixtures under `tests/` capture real frames and
-/// need to see what the store holds; nothing outside this module builds one.
+/// Public so the wire fixtures under `tests/` can look at what the store holds
+/// and resolve against it; production reaches it through `Planes`.
 #[derive(Default)]
 pub struct ImageHandles {
     state: Mutex<Handles>,

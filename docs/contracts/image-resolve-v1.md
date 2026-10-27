@@ -106,12 +106,13 @@ carrying exactly this body:
 `session`. The goldens pin the exact bytes.)
 
 Unknown handles, expired handles and handles captured under a scope outside the
-caller's union all get this one body, byte for byte, and the store does the same
-work for each: the shape of the handle is checked before the single map probe,
-and every scope in the union is compared without an early exit. A caller
-therefore learns nothing about whether a handle exists. `detail.field` is
-always `handle`; there is no reason code, because a reason code would say which
-of the three happened.
+caller's union all get this one body, byte for byte. The store makes the shape
+of the handle cost the same as one map probe, and compares every scope in the
+union without an early exit, so the work it does does not announce which case it
+is in either. `detail.field` is always `handle`; there is no reason code,
+because a reason code would say which of the three happened. A caller with the
+reply bytes cannot tell the three apart, and a handle that does not resolve
+tells it nothing about whether one does.
 
 A malformed request is refused the same way `private_content.query` refuses one:
 

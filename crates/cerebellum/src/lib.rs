@@ -6214,8 +6214,9 @@ fn wall_clock_ms() -> u64 {
 /// resolver authorizes by scope, so nothing could ever fetch those bytes. A
 /// reply whose image is missing or unreadable is left as it is.
 impl Planes {
-    /// The screenshot handle store. Public so the wire fixtures can mint a
-    /// handle without a screen capture; production reaches it through
+    /// The screenshot handle store, exposed so the wire fixtures can inspect it
+    /// and resolve against it. Fixtures mint through
+    /// `mint_image_handle_for_test`; production mints through
     /// `mint_image_handle`.
     pub fn image_handle_store(&self) -> &image_handles::ImageHandles {
         &self.image_handles

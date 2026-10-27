@@ -123,8 +123,9 @@ fn a_scope_keeps_its_eight_newest_handles() {
 #[test]
 fn the_oldest_handles_go_first_when_the_bytes_cap_is_reached() {
     let store = ImageHandles::default();
-    // Each handle holds half the total across the scope caps, so a few put the
-    // store over the byte cap while the scopes stay under theirs.
+    // Each scope gets one handle, well under its eight-handle cap, and each
+    // handle is a few megabytes: several of them together must cross the
+    // store's shared byte cap while no scope's own cap is reached.
     let chunk = TOTAL_BYTES_LIMIT / (PER_SCOPE_LIMIT - 2);
     let mut handles = Vec::new();
     for index in 0..8 {
