@@ -28,11 +28,8 @@ tree_before_build="$(git status --porcelain)"
 # load 12-21 for a working day. Its per-test bound did not help, because the
 # bound sat on one runner's lanes and the wedged children ran under the other.
 #
-# The lock is a directory because mkdir is atomic: two gates racing cannot both
-# believe they hold it. A holder that died without cleaning up leaves a pid
-# nobody can signal, so that case is reclaimed rather than blocking a machine
-# on a corpse -- but a LIVE holder is refused by name, because waiting silently
-# is how the eight-hour version began.
+# A kernel-held advisory lock serializes gates without trusting a pid that may
+# have been reused. A live holder is refused rather than waited on silently.
 # The lock lives in the target directory the gate builds into, because that
 # target directory and its test leases are what two runs would fight over: a
 # worktree, or a CARGO_TARGET_DIR of its own, may hold its own gate. It is not
@@ -44,29 +41,7 @@ gate_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 mkdir -p "$gate_target_dir"
 GATE_LOCK="$gate_target_dir/rust-test-gate.lock"
 
-acquire_gate_lock() {
-  if mkdir "$GATE_LOCK" 2>/dev/null; then
-    echo $$ > "$GATE_LOCK/holder"
-    return 0
-  fi
-  local holder
-  holder="$(cat "$GATE_LOCK/holder" 2>/dev/null || true)"
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-    echo "A gate is already running on this checkout (pid $holder)." >&2
-    echo "Two gates on one checkout share a target directory and the same" >&2
-    echo "single-writer test leases, so the second one can block indefinitely" >&2
-    echo "rather than finish. Wait for that run, or stop it deliberately." >&2
-    echo "Nothing has been verified." >&2
-    exit 2
-  fi
-  echo "Reclaiming a gate lock left by pid ${holder:-unknown}, which is gone." >&2
-  rm -rf "$GATE_LOCK"
-  mkdir "$GATE_LOCK" || {
-    echo "Could not take the gate lock after reclaiming it." >&2
-    exit 2
-  }
-  echo $$ > "$GATE_LOCK/holder"
-}
+source "$repo_root/scripts/lib/gate-lock.sh"
 
 parallel_phase_dir=
 parallel_phase_labels=()
@@ -74,11 +49,10 @@ parallel_phase_pids=()
 parallel_phase_logs=()
 
 release_gate_lock() {
-  [ -n "${parallel_phase_dir:-}" ] && rm -rf "$parallel_phase_dir"
-  [ -n "${GATE_LOCK:-}" ] && rm -rf "$GATE_LOCK"
+  if [ -n "${parallel_phase_dir:-}" ]; then rm -rf "$parallel_phase_dir"; fi
 }
 
-acquire_gate_lock
+acquire_gate_lock "$GATE_LOCK"
 trap release_gate_lock EXIT INT TERM HUP QUIT
 parallel_phase_dir="$gate_target_dir/rust-test-gate-phases.$$"
 mkdir "$parallel_phase_dir"

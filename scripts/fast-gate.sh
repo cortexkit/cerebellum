@@ -321,13 +321,8 @@ fi
 gate_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 mkdir -p "$gate_target_dir"
 gate_lock="$gate_target_dir/rust-test-gate.lock"
-if ! mkdir "$gate_lock" 2>/dev/null; then
-  holder="$(cat "$gate_lock/holder" 2>/dev/null || true)"
-  echo "fast gate: another gate owns the shared Cargo target lock${holder:+ (pid $holder)}" >&2
-  echo "nothing has been verified" >&2
-  exit 2
-fi
-printf '%s\n' "$$" > "$gate_lock/holder"
+source "$repo_root/scripts/lib/gate-lock.sh"
+acquire_gate_lock "$gate_lock"
 static_dir="$(mktemp -d "$gate_target_dir/fast-gate.XXXXXX")"
 static_pids=()
 static_logs=()
@@ -345,7 +340,7 @@ release_lock() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  rm -rf "$static_dir" "$gate_lock"
+  rm -rf "$static_dir"
 }
 trap release_lock EXIT
 trap 'exit 130' INT

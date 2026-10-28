@@ -3,6 +3,7 @@
 set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
+source "$repo_root/scripts/lib/gate-lock.sh"
 scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/fast-gate-test.XXXXXX")"
@@ -30,6 +31,65 @@ setup_phases() {
   static_logs=()
   phase_failed=0
   not_verified=()
+}
+
+reused_pid_lock() {
+  local lock="$scratch/reused-pid.lock"
+  mkdir "$lock" || return 1
+  printf '%s\n' "$$" > "$lock/holder"
+  printf '%s\n' 'unrelated-process-start' > "$lock/start-time"
+  acquire_gate_lock "$lock" || return 1
+  [ "$(cat "$lock/holder")" = "$$" ]
+}
+
+live_pid_lock() {
+  local lock="$scratch/live-pid.lock" status
+  acquire_gate_lock "$lock" || return 1
+  bash -c 'source "$1"; acquire_gate_lock "$2"' _ \
+    "$repo_root/scripts/lib/gate-lock.sh" "$lock" 9>&-
+  status=$?
+  [ "$status" -eq 2 ] &&
+    [ "$(cat "$lock/holder")" = "$$" ]
+}
+
+concurrent_gate_lock() {
+  local lock="$scratch/concurrent.lock" holder_pid ready status
+  mkfifo "$scratch/lock-ready" "$scratch/lock-hold" || return 1
+  bash -c 'source "$1"; acquire_gate_lock "$2" || { echo failed >"$3"; exit 1; }; echo ready >"$3"; read -r line <"$4"' _ \
+    "$repo_root/scripts/lib/gate-lock.sh" "$lock" "$scratch/lock-ready" "$scratch/lock-hold" &
+  holder_pid=$!
+  trap "kill -KILL $holder_pid 2>/dev/null; wait $holder_pid 2>/dev/null" EXIT
+  read -r ready <"$scratch/lock-ready"
+  [ "$ready" = ready ] || return 1
+  acquire_gate_lock "$lock"
+  status=$?
+  [ "$status" -eq 2 ] || return 1
+  kill -KILL "$holder_pid" || return 1
+  wait "$holder_pid" 2>/dev/null || true
+  trap - EXIT
+  # No cleanup ran in the killed gate, and its pid record remains on disk.
+  [ "$(cat "$lock/holder")" = "$holder_pid" ] || return 1
+  acquire_gate_lock "$lock"
+}
+
+inherited_gate_lock() {
+  local lock="$scratch/inherited.lock" child_pid ready status
+  acquire_gate_lock "$lock" || return 1
+  mkfifo "$scratch/child-ready" "$scratch/child-hold" || return 1
+  bash -c 'echo ready >"$1"; read -r line <"$2"' _ \
+    "$scratch/child-ready" "$scratch/child-hold" &
+  child_pid=$!
+  trap "kill -KILL $child_pid 2>/dev/null; wait $child_pid 2>/dev/null" EXIT
+  read -r ready <"$scratch/child-ready"
+  [ "$ready" = ready ] || return 1
+  exec 9>&-
+  acquire_gate_lock "$lock"
+  status=$?
+  [ "$status" -eq 2 ] || return 1
+  kill -KILL "$child_pid" || return 1
+  wait "$child_pid" 2>/dev/null || true
+  trap - EXIT
+  acquire_gate_lock "$lock"
 }
 
 failing_concurrent_phase() {
@@ -192,6 +252,7 @@ mac_clippy_pipeline() {
     "$fixture/crates/cerebellum/src" "$fixture/crates/cerebellum-linux/src"
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
+    "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
@@ -257,6 +318,7 @@ mac_vm_pipeline() {
     "$fixture/crates/cerebellum-macos/src" "$fixture/crates/cerebellum-macos/tests"
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
+    "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
@@ -335,6 +397,10 @@ combined_missing() {
   grep -Fxq 'Linux fingerprint: <missing>' "$scratch/missing"
 }
 
+check 'a stale lock naming a reused live pid is not refused' reused_pid_lock
+check 'a live holder keeps its advisory lock after the helper exits' live_pid_lock
+check 'a concurrent gate is refused until the holder is killed' concurrent_gate_lock
+check 'an inherited descriptor keeps the target locked until the child exits' inherited_gate_lock
 check 'a failing concurrent phase still fails the gate' failing_concurrent_phase
 check 'source checks overlap serial work with whole, ordered logs' concurrent_order
 check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_process_table
