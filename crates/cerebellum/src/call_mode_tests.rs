@@ -506,16 +506,20 @@ async fn codemode_app_consent_detaches_and_standing_grants_short_circuit() {
                     .await
                     .unwrap_err();
                 assert!(matches!(refusal, ConsentRefusal::Pending { .. }));
-                send_tool_response(
-                    &tx,
-                    PROTOCOL_VERSION,
-                    9,
-                    3,
-                    3,
-                    refusal.reply(Some("com.example.Test")),
-                )
-                .await
-                .unwrap();
+                tool_result::RESULT_BIND
+                    .scope(
+                        Some(("computer_use".into(), facts.clone())),
+                        send_tool_response(
+                            &tx,
+                            PROTOCOL_VERSION,
+                            9,
+                            3,
+                            3,
+                            refusal.reply(Some("com.example.Test")),
+                        ),
+                    )
+                    .await
+                    .unwrap();
                 let reply: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
                 assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
                 assert_eq!(

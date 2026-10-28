@@ -8696,7 +8696,6 @@ fn tool_response_frame(
     } else {
         codemode::unsupported(body)
     };
-    let force_content = body["outcome"] == "held_unsupported";
     let tool_result_v1 = tool_result::RESULT_BIND
         .try_with(|binding| {
             binding.as_ref().is_some_and(|(tool, bind)| {
@@ -8709,7 +8708,7 @@ fn tool_response_frame(
             })
         })
         .unwrap_or(false);
-    let body = if tool_result_v1 || force_content {
+    let body = if tool_result_v1 {
         tool_result::encode_with_held(body, held)?
     } else {
         if codemode::active() {
