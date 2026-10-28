@@ -753,6 +753,20 @@ impl ConsentDesk {
         lock(&self.registry).get(elicitation_id).cloned()
     }
 
+    /// Answered cards without an execution outcome still need their owning
+    /// scope watched, even after the module restarts with no browser open.
+    pub(crate) fn awaiting_execution_sessions(&self) -> BTreeSet<SessionKey> {
+        lock(&self.registry)
+            .values()
+            .filter(|card| {
+                card.lifecycle.answered
+                    && !card.lifecycle.ended
+                    && card.lifecycle.final_report.is_none()
+            })
+            .map(|card| card.session.clone())
+            .collect()
+    }
+
     pub(crate) fn retain_user_browser_grant(
         &self,
         id: &str,
