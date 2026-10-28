@@ -122,17 +122,29 @@ async fn undeclared_codemode_route_keeps_held_unsupported() {
         &consent,
     );
     bind_head(&planes).await;
-    exchange(
-        &planes,
-        0,
-        2,
-        serde_json::to_value(run_bind(run_stamp())).unwrap(),
-    )
-    .await;
+    let mut bind = run_bind(run_stamp());
+    if let ModuleControlRequest::RouteBind {
+        consumer_capabilities,
+        ..
+    } = &mut bind
+    {
+        *consumer_capabilities = None;
+    }
+    exchange(&planes, 0, 2, serde_json::to_value(bind).unwrap()).await;
     let reply = decode(exchange(&planes, 9, 3, grant_request(Some("old-key"))).await);
-    assert_eq!(reply["errorCode"], "held_unsupported", "{reply}");
-    assert_eq!(reply["isError"], true);
-    assert!(reply.get("held").is_none());
+    assert_eq!(
+        reply,
+        json!({
+            "outcome": "held_unsupported",
+            "detail": {
+                "action": "open_grant",
+                "ask_id": "old-carrier",
+                "origin": "https://example.com",
+                "step": "consent"
+            },
+            "remedy": "this codemode step needs a person; the carrier cannot suspend until held-reply is supported"
+        })
+    );
     assert!(!planes.calls.has_pending_consents());
 }
 
@@ -233,21 +245,19 @@ async fn held_gate_uses_bind_declarations_not_call_mode_and_requires_tool_opt_in
 /// for the consent question in `the_four_held_reply_declaration_sets_get_exact_bodies`.
 const HELD_ENVELOPE: &str = r#"{"content":[{"type":"text","text":"Waiting for the person to answer a consent question (ask_id gate)."}],"structuredContent":{"ask_id":"gate","kind":"website_access_in_advance","origin":"https://example.com","outcome":"consent_pending"},"held":{"reason":"consent","detail":{"ask_id":"gate","kind":"website_access_in_advance","origin":"https://example.com"}}}"#;
 
-/// The body every other route gets for that consent question: a
-/// `tool-result/v1` refusal with no `held` marker.
+/// The refusal for a route declaring `tool-result/v1` without `held-reply/v1`.
 const HELD_UNSUPPORTED: &str = r#"{"content":[{"type":"text","text":"Held unsupported.\nThis codemode step needs a person; the carrier cannot suspend until held-reply is supported."}],"structuredContent":{"detail":{"ask_id":"gate","origin":"https://example.com","step":"consent"},"outcome":"held_unsupported","remedy":"this codemode step needs a person; the carrier cannot suspend until held-reply is supported"},"isError":true,"errorCode":"held_unsupported"}"#;
+
+/// Routes without a `tool-result/v1` reader get the plain `content/v1` refusal.
+const HELD_UNSUPPORTED_CONTENT: &str = r#"{"detail":{"ask_id":"gate","origin":"https://example.com","step":"consent"},"outcome":"held_unsupported","remedy":"this codemode step needs a person; the carrier cannot suspend until held-reply is supported"}"#;
 
 /// CONTRACT §4.1 pairs `held-reply/v1` with `tool-result/v1`: a held envelope
 /// goes only to a route that declared both. Each declaration set gets one keyed
 /// consent question on a codemode run route, and each body is pinned byte for
 /// byte.
 ///
-/// The routes declaring only `held-reply/v1`, or neither name, do not get the
-/// legacy body §4.1 asks for. On a codemode run route, a question no carrier can
-/// hold becomes a `held_unsupported` refusal, and `tool_response_frame` sends
-/// that refusal as a `tool-result/v1` body on every route (`force_content`).
-/// This deviation from §4.1 is deliberate in this build; the assertions below
-/// pin it so that changing it is a visible decision.
+/// A route without `tool-result/v1` gets the plain `content/v1` refusal even
+/// when it declares `held-reply/v1`; the held marker needs both declarations.
 #[tokio::test]
 async fn the_four_held_reply_declaration_sets_get_exact_bodies() {
     let facts = bound_run().await.routes.get(9, 3).unwrap();
@@ -268,9 +278,9 @@ async fn the_four_held_reply_declaration_sets_get_exact_bodies() {
         (
             "held-reply/v1 only",
             vec![HELD_REPLY_V1.to_string()],
-            HELD_UNSUPPORTED,
+            HELD_UNSUPPORTED_CONTENT,
         ),
-        ("neither", vec![], HELD_UNSUPPORTED),
+        ("neither", vec![], HELD_UNSUPPORTED_CONTENT),
     ] {
         let frame = projected_frame(
             facts.clone(),
