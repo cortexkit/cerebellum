@@ -60,7 +60,12 @@ export class NativeBridge {
         } else throw new Refusal("invalid_frame");
       } catch { this.drop(port); }
     });
-    port.onDisconnect.addListener(() => { clearTimeout(helloTimer); this.drop(port, false); });
+    port.onDisconnect.addListener(() => {
+      // Chrome reports an unchecked error unless lastError is read in this callback.
+      void this.chrome.runtime.lastError;
+      clearTimeout(helloTimer);
+      this.drop(port, false);
+    });
   }
 
   drop(port = this.port, disconnect = true) {

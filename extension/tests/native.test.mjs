@@ -163,6 +163,26 @@ test("native reconnect is a new epoch and never replays an old dispatch", async 
   assert.equal(f.agent.baselines.size, 0);
 });
 
+test("native disconnect reads runtime.lastError before releasing the connection", async t => {
+  const f = await native(t);
+  let reads = 0;
+  let inDisconnect = false;
+  Object.defineProperty(f.chrome.runtime, "lastError", { get() {
+    assert.equal(inDisconnect, true);
+    reads++;
+    return { message: "Native host has exited." };
+  } });
+  inDisconnect = true;
+  f.port.onDisconnect.emit();
+  inDisconnect = false;
+  assert.equal(reads, 1);
+  assert.equal(f.bridge.port, null);
+  assert.equal(f.bridge.epoch, null);
+  await f.bridge.disconnecting;
+  assert.equal(f.agent.connectionEpoch, null);
+  assert.equal(f.chrome.calls.some(call => call[0] === "alarm" && call[1] === "agent-reconnect"), true);
+});
+
 test("duplicate invocation and duplicate Dispatch are never executed twice", async t => {
   const f = await native(t);
   await f.invoke(1, f.cdp([read]));

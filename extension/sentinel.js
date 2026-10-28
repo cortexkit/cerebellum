@@ -1,7 +1,12 @@
 // This isolated-world observer stays alive between debugger attachments. It never
 // reads page text, field values or URLs; only trusted interaction times.
 (() => {
-  if (globalThis.__ckAgentSentinel) return;
+  const previous = globalThis.__ckAgentSentinel;
+  try {
+    if (typeof previous?.isAlive === "function" && previous.isAlive()) return;
+  } catch {}
+  // Keep the original bindings so a new injection cannot make an orphan look live.
+  const runtime = chrome.runtime;
   // randomUUID is secure-context-only; getRandomValues also works on HTTP.
   // Keep a cryptographically random identity even on an insecure document.
   const documentId = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
@@ -11,11 +16,27 @@
   const interactions = [];
   const now = () => performance.timeOrigin + performance.now();
   const observation = () => ({ documentId, sequence, enabled, observedAt: now(), interactions: interactions.slice() });
+  const teardown = () => {
+    enabled = false;
+    for (const type of types) removeEventListener(type, observe, true);
+    // Invalidated bindings can throw even while removing a listener.
+    try { runtime?.onMessage.removeListener(receive); } catch {}
+    if (globalThis.__ckAgentSentinel === state) delete globalThis.__ckAgentSentinel;
+  };
+  const isAlive = () => {
+    if (!enabled) return false;
+    try { if (runtime?.id) return true; } catch {}
+    teardown();
+    return false;
+  };
   const notify = () => {
-    chrome.runtime.sendMessage({ kind: "agent-interaction", ...observation() }).catch(() => {});
+    if (!isAlive()) return;
+    try {
+      runtime.sendMessage({ kind: "agent-interaction", ...observation() }).catch(() => {});
+    } catch { teardown(); }
   };
   const observe = (event) => {
-    if (!enabled || !event.isTrusted) return;
+    if (!event.isTrusted || !isAlive()) return;
     sequence += 1;
     // Event time, rather than message delivery time, identifies input within a
     // debugger attachment. Keep bounded history so sampling can catch delayed
@@ -29,16 +50,15 @@
   const types = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "keydown", "keyup", "beforeinput", "input", "wheel", "touchstart", "touchend"];
   for (const type of types) addEventListener(type, observe, { capture: true, passive: true });
   const receive = (message, sender, reply) => {
-    if (sender.id !== chrome.runtime.id || !message || message.kind !== "agent-sentinel") return;
-    if (message.operation === "disable") {
-      enabled = false;
-      for (const type of types) removeEventListener(type, observe, true);
-      chrome.runtime.onMessage.removeListener(receive);
-      delete globalThis.__ckAgentSentinel;
-    }
+    if (!isAlive() || sender.id !== runtime.id || !message || message.kind !== "agent-sentinel") return;
+    if (message.operation === "disable") teardown();
     reply(observation());
   };
-  chrome.runtime.onMessage.addListener(receive);
-  globalThis.__ckAgentSentinel = true;
-  notify();
+  const state = { isAlive };
+  globalThis.__ckAgentSentinel = state;
+  if (!isAlive()) return;
+  try {
+    runtime.onMessage.addListener(receive);
+    notify();
+  } catch { teardown(); }
 })();

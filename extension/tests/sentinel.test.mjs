@@ -35,6 +35,110 @@ test("sentinel withdrawal removes all page input observers", () => {
   assert.equal(s.send("sample"), undefined);
 });
 
+test("sentinel tears down after sendMessage throws synchronously", () => {
+  const s = sentinel();
+  let sends = 0;
+  s.runtime.sendMessage = () => { sends++; throw new Error("Extension context invalidated."); };
+  assert.doesNotThrow(() => s.event({ type: "keydown", isTrusted: true }));
+  assert.equal(sends, 1);
+  assert.equal(s.listeners, 0);
+  assert.equal(s.messageListeners, 0);
+  assert.equal(s.marker, undefined);
+  assert.equal(s.send("sample"), undefined);
+  assert.doesNotThrow(() => s.event({ type: "click", isTrusted: true }));
+  assert.equal(sends, 1);
+});
+
+test("sentinel tears down when its runtime id disappears", () => {
+  const s = sentinel();
+  delete s.runtime.id;
+  const before = s.messages.length;
+  assert.doesNotThrow(() => s.event({ type: "click", isTrusted: true }));
+  assert.equal(s.listeners, 0);
+  assert.equal(s.messageListeners, 0);
+  assert.equal(s.marker, undefined);
+  assert.equal(s.messages.length, before);
+});
+
+test("a new sentinel replaces an orphan in the same world and observes input", () => {
+  const s = sentinel();
+  const listenerCount = s.listeners;
+  const orphan = s.runtime;
+  delete orphan.id;
+  orphan.sendMessage = () => { throw new Error("Extension context invalidated."); };
+  assert.doesNotThrow(() => s.install({ reload: true }));
+  assert.equal(orphan.onMessage.listeners.size, 0);
+  assert.equal(s.listeners, listenerCount);
+  assert.equal(s.messageListeners, 1);
+  const before = s.messages.length;
+  s.event({ type: "keydown", isTrusted: true });
+  s.event({ type: "click", isTrusted: true });
+  assert.equal(s.messages.length, before + 2);
+  assert.deepEqual(s.send("sample").interactions.map(({ kind }) => kind), ["keydown", "click"]);
+  assert.equal(s.send("sample").sequence, 2);
+});
+
+test("a new isolated world observes input while an orphan remains in the old world", () => {
+  const orphan = sentinel();
+  delete orphan.runtime.id;
+  const fresh = sentinel();
+  assert.ok(orphan.listeners > 0);
+  assert.equal(fresh.messages.length, 1);
+  assert.doesNotThrow(() => orphan.event({ type: "keydown", isTrusted: true }));
+  fresh.event({ type: "keydown", isTrusted: true });
+  fresh.event({ type: "click", isTrusted: true });
+  assert.equal(orphan.listeners, 0);
+  assert.equal(orphan.messageListeners, 0);
+  assert.equal(fresh.messageListeners, 1);
+  assert.equal(fresh.messages.length, 3);
+  assert.equal(fresh.send("sample").sequence, 2);
+});
+
+test("reinjection keeps a live sentinel without duplicating observers", () => {
+  const s = sentinel();
+  const marker = s.marker;
+  const listenerCount = s.listeners;
+  s.event({ type: "keydown", isTrusted: true });
+  s.install();
+  assert.equal(s.marker, marker);
+  assert.equal(s.listeners, listenerCount);
+  assert.equal(s.messageListeners, 1);
+  const before = s.messages.length;
+  s.event({ type: "click", isTrusted: true });
+  assert.equal(s.messages.length, before + 1);
+  assert.equal(s.send("sample").sequence, 2);
+});
+
+test("a legacy boolean sentinel marker does not block installation", () => {
+  const s = sentinel();
+  s.send("disable");
+  s.marker = true;
+  s.install({ reload: true });
+  s.event({ type: "keydown", isTrusted: true });
+  assert.equal(s.send("sample").sequence, 1);
+  assert.equal(s.messageListeners, 1);
+});
+
+test("sentinel keeps observing after an asynchronous delivery rejection", async () => {
+  const s = sentinel();
+  s.runtime.sendMessage = () => Promise.reject(new Error("Receiving end does not exist."));
+  s.event({ type: "click", isTrusted: true });
+  await Promise.resolve();
+  assert.equal(s.send("sample").sequence, 1);
+  assert.equal(s.send("sample").enabled, true);
+  assert.equal(s.messageListeners, 1);
+});
+
+test("sentinel teardown survives invalidated onMessage bindings", () => {
+  const s = sentinel();
+  s.runtime.onMessage.removeListener = () => { throw new Error("Extension context invalidated."); };
+  delete s.runtime.id;
+  assert.doesNotThrow(() => s.event({ type: "click", isTrusted: true }));
+  assert.equal(s.listeners, 0);
+  assert.equal(s.marker, undefined);
+  assert.equal(s.send("sample"), undefined);
+});
+
 
 test("trusted pointer and mouse movement do not change the tab interaction epoch", async () => {
   const f = await setup();
