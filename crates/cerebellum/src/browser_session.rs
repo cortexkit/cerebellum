@@ -747,6 +747,7 @@ pub trait OwnedBrowserProcess: Send {
         _document_epoch: u64,
         _deadline_ms: u64,
         _full: bool,
+        _max_bytes: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         Err(NavigationDriveError::Unavailable)
     }
@@ -2078,10 +2079,11 @@ impl OperationGuard {
         document_epoch: u64,
         deadline_ms: u64,
         full: bool,
+        max_bytes: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.drive(
             |error| error,
-            |process| process.screenshot(context_key, document_epoch, deadline_ms, full),
+            |process| process.screenshot(context_key, document_epoch, deadline_ms, full, max_bytes),
         )
     }
 
@@ -6104,6 +6106,7 @@ mod tests {
             _: u64,
             _: u64,
             _: bool,
+            _: usize,
         ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
             let _ = self.entered.send(());
             let mut killed = self.switch.killed.lock().unwrap();
@@ -6253,7 +6256,7 @@ mod tests {
             panic!("a ready session refused dispatch");
         };
         let caller = std::thread::spawn(move || {
-            let result = operation.screenshot("context", 0, 3_600_000, false);
+            let result = operation.screenshot("context", 0, 3_600_000, false, usize::MAX);
             operation.finish();
             result.is_err()
         });
@@ -6376,7 +6379,7 @@ mod tests {
         };
         let (a_result, a_reply) = std::sync::mpsc::channel();
         let a_caller = std::thread::spawn(move || {
-            let result = a_operation.screenshot("context", 0, 3_600_000, false);
+            let result = a_operation.screenshot("context", 0, 3_600_000, false, usize::MAX);
             a_operation.finish();
             let _ = a_result.send(result.err());
         });
@@ -6409,7 +6412,7 @@ mod tests {
             else {
                 panic!("route B's ready session refused dispatch");
             };
-            let call = operation.screenshot("context", 0, 10, false);
+            let call = operation.screenshot("context", 0, 10, false, usize::MAX);
             let finished_at = Instant::now();
             operation.finish();
             let _ = b_done.send(());
@@ -6655,6 +6658,7 @@ mod tests {
             _: u64,
             deadline_ms: u64,
             _: bool,
+            _: usize,
         ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
             if self.panic_on_screenshot {
                 panic!("a browser driver call panicked for a test");
@@ -7142,7 +7146,7 @@ mod tests {
         };
         let call = in_thread(move || {
             let failed = operation
-                .screenshot("context", 0, 3_600_000, false)
+                .screenshot("context", 0, 3_600_000, false, usize::MAX)
                 .is_err();
             operation.finish();
             failed
@@ -7284,7 +7288,9 @@ mod tests {
             panic!("a ready session refused dispatch");
         };
         assert_eq!(
-            operation.screenshot("context", 0, 10, false).err(),
+            operation
+                .screenshot("context", 0, 10, false, usize::MAX)
+                .err(),
             Some(NavigationDriveError::StateUnavailable),
             "a driver call over a poisoned driver lock refuses"
         );
@@ -7376,7 +7382,7 @@ mod tests {
             panic!("route A refused dispatch");
         };
         let panicked = std::thread::spawn(move || {
-            let _ = operation.screenshot("context", 0, 10, false);
+            let _ = operation.screenshot("context", 0, 10, false, usize::MAX);
         })
         .join();
         assert!(
@@ -7394,7 +7400,9 @@ mod tests {
             panic!("route B refused dispatch after a panic on route A");
         };
         assert_eq!(
-            operation.screenshot("context", 0, 10, false).err(),
+            operation
+                .screenshot("context", 0, 10, false, usize::MAX)
+                .err(),
             Some(NavigationDriveError::CdpFailure),
             "route B's call reached route B's browser"
         );
@@ -7410,7 +7418,9 @@ mod tests {
             panic!("route A refused dispatch");
         };
         assert_eq!(
-            operation.screenshot("context", 0, 10, false).err(),
+            operation
+                .screenshot("context", 0, 10, false, usize::MAX)
+                .err(),
             Some(NavigationDriveError::StateUnavailable)
         );
         operation.finish();
@@ -7641,7 +7651,7 @@ mod tests {
     ) -> std::sync::mpsc::Receiver<bool> {
         in_thread(move || {
             let failed = operation
-                .screenshot("context", 0, deadline_ms, false)
+                .screenshot("context", 0, deadline_ms, false, usize::MAX)
                 .is_err();
             operation.finish();
             failed

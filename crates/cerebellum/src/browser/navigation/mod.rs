@@ -196,6 +196,10 @@ pub fn screenshot_clip_scale(
     }
 }
 
+/// Retry the same viewport at successively smaller bitmap sizes, without
+/// cropping away content. The last attempt is 1/16 of the initial linear size.
+pub(crate) const SCREENSHOT_SCALE_STEPS: [f64; 5] = [1.0, 0.5, 0.25, 0.125, 0.0625];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawAxNode {
     node_id: String,
@@ -713,9 +717,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         document_epoch: u64,
         deadline_ms: u64,
         full: bool,
+        max_bytes: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
-        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, full, &mut clock)
+        self.screenshot_with_clock(
+            context_key,
+            document_epoch,
+            deadline_ms,
+            full,
+            max_bytes,
+            &mut clock,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -933,7 +945,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         full: bool,
         clock: &mut C,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
-        self.screenshot_with_clock(context_key, document_epoch, deadline_ms, full, clock)
+        self.screenshot_with_clock(
+            context_key,
+            document_epoch,
+            deadline_ms,
+            full,
+            crate::coordinate::MAX_ENCODED_PNG_BYTES,
+            clock,
+        )
     }
 
     #[cfg(test)]
@@ -1738,12 +1757,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn screenshot_with_clock<C: NavigationClock>(
         &mut self,
         context_key: &str,
         document_epoch: u64,
         deadline_ms: u64,
         full: bool,
+        max_bytes: usize,
         clock: &mut C,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let deadline = clock
@@ -1760,53 +1781,62 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         let (before, page_origin) =
             self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
-        let mut params = Map::new();
-        params.insert("format".into(), Value::String("png".into()));
-        params.insert("fromSurface".into(), Value::Bool(true));
-        params.insert("captureBeyondViewport".into(), Value::Bool(false));
-        if let Some(scale) = screenshot_clip_scale(
+        let initial_scale = screenshot_clip_scale(
             before.transform.width_input_css,
             before.transform.height_input_css,
             before.transform.device_scale_factor,
             full,
-        ) {
-            // Chrome's clip is document-relative CSS. scale is multiplied by
-            // deviceScaleFactor in the compositor, so this value is chosen so
-            // the returned bitmap is the largest size that fits both
-            // standard-tier vision limits.
-            let (page_x, page_y) = page_origin.ok_or(NavigationDriveError::CdpFailure)?;
-            let mut clip = Map::new();
-            clip.insert("x".into(), json_finite_number(page_x)?);
-            clip.insert("y".into(), json_finite_number(page_y)?);
-            clip.insert(
-                "width".into(),
-                json_finite_number(before.transform.width_input_css)?,
-            );
-            clip.insert(
-                "height".into(),
-                json_finite_number(before.transform.height_input_css)?,
-            );
-            clip.insert("scale".into(), json_finite_number(scale)?);
-            params.insert("clip".into(), Value::Object(clip));
+        );
+        for step in SCREENSHOT_SCALE_STEPS {
+            let scale = initial_scale.unwrap_or(1.0) * step;
+            let mut params = Map::new();
+            params.insert("format".into(), Value::String("png".into()));
+            params.insert("fromSurface".into(), Value::Bool(true));
+            params.insert("captureBeyondViewport".into(), Value::Bool(false));
+            if initial_scale.is_some() || step < 1.0 {
+                // Keep the document-relative CSS rectangle unchanged. Chrome
+                // multiplies scale by deviceScaleFactor; only the bitmap's
+                // sampling density shrinks when a capture exceeds max_bytes.
+                let (page_x, page_y) = page_origin.ok_or(NavigationDriveError::CdpFailure)?;
+                let mut clip = Map::new();
+                clip.insert("x".into(), json_finite_number(page_x)?);
+                clip.insert("y".into(), json_finite_number(page_y)?);
+                clip.insert(
+                    "width".into(),
+                    json_finite_number(before.transform.width_input_css)?,
+                );
+                clip.insert(
+                    "height".into(),
+                    json_finite_number(before.transform.height_input_css)?,
+                );
+                clip.insert("scale".into(), json_finite_number(scale)?);
+                params.insert("clip".into(), Value::Object(clip));
+            }
+            let captured = self.command(
+                "Page.captureScreenshot",
+                Some(params),
+                Some(session_id.clone()),
+                deadline,
+                None,
+                clock,
+            )?;
+            let image_png_b64 = required_result_string(&captured, "data")?;
+            let (after, after_page_origin) =
+                self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
+            let invalidation_observed = page_origin != after_page_origin;
+            if image_png_b64.len() <= max_bytes
+                || step == 0.0625
+                || !before.coherent_with(after, invalidation_observed)
+            {
+                return Ok(BrowserScreenshotObservation {
+                    image_png_b64,
+                    before,
+                    after,
+                    invalidation_observed,
+                });
+            }
         }
-        let captured = self.command(
-            "Page.captureScreenshot",
-            Some(params),
-            Some(session_id.clone()),
-            deadline,
-            None,
-            clock,
-        )?;
-        let image_png_b64 = required_result_string(&captured, "data")?;
-        let (after, _) =
-            self.read_viewport_observation(document_epoch, &session_id, deadline, clock)?;
-
-        Ok(BrowserScreenshotObservation {
-            image_png_b64,
-            before,
-            after,
-            invalidation_observed: false,
-        })
+        unreachable!("the last screenshot scale always returns its observation")
     }
 
     fn read_viewport_observation<C: NavigationClock>(
@@ -3607,6 +3637,7 @@ pub(crate) fn snapshot_from_capture(
     frame_id: &str,
     document_epoch: u64,
     document_url: &str,
+    effective_origin: &str,
 ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
     let nodes = ax_nodes
         .iter()
@@ -3636,7 +3667,10 @@ pub(crate) fn snapshot_from_capture(
             .collect())
     })?;
     let projected = parse_flattened_dom_nodes(dom);
-    let origin = document_origin(document_url);
+    // Blank/srcdoc children inherit an origin that cannot be derived from
+    // their URL. Keep the URL for link facts, but classify with the verified
+    // frame origin supplied by the caller.
+    let origin = document_origin(effective_origin);
     match (&projected, &origin) {
         (Ok(nodes), Ok(origin)) => {
             classify_refs(&mut observation.refs, nodes, document_epoch, origin)
@@ -5759,6 +5793,53 @@ mod tests {
     }
 
     #[test]
+    fn oversize_screenshot_retries_only_an_unchanged_document_relative_viewport() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        for moved in [false, true] {
+            let metrics = json!({"cssVisualViewport":{"offsetX":0.0,"offsetY":0.0,"pageX":40.0,"pageY":80.0,"clientWidth":100.0,"clientHeight":100.0,"scale":1.0}});
+            let mut after = metrics.clone();
+            if moved {
+                after["cssVisualViewport"]["pageY"] = json!(180.0);
+            }
+            let frames = [
+                json!({"id":1,"sessionId":"session-own","result":metrics.clone()}),
+                json!({"id":2,"sessionId":"session-own","result":{"result":{"value":2.0}}}),
+                json!({"id":3,"sessionId":"session-own","result":{"data":"x".repeat(300)}}),
+                json!({"id":4,"sessionId":"session-own","result":after}),
+                json!({"id":5,"sessionId":"session-own","result":{"result":{"value":2.0}}}),
+                json!({"id":6,"sessionId":"session-own","result":{"data":PNG}}),
+                json!({"id":7,"sessionId":"session-own","result":metrics}),
+                json!({"id":8,"sessionId":"session-own","result":{"result":{"value":2.0}}}),
+            ];
+            let mut driver = attached_driver(frames);
+            let observation = driver
+                .screenshot_with_clock("route-own", 7, 100, true, 250, &mut FakeClock::new())
+                .unwrap();
+            let captures: Vec<_> = driver
+                .pipe
+                .writes
+                .iter()
+                .filter(|write| write["method"] == "Page.captureScreenshot")
+                .collect();
+            if moved {
+                assert!(observation.invalidation_observed);
+                assert_eq!(
+                    captures.len(),
+                    1,
+                    "a moved clip must not be retried against the old origin"
+                );
+            } else {
+                assert_eq!(observation.image_png_b64, PNG);
+                assert_eq!(captures.len(), 2);
+                assert_eq!(
+                    captures[1]["params"]["clip"],
+                    json!({"x":40.0,"y":80.0,"width":100.0,"height":100.0,"scale":0.5})
+                );
+            }
+        }
+    }
+
+    #[test]
     fn screenshot_clip_scale_is_none_when_full_or_already_within_the_cap() {
         assert_eq!(screenshot_clip_scale(3136.0, 1568.0, 1.0, false), Some(0.5));
         assert_eq!(screenshot_clip_scale(3136.0, 1568.0, 1.0, true), None);
@@ -7724,6 +7805,7 @@ mod tests {
             capture["frameId"].as_str().unwrap(),
             7,
             &url,
+            "https://dash.cloudflare.com",
         )
         .unwrap();
         (observation, url)

@@ -924,6 +924,7 @@ impl OwnedBrowserProcess for RecordingProcess {
         _: u64,
         _: u64,
         _: bool,
+        _: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.effects.lock().unwrap().push("screenshot");
         if let Some(fixture) = &self.frame_fixture {
@@ -4111,6 +4112,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
         _: u64,
         _: u64,
         _: bool,
+        _: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let viewport = ViewportObservation::new(
             0,

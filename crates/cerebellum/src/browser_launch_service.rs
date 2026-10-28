@@ -2254,11 +2254,12 @@ impl OwnedBrowserProcess for ProductionProcess {
         document_epoch: u64,
         deadline_ms: u64,
         full: bool,
+        max_bytes: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         self.driver
             .as_mut()
             .ok_or(NavigationDriveError::Unavailable)?
-            .screenshot(context_key, document_epoch, deadline_ms, full)
+            .screenshot(context_key, document_epoch, deadline_ms, full, max_bytes)
     }
 
     fn classify_point(
