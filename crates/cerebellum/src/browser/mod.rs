@@ -1351,8 +1351,8 @@ impl ContextState {
 }
 
 /// A zoom must prove that the previously printed ref still names the same
-/// browser node in the same document. Unknown or removed nodes get a short miss;
-/// missing identity evidence refuses rather than selecting by capture position.
+/// browser node in the same document. Unissued refs require a fresh snapshot;
+/// removed nodes return no target, never a fallback to capture position.
 fn zoom_target(
     context: &ContextState,
     requested: &str,
@@ -1360,7 +1360,9 @@ fn zoom_target(
     document: Option<&CommittedDocument>,
 ) -> Result<Option<String>, BrowserError> {
     let Some(shown) = context.refs.shown(requested) else {
-        return Ok(None);
+        return Err(BrowserError::StaleSnapshot {
+            reason_code: "ref_not_shown",
+        });
     };
     if shown.epoch != context.epoch.value()
         || matches!((&shown.document, document), (Some(old), Some(live)) if old.loader_id != live.loader_id)
@@ -6331,6 +6333,96 @@ fn map_coordinate_error(error: CoordinateError) -> BrowserError {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn stable_refs_zoom_after_plane_restart_requires_a_snapshot_first() {
+        let identity = identity();
+        let doc = CommittedDocument::new("https://example.com/", 1, "loader");
+        let (mut records, mut refs) = ax_fixture();
+        records.truncate(1);
+        refs.truncate(1);
+        records[0].role = "button".into();
+        refs[0].captured.role = "button".into();
+        refs[0].backend_identity =
+            Some(crate::snapshot_store::BackendNodeIdentity::new("target", "frame", 1).unwrap());
+        let plane = BrowserPlane::new();
+        plane.open_context(identity.clone()).await.unwrap();
+        let old = plane
+            .retain_text_snapshot(
+                &identity,
+                SnapshotKind::Ax,
+                &records,
+                None,
+                refs.clone(),
+                4096,
+                Some(doc.clone()),
+            )
+            .await
+            .unwrap();
+        let held = old["state_text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        assert_eq!(held, "e1");
+        drop(plane);
+
+        let plane = BrowserPlane::new();
+        plane.open_context(identity.clone()).await.unwrap();
+        records[0].name = "Replacement page".into();
+        refs[0].captured.name = "Replacement page".into();
+        refs[0].backend_identity =
+            Some(crate::snapshot_store::BackendNodeIdentity::new("target", "frame", 2).unwrap());
+        let capture = |zoom| {
+            let (plane, identity, records, refs, doc) =
+                (&plane, &identity, &records, refs.clone(), doc.clone());
+            async move {
+                plane
+                    .retain_text_snapshot_inner(
+                        identity,
+                        SnapshotKind::Actionable,
+                        records,
+                        None,
+                        refs,
+                        &HashMap::new(),
+                        zoom,
+                        &state_text::Filters::default(),
+                        4096,
+                        false,
+                        false,
+                        Some(doc),
+                    )
+                    .await
+            }
+        };
+        let error = capture(Some(held.as_str())).await.unwrap_err();
+        assert!(matches!(
+            error,
+            BrowserError::StaleSnapshot {
+                reason_code: "ref_not_shown"
+            }
+        ));
+        assert!(error.remedy().contains("take a snapshot"));
+
+        // The replacement capture reuses e1, but it becomes usable only after
+        // a snapshot has actually shown the replacement page to the caller.
+        let (snapshot, _) = capture(None).await.unwrap();
+        assert!(
+            snapshot["state_text"]
+                .as_str()
+                .unwrap()
+                .contains("e1 button Replacement page"),
+            "{snapshot}"
+        );
+        let (zoomed, _) = capture(Some(held.as_str())).await.unwrap();
+        assert_eq!(zoomed["outcome"], "ok");
+        assert!(zoomed["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Replacement page"));
+    }
+
+    #[tokio::test]
     async fn stable_refs_reopening_a_context_does_not_recycle_names() {
         let plane = BrowserPlane::new();
         let identity = identity();
@@ -6442,10 +6534,12 @@ mod tests {
             zoom_target(&context, &requested, &fresh[..1], Some(&doc)).unwrap(),
             None
         );
-        assert_eq!(
-            zoom_target(&context, "e999", &fresh, Some(&doc)).unwrap(),
-            None
-        );
+        assert!(matches!(
+            zoom_target(&context, "e999", &fresh, Some(&doc)),
+            Err(BrowserError::StaleSnapshot {
+                reason_code: "ref_not_shown"
+            })
+        ));
         let changed = CommittedDocument::new("https://example.com/", 2, "new-loader");
         assert!(matches!(
             zoom_target(&context, &requested, &fresh, Some(&changed)),
