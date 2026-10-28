@@ -280,6 +280,10 @@ impl AppStateSource for MacAppStateSource {
         cerebellum_macos::press_element(retained(element)?).map_err(action_error)
     }
 
+    fn show_menu(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+        cerebellum_macos::show_element_menu(retained(element)?).map_err(action_error)
+    }
+
     fn text_value(&self, element: &ElementHandle) -> Result<Option<String>, ElementActionError> {
         cerebellum_macos::element_text_value(retained(element)?).map_err(action_error)
     }

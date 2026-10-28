@@ -720,8 +720,8 @@ pub struct DeskState {
     pub dispatched_at: Vec<tokio::time::Instant>,
     pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
-    /// Swapped in for `roots` by the first press or write, so the diff that
-    /// follows has something to report.
+    /// Swapped in for `roots` by the first press, menu opening or write, so
+    /// the diff that follows has something to report.
     pub after_action: Option<Vec<RawElement>>,
     /// The application's focus after the first press or write, the way
     /// pressing a button can move focus to what it opened.
@@ -757,6 +757,7 @@ pub struct DeskState {
     pub topmost_window: Option<u32>,
     pub topmost_windows_at: Vec<((f64, f64), u32)>,
     pub presses: Vec<u64>,
+    pub shown_menus: Vec<u64>,
     pub writes: Vec<(u64, TextAttribute)>,
     pub hit_scopes: Vec<HitScope>,
     pub focus_reads: usize,
@@ -782,8 +783,8 @@ pub struct DeskState {
 }
 
 /// A fixture application: its tree, its elements' facts and text, its focus,
-/// and which application is frontmost. Records every press, write and hit
-/// test so a test can assert what was done rather than what was replied.
+/// and which application is frontmost. Records every press, menu opening,
+/// write and hit test so a test can assert what was done rather than what was replied.
 #[derive(Debug, Clone)]
 pub struct Desk(pub Arc<Mutex<DeskState>>);
 
@@ -814,6 +815,7 @@ impl Desk {
             topmost_window: None,
             topmost_windows_at: Vec::new(),
             presses: Vec::new(),
+            shown_menus: Vec::new(),
             writes: Vec::new(),
             hit_scopes: Vec::new(),
             focus_reads: 0,
@@ -960,6 +962,17 @@ impl AppStateSource for Desk {
         };
         if let Some(DeskHook(hook)) = hook {
             hook();
+        }
+        Ok(())
+    }
+
+    fn show_menu(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        let mut state = self.state();
+        state.shown_menus.push(token);
+        state.dispatched_at.push(tokio::time::Instant::now());
+        if let Some(after) = state.after_action.take() {
+            state.roots = after;
         }
         Ok(())
     }

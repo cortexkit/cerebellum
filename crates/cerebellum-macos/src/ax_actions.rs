@@ -452,11 +452,24 @@ pub fn window_minimized(window: &AxRetainedElement) -> Option<bool> {
 /// Ask the element to perform `AXPress`. The pointer is never touched: this
 /// is a message to the application, which runs the element's own handler.
 pub fn press_element(element: &AxRetainedElement) -> Result<(), AxElementActionError> {
+    perform_element_action(element, "AXPress")
+}
+
+/// Ask the element to perform `AXShowMenu`. Like a press, this calls the
+/// application's accessibility handler without moving the pointer.
+pub fn show_element_menu(element: &AxRetainedElement) -> Result<(), AxElementActionError> {
+    perform_element_action(element, "AXShowMenu")
+}
+
+fn perform_element_action(
+    element: &AxRetainedElement,
+    action: &'static str,
+) -> Result<(), AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
     prepare_element(pointer);
     bound_messages(pointer);
-    let action = CFString::from_static_str("AXPress");
+    let action = CFString::from_static_str(action);
     // SAFETY: element and action name are retained for the call.
     let code =
         unsafe { AXUIElementPerformAction(pointer, CFRetained::as_ptr(&action).as_ptr().cast()) };

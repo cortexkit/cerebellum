@@ -151,7 +151,7 @@ fn desk() -> Desk {
         .with_element(
             11,
             DeskElement {
-                facts: facts("AXStaticText", &["AXShowMenu", "Name:open\nfake"]),
+                facts: facts("AXStaticText", &["AXScrollToVisible", "Name:open\nfake"]),
                 ..DeskElement::default()
             },
         )
@@ -276,6 +276,7 @@ async fn pressing_a_live_element_presses_it_and_returns_the_diff() {
 
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert_eq!(desk.state().presses, vec![10]);
+    assert!(desk.state().shown_menus.is_empty());
     assert_eq!(ids(&reply, "added").len(), 1, "{reply}");
     assert!(ids(&reply, "changed").is_empty() && ids(&reply, "removed").is_empty());
     assert_eq!(reply["unreadable_subtrees"], 0);
@@ -528,9 +529,9 @@ async fn a_point_on_a_disabled_element_presses_nothing() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
-/// An element with no press refuses by name, the refusal names the standard
-/// actions it does offer and counts the rest without quoting them, and the
-/// pointer is never used in its place.
+/// An element with neither press nor menu action refuses by name. The refusal
+/// names standard actions and counts the rest without quoting them; the pointer
+/// is never used in place of an accessibility action.
 #[tokio::test]
 async fn an_element_without_a_press_names_what_it_supports() {
     let desk = desk();
@@ -547,7 +548,7 @@ async fn an_element_without_a_press_names_what_it_supports() {
     assert_eq!(reply["outcome"], "no_press_action", "{reply}");
     let remedy = reply["remedy"].as_str().unwrap();
     assert!(
-        remedy.contains("AXShowMenu") && remedy.contains("1 custom"),
+        remedy.contains("AXScrollToVisible") && remedy.contains("1 custom"),
         "{remedy}"
     );
     assert!(
@@ -555,7 +556,146 @@ async fn an_element_without_a_press_names_what_it_supports() {
         "application text reached a remedy: {remedy}"
     );
     assert!(desk.state().presses.is_empty());
+    assert!(desk.state().shown_menus.is_empty());
     assert!(desk.state().hit_scopes.is_empty());
+}
+
+fn popup_desk() -> Desk {
+    let desk = desk().with_element(
+        14,
+        DeskElement {
+            facts: facts("AXPopUpButton", &["AXShowMenu", "AXScrollToVisible"]),
+            ..DeskElement::default()
+        },
+    );
+    let mut roots = window_and_menus();
+    roots[0]
+        .children
+        .push(RawElement::fixture(14, "AXPopUpButton").titled("Operating system"));
+    let mut menu = RawElement::fixture(39, "AXMenu").with_children(vec![
+        RawElement::fixture(40, "AXMenuItem").titled("Log Out…"),
+        RawElement::fixture(41, "AXMenuItem").titled("Restart…"),
+        RawElement::fixture(42, "AXMenuItem").titled("Shut Down…"),
+        RawElement::fixture(43, "AXMenuItem").titled("Linux"),
+    ]);
+    menu.menu_visible = true;
+    {
+        let mut state = desk.state();
+        state.roots = roots.clone();
+        roots[0].children.last_mut().unwrap().children.push(menu);
+        state.after_action = Some(roots);
+        state.application_hit = Some((14, Some(grant().pid)));
+        state.element_windows.insert(14, 77);
+        state.elements.insert(
+            43,
+            DeskElement {
+                facts: facts("AXMenuItem", &["AXPress"]),
+                ..DeskElement::default()
+            },
+        );
+    }
+    desk
+}
+
+#[tokio::test]
+async fn a_show_menu_only_element_opens_readable_items_and_filters_hazards() {
+    let desk = popup_desk();
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": id_of(&tree, "Operating system")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().shown_menus, vec![14]);
+    assert!(desk.state().presses.is_empty());
+    let text = reply["state_text"].as_str().unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with('+') && line.contains("menu item Linux")),
+        "{reply}"
+    );
+    for title in ["Log Out", "Restart", "Shut Down"] {
+        assert!(!text.contains(title), "{reply}");
+    }
+
+    // Added lines carry the same readable element IDs as the next state read.
+    let linux = text
+        .lines()
+        .find(|line| line.contains("menu item Linux"))
+        .unwrap()
+        .trim_start_matches('+')
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let readable = serve(
+        &plane,
+        &management,
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID}),
+    )
+    .await;
+    assert_eq!(
+        id_of(readable["state_text"].as_str().unwrap(), "menu item Linux"),
+        linux
+    );
+    let (tag, number) = split_id(&linux);
+    for offset in 1..=3 {
+        let refused = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": format!("{tag}{}", number - offset)}),
+        )
+        .await;
+        assert_eq!(refused["outcome"], "blocked_menu_item", "{refused}");
+    }
+    let selected = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": linux}),
+    )
+    .await;
+    assert_eq!(selected["outcome"], "completed", "{selected}");
+    assert_eq!(desk.state().presses, vec![43]);
+    assert_eq!(desk.state().shown_menus, vec![14]);
+    assert!(plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn a_point_on_a_show_menu_only_element_opens_its_menu() {
+    let desk = popup_desk();
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().shown_menus, vec![14]);
+    assert!(desk.state().presses.is_empty());
+    assert_eq!(
+        desk.state().hit_scopes,
+        vec![HitScope::Application { pid: grant().pid }]
+    );
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("menu item Linux"),
+        "{reply}"
+    );
+    assert!(plane.result_schema_findings().is_empty());
 }
 
 /// When the application restarts after the read, its ids name nothing: the
