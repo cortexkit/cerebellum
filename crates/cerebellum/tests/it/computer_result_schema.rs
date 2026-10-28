@@ -46,6 +46,7 @@ enum DivergenceKind {
     UnlistedEnumValue,
     WrongType,
     MissingRequiredProperty,
+    NoMatchingAlternative,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,6 +114,12 @@ fn observed_facts(
                     capability_id,
                     path,
                     DivergenceKind::UnlistedEnumValue,
+                    OwedBy::Reply,
+                ),
+                CapabilityResultViolation::AnyOfMismatch { path } => fact(
+                    capability_id,
+                    path,
+                    DivergenceKind::NoMatchingAlternative,
                     OwedBy::Reply,
                 ),
             };

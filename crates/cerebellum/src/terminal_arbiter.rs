@@ -1664,19 +1664,10 @@ mod arbiter_egress_tests {
     /// Every terminal body is checked against each fronting row's result
     /// schema, as it is and as it reads after a front: carrying `fronting`,
     /// and with a failed restore turning the outcome into `restore_failed`
-    /// while the body's `detail` and `effect_status` are kept. Apart from the
-    /// keystroke-row exception below, each must pass.
-    ///
-    /// The keystroke rows require `containment_rung`, `effect_status` and
-    /// `target_fronted` on every reply. This arbiter's own bodies never carry
-    /// the first and last, and its deadline body carries no `effect_status`,
-    /// so on those rows the only violations allowed are those required
-    /// fields the body lacks. The result-schema validator accepts no `anyOf`,
-    /// so a keystroke row cannot declare a separate terminal shape.
+    /// while the body's `detail` and `effect_status` are kept. Each reply must
+    /// satisfy the whole result schema, including the keystroke rows.
     fn fronting_terminal_bodies_pass(terminal: &Value) {
-        use computer::platform::vocabulary::{
-            validate_capability_result, CapabilityResultValidationError, CapabilityResultViolation,
-        };
+        use computer::platform::vocabulary::validate_capability_result;
         let mut fronted = terminal.clone();
         fronted["fronting"] = json!({"mode":"background", "fronted":true,
             "purpose":"needs_front", "restore":"restored"});
@@ -1694,26 +1685,9 @@ mod arbiter_egress_tests {
             "computer.keys",
             "computer.open_app",
         ] {
-            let keystroke_row = matches!(capability, "computer.type" | "computer.keys");
             for reply in [terminal, &fronted, &restore_failed] {
-                let allowed: Vec<_> = ["containment_rung", "effect_status", "target_fronted"]
-                    .into_iter()
-                    .filter(|property| keystroke_row && reply.get(property).is_none())
-                    .map(
-                        |property| CapabilityResultViolation::MissingRequiredProperty {
-                            path: "$".into(),
-                            property: property.into(),
-                        },
-                    )
-                    .collect();
-                let violations = match validate_capability_result(capability, reply) {
-                    Ok(()) => Vec::new(),
-                    Err(CapabilityResultValidationError::ReplyViolations {
-                        violations, ..
-                    }) => violations,
-                    Err(error) => panic!("{capability}: {error}"),
-                };
-                assert_eq!(violations, allowed, "{capability}: {reply}");
+                validate_capability_result(capability, reply)
+                    .unwrap_or_else(|error| panic!("{capability}: {reply}: {error}"));
             }
         }
     }

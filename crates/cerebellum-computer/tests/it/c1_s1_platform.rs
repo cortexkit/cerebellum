@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v31.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v32.json");
 /// The digests of the v30 and v31 artifacts this build no longer ships but
 /// keeps as history: v30 adds the operator-app refusal, v31 adds the image
 /// handle.
@@ -804,7 +804,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v29_from_v28(&generated, historical_revision(29).as_str().unwrap());
     let generated =
         vocabulary_mint::v30_from_v29(&generated, historical_revision(30).as_str().unwrap());
-    let generated = vocabulary_mint::v31_from_v30(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v31_from_v30(&generated, historical_revision(31).as_str().unwrap());
+    let generated = vocabulary_mint::v32_from_v31(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1863,12 +1865,12 @@ fn v29_changes_only_the_not_fronted_reasons() {
     );
 }
 
-/// The shipped artifact with v31's one addition taken back out:
+/// The recreated v31 with its one addition taken back out:
 /// `computer.read_state`'s `image_handle`. The removal asserts the field was
 /// there, so a v31 that stopped adding it is caught here as well as by the
 /// digest.
 fn recreated_v30() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v31();
     vocabulary["revision"] = historical_revision(30);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         let capability = row["capability_id"].as_str().unwrap().to_string();
@@ -1903,7 +1905,7 @@ fn v31_only_adds_read_states_image_handle_to_the_recreated_v30() {
 #[test]
 fn v31_changes_only_read_states_image_handle() {
     let previous = recreated_v30();
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let current = recreated_v31();
     let previous_rows = previous["rows"].as_array().unwrap();
     let current_rows = current["rows"].as_array().unwrap();
     assert_eq!(previous_rows.len(), current_rows.len());
@@ -1933,6 +1935,59 @@ fn v31_changes_only_read_states_image_handle() {
         previous, current,
         "a document field other than revision changed"
     );
+}
+
+/// Removing the terminal alternatives recovers the exact ordinary schemas
+/// carried by v31, whose independently pinned digest guards the reconstruction.
+fn recreated_v31() -> Value {
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(31);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if SYNTHETIC_CAPABILITIES.contains(&row["capability_id"].as_str().unwrap()) {
+            let alternatives = row["result_schema"]
+                .as_object_mut()
+                .unwrap()
+                .remove("anyOf")
+                .unwrap();
+            assert_eq!(alternatives.as_array().unwrap().len(), 3);
+            row["result_schema"] = alternatives[0].clone();
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v32_recreates_the_pinned_v31() {
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&recreated_v31()).unwrap()),
+        V31_ARTIFACT_SHA256
+    );
+}
+
+#[test]
+fn v32_changes_only_keystroke_result_schemas() {
+    let previous = recreated_v31();
+    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let generated = vocabulary_mint::v32_from_v31(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    assert_eq!(current, generated);
+    for (before, after) in previous["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(current["rows"].as_array_mut().unwrap())
+    {
+        if SYNTHETIC_CAPABILITIES.contains(&before["capability_id"].as_str().unwrap()) {
+            assert_ne!(before["result_schema"], after["result_schema"]);
+            after["result_schema"] = before["result_schema"].clone();
+        }
+        assert_eq!(
+            before, after,
+            "{} changed outside its result schema",
+            before["capability_id"]
+        );
+    }
+    current["revision"] = previous["revision"].clone();
+    assert_eq!(previous, current);
 }
 
 /// The shipped artifact with v30's addition taken back out from the recreated

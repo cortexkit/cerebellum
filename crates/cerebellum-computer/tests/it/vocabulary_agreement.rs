@@ -26,7 +26,7 @@ use cerebellum_computer::{
 };
 use serde_json::Value;
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v31.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v32.json");
 
 /// These frozen fields have no per-capability code counterpart to compare.
 ///
