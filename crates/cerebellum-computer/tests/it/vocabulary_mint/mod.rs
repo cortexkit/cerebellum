@@ -2482,3 +2482,68 @@ pub fn v31_from_v30(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Revision 32 admits terminal keystroke replies without inventing dispatch
+/// metadata. A deadline can expire before the worker establishes which
+/// application or field will contain the keystrokes (`containment_rung`), and
+/// the arbiter can stop while the worker is still bringing the target forward.
+/// Ordinary replies keep their complete envelope; terminal replies instead
+/// disclose the dispatch boundary and phase that the arbiter actually knows.
+pub fn v32_from_v31(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        if !matches!(
+            row["capability_id"].as_str(),
+            Some("computer.type" | "computer.keys")
+        ) {
+            continue;
+        }
+        let ordinary = row["result_schema"].clone();
+        let terminal_branch = |dispatched: bool| {
+            let mut properties = Map::new();
+            for name in ["outcome", "detail", "fronting", "remedy"] {
+                properties.insert(name.into(), ordinary["properties"][name].clone());
+            }
+            properties["outcome"]["enum"] = json!([
+                if dispatched {
+                    "dispatch_outcome_unknown"
+                } else {
+                    "action_deadline_exceeded"
+                },
+                "restore_failed"
+            ]);
+            properties["detail"]["required"] = json!(["dispatched", "step"]);
+            properties["detail"]["properties"]["dispatched"]["enum"] = json!([dispatched]);
+            properties["detail"]["properties"]["step"]["enum"] = if dispatched {
+                json!(["dispatch", "release"])
+            } else {
+                json!([
+                    "admission",
+                    "queue",
+                    "consent",
+                    "preflight",
+                    "dispatch",
+                    "release"
+                ])
+            };
+            if dispatched {
+                properties.insert(
+                    "effect_status".into(),
+                    json!({
+                        "type":"string", "enum":["effect_indeterminate"]
+                    }),
+                );
+                closed(properties, &["outcome", "detail", "effect_status"])
+            } else {
+                closed(properties, &["outcome", "detail"])
+            }
+        };
+        let dispatched = terminal_branch(true);
+        let not_dispatched = terminal_branch(false);
+        let schema = &mut row["result_schema"];
+        schema["required"] = json!(["outcome"]);
+        schema["anyOf"] = json!([ordinary, dispatched, not_dispatched]);
+    }
+    next
+}

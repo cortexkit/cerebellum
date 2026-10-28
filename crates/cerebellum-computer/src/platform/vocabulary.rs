@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v31";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v32";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v31.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v32.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "bfd49ebcfc9166f1ed41754ea7b9a18606567e046c1c2f6e8a9bce1ba2d07943";
+    "a848a0634cf825af7b02d5e1fd3f3af7c9bf2cde9673ada0a8cf746d8aac8b5e";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -93,6 +93,7 @@ pub enum CapabilityResultViolation {
     MissingRequiredProperty { path: String, property: String },
     UndeclaredProperty { path: String },
     EnumMismatch { path: String },
+    AnyOfMismatch { path: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -464,10 +465,7 @@ fn validate_closed_schema(value: &Value, path: &str) -> Result<(), VocabularyVal
     {
         return Err(VocabularyValidationError::ClosedSchema(path.into()));
     }
-    for (name, schema) in object["properties"].as_object().unwrap() {
-        validate_schema_node(schema, &format!("{path}.{name}"))?;
-    }
-    Ok(())
+    validate_schema_node(value, path)
 }
 
 fn validate_schema_node(value: &Value, path: &str) -> Result<(), VocabularyValidationError> {
@@ -489,6 +487,15 @@ fn validate_schema_node(value: &Value, path: &str) -> Result<(), VocabularyValid
     }
     if let Some(items) = object.get("items") {
         validate_schema_node(items, &format!("{path}[]"))?;
+    }
+    if let Some(branches) = object.get("anyOf") {
+        let branches = branches
+            .as_array()
+            .filter(|branches| !branches.is_empty())
+            .ok_or_else(|| VocabularyValidationError::ClosedSchema(path.into()))?;
+        for (index, branch) in branches.iter().enumerate() {
+            validate_schema_node(branch, &format!("{path}.anyOf[{index}]"))?;
+        }
     }
     Ok(())
 }
@@ -559,6 +566,7 @@ fn validate_runtime_result_schema(
         if !matches!(
             keyword.as_str(),
             "additionalProperties"
+                | "anyOf"
                 | "description"
                 | "enum"
                 | "items"
@@ -571,6 +579,20 @@ fn validate_runtime_result_schema(
             return Err(CapabilityResultValidationError::MalformedArtifact(format!(
                 "{path} uses unsupported result-schema keyword {keyword}"
             )));
+        }
+    }
+
+    if let Some(branches) = object.get("anyOf") {
+        let branches = branches
+            .as_array()
+            .filter(|branches| !branches.is_empty())
+            .ok_or_else(|| {
+                CapabilityResultValidationError::MalformedArtifact(format!(
+                    "{path}.anyOf is not a nonempty array"
+                ))
+            })?;
+        for (index, branch) in branches.iter().enumerate() {
+            validate_runtime_result_schema(branch, &format!("{path}.anyOf[{index}]"))?;
         }
     }
 
@@ -592,16 +614,20 @@ fn validate_runtime_result_schema(
             "object" => matches!(
                 keyword.as_str(),
                 "additionalProperties"
+                    | "anyOf"
                     | "description"
                     | "enum"
                     | "properties"
                     | "required"
                     | "type"
             ),
-            "array" => matches!(keyword.as_str(), "description" | "enum" | "items" | "type"),
+            "array" => matches!(
+                keyword.as_str(),
+                "anyOf" | "description" | "enum" | "items" | "type"
+            ),
             _ => matches!(
                 keyword.as_str(),
-                "description" | "enum" | "maxLength" | "minLength" | "type"
+                "anyOf" | "description" | "enum" | "maxLength" | "minLength" | "type"
             ),
         };
         if !applicable {
@@ -801,6 +827,7 @@ fn collect_result_violations(
     let object = schema
         .as_object()
         .expect("cached result schemas were validated while loading");
+    let initial_violation_count = violations.len();
     let schema_type = object["type"]
         .as_str()
         .expect("cached result schema types were validated while loading");
@@ -873,14 +900,29 @@ fn collect_result_violations(
         }
         _ => {}
     }
+    // Prefer a precise shared-schema error over a redundant branch mismatch.
+    if violations.len() == initial_violation_count {
+        if let Some(branches) = object.get("anyOf").and_then(Value::as_array) {
+            let matches_branch = branches.iter().any(|branch| {
+                let mut branch_violations = Vec::new();
+                collect_result_violations(branch, result, path, &mut branch_violations);
+                branch_violations.is_empty()
+            });
+            if !matches_branch {
+                violations.push(CapabilityResultViolation::AnyOfMismatch {
+                    path: path.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Check a served capability reply against the digest-pinned result schema.
 ///
-/// The artifact is parsed and checked once per process. Each call then walks the
-/// reply once, without cloning it. An unknown capability or an unsupported
-/// schema keyword fails
-/// closed rather than silently weakening the contract.
+/// The artifact is parsed and checked once per process. Each call validates the
+/// reply without cloning it, trying alternatives only until one matches. An
+/// unknown capability or an unsupported schema keyword fails closed rather than
+/// silently weakening the contract.
 pub fn validate_capability_result(
     capability_id: &str,
     result: &Value,
@@ -1026,6 +1068,158 @@ pub fn required_permission_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_of_accepts_each_closed_branch_and_refuses_neither_and_mixed_shapes() {
+        let schema = serde_json::json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "ordinary":{"type":"boolean"},
+                "terminal":{"type":"boolean"}
+            },
+            "required":[],
+            "anyOf":[
+                {"type":"object", "additionalProperties":false,
+                 "properties":{"ordinary":{"type":"boolean"}}, "required":["ordinary"]},
+                {"type":"object", "additionalProperties":false,
+                 "properties":{"terminal":{"type":"boolean"}}, "required":["terminal"]}
+            ]
+        });
+        validate_closed_schema(&schema, "$").unwrap();
+        validate_runtime_result_schema(&schema, "$").unwrap();
+        for reply in [
+            serde_json::json!({"ordinary":true}),
+            serde_json::json!({"terminal":false}),
+        ] {
+            let mut violations = Vec::new();
+            collect_result_violations(&schema, &reply, "$", &mut violations);
+            assert!(violations.is_empty(), "{reply}: {violations:?}");
+        }
+        for (reply, branch_mismatch) in [
+            (serde_json::json!({}), true),
+            (serde_json::json!({"ordinary":true, "terminal":false}), true),
+            (serde_json::json!({"terminal":"false"}), false),
+            (serde_json::json!({"extra":true}), false),
+        ] {
+            let mut violations = Vec::new();
+            collect_result_violations(&schema, &reply, "$", &mut violations);
+            assert!(!violations.is_empty(), "{reply}");
+            assert_eq!(
+                violations.contains(&CapabilityResultViolation::AnyOfMismatch { path: "$".into() }),
+                branch_mismatch,
+                "{reply}: {violations:?}"
+            );
+        }
+
+        let mut constrained = schema.clone();
+        constrained["required"] = serde_json::json!(["ordinary"]);
+        let mut violations = Vec::new();
+        collect_result_violations(
+            &constrained,
+            &serde_json::json!({"terminal":false}),
+            "$",
+            &mut violations,
+        );
+        assert_eq!(
+            violations,
+            [CapabilityResultViolation::MissingRequiredProperty {
+                path: "$".into(),
+                property: "ordinary".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn any_of_rejects_empty_malformed_and_open_branches() {
+        for branches in [
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([false]),
+            serde_json::json!([{"type":"object", "additionalProperties":true,
+                "properties":{}, "required":[]}]),
+            serde_json::json!([{"type":"array"}]),
+            serde_json::json!([{"type":"string", "unsupported":true}]),
+        ] {
+            let schema = serde_json::json!({
+                "type":"object", "additionalProperties":false,
+                "properties":{}, "required":[], "anyOf":branches
+            });
+            assert!(
+                validate_runtime_result_schema(&schema, "$").is_err(),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn keystroke_terminal_branches_do_not_weaken_ordinary_envelopes() {
+        for capability in ["computer.type", "computer.keys"] {
+            let mut ordinary = serde_json::json!({
+                "outcome":"ambiguous", "containment_rung":"pid_structural",
+                "effect_status":"effect_indeterminate", "target_fronted":false
+            });
+            for outcome in ["ambiguous", "delivery_unconfirmed", "restore_failed"] {
+                ordinary["outcome"] = serde_json::json!(outcome);
+                validate_capability_result(capability, &ordinary).unwrap();
+                for field in ["containment_rung", "effect_status", "target_fronted"] {
+                    let mut missing = ordinary.clone();
+                    missing.as_object_mut().unwrap().remove(field);
+                    assert!(
+                        validate_capability_result(capability, &missing).is_err(),
+                        "{capability}: {missing}"
+                    );
+                }
+            }
+            let deadline = serde_json::json!({
+                "outcome":"action_deadline_exceeded", "detail":{"dispatched":false,"step":"admission"}
+            });
+            let unknown = serde_json::json!({
+                "outcome":"dispatch_outcome_unknown", "effect_status":"effect_indeterminate",
+                "detail":{"dispatched":true,"step":"dispatch","reason":"cancelled","held_state":"none_held"},
+                "remedy":"read the state before retrying"
+            });
+            for terminal in [deadline, unknown] {
+                validate_capability_result(capability, &terminal).unwrap();
+                for extra in ["containment_rung", "target_fronted", "extra"] {
+                    let mut mixed = terminal.clone();
+                    mixed[extra] = ordinary
+                        .get(extra)
+                        .cloned()
+                        .unwrap_or(serde_json::json!(false));
+                    assert!(
+                        validate_capability_result(capability, &mixed).is_err(),
+                        "{capability}: {mixed}"
+                    );
+                }
+                for field in ["detail", "outcome"] {
+                    let mut missing = terminal.clone();
+                    missing.as_object_mut().unwrap().remove(field);
+                    assert!(
+                        validate_capability_result(capability, &missing).is_err(),
+                        "{capability}: {missing}"
+                    );
+                }
+                let mut missing_step = terminal.clone();
+                missing_step["detail"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("step");
+                assert!(validate_capability_result(capability, &missing_step).is_err());
+                let mut contradictory = terminal.clone();
+                contradictory["detail"]["dispatched"] =
+                    serde_json::json!(!terminal["detail"]["dispatched"].as_bool().unwrap());
+                assert!(validate_capability_result(capability, &contradictory).is_err());
+                let mut missing_effect = terminal.clone();
+                missing_effect
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("effect_status");
+                if terminal["detail"]["dispatched"] == true {
+                    assert!(validate_capability_result(capability, &missing_effect).is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn read_fronting_bound_is_a_positive_integer_at_most_half_a_second() {
@@ -1201,8 +1395,8 @@ mod tests {
         }
     }
 
-    /// A keystroke row requires its envelope on every reply, refusals
-    /// included; a refusal made before any post call carries these values.
+    /// An ordinary keystroke reply requires its envelope, refusals included;
+    /// a refusal made before any post call carries these values.
     fn with_keystroke_envelope(capability_id: &str, mut reply: Value) -> Value {
         if matches!(capability_id, "computer.type" | "computer.keys") {
             let object = reply.as_object_mut().unwrap();
