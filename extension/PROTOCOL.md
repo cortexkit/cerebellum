@@ -352,6 +352,30 @@ back button walking a frame's history start it, and its new document changes
 continuity when it commits.
 Missing observer/frame coverage and changed document identity invalidate input.
 
+**Sentinel lifetime across extension reloads.**
+
+Current Chromium gives a reloaded extension a **new isolated-world id**, even
+when its extension id is unchanged: the
+[unload handler](https://chromium.googlesource.com/chromium/src/+/main/extensions/renderer/dispatcher.cc)
+explicitly removes its isolated-world mappings so a reload gets a new id.
+[`RemoveIsolatedWorlds` and `GetOrCreateIsolatedWorldForHost`](https://chromium.googlesource.com/chromium/src/+/main/extensions/renderer/isolated_world_manager.cc)
+erase the old entries and allocate the new id, which
+[`ScriptInjection::InjectJs`](https://chromium.googlesource.com/chromium/src/+/main/extensions/renderer/script_injection.cc)
+passes to Blink. Together with Chrome's
+[isolated-world execution model](https://developer.chrome.com/docs/extensions/develop/concepts/content-scripts#work-in-isolated-worlds),
+this means a new injection does not share the orphan's JavaScript global. An old
+world's installation marker therefore cannot block installation in the new one.
+These sources do not establish whether old-world listeners survive unloading.
+If they do survive, they remain in the old world, not the new injection's global.
+
+The sentinel removes its input and message listeners and clears its own marker
+when its captured runtime loses its id or `sendMessage` throws synchronously.
+An asynchronous delivery rejection alone does not establish context invalidation.
+As a defensive same-world reinjection guard, the marker carries a liveness
+function tied to the installing runtime rather than a boolean. A new injection
+keeps a live sentinel, but replaces an invalid or legacy marker. The marker and
+liveness function are private to the isolated world, not protocol fields.
+
 Successful AX/DOM content reads or screenshots with live observer coverage establish
 an input baseline. Input plans must supply that read's `interaction_epoch`; status/open/claim, a
 refused input, and reconnect do not create a baseline. Epochs are checked before
