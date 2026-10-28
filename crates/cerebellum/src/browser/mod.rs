@@ -382,7 +382,7 @@ impl BrowserError {
             }
             Self::InvalidCoordinates { reason } => reason.remedy(),
             Self::ImageTooLarge { .. } => {
-                "use snapshot for a text observation, or reduce the viewport before capturing another image"
+                "the screenshot still exceeds max_bytes at the smallest scale (1/16 of the initial linear size); increase max_bytes or request a text snapshot"
             }
             // The bare form is only produced when the grant selected for this
             // action changed before it was committed. Nothing about what a new
@@ -4040,8 +4040,13 @@ impl BrowserPlane {
 
         let route_key = identity.conversation_key.clone();
         let driven = tokio::task::spawn_blocking(move || {
-            let result =
-                session_operation.screenshot(&route_key, document_epoch, deadline_ms, full);
+            let result = session_operation.screenshot(
+                &route_key,
+                document_epoch,
+                deadline_ms,
+                full,
+                max_bytes,
+            );
             // Read which document the page shows on the same admitted
             // operation right after the capture, so nothing this module issues
             // can sit between the capture and the check that it read the
@@ -4063,6 +4068,14 @@ impl BrowserPlane {
             live_after,
         )
         .await?;
+        if !observation
+            .before
+            .coherent_with(observation.after, observation.invalidation_observed)
+        {
+            return Err(BrowserError::InvalidCoordinates {
+                reason: crate::coordinate::InvalidCoordinatesReason::ConversionFailure,
+            });
+        }
         let bytes = observation.image_png_b64.len();
         if bytes > max_bytes {
             return Err(BrowserError::ImageTooLarge {
@@ -4072,9 +4085,12 @@ impl BrowserPlane {
         }
         let png = validate_png_base64_dimensions(&observation.image_png_b64)
             .map_err(map_coordinate_error)?;
+        let native_width = observation.before.transform.width_input_css
+            * observation.before.transform.device_scale_factor;
+        let scale = f64::from(png.width_px()) / native_width;
         let payload =
             ScreenshotPayload::new(observation.image_png_b64, png.width_px(), png.height_px());
-        let result = self
+        let mut result = self
             .retain_screenshot_inner(
                 identity,
                 payload,
@@ -4085,6 +4101,14 @@ impl BrowserPlane {
                 captured_frames,
             )
             .await?;
+        if scale < 1.0 {
+            result["remedy"] = json!(format!(
+                "Image scaled to {:.2}% of the native linear size ({}×{} pixels).",
+                scale * 100.0,
+                result["image_width_px"],
+                result["image_height_px"]
+            ));
+        }
         self.finalize(
             identity,
             BrowserCapability::Screenshot,
@@ -7130,7 +7154,7 @@ mod tests {
                     bound_bytes: 10,
                 },
                 "image_too_large",
-                "use snapshot for a text observation, or reduce the viewport before capturing another image",
+                "the screenshot still exceeds max_bytes at the smallest scale (1/16 of the initial linear size); increase max_bytes or request a text snapshot",
             ),
             (
                 "authorization_denied",

@@ -278,7 +278,7 @@ print('cross-origin and opaque-frame pixels:', counts)
             .present("probe", DEADLINE)
             .map_err(|e| format!("present headless probe tab: {e:?}"))?;
         let image = driver
-            .screenshot("probe", 1, DEADLINE, false)
+            .screenshot("probe", 1, DEADLINE, false, usize::MAX)
             .map_err(|e| format!("screenshot: {e:?}"))?;
         assert_embedded_pixels(&image.image_png_b64)?;
         println!("top-page screenshot captures embedded documents without frame grants: PASS");

@@ -643,6 +643,62 @@ fn refusal(reason: &str) -> Value {
     json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false})
 }
 
+fn classification_failure(
+    step: &str,
+    frame_url: &str,
+    node_resolved: Option<bool>,
+    cause: &str,
+) -> Value {
+    // Derive URL details only through the fixed scheme allowlist, so private
+    // paths and query values cannot enter the diagnostic. The step label and
+    // classifier facts describe structure rather than page content.
+    let scheme = match frame_url.split_once(':').map(|(scheme, _)| scheme) {
+        Some("http") => "http",
+        Some("https") => "https",
+        Some("about") => "about",
+        Some("blob") => "blob",
+        Some("data") => "data",
+        Some("file") => "file",
+        _ => "other",
+    };
+    let resolved = node_resolved.map_or("unknown", |found| if found { "yes" } else { "no" });
+    let problem =
+        format!("frame_url_scheme={scheme}; node_resolved_in_capture={resolved}; cause={cause}");
+    let mut reply = refusal("classification_unavailable");
+    reply["detail"] = json!({"step":step,"problem":problem});
+    reply["remedy"] = json!(format!("Classification failed at {step}: {problem}. No further input was sent. Take a fresh frame-aware snapshot after the frame finishes loading and retry; if it persists, report this step and cause."));
+    reply
+}
+
+fn classify_frame_capture<'a>(
+    capture: Option<&'a Value>,
+    identity: &BackendNodeIdentity,
+    frame: &FrameDocument,
+    epoch: u64,
+    step: &str,
+) -> Result<
+    (
+        &'a serde_json::Map<String, Value>,
+        NonTypeClassificationRecord,
+    ),
+    Value,
+> {
+    let resolved = capture
+        .and_then(|capture| capture["nodes"].as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .any(|node| node["backendNodeId"].as_u64() == Some(identity.backend_node_id))
+        });
+    let fail = |cause: &str| classification_failure(step, &frame.url, resolved, cause);
+    let dom = capture
+        .and_then(Value::as_object)
+        .ok_or_else(|| fail("flattened_document_result_missing"))?;
+    let record = classify_flattened_document(dom, identity, epoch, &frame.origin)
+        .map_err(|cause| fail(&cause.to_string()))?;
+    Ok((dom, record))
+}
+
 /// The revision of the cerebellum-to-extension contract this build speaks.
 /// The extension stamps its own revision (`EXTENSION_REVISION` in
 /// `extension/revision.mjs`) on every completed reply and every refusal, and
@@ -2906,6 +2962,7 @@ async fn capture_attempt(
             &frame.frame_id,
             document.interaction,
             &frame.url,
+            &frame.origin,
         )
         .map_err(|_| {
             let mut reply = refusal("snapshot_not_ready");
@@ -3452,32 +3509,59 @@ async fn screenshot(
     ) {
         return Err(refusal("landing_site_not_authorized"));
     }
-    let capture = context
+    let metrics = context
         .cdp(
             tab,
             Some(document.interaction),
-            vec![
-                command("Page.getLayoutMetrics", json!({})),
-                command(
-                    "Page.captureScreenshot",
-                    json!({"format":"png","captureBeyondViewport":false}),
-                ),
-                command("Page.getLayoutMetrics", json!({})),
-            ],
+            vec![command("Page.getLayoutMetrics", json!({}))],
         )
         .await?;
-    let viewport = &capture.results[0]["cssVisualViewport"];
-    if viewport != &capture.results[2]["cssVisualViewport"] {
-        return Err(refusal("viewport_changed"));
+    let viewport = &metrics.results[0]["cssVisualViewport"];
+    let transform = viewport_transform(viewport)?;
+    let max_bytes = args["max_bytes"].as_u64().unwrap_or(262144) as usize;
+    let mut image = String::new();
+    let mut captured_scale = 1.0;
+    for scale in crate::browser::navigation::SCREENSHOT_SCALE_STEPS {
+        let mut params = json!({"format":"png","fromSurface":true,"captureBeyondViewport":false});
+        if scale < 1.0 {
+            params["clip"] = json!({
+                "x":viewport["pageX"].as_f64().ok_or_else(|| protocol_field_error("Page.getLayoutMetrics", "cssVisualViewport.pageX"))?,
+                "y":viewport["pageY"].as_f64().ok_or_else(|| protocol_field_error("Page.getLayoutMetrics", "cssVisualViewport.pageY"))?,
+                "width":transform.width_input_css,"height":transform.height_input_css,"scale":scale
+            });
+        }
+        let capture = context
+            .cdp(
+                tab,
+                Some(document.interaction),
+                vec![
+                    command("Page.getLayoutMetrics", json!({})),
+                    command("Page.captureScreenshot", params),
+                    command("Page.getLayoutMetrics", json!({})),
+                ],
+            )
+            .await?;
+        if viewport != &capture.results[0]["cssVisualViewport"]
+            || viewport != &capture.results[2]["cssVisualViewport"]
+        {
+            return Err(refusal("viewport_changed"));
+        }
+        image = capture.results[1]["data"]
+            .as_str()
+            .ok_or_else(|| protocol_field_error("Page.captureScreenshot", "data"))?
+            .into();
+        captured_scale = scale;
+        if image.len() <= max_bytes {
+            break;
+        }
     }
-    let image = capture.results[1]["data"]
-        .as_str()
-        .ok_or_else(|| protocol_field_error("Page.captureScreenshot", "data"))?;
-    let decoded = crate::coordinate::validate_png_base64_dimensions(image)
+    if image.len() > max_bytes {
+        let mut reply = refusal("image_too_large");
+        reply["remedy"] = json!("The screenshot still exceeds max_bytes at the smallest scale (1/16 of the initial linear size); increase max_bytes or request a text snapshot.");
+        return Err(reply);
+    }
+    let decoded = crate::coordinate::validate_png_base64_dimensions(&image)
         .map_err(|_| refusal("screenshot_not_ready"))?;
-    if decoded.as_bytes().len() > args["max_bytes"].as_u64().unwrap_or(262144) as usize {
-        return Err(refusal("image_too_large"));
-    }
     let width = u64::from(decoded.width_px());
     let height = u64::from(decoded.height_px());
     confirm(context, tab, document).await?;
@@ -3489,9 +3573,11 @@ async fn screenshot(
         viewport: viewport.clone(),
     });
     context.target().retain(id.clone(), snapshot);
-    Ok(
-        json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"image":{"mime":"image/png","data_b64":image,"width_px":width,"height_px":height},"image_width_px":width,"image_height_px":height,"input_dispatched":false}),
-    )
+    let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"image":{"mime":"image/png","data_b64":image,"width_px":width,"height_px":height},"image_width_px":width,"image_height_px":height,"input_dispatched":false});
+    if captured_scale < 1.0 {
+        reply["remedy"] = json!(format!("Image scaled to {:.2}% of the initial linear size ({width}×{height} pixels) to fit max_bytes.", captured_scale * 100.0));
+    }
+    Ok(reply)
 }
 
 async fn input(
@@ -3545,18 +3631,28 @@ async fn input(
         .map_err(|_| refusal("invalid_coordinates"))?;
         let (x, y) = mapped.tuple();
         let hit = context.cdp(tab, Some(snapshot.interaction), vec![command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await?;
-        let frame_id = hit.results[0]["frameId"]
-            .as_str()
-            .ok_or_else(|| refusal("classification_unavailable"))?;
+        let frame_id = hit.results[0]["frameId"].as_str().ok_or_else(|| {
+            classification_failure(
+                "click_point.hit_frame",
+                "",
+                None,
+                "hit_test_frame_id_missing",
+            )
+        })?;
         let frame = current
             .frames
             .iter()
             .find(|frame| frame.frame_id == frame_id)
             .ok_or_else(|| refusal("frame_not_authorized"))?
             .clone();
-        let backend = hit.results[0]["backendNodeId"]
-            .as_u64()
-            .ok_or_else(|| refusal("classification_unavailable"))?;
+        let backend = hit.results[0]["backendNodeId"].as_u64().ok_or_else(|| {
+            classification_failure(
+                "click_point.hit_node",
+                &frame.url,
+                Some(false),
+                "hit_test_backend_node_id_missing",
+            )
+        })?;
         let local = &hit.results[0]["frame_point"];
         let position = if local.is_null() {
             (x, y)
@@ -3571,8 +3667,14 @@ async fn input(
             )
         };
         (
-            BackendNodeIdentity::new(tab, frame_id, backend)
-                .map_err(|_| refusal("classification_unavailable"))?,
+            BackendNodeIdentity::new(tab, frame_id, backend).map_err(|_| {
+                classification_failure(
+                    "click_point.node_identity",
+                    &frame.url,
+                    Some(true),
+                    "invalid_backend_node_identity",
+                )
+            })?,
             frame,
             Some(position),
         )
@@ -3607,7 +3709,7 @@ async fn input(
             BTreeSet::new(),
         )
         .await?;
-    let mut observed = context
+    let observed = context
         .cdp_frame(
             tab,
             Some(snapshot.interaction),
@@ -3615,16 +3717,13 @@ async fn input(
             flattened_document(),
         )
         .await?;
-    let dom = observed
-        .results
-        .pop()
-        .ok_or_else(|| refusal("classification_unavailable"))?;
-    let dom_object = dom
-        .as_object()
-        .ok_or_else(|| refusal("classification_unavailable"))?;
-    let classification =
-        classify_flattened_document(dom_object, &identity, snapshot.interaction, &frame.url)
-            .map_err(|_| refusal("classification_unavailable"))?;
+    let (dom_object, classification) = classify_frame_capture(
+        observed.results.last(),
+        &identity,
+        &frame,
+        snapshot.interaction,
+        "input.classify_flattened_document",
+    )?;
     if let Some(expected) = args["ref"]
         .as_str()
         .and_then(|reference| snapshot.refs.get(reference))
@@ -3640,7 +3739,14 @@ async fn input(
             &identity,
             &classification,
         )
-        .map_err(|_| refusal("classification_unavailable"))?;
+        .map_err(|cause| {
+            classification_failure(
+                "input.type_target_from_capture",
+                &frame.url,
+                Some(true),
+                &cause.to_string(),
+            )
+        })?;
         if !crate::browser_type::browser_type_dispatch_eligible(&target)
             || target.classification().credential
             || target.classification().financial
@@ -3662,8 +3768,14 @@ async fn input(
     let hazards = if action == "type" {
         BTreeSet::new()
     } else {
-        authorization::target_hazards(authorized_action, Some(&classification))
-            .map_err(|_| refusal("classification_unavailable"))?
+        authorization::target_hazards(authorized_action, Some(&classification)).map_err(|_| {
+            classification_failure(
+                "input.target_hazards",
+                &frame.url,
+                Some(true),
+                "hazard_projection_failed",
+            )
+        })?
     };
     let once = if read_grant.covers(&input_origin, severity, &hazards) {
         read_grant
@@ -3999,7 +4111,7 @@ async fn verify_input(
         reply["input_dispatched"] = json!(dispatched);
         return Err(reply);
     }
-    let mut plan = context
+    let plan = context
         .cdp_frame(tab, Some(snapshot.interaction), frame, flattened_document())
         .await
         .map_err(|mut reply| {
@@ -4008,30 +4120,28 @@ async fn verify_input(
             }
             reply
         })?;
-    let dom = plan
-        .results
-        .pop()
-        .ok_or_else(|| refusal("classification_unavailable"))?;
-    let record = classify_flattened_document(
-        dom.as_object()
-            .ok_or_else(|| refusal("classification_unavailable"))?,
+    let (dom, record) = classify_frame_capture(
+        plan.results.last(),
         identity,
+        frame,
         snapshot.interaction,
-        &frame.url,
-    )
-    .map_err(|_| refusal("classification_unavailable"))?;
+        "verify_input.classify_flattened_document",
+    )?;
     if record != *expected {
         let mut reply = refusal("classification_changed");
         reply["input_dispatched"] = json!(dispatched);
         return Err(reply);
     }
     if context.action == "type" {
-        let target = crate::browser::navigation::type_target_from_capture(
-            dom.as_object().unwrap(),
-            identity,
-            &record,
-        )
-        .map_err(|_| refusal("classification_unavailable"))?;
+        let target = crate::browser::navigation::type_target_from_capture(dom, identity, &record)
+            .map_err(|cause| {
+            classification_failure(
+                "verify_input.type_target_from_capture",
+                &frame.url,
+                Some(true),
+                &cause.to_string(),
+            )
+        })?;
         if !crate::browser_type::browser_type_dispatch_eligible(&target)
             || target.classification().credential
             || target.classification().financial
@@ -4207,21 +4317,16 @@ async fn verify_click_position(
         .ok_or_else(|| refusal("element_intercepted"))?;
     let identity = BackendNodeIdentity::new(tab, &frame.frame_id, backend)
         .map_err(|_| refusal("element_intercepted"))?;
-    let mut dom = context
+    let dom = context
         .cdp_frame(tab, Some(snapshot.interaction), frame, flattened_document())
         .await?;
-    let dom = dom
-        .results
-        .pop()
-        .ok_or_else(|| refusal("classification_unavailable"))?;
-    let record = classify_flattened_document(
-        dom.as_object()
-            .ok_or_else(|| refusal("classification_unavailable"))?,
+    let (_, record) = classify_frame_capture(
+        dom.results.last(),
         &identity,
+        frame,
         snapshot.interaction,
-        &frame.url,
-    )
-    .map_err(|_| refusal("classification_unavailable"))?;
+        "verify_click_position.classify_flattened_document",
+    )?;
     if record.activation_target_identity != expected.activation_target_identity {
         let mut reply = refusal("element_intercepted");
         reply["input_dispatched"] = json!(dispatched);

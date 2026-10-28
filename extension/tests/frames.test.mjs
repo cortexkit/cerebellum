@@ -125,6 +125,61 @@ test("same-origin child commands stay on the root target", async () => {
   assert.deepEqual(f.chrome.calls.find(call => call[0] === "cdp" && call[2] === "DOM.enable")[1], { tabId: 2 });
 });
 
+for (const cross of [false, true]) {
+  const owner = cross ? "OOPIF" : "same-process";
+  test(`${owner} child classification reads and button mouse pairs use the verified owner`, async () => {
+    const f = await framed(cross);
+    // The fake models document-id targeting only for the root. Frame-id
+    // targeting still exercises the child's sentinel and verified CDP scope.
+    f.frames[0].documentId = "document-2";
+    delete f.frames[1].documentId;
+    assert.equal(await f.epochs.install(2), true);
+    assert.ok(f.chrome.sentinels.has("2:17"));
+    const { frame_id, loader_id, session_id } = f.scope;
+    const scope = { frame_id, loader_id, session_id };
+    const send = f.chrome.debugger.sendCommand;
+    const button = { nodeId: 42, backendNodeId: 42, nodeType: 1, nodeName: "BUTTON", localName: "button", attributes: ["type", "button"] };
+    f.chrome.debugger.sendCommand = async (target, method, params) => {
+      const result = await send(target, method, params);
+      return method === "DOM.getFlattenedDocument" ? { nodes: [button] } : result;
+    };
+    const read = await f.run(f.cdp([
+      { method: "DOM.enable", params: {}, ...scope },
+      { method: "DOM.getFlattenedDocument", params: { depth: -1, pierce: true }, ...scope },
+    ]));
+    assert.equal(read.observer_available, true);
+    assert.deepEqual(read.results[1].result.nodes, [button]);
+    const mouse = type => ({ method: "Input.dispatchMouseEvent", params: { type, x: 10, y: 20, button: "left" }, ...scope });
+    const clicked = await f.run({ ...f.cdp([mouse("mousePressed"), mouse("mouseReleased")]), interaction_epoch: read.interaction_epoch });
+    assert.equal(clicked.results.length, 2);
+    assert.equal(clicked.results.some(entry => entry.error), false);
+    const target = cross ? { tabId: 2, sessionId: "ephemeral-child-session" } : { tabId: 2 };
+    const dom = f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "DOM.getFlattenedDocument");
+    assert.deepEqual(dom.map(call => call[1]), [target]);
+    assert.deepEqual(dom[0][3], { depth: -1, pierce: true });
+    const clicks = f.chrome.calls.filter(call => call[0] === "cdp" && call[2] === "Input.dispatchMouseEvent");
+    assert.deepEqual(clicks.map(call => call[1]), [target, target]);
+  });
+
+  test(`${owner} child DOM capture preserves credential facts for the Rust input guard`, async () => {
+    const f = await framed(cross);
+    const { frame_id, loader_id, session_id } = f.scope;
+    const scope = { frame_id, loader_id, session_id };
+    const password = { nodeId: 43, backendNodeId: 43, nodeType: 1, nodeName: "INPUT", localName: "input", attributes: ["type", "password", "autocomplete", "current-password"] };
+    const send = f.chrome.debugger.sendCommand;
+    f.chrome.debugger.sendCommand = async (target, method, params) => {
+      const result = await send(target, method, params);
+      return method === "DOM.getFlattenedDocument" ? { nodes: [password] } : result;
+    };
+    const read = await f.run(f.cdp([
+      { method: "DOM.enable", params: {}, ...scope },
+      { method: "DOM.getFlattenedDocument", params: { depth: -1, pierce: true }, ...scope },
+    ]));
+    assert.deepEqual(read.results[1].result.nodes[0].attributes, password.attributes);
+    assert.equal(f.chrome.calls.some(call => call[0] === "cdp" && call[2].startsWith("Input.")), false);
+  });
+}
+
 test("a stale loader cannot dispatch through a newly attached child session", async () => {
   const f = await framed();
   const { frame_id, session_id } = f.scope;

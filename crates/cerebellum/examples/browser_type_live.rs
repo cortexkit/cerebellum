@@ -499,11 +499,13 @@ mod probe {
             epoch: u64,
             deadline: u64,
             full: bool,
+            max_bytes: usize,
         ) -> Result<
             cerebellum::browser::navigation::BrowserScreenshotObservation,
             NavigationDriveError,
         > {
-            self.driver.screenshot(context, epoch, deadline, full)
+            self.driver
+                .screenshot(context, epoch, deadline, full, max_bytes)
         }
         fn point_frame_document(&mut self) -> Option<FrameDocument> {
             self.driver.point_frame_document()

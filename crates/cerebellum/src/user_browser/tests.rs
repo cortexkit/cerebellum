@@ -102,6 +102,7 @@ struct DoubleState {
     remove_group_on_card: bool,
     foreign_hit: bool,
     viewport_changed: bool,
+    screenshot_images: std::collections::VecDeque<String>,
     clipped_click: bool,
     scrolled: bool,
     /// Chrome's CDP error for the next plan command with this method.
@@ -118,6 +119,7 @@ struct DoubleState {
     top_level_only: bool,
     unmapped_child_owner: bool,
     same_origin_child: bool,
+    child_url_override: Option<String>,
     ambiguous_frames: bool,
     frame_pair: bool,
     stray_navigation: bool,
@@ -765,7 +767,9 @@ fn execute(
         return Err("tab_not_claimed_by_route".into());
     }
     assert_eq!(name, "cdp");
-    let child_url = if state.same_origin_child {
+    let child_url = if let Some(url) = &state.child_url_override {
+        url.clone()
+    } else if state.same_origin_child {
         tab.url.clone()
     } else {
         "https://ungranted.example/secret".into()
@@ -1009,7 +1013,7 @@ fn execute(
                 }
             }
             "Page.captureScreenshot" => {
-                json!({"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="})
+                json!({"data":state.screenshot_images.pop_front().unwrap_or_else(|| "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".into())})
             }
             "DOM.resolveNode" => json!({"object":{"objectId":"typed-node"}}),
             "Runtime.callFunctionOn" => json!({"result":{"value":true}}),
@@ -2235,6 +2239,83 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
 }
 
 #[tokio::test]
+async fn oversize_user_screenshot_scales_to_fit_and_keeps_pixel_coordinates() {
+    const NATIVE: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAA/UlEQVR4nO3RoQ0A",
+        "MBDEsNt/6e8YDTAwj5TddnTsdwCGpBkSY0iMITGGxBgSY0iMITGGxBgSY0iMITGG",
+        "xBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgS",
+        "Y0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iM",
+        "ITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGG",
+        "xBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgS",
+        "8wBKb9Zkl+sjewAAAABJRU5ErkJggg==",
+    );
+    const SCALED: &str = "iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAYAAAAeP4ixAAAAVElEQVR4nO3PsQ0AMAjAMP5/mp7RCHnIHs/O7IXm9wAISDyQWiC1QGqB1AKpBVILpBZILZBaILVAaoHUAqkFUgukFkgtkFogtUBqgdQCqQVS6wzkAbAzdZYM2Ma3AAAAAElFTkSuQmCC";
+    crate::coordinate::validate_png_base64_dimensions(NATIVE).unwrap();
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().screenshot_images = [NATIVE.into(), SCALED.into()].into();
+    let (image, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab,"max_bytes":250}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(image["outcome"], "ok", "{image}");
+    assert_eq!(image["image"]["data_b64"], SCALED);
+    assert_eq!(image["image_width_px"], 50);
+    assert_eq!(image["image_height_px"], 50);
+    assert!(image["remedy"].as_str().unwrap().contains("50.00%"));
+    let (clicked, _) = fixture.call(1, json!({"browser":"user","action":"click_point","tab":tab,"snapshot_id":image["snapshot_id"],"image_width_px":50,"image_height_px":50,"point":{"x":25,"y":25},"intent":"click button","severity":{"tier":2,"credential":false,"financial":false}}), "allow_30m").await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    let state = fixture.state.lock().unwrap();
+    let commands: Vec<_> = state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .collect();
+    let captures: Vec<_> = commands
+        .iter()
+        .filter(|step| step["method"] == "Page.captureScreenshot")
+        .collect();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(
+        captures[1]["params"]["clip"],
+        json!({"x":0.0,"y":0.0,"width":100.0,"height":100.0,"scale":0.5})
+    );
+    let press = commands
+        .iter()
+        .find(|step| step["params"]["type"] == "mousePressed")
+        .unwrap();
+    assert_eq!(press["params"]["x"], 51.0);
+    assert_eq!(press["params"]["y"], 51.0);
+}
+
+#[tokio::test]
+async fn user_screenshot_exhaustion_names_the_smallest_scale_and_remedy() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let (refused, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab,"max_bytes":1}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(refused["reason"], "image_too_large", "{refused}");
+    assert!(refused["remedy"].as_str().unwrap().contains("1/16"));
+    let state = fixture.state.lock().unwrap();
+    let scales: Vec<_> = state
+        .commands
+        .iter()
+        .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+        .filter(|step| step["method"] == "Page.captureScreenshot")
+        .map(|step| step["params"]["clip"]["scale"].as_f64().unwrap_or(1.0))
+        .collect();
+    assert_eq!(scales, [1.0, 0.5, 0.25, 0.125, 0.0625]);
+}
+
+#[tokio::test]
 async fn screenshot_returns_a_liftable_image_object_without_flat_base64() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
@@ -2964,6 +3045,145 @@ async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card
     assert!(sent.iter().all(|command| command["frame_id"] == "foreign"
         && command["session_id"] == "root"
         && command["loader_id"] == "foreign-loader"));
+}
+
+#[tokio::test]
+async fn inherited_origin_child_button_classifies_and_dispatches() {
+    for url in ["about:blank", "about:srcdoc"] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.same_origin_child = true;
+            state.child_url_override = Some(url.into());
+        }
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        let (reply, cards) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Child go")),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(reply["outcome"], "ok", "{url}: {reply}");
+        assert!(
+            cards.is_empty(),
+            "an inherited origin reuses the parent's grant"
+        );
+        let state = fixture.state.lock().unwrap();
+        let events: Vec<_> = state
+            .commands
+            .iter()
+            .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+            .filter(|step| step["method"] == "Input.dispatchMouseEvent")
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event["frame_id"] == "foreign" && event["session_id"] == "root"));
+    }
+}
+
+#[tokio::test]
+async fn inherited_origin_child_text_field_is_classified_before_typing() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.same_origin_child = true;
+        state.child_url_override = Some("about:srcdoc".into());
+    }
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"hello"}), "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(fixture
+        .state
+        .lock()
+        .unwrap()
+        .inputs
+        .iter()
+        .any(|method| method == "Input.insertText"));
+}
+
+#[tokio::test]
+async fn inherited_origin_child_credential_and_payment_fields_stay_guarded() {
+    for payment in [false, true] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.same_origin_child = true;
+            state.child_url_override = Some("about:blank".into());
+            state.password = !payment;
+            state.payment = payment;
+        }
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        assert!(!snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("child field value"));
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"secret"}), "allow_30m").await;
+        assert_eq!(
+            reply["reason"], "credential_payment_or_ineligible_field",
+            "{reply}"
+        );
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_classification_failure_names_step_scheme_node_resolution_and_remedy() {
+    for missing in [true, false] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        fixture.state.lock().unwrap().child_url_override =
+            Some("https://ungranted.example/private?token=private-value".into());
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        let mut capture = dom(false, false, false, false);
+        let nodes = capture["nodes"].as_array_mut().unwrap();
+        if missing {
+            nodes.retain(|node| node["backendNodeId"] != 3);
+        } else {
+            nodes
+                .iter_mut()
+                .find(|node| node["backendNodeId"] == 3)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("attributes");
+        }
+        fixture.state.lock().unwrap().dom_override = Some(capture);
+        let (reply, _) = fixture
+            .call(
+                1,
+                click(&tab, &snapshot, &reference(&snapshot, "Child go")),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(reply["reason"], "classification_unavailable", "{reply}");
+        assert_eq!(reply["detail"]["step"], "input.classify_flattened_document");
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains("frame_url_scheme=https"), "{reply}");
+        assert!(
+            remedy.contains(if missing {
+                "node_resolved_in_capture=no"
+            } else {
+                "node_resolved_in_capture=yes"
+            }),
+            "{reply}"
+        );
+        assert!(
+            remedy.contains(if missing {
+                "target_not_in_document"
+            } else {
+                "attributes_missing"
+            }),
+            "{reply}"
+        );
+        assert!(remedy.contains("fresh frame-aware snapshot"));
+        assert!(!reply.to_string().contains("private"));
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
 }
 
 #[tokio::test]

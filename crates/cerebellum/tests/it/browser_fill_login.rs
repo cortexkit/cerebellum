@@ -597,6 +597,7 @@ impl OwnedBrowserProcess for Process {
         document_epoch: u64,
         _: u64,
         _: bool,
+        _: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
         let viewport = ViewportObservation::new(
             document_epoch,

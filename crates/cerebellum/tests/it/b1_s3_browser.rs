@@ -537,6 +537,10 @@ impl OwnedBrowserProcess for SnapshotProcess {
 
 struct ScreenshotPipe {
     reads: VecDeque<Vec<u8>>,
+    metrics: Value,
+    dpr: f64,
+    images: VecDeque<String>,
+    captures: Arc<AtomicUsize>,
 }
 
 fn download_denied_replies(frames: impl IntoIterator<Item = Value>) -> Vec<Value> {
@@ -551,22 +555,44 @@ fn download_denied_replies(frames: impl IntoIterator<Item = Value>) -> Vec<Value
 }
 
 impl ScreenshotPipe {
-    fn with_frames(frames: impl IntoIterator<Item = Value>) -> Self {
+    fn new(metrics: Value, dpr: f64, images: VecDeque<String>, captures: Arc<AtomicUsize>) -> Self {
         Self {
-            reads: download_denied_replies(frames)
-                .into_iter()
-                .map(|frame| {
-                    let mut bytes = serde_json::to_vec(&frame).unwrap();
-                    bytes.push(0);
-                    bytes
-                })
-                .collect(),
+            reads: VecDeque::new(),
+            metrics,
+            dpr,
+            images,
+            captures,
         }
     }
 }
 
 impl CdpPipeIo for ScreenshotPipe {
-    fn write_frame(&mut self, _: &[u8]) -> io::Result<()> {
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let request: Value =
+            serde_json::from_slice(bytes.strip_suffix(&[0]).unwrap_or(bytes)).unwrap();
+        let result = match request["method"].as_str().unwrap() {
+            "Target.createTarget" => json!({"targetId":"target-own"}),
+            "Target.attachToTarget" => json!({"sessionId":"session-own"}),
+            "Page.getLayoutMetrics" => self.metrics.clone(),
+            "Runtime.evaluate" => json!({"result":{"type":"number","value":self.dpr}}),
+            "Page.captureScreenshot" => {
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                let image = if self.images.len() > 1 {
+                    self.images.pop_front().unwrap()
+                } else {
+                    self.images.front().unwrap().clone()
+                };
+                json!({"data":image})
+            }
+            _ => json!({}),
+        };
+        let mut reply = json!({"id":request["id"],"result":result});
+        if let Some(session) = request.get("sessionId") {
+            reply["sessionId"] = session.clone();
+        }
+        let mut bytes = serde_json::to_vec(&reply).unwrap();
+        bytes.push(0);
+        self.reads.push_back(bytes);
         Ok(())
     }
 
@@ -581,7 +607,6 @@ impl CdpPipeIo for ScreenshotPipe {
 
 struct ScreenshotProcess {
     driver: CdpNavigationDriver<ScreenshotPipe>,
-    captures: Arc<AtomicUsize>,
     /// Where the browser reports its main frame to be; a screenshot
     /// authorizes against this rather than the tracked navigation.
     page_url: &'static str,
@@ -602,10 +627,10 @@ impl OwnedBrowserProcess for ScreenshotProcess {
         document_epoch: u64,
         deadline_ms: u64,
         full: bool,
+        max_bytes: usize,
     ) -> Result<BrowserScreenshotObservation, NavigationDriveError> {
-        self.captures.fetch_add(1, Ordering::SeqCst);
         self.driver
-            .screenshot(context_key, document_epoch, deadline_ms, full)
+            .screenshot(context_key, document_epoch, deadline_ms, full, max_bytes)
     }
 
     // These fixtures exercise geometry and input ordering, with a fixed plain button.
@@ -1302,6 +1327,8 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
     let viewport = json!({
         "offsetX": 3.5,
         "offsetY": 4.25,
+        "pageX": 40.0,
+        "pageY": 80.0,
         "clientWidth": 40.0,
         "clientHeight": 20.0,
         "scale": 1.75
@@ -1322,28 +1349,13 @@ fn screenshot_process(captures: Arc<AtomicUsize>) -> ScreenshotProcess {
         "cssVisualViewport": viewport,
         "visualViewport": device_viewport,
     });
-    let frames = [
-        json!({"id":1,"result":{"targetId":"target-own"}}),
-        json!({"id":2,"result":{"sessionId":"session-own"}}),
-        json!({"id":3,"sessionId":"session-own","result":metrics.clone()}),
-        json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
-        json!({"id":5,"sessionId":"session-own","result":{"data":ONE_BY_ONE_PNG_B64}}),
-        json!({"id":6,"sessionId":"session-own","result":metrics.clone()}),
-        json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":2.25}}}),
-        json!({"id":8,"sessionId":"session-own","result":metrics}),
-        json!({"id":9,"sessionId":"session-own","result":{}}),
-        json!({"id":10,"sessionId":"session-own","result":{}}),
-        json!({"id":11,"sessionId":"session-own","result":{}}),
-        json!({"id":12,"sessionId":"session-own","result":{}}),
-    ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
-            ScreenshotPipe::with_frames(frames),
+            ScreenshotPipe::new(metrics, 2.25, [ONE_BY_ONE_PNG_B64.into()].into(), captures),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         )
         .with_incremental_ax_snapshots(),
-        captures,
         page_url: "https://requested.example.com/page",
     }
 }
@@ -1388,6 +1400,22 @@ fn screenshot_process_with_capture(
     dpr: f64,
     png_b64: &str,
 ) -> ScreenshotProcess {
+    screenshot_process_with_images(
+        captures,
+        css_width,
+        css_height,
+        dpr,
+        [png_b64.into()].into(),
+    )
+}
+
+fn screenshot_process_with_images(
+    captures: Arc<AtomicUsize>,
+    css_width: f64,
+    css_height: f64,
+    dpr: f64,
+    images: VecDeque<String>,
+) -> ScreenshotProcess {
     let viewport = json!({
         "offsetX": 3.5,
         "offsetY": 4.25,
@@ -1410,28 +1438,13 @@ fn screenshot_process_with_capture(
         "cssVisualViewport": viewport,
         "visualViewport": device_viewport,
     });
-    let frames = [
-        json!({"id":1,"result":{"targetId":"target-own"}}),
-        json!({"id":2,"result":{"sessionId":"session-own"}}),
-        json!({"id":3,"sessionId":"session-own","result":metrics.clone()}),
-        json!({"id":4,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
-        json!({"id":5,"sessionId":"session-own","result":{"data":png_b64}}),
-        json!({"id":6,"sessionId":"session-own","result":metrics.clone()}),
-        json!({"id":7,"sessionId":"session-own","result":{"result":{"type":"number","value":dpr}}}),
-        json!({"id":8,"sessionId":"session-own","result":metrics}),
-        json!({"id":9,"sessionId":"session-own","result":{}}),
-        json!({"id":10,"sessionId":"session-own","result":{}}),
-        json!({"id":11,"sessionId":"session-own","result":{}}),
-        json!({"id":12,"sessionId":"session-own","result":{}}),
-    ];
     ScreenshotProcess {
         driver: CdpNavigationDriver::new(
-            ScreenshotPipe::with_frames(frames),
+            ScreenshotPipe::new(metrics, dpr, images, captures),
             CdpTransport::new(),
             CdpFrameDecoder::default(),
         )
         .with_incremental_ax_snapshots(),
-        captures,
         page_url: "https://requested.example.com/page",
     }
 }
@@ -1988,7 +2001,7 @@ async fn screenshot_full_keeps_the_uncropped_capture_dimensions() {
 }
 
 #[tokio::test]
-async fn screenshot_full_over_max_bytes_refuses_rather_than_downscaling() {
+async fn screenshot_full_over_max_bytes_exhausts_scales_and_names_smallest_step() {
     let route = identity();
     let captures = Arc::new(AtomicUsize::new(0));
     let capture_width = 3136;
@@ -2020,11 +2033,55 @@ async fn screenshot_full_over_max_bytes_refuses_rather_than_downscaling() {
     assert_eq!(refused["outcome"], "image_too_large", "{refused}");
     assert_eq!(refused["detail"]["bytes"], png.len());
     assert_eq!(refused["detail"]["bound_bytes"], bound_bytes);
+    assert!(refused["remedy"].as_str().unwrap().contains("1/16"));
     assert_eq!(
         captures.load(Ordering::SeqCst),
-        1,
-        "full over the byte bound retried a downscaled capture"
+        5,
+        "full starts at native size but must still retry smaller captures to meet max_bytes"
     );
+}
+
+#[tokio::test]
+async fn oversize_own_screenshot_scales_to_fit_even_when_full_is_requested() {
+    const NATIVE: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAA/UlEQVR4nO3RoQ0A",
+        "MBDEsNt/6e8YDTAwj5TddnTsdwCGpBkSY0iMITGGxBgSY0iMITGGxBgSY0iMITGG",
+        "xBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgS",
+        "Y0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iM",
+        "ITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGG",
+        "xBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgSY0iMITGGxBgS",
+        "8wBKb9Zkl+sjewAAAABJRU5ErkJggg==",
+    );
+    const SCALED: &str = "iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAYAAAAeP4ixAAAAVElEQVR4nO3PsQ0AMAjAMP5/mp7RCHnIHs/O7IXm9wAISDyQWiC1QGqB1AKpBVILpBZILZBaILVAaoHUAqkFUgukFkgtkFogtUBqgdQCqQVS6wzkAbAzdZYM2Ma3AAAAAElFTkSuQmCC";
+    cerebellum::coordinate::validate_png_base64_dimensions(NATIVE).unwrap();
+    let route = identity();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let plane = plane_with_process(
+        &route,
+        Box::new(screenshot_process_with_images(
+            Arc::clone(&captures),
+            100.0,
+            100.0,
+            1.0,
+            [NATIVE.into(), SCALED.into()].into(),
+        )),
+        100,
+    );
+    plane.open_context(route.clone()).await.unwrap();
+    position_on_authorized_page(&plane, &route).await;
+    let captured = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Screenshot,
+            &json!({"full":true,"max_bytes":250}),
+        )
+        .await;
+    assert_eq!(captured["outcome"], "ok", "{captured}");
+    assert_eq!(captured["image_width_px"], 50);
+    assert_eq!(captured["image_height_px"], 50);
+    assert_eq!(captured["image"]["data_b64"], SCALED);
+    assert!(captured["remedy"].as_str().unwrap().contains("50.00%"));
+    assert_eq!(captures.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
