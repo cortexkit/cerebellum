@@ -3,6 +3,7 @@
 //! are simulated, so these tests need no installed browser or real login.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -359,13 +360,39 @@ async fn next_ending(planes: &Planes) -> LateResultsReply {
     .expect("the handoff watcher did not settle before the test hang guard")
 }
 
+async fn present_for_watch(planes: &Planes, key: &str) -> Value {
+    struct ResumeClock;
+    impl Drop for ResumeClock {
+        fn drop(&mut self) {
+            tokio::time::resume();
+        }
+    }
+
+    // These tests check the watcher, not the six-second call-record admission
+    // budget. Stop its clock during file-backed setup so a busy blocking worker
+    // cannot refuse the present before the watcher runs. Keep the task runnable
+    // to prevent Tokio's automatic time advance, with a real-clock hang guard.
+    tokio::time::pause();
+    let _resume = ResumeClock;
+    let started = std::time::Instant::now();
+    let mut setup = std::pin::pin!(present(planes, Some(key)));
+    loop {
+        assert!(started.elapsed() < HANG_GUARD, "keyed present setup hung");
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(reply) = setup.as_mut().poll(&mut context) {
+            return reply;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn handoff_watch_observes_login_before_first_tick_without_resume_or_journal() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
     assert_eq!(
-        present(&planes, Some("pf:autonomous")).await["expires_in_ms"],
+        present_for_watch(&planes, "pf:autonomous").await["expires_in_ms"],
         HANDOFF_DURATION_MS
     );
     assert!(facts.credential_polled.load(Ordering::SeqCst));
@@ -411,7 +438,7 @@ async fn handoff_watch_unreadable_opening_field_is_not_login_evidence() {
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
     facts.credential_unreadable.store(true, Ordering::SeqCst);
     assert_eq!(
-        present(&planes, Some("pf:unreadable")).await["outcome"],
+        present_for_watch(&planes, "pf:unreadable").await["outcome"],
         "login_pending"
     );
     facts.logged_in.store(true, Ordering::SeqCst);
@@ -442,7 +469,7 @@ async fn handoff_watch_expiry_still_settles_without_resume() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
-    present(&planes, Some("pf:expires")).await;
+    present_for_watch(&planes, "pf:expires").await;
     planes
         .sessions
         .expire_handoff_for_test("test-session", planes.lease_clock.as_ref());
@@ -473,7 +500,7 @@ async fn handoff_watch_stops_after_close() {
         planes.lease_clock.as_ref(),
         SystemTime::now(),
     );
-    present(&planes, Some("pf:close")).await;
+    present_for_watch(&planes, "pf:close").await;
     let closed = call(
         &planes,
         9,
