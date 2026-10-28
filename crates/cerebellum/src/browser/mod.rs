@@ -4733,7 +4733,7 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         },
         BrowserToolDefinition {
             name: SCROLL,
-            description: "Scroll a previously printed ref into view, or scroll by direction and amount (CSS pixels, default 600). Tier 1; never fronts the window. Choose ref or direction, not both. Unsupported on the user-browser target.",
+            description: "Scroll a previously printed ref into view, or scroll by direction and amount (CSS pixels, default 600). Tier 1; never fronts the window. Choose ref or direction, not both. On the user-browser target it scrolls a claimed tab the agent has read, and refuses if the person used the page since.",
             request_schema: json!({"type":"object","properties":{
                 "ref":{"type":"string","description":"A previously printed ref to bring into view. Do not combine with direction or amount."},
                 "direction":{"type":"string","enum":["up","down","left","right"],"description":"Use instead of ref."},
@@ -8245,7 +8245,7 @@ mod tests {
         // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "3b578a645cc899d123b4ac85241500b1111963fe9d65325fb4dc868b7d06f0ca"
+            "b2d46d21d47cfd4ff91322813afd724de226af271eb06f5f4bce179e6e156bdd"
         );
     }
 

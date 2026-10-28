@@ -594,6 +594,9 @@ pub const USER_TYPE_PLANS: u64 = 1 + 1 + 3 * (2 + 1) + 1 + 2 + 1;
 // (AX/DOM, confirm). Navigation cannot request dom_full. Commit polling is
 // variable-length and shares one phase cap.
 pub const USER_NAVIGATE_PLANS: u64 = 2 + 1 + 2;
+// Scroll: document + (root element and viewport read) + scroll = 3. A ref
+// scroll needs no root-element read, so it uses one fewer.
+pub const USER_SCROLL_PLANS: u64 = 1 + 1 + 1;
 pub const USER_NAVIGATION_READ_MS: u64 =
     crate::user_browser::NAVIGATION_READ_DEADLINE.as_millis() as u64;
 // Reserve one queue wait, two acknowledgement caps per planned attachment,
@@ -629,6 +632,7 @@ user_budget!(USER_CLOSE, "close", 1, 1, 0);
 user_budget!(USER_SNAPSHOT, "snapshot", USER_SNAPSHOT_PLANS, 3, 0);
 user_budget!(USER_SCREENSHOT, "screenshot", USER_SCREENSHOT_PLANS, 2, 0);
 user_budget!(USER_NAVIGATE, "navigate", USER_NAVIGATE_PLANS, 3, 1);
+user_budget!(USER_SCROLL, "scroll", USER_SCROLL_PLANS, 3, 0);
 user_budget!(USER_CLICK, "click", USER_CLICK_PLANS, 7, 0);
 user_budget!(
     USER_CLICK_POINT,
@@ -645,7 +649,7 @@ budget!(
     [("store", STORE_MS, 2)]
 );
 budget!(USER_UNSUPPORTED, "unsupported", [("journal", STORE_MS, 1)]);
-pub const USER_BROWSER_ACTIONS: [ActionBudget; 12] = [
+pub const USER_BROWSER_ACTIONS: [ActionBudget; 13] = [
     USER_OPEN_TAB,
     USER_CLAIM_TAB,
     USER_STATUS,
@@ -653,6 +657,7 @@ pub const USER_BROWSER_ACTIONS: [ActionBudget; 12] = [
     USER_SNAPSHOT,
     USER_SCREENSHOT,
     USER_NAVIGATE,
+    USER_SCROLL,
     USER_CLICK,
     USER_CLICK_POINT,
     USER_TYPE,
@@ -664,7 +669,7 @@ pub fn user_browser(action: &str) -> Option<&'static ActionBudget> {
     lookup(&USER_BROWSER_ACTIONS, action).or_else(|| {
         matches!(
             action,
-            "launch" | "present" | "resume" | "import_login" | "capture_login" | "scroll"
+            "launch" | "present" | "resume" | "import_login" | "capture_login"
         )
         .then_some(&USER_UNSUPPORTED)
     })
@@ -695,7 +700,7 @@ pub const fn user_consent_count(action: &str) -> u64 {
     // Typing only edits a field, so it needs no link-destination approval.
     match action.as_bytes() {
         b"click" | b"click_point" => 3,
-        b"snapshot" | b"screenshot" | b"navigate" | b"type" | b"open_grant" => 1,
+        b"snapshot" | b"screenshot" | b"navigate" | b"scroll" | b"type" | b"open_grant" => 1,
         _ => 0,
     }
 }

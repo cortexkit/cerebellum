@@ -107,6 +107,7 @@ async fn user_browser_retains_the_authorizing_row_and_rechecks_it_before_plan_di
             None,
             &CancelHandle::pending(),
             vec![],
+            false,
         )
         .await;
         assert_eq!(result.err().unwrap()["reason"], "grant_revoked");
