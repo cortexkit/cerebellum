@@ -671,6 +671,12 @@ impl TerminalArbiter {
         let dispatched = self.state.lock().unwrap().possibly_dispatched
             || self.gate.0.load(std::sync::atomic::Ordering::SeqCst) & 1 != 0;
         let outcome = body["outcome"].as_str().unwrap_or_default();
+        if outcome == "consent_pending" && !dispatched {
+            // A grant can authorize classification before the action needs a
+            // second permission. Waiting for that answer is not a refusal of
+            // the earlier grant; its card still belongs to a future retry.
+            return;
+        }
         let refused_before_dispatch =
             body["input_dispatched"] == false || body["detail"]["dispatched"] == false;
         let success = reply.header.ty == FrameType::Response
@@ -688,6 +694,18 @@ impl TerminalArbiter {
                     | "screenshot"
                     | "read"
             );
+        if success
+            && serde_json::from_slice::<Value>(&self.request.body)
+                .ok()
+                .is_some_and(|request| {
+                    request["name"] == "browser_use"
+                        && request["arguments"]["action"] == "open_grant"
+                })
+        {
+            // Saving or checking permission does not run the browser action
+            // that will eventually consume it.
+            return;
+        }
         let execution = if matches!(outcome, "dispatch_outcome_unknown" | "outcome_unknown") {
             Execution::OutcomeUnknown
         } else if body["effect_status"] == "not_dispatched" {
@@ -1225,6 +1243,75 @@ mod consent_execution_tests {
     }
 
     #[test]
+    fn durable_browser_app_and_takeover_cards_wait_through_another_pending_permission() {
+        for (kind, choice) in [
+            (CardKind::UserBrowserSite, "allow_origin_always"),
+            (CardKind::AppControl, "allow_30m"),
+            (CardKind::Takeover, "computer_30m"),
+        ] {
+            let store = Arc::new(Saved(std::sync::Mutex::new(vec![RaisedCard {
+                elicitation_id: "el_saved".into(),
+                session: SessionKey {
+                    owner: "owner".into(),
+                    scope_ref: "scope".into(),
+                    scope_epoch: 1,
+                },
+                kind,
+                subject: "target".into(),
+                grant_ids: vec![choice.into()],
+                decline_id: "deny".into(),
+                next_steps: Default::default(),
+                applied: true,
+                lifecycle: CardLifecycle {
+                    answered: true,
+                    answer_choice: Some(choice.into()),
+                    deferred_use: true,
+                    ..Default::default()
+                },
+            }])));
+            let desk = Arc::new(ConsentDesk::with_store(
+                Arc::new(ScriptedCingulate::new()),
+                store.clone(),
+            ));
+            for dispatch in [false, true] {
+                let request =
+                    Frame::build(FrameType::Request, control_flags(), 1, 1, 1, vec![]).unwrap();
+                let terminal = TerminalArbiter::new(request);
+                terminal.track_consent(Arc::clone(&desk), "el_saved");
+                if dispatch {
+                    assert!(terminal.gate.begin_mutation());
+                }
+                let body = if dispatch {
+                    json!({"outcome":"ok"})
+                } else {
+                    json!({"outcome":"consent_pending","input_dispatched":false})
+                };
+                let reply = Frame::build(
+                    FrameType::Response,
+                    control_flags(),
+                    1,
+                    1,
+                    1,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+                terminal.finish_consent(&reply);
+                let card = &store.load().unwrap()[0];
+                if dispatch {
+                    assert_eq!(
+                        card.lifecycle.final_report.unwrap().execution,
+                        Execution::Executed,
+                        "{kind:?}"
+                    );
+                } else {
+                    assert_eq!(card.lifecycle.final_report, None, "{kind:?}");
+                    assert!(!card.lifecycle.dispatch_started);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn final_action_reports_distinguish_dispatch_refusal_and_postdispatch_deadline() {
         for kind in [
             CardKind::AppControl,
@@ -1234,6 +1321,12 @@ mod consent_execution_tests {
         ] {
             for (dispatch, body, execution, reason) in [
                 (true, json!({"outcome":"ok"}), Execution::Executed, None),
+                (
+                    true,
+                    json!({"outcome":"consent_pending"}),
+                    Execution::Executed,
+                    None,
+                ),
                 (
                     false,
                     json!({"outcome":"ok","input_dispatched":false}),

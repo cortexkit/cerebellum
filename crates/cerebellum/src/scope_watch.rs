@@ -440,6 +440,18 @@ impl ScopeRevocation {
         starting
     }
 
+    /// Retained consent cards need a scope watcher without claiming that a
+    /// browser conversation was open in this process. Share any existing watch.
+    pub(crate) fn note_retained(&self, key: &ScopeKey) -> bool {
+        let mut watched = self.watched();
+        if let std::collections::hash_map::Entry::Vacant(entry) = watched.entry(key.clone()) {
+            entry.insert(Watched::default());
+            true
+        } else {
+            false
+        }
+    }
+
     /// What wakes `key`'s watcher when another route under it closes.
     pub fn closed_again(&self, key: &ScopeKey) -> std::sync::Arc<tokio::sync::Notify> {
         self.watched()
@@ -491,6 +503,26 @@ impl ScopeRevocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_consent_and_closed_routes_share_one_watch_without_inventing_a_conversation() {
+        let scopes = ScopeRevocation::default();
+        let key = ScopeKey::from_stamp(&crate::computer_grants::tests::stamp("scope"));
+        assert!(scopes.note_retained(&key));
+        assert!(!scopes.note_retained(&key));
+        assert!(scopes.conversations(&key).is_empty());
+        assert!(!scopes.note_closed(&key, "real-conversation"));
+        assert_eq!(
+            scopes.finish(&key),
+            BTreeSet::from(["real-conversation".into()])
+        );
+        assert!(scopes.note_closed(&key, "another-conversation"));
+        assert!(!scopes.note_retained(&key));
+        assert_eq!(
+            scopes.finish(&key),
+            BTreeSet::from(["another-conversation".into()])
+        );
+    }
 
     fn answer(
         status: ScopeStatus,

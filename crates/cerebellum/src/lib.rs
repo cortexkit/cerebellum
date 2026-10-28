@@ -1599,12 +1599,17 @@ impl RouteBindings {
 /// the answer is unresolved everything stays, and the scope is asked about
 /// again when another route under it closes, or once per
 /// [`scope_watch::SCOPE_RECHECK_INTERVAL`], but only while a
-/// browser it opened is still open and no route under it is bound: a bound
-/// route asks again itself when it closes, and with no browser open nothing is
-/// running that a late end would have to stop.
+/// browser it opened is still open or an answered consent card awaits execution,
+/// and no route under it is bound. A bound route asks again when it closes;
+/// retained cards must learn a late session end even with no browser open.
 async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_watch::ScopeKey) {
     let mut drain = planes.drain_signal.subscribe();
     let closed_again = planes.scopes.closed_again(&key);
+    let session = cingulate_client::live_call::SessionKey {
+        owner: serde_json::to_string(&key.owner).unwrap_or_default(),
+        scope_ref: key.scope_ref.clone(),
+        scope_epoch: key.scope_epoch,
+    };
     loop {
         let answer = planes.scopes.describe(&writer, &key).await;
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
@@ -1614,13 +1619,7 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             // A route under the scope whose close has not reached this module
             // yet belongs to the ended session too.
             conversations.extend(planes.routes.conversations_under_scope(&key));
-            let _ = planes
-                .consent
-                .forget_session(&cingulate_client::live_call::SessionKey {
-                    owner: serde_json::to_string(&key.owner).unwrap_or_default(),
-                    scope_ref: key.scope_ref.clone(),
-                    scope_epoch: key.scope_epoch,
-                });
+            let _ = planes.consent.forget_session(&session);
             revoke_scope(&planes, &conversations).await;
             return;
         }
@@ -1629,7 +1628,11 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             .conversations(&key)
             .iter()
             .any(|conversation_key| planes.sessions.has_open_session(conversation_key));
-        if !browser_open || planes.routes.carries_scope(&key) {
+        let consent_waiting = planes
+            .consent
+            .awaiting_execution_sessions()
+            .contains(&session);
+        if (!browser_open && !consent_waiting) || planes.routes.carries_scope(&key) {
             planes.scopes.finish(&key);
             return;
         }
@@ -1642,6 +1645,23 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
                 planes.scopes.finish(&key);
                 return;
             }
+        }
+    }
+}
+
+fn watch_retained_consent_scopes(planes: &Planes, writer: &mpsc::Sender<Frame>) {
+    for session in planes.consent.awaiting_execution_sessions() {
+        let Ok(owner) = serde_json::from_str(&session.owner) else {
+            // An unreadable owner cannot establish that a session ended.
+            continue;
+        };
+        let key = scope_watch::ScopeKey {
+            owner,
+            scope_ref: session.scope_ref,
+            scope_epoch: session.scope_epoch,
+        };
+        if planes.scopes.note_retained(&key) {
+            tokio::spawn(watch_scope(planes.clone(), writer.clone(), key));
         }
     }
 }
@@ -2738,6 +2758,7 @@ where
     expect_hello_ack(read_half).await?;
 
     planes.scopes.control.connect(&writer);
+    watch_retained_consent_scopes(&planes, &writer);
 
     let mut idle_wake = PeriodicIdleWake {
         period: idle_wake_period(config.health.heartbeat_threshold()),

@@ -227,14 +227,24 @@ async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clo
 }
 
 async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
-    let script = ScriptedCingulate::new();
+    late_site_answer_with_hazards(choice, tier, json!([]))
+        .await
+        .0
+}
+
+async fn late_site_answer_with_hazards(
+    choice: &str,
+    tier: u8,
+    hazards: Value,
+) -> (Fixture, Arc<ScriptedCingulate>) {
+    let script = ScriptedCingulate::new().accept_execution_reports();
     let fixture = Fixture::scripted(&script);
     fixture.state.lock().unwrap().top_level_only = true;
     let args = if tier == 1 {
         let tab = fixture.claim(1).await;
         snapshot_args(&tab)
     } else {
-        ask(tier, json!([]), "https://example.com")
+        ask(tier, hazards, "https://example.com")
     };
     script
         .then(
@@ -251,7 +261,7 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
                 json!({"elicitation_id":"el_late_site","state":"pending","detached":true}),
             ),
         );
-    let (reply, _) = fixture.call(1, args, "").await;
+    let reply = fixture.finish(fixture.start_arbitrated(args)).await;
     assert_eq!(reply["outcome"], "consent_pending", "{reply}");
     assert!(rows(&fixture).is_empty());
     // The observer may be replaced while consent is detached. The retry's new
@@ -262,8 +272,8 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
         .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
     // Status does not retry the original demand. Its admitted-call drain must
     // nevertheless make the durable answer available to subsequent actions.
-    let (status, _) = fixture
-        .call(1, json!({"browser":"user","action":"status"}), "")
+    let status = fixture
+        .finish(fixture.start_arbitrated(json!({"browser":"user","action":"status"})))
         .await;
     assert_eq!(status["outcome"], "ok", "{status}");
     assert_eq!(
@@ -274,7 +284,387 @@ async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
             .count(),
         1
     );
+    (fixture, script)
+}
+
+async fn consent_scope_question(replies: &mut mpsc::Receiver<Frame>) -> Frame {
+    let question = tokio::time::timeout(HANG_GUARD, replies.recv())
+        .await
+        .expect("scope describe is bounded")
+        .expect("scope describe request");
+    assert_eq!(question.header.ty, subc_protocol::FrameType::Request);
+    assert_eq!(question.header.channel, 0);
+    let body: Value = serde_json::from_slice(&question.body).unwrap();
+    assert_eq!(body["op"], "scope.describe");
+    assert_eq!(body["ref"], "card-tests");
+    question
+}
+
+async fn answer_consent_scope(
+    planes: &Planes,
+    writer: &mpsc::Sender<Frame>,
+    question: &Frame,
+    ty: subc_protocol::FrameType,
+    answer: Value,
+) {
+    let frame = Frame::build(
+        ty,
+        crate::control_flags(),
+        0,
+        0,
+        question.header.corr,
+        serde_json::to_vec(&answer).unwrap(),
+    )
+    .unwrap();
+    crate::handle_frame_for_test(frame, writer, planes)
+        .await
+        .unwrap();
+}
+
+async fn wait_for_consent_session_end(planes: &Planes) {
+    tokio::time::timeout(HANG_GUARD, async {
+        while !planes
+            .consent
+            .raised("el_late_site")
+            .unwrap()
+            .lifecycle
+            .ended
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("confirmed session end is recorded");
+}
+
+#[tokio::test]
+async fn route_goodbye_waits_for_confirmed_session_end_without_revoking_the_saved_site_grant() {
+    use crate::cingulate_client::wire::{Execution, ExecutionReason};
+    let (fixture, script) = late_site_answer_with_hazards(
+        "allow_origin_always",
+        3,
+        json!(["unverified_form_contents"]),
+    )
+    .await;
+    let granted = rows(&fixture);
+    let mut planes = (*fixture.planes).clone();
+    planes.scopes = Arc::new(crate::scope_watch::ScopeRevocation::with_intervals(
+        Duration::from_millis(10),
+        HANG_GUARD,
+    ));
+    let (writer, mut replies) = mpsc::channel(8);
+    for channel in [1, 2] {
+        let goodbye = Frame::build(
+            subc_protocol::FrameType::Goodbye,
+            crate::control_flags(),
+            channel,
+            1,
+            0,
+            vec![],
+        )
+        .unwrap();
+        crate::handle_frame_for_test(goodbye, &writer, &planes)
+            .await
+            .unwrap();
+        assert!(planes.routes.get(channel, 1).is_none());
+    }
+    let question = consent_scope_question(&mut replies).await;
+    assert_eq!(
+        planes
+            .consent
+            .raised("el_late_site")
+            .unwrap()
+            .lifecycle
+            .final_report,
+        None
+    );
+    answer_consent_scope(
+        &planes,
+        &writer,
+        &question,
+        subc_protocol::FrameType::Error,
+        json!({"code":"unavailable","message":"try again"}),
+    )
+    .await;
+    let question = consent_scope_question(&mut replies).await;
+    assert_eq!(
+        planes
+            .consent
+            .raised("el_late_site")
+            .unwrap()
+            .lifecycle
+            .final_report,
+        None
+    );
+    assert_eq!(rows(&fixture), granted);
+    answer_consent_scope(
+        &planes,
+        &writer,
+        &question,
+        subc_protocol::FrameType::Response,
+        json!({"op":"scope.describe","status":"ended","scope_epoch":1,
+            "daemon_incarnation":"test","owner_synced":true,"owner_configured":true}),
+    )
+    .await;
+    wait_for_consent_session_end(&planes).await;
+    let card = planes.consent.raised("el_late_site").unwrap();
+    let report = card.lifecycle.final_report.unwrap();
+    assert_eq!(report.execution, Execution::ApprovedNotExecuted);
+    assert_eq!(report.reason, Some(ExecutionReason::SessionEnded));
+    assert!(!card.lifecycle.dispatch_started);
+    assert_eq!(rows(&fixture), granted);
+
+    let frame = tool_frame(3, 1, json!({"browser":"user","action":"status"}));
+    crate::install_test_bind(&planes.routes, &frame);
+    let mut stamp = crate::computer_grants::tests::stamp("next-agent");
+    stamp.scope_ref = "next-session".into();
+    let facts = planes.routes.get(3, 1).unwrap().with_scope(Some(stamp));
+    planes.routes.insert(3, 1, facts);
+    script.report_features(Some(crate::cingulate_client::features::CingulateFeatures {
+        option_group: true,
+        single_use: false,
+        no_expiry: true,
+        secret_use_approval: true,
+    }));
     fixture
+        .call(3, json!({"browser":"user","action":"status"}), "")
+        .await;
+    let reports: Vec<_> = script
+        .calls()
+        .into_iter()
+        .filter(|(method, _)| method == wire::CONSENT_REPORT_EXECUTION)
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].1["execution"], "approved_not_executed");
+    assert_eq!(reports[0].1["reason"], "session_ended");
+    assert_eq!(rows(&fixture), granted);
+}
+
+#[tokio::test]
+async fn restarted_consent_desk_waits_for_scope_evidence_before_settling_an_unused_grant() {
+    use crate::cingulate_client::desk::ConsentDesk;
+    use crate::cingulate_client::wire::{Execution, ExecutionReason};
+    let (fixture, script) = late_site_answer_with_hazards(
+        "allow_origin_always",
+        3,
+        json!(["unverified_form_contents"]),
+    )
+    .await;
+    let granted = rows(&fixture);
+    let mut recovered = (*fixture.planes).clone();
+    recovered.consent = Arc::new(ConsentDesk::with_store(
+        Arc::new(script.clone()),
+        Arc::new(FileRegistryStore::new(
+            fixture.registry.join("registry.json"),
+        )),
+    ));
+    recovered.routes = Arc::new(crate::RouteBindings::default());
+    recovered.scopes = Arc::new(crate::scope_watch::ScopeRevocation::with_intervals(
+        Duration::from_millis(10),
+        HANG_GUARD,
+    ));
+    let (writer, mut replies) = mpsc::channel(8);
+    recovered.scopes.control.connect(&writer);
+    crate::watch_retained_consent_scopes(&recovered, &writer);
+    // Starting recovery twice must share the same watcher, not two describes.
+    crate::watch_retained_consent_scopes(&recovered, &writer);
+    for (ty, answer) in [
+        (
+            subc_protocol::FrameType::Response,
+            json!({"op":"scope.describe","status":"not_live",
+            "daemon_incarnation":"restarted","owner_synced":false,"owner_configured":true}),
+        ),
+        (
+            subc_protocol::FrameType::Error,
+            json!({"code":"unavailable","message":"try again"}),
+        ),
+        (
+            subc_protocol::FrameType::Response,
+            json!({"op":"scope.describe","status":"live","scope_epoch":1,
+            "daemon_incarnation":"restarted","owner_synced":true,"owner_configured":true}),
+        ),
+    ] {
+        let question = consent_scope_question(&mut replies).await;
+        assert_eq!(recovered.scopes.control.outstanding(), 1);
+        assert_eq!(
+            recovered
+                .consent
+                .raised("el_late_site")
+                .unwrap()
+                .lifecycle
+                .final_report,
+            None
+        );
+        assert_eq!(rows(&fixture), granted);
+        answer_consent_scope(&recovered, &writer, &question, ty, answer).await;
+    }
+    let question = consent_scope_question(&mut replies).await;
+    assert_eq!(
+        recovered
+            .consent
+            .raised("el_late_site")
+            .unwrap()
+            .lifecycle
+            .final_report,
+        None
+    );
+    answer_consent_scope(
+        &recovered,
+        &writer,
+        &question,
+        subc_protocol::FrameType::Response,
+        json!({"op":"scope.describe","status":"ended","scope_epoch":1,
+            "daemon_incarnation":"restarted","owner_synced":true,"owner_configured":true}),
+    )
+    .await;
+    wait_for_consent_session_end(&recovered).await;
+    let report = recovered
+        .consent
+        .raised("el_late_site")
+        .unwrap()
+        .lifecycle
+        .final_report
+        .unwrap();
+    assert_eq!(report.execution, Execution::ApprovedNotExecuted);
+    assert_eq!(report.reason, Some(ExecutionReason::SessionEnded));
+    assert_eq!(rows(&fixture), granted);
+}
+
+#[tokio::test]
+async fn retrying_open_grant_does_not_report_the_saved_permission_as_executed() {
+    let (fixture, script) = late_site_answer_with_hazards(
+        "allow_origin_always",
+        3,
+        json!(["unverified_form_contents"]),
+    )
+    .await;
+    let reply = fixture
+        .finish(fixture.start_arbitrated(ask(
+            3,
+            json!(["unverified_form_contents"]),
+            "https://example.com",
+        )))
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["input_dispatched"], false);
+    let card = fixture.planes.consent.raised("el_late_site").unwrap();
+    assert_eq!(card.lifecycle.final_report, None);
+    assert!(!card.lifecycle.dispatch_started);
+    assert_eq!(rows(&fixture).len(), 1);
+    assert!(!script
+        .methods()
+        .iter()
+        .any(|m| m == wire::CONSENT_REPORT_EXECUTION));
+}
+
+#[tokio::test]
+async fn late_durable_site_approval_waits_for_retry_before_reporting_execution() {
+    use crate::cingulate_client::wire::Execution;
+
+    for choice in ["allow_30m", "allow_origin_always"] {
+        let (fixture, script) =
+            late_site_answer_with_hazards(choice, 3, json!(["unverified_form_contents"])).await;
+        let granted = rows(&fixture);
+        assert_eq!(granted.len(), 1);
+        assert_eq!(granted[0].max_level, 3);
+        assert_eq!(granted[0].card_ref.as_deref(), Some("el_late_site"));
+        assert!(granted[0]
+            .hazards
+            .contains(&crate::authorization::HazardClass::UnverifiedFormContents));
+        let card = fixture.planes.consent.raised("el_late_site").unwrap();
+        assert!(card.applied && card.lifecycle.acked && card.lifecycle.deferred_use);
+        assert!(!card.lifecycle.approval_taken && !card.lifecycle.dispatch_started);
+        assert_eq!(card.lifecycle.final_report, None, "{choice}");
+        assert!(!script
+            .methods()
+            .iter()
+            .any(|m| m == wire::CONSENT_REPORT_EXECUTION));
+
+        fixture.state.lock().unwrap().submit_button = true;
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "").await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        script
+            .then(
+                wire::CONSENT_REQUEST,
+                Reply::Result(json!({"elicitation_id":"el_stronger"})),
+            )
+            .then(
+                wire::CONSENT_AWAIT,
+                Reply::Result(json!({"elicitation_id":"el_stronger","state":"pending"})),
+            )
+            .then(
+                wire::CONSENT_DETACH,
+                Reply::Result(
+                    json!({"elicitation_id":"el_stronger","state":"pending","detached":true}),
+                ),
+            );
+        let reply = fixture
+            .finish(fixture.start_arbitrated(click(&tab, &snapshot, &reference(&snapshot, "Go"))))
+            .await;
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        assert_eq!(reply["input_dispatched"], false);
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+        let stronger = script
+            .calls()
+            .into_iter()
+            .rfind(|(method, _)| method == wire::CONSENT_REQUEST)
+            .unwrap()
+            .1;
+        assert_eq!(stronger["scope"]["severity_tier"], 4);
+        let card = fixture.planes.consent.raised("el_late_site").unwrap();
+        assert!(!card.lifecycle.dispatch_started);
+        assert_eq!(
+            card.lifecycle.final_report, None,
+            "pending another permission is not a refusal of {choice}"
+        );
+
+        // A later ordinary click can use the saved grant without the stronger
+        // permission. The earlier attempt classified its target but sent no input.
+        fixture.state.lock().unwrap().submit_button = false;
+        script
+            .then(
+                wire::CONSENT_ANSWERS,
+                Reply::Result(json!({"records":[],"cursor":2})),
+            )
+            .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":2})));
+        let (snapshot, _) = fixture.snapshot(1, &tab, "").await;
+        script
+            .then(
+                wire::CONSENT_ANSWERS,
+                Reply::Result(json!({"records":[],"cursor":2})),
+            )
+            .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":2})));
+        let reply = fixture
+            .finish(fixture.start_arbitrated(click(&tab, &snapshot, &reference(&snapshot, "Go"))))
+            .await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert!(!fixture.state.lock().unwrap().inputs.is_empty());
+        let card = fixture.planes.consent.raised("el_late_site").unwrap();
+        assert!(card.lifecycle.dispatch_started);
+        assert_eq!(
+            card.lifecycle.final_report.unwrap().execution,
+            Execution::Executed
+        );
+
+        script
+            .then(
+                wire::CONSENT_ANSWERS,
+                Reply::Result(json!({"records":[],"cursor":2})),
+            )
+            .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":2})));
+        fixture
+            .call(1, json!({"browser":"user","action":"status"}), "")
+            .await;
+        let reports: Vec<_> = script
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == wire::CONSENT_REPORT_EXECUTION)
+            .collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].1["execution"], "executed");
+        assert!(reports[0].1.get("reason").is_none());
+    }
 }
 
 #[tokio::test]
