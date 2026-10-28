@@ -41,3 +41,7 @@ tokio-util = { version = "0.7", default-features = false }
 # default disposition restored so a supervisor sees a death by signal. The
 # default features add a signal-iterator thread this module does not use.
 signal-hook = { version = "0.4", default-features = false }
+
+# Test fixtures hash executable bytes; keep hashing fast in dev and inherited test builds.
+[profile.dev.package.sha2]
+opt-level = 3
