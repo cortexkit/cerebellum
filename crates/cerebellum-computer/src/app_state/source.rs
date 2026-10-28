@@ -552,6 +552,11 @@ pub trait AppStateSource: Send + Sync {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 
+    /// Ask the element to open its menu without moving the pointer.
+    fn show_menu(&self, _element: &ElementHandle) -> Result<(), ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
     /// The element's value when it is text; `Ok(None)` when it has none.
     fn text_value(&self, _element: &ElementHandle) -> Result<Option<String>, ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)

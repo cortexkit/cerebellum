@@ -790,8 +790,8 @@ fn is_blocked_menu_item(facts: &ElementFacts) -> bool {
         && facts.title.as_deref().is_some_and(is_session_ending_title)
 }
 
-/// Press one element, journaling the attempt. Returns the reply so far; the
-/// caller adds the diff to a completed one.
+/// Activate one element, preferring a press to opening its menu, and journal
+/// the action sent. The caller adds the observed diff to a completed reply.
 pub(crate) fn press_blocking<R, T, S>(
     source: &dyn AppStateSource,
     journal: &mut ElementJournal<'_, R, T, S>,
@@ -815,7 +815,11 @@ where
         }
         return blocked_menu_item_reply();
     }
-    if !facts.actions.iter().any(|action| action == "AXPress") {
+    let action = if facts.actions.iter().any(|action| action == "AXPress") {
+        "AXPress"
+    } else if facts.actions.iter().any(|action| action == "AXShowMenu") {
+        "AXShowMenu"
+    } else {
         if journal.refused(&role, "no_press_action").is_err() {
             return audit_unavailable_reply(false);
         }
@@ -828,11 +832,11 @@ where
                 describe_actions(&facts.actions)
             ),
         });
-    }
-    // Read just before pressing, after the checks above: a press on an
+    };
+    // Read just before dispatch, after the checks above: an action on an
     // element the application reports disabled does nothing, and saying so is
     // better than a completed reply with no effect. An unreadable state is
-    // unknown, not disabled, so it presses as before.
+    // unknown, not disabled, so dispatch is still allowed.
     if source.element_enabled(handle) == Some(false) {
         if journal.refused(&role, "element_disabled").is_err() {
             return audit_unavailable_reply(false);
@@ -842,13 +846,17 @@ where
             .is_some_and(|frontmost| frontmost != grant.pid);
         return element_disabled_reply(facts.title.as_deref(), element_id, background);
     }
-    let token = match journal.intent(grant, element_id, "AXPress", &role) {
+    let token = match journal.intent(grant, element_id, action, &role) {
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
-    let (outcome, reply) = match source.press(handle) {
+    let dispatched = match action {
+        "AXShowMenu" => source.show_menu(handle),
+        _ => source.press(handle),
+    };
+    let (outcome, reply) = match dispatched {
         Ok(()) => ("completed", json!({"outcome": "completed"})),
-        // The press was sent and no answer came back in time: it may have
+        // The action was sent and no answer came back in time: it may have
         // happened, so this is never a refusal that is safe to retry.
         Err(ElementActionError::Indeterminate) => (
             "dispatch_outcome_unknown",
@@ -859,7 +867,7 @@ where
                     "reason": "application_did_not_answer",
                     "dispatched": true,
                     "step": "dispatch",
-                    "call": "AXPress",
+                    "call": action,
                     "held_state": "none_held",
                 },
                 "remedy": "read the state before retrying",
@@ -871,8 +879,13 @@ where
             json!({
                 "outcome": "no_press_action",
                 "reason": "press_refused",
-                "remedy": "the application refused the press; read the state to see whether \
-                           anything changed before trying again",
+                "remedy": if action == "AXShowMenu" {
+                    "the application refused to open the menu; read the state to see whether \
+                     anything changed before trying again"
+                } else {
+                    "the application refused the press; read the state to see whether \
+                     anything changed before trying again"
+                },
             }),
         ),
     };
@@ -2501,6 +2514,152 @@ fn same_application_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, FixtureElementToken, RawAppState,
+    };
+    use cerebellum_computer::audit::redaction::ExcludeApplicationText;
+    use cerebellum_computer::audit::ComputerAudit;
+    use cerebellum_computer::capture_custody::{
+        CaptureCustody, CustodyBounds, InMemoryCustodyStorage, InMemoryGrantAuthority,
+    };
+    use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
+    use std::sync::Mutex;
+
+    struct MenuSource {
+        actions: Vec<String>,
+        calls: Mutex<Vec<&'static str>>,
+        enabled: bool,
+        indeterminate: bool,
+    }
+
+    impl MenuSource {
+        fn new(actions: &[&str]) -> Self {
+            Self {
+                actions: actions.iter().map(|action| (*action).into()).collect(),
+                calls: Mutex::new(Vec::new()),
+                enabled: true,
+                indeterminate: false,
+            }
+        }
+    }
+
+    impl AppStateSource for MenuSource {
+        fn read_app_state(
+            &self,
+            _: &ProcessGrant,
+            _: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            unreachable!("dispatch does not read the state tree")
+        }
+
+        fn element_facts(&self, _: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
+            Ok(ElementFacts {
+                role: Some("AXPopUpButton".into()),
+                actions: self.actions.clone(),
+                ..Default::default()
+            })
+        }
+
+        fn element_enabled(&self, _: &ElementHandle) -> Option<bool> {
+            Some(self.enabled)
+        }
+
+        fn press(&self, _: &ElementHandle) -> Result<(), ElementActionError> {
+            self.calls.lock().unwrap().push("AXPress");
+            Ok(())
+        }
+
+        fn show_menu(&self, _: &ElementHandle) -> Result<(), ElementActionError> {
+            self.calls.lock().unwrap().push("AXShowMenu");
+            if self.indeterminate {
+                Err(ElementActionError::Indeterminate)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn press_fixture(source: &MenuSource) -> Value {
+        let custody = CaptureCustody::new(
+            CustodyBounds {
+                maximum_verification_duration_ms: 100,
+                maximum_pin_lifetime_ms: 100,
+                maximum_concurrently_pinned_artifacts: 2,
+                maximum_total_pinned_artifact_bytes: 1000,
+                maximum_custody_attachment_bytes: 1000,
+            },
+            InMemoryGrantAuthority::default(),
+            InMemoryCustodyStorage::new(),
+        )
+        .unwrap();
+        let audit = ComputerAudit::new(
+            ExcludeApplicationText,
+            cerebellum_computer::platform::severity::load_severity_taxonomy().unwrap(),
+            JournalConfig {
+                journal_retention_bytes: 20000,
+                journal_max_entry_bytes: 4000,
+            },
+            InMemoryJournalStorage::default(),
+            custody,
+        )
+        .unwrap();
+        let grant = ProcessGrant {
+            pid: 42,
+            bundle_identity: "com.example.Editor".into(),
+            process_generation_evidence: "generation-42".into(),
+        };
+        let identity = cerebellum_computer::audit::journal_identity(
+            "direct:agent",
+            "conversation",
+            "project",
+            cerebellum_core::identity::SessionKind::Primary,
+        );
+        let token = AuditToken::new(
+            Arc::new(Mutex::new(audit)),
+            Arc::new(super::super::quarantine::ArbiterGate(None)),
+        );
+        let mut journal =
+            ElementJournal::new(token, identity, ComputerCapability::PressElement, &grant);
+        let handle: ElementHandle = Arc::new(FixtureElementToken(1));
+        let reply = press_blocking(source, &mut journal, &grant, "e1", &handle);
+        journal.finish().unwrap();
+        reply
+    }
+
+    #[test]
+    fn a_menu_only_element_dispatches_show_menu() {
+        let source = MenuSource::new(&["AXShowMenu", "AXScrollToVisible"]);
+        let reply = press_fixture(&source);
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(*source.calls.lock().unwrap(), ["AXShowMenu"]);
+    }
+
+    #[test]
+    fn a_press_action_takes_precedence_over_show_menu() {
+        let source = MenuSource::new(&["AXShowMenu", "AXPress"]);
+        let reply = press_fixture(&source);
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(*source.calls.lock().unwrap(), ["AXPress"]);
+    }
+
+    #[test]
+    fn a_disabled_menu_button_never_dispatches() {
+        let mut source = MenuSource::new(&["AXShowMenu"]);
+        source.enabled = false;
+        assert_eq!(press_fixture(&source)["outcome"], "element_disabled");
+        assert!(source.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_menu_dispatch_timeout_names_show_menu_and_is_not_safe_to_retry() {
+        let mut source = MenuSource::new(&["AXShowMenu"]);
+        source.indeterminate = true;
+        let reply = press_fixture(&source);
+        assert_eq!(reply["outcome"], "dispatch_outcome_unknown", "{reply}");
+        assert_eq!(reply["detail"]["call"], "AXShowMenu");
+        assert_eq!(reply["detail"]["dispatched"], true);
+        assert_eq!(*source.calls.lock().unwrap(), ["AXShowMenu"]);
+    }
 
     /// Offsets are UTF-16 code units, so a caret after an emoji (two units)
     /// lands after it in the UTF-8 text rather than inside it.
