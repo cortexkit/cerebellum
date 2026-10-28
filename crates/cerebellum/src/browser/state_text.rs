@@ -977,12 +977,18 @@ impl<'a> Tree<'a> {
     /// `leaf_row` over several sibling subtrees taken together, as one row:
     /// the leaves of `roots`, in order, under the same refusals and bounds.
     fn leaf_row_of(&self, roots: &[usize], matched: usize) -> Option<(Vec<(usize, String)>, bool)> {
-        let mut pending: Vec<usize> = roots.iter().rev().copied().collect();
+        // Keep sibling iterators rather than enqueueing entire wide containers:
+        // the row limits usually reject them after only a few leaves.
+        let mut pending = vec![roots.iter()];
         let mut texts = Vec::new();
         let mut bytes = 0;
         let mut leaves = 0;
         let mut holds_chip = false;
-        while let Some(kid) = pending.pop() {
+        while let Some(siblings) = pending.last_mut() {
+            let Some(&kid) = siblings.next() else {
+                pending.pop();
+                continue;
+            };
             let role = self.role(kid);
             let chip = self.is_key_chip(kid, matched);
             holds_chip |= chip;
@@ -994,7 +1000,7 @@ impl<'a> Tree<'a> {
                 return None;
             }
             if !self.kids[kid].is_empty() {
-                pending.extend(self.kids[kid].iter().rev().copied());
+                pending.push(self.kids[kid].iter());
                 continue;
             }
             leaves += 1;
@@ -1101,12 +1107,19 @@ impl<'a> Tree<'a> {
     /// limits. A key chip (see `is_key_chip`) counts as part of the match, and
     /// its text as a label: the key is the label its value prints with.
     fn is_row_block(&self, node: usize, matched: usize) -> Option<bool> {
-        // Each entry: the node, whether it lies inside the match, and whether
-        // it lies inside a control.
-        let mut pending = vec![(node, false, false)];
+        // Each frame walks siblings lazily in capture order, with their
+        // inherited match/control state. Oversized containers need not enqueue
+        // every child before the leaf and byte limits can reject them.
+        let root = [node];
+        let mut pending = vec![(root.iter(), false, false)];
         let (mut control, mut label, mut beside_match) = (false, false, false);
         let (mut leaves, mut bytes) = (0, 0);
-        while let Some((kid, in_match, in_control)) = pending.pop() {
+        while let Some((siblings, in_match, in_control)) = pending.last_mut() {
+            let Some(&kid) = siblings.next() else {
+                pending.pop();
+                continue;
+            };
+            let (in_match, in_control) = (*in_match, *in_control);
             let role = self.role(kid);
             if kid != node && (self.is_landmark(kid) || is_table_part(role)) {
                 return None;
@@ -1121,12 +1134,11 @@ impl<'a> Tree<'a> {
             label |= labelled;
             beside_match |= (actionable || labelled) && !in_match;
             if !self.kids[kid].is_empty() {
-                pending.extend(
-                    self.kids[kid]
-                        .iter()
-                        .rev()
-                        .map(|&grandkid| (grandkid, in_match, in_control || (actionable && !chip))),
-                );
+                pending.push((
+                    self.kids[kid].iter(),
+                    in_match,
+                    in_control || (actionable && !chip),
+                ));
                 continue;
             }
             leaves += 1;
@@ -1729,6 +1741,60 @@ fn cut_report(lines: &[Line], keep: &[bool], tree: &Tree<'_>, max_bytes: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual debug-render timing on a wide container"]
+    fn wide_container_text_filter_timing() {
+        use sha2::Digest;
+
+        let mut records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "generic", "", Some("e2")),
+        ];
+        let mut facts = HashMap::new();
+        // Chrome can omit line wrappers from the AX tree, leaving all texts
+        // as siblings. Their ignored ancestors still identify each line.
+        for line in 0..4_000 {
+            for field in 0..5 {
+                let reference = format!("e{}", records.len() + 1);
+                let name = if field == 0 {
+                    format!("line {line}")
+                } else {
+                    format!("field {field}")
+                };
+                records.push(record(2, "StaticText", &name, Some(&reference)));
+                facts.insert(
+                    reference,
+                    NodeFacts {
+                        ignored_ancestors: vec![format!("line-{line}")],
+                        ..NodeFacts::default()
+                    },
+                );
+            }
+        }
+        let filters = Filters {
+            text: Some("line".into()),
+            roles: Vec::new(),
+        };
+        let input = RenderInput {
+            records: &records,
+            facts: &facts,
+            filters: &filters,
+            page_url: "https://example.com",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 262_144,
+        };
+        let start = std::time::Instant::now();
+        let rendered = render(&input);
+        println!("wide container: {:?}", start.elapsed());
+        assert!(rendered.text.contains("line 3999"), "{}", rendered.text);
+        println!(
+            "rendered output: {} bytes sha256 {:x}",
+            rendered.text.len(),
+            sha2::Sha256::digest(rendered.text.as_bytes())
+        );
+    }
 
     #[test]
     fn settings_text_filter_searches_the_label_beyond_its_printed_prefix() {

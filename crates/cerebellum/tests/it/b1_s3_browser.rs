@@ -2322,7 +2322,8 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         .unwrap();
     assert_eq!(unprinted["outcome"], "ref_not_found", "{unprinted}");
 
-    // An unknown ref reports a short miss instead of repeating the outline.
+    // A ref never shown by this page context requires a snapshot first;
+    // it cannot select a subtree just because a capture reuses its number.
     let missing = plane
         .serve(
             &route,
@@ -2331,14 +2332,13 @@ async fn outline_zoom_and_click_pass_the_withholding_serve_boundary() {
         )
         .await
         .unwrap();
-    assert_eq!(missing["outcome"], "ref_not_found", "{missing}");
-    let text = missing["state_text"].as_str().unwrap();
-    assert!(
-        text.starts_with("zoom e999: no such element on the page now."),
-        "{text}"
-    );
-    assert!(text.contains("After: none"), "{text}");
-    assert!(!text.contains(" navigation Primary"), "{text}");
+    assert_eq!(missing["outcome"], "stale_snapshot", "{missing}");
+    assert_eq!(missing["detail"]["reason_code"], "ref_not_shown");
+    assert!(missing["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("take a snapshot"));
+    assert!(missing.get("state_text").is_none(), "{missing}");
     assert!(missing.to_string().len() < 1024, "{missing}");
     let invalid = plane
         .serve(
