@@ -48,9 +48,10 @@ use cerebellum_core::identity::RouteIdentity;
 
 pub const FILL_LOGIN: &str = "browser.fill_login";
 
-/// Production admission remains off until the security audit and phone approval
-/// support are complete. Tests can still install a source on an isolated plane.
-pub const FILL_LOGIN_ENABLED: bool = false;
+/// Production admission is on: a plane built for a running module is given
+/// the live vault source and serves `browser.fill_login`. Planes built for
+/// tests get no source unless a test installs one.
+pub const FILL_LOGIN_ENABLED: bool = true;
 
 /// The live vault source. Construction does no I/O; admission remains separate.
 pub const PRODUCTION_LOGIN_MATERIAL_SOURCE: fn(PathBuf, String) -> Arc<dyn LoginMaterialSource> =
@@ -314,14 +315,14 @@ impl FillRefusal {
 
     pub(super) fn remedy(self) -> &'static str {
         match self {
-            Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh browser.snapshot",
+            Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh snapshot",
             Self::LoginUnavailable => "this agent cannot use a saved login of that name on this site; check the name with the person, or ask them to share the login with this agent for this site",
             Self::VaultUnavailable => "the vault could not be reached; retry later, and report it if it persists",
             Self::Aborted { .. } => "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
-            Self::FilledPasswordOnPage => "read this page with browser.snapshot instead; screenshots are refused until you reload or navigate the page itself",
+            Self::FilledPasswordOnPage => "take a snapshot to read this page instead; screenshots are refused until you reload or navigate the page itself",
             Self::WindowExpired => "reload or navigate the page itself before reading it again",
-            Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call browser.fill_login again only if they change their mind",
-            Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call browser.fill_login again when the person is available",
+            Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call fill_login again only if they change their mind",
+            Self::ApprovalNotGiven { .. } => "the approval to use this saved login did not complete; call fill_login again when the person is available",
             Self::ApprovalServiceRefused(_) => "the dedicated vault approval could not be filed; update Cingulate or report the refusal before retrying",
         }
     }
@@ -928,7 +929,16 @@ impl BrowserPlane {
         args: &Value,
     ) -> Result<FillPlan, BrowserError> {
         let object = self
-            .validate_request(args, &["secret", "username_ref", "password_ref", "otp_ref"])
+            .validate_request(
+                args,
+                &[
+                    "secret",
+                    "username_ref",
+                    "password_ref",
+                    "otp_ref",
+                    "snapshot_id",
+                ],
+            )
             .await?;
         let secret = required_string(object, "secret", 1, 256)?.to_owned();
         let mut wanted = vec![
@@ -938,6 +948,21 @@ impl BrowserPlane {
         if object.contains_key("otp_ref") {
             wanted.push((LoginField::Otp, required_ref(object, "otp_ref")?));
         }
+        // As for browser.type: a named snapshot only chooses which elements
+        // the refs name. Every check before insertion runs the same either way.
+        let requested_snapshot = match object.get("snapshot_id") {
+            Some(_) => {
+                let id = required_string(object, "snapshot_id", 32, 32)?;
+                if !snapshot_store::valid_snapshot_id(id) {
+                    return Err(BrowserError::InvalidRequest {
+                        field: "snapshot_id".into(),
+                        reason_code: "unsupported_value",
+                    });
+                }
+                Some(id.to_owned())
+            }
+            None => None,
+        };
         for (index, (field, reference)) in wanted.iter().enumerate() {
             if wanted[..index]
                 .iter()
@@ -957,13 +982,16 @@ impl BrowserPlane {
             .filter(|context| !context.ended)
             .ok_or(BrowserError::NoSession)?;
         let password_ref = wanted[1].1;
-        let snapshot_id = context
-            .refs
-            .shown(password_ref)
-            .map(|shown| shown.snapshot_id.clone())
-            .ok_or(BrowserError::StaleSnapshot {
-                reason_code: "not_retained",
-            })?;
+        let snapshot_id = match requested_snapshot {
+            Some(id) => id,
+            None => context
+                .refs
+                .shown(password_ref)
+                .map(|shown| shown.snapshot_id.clone())
+                .ok_or(BrowserError::StaleSnapshot {
+                    reason_code: "not_retained",
+                })?,
+        };
         let snapshot = context
             .snapshots
             .pin_text(&snapshot_id, context.epoch.value())
@@ -1697,6 +1725,53 @@ mod tests {
         assert!(observation.refs[0].captured.name.is_empty());
     }
 
+    /// Agents call the fill through the flat `browser_use` tool, so a fill
+    /// remedy names its flat actions (snapshot, fill_login) and never a
+    /// granular capability such as `browser.snapshot`.
+    #[test]
+    fn fill_remedies_name_flat_actions() {
+        let refusals = [
+            FillRefusal::Origin {
+                field: "otp_ref",
+                reason_code: "origins_differ",
+            },
+            FillRefusal::LoginUnavailable,
+            FillRefusal::VaultUnavailable,
+            FillRefusal::Aborted {
+                reason_code: "document_changed",
+            },
+            FillRefusal::FilledPasswordOnPage,
+            FillRefusal::WindowExpired,
+            FillRefusal::ApprovalNotGiven {
+                decision: "declined",
+                asked: true,
+            },
+            FillRefusal::ApprovalNotGiven {
+                decision: "timeout",
+                asked: false,
+            },
+            FillRefusal::ApprovalServiceRefused(
+                crate::cingulate_client::desk::SecretUseRefusal::MissingCapability,
+            ),
+        ];
+        for refusal in refusals {
+            assert!(
+                !refusal.remedy().contains("browser."),
+                "{refusal:?}: {}",
+                refusal.remedy()
+            );
+        }
+        assert!(FillRefusal::FilledPasswordOnPage
+            .remedy()
+            .starts_with("take a snapshot"));
+        assert!(FillRefusal::ApprovalNotGiven {
+            decision: "declined",
+            asked: true,
+        }
+        .remedy()
+        .contains("call fill_login again"));
+    }
+
     #[test]
     fn every_fill_reply_is_declared_by_the_fill_schema() {
         let context = json!({
@@ -1740,15 +1815,29 @@ mod tests {
         assert!(validate_fill_login_result(&json!({"outcome": "ok", "password": "x"})).is_err());
     }
 
+    /// The switch is on, and it admits `browser.fill_login` only together
+    /// with a source: the real one a running module's plane is given. A
+    /// plane built for tests has none, so it still does not serve the fill.
     #[test]
-    fn production_switch_refuses_even_with_the_real_source_installed() {
-        const { assert!(!FILL_LOGIN_ENABLED) };
-        let plane =
-            BrowserPlane::new().with_login_material_source(Some(production_login_material_source(
-                PathBuf::from("unread-connection-file"),
-                "cerebellum".into(),
-            )));
+    fn production_switch_admits_only_with_the_real_source_installed() {
+        const { assert!(FILL_LOGIN_ENABLED) };
+        let source = production_login_material_source(
+            PathBuf::from("unread-connection-file"),
+            "cerebellum".into(),
+        );
+        assert!(source.enabled());
+        let plane = BrowserPlane::new().with_login_material_source(Some(source));
         assert!(plane.login_material.is_some());
-        assert_eq!(admitted(FILL_LOGIN, &plane, true), None);
+        assert_eq!(admitted(FILL_LOGIN, &plane, true), Some(FILL_LOGIN));
+        // Without a configured browser there is nothing to fill into.
+        assert_eq!(admitted(FILL_LOGIN, &plane, false), None);
+
+        let test_plane = BrowserPlane::new();
+        assert!(test_plane.login_material_source().is_none());
+        assert_eq!(admitted(FILL_LOGIN, &test_plane, true), None);
+        let planes =
+            crate::isolated_test_planes(&Arc::new(cerebellum_core::health::HealthState::new()));
+        assert!(planes.browser.login_material_source().is_none());
+        assert_eq!(admitted(FILL_LOGIN, &planes.browser, true), None);
     }
 }

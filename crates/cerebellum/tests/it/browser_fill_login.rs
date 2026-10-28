@@ -2165,11 +2165,12 @@ async fn typing_still_refuses_credential_fields() {
     );
 }
 
-/// Test construction installs no live source; production startup installs the
-/// real source, but the rollout switch still refuses it before vault I/O.
+/// The rollout switch is on, but only a plane given a source serves the fill:
+/// production startup installs the real one, and test construction installs
+/// none, so a test plane still refuses `browser.fill_login` as not admitted.
 #[tokio::test]
-async fn production_planes_do_not_serve_fill_login() {
-    const { assert!(!cerebellum::browser::fill::FILL_LOGIN_ENABLED) };
+async fn test_planes_do_not_serve_fill_login() {
+    const { assert!(cerebellum::browser::fill::FILL_LOGIN_ENABLED) };
     let (tx, mut rx) = mpsc::channel(4);
     cerebellum::handle_tool_request_for_test(
         tool_frame(
@@ -2183,25 +2184,102 @@ async fn production_planes_do_not_serve_fill_login() {
     .unwrap();
     let refused: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
     assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
-    let source = cerebellum::browser::fill::production_login_material_source(
-        std::path::PathBuf::from("must-not-read-this-connection-file"),
-        "cerebellum".into(),
-    );
-    let fixture = fixture_with_source(
-        Page::default(),
-        VaultState::default(),
-        Duration::from_secs(600),
-        Some(source),
-    )
-    .await;
-    let arguments = fixture.fill_arguments(false).await;
+}
+
+/// `browser_use` with `action: "fill_login"` is served by `browser.fill_login`:
+/// the vault is asked once, the fields are filled, and the reply names the
+/// fields and the site, never the values.
+#[tokio::test]
+async fn browser_use_fill_login_reaches_the_fill() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    let mut arguments = fixture.fill_arguments(false).await;
+    arguments["action"] = json!("fill_login");
     let frame = fixture
-        .send(
-            json!({"name": "browser.fill_login", "arguments": arguments}),
-            None,
+        .send(json!({"name": "browser_use", "arguments": arguments}), None)
+        .await;
+    let reply = reply_body(&frame);
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(reply["origin"], SITE);
+    assert_eq!(reply["filled"], json!(["username", "password"]));
+    assert_eq!(fixture.page.value(USERNAME_NODE), USERNAME);
+    assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert!(!contains_password(&reply));
+    assert!(fixture.planes.browser.result_schema_findings().is_empty());
+}
+
+/// The person's browser has no fill path: `browser:"user"` is refused by
+/// name before the vault or the page is reached.
+#[tokio::test]
+async fn browser_use_fill_login_refuses_the_persons_browser() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    let mut arguments = fixture.fill_arguments(false).await;
+    arguments["action"] = json!("fill_login");
+    arguments["browser"] = json!("user");
+    let frame = fixture
+        .send(json!({"name": "browser_use", "arguments": arguments}), None)
+        .await;
+    let reply = reply_body(&frame);
+    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    assert_eq!(reply["detail"]["field"], "browser", "{reply}");
+    assert_eq!(reason_code(&reply), "own_browser_only", "{reply}");
+    assert!(fixture.vault.requests().is_empty());
+    assert_eq!(fixture.page.insertions(), 0);
+}
+
+/// A named snapshot chooses which elements the refs name, as it does for
+/// `browser.type`: an unknown or evicted one refuses exactly as type refuses
+/// it, a snapshot of another kind is refused, and the snapshot that showed
+/// the fields fills them. Every refusal comes before the vault is asked.
+#[tokio::test]
+async fn a_named_snapshot_chooses_the_refs_and_an_unknown_one_refuses_as_type_does() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    let screenshot = fixture.screenshot().await;
+    assert_eq!(screenshot["outcome"], "ok", "{screenshot}");
+    let snapshot = fixture.snapshot("ax").await;
+    let username_ref = named_ref(&snapshot, "Email");
+    let arguments = |snapshot_id: &Value| {
+        json!({
+            "secret": SECRET,
+            "username_ref": username_ref,
+            "password_ref": named_ref(&snapshot, "Password"),
+            "snapshot_id": snapshot_id,
+        })
+    };
+
+    let unknown = json!("0123456789abcdef0123456789abcdef");
+    let refused = fixture
+        .call("browser.fill_login", arguments(&unknown))
+        .await;
+    assert_eq!(refused["outcome"], "stale_snapshot", "{refused}");
+    assert_eq!(reason_code(&refused), "snapshot_evicted", "{refused}");
+    let typed = fixture
+        .call(
+            "browser.type",
+            json!({"ref": username_ref, "snapshot_id": unknown, "text": "x"}),
         )
         .await;
-    let refused: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
+    for key in ["outcome", "detail"] {
+        assert_eq!(refused[key], typed[key], "{key}: {refused} versus {typed}");
+    }
+
+    let other_kind = fixture
+        .call("browser.fill_login", arguments(&screenshot["snapshot_id"]))
+        .await;
+    assert_eq!(other_kind["outcome"], "stale_snapshot", "{other_kind}");
+    assert_eq!(
+        reason_code(&other_kind),
+        "snapshot_kind_mismatch",
+        "{other_kind}"
+    );
+    assert!(fixture.vault.requests().is_empty());
     assert_eq!(fixture.page.insertions(), 0);
+
+    let filled = fixture
+        .call("browser.fill_login", arguments(&snapshot["snapshot_id"]))
+        .await;
+    assert_eq!(filled["outcome"], "ok", "{filled}");
+    assert_eq!(filled["filled"], json!(["username", "password"]));
+    assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+    assert_eq!(fixture.vault.requests().len(), 1);
 }

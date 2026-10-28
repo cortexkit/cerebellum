@@ -6575,6 +6575,49 @@ async fn a_call_on_a_quarantined_session_is_a_target_busy_result_recorded_refuse
     .expect("the quarantine outlived its worker");
 }
 
+/// A login fill drives the session's page like any other page action, so a
+/// session in execution quarantine refuses a `browser_use` fill_login at once
+/// as a target_busy result of the fill, instead of queueing it behind the
+/// stuck worker. Nothing reaches the browser.
+#[tokio::test]
+async fn a_fill_login_on_a_quarantined_session_is_a_target_busy_result() {
+    let (planes, launcher, _storage, tx, mut rx, _hold) = quarantined_session().await;
+    let effects_before = launcher.effects.lock().unwrap().len();
+
+    cerebellum::handle_frame_for_test(
+        request(
+            802,
+            "browser_use",
+            json!({
+                "action": "fill_login",
+                "secret": "work-login",
+                "username_ref": "e1",
+                "password_ref": "e2",
+            }),
+        ),
+        &tx,
+        &planes,
+    )
+    .await
+    .unwrap();
+    let refused = frame_for(&mut rx, 802).await;
+    assert_eq!(
+        refused.header.ty,
+        FrameType::Response,
+        "a quarantine refusal is a result, not a route error: {}",
+        body(&refused)
+    );
+    let refusal = body(&refused);
+    assert_eq!(refusal["outcome"], "target_busy", "{refusal}");
+    assert_eq!(
+        refusal["detail"],
+        json!({"dispatched": false, "step": "queue", "call": "browser session operation"}),
+        "{refusal}"
+    );
+    assert_eq!(launcher.effects.lock().unwrap().len(), effects_before);
+    assert!(planes.browser.result_schema_findings().is_empty());
+}
+
 #[tokio::test]
 async fn a_close_of_a_quarantined_session_bypasses_the_lane_the_stuck_worker_holds() {
     let (planes, _launcher, _storage, tx, mut rx, hold) = quarantined_session().await;
