@@ -8,10 +8,29 @@ Run cargo on this Mac only for the gate's Mac half and for tests that need macOS
 
 The fast gate has two halves, chosen from your diff:
 
-- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,8c"`.
+- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,16c"`.
 - **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac --base <that commit>`. An opt-in remote form exists (`bash scripts/fast-gate.sh --part mac --remote --base <commit>` from a Mac terminal with `ck` access, or `--part mac --vm` with `runon: "macos"`), but don't use it: in the VM, cerebellum-computer's macOS lib tests hang until the job's 60-minute timeout, most likely because the VM has no window-server session (jobs 01a17ec1-843f-7155-8394-8e644365a681 and 01a17ef8-ad0b-712b-a7d2-7dfe9cb9386c on 2026-10-27). Use the local half. The remote form reports the desk-bound phases it cannot check as `NOT VERIFIED` lines, never silent skips.
 
 Run both before you deliver, as two parallel tool calls, with the same `--base` commit. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. The `NOT VERIFIED` phases of a remote run (window-server desk tests, the desk-probe example build) need a real desk: run `bash scripts/fast-gate.sh --part mac --base <commit>` locally on a Mac with an unlocked screen to check those. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
+
+## Standing approvals
+
+Start work as soon as you have read the brief. A brief's fence limits what you change, never when you start. Do these without asking, and list each one in your report with the reason:
+
+- Fix tests, fixtures, test doubles and `examples/` that your change breaks, outside the fence included, as long as their assertions keep their meaning. Never loosen an assertion to make it pass.
+- Add narrow plumbing (a parameter, a field or a call site) in a file next to the fence when the change can't reach its target otherwise.
+- Regenerate a pin when its output changes only because of your stated change: digest pins in tests, the `profile/mod.rs` self-digest, goldens and fixtures produced by their generators.
+- Add `#[cfg(test)]` hooks and test-only seams.
+- Rebase onto `origin/main` and resolve conflicts by keeping both sides' intent.
+- Run builds and tests remotely as needed, at up to 16 vCPUs.
+
+These still come to the head before you change them:
+
+- the advertised tool definitions and any agent-visible wording in them;
+- stored formats, migrations and format floors;
+- a new outcome or reason word in a vocabulary;
+- anything that loosens a security, consent or credential check;
+- dependencies and lockfiles.
 
 ## Some computer-plane tests run only on macOS
 
