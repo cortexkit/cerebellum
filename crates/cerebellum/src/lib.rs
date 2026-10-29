@@ -2002,10 +2002,15 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     // configuration can already run a browser probe, and a child started
     // before this read would inherit the launch-nonce pipe.
     launch_nonce::read_before_any_spawn();
+    #[cfg(target_os = "macos")]
+    let cursor_executable = computer_capability::cursor::pin_helper_at_startup();
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
     record_engram_catalog_write();
-    conclude(run(config, read_live_settings_from_config_file, true).await)
+    let ending = run(config, read_live_settings_from_config_file, true).await;
+    #[cfg(target_os = "macos")]
+    drop(cursor_executable);
+    conclude(ending)
 }
 
 /// Point the planes at the settings a running module re-reads from its config
@@ -8990,6 +8995,8 @@ fn record_engram_catalog_write() {
 ///   capture requests the background-mode preview has made and how many frame
 ///   lines it has written to the agent-cursor helper since the process
 ///   started, so an idle preview can be seen to cost nothing;
+/// - on macOS, `cursorHelperBinaryUnavailable`, whether the helper's executable
+///   could not be captured or verified against the module's startup executable;
 /// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
 ///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
 ///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
@@ -9020,6 +9027,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         let counts = browser_crash_reports::leftover_counts();
         #[cfg(target_os = "macos")]
         {
+            metrics.insert(
+                "cursorHelperBinaryUnavailable".into(),
+                json!(computer_capability::cursor::helper_binary_unavailable()),
+            );
             metrics.insert(
                 "cursorAvatarMalformedRows".into(),
                 json!(computer_capability::cursor::avatar::malformed_rows()),

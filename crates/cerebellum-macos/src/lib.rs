@@ -58,6 +58,10 @@ mod event_tap;
 mod input;
 #[cfg(target_os = "macos")]
 mod launch;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+mod pinned_executable;
+#[cfg(target_os = "macos")]
+pub use pinned_executable::PinnedExecutable;
 #[cfg(any(target_os = "macos", test))]
 mod responsibility;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]

@@ -24,10 +24,9 @@
 //! process with an isolated journal, never talks to the running daemon, and
 //! reads no config file, so `computer_use.app_use` is `background` (the
 //! default). Fronting is admitted here as an unreviewed desk build, so the
-//! needs-front chord can run. The plane's agent cursor launches its helper by
-//! re-running this executable with `--agent-cursor`; that branch replaces
-//! itself with the sibling `ck-cerebellum --agent-cursor`, so the helper
-//! process (and its pid) is the real one.
+//! needs-front chord can run. The plane's agent cursor launches a startup-pinned
+//! copy of the sibling `ck-cerebellum --agent-cursor`. Its CPU measurements use
+//! the helper pid owned by the cursor transport, without a wrapper process.
 //!
 //! It launches its own scratch TextEdit (a new instance, never the person's;
 //! TextEdit must not already be running), waits until the person's front
@@ -67,7 +66,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 const APPROVAL_FLAG: &str = "--approve-desk-probe";
-/// The flag the agent cursor's transport launches its helper with.
+/// A helper invocation is not permission to run the desk probe.
+#[cfg(test)]
 const HELPER_FLAG: &str = "--agent-cursor";
 /// Runs the baseline child: the same actions with the agent cursor off.
 const BASELINE_FLAG: &str = "--baseline";
@@ -76,9 +76,6 @@ const BASELINE_LINE: &str = "BASELINE_MODULE_IDLE_CPU_NS=";
 /// The module binary that serves as the cursor helper, beside the
 /// `examples/` directory this probe is built into.
 const HELPER_BINARY: &str = "ck-cerebellum";
-/// Where the helper branch records its pid, beside this executable, so the
-/// probe can measure exactly that process.
-const HELPER_PID_EXTENSION: &str = "helper-pid";
 
 /// How long the idle window lasts.
 const IDLE_WINDOW: Duration = Duration::from_secs(30);
@@ -355,12 +352,7 @@ fn visible_previews(windows: &[ListedWindow], helper: i32) -> usize {
 }
 
 fn main() {
-    // The agent cursor's transport launches its helper as this executable,
-    // with no other argument and an empty environment.
-    let helper = std::env::args()
-        .skip(1)
-        .any(|argument| argument == HELPER_FLAG);
-    if !helper && !approved(std::env::args().skip(1)) {
+    if !approved(std::env::args().skip(1)) {
         eprintln!(
             "REFUSED: this probe fronts a scratch application on the person's screen and \
              draws the agent cursor. Run it only with the person present and their approval, \
@@ -370,22 +362,14 @@ fn main() {
     }
     #[cfg(target_os = "macos")]
     std::process::exit(desk_preflight(|| {
-        if helper {
-            desk::become_helper();
-            1
-        } else {
-            desk::run(
-                std::env::args()
-                    .skip(1)
-                    .any(|argument| argument == BASELINE_FLAG),
-            )
-        }
+        desk::run(
+            std::env::args()
+                .skip(1)
+                .any(|argument| argument == BASELINE_FLAG),
+        )
     }));
     #[cfg(not(target_os = "macos"))]
     {
-        if helper {
-            std::process::exit(1);
-        }
         eprintln!("UNMEASURABLE: macOS desk required");
         std::process::exit(2);
     }
@@ -402,7 +386,6 @@ mod allowing_cingulate;
 #[cfg(target_os = "macos")]
 mod desk {
     use super::*;
-    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -442,24 +425,6 @@ mod desk {
     /// so a hide or a last frame in flight is not counted as idle work.
     const SETTLE: Duration = Duration::from_secs(2);
     const SAMPLE_EVERY: Duration = Duration::from_millis(100);
-
-    /// Replace this process with the module binary's cursor helper, keeping
-    /// the pid and the pipe on stdin the transport launched it with. Returns
-    /// only when that fails.
-    pub fn become_helper() {
-        let Ok(executable) = std::env::current_exe() else {
-            return;
-        };
-        let Some(helper) = helper_binary(&executable) else {
-            return;
-        };
-        // The probe reads this to measure the helper; exec keeps the pid.
-        let _ = std::fs::write(
-            executable.with_extension(HELPER_PID_EXTENSION),
-            std::process::id().to_string(),
-        );
-        let _ = Command::new(helper).arg(HELPER_FLAG).exec();
-    }
 
     /// The scratch TextEdit, killed when dropped.
     struct Scratch {
@@ -826,11 +791,6 @@ mod desk {
         }
     }
 
-    /// The pid the helper branch recorded, once the helper has started.
-    fn helper_pid(record: &Path) -> Option<u32> {
-        std::fs::read_to_string(record).ok()?.trim().parse().ok()
-    }
-
     /// How many preview windows the helper shows, waiting up to `wait` for
     /// at least one when `want_shown`, or for none otherwise.
     fn previews_after(helper: Option<u32>, want_shown: bool, wait: Duration) -> Option<usize> {
@@ -904,6 +864,17 @@ mod desk {
             );
             return 2;
         }
+        let _helper_pin = if let Some(helper) = helper.filter(|_| !baseline) {
+            match cerebellum::computer_capability::cursor::pin_helper_for_probe(&helper) {
+                Ok(pin) => Some(pin),
+                Err(error) => {
+                    eprintln!("UNMEASURABLE: cannot pin the cursor helper: {error}");
+                    return 2;
+                }
+            }
+        } else {
+            None
+        };
         match cerebellum_computer::platform::native::resolve_target(
             TEXTEDIT_BUNDLE,
             Duration::from_secs(3),
@@ -951,7 +922,7 @@ mod desk {
             }
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(measure(&scratch, person, baseline, &executable))
+            runtime.block_on(measure(&scratch, person, baseline))
         }));
         *SCRATCH_PID.lock().unwrap() = 0;
         drop(scratch);
@@ -1024,7 +995,7 @@ mod desk {
     }
 
     /// Every phase against the scratch app. Returns the process exit code.
-    async fn measure(scratch: &Scratch, person: i32, baseline: bool, executable: &Path) -> i32 {
+    async fn measure(scratch: &Scratch, person: i32, baseline: bool) -> i32 {
         let target_pid = scratch.pid();
         let audit = match computer_audit(JournalPersistence::Isolated) {
             Ok(audit) => audit,
@@ -1052,8 +1023,6 @@ mod desk {
         // `agent_cursor: true` for the measured run, `false` for the
         // baseline; a plane's cursor starts disabled.
         let cursor = plane.cursor();
-        let helper_record = executable.with_extension(HELPER_PID_EXTENSION);
-        let _ = std::fs::remove_file(&helper_record);
         if !baseline {
             cursor.enable(true);
         }
@@ -1178,7 +1147,7 @@ mod desk {
                 Err("no settable text area in the scratch window".into()),
             ),
         }
-        let helper = helper_pid(&helper_record);
+        let helper = cursor.helper_pid_for_probe();
         if !baseline {
             report.check(
                 "preview visible after the first background actions",
