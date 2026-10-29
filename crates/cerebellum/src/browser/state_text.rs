@@ -290,7 +290,11 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
     if input.filters.narrows() && lines.is_empty() {
         header.push_str("\nNo matches for the requested filters.");
     }
-    fit(header, header_refs, lines, &tree, input.max_bytes)
+    if input.zoom.is_none() && !input.filters.narrows() {
+        fit_outline(header, lines, &tree, input.max_bytes)
+    } else {
+        fit(header, header_refs, lines, &tree, input.max_bytes)
+    }
 }
 
 /// Neighbours are numeric ref neighbours, not DOM siblings. Callers pass only
@@ -534,6 +538,11 @@ struct Line {
     /// The outermost landmark the line belongs to, so the closing line that
     /// reports what `max_bytes` removed can name it.
     section: Option<usize>,
+    /// Nodes represented by this row, including descendants hidden behind a
+    /// summary or a sibling-fold disclosure. Expanded landmark headers count
+    /// only themselves, not the children printed after them.
+    covered: usize,
+    covered_bytes: Option<usize>,
 }
 
 impl Line {
@@ -717,11 +726,21 @@ impl<'a> Tree<'a> {
                     .collect()
             };
             let own_name = &self.names[node];
-            collapsed.retain(|child| {
-                self.role(*child) != "StaticText"
-                    || !(self.names[*child].is_empty()
-                        || (!own_name.is_empty() && &self.names[*child] == own_name))
-            });
+            collapsed = collapsed
+                .into_iter()
+                .flat_map(|child| {
+                    if self.role(child) == "StaticText"
+                        && (self.names[child].is_empty()
+                            || (!own_name.is_empty() && &self.names[child] == own_name))
+                    {
+                        // Only the redundant text disappears. A captured text
+                        // node can still own controls or labelled descendants.
+                        kids[child].clone()
+                    } else {
+                        vec![child]
+                    }
+                })
+                .collect();
             replacement[node] = if node != 0 && is_wrapper(&role) && own_name.is_empty() {
                 match collapsed.len() {
                     0 => Vec::new(),
@@ -919,6 +938,8 @@ impl<'a> Tree<'a> {
                 .into_iter()
                 .collect(),
             section: self.section[node],
+            covered: 1,
+            covered_bytes: None,
         }
     }
 
@@ -1467,12 +1488,18 @@ impl<'a> Tree<'a> {
             text.push_str(reference);
             refs.push(reference.to_string());
         }
+        let sizes: Vec<_> = members
+            .iter()
+            .map(|member| self.zoom_size(*member))
+            .collect();
         Line {
             depth,
             text,
             class: self.class[members[0]],
             refs,
             section: self.section[members[0]],
+            covered: sizes.iter().map(|size| size.0).sum(),
+            covered_bytes: Some(sizes.iter().map(|size| size.1).sum()),
         }
     }
 
@@ -1491,15 +1518,22 @@ impl<'a> Tree<'a> {
             lines,
             size_text(bytes)
         );
-        self.line(node, depth, text)
+        let mut line = self.line(node, depth, text);
+        line.covered = lines;
+        line.covered_bytes = Some(bytes);
+        line
     }
 
-    /// The landmarks among `nodes`, looking through anything that is not a
-    /// landmark itself but holds one; what holds none is loose content.
+    /// Look through unlabelled layout wrappers to find landmarks. Named or
+    /// semantic containers keep their own row, even when they hold a landmark.
     fn entries(&self, nodes: &[usize]) -> Vec<usize> {
         let mut entries = Vec::new();
         for &node in nodes {
-            if self.is_landmark(node) || !self.has_landmark_below[node] {
+            if self.is_landmark(node)
+                || !self.has_landmark_below[node]
+                || !is_wrapper(self.role(node))
+                || !self.names[node].is_empty()
+            {
                 entries.push(node);
             } else {
                 entries.extend(self.entries(&self.kids[node]));
@@ -1533,6 +1567,13 @@ impl<'a> Tree<'a> {
                 Item::Node(node) if self.is_landmark(node) => {
                     previous_hidden = false;
                     self.emit_landmark(node, depth, out);
+                }
+                Item::Node(node) if self.has_landmark_below[node] => {
+                    previous_hidden = false;
+                    out.push(self.line(node, depth, self.element_text(node, OUTLINE_NAME_CHARS)));
+                    let mut entries = self.entries(&self.kids[node]);
+                    entries.sort_by_key(|entry| self.class[*entry]);
+                    self.emit_level(&entries, depth + 1, node, loose_budget, out);
                 }
                 Item::Node(node) => {
                     let mut lines = Vec::new();
@@ -1585,6 +1626,8 @@ impl<'a> Tree<'a> {
                 },
                 refs,
                 section: self.section[owner],
+                covered: lines,
+                covered_bytes: Some(bytes),
             });
         }
     }
@@ -1602,9 +1645,151 @@ impl<'a> Tree<'a> {
             out.extend(lines);
             return;
         }
-        out.push(self.summary_line(node, depth));
+        let mut summary = self.summary_line(node, depth);
+        summary.covered = 1;
+        summary.covered_bytes = None;
+        out.push(summary);
         let entries = self.entries(&self.kids[node]);
         self.emit_level(&entries, depth + 1, node, NESTED_LOOSE_BYTES, out);
+    }
+}
+
+/// An outline row may stand for a whole subtree. If the final byte budget
+/// removes that row, carry its hidden nodes into a new disclosure under the
+/// nearest surviving parent with a reference, rather than counting only the
+/// removed row.
+fn fit_outline(
+    header: String,
+    lines: Vec<Line>,
+    tree: &Tree<'_>,
+    max_bytes: usize,
+) -> RenderedState {
+    if header.len() + 1 + lines.iter().map(Line::bytes).sum::<usize>() <= max_bytes {
+        return fit(header, Vec::new(), lines, tree, max_bytes);
+    }
+
+    let mut parents = vec![None; lines.len()];
+    let mut ends = vec![lines.len(); lines.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        while stack
+            .last()
+            .is_some_and(|&parent| lines[parent].depth >= line.depth)
+        {
+            ends[stack.pop().expect("a parent was present")] = index;
+        }
+        parents[index] = stack.last().copied();
+        stack.push(index);
+    }
+
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|&index| (lines[index].class, index));
+    let (mut keep, mut header_kept, _) = select_lines(header.len() + 1, &lines, tree, max_bytes);
+    order.retain(|&index| keep[index]);
+    loop {
+        // Slot zero holds cuts outside a surviving, referenced parent. Other
+        // slots belong to that parent's row and are printed before it closes.
+        let mut cuts = vec![(0_usize, 0_usize); lines.len() + 1];
+        for (index, line) in lines.iter().enumerate().filter(|(index, _)| !keep[*index]) {
+            let mut parent = parents[index];
+            while let Some(owner) = parent {
+                if keep[owner] && !lines[owner].refs.is_empty() {
+                    break;
+                }
+                parent = parents[owner];
+            }
+            let cut = &mut cuts[parent.map_or(0, |owner| owner + 1)];
+            cut.0 += line.covered;
+            cut.1 += line.covered_bytes.unwrap_or_else(|| line.bytes());
+        }
+        if !header_kept {
+            cuts[0].0 += 1;
+            cuts[0].1 += header.len() + 1;
+        }
+        let mut disclosures = Vec::new();
+        for (slot, &(count, bytes)) in cuts.iter().enumerate().rev().filter(|(_, cut)| cut.0 > 0) {
+            let (at, depth, reference) = if slot == 0 {
+                (lines.len(), 0, tree.reference(0))
+            } else {
+                let owner = slot - 1;
+                (
+                    ends[owner],
+                    lines[owner].depth + 1,
+                    Some(lines[owner].refs[0].as_str()),
+                )
+            };
+            let mut text = format!(
+                "{}… {count} more lines, {} not shown",
+                "  ".repeat(depth),
+                size_text(bytes)
+            );
+            if let Some(reference) = reference {
+                text.push_str("; zoom ");
+                text.push_str(reference);
+            }
+            disclosures.push((at, text, reference));
+        }
+        // Inner parents close before outer parents at the same position.
+        disclosures.sort_by_key(|(at, _, _)| *at);
+        let mut text = String::new();
+        let mut printed_refs = BTreeSet::new();
+        if header_kept {
+            text.push_str(&header);
+            text.push('\n');
+        }
+        let mut disclosures = disclosures.into_iter().peekable();
+        for index in 0..=lines.len() {
+            while disclosures.peek().is_some_and(|(at, _, _)| *at == index) {
+                let (_, disclosure, reference) =
+                    disclosures.next().expect("a disclosure was present");
+                text.push_str(&disclosure);
+                text.push('\n');
+                if let Some(reference) = reference {
+                    printed_refs.insert(reference.to_string());
+                }
+            }
+            if index < lines.len() && keep[index] {
+                let line = &lines[index];
+                text.push_str(&"  ".repeat(line.depth));
+                text.push_str(&line.text);
+                text.push('\n');
+                printed_refs.extend(line.refs.iter().cloned());
+            }
+        }
+        if text.len() <= max_bytes || (!header_kept && order.is_empty()) {
+            // No readable disclosure fits a cap smaller than the disclosure
+            // itself. The reply's omitted counters still describe that case.
+            if text.len() > max_bytes {
+                text.clear();
+                printed_refs.clear();
+            }
+            return RenderedState {
+                text,
+                printed_refs,
+                cut_bytes: lines
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, kept)| !**kept)
+                    .map(|(line, _)| line.bytes())
+                    .sum::<usize>()
+                    + if header_kept { 0 } else { header.len() + 1 },
+                cut_lines: keep.iter().filter(|kept| !**kept).count() + usize::from(!header_kept),
+            };
+        }
+        // Drop the lowest-priority suffix, never content to admit chrome.
+        // Recompute disclosures after each batch: removing a parent coalesces
+        // all its children's cuts into the parent's own surviving ancestor.
+        let mut removed = 0;
+        let overflow = text.len() - max_bytes;
+        while removed < overflow {
+            if let Some(index) = order.pop() {
+                keep[index] = false;
+                removed += lines[index].bytes();
+            } else {
+                header_kept = false;
+                break;
+            }
+        }
     }
 }
 
@@ -1621,37 +1806,7 @@ fn fit(
     max_bytes: usize,
 ) -> RenderedState {
     let header_bytes = header.len() + 1;
-    let total = header_bytes + lines.iter().map(Line::bytes).sum::<usize>();
-    let mut order: Vec<usize> = (0..lines.len()).collect();
-    order.sort_by_key(|index| (lines[*index].class, *index));
-
-    let mut keep = vec![true; lines.len()];
-    let mut trailer = String::new();
-    let mut header_kept = total <= max_bytes || header_bytes <= max_bytes;
-    if total > max_bytes {
-        let mut reserve = 0;
-        for _ in 0..4 {
-            let budget = max_bytes.saturating_sub(reserve);
-            keep = vec![false; lines.len()];
-            header_kept = header_bytes <= budget;
-            let mut used = if header_kept { header_bytes } else { 0 };
-            if header_kept {
-                for &index in &order {
-                    let bytes = lines[index].bytes();
-                    if used + bytes > budget {
-                        break;
-                    }
-                    used += bytes;
-                    keep[index] = true;
-                }
-            }
-            trailer = cut_report(&lines, &keep, tree, max_bytes);
-            if trailer.len() < reserve {
-                break;
-            }
-            reserve = trailer.len() + 1;
-        }
-    }
+    let (keep, header_kept, trailer) = select_lines(header_bytes, &lines, tree, max_bytes);
 
     let mut text = String::new();
     let mut printed_refs = BTreeSet::new();
@@ -1691,6 +1846,47 @@ fn fit(
         cut_bytes,
         cut_lines,
     }
+}
+
+fn select_lines(
+    header_bytes: usize,
+    lines: &[Line],
+    tree: &Tree<'_>,
+    max_bytes: usize,
+) -> (Vec<bool>, bool, String) {
+    let total = header_bytes + lines.iter().map(Line::bytes).sum::<usize>();
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|index| (lines[*index].class, *index));
+
+    let mut keep = vec![true; lines.len()];
+    let mut trailer = String::new();
+    let mut header_kept = total <= max_bytes || header_bytes <= max_bytes;
+    if total > max_bytes {
+        let mut reserve = 0;
+        for _ in 0..4 {
+            let budget = max_bytes.saturating_sub(reserve);
+            keep = vec![false; lines.len()];
+            header_kept = header_bytes <= budget;
+            let mut used = if header_kept { header_bytes } else { 0 };
+            if header_kept {
+                for &index in &order {
+                    let bytes = lines[index].bytes();
+                    if used + bytes > budget {
+                        break;
+                    }
+                    used += bytes;
+                    keep[index] = true;
+                }
+            }
+            trailer = cut_report(lines, &keep, tree, max_bytes);
+            if trailer.len() < reserve {
+                break;
+            }
+            reserve = trailer.len() + 1;
+        }
+    }
+
+    (keep, header_kept, trailer)
 }
 
 /// One line naming what the budget removed, by the landmark it belonged to.
@@ -2448,6 +2644,309 @@ mod tests {
              e8 group\n  e9 link One\n  e10 link Two\n\
              e13 button\n"
         );
+    }
+
+    fn settings_outline_records() -> Vec<AxRecord> {
+        let mut records = vec![
+            record(0, "RootWebArea", "Settings", Some("e1")),
+            record(1, "link", "Skip to content", Some("e4")),
+            record(1, "banner", "GitHub", Some("e6")),
+        ];
+        for index in 0..24 {
+            records.push(record(
+                2,
+                "link",
+                &format!("Banner destination {}", char::from(b'a' + index)),
+                Some(&format!("b{index}")),
+            ));
+        }
+        records.extend([
+            record(1, "main", "", Some("e72")),
+            record(2, "sectionheader", "cortexkit settings", Some("e73")),
+            record(3, "heading", "Organization settings", Some("e74")),
+            record(2, "navigation", "Organization settings", Some("e88")),
+            record(3, "list", "", Some("e89")),
+        ]);
+        for index in 0..4 {
+            records.push(record(
+                4,
+                "listitem",
+                &format!("Settings category {index}"),
+                Some(&format!("n{index}")),
+            ));
+            records.push(record(
+                5,
+                "link",
+                &format!("Category {index}"),
+                Some(&format!("l{index}")),
+            ));
+        }
+        records.extend([
+            record(2, "form", "Actions settings", Some("e500")),
+            record(3, "heading", "Cache", Some("e507")),
+            record(3, "spinbutton", "Cache storage limit", Some("e514")),
+            record(3, "spinbutton", "Cache retention days", Some("e529")),
+        ]);
+        records
+    }
+
+    #[test]
+    fn redundant_text_cannot_disconnect_the_later_settings_form() {
+        let mut records = settings_outline_records();
+        let form = records
+            .iter()
+            .position(|record| record.reference.as_deref() == Some("e500"))
+            .unwrap();
+        for record in &mut records[form..] {
+            record.depth += 1;
+        }
+        records.insert(form, record(2, "StaticText", "", Some("e499")));
+        let state = render_plain(&records, &HashMap::new());
+        for reference in ["e500", "e507", "e514", "e529"] {
+            assert!(
+                state.printed_refs.contains(reference),
+                "settings form silently disconnected: {}",
+                state.text
+            );
+        }
+        assert_eq!(
+            accounted_outline_nodes(&state.text, &HashMap::from([("e89", 2)])),
+            records.len() - 1,
+            "{}",
+            state.text
+        );
+    }
+
+    #[test]
+    fn a_named_wrapper_keeps_its_label_and_orders_main_before_chrome() {
+        let records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "generic", "Settings panel", Some("e2")),
+            record(2, "banner", "Site header", Some("e3")),
+            record(2, "main", "", Some("e4")),
+            record(3, "heading", "Cache", Some("e5")),
+            record(3, "spinbutton", "Retention", Some("e6")),
+        ];
+        let state = render_plain(&records, &HashMap::new());
+        assert!(
+            state.text.contains("e2 generic Settings panel"),
+            "{}",
+            state.text
+        );
+        assert!(
+            state.text.find("e4 main") < state.text.find("e3 banner"),
+            "{}",
+            state.text
+        );
+        assert_eq!(
+            accounted_outline_nodes(&state.text, &HashMap::new()),
+            records.len(),
+            "{}",
+            state.text
+        );
+    }
+
+    #[test]
+    fn a_settings_outline_never_silently_loses_the_later_form() {
+        let records = settings_outline_records();
+        for max_bytes in (256..2_048).step_by(17) {
+            let state = render(&RenderInput {
+                filters: &Filters::default(),
+                records: &records,
+                facts: &HashMap::new(),
+                page_url: "https://github.com/organizations/cortexkit/settings/actions",
+                snapshot_id: "s1",
+                zoom: None,
+                max_bytes,
+            });
+            assert!(
+                state.text.len() <= max_bytes,
+                "budget {max_bytes}: {}",
+                state.text
+            );
+            assert_eq!(
+                accounted_outline_nodes(&state.text, &HashMap::from([("e89", 2)])),
+                records.len(),
+                "budget {max_bytes}: {}",
+                state.text
+            );
+            assert!(
+                state.text.contains("e500 form")
+                    || state
+                        .text
+                        .lines()
+                        .any(|line| line.contains("not shown; zoom e72"))
+                    || state
+                        .text
+                        .lines()
+                        .any(|line| line.contains("not shown; zoom e1")),
+                "form missing without disclosure at budget {max_bytes}: {}",
+                state.text,
+            );
+            if let Some(banner) = state.text.find("e6 banner") {
+                assert!(
+                    state
+                        .text
+                        .find("e72 main")
+                        .is_some_and(|main| main < banner),
+                    "{}",
+                    state.text
+                );
+                for reference in ["e507", "e514", "e529"] {
+                    assert!(
+                        state.printed_refs.contains(reference),
+                        "banner displaced main content: {}",
+                        state.text
+                    );
+                }
+            }
+        }
+    }
+
+    fn accounted_outline_nodes(text: &str, repeated_sizes: &HashMap<&str, usize>) -> usize {
+        let lines: Vec<_> = text.lines().collect();
+        let depth = |line: &str| line.len() - line.trim_start().len();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let row = line.trim_start();
+                if let Some(more) = row.strip_prefix('+') {
+                    let count = more
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let owner = row.rsplit_once("; zoom ").unwrap().1;
+                    return count * repeated_sizes.get(owner).copied().unwrap_or(1);
+                }
+                if let Some(more) = row.strip_prefix("… ") {
+                    return more
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                }
+                if let Some(more) = row.strip_prefix("[cut ") {
+                    return more
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                }
+                if let Some((_, size)) = row.rsplit_once(" · ") {
+                    if size.contains(" lines, ")
+                        && !lines
+                            .get(index + 1)
+                            .is_some_and(|next| depth(next) > depth(line))
+                    {
+                        return size
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                    }
+                }
+                1
+            })
+            .sum()
+    }
+
+    #[test]
+    fn random_outlines_account_for_printed_and_disclosed_nodes() {
+        for seed in [1_u64, 7, 29, 103, 911, 65_537] {
+            let mut random = seed;
+            let mut next = || {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (random >> 32) as usize
+            };
+            let mut records = vec![
+                record(0, "RootWebArea", "Page", Some("e1")),
+                record(1, "main", "", Some("e2")),
+            ];
+            for group in 0..(3 + next() % 5) {
+                records.push(record(
+                    2,
+                    if next() % 2 == 0 { "group" } else { "generic" },
+                    &format!("Section {}", char::from(b'a' + group as u8)),
+                    Some(&format!("g{group}")),
+                ));
+                for child in 0..(6 + next() % 12) {
+                    let reference = format!("c{group}_{child}");
+                    if next() % 4 == 0 {
+                        records.push(record(
+                            3,
+                            "article",
+                            &format!("Story {}", char::from(b'a' + child as u8)),
+                            Some(&reference),
+                        ));
+                        records.push(record(
+                            4,
+                            "heading",
+                            "Story title",
+                            Some(&format!("{reference}h")),
+                        ));
+                        records.push(record(
+                            4,
+                            "button",
+                            "Read story",
+                            Some(&format!("{reference}b")),
+                        ));
+                    } else {
+                        records.push(record(
+                            3,
+                            "StaticText",
+                            &format!(
+                                "Paragraph {} {}",
+                                char::from(b'a' + child as u8),
+                                "content ".repeat(next() % 20)
+                            ),
+                            Some(&reference),
+                        ));
+                    }
+                }
+                for button in 0..4 {
+                    records.push(record(
+                        3,
+                        "button",
+                        &format!("Action {button}"),
+                        Some(&format!("a{group}_{button}")),
+                    ));
+                }
+            }
+            for max_bytes in [64, 96, 128, 256, 480, 900, 1_500, 65_536] {
+                let state = render(&RenderInput {
+                    filters: &Filters::default(),
+                    records: &records,
+                    facts: &HashMap::new(),
+                    page_url: "https://example.com/",
+                    snapshot_id: "s1",
+                    zoom: None,
+                    max_bytes,
+                });
+                assert!(state.text.len() <= max_bytes, "{}", state.text);
+                assert_eq!(
+                    accounted_outline_nodes(&state.text, &HashMap::new()),
+                    records.len(),
+                    "seed {seed}, budget {max_bytes}: {}",
+                    state.text
+                );
+                for line in state.text.lines().filter(|line| line.contains("; zoom ")) {
+                    let reference = line.rsplit_once("; zoom ").unwrap().1;
+                    assert!(
+                        state.printed_refs.contains(reference),
+                        "missing zoom ref {reference}: {}",
+                        state.text
+                    );
+                }
+            }
+        }
     }
 
     #[test]
