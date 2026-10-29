@@ -114,6 +114,56 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         || (path == "cerebellum-macos/tests/preview_hide.rs"
             && name == "child"
             && preview_skip_relocation(before, binding, &expression))
+        || (path == "cerebellum-macos/src/pinned_executable.rs"
+            && name == "launch"
+            && pinned_helper_relocation(before, binding, &expression))
+}
+
+// The pin regression launches a private copy of its own test binary, not a
+// browser. Approve only the reviewed fixture construction and pin selection.
+fn pinned_helper_relocation(before: &[Token], binding: usize, expression: &[&str]) -> bool {
+    if !expression.starts_with(&[
+        "pin", ".", "path_for", "(", "&", "fixture", ".", "module", ")", ".", "unwrap", "(", ")",
+        ";",
+    ]) {
+        return false;
+    }
+    let words: Vec<&str> = before[..binding]
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    let last_binding = |name| {
+        words
+            .windows(3)
+            .rposition(|w| w == ["let", name, "="])
+            .map(|at| &words[at + 3..])
+    };
+    let own_fixture = last_binding("fixture")
+        .is_some_and(|value| value.starts_with(&["Fixture", "::", "new", "(", ")", ";"]));
+    let pinned = last_binding("pin")
+        .is_some_and(|value| value.starts_with(&["fixture", ".", "pin", "(", ")", ";"]));
+    let copy = [
+        "fs",
+        "::",
+        "copy",
+        "(",
+        "std",
+        "::",
+        "env",
+        "::",
+        "current_exe",
+        "(",
+        ")",
+        ".",
+        "unwrap",
+        "(",
+        ")",
+        ",",
+        "&",
+        "module",
+        ")",
+    ];
+    own_fixture && pinned && words.windows(copy.len()).any(|w| w == copy)
 }
 
 // Integration tests cannot call launch.rs's cfg(test) relocation helper.
@@ -321,6 +371,29 @@ fn operator_script_reexec_accepts_only_a_copy_of_its_own_test_executable() {
     assert!(violations(path, own).is_empty());
     assert_eq!(violations(path, other).len(), 1);
     assert_eq!(violations("cerebellum/tests/other.rs", own).len(), 1);
+}
+
+#[test]
+fn pinned_cursor_reexec_accepts_only_its_own_copied_test_binary() {
+    let path = "cerebellum-macos/src/pinned_executable.rs";
+    let source = include_str!("../../../cerebellum-macos/src/pinned_executable.rs");
+    assert!(violations(path, source).is_empty());
+    for (own, other) in [
+        (
+            "fs::copy(std::env::current_exe().unwrap(), &module)",
+            "fs::copy(browser, &module)",
+        ),
+        (
+            "let fixture = Fixture::new();",
+            "let fixture = Fixture::from(browser);",
+        ),
+        ("let pin = fixture.pin();", "let pin = browser.pin();"),
+        ("pin.path_for(&fixture.module)", "pin.path_for(&browser)"),
+    ] {
+        assert!(source.contains(own), "fixture changed: {own}");
+        assert_eq!(violations(path, &source.replace(own, other)).len(), 1);
+    }
+    assert_eq!(violations("cerebellum/tests/other.rs", source).len(), 1);
 }
 
 #[test]

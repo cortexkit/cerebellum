@@ -60,6 +60,70 @@ struct ReduceMotionCache {
     reader: OnceLock<ReduceMotionReader>,
 }
 const CAPACITY: usize = 32;
+
+#[cfg(target_os = "macos")]
+static HELPER_EXECUTABLE: std::sync::Mutex<Option<cerebellum_macos::PinnedExecutable>> =
+    std::sync::Mutex::new(None);
+#[cfg(target_os = "macos")]
+static HELPER_BINARY_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub struct HelperExecutableGuard(());
+
+#[cfg(target_os = "macos")]
+impl Drop for HelperExecutableGuard {
+    fn drop(&mut self) {
+        HELPER_EXECUTABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// Pin before configuration or serving can start the lazy helper. The guard
+/// removes the link after module teardown, before a SIGTERM is re-raised.
+#[cfg(target_os = "macos")]
+pub(crate) fn pin_helper_at_startup() -> HelperExecutableGuard {
+    let executable = cerebellum_macos::PinnedExecutable::at_startup().ok();
+    HELPER_BINARY_UNAVAILABLE.store(executable.is_none(), std::sync::atomic::Ordering::Relaxed);
+    *HELPER_EXECUTABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = executable;
+    HelperExecutableGuard(())
+}
+
+/// The helper could not be launched with the executable captured at startup.
+#[cfg(target_os = "macos")]
+pub(crate) fn helper_binary_unavailable() -> bool {
+    HELPER_BINARY_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+fn helper_launch_path(
+    pin: Option<&cerebellum_macos::PinnedExecutable>,
+) -> Option<std::path::PathBuf> {
+    let path = pin.and_then(|pin| pin.launch_path().ok());
+    if path.is_none() {
+        HELPER_BINARY_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    path
+}
+
+/// The standalone desk probe launches the sibling module binary rather than
+/// another copy of the probe. Keep that helper pinned for the whole probe run.
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+#[doc(hidden)]
+pub fn pin_helper_for_probe(
+    executable: &std::path::Path,
+) -> std::io::Result<HelperExecutableGuard> {
+    let executable = cerebellum_macos::PinnedExecutable::for_probe(executable)?;
+    *HELPER_EXECUTABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executable);
+    Ok(HelperExecutableGuard(()))
+}
 /// Bounds each memory-only record of who drew a badge. Far more than the agents
 /// one person runs at once; past it the oldest record goes, and that agent's
 /// badge still idles out on its own.
@@ -434,6 +498,18 @@ impl RestartLimit {
 }
 
 impl Coordinator {
+    /// The desk probe measures the same helper generation the transport owns,
+    /// without a wrapper process or a pid file next to the build output.
+    #[cfg(all(target_os = "macos", feature = "desk-probe"))]
+    #[doc(hidden)]
+    pub fn helper_pid_for_probe(&self) -> Option<u32> {
+        self.0
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|generation| generation.pid)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn set_avatars(&self, avatars: Arc<avatar::Avatars>) {
         let _ = self.0.avatars.set(avatars);
@@ -2086,10 +2162,17 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 return false;
             }
             let launched = (|| {
-                let executable = std::env::current_exe().ok()?;
+                let pinned = HELPER_EXECUTABLE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let executable = helper_launch_path(pinned.as_ref())?;
                 let (barred, pipe) =
                     cerebellum_macos::spawn_barred_stdin(&executable, &["--agent-cursor".into()])
                         .ok()?;
+                if !pinned.as_ref()?.accepts_child(barred.generation().pid) {
+                    HELPER_BINARY_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
                 let mut generation = state
                     .generation
                     .lock()
@@ -2171,6 +2254,21 @@ impl Coordinator {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unavailable_startup_binary_refuses_launch_and_is_reported_in_health() {
+        assert!(super::helper_launch_path(None).is_none());
+        let report = crate::with_process_gauges(crate::HealthState::new().report());
+        let subc_protocol::session::ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = report
+        else {
+            panic!("health metrics");
+        };
+        assert_eq!(metrics["cursorHelperBinaryUnavailable"], true);
+    }
+
     use super::*;
     use crate::test_support::HANG_GUARD;
     use cerebellum_computer::cursor::MAX_FRAME_BYTES;
