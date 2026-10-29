@@ -15,14 +15,15 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v32.json");
-/// The digests of the v30 and v31 artifacts this build no longer ships but
-/// keeps as history: v30 adds the operator-app refusal, v31 adds the image
-/// handle.
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v33.json");
+/// The digests of retained historical artifacts: operator-app refusal, image
+/// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
     "b0b9b5aab421dd5c5380ddfef0580168f485af8bc44a3b7991898b96d144a906";
 const V31_ARTIFACT_SHA256: &str =
     "bfd49ebcfc9166f1ed41754ea7b9a18606567e046c1c2f6e8a9bce1ba2d07943";
+const V32_ARTIFACT_SHA256: &str =
+    "a848a0634cf825af7b02d5e1fd3f3af7c9bf2cde9673ada0a8cf746d8aac8b5e";
 const V13_ARTIFACT_SHA256: &str =
     "df4dd2cae84214efad94c3e3ce83537abc284252c8375e49ba151afe416c62fc";
 /// The digest of the v14 artifact, measured before v15 was minted.
@@ -134,6 +135,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V30_ARTIFACT_SHA256
             } else if path.ends_with("v31.json") {
                 V31_ARTIFACT_SHA256
+            } else if path.ends_with("v32.json") {
+                V32_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -806,7 +809,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v30_from_v29(&generated, historical_revision(30).as_str().unwrap());
     let generated =
         vocabulary_mint::v31_from_v30(&generated, historical_revision(31).as_str().unwrap());
-    let generated = vocabulary_mint::v32_from_v31(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v32_from_v31(&generated, historical_revision(32).as_str().unwrap());
+    let generated = vocabulary_mint::v33_from_v32(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -1940,7 +1945,7 @@ fn v31_changes_only_read_states_image_handle() {
 /// Removing the terminal alternatives recovers the exact ordinary schemas
 /// carried by v31, whose independently pinned digest guards the reconstruction.
 fn recreated_v31() -> Value {
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v32();
     vocabulary["revision"] = historical_revision(31);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         if SYNTHETIC_CAPABILITIES.contains(&row["capability_id"].as_str().unwrap()) {
@@ -1967,8 +1972,9 @@ fn v32_recreates_the_pinned_v31() {
 #[test]
 fn v32_changes_only_keystroke_result_schemas() {
     let previous = recreated_v31();
-    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
-    let generated = vocabulary_mint::v32_from_v31(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let mut current = recreated_v32();
+    let generated =
+        vocabulary_mint::v32_from_v31(&previous, historical_revision(32).as_str().unwrap());
     assert_eq!(current, generated);
     for (before, after) in previous["rows"]
         .as_array()
@@ -1988,6 +1994,91 @@ fn v32_changes_only_keystroke_result_schemas() {
     }
     current["revision"] = previous["revision"].clone();
     assert_eq!(previous, current);
+}
+
+/// Remove only the optional diagnostic to recover the independently pinned v32.
+fn recreated_v32() -> Value {
+    fn remove(schema: &mut Value) {
+        assert_eq!(
+            schema["properties"]["detail"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("development_build_check"),
+            Some(vocabulary_mint::v33_development_build_check_field())
+        );
+        if let Some(branches) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+            for branch in branches {
+                if branch["properties"]["outcome"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(vocabulary_mint::AUTHORIZATION_DENIED))
+                {
+                    remove(branch);
+                }
+            }
+        }
+    }
+    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    vocabulary["revision"] = historical_revision(32);
+    for row in vocabulary["rows"].as_array_mut().unwrap() {
+        if row["capability_id"] != "computer.list_apps" {
+            remove(&mut row["result_schema"]);
+        }
+    }
+    vocabulary
+}
+
+#[test]
+fn v33_only_adds_the_optional_development_diagnostic_to_results() {
+    let previous = recreated_v32();
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&previous).unwrap()),
+        V32_ARTIFACT_SHA256
+    );
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    assert_eq!(
+        current,
+        vocabulary_mint::v33_from_v32(&previous, COMPUTER_ACTION_VOCABULARY_REVISION)
+    );
+    for (before, after) in previous["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(current["rows"].as_array().unwrap())
+    {
+        assert_eq!(before["request_schema"], after["request_schema"]);
+        let mut after = after.clone();
+        after["result_schema"] = before["result_schema"].clone();
+        assert_eq!(*before, after, "only result schemas may change");
+    }
+}
+
+/// Explicit writer for the content revision; ordinary test runs never write artifacts.
+#[test]
+#[ignore = "artifact-writing generator; run explicitly with --ignored --exact"]
+fn mint_current_vocabulary_artifact() {
+    let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let previous_path = resources.join(format!(
+        "{}.json",
+        historical_revision(32).as_str().unwrap()
+    ));
+    let previous: Value = serde_json::from_slice(&std::fs::read(previous_path).unwrap()).unwrap();
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&previous).unwrap()),
+        V32_ARTIFACT_SHA256
+    );
+    let generated = vocabulary_mint::v33_from_v32(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let bytes = canonical_json_bytes(&generated).unwrap();
+    std::fs::write(
+        resources.join(format!("{COMPUTER_ACTION_VOCABULARY_REVISION}.json")),
+        &bytes,
+    )
+    .unwrap();
+    println!(
+        "minted {} bytes; sha256 {}",
+        bytes.len(),
+        hex_digest(&bytes)
+    );
 }
 
 /// The shipped artifact with v30's addition taken back out from the recreated

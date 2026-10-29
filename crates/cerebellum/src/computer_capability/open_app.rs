@@ -99,9 +99,9 @@ where
         // application no agent may use is refused before its signature is
         // read or its grant looked up.
         if super::operator_apps::installed_app_blocked(&app) {
-            return self
-                .operator_app_refused(context.grantee, &request.target)
+            self.operator_app_refused(context.grantee, &request.target)
                 .await;
+            return super::operator_apps::installed_app_refusal(&app, &context.consent.caller);
         }
         if let Some(url) = request.url.as_deref() {
             let source = self.app_state_source.clone();

@@ -112,6 +112,8 @@ mod open_app;
 #[cfg(test)]
 mod open_app_tests;
 mod operator_apps;
+#[doc(hidden)]
+pub use operator_apps::development_build_snapshot;
 pub use operator_apps::ExecutableReader;
 #[cfg(test)]
 mod permission_tests;

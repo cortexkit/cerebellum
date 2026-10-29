@@ -2547,3 +2547,74 @@ pub fn v32_from_v31(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Optional, caller-scoped diagnostics for a refused development-build exception.
+/// Counts include all window layers, never titles. A missing numeric reading is
+/// unknown; a zero is an actual reading of no matching process or windows.
+pub fn v33_development_build_check_field() -> Value {
+    json!({
+        "type":"object", "additionalProperties":false, "required":["condition"],
+        "properties":{
+            "condition":{"type":"string","enum":["caller","process_unresolved","identity_unreadable","executable_unreadable","not_a_development_build","signature_unreadable","release_signed","title_fallback"]},
+            "error_kind":{"type":"string","enum":["NoReader","Unsigned","Failed"]},
+            "error":{"type":"string","maxLength":240},
+            "bundle_identity_present":{"type":"boolean"},
+            "executable_present":{"type":"boolean"},
+            "classes":{
+                "type":"object","additionalProperties":false,"required":["bundle_identity","executable"],
+                "properties":{
+                    "bundle_identity":{"type":"string","enum":["always","development_build","unmatched"]},
+                    "executable":{"type":"string","enum":["always","development_build","unmatched"]}
+                }
+            },
+            "processes":{
+                "type":"array","items":{
+                    "type":"object","additionalProperties":false,"required":["pid"],
+                    "properties":{
+                        "pid":{"type":"integer"},
+                        "pid_alive":{"type":"integer","enum":[0,1]},
+                        "total_windows":{"type":"integer"},
+                        "on_screen_windows":{"type":"integer"},
+                        "windows_on_active_display":{"type":"integer"},
+                        "windows_on_awake_display":{"type":"integer"}
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Revision 33 changes result schemas only. The diagnostic is optional and is
+/// emitted only to an attested development-build driver, never to other agents.
+pub fn v33_from_v32(previous: &Value, revision: &str) -> Value {
+    fn extend(schema: &mut Value) {
+        let properties = schema["properties"]["detail"]["properties"]
+            .as_object_mut()
+            .unwrap();
+        assert!(properties
+            .insert(
+                "development_build_check".into(),
+                v33_development_build_check_field()
+            )
+            .is_none());
+        if let Some(branches) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+            for branch in branches {
+                if branch["properties"]["outcome"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(AUTHORIZATION_DENIED))
+                {
+                    extend(branch);
+                }
+            }
+        }
+    }
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        if row["capability_id"] != "computer.list_apps" {
+            extend(&mut row["result_schema"]);
+        }
+    }
+    next
+}
