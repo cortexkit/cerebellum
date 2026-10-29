@@ -4,9 +4,9 @@
 //! in the vault's own shapes.
 //!
 //! The page double speaks CDP the way Chrome does for the commands the fill
-//! sends, and records every command. The snapshot is canned (the snapshot
-//! path is not what these tests exercise), built from the same DOM the driver
-//! reads, so the fill's live re-check sees what the snapshot saw.
+//! sends, and records every command. Most snapshots are canned from the same
+//! DOM the driver reads; the owner-document regression also runs the production
+//! AX capture so the fill uses refs printed by a real outline snapshot.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -109,6 +109,7 @@ struct Page {
     resolve_fails: bool,
     snapshot_delay: Duration,
     real_dom_capture: bool,
+    real_ax_capture: bool,
     frame_generation: u64,
     /// Bumped by every cross-document navigation.
     document: u64,
@@ -146,6 +147,7 @@ impl Default for Page {
             resolve_fails: false,
             snapshot_delay: Duration::ZERO,
             real_dom_capture: false,
+            real_ax_capture: false,
             frame_generation: 1,
             document: 1,
             frame: None,
@@ -199,6 +201,16 @@ impl Shared {
 }
 
 impl Page {
+    fn ax_nodes(&self) -> Vec<Value> {
+        vec![
+            json!({"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Login"},"backendDOMNodeId":1,"frameId":MAIN,"childIds":["main"]}),
+            json!({"nodeId":"main","ignored":false,"role":{"value":"main"},"name":{"value":""},"backendDOMNodeId":2,"childIds":["form"]}),
+            json!({"nodeId":"form","ignored":false,"role":{"value":"form"},"name":{"value":"Sign in"},"backendDOMNodeId":FORM,"childIds":["username","password"]}),
+            json!({"nodeId":"username","ignored":false,"role":{"value":"textbox"},"name":{"value":"Email"},"backendDOMNodeId":USERNAME_NODE,"childIds":[]}),
+            json!({"nodeId":"password","ignored":false,"role":{"value":"textbox"},"name":{"value":"Password"},"backendDOMNodeId":PASSWORD_NODE,"childIds":[]}),
+        ]
+    }
+
     fn dom(&self) -> Map<String, Value> {
         if let Some(dom) = &self.dom_override {
             return dom.clone();
@@ -270,13 +282,23 @@ impl Page {
             "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
             "DOM.describeNode" => {
                 let in_frame = self.form_in == Place::Frame;
-                json!({"node":{"nodeType":9,"frameId":if self.adopted_owner {"adopted-frame"} else if in_frame { LOGIN_FRAME } else { MAIN },
-                    "documentURL":if self.adopted_owner {"about:blank"} else if in_frame {&self.frame.as_ref().unwrap().url} else {&self.main_url}}})
+                // Chrome describes a Document without frameId; that optional
+                // DOM.Node property identifies frame-owner elements instead.
+                json!({"node":{"nodeType":9,"backendNodeId":1,
+                    "documentURL":if in_frame {&self.frame.as_ref().unwrap().url} else {&self.main_url}}})
             }
             "Accessibility.getRootAXNode" => {
-                json!({"node":{"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Login"},"backendDOMNodeId":1,"frameId":MAIN}})
+                json!({"node":self.ax_nodes()[0]})
             }
-            "Accessibility.getChildAXNodes" => json!({"nodes":[]}),
+            "Accessibility.getFullAXTree" => json!({"nodes":self.ax_nodes()}),
+            "Accessibility.getChildAXNodes" => {
+                let nodes = self.ax_nodes();
+                let parent = nodes
+                    .iter()
+                    .find(|node| node["nodeId"] == params["id"])
+                    .unwrap();
+                json!({"nodes":nodes.iter().filter(|node| parent["childIds"].as_array().unwrap().contains(&node["nodeId"])).collect::<Vec<_>>()})
+            }
             "DOM.getDocument" => json!({"root":{"nodeId":1}}),
             "DOM.pushNodesByBackendIdsToFrontend" => json!({"nodeIds":[1]}),
             "DOM.querySelector" => json!({"nodeId":1}),
@@ -302,6 +324,11 @@ impl Page {
                 if function == "function() { return this.ownerDocument; }" {
                     return Ok(json!({"result":{"objectId":"document-owner"}}));
                 }
+                if function == "function() { return this.ownerDocument === document; }" {
+                    // Adoption can keep the backend id and HTTPS origin while
+                    // moving the node into another same-session document.
+                    return Ok(json!({"result":{"value":!self.adopted_owner}}));
+                }
                 let value = if function.contains("protectedNodes") {
                     assert!(params["arguments"]
                         .as_array()
@@ -318,6 +345,13 @@ impl Page {
                     assert!(function.contains("dispatchEvent(new win.Event('change'"));
                     if self.mutate_before_set {
                         return Ok(json!({"result":{"value":false}}));
+                    }
+                    if params["arguments"][7]["value"] == true {
+                        assert!(
+                            params["arguments"][4]["value"].is_null(),
+                            "precheck sent a value"
+                        );
+                        return Ok(json!({"result":{"value":true}}));
                     }
                     let text = params["arguments"][4]["value"].as_str().unwrap().to_owned();
                     self.values.insert(node, text);
@@ -490,11 +524,20 @@ impl OwnedBrowserProcess for Process {
     fn snapshot_classified(
         &mut self,
         context_key: &str,
-        _: SnapshotKind,
+        mode: SnapshotKind,
         document_epoch: u64,
         current_origin: &str,
         deadline_ms: u64,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        if self.page.lock().real_ax_capture {
+            return self.driver.snapshot_classified(
+                context_key,
+                mode,
+                document_epoch,
+                current_origin,
+                deadline_ms,
+            );
+        }
         let frames = self.driver.frame_documents(context_key, deadline_ms)?;
         let page = self.page.lock();
         let dom = page.dom();
@@ -630,6 +673,15 @@ impl OwnedBrowserProcess for Process {
     ) -> Result<cerebellum::browser_type::BrowserTypeResult, NavigationDriveError> {
         self.driver
             .type_classified(context_key, target, text, clear_first, deadline_ms)
+    }
+
+    fn check_fill_login(
+        &mut self,
+        context: &str,
+        dispatch: &cerebellum::browser::fill::FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<Option<&'static str>, NavigationDriveError> {
+        self.driver.check_fill_login(context, dispatch, deadline_ms)
     }
 
     fn fill_login(
@@ -1206,6 +1258,41 @@ async fn real_source_fills_and_handles_golden_approval_and_refusal() {
 }
 
 #[tokio::test]
+async fn fresh_outline_refs_fill_when_the_owner_document_has_no_frame_id() {
+    for arguments in [json!({}), json!({"role_filter":["textbox"]})] {
+        let f = fixture(
+            Page {
+                real_ax_capture: true,
+                ..Page::default()
+            },
+            VaultState::default(),
+        )
+        .await;
+        let snapshot = f.call("browser.snapshot", arguments).await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        let filled = f
+            .call(
+                "browser.fill_login",
+                json!({
+                    "secret": SECRET,
+                    "username_ref": named_ref(&snapshot, "Email"),
+                    "password_ref": named_ref(&snapshot, "Password"),
+                }),
+            )
+            .await;
+        assert_eq!(filled["outcome"], "ok", "{filled}");
+        assert_eq!(f.page.value(USERNAME_NODE), USERNAME);
+        assert_eq!(f.page.value(PASSWORD_NODE), PASSWORD);
+        assert!(f
+            .page
+            .lock()
+            .commands
+            .iter()
+            .any(|method| method == "Accessibility.getRootAXNode"));
+    }
+}
+
+#[tokio::test]
 async fn an_ableton_django_username_without_autocomplete_fills() {
     let fixture = fixture(
         Page {
@@ -1595,8 +1682,18 @@ async fn a_navigation_between_the_check_and_the_insertion_inserts_nothing() {
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.page.value(USERNAME_NODE), "");
     assert_eq!(fixture.page.value(PASSWORD_NODE), "");
-    // The window is installed before dispatch and stays until a read
-    // confirms main-frame document replacement.
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert!(!reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("some values may have reached it"));
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
     assert_eq!(fixture.snapshot("ax").await["outcome"], "ok");
     assert!(
         !fixture
@@ -1877,6 +1974,83 @@ async fn adopted_owner_frame_is_refused_before_insertion() {
     let reply = fixture.fill(false).await;
     assert_eq!(reason_code(&reply), "owner_frame_changed", "{reply}");
     assert_eq!(fixture.page.insertions(), 0);
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert!(!reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("some values may have reached it"));
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
+    assert_eq!(fixture.screenshot().await["outcome"], "ok");
+}
+
+#[tokio::test]
+async fn refused_live_field_checks_never_ask_the_vault_or_protect_the_page() {
+    for page in [
+        Page {
+            adopted_owner: true,
+            ..Page::default()
+        },
+        Page {
+            mutate_before_set: true,
+            ..Page::default()
+        },
+    ] {
+        let fixture = fixture(page, VaultState::default()).await;
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
+        assert!(
+            fixture.vault.requests().is_empty(),
+            "a refused precheck asked the vault"
+        );
+        assert_eq!(fixture.page.insertions(), 0);
+        assert!(!reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("some values may have reached it"));
+        assert!(
+            !fixture
+                .planes
+                .browser
+                .fill_window_open_for_test(&identity())
+                .await
+        );
+        assert_eq!(fixture.screenshot().await["outcome"], "ok");
+    }
+}
+
+#[tokio::test]
+async fn an_unattempted_retry_preserves_an_earlier_fills_protection() {
+    let fixture = fixture(Page::default(), VaultState::default()).await;
+    assert_eq!(fixture.fill(false).await["outcome"], "ok");
+    let page = fixture.page.clone();
+    fixture.vault.0.lock().unwrap().during_request =
+        Some(Box::new(move || page.lock().adopted_owner = true));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reason_code(&reply), "owner_frame_changed", "{reply}");
+    assert_eq!(
+        fixture.page.insertions(),
+        2,
+        "the refused retry inserted a value"
+    );
+    assert!(
+        fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
+    assert_eq!(
+        fixture.screenshot().await["outcome"],
+        "authorization_denied"
+    );
+    fixture.page.lock().copied_text = Some(PASSWORD.into());
+    assert!(!contains_password(&fixture.snapshot("ax").await));
 }
 
 #[tokio::test]
@@ -1908,6 +2082,10 @@ async fn partial_fill_with_failed_cleanup_keeps_protection() {
     .await;
     let reply = fixture.fill(false).await;
     assert_ne!(reply["outcome"], "ok", "{reply}");
+    assert!(reply["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("some values may have reached it"));
     assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
     assert!(
         fixture
@@ -2180,6 +2358,36 @@ async fn a_declined_approval_fills_nothing() {
     assert_eq!(reply["detail"]["decision"], "declined", "{reply}");
     assert_eq!(fixture.page.insertions(), 0);
     assert_eq!(fixture.vault.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_changed_owner_after_approval_refuses_before_the_second_vault_request() {
+    let fixture = fixture(
+        Page::default(),
+        VaultState {
+            needs_approval: true,
+            approves_when_asked: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let page = fixture.page.clone();
+    fixture.vault.0.lock().unwrap().during_request =
+        Some(Box::new(move || page.lock().adopted_owner = true));
+    fixture
+        .carrier()
+        .queue(vault_approval_answer("req_vault_1", "allow"));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reason_code(&reply), "owner_frame_changed", "{reply}");
+    assert_eq!(fixture.vault.requests().len(), 1);
+    assert_eq!(fixture.page.insertions(), 0);
+    assert!(
+        !fixture
+            .planes
+            .browser
+            .fill_window_open_for_test(&identity())
+            .await
+    );
 }
 
 #[tokio::test]

@@ -178,6 +178,9 @@ async fn serve_inner(
         stamp,
         origin: plan.origin.clone(),
     };
+    if let Err(error) = browser.check_planned_login(identity, &plan).await {
+        return browser.finish_fill_reply(browser.fill_reply(identity, Err(error)).await);
+    }
     let result = match ask(source.as_ref(), &secret_use).await {
         Ok(SecretUseAnswer::Released(material)) => {
             browser.fill_planned_login(identity, plan, material).await
@@ -325,14 +328,17 @@ async fn approve_then_fill(
             let _ = planes.consent.mark_applied(&id);
             // The vault recorded the approval from the person's answer; asked
             // again, it releases the login.
-            let result = match ask(source, secret_use).await {
-                Ok(SecretUseAnswer::Released(material)) => {
-                    browser.fill_planned_login(identity, plan, material).await
-                }
-                Ok(_) => Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable)),
-                Err(SourceUnavailable) => {
-                    Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable))
-                }
+            let result = match browser.check_planned_login(identity, &plan).await {
+                Err(error) => Err(error),
+                Ok(()) => match ask(source, secret_use).await {
+                    Ok(SecretUseAnswer::Released(material)) => {
+                        browser.fill_planned_login(identity, plan, material).await
+                    }
+                    Ok(_) => Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable)),
+                    Err(SourceUnavailable) => {
+                        Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable))
+                    }
+                },
             };
             let (execution, reason) = if result.is_ok() {
                 (Execution::Executed, None)

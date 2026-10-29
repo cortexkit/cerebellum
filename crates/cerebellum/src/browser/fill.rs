@@ -26,6 +26,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -234,6 +235,23 @@ pub struct FillDispatch {
     pub document: Option<CommittedDocument>,
     /// In insertion order.
     pub targets: Vec<FillTarget>,
+    insertion_attempted: Arc<AtomicBool>,
+}
+
+impl FillDispatch {
+    fn new(document: CommittedDocument, targets: Vec<FillTarget>) -> Self {
+        Self {
+            document: Some(document),
+            targets,
+            insertion_attempted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Any adapter that sends a value to the renderer must call this immediately
+    /// before sending it, even if the command may fail or its reply may be lost.
+    pub fn mark_insertion_attempted(&self) {
+        self.insertion_attempted.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,10 +298,11 @@ pub enum FillRefusal {
     LoginUnavailable,
     /// The vault could not be asked.
     VaultUnavailable,
-    /// The page changed or insertion could not be confirmed. Reads remain
-    /// protected even if rollback could not reach the renderer.
+    /// The page changed or insertion could not be confirmed. Once insertion
+    /// was attempted, reads remain protected even after rollback.
     Aborted {
         reason_code: &'static str,
+        insertion_attempted: bool,
     },
     /// A screenshot of a tab holding a filled password.
     FilledPasswordOnPage,
@@ -318,7 +337,8 @@ impl FillRefusal {
             Self::Origin { .. } => "a saved login goes only into fields whose frames are https and share one origin; choose the fields of such a form from a fresh snapshot",
             Self::LoginUnavailable => "this agent cannot use a saved login of that name on this site; check the name with the person, or ask them to share the login with this agent for this site",
             Self::VaultUnavailable => "the vault could not be reached; retry later, and report it if it persists",
-            Self::Aborted { .. } => "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
+            Self::Aborted { insertion_attempted: false, .. } => "the login was not filled and no values were sent to the page; take a fresh snapshot before retrying",
+            Self::Aborted { insertion_attempted: true, .. } => "the login could not be completely filled; the page remains protected because some values may have reached it; reload or navigate the page itself before retrying",
             Self::FilledPasswordOnPage => "take a snapshot to read this page instead; screenshots are refused until you reload or navigate the page itself",
             Self::WindowExpired => "reload or navigate the page itself before reading it again",
             Self::ApprovalNotGiven { decision: "declined", .. } => "the person did not approve using this saved login; call fill_login again only if they change their mind",
@@ -335,7 +355,7 @@ impl FillRefusal {
             }),
             Self::LoginUnavailable => json!({"reason_code": "login_unavailable"}),
             Self::VaultUnavailable => json!({"reason_code": "vault_unavailable"}),
-            Self::Aborted { reason_code } => json!({"reason_code": reason_code}),
+            Self::Aborted { reason_code, .. } => json!({"reason_code": reason_code}),
             Self::FilledPasswordOnPage => json!({
                 "reason_code": "filled_password_on_page",
                 "reason": "a filled password is on this page",
@@ -454,6 +474,28 @@ impl FillWindow {
             .expect("checked redaction material")
             .extend(secrets);
         Ok(())
+    }
+
+    fn checkpoint(&self) -> (usize, usize) {
+        let guard = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.fields.len(), guard.as_ref().map_or(0, Vec::len))
+    }
+
+    /// Remove only material staged for a dispatch that sent no values. An
+    /// earlier fill's protection and expiry must survive a refused retry.
+    fn restore(&mut self, (fields, secrets): (usize, usize)) {
+        self.fields.truncate(fields);
+        if let Some(material) = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            material.truncate(secrets);
+        }
     }
 
     /// Hold the material lock through redaction, so expiry cannot wipe it
@@ -1148,6 +1190,72 @@ impl BrowserPlane {
         })
     }
 
+    /// Run every value-independent live check before asking the vault. The
+    /// empty values stand in for the planned fields; check_fill_login checks
+    /// them but never inserts a value.
+    pub(crate) async fn check_planned_login(
+        &self,
+        identity: &RouteIdentity,
+        plan: &FillPlan,
+    ) -> Result<(), BrowserError> {
+        let _lane = self.lane(&identity.conversation_key).await;
+        {
+            let state = self.state.lock().await;
+            let context = state
+                .contexts
+                .get(&identity.conversation_key)
+                .filter(|context| !context.ended)
+                .ok_or(BrowserError::NoSession)?;
+            if let Some(window) = &context.fill_window {
+                window.with_redactor(|_| ())?;
+            }
+        }
+        let (sessions, clock, deadline_ms) =
+            self.session_gate.as_ref().ok_or(BrowserError::NoSession)?;
+        if let Some(handoff) = sessions.human_in_control(&identity.conversation_key, clock.as_ref())
+        {
+            return Err(BrowserError::HumanInControl {
+                origin: handoff.origin,
+                expires_in_ms: handoff.expires_in_ms,
+            });
+        }
+        let deadline_ms = *deadline_ms;
+        let operation = self
+            .admit_operation(identity, BrowserCapability::Type)?
+            .ok_or(BrowserError::NoSession)?;
+        let dispatch = FillDispatch::new(
+            plan.document.clone(),
+            plan.fields
+                .iter()
+                .map(|field| FillTarget {
+                    field: field.field,
+                    identity: field.identity.clone(),
+                    classification: field.classification.clone(),
+                    frame: field.frame.clone(),
+                    value: Zeroizing::new(String::new()),
+                })
+                .collect(),
+        );
+        let route = identity.conversation_key.clone();
+        let (operation, result) = tokio::task::spawn_blocking(move || {
+            let mut operation = operation;
+            let result = operation.check_fill_login(&route, &dispatch, deadline_ms);
+            (operation, result)
+        })
+        .await
+        .map_err(|_| BrowserError::Internal {
+            reason_code: JournalReasonCode::InternalFailure,
+        })?;
+        operation.finish();
+        match result.map_err(map_navigation_drive_error)? {
+            None => Ok(()),
+            Some(reason_code) => Err(BrowserError::FillRefused(FillRefusal::Aborted {
+                reason_code,
+                insertion_attempted: false,
+            })),
+        }
+    }
+
     /// Check the fields again on the live page and insert the login. The
     /// material is consumed: every buffer holding it is wiped when this
     /// returns, except the material kept for the tab's fill window redaction.
@@ -1226,13 +1334,14 @@ impl BrowserPlane {
         let operation = self
             .admit_operation(identity, BrowserCapability::Type)?
             .ok_or(BrowserError::NoSession)?;
-        {
+        let checkpoint = {
             let mut state = self.state.lock().await;
             let context = state
                 .contexts
                 .get_mut(&identity.conversation_key)
                 .filter(|context| !context.ended)
                 .ok_or(BrowserError::NoSession)?;
+            let checkpoint = context.fill_window.as_ref().map(FillWindow::checkpoint);
             match context.fill_window.as_mut() {
                 Some(window) => window.extend(filled.clone(), secrets)?,
                 None => {
@@ -1244,18 +1353,17 @@ impl BrowserPlane {
                     ))
                 }
             }
-        }
-        // The dispatch commitment, reached before the first CDP command of
-        // the fill: a reply without it means nothing reached the page.
+            checkpoint
+        };
+        // Commit before the value-bearing dispatch. The earlier precheck only
+        // reads the page and cannot insert a credential.
         identity.witness.mark_committed();
         let route = identity.conversation_key.clone();
         let expected = document.clone();
         let cleared = filled.clone();
-        let dispatch = FillDispatch {
-            document: Some(document),
-            targets,
-        };
-        let (operation, result) = tokio::task::spawn_blocking(move || {
+        let dispatch = FillDispatch::new(document, targets);
+        let insertion_attempted = dispatch.insertion_attempted.clone();
+        let dispatched = tokio::task::spawn_blocking(move || {
             let mut operation = operation;
             let outcome = operation.fill_login(&route, &dispatch, deadline_ms);
             // The values are wiped before anything else is asked of the page.
@@ -1282,8 +1390,21 @@ impl BrowserPlane {
             };
             (operation, result)
         })
-        .await
-        .map_err(|_| BrowserError::Internal {
+        .await;
+        let insertion_attempted = insertion_attempted.load(Ordering::Acquire);
+        if !insertion_attempted {
+            let mut state = self.state.lock().await;
+            if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
+                if let Some(checkpoint) = checkpoint {
+                    if let Some(window) = &mut context.fill_window {
+                        window.restore(checkpoint);
+                    }
+                } else {
+                    context.fill_window = None;
+                }
+            }
+        }
+        let (operation, result) = dispatched.map_err(|_| BrowserError::Internal {
             reason_code: JournalReasonCode::InternalFailure,
         })?;
         operation.finish();
@@ -1294,6 +1415,7 @@ impl BrowserPlane {
             (FillOutcome::Aborted { reason_code }, _) => {
                 Err(BrowserError::FillRefused(FillRefusal::Aborted {
                     reason_code,
+                    insertion_attempted,
                 }))
             }
         }
@@ -1842,6 +1964,11 @@ mod tests {
             FillRefusal::VaultUnavailable,
             FillRefusal::Aborted {
                 reason_code: "document_changed",
+                insertion_attempted: true,
+            },
+            FillRefusal::Aborted {
+                reason_code: "owner_frame_changed",
+                insertion_attempted: false,
             },
             FillRefusal::FilledPasswordOnPage,
             FillRefusal::WindowExpired,
@@ -1897,6 +2024,11 @@ mod tests {
             FillRefusal::VaultUnavailable,
             FillRefusal::Aborted {
                 reason_code: "document_changed",
+                insertion_attempted: true,
+            },
+            FillRefusal::Aborted {
+                reason_code: "owner_frame_changed",
+                insertion_attempted: false,
             },
             FillRefusal::FilledPasswordOnPage,
             FillRefusal::WindowExpired,
