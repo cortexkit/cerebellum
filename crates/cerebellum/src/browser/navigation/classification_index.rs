@@ -45,6 +45,8 @@ pub(super) struct DomIndexes {
     pub(super) label_controls: HashMap<usize, usize>,
     pub(super) controls_by_form: HashMap<usize, Vec<usize>>,
     pub(super) base_href: Option<String>,
+    pub(super) document_order: Vec<Option<usize>>,
+    pub(super) preceding_text_inputs: Vec<usize>,
 }
 struct PreparedDocument {
     nodes: Vec<RawDomNode>,
@@ -266,6 +268,53 @@ impl PreparedDocument {
                 }
             })
             .collect::<Vec<_>>();
+        // CDP flattens descendants before their parents. Reconstruct preorder
+        // from parent links so the form's start also precedes its controls.
+        let mut children = vec![Vec::new(); nodes.len()];
+        let mut stack = Vec::new();
+        for (index, node) in counted.iter().enumerate() {
+            if node.local_name == "#document" {
+                stack.push(index);
+            } else if let Some(parent) = parents[index] {
+                children[parent].push(index);
+            }
+        }
+        let mut document_order = vec![None; nodes.len()];
+        let mut ordered = Vec::new();
+        while let Some(index) = stack.pop() {
+            work.step();
+            if document_order[index].is_some() || counted[index].local_name == "#document-fragment"
+            {
+                continue;
+            }
+            document_order[index] = Some(ordered.len());
+            ordered.push(index);
+            stack.extend(children[index].iter().rev().copied());
+        }
+        let mut preceding_text_inputs = vec![0; nodes.len()];
+        let mut text_counts = HashMap::<usize, usize>::new();
+        for index in ordered {
+            work.step();
+            let Some(owner) = form_owners[index] else {
+                continue;
+            };
+            let (Some(start), Some(order)) = (document_order[owner], document_order[index]) else {
+                continue;
+            };
+            if order <= start {
+                continue;
+            }
+            let count = text_counts.entry(owner).or_default();
+            preceding_text_inputs[index] = *count;
+            let node = &counted[index];
+            if node.local_name == "input"
+                && node.attributes.get("type").is_none_or(|kind| {
+                    kind.eq_ignore_ascii_case("text") || kind.eq_ignore_ascii_case("email")
+                })
+            {
+                *count += 1;
+            }
+        }
         let mut label_controls = HashMap::new();
         let mut controls_by_form: HashMap<usize, Vec<usize>> = HashMap::new();
         for (index, node) in counted.iter().enumerate() {
@@ -309,6 +358,8 @@ impl PreparedDocument {
                 label_controls,
                 controls_by_form,
                 base_href,
+                document_order,
+                preceding_text_inputs,
             },
         })
     }

@@ -278,7 +278,7 @@ impl NonTypeClassificationInput {
 }
 
 /// The exact closed record used by `browser.click` and `browser.click_point`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NonTypeClassificationRecord {
     pub schema: String,
     pub node_identity: String,
@@ -296,6 +296,46 @@ pub struct NonTypeClassificationRecord {
     pub required_tier: u8,
     pub credential: bool,
     pub financial: bool,
+    /// Ephemeral login hints, excluded from the closed authorization record and
+    /// its fingerprint. These contain DOM metadata only, never input values.
+    #[serde(skip)]
+    pub login_field: Option<LoginFieldFacts>,
+}
+
+// Login metadata is revalidated by fill_login only. Including it in equality
+// would make unrelated DOM edits invalidate ordinary click and type actions.
+impl PartialEq for NonTypeClassificationRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.node_identity == other.node_identity
+            && self.activation_target_identity == other.activation_target_identity
+            && self.document_epoch == other.document_epoch
+            && self.target_kind == other.target_kind
+            && self.effective_input_type == other.effective_input_type
+            && self.activation_invokes_form_submit == other.activation_invokes_form_submit
+            && self.form_owner == other.form_owner
+            && self.current_top_level_origin == other.current_top_level_origin
+            && self.activation_destination_origin == other.activation_destination_origin
+            && self.target_autocomplete_tokens == other.target_autocomplete_tokens
+            && self.target_password == other.target_password
+            && self.associated_form_controls == other.associated_form_controls
+            && self.required_tier == other.required_tier
+            && self.credential == other.credential
+            && self.financial == other.financial
+    }
+}
+
+impl Eq for NonTypeClassificationRecord {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginFieldFacts {
+    pub name: String,
+    pub id: String,
+    pub role: String,
+    pub hidden: bool,
+    pub document_order: Option<usize>,
+    pub form_start_order: Option<usize>,
+    pub preceding_text_inputs: usize,
 }
 
 /// The associated-control projection retained in the closed record.
@@ -767,6 +807,7 @@ pub fn classify_non_type(
         required_tier,
         credential,
         financial,
+        login_field: None,
     };
     record.validate().map_err(|error| match error {
         ClassificationError::CanonicalRecordOutOfBounds => error,

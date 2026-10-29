@@ -118,6 +118,8 @@ struct Page {
     /// Where the one-time-code input is.
     otp_in: Place,
     password_type: String,
+    username_attributes: Vec<String>,
+    dom_override: Option<Map<String, Value>>,
     values: HashMap<u64, String>,
     focused: Option<u64>,
     /// Text a page script copied into the document.
@@ -150,6 +152,10 @@ impl Default for Page {
             form_in: Place::Main,
             otp_in: Place::Main,
             password_type: "password".into(),
+            username_attributes: ["type", "email", "autocomplete", "username"]
+                .map(str::to_owned)
+                .to_vec(),
+            dom_override: None,
             values: HashMap::new(),
             focused: None,
             copied_text: None,
@@ -194,12 +200,15 @@ impl Shared {
 
 impl Page {
     fn dom(&self) -> Map<String, Value> {
+        if let Some(dom) = &self.dom_override {
+            return dom.clone();
+        }
         let mut nodes = vec![
             json!({"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"","nodeName":"#document"}),
         ];
         if !self.form_removed {
             nodes.push(json!({"nodeId":FORM,"backendNodeId":FORM,"parentId":1,"nodeType":1,"localName":"form","nodeName":"FORM","attributes":[]}));
-            nodes.push(json!({"nodeId":USERNAME_NODE,"backendNodeId":USERNAME_NODE,"parentId":FORM,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type","email","autocomplete","username"]}));
+            nodes.push(json!({"nodeId":USERNAME_NODE,"backendNodeId":USERNAME_NODE,"parentId":FORM,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":self.username_attributes}));
             nodes.push(json!({"nodeId":PASSWORD_NODE,"backendNodeId":PASSWORD_NODE,"parentId":FORM,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type",self.password_type]}));
             nodes.push(json!({"nodeId":OTP_NODE,"backendNodeId":OTP_NODE,"parentId":1,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type","text","autocomplete","one-time-code"]}));
         }
@@ -1193,6 +1202,202 @@ async fn real_source_fills_and_handles_golden_approval_and_refusal() {
                 "target": {"origin": SITE},
             }})
         );
+    }
+}
+
+#[tokio::test]
+async fn an_ableton_django_username_without_autocomplete_fills() {
+    let fixture = fixture(
+        Page {
+            username_attributes: [
+                "type",
+                "text",
+                "name",
+                "username",
+                "maxlength",
+                "150",
+                "required",
+                "",
+                "id",
+                "id_username",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            ..Default::default()
+        },
+        VaultState::default(),
+    )
+    .await;
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.page.value(USERNAME_NODE), USERNAME);
+    assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+}
+
+fn plain_username_page(attributes: &[&str], another_input: bool) -> Page {
+    let mut page = Page {
+        username_attributes: attributes.iter().map(|value| (*value).to_owned()).collect(),
+        ..Default::default()
+    };
+    let mut dom = page.dom();
+    if another_input {
+        dom["nodes"].as_array_mut().unwrap().insert(
+            2,
+            json!({
+                "nodeId":20,"backendNodeId":20,"parentId":FORM,"nodeType":1,
+                "localName":"input","nodeName":"INPUT","attributes":["type","text","name","company"]
+            }),
+        );
+    }
+    page.dom_override = Some(dom);
+    page
+}
+
+#[tokio::test]
+async fn plain_usernames_use_whole_name_id_or_autocomplete_tokens() {
+    for (attribute, hint) in [
+        ("name", "USERNAME"),
+        ("id", "id_UsEr"),
+        ("name", "login"),
+        ("name", "email"),
+        ("name", "e-mail"),
+        ("name", "mail"),
+        ("name", "userid"),
+        ("name", "user_id"),
+        ("id", "account.login"),
+        ("autocomplete", "section-LOGIN"),
+    ] {
+        let fixture = fixture(
+            plain_username_page(&["type", "text", attribute, hint], true),
+            VaultState::default(),
+        )
+        .await;
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], "ok", "{attribute}={hint}: {reply}");
+        assert_eq!(fixture.page.value(USERNAME_NODE), USERNAME);
+        assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+    }
+}
+
+#[tokio::test]
+async fn the_only_preceding_text_input_fills_without_a_username_hint() {
+    for postorder in [false, true] {
+        let mut page = plain_username_page(&["name", "company"], false);
+        if postorder {
+            let nodes = page.dom_override.as_mut().unwrap()["nodes"]
+                .as_array_mut()
+                .unwrap();
+            let document = nodes.remove(0);
+            let form = nodes.remove(0);
+            nodes.insert(2, form);
+            nodes.push(document);
+        }
+        let fixture = fixture(page, VaultState::default()).await;
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], "ok", "postorder={postorder}: {reply}");
+        assert_eq!(fixture.page.value(USERNAME_NODE), USERNAME);
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_search_hidden_after_password_and_other_form_inputs_refuse() {
+    for case in [
+        "company",
+        "substring",
+        "other_form",
+        "search_type",
+        "search_role",
+        "searchbox_role",
+        "hidden_type",
+        "hidden_attribute",
+        "after_password",
+        "no_form",
+    ] {
+        let attributes: Vec<&str> = match case {
+            "company" => vec!["type", "text", "name", "company"],
+            "substring" => vec!["type", "text", "name", "companyusername"],
+            "search_type" => vec!["type", "search", "name", "username"],
+            "search_role" => vec!["type", "email", "role", "SEARCH"],
+            "searchbox_role" => vec!["type", "text", "name", "username", "role", "searchbox"],
+            "hidden_type" => vec!["type", "hidden", "name", "username"],
+            "hidden_attribute" => vec!["type", "text", "name", "username", "hidden", ""],
+            _ => vec!["type", "text", "name", "username"],
+        };
+        let mut page = plain_username_page(&attributes, true);
+        let nodes = page.dom_override.as_mut().unwrap()["nodes"]
+            .as_array_mut()
+            .unwrap();
+        match case {
+            "other_form" => {
+                nodes.push(
+                    json!({"nodeId":30,"backendNodeId":30,"parentId":1,"nodeType":1,
+                    "localName":"form","nodeName":"FORM","attributes":[]}),
+                );
+                nodes
+                    .iter_mut()
+                    .find(|node| node["nodeId"] == USERNAME_NODE)
+                    .unwrap()["parentId"] = json!(30);
+            }
+            "after_password" => {
+                let index = nodes
+                    .iter()
+                    .position(|node| node["nodeId"] == USERNAME_NODE)
+                    .unwrap();
+                let username = nodes.remove(index);
+                nodes.push(username);
+            }
+            "no_form" => {
+                nodes.retain(|node| node["nodeId"] != FORM);
+                for node in nodes {
+                    if node["parentId"] == FORM {
+                        node["parentId"] = json!(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let fixture = fixture(page, VaultState::default()).await;
+        let reply = fixture.fill(false).await;
+        assert_eq!(reply["outcome"], "invalid_request", "{case}: {reply}");
+        assert_eq!(reply["detail"]["field"], "username_ref", "{case}: {reply}");
+        assert!(fixture.vault.requests().is_empty(), "{case}");
+        assert_eq!(fixture.page.insertions(), 0, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn changing_plain_username_context_after_snapshot_aborts_before_insertion() {
+    for after_username in [false, true] {
+        let mut page = plain_username_page(&["type", "text", "name", "company"], true);
+        let nodes = page.dom_override.as_mut().unwrap()["nodes"]
+            .as_array_mut()
+            .unwrap();
+        if after_username {
+            nodes.swap(2, 3);
+        }
+        nodes.iter_mut().find(|node| node["nodeId"] == 20).unwrap()["attributes"][1] =
+            json!("hidden");
+        let fixture = fixture(page, VaultState::default()).await;
+        let arguments = fixture.fill_arguments(false).await;
+        let mut changed = fixture.page.lock().dom();
+        changed["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|node| node["nodeId"] == 20)
+            .unwrap()["attributes"][1] = json!("text");
+        fixture.page.lock().dom_override = Some(changed);
+        let reply = fixture.call("browser.fill_login", arguments).await;
+        assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
+        assert_eq!(
+            reason_code(&reply),
+            if after_username {
+                "not_a_username_field"
+            } else {
+                "classification_changed"
+            }
+        );
+        assert_eq!(fixture.page.insertions(), 0);
     }
 }
 

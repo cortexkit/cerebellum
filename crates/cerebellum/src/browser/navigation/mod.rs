@@ -3963,6 +3963,39 @@ fn classify_indexed(
             backend_node_id: target_identity.backend_node_id,
         }
     })?;
+    let node = &nodes[target_index];
+    if node.local_name == "input" {
+        let bounded_attribute = |attribute| {
+            node.attributes
+                .get(attribute)
+                .filter(|value| value.len() <= 1024)
+                .cloned()
+                .unwrap_or_default()
+        };
+        record.login_field = Some(classification::LoginFieldFacts {
+            name: bounded_attribute("name"),
+            id: bounded_attribute("id"),
+            role: node
+                .attributes
+                .get("role")
+                .map(|role| {
+                    role.split_ascii_whitespace()
+                        .find(|token| {
+                            token.eq_ignore_ascii_case("search")
+                                || token.eq_ignore_ascii_case("searchbox")
+                        })
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                })
+                .unwrap_or_default(),
+            hidden: node.attributes.contains_key("hidden"),
+            document_order: context.indexes.document_order[target_index],
+            form_start_order: context
+                .form_owner(target_index)
+                .and_then(|owner| context.indexes.document_order[owner]),
+            preceding_text_inputs: context.indexes.preceding_text_inputs[target_index],
+        });
+    }
     Ok(record)
 }
 
