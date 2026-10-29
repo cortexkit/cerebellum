@@ -4,6 +4,7 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
 source "$repo_root/scripts/lib/gate-lock.sh"
+source "$repo_root/scripts/lib/fast-gate-plan.sh"
 scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/fast-gate-test.XXXXXX")"
@@ -31,6 +32,88 @@ setup_phases() {
   static_logs=()
   phase_failed=0
   not_verified=()
+}
+
+browser_source_plan() {
+  local metadata plan path
+  metadata="$(cd "$repo_root" && cargo metadata --locked --format-version 1 --no-deps)" || return 1
+  for path in crates/cerebellum/src/browser/mod.rs \
+    crates/cerebellum/src/browser/nested/module.rs \
+    crates/cerebellum/src/user_browser.rs \
+    crates/cerebellum/src/user_browser_session.rs \
+    crates/cerebellum/src/browser_session.rs \
+    crates/cerebellum/src/browser_launch_native.rs; do
+    plan="$(cd "$repo_root" && plan_for_files "$path" "$metadata")" || return 1
+    if ! grep -Fxq 'T|cerebellum|browser_session_wire' <<< "$plan"; then
+      echo "$path did not select browser_session_wire"
+      return 1
+    fi
+  done
+}
+
+expect_source_suites() {
+  local path="$1" plan actual expected suite
+  shift
+  plan="$(cd "$repo_root" && plan_for_files "$path" "$metadata")" || return 1
+  actual="$(grep '^T|cerebellum|' <<< "$plan" || :)"
+  expected="$(for suite in "$@"; do printf 'T|cerebellum|%s\n' "$suite"; done | sort)"
+  if [ "$actual" != "$expected" ]; then
+    printf 'Unexpected cerebellum suites for %s\nExpected:\n%s\nActual:\n%s\n' "$path" "$expected" "$actual"
+    return 1
+  fi
+}
+
+standalone_source_plans() {
+  local metadata
+  metadata="$(cd "$repo_root" && cargo metadata --locked --format-version 1 --no-deps)" || return 1
+  expect_source_suites crates/cerebellum/src/browser/mod.rs \
+    browser_own_golden browser_session_wire conformance flow_live it || return 1
+  expect_source_suites crates/cerebellum/src/browser_session.rs \
+    browser_own_golden browser_session_wire conformance flow_live it scope_revocation_live shutdown_endings || return 1
+  expect_source_suites crates/cerebellum/src/computer_grants.rs \
+    computer_grant_store_health conformance flow_live format_floor it || return 1
+  expect_source_suites crates/cerebellum/src/computer_capability/mod.rs \
+    conformance flow_live hardware_observer_health it || return 1
+  expect_source_suites crates/cerebellum/src/management.rs \
+    conformance flow_live it scope_revocation_live || return 1
+  expect_source_suites crates/cerebellum/src/scope_watch.rs \
+    conformance flow_live it scope_revocation_live shutdown_endings || return 1
+  expect_source_suites crates/cerebellum/src/login_capture/vault_wire.rs \
+    browser_own_golden browser_session_wire conformance flow_live it vault_deposit_live || return 1
+  expect_source_suites crates/cerebellum/src/manifest.rs \
+    browser_own_golden browser_session_wire conformance flow_live it manifest_flag vault_deposit_live || return 1
+  expect_source_suites crates/cerebellum/src/profile/mod.rs \
+    browser_own_golden browser_session_wire conformance flow_live format_floor it || return 1
+  expect_source_suites crates/cerebellum/src/content_named_fixture.rs \
+    conformance flow_live it manifest_flag scope_revocation_live vault_deposit_live || return 1
+  expect_source_suites crates/cerebellum/src/new_module.rs conformance it || return 1
+  expect_source_suites crates/cerebellum-macos/src/event_tap.rs hardware_observer_health || return 1
+  expect_source_suites crates/cerebellum-core/src/private_fs.rs || return 1
+  expect_source_suites scripts/fast-gate.sh || return 1
+  expect_source_suites crates/cerebellum/tests/browser_session_wire.rs browser_session_wire it
+}
+
+standalone_source_coverage() {
+  local metadata plan sources
+  metadata="$(cd "$repo_root" && cargo metadata --locked --format-version 1 --no-deps)" || return 1
+  sources="$(cd "$repo_root" && git ls-files 'crates/cerebellum/src/*')" || return 1
+  plan="$(cd "$repo_root" && plan_for_files "$sources" "$metadata")" || return 1
+  FAST_GATE_METADATA="$metadata" FAST_GATE_PLAN="$plan" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+package = next(p for p in json.loads(os.environ['FAST_GATE_METADATA'])['packages']
+               if p['name'] == 'cerebellum')
+tests = Path(package['manifest_path']).parent / 'tests'
+standalone = {t['name'] for t in package['targets']
+              if 'test' in t['kind'] and Path(t['src_path']).parent == tests}
+selected = {line.split('|')[2] for line in os.environ['FAST_GATE_PLAN'].splitlines()
+            if line.startswith('T|cerebellum|')}
+# format_floor already runs unconditionally in the Linux half.
+missing = standalone - selected - {'format_floor'}
+assert not missing, f'standalone binaries without a source-area rule: {sorted(missing)}'
+PY
 }
 
 reused_pid_lock() {
@@ -252,6 +335,7 @@ mac_clippy_pipeline() {
     "$fixture/crates/cerebellum/src" "$fixture/crates/cerebellum-linux/src"
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
+    "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
@@ -318,6 +402,7 @@ mac_vm_pipeline() {
     "$fixture/crates/cerebellum-macos/src" "$fixture/crates/cerebellum-macos/tests"
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
+    "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
@@ -397,6 +482,9 @@ combined_missing() {
   grep -Fxq 'Linux fingerprint: <missing>' "$scratch/missing"
 }
 
+check 'a browser-only source diff selects browser_session_wire' browser_source_plan
+check 'standalone source areas select their binaries without unrelated suites' standalone_source_plans
+check 'every standalone cerebellum binary has source coverage or an unconditional phase' standalone_source_coverage
 check 'a stale lock naming a reused live pid is not refused' reused_pid_lock
 check 'a live holder keeps its advisory lock after the helper exits' live_pid_lock
 check 'a concurrent gate is refused until the holder is killed' concurrent_gate_lock
