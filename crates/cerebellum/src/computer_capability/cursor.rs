@@ -395,8 +395,8 @@ struct Follow {
     base_window: [f64; 4],
     base_element: Option<[f64; 4]>,
     /// Dropping it removes the observer: on a hide, a new target, or the
-    /// window closing.
-    _watch: Box<dyn CursorWindowWatch>,
+    /// window closing. Absent only while the observer is being installed.
+    _watch: Option<Box<dyn CursorWindowWatch>>,
 }
 
 /// Preferred element for a read picture and the focused element to use when
@@ -763,59 +763,71 @@ impl Coordinator {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = Arc::downgrade(&self.0);
         let followed = agent.clone();
-        let Some(watch) = source.watch_cursor_window(
+        let follow = Follow {
+            id,
+            serial: event.serial,
+            source: source.clone(),
+            window: window.clone(),
+            element,
+            base_window,
+            // The frame the picture itself was drawn from, read with it.
+            base_element: event.target,
+            _watch: None,
+        };
+        {
+            // Publish before installing the observer: it can report as soon
+            // as it is registered, even before watch_cursor_window returns.
+            // Checked and inserted under the record's lock, the same lock
+            // `end` takes before removing the follow, so an end is either
+            // seen here or removes this entry afterwards.
+            let drawn = self.drawn();
+            if drawn
+                .ended_at
+                .get(agent)
+                .is_some_and(|ended| event.serial < *ended)
+            {
+                return;
+            }
+            let mut follows = self.follows();
+            if follows
+                .get(agent)
+                .is_some_and(|newer| newer.serial > event.serial)
+            {
+                // A later picture's watch is already in place.
+                return;
+            }
+            if follows.len() >= FOLLOW_CAP && !follows.contains_key(agent) {
+                // Bounded: the badge whose watch goes keeps its place and simply
+                // stops following its window.
+                if let Some(oldest) = follows
+                    .iter()
+                    .min_by_key(|(_, follow)| follow.serial)
+                    .map(|(agent, _)| agent.clone())
+                {
+                    follows.remove(&oldest);
+                }
+            }
+            follows.insert(agent.clone(), follow);
+        }
+        // No locks across the platform call: it may call back synchronously.
+        let watch = source.watch_cursor_window(
             &window,
             Box::new(move |change| {
                 if let Some(state) = state.upgrade() {
                     Coordinator(state).window_changed(&followed, id, change);
                 }
             }),
-        ) else {
-            self.drop_older_follow(agent, event.serial);
-            return;
-        };
-        let follow = Follow {
-            id,
-            serial: event.serial,
-            source: source.clone(),
-            window,
-            element,
-            base_window,
-            // The frame the picture itself was drawn from, read with it.
-            base_element: event.target,
-            _watch: watch,
-        };
-        // Checked and inserted under the record's lock, the same lock `end`
-        // records an end under before it removes the watch: an end either
-        // comes first and is seen here, or comes after and removes this.
-        let drawn = self.drawn();
-        if drawn
-            .ended_at
-            .get(agent)
-            .is_some_and(|ended| event.serial < *ended)
-        {
-            return;
-        }
+        );
         let mut follows = self.follows();
-        if follows
-            .get(agent)
-            .is_some_and(|newer| newer.serial > event.serial)
-        {
-            // A later picture's watch is already in place.
-            return;
-        }
-        if follows.len() >= FOLLOW_CAP && !follows.contains_key(agent) {
-            // Bounded: the badge whose watch goes keeps its place and simply
-            // stops following its window.
-            if let Some(oldest) = follows
-                .iter()
-                .min_by_key(|(_, follow)| follow.serial)
-                .map(|(agent, _)| agent.clone())
-            {
-                follows.remove(&oldest);
+        if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
+            if let Some(watch) = watch {
+                follow._watch = Some(watch);
+            } else {
+                follows.remove(agent);
             }
         }
-        follows.insert(agent.clone(), follow);
+        // If an end, replacement or Gone report removed the entry during
+        // installation, the returned watch is dropped rather than revived.
     }
 
     fn drop_older_follow(&self, agent: &str, serial: u64) {
@@ -2576,6 +2588,7 @@ mod tests {
         /// Every watch's report callback, in the order they were created.
         watches: std::sync::Mutex<Vec<Report>>,
         live: Arc<std::sync::atomic::AtomicUsize>,
+        watch_release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
 
     struct FakeWatch(Arc<std::sync::atomic::AtomicUsize>);
@@ -2597,6 +2610,7 @@ mod tests {
                 element_frame: std::sync::Mutex::new([400.0, 120.0, 90.0, 22.0]),
                 watches: std::sync::Mutex::new(Vec::new()),
                 live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                watch_release: std::sync::Mutex::new(None),
             })
         }
 
@@ -2606,6 +2620,14 @@ mod tests {
 
         fn created(&self) -> usize {
             self.watches.lock().unwrap().len()
+        }
+
+        /// Hold the next watch's return after its callback is live, so a
+        /// report during observer installation does not depend on scheduling.
+        fn hold_next_watch(&self) -> std::sync::mpsc::Sender<()> {
+            let (release, held) = std::sync::mpsc::channel();
+            *self.watch_release.lock().unwrap() = Some(held);
+            release
         }
 
         /// What the platform's observer does when the window changes.
@@ -2669,6 +2691,11 @@ mod tests {
         ) -> Option<Box<dyn CursorWindowWatch>> {
             self.watches.lock().unwrap().push(Arc::from(changed));
             self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let held = self.watch_release.lock().unwrap().take();
+            if let Some(held) = held {
+                held.recv_timeout(HANG_GUARD)
+                    .expect("released window watch installation");
+            }
             Some(Box::new(FakeWatch(self.live.clone())))
         }
     }
@@ -2850,9 +2877,13 @@ mod tests {
     }
 
     async fn next_line(receiver: &mut mpsc::Receiver<CursorLine>) -> CursorLine {
+        next_line_for(receiver, "a cursor line").await
+    }
+
+    async fn next_line_for(receiver: &mut mpsc::Receiver<CursorLine>, what: &str) -> CursorLine {
         tokio::time::timeout(HANG_GUARD, receiver.recv())
             .await
-            .expect("a cursor line before HANG_GUARD")
+            .unwrap_or_else(|error| panic!("{what} before HANG_GUARD: {error}"))
             .unwrap()
     }
 
@@ -2878,22 +2909,34 @@ mod tests {
     async fn a_window_move_moves_the_badge_with_its_element() {
         let (cursor, mut receiver) = Coordinator::channel();
         let geometry = FollowGeometry::new();
+        let release = geometry.hold_next_watch();
         schedule_on(&cursor, &geometry, CursorKind::Press);
-        let picture = next_line(&mut receiver).await.picture().unwrap();
+        let picture = next_line_for(&mut receiver, "the initial picture")
+            .await
+            .picture()
+            .unwrap();
         assert_eq!(picture.to, [445.0, 131.0], "the element's centre");
         until("watched the window", || geometry.live() == 1).await;
 
         // The person drags the window 120 right and 40 up.
         FollowGeometry::shift(&geometry.window_frame, [120.0, -40.0, 0.0, 0.0]);
         geometry.fire(0, WindowChange::Moved);
+        release.send(()).unwrap();
         assert_eq!(
-            next_line(&mut receiver).await,
+            next_line_for(&mut receiver, "the first move Follow").await,
             CursorLine::Follow(CursorFollow {
                 agent: AGENT.into(),
                 serial: picture.serial,
                 offset: [120.0, -40.0],
             })
         );
+        until("finished installing the watch", || {
+            cursor
+                .follows()
+                .get(AGENT)
+                .is_some_and(|follow| follow._watch.is_some())
+        })
+        .await;
 
         // Then widens it from the left edge: the element is laid out again
         // and is now 90 right and 40 up of where the picture was drawn.
@@ -2901,7 +2944,7 @@ mod tests {
         FollowGeometry::shift(&geometry.element_frame, [90.0, -40.0, 0.0, 0.0]);
         geometry.fire(0, WindowChange::Resized);
         assert_eq!(
-            next_line(&mut receiver).await,
+            next_line_for(&mut receiver, "the resize Follow").await,
             CursorLine::Follow(CursorFollow {
                 agent: AGENT.into(),
                 serial: picture.serial,
@@ -2916,6 +2959,52 @@ mod tests {
         assert_eq!(geometry.live(), 0, "the closed window's watch was kept");
         geometry.fire(0, WindowChange::Moved);
         no_line(&mut receiver, "a released watch still reported");
+    }
+
+    #[tokio::test]
+    async fn a_window_closed_during_watch_installation_is_not_followed() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        let release = geometry.hold_next_watch();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("registered the callback", || geometry.live() == 1).await;
+
+        geometry.fire(0, WindowChange::Gone);
+        assert!(!cursor.follows().contains_key(AGENT));
+        release.send(()).unwrap();
+        until("released the closed window's watch", || {
+            geometry.live() == 0
+        })
+        .await;
+        assert!(!cursor.follows().contains_key(AGENT));
+        geometry.fire(0, WindowChange::Moved);
+        no_line(
+            &mut receiver,
+            "a closed window's installing watch was revived",
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_a_badge_during_watch_installation_drops_the_returned_watch() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        let release = geometry.hold_next_watch();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("registered the callback", || geometry.live() == 1).await;
+
+        cursor.end(AGENT);
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        assert!(!cursor.follows().contains_key(AGENT));
+        release.send(()).unwrap();
+        until("released the ended badge's watch", || geometry.live() == 0).await;
+        assert!(!cursor.follows().contains_key(AGENT));
+        geometry.fire(0, WindowChange::Moved);
+        no_line(
+            &mut receiver,
+            "an ended badge's installing watch was revived",
+        );
     }
 
     #[tokio::test]
@@ -2946,7 +3035,12 @@ mod tests {
         schedule_on(&cursor, &geometry, CursorKind::Press);
         next_line(&mut receiver).await.picture().unwrap();
         until("replaced the watch", || {
-            geometry.created() == 2 && geometry.live() == 1
+            geometry.created() == 2
+                && geometry.live() == 1
+                && cursor
+                    .follows()
+                    .get(AGENT)
+                    .is_some_and(|follow| follow._watch.is_some())
         })
         .await;
         FollowGeometry::shift(&geometry.window_frame, [5.0, 5.0, 0.0, 0.0]);
