@@ -2358,7 +2358,7 @@ async fn typing_still_refuses_credential_fields() {
             )
             .await;
         assert_eq!(reply["outcome"], "invalid_request", "{reply}");
-        assert_eq!(reason_code(&reply), "credential_input_unsupported");
+        assert_eq!(reason_code(&reply), "credential_field");
         if !filled {
             assert_eq!(fixture.page.insertions(), 0);
             assert_eq!(fixture.fill(false).await["outcome"], "ok");

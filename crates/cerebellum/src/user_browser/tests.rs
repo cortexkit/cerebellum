@@ -90,6 +90,10 @@ struct DoubleState {
     tabs: BTreeMap<String, DoubleTab>,
     commands: Vec<Value>,
     inputs: Vec<String>,
+    typed_value: String,
+    typed_selected: bool,
+    typed_caret: usize,
+    type_name_after_focus: Option<String>,
     captures: Vec<String>,
     redirect: Option<String>,
     human_before_input: bool,
@@ -1038,11 +1042,38 @@ fn execute(
                 json!({"data":state.screenshot_images.pop_front().unwrap_or_else(|| "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".into())})
             }
             "DOM.resolveNode" => json!({"object":{"objectId":"typed-node"}}),
-            "Runtime.callFunctionOn" => json!({"result":{"value":true}}),
-            "Input.dispatchMouseEvent"
-            | "Input.insertText"
-            | "Input.dispatchKeyEvent"
-            | "DOM.focus" => {
+            "Runtime.callFunctionOn" => {
+                let declaration = command["params"]["functionDeclaration"].as_str().unwrap();
+                if declaration == functions::SELECT {
+                    state.typed_selected = true;
+                } else if declaration == functions::APPEND_CARET {
+                    state.typed_selected = false;
+                    state.typed_caret = state.typed_value.len();
+                }
+                json!({"result":{"value":true}})
+            }
+            "Input.insertText" => {
+                state.inputs.push(method.into());
+                if state.typed_selected {
+                    state.typed_value.clear();
+                    state.typed_caret = 0;
+                }
+                let text = command["params"]["text"].as_str().unwrap();
+                let caret = state.typed_caret;
+                state.typed_value.insert_str(caret, text);
+                state.typed_caret += text.len();
+                state.typed_selected = false;
+                json!({})
+            }
+            "Input.dispatchKeyEvent" => {
+                state.inputs.push(method.into());
+                if command["params"]["key"] == "End" {
+                    state.typed_caret = state.typed_value.len();
+                    state.typed_selected = false;
+                }
+                json!({})
+            }
+            "Input.dispatchMouseEvent" | "DOM.focus" => {
                 state.inputs.push(method.into());
                 json!({})
             }
@@ -1110,6 +1141,16 @@ fn execute(
     // The page reacts after the agent's focus plan has returned, between it
     // and the agent's next plan, as an asynchronous focus handler would.
     if commands.iter().any(|step| step["method"] == "DOM.focus") {
+        if let Some(name) = state.type_name_after_focus.take() {
+            let attrs = state.dom_override.as_mut().unwrap()["nodes"][3]["attributes"]
+                .as_array_mut()
+                .unwrap();
+            let key = (0..attrs.len())
+                .step_by(2)
+                .find(|&index| attrs[index] == "name")
+                .unwrap();
+            attrs[key + 1] = json!(name);
+        }
         match state.page_reaction.take() {
             Some(PageReaction::ExecCommand) => {
                 tab.interaction += 2;
@@ -1180,6 +1221,207 @@ fn reference(reply: &Value, name: &str) -> String {
         .next()
         .unwrap()
         .into()
+}
+
+fn type_field_fixture(input_type: &str, autocomplete: &str) -> Fixture {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let mut capture = dom(false, false, false, false);
+        capture["nodes"][3]["attributes"] = json!([
+            "type",
+            input_type,
+            "autocomplete",
+            autocomplete,
+            "value",
+            "7",
+            "name",
+            "cache_retention"
+        ]);
+        state.dom_override = Some(capture);
+        let mut tree = ax();
+        tree["nodes"][2]["role"]["value"] = json!("spinbutton");
+        tree["nodes"][2]["value"] = json!({"value":"7"});
+        state.ax_override = Some(tree);
+        state.typed_value = "7".into();
+    }
+    fixture
+}
+
+#[tokio::test]
+async fn number_input_clear_first_replaces_value() {
+    let fixture = type_field_fixture("number", "");
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert!(snapshot["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("spinbutton"));
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30","clear_first":true}), "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.state.lock().unwrap().typed_value, "30");
+}
+
+#[tokio::test]
+async fn number_and_email_inputs_append_with_native_end_key() {
+    for kind in ["number", "email"] {
+        let fixture = type_field_fixture(kind, "");
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30"}), "allow_30m").await;
+        assert_eq!(reply["outcome"], "ok", "{kind}: {reply}");
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.typed_value, "730");
+        assert!(state
+            .commands
+            .iter()
+            .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+            .any(
+                |step| step["method"] == "Input.dispatchKeyEvent" && step["params"]["key"] == "End"
+            ));
+        assert!(!state
+            .commands
+            .iter()
+            .flat_map(|plan| plan["commands"].as_array().into_iter().flatten())
+            .any(|step| step["params"]["functionDeclaration"] == functions::APPEND_CARET));
+    }
+}
+
+#[tokio::test]
+async fn type_numeric_sensitive_fields_keep_specific_hard_refusals() {
+    for (kind, autocomplete, reason) in [
+        ("number", "cc-number", "payment_field"),
+        ("number", "cc-csc", "payment_field"),
+        ("number", "cc-exp", "payment_field"),
+        ("number", "one-time-code", "credential_field"),
+        ("number", "current-password", "credential_field"),
+        ("password", "", "credential_field"),
+    ] {
+        let fixture = type_field_fixture(kind, autocomplete);
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30","clear_first":true}), "allow_30m").await;
+        assert_eq!(reply["detail"]["reason_code"], reason, "{reply}");
+        assert_eq!(reply["detail"]["field"], "ref");
+        assert!(reply["remedy"].as_str().unwrap().contains(kind));
+        assert!(reply["remedy"].as_str().unwrap().contains("person"));
+        assert_eq!(reply["input_dispatched"], false);
+        let state = fixture.state.lock().unwrap();
+        assert!(state.inputs.is_empty());
+        assert_eq!(state.typed_value, "7");
+    }
+}
+
+#[tokio::test]
+async fn type_unsupported_fields_name_type_and_alternative() {
+    for kind in [
+        "date",
+        "datetime-local",
+        "month",
+        "week",
+        "time",
+        "color",
+        "range",
+        "checkbox",
+        "radio",
+        "file",
+        "hidden",
+    ] {
+        let fixture = type_field_fixture(kind, "");
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30"}), "allow_30m").await;
+        assert_eq!(
+            reply["detail"]["reason_code"], "unsupported_field_type",
+            "{reply}"
+        );
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains(kind));
+        assert!(remedy.contains(if matches!(kind, "file" | "hidden") {
+            "no type action"
+        } else {
+            "click"
+        }));
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn type_text_entry_spinbuttons_do_not_require_number_type() {
+    let fixture = type_field_fixture("text", "");
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30","clear_first":true}), "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.state.lock().unwrap().typed_value, "30");
+}
+
+#[tokio::test]
+async fn type_noneditable_spinbutton_is_not_text_entry() {
+    let fixture = type_field_fixture("number", "");
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let node = &mut state.dom_override.as_mut().unwrap()["nodes"][3];
+        node["localName"] = json!("div");
+        node["nodeName"] = json!("DIV");
+        node["attributes"] = json!(["role", "spinbutton"]);
+    }
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30"}), "allow_30m").await;
+    assert_eq!(reply["reason"], "target_not_interactive", "{reply}");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test]
+async fn type_sensitive_names_and_ids_do_not_match_substrings() {
+    for (kind, name, id, expected) in [
+        ("number", "card_number", "", Some("payment_field")),
+        ("text", "api_token", "", Some("credential_field")),
+        ("number", "", "cardNumber", Some("payment_field")),
+        ("text", "", "apiToken", Some("credential_field")),
+        ("text", "token_name", "", Some("credential_field")),
+        ("number", "pin", "", Some("credential_field")),
+        ("text", "pin_label", "", None),
+        ("number", "cache_retention_days", "", None),
+        ("number", "discard_reason", "scardinal", None),
+    ] {
+        let fixture = type_field_fixture(kind, "");
+        fixture.state.lock().unwrap().dom_override.as_mut().unwrap()["nodes"][3]["attributes"] =
+            json!(["type", kind, "name", name, "id", id, "value", "7"]);
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+        let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30","clear_first":true}), "allow_30m").await;
+        if let Some(reason) = expected {
+            assert_eq!(
+                reply["detail"]["reason_code"], reason,
+                "{kind} {name} {id}: {reply}"
+            );
+            assert!(reply["remedy"].as_str().unwrap().contains("looks like"));
+            let state = fixture.state.lock().unwrap();
+            assert!(state.inputs.is_empty());
+            assert_eq!(state.typed_value, "7");
+        } else {
+            assert_eq!(reply["outcome"], "ok", "{kind} {name} {id}: {reply}");
+            assert_eq!(fixture.state.lock().unwrap().typed_value, "30");
+        }
+    }
+}
+
+#[tokio::test]
+async fn type_rechecks_sensitive_name_after_focus() {
+    let fixture = type_field_fixture("number", "");
+    fixture.state.lock().unwrap().type_name_after_focus = Some("card_number".into());
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"30","clear_first":true}), "allow_30m").await;
+    assert_eq!(reply["detail"]["reason_code"], "payment_field", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    assert!(!state
+        .inputs
+        .iter()
+        .any(|method| method.starts_with("Input.")));
+    assert_eq!(state.typed_value, "7");
 }
 
 fn click(tab: &str, snapshot: &Value, reference: &str) -> Value {
@@ -2113,7 +2355,7 @@ async fn credential_payment_typing_refuses_and_normal_typing_uses_background_foc
     let password = reference(&snapshot, "Password");
     let (refused, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":password,"text":"do not persist this"}), "allow_30m").await;
     assert_eq!(
-        refused["reason"], "credential_payment_or_ineligible_field",
+        refused["detail"]["reason_code"], "credential_field",
         "{refused}"
     );
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
@@ -2600,10 +2842,7 @@ async fn payment_field_typing_is_hard_refused_even_with_site_consent() {
     fixture.state.lock().unwrap().payment = true;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
     let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Message"),"text":"4111"}), "allow_30m").await;
-    assert_eq!(
-        reply["reason"], "credential_payment_or_ineligible_field",
-        "{reply}"
-    );
+    assert_eq!(reply["detail"]["reason_code"], "payment_field", "{reply}");
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
 }
 
@@ -3318,7 +3557,12 @@ async fn inherited_origin_child_credential_and_payment_fields_stay_guarded() {
             .contains("child field value"));
         let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"secret"}), "allow_30m").await;
         assert_eq!(
-            reply["reason"], "credential_payment_or_ineligible_field",
+            reply["detail"]["reason_code"],
+            if payment {
+                "payment_field"
+            } else {
+                "credential_field"
+            },
             "{reply}"
         );
         assert!(fixture.state.lock().unwrap().inputs.is_empty());
@@ -3427,7 +3671,12 @@ async fn credential_field_in_a_child_is_refused_even_with_its_origin_granted() {
             .contains("child field value"));
         let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Child message"),"text":"secret"}), "allow_30m").await;
         assert_eq!(
-            reply["reason"], "credential_payment_or_ineligible_field",
+            reply["detail"]["reason_code"],
+            if payment {
+                "payment_field"
+            } else {
+                "credential_field"
+            },
             "{reply}"
         );
         assert!(fixture.state.lock().unwrap().inputs.is_empty());

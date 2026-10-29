@@ -68,6 +68,19 @@ struct TypeAdapter<'a, IO: CdpPipeIo> {
 }
 
 impl<IO: CdpPipeIo> TypeAdapter<'_, IO> {
+    fn verify_focus(&mut self, object_id: &str) -> Result<(), TypeDriverError> {
+        let focused = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }","returnByValue":true}))?;
+        if focused
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(TypeDriverError::new("type_focus_not_ready"));
+        }
+        Ok(())
+    }
+
     fn command(
         &mut self,
         method: &str,
@@ -90,6 +103,7 @@ impl<IO: CdpPipeIo> TypeAdapter<'_, IO> {
             "DOM.focus" => "type_focus_not_ready",
             "DOM.resolveNode" => "type_context_not_ready",
             "Runtime.enable" => "type_runtime_not_ready",
+            "Input.dispatchKeyEvent" if params["key"] == "End" => "type_caret_not_ready",
             "Input.dispatchKeyEvent" => "type_clear_not_ready",
             "Input.insertText" => "type_insert_not_ready",
             "Runtime.callFunctionOn"
@@ -176,7 +190,13 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             &expected.current_top_level_origin,
         )
         .map_err(|_| TypeDriverError::new("classification_unavailable"))?;
-        if &actual != expected {
+        // Name/id hints are deliberately excluded from the stored fingerprint.
+        // Recheck their typing verdict so a focus handler cannot turn an
+        // ordinary field into a sensitive one between observations.
+        if &actual != expected
+            || crate::classification::type_field_reason(&actual)
+                != crate::classification::type_field_reason(expected)
+        {
             return Err(TypeDriverError::new("classification_changed"));
         }
         let node = nodes
@@ -190,10 +210,7 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             .unwrap_or_else(|| "text".into());
         let writable = node.local_name == "textarea"
             || (node.local_name == "input"
-                && matches!(
-                    input_type.as_str(),
-                    "text" | "search" | "email" | "url" | "tel" | "password"
-                ));
+                && crate::classification::type_input_supported(&input_type));
         let mut inert = attrs.contains_key("inert");
         let mut editable = attrs.get("contenteditable").map(|value| value != "false");
         let mut parent_id = node.parent_id;
@@ -285,15 +302,7 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             .and_then(|object| object.get("objectId"))
             .and_then(Value::as_str)
             .ok_or_else(|| TypeDriverError::new("cdp_failure"))?;
-        let focused = self.command("Runtime.callFunctionOn", serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }","returnByValue":true}))?;
-        if focused
-            .get("result")
-            .and_then(|result| result.get("value"))
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
-            return Err(TypeDriverError::new("type_focus_not_ready"));
-        }
+        self.verify_focus(object_id)?;
         if self.selected {
             self.command("Input.dispatchKeyEvent", serde_json::json!({"type":"keyDown","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}))?;
             self.command("Input.dispatchKeyEvent", serde_json::json!({"type":"keyUp","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8}))?;
@@ -306,6 +315,22 @@ impl<IO: CdpPipeIo> BrowserTypeDriver for TypeAdapter<'_, IO> {
             {
                 return Err(TypeDriverError::new("type_clear_not_ready"));
             }
+        } else if matches!(
+            self.target.classification.effective_input_type.as_deref(),
+            Some("number" | "email")
+        ) {
+            // Number and email inputs reject setSelectionRange; a native End
+            // key moves their caret without changing the value.
+            for event in ["keyDown", "keyUp"] {
+                self.command("Input.dispatchKeyEvent", serde_json::json!({"type":event,"key":"End","code":"End","windowsVirtualKeyCode":35}))?;
+            }
+            // Key handlers can change the field or move focus. Revalidate both
+            // before any text follows the caret movement.
+            let live = self.observe_type_target()?;
+            if !crate::browser_type::browser_type_dispatch_eligible(&live) {
+                return Err(TypeDriverError::new("classification_changed"));
+            }
+            self.verify_focus(object_id)?;
         } else {
             // Focus does not establish an append caret. Move it only after the
             // executor's live-document and classification rechecks, just before insertion.

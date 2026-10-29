@@ -98,16 +98,16 @@ impl BrowserPlane {
                     .map_err(|reason| BrowserError::ClassificationUnavailable(reason.clone()))?
                     .as_ref()
                     .clone();
-                // Sensitive fields are rejected before consuming any grant or committing input.
-                if classification.is_credential_field()
-                    || classification
-                        .target_autocomplete_tokens
-                        .iter()
-                        .any(|token| crate::classification::financial_token(token))
+                // Sensitive and unsupported controls are rejected before consuming
+                // any grant or committing input.
+                if let Some(reason_code) = crate::classification::type_field_reason(&classification)
                 {
-                    return Err(BrowserError::InvalidRequest {
-                        field: "text".into(),
-                        reason_code: "credential_input_unsupported",
+                    return Err(BrowserError::TypeField {
+                        reason_code,
+                        input_type: classification
+                            .effective_input_type
+                            .clone()
+                            .unwrap_or_else(|| "none".into()),
                     });
                 }
                 let origin = record

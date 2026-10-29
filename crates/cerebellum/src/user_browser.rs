@@ -664,6 +664,16 @@ fn refusal(reason: &str) -> Value {
     json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false})
 }
 
+fn type_field_refusal(record: &NonTypeClassificationRecord) -> Option<Value> {
+    let reason_code = crate::classification::type_field_reason(record)?;
+    let input_type = record.effective_input_type.as_deref().unwrap_or("none");
+    Some(json!({
+        "browser":"user", "outcome":"refused", "input_dispatched":false,
+        "detail":{"field":"ref","reason_code":reason_code},
+        "remedy":crate::classification::type_field_remedy(reason_code, input_type, true)
+    }))
+}
+
 fn classification_failure(
     step: &str,
     frame_url: &str,
@@ -3782,6 +3792,9 @@ async fn input(
         }
     }
     if action == "type" {
+        if let Some(reply) = type_field_refusal(&classification) {
+            return Err(reply);
+        }
         let target = crate::browser::navigation::type_target_from_capture(
             dom_object,
             &identity,
@@ -3799,7 +3812,7 @@ async fn input(
             || target.classification().credential
             || target.classification().financial
         {
-            return Err(refusal("credential_payment_or_ineligible_field"));
+            return Err(refusal("target_not_interactive"));
         }
     }
     let authorized_action = if action == "click_point" {
@@ -3922,15 +3935,31 @@ async fn input(
             "DOM.focus",
             json!({"backendNodeId":identity.backend_node_id}),
         ));
-        let declaration = if args["clear_first"] == true {
-            functions::SELECT
+        if args["clear_first"] != true
+            && matches!(
+                classification.effective_input_type.as_deref(),
+                Some("number" | "email")
+            )
+        {
+            // Number and email inputs reject setSelectionRange; move their
+            // caret with a native key after focusing and before inserting text.
+            for event in ["keyDown", "keyUp"] {
+                steps.push(command(
+                    "Input.dispatchKeyEvent",
+                    json!({"type":event,"key":"End","code":"End","windowsVirtualKeyCode":35}),
+                ));
+            }
         } else {
-            functions::APPEND_CARET
-        };
-        steps.push(command(
-            "Runtime.callFunctionOn",
-            json!({"functionDeclaration":declaration,"returnByValue":true}),
-        ));
+            let declaration = if args["clear_first"] == true {
+                functions::SELECT
+            } else {
+                functions::APPEND_CARET
+            };
+            steps.push(command(
+                "Runtime.callFunctionOn",
+                json!({"functionDeclaration":declaration,"returnByValue":true}),
+            ));
+        }
         steps.push(command("Input.insertText", json!({"text":args["text"]})));
     } else {
         let (x, y) = position.unwrap();
@@ -4428,6 +4457,9 @@ async fn verify_input(
         return Err(reply);
     }
     if context.action == "type" {
+        if let Some(reply) = type_field_refusal(&record) {
+            return Err(prior_input(reply, dispatched));
+        }
         let target = crate::browser::navigation::type_target_from_capture(dom, identity, &record)
             .map_err(|cause| {
             classification_failure(
@@ -4441,7 +4473,7 @@ async fn verify_input(
             || target.classification().credential
             || target.classification().financial
         {
-            return Err(refusal("credential_payment_or_ineligible_field"));
+            return Err(refusal("target_not_interactive"));
         }
     }
     input_document(context, tab, snapshot, dispatched).await?;

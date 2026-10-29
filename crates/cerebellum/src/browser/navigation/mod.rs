@@ -3706,11 +3706,7 @@ pub(crate) fn type_target_from_capture(
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_else(|| "text".into());
     let writable = node.local_name == "textarea"
-        || (node.local_name == "input"
-            && matches!(
-                input_type.as_str(),
-                "text" | "search" | "email" | "url" | "tel" | "password"
-            ));
+        || (node.local_name == "input" && crate::classification::type_input_supported(&input_type));
     let mut inert = attrs.contains_key("inert");
     let mut editable = attrs.get("contenteditable").map(|value| value != "false");
     let mut parent_id = node.parent_id;

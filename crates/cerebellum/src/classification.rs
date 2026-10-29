@@ -349,8 +349,9 @@ pub struct AssociatedFormControl {
 impl NonTypeClassificationRecord {
     /// Whether this record describes a field that may receive a credential.
     ///
-    /// This is the same direct-field predicate used by the typing path: password
-    /// inputs and the three credential autocomplete tokens. Associated controls
+    /// This direct-field predicate covers password inputs and the three
+    /// credential autocomplete tokens. Typing also checks sensitive names and ids.
+    /// Associated controls
     /// do not make a non-field submit button into a credential field.
     pub fn is_credential_field(&self) -> bool {
         self.target_password
@@ -860,6 +861,118 @@ pub fn financial_token(token: &str) -> bool {
     FINANCIAL_TOKENS.contains(&token)
 }
 
+/// Input types that accept ordinary text insertion. Date/time controls use
+/// native, segmented editors; range, color and file controls are not text entry.
+/// Include password here so the separate credential check rejects it as sensitive,
+/// rather than misreporting it as an unsupported control.
+pub(crate) fn type_input_supported(input_type: &str) -> bool {
+    matches!(
+        input_type,
+        "text" | "search" | "email" | "url" | "tel" | "number" | "password"
+    )
+}
+
+/// Sensitive meaning takes precedence over the control's input type.
+pub(crate) fn type_field_reason(record: &NonTypeClassificationRecord) -> Option<&'static str> {
+    let named = type_named_field_reason(record);
+    if record.is_credential_field() {
+        Some("credential_field")
+    } else if record
+        .target_autocomplete_tokens
+        .iter()
+        .any(|token| financial_token(token))
+    {
+        Some("payment_field")
+    } else if named.is_some() {
+        named
+    } else if record
+        .effective_input_type
+        .as_deref()
+        .is_some_and(|kind| !type_input_supported(kind))
+    {
+        Some("unsupported_field_type")
+    } else {
+        None
+    }
+}
+
+fn type_named_field_reason(record: &NonTypeClassificationRecord) -> Option<&'static str> {
+    let facts = record.login_field.as_ref()?;
+    let tokens = [facts.name.as_str(), facts.id.as_str()]
+        .into_iter()
+        .flat_map(type_name_tokens)
+        .collect::<Vec<_>>();
+    let numeric_or_password = matches!(
+        record.effective_input_type.as_deref(),
+        Some("number" | "password")
+    );
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "password" | "passwd" | "pwd" | "secret" | "token" | "otp" | "totp" | "passcode"
+        ) || (token == "pin" && numeric_or_password)
+    }) {
+        Some("credential_field")
+    } else if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "card" | "cc" | "ccnum" | "cardnumber" | "cvv" | "cvc" | "csc" | "iban"
+        )
+    }) {
+        // Expiry/exp is sensitive when paired with card or cc, already covered
+        // by those tokens. An unrelated expiry setting is not a payment field.
+        Some("payment_field")
+    } else {
+        None
+    }
+}
+
+/// Split identifier words rather than matching substrings such as card in discard.
+fn type_name_tokens(name: &str) -> Vec<String> {
+    let chars = name.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for (index, &ch) in chars.iter().enumerate() {
+        let camel_boundary = ch.is_ascii_uppercase()
+            && index > 0
+            && (chars[index - 1].is_ascii_lowercase()
+                || (chars[index - 1].is_ascii_uppercase()
+                    && chars.get(index + 1).is_some_and(char::is_ascii_lowercase)));
+        if (matches!(ch, '_' | '-' | '.') || camel_boundary) && !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+        if !matches!(ch, '_' | '-' | '.') {
+            token.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+pub(crate) fn type_field_remedy(reason: &str, input_type: &str, user_browser: bool) -> String {
+    let action = match reason {
+        "credential_field" | "payment_field" if user_browser =>
+            "ask the person to enter the value in their Chrome; no grant authorizes typing into this field",
+        "credential_field" | "payment_field" =>
+            "use browser_use present to let the person enter the value, then resume; no grant authorizes typing into this field",
+        _ => match input_type {
+            "checkbox" | "radio" | "button" | "submit" | "reset" | "image" =>
+                "use click on the control instead of type",
+            "date" | "datetime-local" | "month" | "week" | "time" | "color" | "range" =>
+                "use click to open or adjust the native control; ask the person if the picker cannot be operated with click",
+            _ => "no type action supports this control; choose a writable text-entry ref or ask the person to use the control",
+        },
+    };
+    let meaning = match reason {
+        "credential_field" => "the field looks like a credential field; ",
+        "payment_field" => "the field looks like a payment field; ",
+        _ => "",
+    };
+    format!("input type {input_type:?}: {meaning}{action}")
+}
+
 fn derive_activation_target<'a>(
     target: &'a ElementClassificationInput,
     ancestors: &'a [ElementClassificationInput],
@@ -1207,6 +1320,132 @@ fn activation_tier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_names_use_whole_identifier_tokens_and_numeric_pin_context() {
+        assert_eq!(type_name_tokens("cardNumber"), ["card", "number"]);
+        assert_eq!(type_name_tokens("CCNumber"), ["cc", "number"]);
+        assert_eq!(
+            type_name_tokens("API.Token-label"),
+            ["api", "token", "label"]
+        );
+        for (kind, name, expected) in [
+            ("number", "card_number", Some("payment_field")),
+            ("text", "api_token", Some("credential_field")),
+            ("number", "pin", Some("credential_field")),
+            ("text", "pin", None),
+            ("number", "cache_retention_days", None),
+            ("number", "discard_reason", None),
+            ("number", "scardinal", None),
+            ("number", "expiry_days", None),
+            ("number", "cardExpiry", Some("payment_field")),
+            ("text", "token_name_label", Some("credential_field")),
+        ]
+        .into_iter()
+        .chain(
+            [
+                "password", "passwd", "pwd", "secret", "token", "otp", "totp", "passcode",
+            ]
+            .into_iter()
+            .map(|name| ("text", name, Some("credential_field"))),
+        )
+        .chain(
+            [
+                "card",
+                "cc",
+                "ccnum",
+                "cardnumber",
+                "cvv",
+                "cvc",
+                "csc",
+                "iban",
+                "cc.exp",
+            ]
+            .into_iter()
+            .map(|name| ("number", name, Some("payment_field"))),
+        ) {
+            let target =
+                ElementClassificationInput::new(identity(1), TargetKind::Input).input_type(kind);
+            let mut record = classify_non_type(&NonTypeClassificationInput::new(
+                1,
+                target,
+                "https://example.test",
+            ))
+            .unwrap();
+            record.login_field = Some(LoginFieldFacts {
+                name: name.into(),
+                id: String::new(),
+                role: String::new(),
+                hidden: false,
+                document_order: None,
+                form_start_order: None,
+                preceding_text_inputs: 0,
+            });
+            assert_eq!(type_field_reason(&record), expected, "{kind} {name}");
+        }
+    }
+
+    #[test]
+    fn typing_policy_keeps_native_pickers_out_and_sensitive_numbers_guarded() {
+        for kind in ["text", "search", "email", "url", "tel", "number"] {
+            assert!(type_input_supported(kind), "{kind}");
+            let target =
+                ElementClassificationInput::new(identity(1), TargetKind::Input).input_type(kind);
+            let record = classify_non_type(&NonTypeClassificationInput::new(
+                1,
+                target,
+                "https://example.test",
+            ))
+            .unwrap();
+            assert_eq!(type_field_reason(&record), None, "{kind}");
+        }
+        for kind in [
+            "date",
+            "datetime-local",
+            "month",
+            "week",
+            "time",
+            "range",
+            "color",
+            "file",
+            "hidden",
+            "checkbox",
+            "radio",
+            "button",
+            "submit",
+            "reset",
+            "image",
+        ] {
+            assert!(!type_input_supported(kind), "{kind}");
+        }
+        for (kind, token, expected) in [
+            ("password", "", "credential_field"),
+            ("number", "current-password", "credential_field"),
+            ("number", "new-password", "credential_field"),
+            ("number", "one-time-code", "credential_field"),
+            ("number", "cc-number", "payment_field"),
+            ("number", "cc-csc", "payment_field"),
+            ("number", "cc-exp", "payment_field"),
+            ("number", "cc-exp-month", "payment_field"),
+            ("number", "cc-exp-year", "payment_field"),
+            ("date", "cc-exp", "payment_field"),
+        ] {
+            let target = ElementClassificationInput::new(identity(1), TargetKind::Input)
+                .input_type(kind)
+                .autocomplete(if token.is_empty() {
+                    vec![]
+                } else {
+                    vec![token]
+                });
+            let record = classify_non_type(&NonTypeClassificationInput::new(
+                1,
+                target,
+                "https://example.test",
+            ))
+            .unwrap();
+            assert_eq!(type_field_reason(&record), Some(expected), "{kind} {token}");
+        }
+    }
 
     fn identity(number: u64) -> NodeIdentityInput {
         NodeIdentityInput::new("target-1", "frame-1", number)
