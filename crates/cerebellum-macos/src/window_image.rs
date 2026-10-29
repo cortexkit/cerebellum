@@ -18,6 +18,7 @@ use crate::macos::{bgra_image, encode_image};
 extern "C" {
     fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
     /// A drawing context backed by memory the system allocates.
     fn CGBitmapContextCreate(
         data: *mut c_void,
@@ -151,6 +152,142 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
         }
     }
     None
+}
+
+/// Numeric window-server context for a process that capture could not resolve.
+/// Unknown readings stay `None`, rather than looking like zero windows.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessWindowCounts {
+    pub total_windows: Option<usize>,
+    pub on_screen_windows: Option<usize>,
+    pub windows_on_active_display: Option<usize>,
+    pub windows_on_awake_display: Option<usize>,
+}
+
+/// Read counts only: no window names, titles, images or accessibility attributes.
+/// All layers are counted, including helper windows. Display intersection uses
+/// the all-windows list, so it does not imply that a window is on the current Space.
+pub fn process_window_counts(pid: u32) -> ProcessWindowCounts {
+    let all = process_window_bounds(pid, CGWindowListOption::OptionAll);
+    let on_screen = process_window_bounds(pid, CGWindowListOption::OptionOnScreenOnly);
+    let displays = diagnostic_display_bounds();
+    let active = displays.as_ref().map(|displays| {
+        displays
+            .iter()
+            .map(|(bounds, _)| *bounds)
+            .collect::<Vec<_>>()
+    });
+    let awake = displays.as_ref().map(|displays| {
+        displays
+            .iter()
+            .filter(|(_, asleep)| !asleep)
+            .map(|(bounds, _)| *bounds)
+            .collect::<Vec<_>>()
+    });
+    ProcessWindowCounts {
+        total_windows: all.as_ref().map(Vec::len),
+        on_screen_windows: on_screen.as_ref().map(Vec::len),
+        windows_on_active_display: intersecting_window_count(all.as_deref(), active.as_deref()),
+        windows_on_awake_display: intersecting_window_count(all.as_deref(), awake.as_deref()),
+    }
+}
+
+fn process_window_bounds(pid: u32, options: CGWindowListOption) -> Option<Vec<Option<CGRect>>> {
+    let windows = CGWindowListCopyWindowInfo(options, 0)?;
+    // SAFETY: CoreGraphics documents this array as string-keyed window dictionaries.
+    let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
+    let mut bounds = Vec::new();
+    for index in 0..windows.len() {
+        let window = windows.get(index)?;
+        let owner = window
+            .get(&CFString::from_static_str("kCGWindowOwnerPID"))?
+            .downcast::<CFNumber>()
+            .ok()?
+            .as_f64()?;
+        if owner != f64::from(pid) {
+            continue;
+        }
+        let rect = window
+            .get(&CFString::from_static_str("kCGWindowBounds"))
+            .and_then(|value| value.downcast::<CFDictionary>().ok())
+            .and_then(|dictionary| {
+                // SAFETY: CoreGraphics window bounds use numeric X/Y/Width/Height keys.
+                let dictionary: &CFDictionary<CFString, CFType> =
+                    unsafe { dictionary.cast_unchecked() };
+                let value = |key: &str| {
+                    dictionary
+                        .get(&CFString::from_str(key))?
+                        .downcast::<CFNumber>()
+                        .ok()?
+                        .as_f64()
+                };
+                Some(CGRect::new(
+                    CGPoint::new(value("X")?, value("Y")?),
+                    CGSize::new(value("Width")?, value("Height")?),
+                ))
+            });
+        bounds.push(rect);
+    }
+    Some(bounds)
+}
+
+fn diagnostic_display_bounds() -> Option<Vec<(CGRect, bool)>> {
+    let mut ids = [0u32; 32];
+    let mut count = 0;
+    // SAFETY: ids and count are valid output buffers for the supplied capacity.
+    let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 || count as usize >= ids.len() {
+        return None;
+    }
+    Some(
+        ids[..count as usize]
+            .iter()
+            .map(|id| {
+                // SAFETY: CoreGraphics just returned this display ID; these calls only read it.
+                unsafe { (CGDisplayBounds(*id), CGDisplayIsAsleep(*id) != 0) }
+            })
+            .collect(),
+    )
+}
+
+fn intersecting_window_count(
+    windows: Option<&[Option<CGRect>]>,
+    displays: Option<&[CGRect]>,
+) -> Option<usize> {
+    let displays = displays?;
+    let valid = |rect: &CGRect| {
+        [
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            rect.origin.x + rect.size.width,
+            rect.origin.y + rect.size.height,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && rect.size.width >= 0.0
+            && rect.size.height >= 0.0
+    };
+    if !displays.iter().all(valid) {
+        return None;
+    }
+    let mut count = 0;
+    for window in windows? {
+        let window = window.as_ref().filter(|rect| valid(rect))?;
+        if displays.iter().any(|display| {
+            window.origin.x.max(display.origin.x)
+                < (window.origin.x + window.size.width).min(display.origin.x + display.size.width)
+                && window.origin.y.max(display.origin.y)
+                    < (window.origin.y + window.size.height)
+                        .min(display.origin.y + display.size.height)
+                && window.size.width > 0.0
+                && window.size.height > 0.0
+        }) {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// Whether this exact window is wholly on screen under the image visibility rules.
@@ -319,6 +456,48 @@ fn window_visibility_with_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
+    }
+
+    #[test]
+    fn diagnostic_display_counts_use_all_windows_and_positive_area_overlap() {
+        let displays = [rect(0.0, 0.0, 100.0, 100.0), rect(100.0, 0.0, 100.0, 100.0)];
+        let windows = [
+            Some(rect(90.0, 0.0, 20.0, 20.0)),
+            Some(rect(300.0, 0.0, 20.0, 20.0)),
+            Some(rect(10.0, 10.0, 0.0, 20.0)),
+            Some(rect(-10.0, 0.0, 10.0, 20.0)),
+        ];
+        assert_eq!(
+            intersecting_window_count(Some(&windows), Some(&displays)),
+            Some(1)
+        );
+        assert_eq!(
+            intersecting_window_count(Some(&windows), Some(&[])),
+            Some(0)
+        );
+        assert_eq!(
+            intersecting_window_count(Some(&[]), Some(&displays)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn diagnostic_display_counts_keep_missing_or_invalid_readings_unknown() {
+        let display = [rect(0.0, 0.0, 100.0, 100.0)];
+        assert_eq!(intersecting_window_count(None, Some(&display)), None);
+        assert_eq!(
+            intersecting_window_count(Some(&[None]), Some(&display)),
+            None
+        );
+        assert_eq!(intersecting_window_count(Some(&[]), None), None);
+        assert_eq!(
+            intersecting_window_count(Some(&[Some(rect(f64::NAN, 0.0, 1.0, 1.0))]), Some(&display)),
+            None
+        );
+    }
 
     /// The frame header's width and height, found by walking the markers.
     fn frame_size(jpeg: &[u8]) -> Option<(u16, u16)> {

@@ -511,7 +511,8 @@ where
             }
             TakeoverRequest::Scroll { target, .. } => target,
         };
-        self.operator_app_refused(grantee, claimed).await
+        self.operator_app_refused(grantee, claimed).await;
+        refusal
     }
 
     /// The containment target of a request and the pointer action to post.
@@ -584,8 +585,8 @@ where
                         // looked up.
                         application_under(source.as_ref(), &hit_management, &hit_image, *point)
                             .and_then(|owner| {
-                                if lookup.process_blocked(&owner, Vec::new()) {
-                                    Err(super::operator_apps::refusal())
+                                if let Some(refusal) = lookup.process_refusal(&owner, Vec::new()) {
+                                    Err(refusal)
                                 } else {
                                     Ok(owner)
                                 }

@@ -242,6 +242,7 @@ pub use skylight::{
 };
 #[cfg(target_os = "macos")]
 pub use window_image::{
-    encode_scaled_jpeg, frontmost_window_id, register_cursor_generation, topmost_window_at,
-    visible_cursor_point, window_visibility, window_visibility_decision,
+    encode_scaled_jpeg, frontmost_window_id, process_window_counts, register_cursor_generation,
+    topmost_window_at, visible_cursor_point, window_visibility, window_visibility_decision,
+    ProcessWindowCounts,
 };

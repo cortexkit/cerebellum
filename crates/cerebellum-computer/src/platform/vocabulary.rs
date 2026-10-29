@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v32";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v33";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v32.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v33.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "a848a0634cf825af7b02d5e1fd3f3af7c9bf2cde9673ada0a8cf746d8aac8b5e";
+    "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1456,6 +1456,42 @@ mod tests {
                 );
             } else {
                 assert_eq!(withheld(&id, &reply), Vec::new(), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn development_build_refusal_details_are_closed_and_optional_on_action_rows() {
+        let checks = [
+            serde_json::json!({"condition":"signature_unreadable","error_kind":"Failed","error":"TimedOut"}),
+            serde_json::json!({"condition":"not_a_development_build","classes":{"bundle_identity":"always","executable":"unmatched"}}),
+            serde_json::json!({"condition":"title_fallback","bundle_identity_present":true,"executable_present":false}),
+            serde_json::json!({"condition":"process_unresolved","processes":[{"pid":30601,"pid_alive":1,"total_windows":3,"on_screen_windows":0,"windows_on_active_display":3,"windows_on_awake_display":0}]}),
+        ];
+        for id in artifact_row_ids() {
+            for check in &checks {
+                let mut reply = with_keystroke_envelope(
+                    &id,
+                    serde_json::json!({
+                        "outcome":"authorization_denied", "reason":"operator_app_blocked",
+                        "detail":{"development_build_check":check},
+                    }),
+                );
+                if id == "computer.list_apps" {
+                    assert!(!withheld(&id, &reply).is_empty());
+                } else {
+                    assert!(
+                        withheld(&id, &reply).is_empty(),
+                        "{id}: {:?}",
+                        withheld(&id, &reply)
+                    );
+                    reply["detail"]["development_build_check"]["window_title"] =
+                        serde_json::json!("not allowed");
+                    assert!(
+                        !withheld(&id, &reply).is_empty(),
+                        "{id} must keep the diagnostic closed"
+                    );
+                }
             }
         }
     }

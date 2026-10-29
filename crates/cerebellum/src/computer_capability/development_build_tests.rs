@@ -275,6 +275,184 @@ fn rig() -> Rig {
     }
 }
 
+#[test]
+fn development_snapshot_reports_a_clean_ad_hoc_signature_and_release_mismatch() {
+    let desktop = Desktop(apps());
+    let grant = desktop.process_for_pid(DEV_PID).unwrap();
+    let management = ManagementPlane::new(Arc::new(desktop));
+    let snapshot = super::operator_apps::development_build_snapshot(&management, &grant);
+    assert_eq!(snapshot["pid"], DEV_PID);
+    assert_eq!(snapshot["bundle_identity"], DEV);
+    assert_eq!(snapshot["app_need_is_app"], true);
+    assert_eq!(snapshot["identity"]["ok"]["team_id"], Value::Null);
+    assert_eq!(snapshot["identity"]["ok"]["ad_hoc"], true);
+    assert_eq!(
+        snapshot["identity"]["ok"]["designated_requirement"],
+        "cdhash H\"0123456789abcdef0123456789abcdef01234567\""
+    );
+    assert_eq!(
+        snapshot["satisfies_release_requirement"],
+        json!({"ok": false})
+    );
+    assert_eq!(
+        snapshot["release_requirement"],
+        "anchor apple generic and certificate leaf[subject.OU] = \"5R5846NBPW\""
+    );
+}
+
+#[test]
+fn development_snapshot_preserves_both_signature_errors_even_when_identity_fails() {
+    let mut fixtures = apps();
+    let app = fixtures.iter_mut().find(|app| app.pid == DEV_PID).unwrap();
+    let detail = "signature reader: OSStatus -67050\npath: /Volumes/Test Disk/Alfonso.app";
+    app.signature = Err(AppIdentityUnreadable::Failed {
+        detail: detail.into(),
+    });
+    let grant = process(app);
+    let management = ManagementPlane::new(Arc::new(Desktop(fixtures)));
+    let snapshot = super::operator_apps::development_build_snapshot(&management, &grant);
+    for field in ["identity", "satisfies_release_requirement"] {
+        assert_eq!(snapshot[field]["detail"], detail);
+        assert_eq!(
+            snapshot[field]["error"],
+            "Failed { detail: \"signature reader: OSStatus -67050\\npath: /Volumes/Test Disk/Alfonso.app\" }"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
+    let rig = rig();
+    for (target, condition) in [
+        (DEV_RELEASE_SIGNED, "release_signed"),
+        (DEV_UNSIGNED, "signature_unreadable"),
+        (RELEASED_BY_ID, "not_a_development_build"),
+        (UNIDENTIFIED, "title_fallback"),
+        ("Alfonso Beta", "process_unresolved"),
+    ] {
+        let reply = rig
+            .serve_as(
+                &head(CKDESK),
+                "computer.read_state",
+                json!({"target":target}),
+            )
+            .await;
+        assert_refused(&reply, target);
+        let check = &reply["detail"]["development_build_check"];
+        assert_eq!(check["condition"], condition, "{target}: {reply}");
+        match condition {
+            "signature_unreadable" => assert_eq!(check["error_kind"], "Unsigned"),
+            "not_a_development_build" => assert_eq!(check["classes"]["bundle_identity"], "always"),
+            "title_fallback" => {
+                assert_eq!(check["bundle_identity_present"], true);
+                assert_eq!(check["executable_present"], false);
+            }
+            "process_unresolved" => {
+                assert!(check["error"].is_string());
+                assert_eq!(check["processes"], json!([{"pid":7109}]));
+            }
+            _ => {}
+        }
+    }
+    assert!(rig.plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn ckdesk_operator_refusal_retains_a_short_signature_reader_error() {
+    let mut rig = rig();
+    let mut fixtures = apps();
+    fixtures
+        .iter_mut()
+        .find(|app| app.pid == DEV_PID)
+        .unwrap()
+        .signature = Err(AppIdentityUnreadable::Failed {
+        detail: "SigningInformation(-67050)".into(),
+    });
+    rig.management = Arc::new(ManagementPlane::new(Arc::new(Desktop(fixtures))));
+    let reply = rig
+        .serve_as(&head(CKDESK), "computer.read_state", json!({"target": DEV}))
+        .await;
+    assert_refused(&reply, DEV);
+    assert_eq!(
+        reply["detail"]["development_build_check"],
+        json!({
+            "condition":"signature_unreadable", "error_kind":"Failed", "error":"SigningInformation(-67050)",
+        })
+    );
+}
+
+#[tokio::test]
+async fn other_callers_operator_refusals_remain_byte_identical() {
+    let rig = rig();
+    let mut unattested = head(CKDESK);
+    unattested.durable_identity_attested = false;
+    let mut worker = head(CKDESK);
+    worker.holder = Some(GrantHolder::Worker {
+        agent_id: CKDESK.into(),
+        scope_ref: "worker-scope".into(),
+    });
+    let expected = serde_json::to_vec(&json!({
+        "outcome":"authorization_denied",
+        "reason":"operator_app_blocked",
+        "remedy":"The agent may not use this app, because it confirms the person's own actions; nothing was read or done in it, and nobody was asked. No agent may use it, so ask the person to act in the app themselves.",
+        "screen_lock_state":"unknown",
+    })).unwrap();
+    for caller in [head(OTHER_AGENT), unattested, worker] {
+        for target in [
+            DEV,
+            DEV_UNSIGNED,
+            RELEASED_BY_ID,
+            UNIDENTIFIED,
+            "Alfonso Beta",
+        ] {
+            let reply = rig
+                .serve_as(&caller, "computer.read_state", json!({"target":target}))
+                .await;
+            assert_eq!(
+                serde_json::to_vec(&reply).unwrap(),
+                expected,
+                "{target}: {reply}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_release_requirement_read_error_stays_closed_and_names_the_error() {
+    struct Code;
+    impl AppCode for Code {
+        fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+            Ok(ad_hoc())
+        }
+        fn satisfies(&self, _: &str) -> Result<bool, AppIdentityUnreadable> {
+            Err(AppIdentityUnreadable::Failed {
+                detail: "TimedOut".into(),
+            })
+        }
+    }
+    struct Resolver(Desktop);
+    impl TargetResolver for Resolver {
+        fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+            self.0.resolve(bundle_identity)
+        }
+        fn app_code(&self, _: &ProcessGrant) -> Arc<dyn AppCode> {
+            Arc::new(Code)
+        }
+    }
+    let mut rig = rig();
+    rig.management = Arc::new(ManagementPlane::new(Arc::new(Resolver(Desktop(apps())))));
+    let reply = rig
+        .serve_as(&head(CKDESK), "computer.read_state", json!({"target": DEV}))
+        .await;
+    assert_refused(&reply, DEV);
+    assert_eq!(
+        reply["detail"]["development_build_check"],
+        json!({
+            "condition":"signature_unreadable","error_kind":"Failed","error":"TimedOut",
+        })
+    );
+}
+
 /// A head the daemon attested, as the route's accepted bind names it.
 fn head(agent: &str) -> GrantCaller {
     GrantCaller::new(

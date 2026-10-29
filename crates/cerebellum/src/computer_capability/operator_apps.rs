@@ -248,14 +248,46 @@ pub(crate) fn drives_development_builds(caller: &GrantCaller) -> bool {
 /// signing requirement. An unsigned process, or one whose signature cannot
 /// be read, is refused too, since it might be the released app.
 fn signed_as_development_build(management: &ManagementPlane, grant: &ProcessGrant) -> bool {
+    development_signature_check(management, grant).is_ok()
+}
+
+fn failed_check(condition: &str) -> Value {
+    json!({ "condition": condition })
+}
+
+fn signature_error(error: crate::computer_grants::AppIdentityUnreadable) -> Value {
+    use crate::computer_grants::AppIdentityUnreadable;
+    let (kind, message) = match error {
+        AppIdentityUnreadable::NoReader => ("NoReader", "no code-signing reader".to_string()),
+        AppIdentityUnreadable::Unsigned => (
+            "Unsigned",
+            "no signature or designated requirement".to_string(),
+        ),
+        AppIdentityUnreadable::Failed { detail } => ("Failed", detail),
+    };
+    json!({
+        "condition": "signature_unreadable",
+        "error_kind": kind,
+        "error": short_error(&message),
+    })
+}
+
+fn short_error(error: &str) -> String {
+    error.chars().take(240).collect()
+}
+
+fn development_signature_check(
+    management: &ManagementPlane,
+    grant: &ProcessGrant,
+) -> Result<(), Value> {
     let GrantNeed::App { code, .. } =
         management.app_need(&grant.bundle_identity, grant, String::new())
     else {
-        return false;
+        return Err(signature_error(
+            crate::computer_grants::AppIdentityUnreadable::NoReader,
+        ));
     };
-    let Ok(identity) = code.identity() else {
-        return false;
-    };
+    let identity = code.identity().map_err(signature_error)?;
     let release = RELEASE_TEAM_ID.to_ascii_lowercase();
     if identity
         .team_id
@@ -266,11 +298,71 @@ fn signed_as_development_build(management: &ManagementPlane, grant: &ProcessGran
             .to_ascii_lowercase()
             .contains(&release)
     {
-        return false;
+        return Err(failed_check("release_signed"));
     }
     let release_requirement =
         format!("anchor apple generic and certificate leaf[subject.OU] = \"{RELEASE_TEAM_ID}\"");
-    matches!(code.satisfies(&release_requirement), Ok(false))
+    match code.satisfies(&release_requirement) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(failed_check("release_signed")),
+        Err(error) => Err(signature_error(error)),
+    }
+}
+
+/// Read the development-build checks without admitting an action or storing a grant.
+///
+/// This diagnostic deliberately reads both signature results, even if identity
+/// reading fails, so a host probe can distinguish the failing checks. It does not
+/// attest a caller or establish that the caller may drive development builds.
+#[doc(hidden)]
+pub fn development_build_snapshot(management: &ManagementPlane, grant: &ProcessGrant) -> Value {
+    use crate::computer_grants::AppIdentityUnreadable;
+
+    fn error(error: AppIdentityUnreadable) -> Value {
+        let detail = match &error {
+            AppIdentityUnreadable::Failed { detail } => Some(detail.as_str()),
+            _ => None,
+        };
+        json!({ "error": format!("{error:?}"), "detail": detail })
+    }
+
+    let executable = native_executable(grant);
+    let sighting = Sighting {
+        bundle_identity: readable(&grant.bundle_identity),
+        executable: executable.clone(),
+        titles: Vec::new(),
+    };
+    let release_requirement =
+        format!("anchor apple generic and certificate leaf[subject.OU] = \"{RELEASE_TEAM_ID}\"");
+    let mut snapshot = json!({
+        "pid": grant.pid,
+        "process_generation_evidence": grant.process_generation_evidence,
+        "bundle_identity": grant.bundle_identity,
+        "executable": executable,
+        "sighting_verdict": format!("{:?}", sighting.verdict()),
+        "release_requirement": release_requirement,
+    });
+    let GrantNeed::App { code, .. } =
+        management.app_need(&grant.bundle_identity, grant, String::new())
+    else {
+        snapshot["app_need_is_app"] = json!(false);
+        return snapshot;
+    };
+    snapshot["app_need_is_app"] = json!(true);
+    snapshot["identity"] = match code.identity() {
+        Ok(identity) => json!({ "ok": {
+            "team_id": identity.team_id,
+            "designated_requirement": identity.designated_requirement,
+            "ad_hoc": identity.ad_hoc,
+            "apple_anchored": identity.apple_anchored,
+        }}),
+        Err(unreadable) => error(unreadable),
+    };
+    snapshot["satisfies_release_requirement"] = match code.satisfies(&release_requirement) {
+        Ok(satisfies) => json!({ "ok": satisfies }),
+        Err(unreadable) => error(unreadable),
+    };
+    snapshot
 }
 
 /// What [`OPERATOR_APPS`] says about one sighted application.
@@ -295,6 +387,40 @@ struct Sighting {
 }
 
 impl Sighting {
+    fn failed_development_check(&self) -> Value {
+        let bundle_class = self.bundle_identity.as_deref().and_then(identity_class);
+        let executable_class = self.executable.as_deref().and_then(identity_class);
+        let classes = [bundle_class, executable_class];
+        if !classes.contains(&Some(Class::Always))
+            && classes.contains(&Some(Class::DevelopmentBuild))
+        {
+            if self.bundle_identity.is_none() {
+                return failed_check("identity_unreadable");
+            }
+            if self.executable.is_none() {
+                return failed_check("executable_unreadable");
+            }
+        }
+        let class_name = |class: Option<Class>| match class {
+            Some(Class::Always) => "always",
+            Some(Class::DevelopmentBuild) => "development_build",
+            None => "unmatched",
+        };
+        json!({
+            "condition": if classes.iter().all(Option::is_none) && self.blocked() {
+                "title_fallback"
+            } else {
+                "not_a_development_build"
+            },
+            "bundle_identity_present": self.bundle_identity.is_some(),
+            "executable_present": self.executable.is_some(),
+            "classes": {
+                "bundle_identity": class_name(bundle_class),
+                "executable": class_name(executable_class),
+            },
+        })
+    }
+
     fn verdict(&self) -> Verdict {
         let classes: Vec<Class> = [&self.bundle_identity, &self.executable]
             .into_iter()
@@ -422,7 +548,76 @@ pub(super) struct Lookup {
     pub(super) drives_development_builds: bool,
 }
 
+fn unresolved_process_facts(pid: u32) -> Value {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use cerebellum_macos::{process_owner, process_window_counts, ProcessOwner};
+        let alive = match process_owner(pid) {
+            ProcessOwner::Running { zombie, .. } => Some(u8::from(!zombie)),
+            ProcessOwner::NoSuchProcess => Some(0),
+            ProcessOwner::NotPermitted | ProcessOwner::Unreadable(_) => None,
+        };
+        let windows = process_window_counts(pid);
+        let mut facts = json!({"pid": pid});
+        for (name, count) in [
+            ("pid_alive", alive.map(usize::from)),
+            ("total_windows", windows.total_windows),
+            ("on_screen_windows", windows.on_screen_windows),
+            (
+                "windows_on_active_display",
+                windows.windows_on_active_display,
+            ),
+            ("windows_on_awake_display", windows.windows_on_awake_display),
+        ] {
+            if let Some(count) = count {
+                facts[name] = json!(count);
+            }
+        }
+        facts
+    }
+    // Unit-test PIDs are fixtures, not processes on the operator's machine.
+    #[cfg(any(not(target_os = "macos"), test))]
+    json!({ "pid": pid })
+}
+
 impl Lookup {
+    fn refusal(&self, check: Value) -> Value {
+        let mut reply = refusal();
+        if self.drives_development_builds {
+            reply["detail"] = json!({ "development_build_check": check });
+        }
+        reply
+    }
+
+    fn unresolved(&self, bundle_identity: &str, pid: Option<u32>, error: &str) -> Value {
+        let mut check = json!({
+            "condition": "process_unresolved",
+            "error": short_error(error),
+        });
+        if self.drives_development_builds {
+            let pids = match pid {
+                Some(pid) => Some(vec![pid]),
+                None => self.source.running_apps().ok().map(|apps| {
+                    let mut pids = apps
+                        .into_iter()
+                        .filter(|app| app.bundle_identity.eq_ignore_ascii_case(bundle_identity))
+                        .map(|app| app.pid)
+                        .collect::<Vec<_>>();
+                    pids.sort_unstable();
+                    pids.dedup();
+                    pids
+                }),
+            };
+            if let Some(pids) = pids {
+                check["processes"] = json!(pids
+                    .into_iter()
+                    .map(unresolved_process_facts)
+                    .collect::<Vec<_>>());
+            }
+        }
+        self.refusal(check)
+    }
+
     /// Whether an identity the request named is refused before it is
     /// resolved: anything in [`OPERATOR_APPS`], except that a development
     /// build named by a driver is resolved and checked as a process.
@@ -434,11 +629,15 @@ impl Lookup {
         }
     }
 
-    /// Whether a resolved process is an operator app. `titles` are names the
+    /// The refusal for a resolved operator app. `titles` are names the
     /// caller already knows it by; the application's running name and its
     /// focused window's title are added only when its identity is partly
     /// unreadable, the one case titles decide.
-    pub(super) fn process_blocked(&self, grant: &ProcessGrant, mut titles: Vec<String>) -> bool {
+    pub(super) fn process_refusal(
+        &self,
+        grant: &ProcessGrant,
+        mut titles: Vec<String>,
+    ) -> Option<Value> {
         let mut sighting = Sighting {
             bundle_identity: readable(&grant.bundle_identity),
             executable: (self.executable)(grant),
@@ -452,16 +651,24 @@ impl Lookup {
             sighting.titles = titles;
         }
         match sighting.verdict() {
-            Verdict::Ordinary => false,
-            Verdict::Blocked => true,
+            Verdict::Ordinary => None,
+            Verdict::Blocked => Some(self.refusal(sighting.failed_development_check())),
             Verdict::DevelopmentBuild => {
-                !(self.drives_development_builds
-                    && signed_as_development_build(&self.management, grant))
+                if !self.drives_development_builds {
+                    return Some(self.refusal(failed_check("caller")));
+                }
+                development_signature_check(&self.management, grant)
+                    .err()
+                    .map(|check| self.refusal(check))
             }
         }
     }
 
-    /// Whether a target given by name or app identity is an operator app.
+    pub(super) fn process_blocked(&self, grant: &ProcessGrant, titles: Vec<String>) -> bool {
+        self.process_refusal(grant, titles).is_some()
+    }
+
+    /// The refusal for a target given by name or app identity, if it is an operator app.
     ///
     /// The target as given is checked first, so naming an operator app is
     /// refused even while it is not running. A name is then matched against
@@ -470,21 +677,40 @@ impl Lookup {
     /// executable is read. A target that resolves to no process, or to
     /// several, is left to the action, which refuses it as not running or
     /// ambiguous.
-    pub(super) fn named_blocked(&self, target: &str) -> bool {
+    fn named_refusal(&self, target: &str) -> Option<Value> {
         if self.identity_refused(target) {
-            return true;
+            return Some(
+                self.refusal(
+                    Sighting {
+                        bundle_identity: readable(target),
+                        executable: None,
+                        titles: Vec::new(),
+                    }
+                    .failed_development_check(),
+                ),
+            );
         }
         let mut titles = vec![target.to_string()];
         let bundle_identity = if super::looks_like_bundle_identity(target) {
             target.trim().to_string()
         } else {
-            let Ok(apps) = self.source.running_apps() else {
-                // The running applications could not be listed, so the name
-                // leads to no identity at all.
-                return title_names_operator_app(target);
+            let apps = match self.source.running_apps() {
+                Ok(apps) => apps,
+                Err(error) => {
+                    // The running applications could not be listed, so the name
+                    // leads to no identity at all.
+                    return title_names_operator_app(target).then(|| {
+                        self.refusal(json!({
+                            "condition": "title_fallback",
+                        "bundle_identity_present": false,
+                        "executable_present": false,
+                            "error": short_error(&format!("{error:?}")),
+                        }))
+                    });
+                }
             };
             let Ok(matched) = super::match_target_name(target, &apps) else {
-                return false;
+                return None;
             };
             titles.extend(
                 apps.iter()
@@ -494,35 +720,46 @@ impl Lookup {
             matched.bundle_identity
         };
         if self.identity_refused(&bundle_identity) {
-            return true;
+            return Some(
+                self.refusal(
+                    Sighting {
+                        bundle_identity: readable(&bundle_identity),
+                        executable: None,
+                        titles: Vec::new(),
+                    }
+                    .failed_development_check(),
+                ),
+            );
         }
         match self.management.resolve_process(&bundle_identity) {
-            Ok(grant) => self.process_blocked(&grant, titles),
+            Ok(grant) => self.process_refusal(&grant, titles),
             // The process could not be identified, so its executable cannot
             // be read.
-            Err(reply) if reply["outcome"] == "targets_unreadable" => {
-                titles.iter().any(|title| title_names_operator_app(title))
-            }
-            Err(_) => false,
+            Err(reply) if reply["outcome"] == "targets_unreadable" => titles
+                .iter()
+                .any(|title| title_names_operator_app(title))
+                .then(|| self.unresolved(&bundle_identity, None, &reply.to_string())),
+            Err(_) => None,
         }
     }
 
-    /// Whether the frontmost application is an operator app. A frontmost
+    /// The refusal for the frontmost operator app. A frontmost
     /// application that cannot be read at all is not refused.
-    pub(super) fn frontmost_blocked(&self) -> bool {
-        let Some(pid) = self.source.frontmost_pid() else {
-            return false;
-        };
+    fn frontmost_refusal(&self) -> Option<Value> {
+        let pid = self.source.frontmost_pid()?;
         if let Some(grant) = self.management.process_for_pid(pid) {
-            return self.process_blocked(&grant, Vec::new());
+            return self.process_refusal(&grant, Vec::new());
         }
         // The process could not be identified by its start time; what the
         // running-application list says about that pid is all there is.
-        self.source.running_apps().is_ok_and(|apps| {
-            apps.iter().filter(|app| app.pid == pid).any(|app| {
-                identity_blocked(&app.bundle_identity) || title_names_operator_app(&app.name)
+        self.source
+            .running_apps()
+            .is_ok_and(|apps| {
+                apps.iter().filter(|app| app.pid == pid).any(|app| {
+                    identity_blocked(&app.bundle_identity) || title_names_operator_app(&app.name)
+                })
             })
-        })
+            .then(|| self.unresolved("", Some(pid), "process_for_pid returned None"))
     }
 }
 
@@ -663,21 +900,30 @@ where
             frontmost = super::takeover::parse_request(capability.capability(), arguments).is_ok();
         }
         let lookup = self.operator_lookup(context.management, &context.consent.caller);
-        let claimed = tokio::task::spawn_blocking(move || {
-            if let Some(target) = named.iter().find(|target| lookup.named_blocked(target)) {
-                return Some(target.clone());
+        let (claimed, reply) = tokio::task::spawn_blocking(move || {
+            if let Some(refused) = named.iter().find_map(|target| {
+                lookup
+                    .named_refusal(target)
+                    .map(|reply| (target.clone(), reply))
+            }) {
+                return Some(refused);
             }
-            if let Some((id, _)) = processes
-                .iter()
-                .find(|(_, grant)| lookup.process_blocked(grant, Vec::new()))
-            {
-                return Some(id.clone());
+            if let Some(refused) = processes.iter().find_map(|(id, grant)| {
+                lookup
+                    .process_refusal(grant, Vec::new())
+                    .map(|reply| (id.clone(), reply))
+            }) {
+                return Some(refused);
             }
-            (frontmost && lookup.frontmost_blocked()).then(|| "frontmost application".to_string())
+            frontmost
+                .then(|| lookup.frontmost_refusal())
+                .flatten()
+                .map(|reply| ("frontmost application".to_string(), reply))
         })
         .await
         .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))?;
-        Some(self.operator_app_refused(context.grantee, &claimed).await)
+        self.operator_app_refused(context.grantee, &claimed).await;
+        Some(reply)
     }
 
     /// Record an operator-app refusal in the refusal ring under `caller`,
@@ -743,9 +989,66 @@ pub(super) fn installed_app_blocked(app: &InstalledApp) -> bool {
     .blocked()
 }
 
+pub(super) fn installed_app_refusal(app: &InstalledApp, caller: &GrantCaller) -> Value {
+    let mut reply = refusal();
+    if drives_development_builds(caller) {
+        let sighting = Sighting {
+            bundle_identity: readable(&app.bundle_identity),
+            executable: None,
+            titles: vec![app.name.clone()],
+        };
+        reply["detail"] = json!({
+            "development_build_check": sighting.failed_development_check(),
+        });
+    }
+    reply
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn development_check_error_strings_are_bounded_without_splitting_unicode() {
+        assert_eq!(short_error(&"é".repeat(241)), "é".repeat(240));
+    }
+
+    #[test]
+    fn development_check_distinguishes_unreadable_identity_from_executable() {
+        for (bundle_identity, executable, condition) in [
+            (None, Some("alfonso-desktop"), "identity_unreadable"),
+            (
+                Some("dev.cortexkit.alfonso.review"),
+                None,
+                "executable_unreadable",
+            ),
+        ] {
+            let sighting = Sighting {
+                bundle_identity: bundle_identity.map(str::to_string),
+                executable: executable.map(str::to_string),
+                titles: vec!["Alfonso".into()],
+            };
+            assert_eq!(
+                sighting.failed_development_check(),
+                json!({"condition":condition})
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_class_wins_over_an_unreadable_identity_in_the_diagnostic_too() {
+        let sighting = Sighting {
+            bundle_identity: None,
+            executable: Some("Alfonso".into()),
+            titles: vec![],
+        };
+        let check = sighting.failed_development_check();
+        assert_eq!(check["condition"], "not_a_development_build");
+        assert_eq!(
+            check["classes"],
+            json!({"bundle_identity":"unmatched","executable":"always"})
+        );
+    }
 
     #[test]
     fn every_compiled_identity_and_its_children_are_blocked_in_any_case() {
