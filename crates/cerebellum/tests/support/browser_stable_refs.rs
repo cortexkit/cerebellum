@@ -349,15 +349,19 @@ async fn stable_refs_wire_old_refs_survive_views_but_not_snapshot_eviction() {
     assert_eq!(stale["outcome"], "stale_snapshot", "{stale}");
     assert!(!launcher.effects.lock().unwrap().contains(&"input_press"));
     // Eviction removes proof of what the caller saw, even if the name cache
-    // remembers the node. An unknown zoom reports a miss, not that node.
+    // remembers the node. A zoom on a ref no surviving snapshot showed is
+    // refused with a request for a fresh snapshot, and never shows that node.
     let zoom = call(&planes, "snapshot", json!({"zoom":old})).await;
-    assert_eq!(zoom["outcome"], "ref_not_found", "{zoom}");
-    let text = zoom["state_text"].as_str().unwrap();
+    assert_eq!(zoom["outcome"], "stale_snapshot", "{zoom}");
+    assert_eq!(zoom["detail"]["reason_code"], "ref_not_shown", "{zoom}");
     assert!(
-        text.contains(&format!("zoom {old}: no such element on the page now.")),
-        "{text}"
+        zoom["remedy"].as_str().unwrap().contains("take a snapshot"),
+        "{zoom}"
     );
-    assert!(!text.contains("Access: Permission 39"), "{text}");
+    assert!(
+        !zoom.to_string().contains("Access: Permission 39"),
+        "{zoom}"
+    );
     let fresh = call(
         &planes,
         "snapshot",

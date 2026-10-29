@@ -74,7 +74,7 @@ run_linux_part() {
   local attempt status
   # 8 CPUs measured faster end to end than 4 once queue time is counted.
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    ck motor run --vcpus 16 --timeout 1800 --cwd "$repo_root" -- \
+    ck motor run --vcpus 8 --timeout 1800 --cwd "$repo_root" -- \
       ./scripts/fast-gate.sh --part linux --base "$base"
     status=$?
     [ "$status" -eq 200 ] || return "$status"
