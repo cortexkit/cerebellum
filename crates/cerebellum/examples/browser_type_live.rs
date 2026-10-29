@@ -701,11 +701,11 @@ mod probe {
                 if name == "plain non-ASCII" { println!("Focus event evidence: {}", pipe.evaluate("focusLog")?); }
                 passed &= table_row(name, typed["outcome"] == "ok" && value == expected, &json!({"value":value,"reply":typed}));
             }
-            for (name, label, id) in [("password refusal", "Probe password", "password"), ("cc-number refusal", "Probe card", "card")] {
+            for (name, label, id, reason) in [("password refusal", "Probe password", "password", "credential_field"), ("cc-number refusal", "Probe card", "card", "payment_field")] {
                 let reference = reference(&snapshot, label)?;
                 let typed = invoke(planes, &mut corr, "browser.type", json!({"ref":reference,"text":"must-not-enter"})).await?;
                 let value = pipe.evaluate(&format!("document.getElementById('{id}').value"))?;
-                passed &= table_row(name, typed.pointer("/detail/reason_code") == Some(&json!("credential_input_unsupported")) && value == "", &json!({"value":value,"reply":typed}));
+                passed &= table_row(name, typed.pointer("/detail/reason_code") == Some(&json!(reason)) && value == "", &json!({"value":value,"reply":typed}));
             }
             let away = invoke(planes, &mut corr, "browser.navigate", json!({"url":format!("{origin}/away"),"intent":"invalidate fixture refs","wait":"settle","severity":{"tier":1,"credential":false,"financial":false}})).await?;
             check_ok(&away)?;

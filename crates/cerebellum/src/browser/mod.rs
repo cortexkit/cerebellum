@@ -164,6 +164,10 @@ pub enum BrowserError {
         field: String,
         reason_code: &'static str,
     },
+    TypeField {
+        reason_code: &'static str,
+        input_type: String,
+    },
     NoSession,
     BrowserLaunchPending,
     HumanInControl {
@@ -294,7 +298,9 @@ pub enum BrowserError {
 impl BrowserError {
     fn outcome(&self) -> &'static str {
         match self {
-            Self::InvalidRequest { .. } | Self::SeverityBelowFloor { .. } => "invalid_request",
+            Self::InvalidRequest { .. }
+            | Self::TypeField { .. }
+            | Self::SeverityBelowFloor { .. } => "invalid_request",
             Self::NoSession => "no_session",
             Self::BrowserLaunchPending => "browser_launch_pending",
             Self::HumanInControl { .. } => "human_in_control",
@@ -327,8 +333,9 @@ impl BrowserError {
         }
     }
     /// Tell a caller which action can change this refusal, or explicitly when none exists.
-    fn remedy(&self) -> &'static str {
+    fn remedy(&self) -> String {
         match self {
+            Self::TypeField { reason_code, input_type } => return crate::classification::type_field_remedy(reason_code, input_type, false),
             Self::InvalidRequest { reason_code, .. } if *reason_code == "path_abandons_custody" => {
                 "omit path; authenticated-session pixels stay inside this module's retention machinery"
             }
@@ -432,7 +439,7 @@ impl BrowserError {
                 "no caller remedy: report this module failure with its stage; the browser session state is unreadable until the module restarts"
             }
             Self::FillRefused(refusal) => refusal.remedy(),
-        }
+        }.into()
     }
 
     fn detail(&self) -> Option<Value> {
@@ -448,6 +455,9 @@ impl BrowserError {
             }
             Self::InvalidRequest { field, reason_code } => {
                 json!({"field":field,"reason_code":reason_code})
+            }
+            Self::TypeField { reason_code, .. } => {
+                json!({"field":"ref","reason_code":reason_code})
             }
             Self::NavigateNotReady {
                 reason_code,
@@ -2278,7 +2288,7 @@ impl BrowserPlane {
             Err(error) => {
                 let mut object = Map::new();
                 object.insert("outcome".into(), Value::String(error.outcome().into()));
-                object.insert("remedy".into(), Value::String(error.remedy().into()));
+                object.insert("remedy".into(), Value::String(error.remedy()));
                 object.insert("context".into(), context);
                 if let Some(detail) = error.detail() {
                     object.insert("detail".into(), detail);
@@ -6023,7 +6033,7 @@ fn optional_integer(
 fn partial_error_result(error: &BrowserError) -> Value {
     let mut result = Map::new();
     result.insert("outcome".into(), Value::String(error.outcome().into()));
-    result.insert("remedy".into(), Value::String(error.remedy().into()));
+    result.insert("remedy".into(), Value::String(error.remedy()));
     if let Some(detail) = error.detail() {
         result.insert("detail".into(), detail);
     }
@@ -6172,9 +6182,9 @@ fn journal_refusal_detail(error: &BrowserError) -> Value {
 
 fn journal_outcome(error: &BrowserError) -> Outcome {
     match error {
-        BrowserError::InvalidRequest { .. } | BrowserError::SeverityBelowFloor { .. } => {
-            Outcome::InvalidRequest
-        }
+        BrowserError::InvalidRequest { .. }
+        | BrowserError::TypeField { .. }
+        | BrowserError::SeverityBelowFloor { .. } => Outcome::InvalidRequest,
         BrowserError::AuthorizationDenied { .. }
         | BrowserError::AuthorizationOriginScope { .. }
         | BrowserError::AuthorizationNoGrantForAction { .. }
@@ -7490,6 +7500,7 @@ mod tests {
     fn browser_error_variant(error: &BrowserError) -> &'static str {
         match error {
             BrowserError::InvalidRequest { .. } => "InvalidRequest",
+            BrowserError::TypeField { .. } => "TypeField",
             BrowserError::NoSession => "NoSession",
             BrowserError::BrowserLaunchPending => "BrowserLaunchPending",
             BrowserError::HumanInControl { .. } => "HumanInControl",
@@ -7528,7 +7539,7 @@ mod tests {
         }
     }
 
-    const BROWSER_ERROR_VARIANTS: usize = 33;
+    const BROWSER_ERROR_VARIANTS: usize = 34;
 
     /// A sample of every `BrowserError` variant, with one more sample for
     /// each case `remedy` words differently (a reason code, a sent flag, a
@@ -7665,6 +7676,18 @@ mod tests {
             },
             BrowserError::SessionStateUnavailable,
         ];
+        for (reason_code, input_type) in [
+            ("credential_field", "number"),
+            ("payment_field", "number"),
+            ("unsupported_field_type", "date"),
+            ("unsupported_field_type", "checkbox"),
+            ("unsupported_field_type", "file"),
+        ] {
+            errors.push(BrowserError::TypeField {
+                reason_code,
+                input_type: input_type.into(),
+            });
+        }
         for refusal in [
             fill::FillRefusal::Origin {
                 field: "password_ref",

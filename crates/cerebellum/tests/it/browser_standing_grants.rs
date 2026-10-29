@@ -2163,13 +2163,13 @@ async fn baseline_credential_and_payment_typing_remain_hard_refused() {
         .route(Session::primary("c-baseline-sensitive", AGENT).asking())
         .await;
     let snapshot = public_snapshot(&fixture, &route, PUBLIC).await;
-    for name in ["Password", "Payment"] {
+    for (name, reason) in [
+        ("Password", "credential_field"),
+        ("Payment", "payment_field"),
+    ] {
         let reply = fixture.call(&route,"browser.type",json!({"ref":named_ref(&snapshot,name),"snapshot_id":snapshot["snapshot_id"],"text":"sensitive"})).await;
         assert_eq!(reply["outcome"], "invalid_request", "{reply}");
-        assert_eq!(
-            reply["detail"]["reason_code"], "credential_input_unsupported",
-            "{reply}"
-        );
+        assert_eq!(reply["detail"]["reason_code"], reason, "{reply}");
     }
     assert!(!fixture
         .browser

@@ -3888,6 +3888,11 @@ impl CdpPipeIo for ChromeLikePipe {
                 if self.typing.as_ref().is_some_and(|page| page.fail_focus) {
                     self.queue(json!({"id":id,"sessionId":"session-own","error":{"code":-32000,"message":"DOM node is not ready"}}));
                 } else {
+                    if let Some(page) = &self.typing {
+                        if let Some(name) = &page.name_after_focus {
+                            *page.field_name.lock().unwrap() = name.clone();
+                        }
+                    }
                     self.reply(id, json!({}));
                 }
             }
@@ -3916,6 +3921,10 @@ impl CdpPipeIo for ChromeLikePipe {
                     *page.selected.lock().unwrap() = true;
                     None
                 } else if function.contains("collapse(false)") {
+                    assert!(
+                        !matches!(page.input_type.as_str(), "number" | "email"),
+                        "number and email inputs reject setSelectionRange"
+                    );
                     *page.caret.lock().unwrap() = page.value.lock().unwrap().len();
                     *page.selected.lock().unwrap() = false;
                     Some(true)
@@ -3935,7 +3944,16 @@ impl CdpPipeIo for ChromeLikePipe {
             }
             "Input.dispatchKeyEvent" => {
                 let page = self.typing.as_ref().unwrap();
-                if command["params"]["type"] == "keyDown"
+                if command["params"]["key"] == "End" {
+                    *page.caret.lock().unwrap() = page.value.lock().unwrap().len();
+                    *page.selected.lock().unwrap() = false;
+                    if let Some(name) = &page.name_after_end {
+                        *page.field_name.lock().unwrap() = name.clone();
+                    }
+                    if page.blur_after_end {
+                        *page.has_focus.lock().unwrap() = false;
+                    }
+                } else if command["params"]["type"] == "keyDown"
                     && *page.selected.lock().unwrap()
                     && !page.ignore_delete
                 {
@@ -9617,6 +9635,11 @@ async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
 #[derive(Clone, Default)]
 struct TypePage {
     input_type: String,
+    field_name: Arc<Mutex<String>>,
+    field_id: String,
+    name_after_focus: Option<String>,
+    name_after_end: Option<String>,
+    blur_after_end: bool,
     caret: Arc<Mutex<usize>>,
     selected: Arc<Mutex<bool>>,
     ignore_delete: bool,
@@ -9631,7 +9654,7 @@ struct TypePage {
 
 impl TypePage {
     fn document(&self) -> serde_json::Map<String, Value> {
-        json!({"nodes":[{"nodeId":1,"backendNodeId":LINK_BACKEND_NODE,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type",if self.input_type.is_empty() { "text" } else { &self.input_type },"autocomplete",self.autocomplete]}]}).as_object().unwrap().clone()
+        json!({"nodes":[{"nodeId":1,"backendNodeId":LINK_BACKEND_NODE,"nodeType":1,"localName":"input","nodeName":"INPUT","attributes":["type",if self.input_type.is_empty() { "text" } else { &self.input_type },"autocomplete",self.autocomplete,"name",*self.field_name.lock().unwrap(),"id",self.field_id]}]}).as_object().unwrap().clone()
     }
 }
 
@@ -9723,6 +9746,162 @@ async fn wire_type_clear_first_replaces_value() {
 }
 
 #[tokio::test]
+async fn wire_type_number_input_clear_first_replaces_value() {
+    let page = TypePage {
+        input_type: "number".into(),
+        field_name: Arc::new(Mutex::new("cache_retention".into())),
+        ..Default::default()
+    };
+    let value = page.value.clone();
+    *value.lock().unwrap() = "7".into();
+    let (planes, _, _, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, "30", true).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(*value.lock().unwrap(), "30");
+}
+
+#[tokio::test]
+async fn wire_type_number_and_email_append_without_selection_range() {
+    for kind in ["number", "email"] {
+        let page = TypePage {
+            input_type: kind.into(),
+            ..Default::default()
+        };
+        let value = page.value.clone();
+        *value.lock().unwrap() = "7".into();
+        let (planes, _, _, reference) = type_fixture(page).await;
+        let reply = type_wire(&planes, &reference, "30", false).await;
+        assert_eq!(reply["outcome"], "ok", "{kind}: {reply}");
+        assert_eq!(*value.lock().unwrap(), "730");
+    }
+}
+
+#[tokio::test]
+async fn wire_type_sensitive_names_and_ids_do_not_match_substrings() {
+    for (kind, name, id, expected) in [
+        ("number", "card_number", "", Some("payment_field")),
+        ("text", "api_token", "", Some("credential_field")),
+        ("number", "", "cardNumber", Some("payment_field")),
+        ("text", "", "apiToken", Some("credential_field")),
+        ("text", "token_name", "", Some("credential_field")),
+        ("number", "pin", "", Some("credential_field")),
+        ("text", "pin_label", "", None),
+        ("number", "cache_retention_days", "", None),
+        ("number", "discard_reason", "scardinal", None),
+    ] {
+        let page = TypePage {
+            input_type: kind.into(),
+            field_name: Arc::new(Mutex::new(name.into())),
+            field_id: id.into(),
+            ..Default::default()
+        };
+        let value = page.value.clone();
+        *value.lock().unwrap() = "7".into();
+        let (planes, _, commands, reference) = type_fixture(page).await;
+        let reply = type_wire(&planes, &reference, "30", true).await;
+        if let Some(reason) = expected {
+            assert_eq!(
+                reply["detail"]["reason_code"], reason,
+                "{kind} {name} {id}: {reply}"
+            );
+            assert!(reply["remedy"].as_str().unwrap().contains("looks like"));
+            assert!(!commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method.starts_with("Input.") || method == "DOM.focus"));
+            assert_eq!(*value.lock().unwrap(), "7");
+        } else {
+            assert_eq!(reply["outcome"], "ok", "{kind} {name} {id}: {reply}");
+            assert_eq!(*value.lock().unwrap(), "30");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wire_type_rechecks_sensitive_name_after_focus() {
+    let page = TypePage {
+        input_type: "number".into(),
+        name_after_focus: Some("card_number".into()),
+        ..Default::default()
+    };
+    let value = page.value.clone();
+    *value.lock().unwrap() = "7".into();
+    let (planes, _, commands, reference) = type_fixture(page).await;
+    let reply = type_wire(&planes, &reference, "30", true).await;
+    assert_ne!(reply["outcome"], "ok", "{reply}");
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|method| method.starts_with("Input.")));
+    assert_eq!(*value.lock().unwrap(), "7");
+}
+
+#[tokio::test]
+async fn wire_type_rechecks_sensitive_name_and_focus_after_end_key() {
+    for sensitive in [false, true] {
+        let page = TypePage {
+            input_type: "number".into(),
+            name_after_end: sensitive.then(|| "card_number".into()),
+            blur_after_end: !sensitive,
+            ..Default::default()
+        };
+        let value = page.value.clone();
+        *value.lock().unwrap() = "7".into();
+        let (planes, _, commands, reference) = type_fixture(page).await;
+        let reply = type_wire(&planes, &reference, "30", false).await;
+        assert_ne!(reply["outcome"], "ok", "{reply}");
+        assert!(!commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "Input.insertText"));
+        assert_eq!(*value.lock().unwrap(), "7");
+    }
+}
+
+#[tokio::test]
+async fn wire_type_unsupported_fields_name_type_and_alternative() {
+    for kind in [
+        "date",
+        "datetime-local",
+        "month",
+        "week",
+        "time",
+        "color",
+        "range",
+        "checkbox",
+        "radio",
+        "file",
+        "hidden",
+    ] {
+        let (planes, _, commands, reference) = type_fixture(TypePage {
+            input_type: kind.into(),
+            ..Default::default()
+        })
+        .await;
+        let reply = type_wire(&planes, &reference, "30", true).await;
+        assert_eq!(
+            reply["detail"]["reason_code"], "unsupported_field_type",
+            "{reply}"
+        );
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains(kind));
+        assert!(remedy.contains(if matches!(kind, "file" | "hidden") {
+            "no type action"
+        } else {
+            "click"
+        }));
+        assert!(!commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method.starts_with("Input.") || method == "DOM.focus"));
+    }
+}
+
+#[tokio::test]
 async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
     for (input_type, autocomplete) in [
         ("password", ""),
@@ -9730,6 +9909,10 @@ async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
         ("text", "current-password"),
         ("text", "new-password"),
         ("text", "one-time-code"),
+        ("number", "cc-number"),
+        ("number", "cc-csc"),
+        ("number", "cc-exp"),
+        ("number", "one-time-code"),
     ] {
         let page = TypePage {
             input_type: input_type.into(),
@@ -9741,9 +9924,16 @@ async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
         let before = planes.browser.journal_export_for_test().await;
         let reply = type_wire(&planes, &reference, "secret", false).await;
         assert_eq!(
-            reply["detail"]["reason_code"], "credential_input_unsupported",
+            reply["detail"]["reason_code"],
+            if autocomplete.starts_with("cc-") {
+                "payment_field"
+            } else {
+                "credential_field"
+            },
             "{reply}"
         );
+        assert_eq!(reply["detail"]["field"], "ref");
+        assert!(reply["remedy"].as_str().unwrap().contains(input_type));
         assert!(reply["remedy"].as_str().unwrap().contains("present"));
         assert_eq!(planes.browser.journal_export_for_test().await, before);
         assert!(!commands
