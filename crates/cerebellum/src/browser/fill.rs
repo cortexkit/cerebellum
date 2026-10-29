@@ -858,6 +858,7 @@ fn check_field_kind(
         LoginField::Username
             if input
                 && !classification.is_credential_field()
+                && !search_or_hidden(classification)
                 && matches!(input_type, None | Some("text") | Some("email"))
                 && (input_type == Some("email")
                     || has_token(classification, "username")
@@ -868,6 +869,79 @@ fn check_field_kind(
         LoginField::Username => Err("not_a_username_field"),
         LoginField::Otp if input && has_token(classification, "one-time-code") => Ok(()),
         LoginField::Otp => Err("not_a_one_time_code_field"),
+    }
+}
+
+fn search_or_hidden(classification: &NonTypeClassificationRecord) -> bool {
+    classification.login_field.as_ref().is_some_and(|facts| {
+        facts.hidden
+            || facts.role.split_ascii_whitespace().any(|role| {
+                role.eq_ignore_ascii_case("search") || role.eq_ignore_ascii_case("searchbox")
+            })
+    })
+}
+
+fn username_like(value: &str) -> bool {
+    value.split_ascii_whitespace().any(|part| {
+        part.eq_ignore_ascii_case("e-mail")
+            || part.eq_ignore_ascii_case("user_id")
+            || part.split(['_', '-', '.']).any(|token| {
+                [
+                    "username", "user", "login", "email", "mail", "userid", "account",
+                ]
+                .iter()
+                .any(|hint| token.eq_ignore_ascii_case(hint))
+            })
+    })
+}
+
+pub(super) fn username_uses_form_heuristic(username: &NonTypeClassificationRecord) -> bool {
+    check_field_kind(LoginField::Username, username).is_err()
+}
+
+pub(super) fn check_username_field(
+    username: &NonTypeClassificationRecord,
+    password: &NonTypeClassificationRecord,
+) -> Result<(), &'static str> {
+    if !username_uses_form_heuristic(username) {
+        return Ok(());
+    }
+    let refused = Err("not_a_username_field");
+    if username.target_kind != TargetKind::Input
+        || username.is_credential_field()
+        || search_or_hidden(username)
+        || !matches!(
+            username.effective_input_type.as_deref(),
+            None | Some("text") | Some("email")
+        )
+        || username.form_owner.is_none()
+        || username.form_owner != password.form_owner
+    {
+        return refused;
+    }
+    let (Some(user), Some(pass)) = (&username.login_field, &password.login_field) else {
+        return refused;
+    };
+    let (Some(user_order), Some(pass_order)) = (user.document_order, pass.document_order) else {
+        return refused;
+    };
+    if user_order >= pass_order {
+        return refused;
+    }
+    if username_like(&user.name)
+        || username_like(&user.id)
+        || username
+            .target_autocomplete_tokens
+            .iter()
+            .any(|token| username_like(token))
+        || (pass.preceding_text_inputs == 1
+            && user
+                .form_start_order
+                .is_some_and(|start| start < user_order))
+    {
+        Ok(())
+    } else {
+        refused
     }
 }
 
@@ -1018,12 +1092,14 @@ impl BrowserPlane {
                 .map_err(|reason| BrowserError::ClassificationUnavailable(reason.clone()))?
                 .as_ref()
                 .clone();
-            check_field_kind(field, &classification).map_err(|reason_code| {
-                BrowserError::InvalidRequest {
-                    field: field.argument().into(),
-                    reason_code,
-                }
-            })?;
+            if field != LoginField::Username {
+                check_field_kind(field, &classification).map_err(|reason_code| {
+                    BrowserError::InvalidRequest {
+                        field: field.argument().into(),
+                        reason_code,
+                    }
+                })?;
+            }
             fields.push(PlannedField {
                 field,
                 identity: record
@@ -1034,6 +1110,12 @@ impl BrowserPlane {
                 frame: record.frame_document.clone(),
             });
         }
+        check_username_field(&fields[0].classification, &fields[1].classification).map_err(
+            |reason_code| BrowserError::InvalidRequest {
+                field: LoginField::Username.argument().into(),
+                reason_code,
+            },
+        )?;
         let password_form = &fields[1].classification.form_owner;
         if password_form.is_none() || fields[0].classification.form_owner != *password_form {
             return Err(BrowserError::InvalidRequest {
@@ -1455,6 +1537,27 @@ mod tests {
             check_field_kind(LoginField::Otp, &plain),
             Err("not_a_one_time_code_field")
         );
+    }
+
+    #[test]
+    fn login_metadata_is_not_part_of_stored_classifications_or_fingerprints() {
+        let mut classification = field(|f| f.input_type("text"));
+        let bytes = classification.canonical_bytes().unwrap();
+        let fingerprint = classification.try_fingerprint().unwrap();
+        classification.login_field = Some(crate::classification::LoginFieldFacts {
+            name: "username".into(),
+            id: "id_username".into(),
+            role: String::new(),
+            hidden: false,
+            document_order: Some(3),
+            form_start_order: Some(1),
+            preceding_text_inputs: 0,
+        });
+        assert_eq!(classification.canonical_bytes().unwrap(), bytes);
+        assert_eq!(classification.try_fingerprint().unwrap(), fingerprint);
+        let restored: NonTypeClassificationRecord = serde_json::from_slice(&bytes).unwrap();
+        assert!(restored.login_field.is_none());
+        assert_eq!(classification, restored);
     }
 
     #[test]

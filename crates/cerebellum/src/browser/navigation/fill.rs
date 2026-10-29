@@ -6,11 +6,13 @@
 //! resolved element, bound to its independently resolved owner document.
 
 use super::*;
-use crate::browser::fill::{FillDispatch, FillOutcome, FillTarget, FilledField, FilledFieldsState};
+use crate::browser::fill::{
+    FillDispatch, FillOutcome, FillTarget, FilledField, FilledFieldsState, LoginField,
+};
 
 // No focus events or focus-directed CDP insertion: the page cannot redirect
 // this value to a different element between validation and the setter.
-const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin, value) {
+const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin, value, isUsername, password) {
     const win = doc.defaultView;
     if (!this.isConnected || this.ownerDocument !== doc || !win || win.document !== doc ||
         win.origin !== origin || doc.location.protocol !== 'https:' ||
@@ -18,6 +20,30 @@ const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin,
         this.type !== expectedType || this.disabled || this.readOnly) return false;
     const tokens = (this.getAttribute('autocomplete') || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (JSON.stringify(tokens) !== JSON.stringify(autocomplete)) return false;
+    if (isUsername) {
+        const roles = (this.getAttribute('role') || '').toLowerCase().split(/\s+/);
+        if (this.hidden || roles.some(role => role === 'search' || role === 'searchbox')) return false;
+        if (expectedType !== 'email' && !tokens.includes('username') && !tokens.includes('email')) {
+            const follows = (a, b) => {
+                const position = a.compareDocumentPosition(b);
+                return !(position & 1) && !!(position & 4);
+            };
+            const form = this.form;
+            if (!form || !(password instanceof win.HTMLInputElement) || !password.isConnected ||
+                password.ownerDocument !== doc || password.type !== 'password' ||
+                password.form !== form || !follows(this, password)) return false;
+            const usernameLike = value => value.toLowerCase().split(/\s+/).some(part =>
+                part === 'e-mail' || part === 'user_id' || part.split(/[_\-.]/).some(token =>
+                    ['username','user','login','email','mail','userid','account'].includes(token)));
+            const hinted = [this.name, this.id, ...tokens].some(usernameLike);
+            if (!hinted) {
+                const preceding = Array.from(doc.querySelectorAll('input')).filter(input =>
+                    input.form === form && ['text','email'].includes(input.type) &&
+                    follows(form, input) && follows(input, password));
+                if (preceding.length !== 1 || preceding[0] !== this) return false;
+            }
+        }
+    }
     const set = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'value').set;
     set.call(this, value);
     this.dispatchEvent(new win.Event('input', {bubbles:true}));
@@ -202,6 +228,26 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         if &actual != expected {
             return Err("classification_changed");
         }
+        if target.field == LoginField::Username {
+            if crate::browser::fill::username_uses_form_heuristic(expected)
+                && actual.login_field != expected.login_field
+            {
+                return Err("classification_changed");
+            }
+            let password = dispatch
+                .targets
+                .iter()
+                .find(|field| field.field == LoginField::Password)
+                .ok_or("not_a_password_field")?;
+            let actual_password = build_non_type_classification(
+                &nodes,
+                &password.identity,
+                expected.document_epoch,
+                &expected.current_top_level_origin,
+            )
+            .map_err(|_| "classification_unavailable")?;
+            crate::browser::fill::check_username_field(&actual, &actual_password)?;
+        }
         let node = nodes
             .iter()
             .find(|node| node.backend_node_id == target.identity.backend_node_id)
@@ -276,12 +322,27 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // ownership. A later navigation detaches this document and the atomic
         // function below refuses it rather than inserting in its replacement.
         self.verify_fill_target(context_key, dispatch, target, deadline, clock)?;
+        let password_argument = if target.field == LoginField::Username {
+            let password = dispatch
+                .targets
+                .iter()
+                .find(|field| field.field == LoginField::Password)
+                .ok_or("not_a_password_field")?;
+            let password_id = self
+                .resolve_fill_node(&password.identity, runtime, deadline, clock)
+                .map_err(|_| "fill_context_not_ready")?
+                .ok_or("node_changed")?;
+            serde_json::json!({"objectId": password_id})
+        } else {
+            serde_json::json!({"value": null})
+        };
         let result = self.fill_command(&attachment.session_id, "Runtime.callFunctionOn", serde_json::json!({
             "objectId":object_id, "functionDeclaration":INSERT_FILLED, "returnByValue":true,
             "arguments":[{"objectId":owner_id},
                 {"value":target.classification.effective_input_type.as_deref().unwrap_or("text")},
                 {"value":target.classification.target_autocomplete_tokens},
-                {"value":expected_origin}, {"value":target.value.as_str()}]
+                {"value":expected_origin}, {"value":target.value.as_str()},
+                {"value":target.field == LoginField::Username}, password_argument]
         }), deadline, clock).ok_or("fill_insert_not_ready")?;
         if result.contains_key("exceptionDetails")
             || result
