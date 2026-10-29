@@ -1,9 +1,14 @@
-//! A private hard link lets cursor helpers run the executable captured when
-//! the module started, even if an installer replaces its original path.
+//! Cursor helpers run only the executable captured when the module started.
+//! The module launches its helper from the installed path while that path
+//! still names the startup inode; the desk probe pins a private hard link.
 
-use std::fs::{self, DirBuilder, File};
+#[cfg(any(test, feature = "desk-probe"))]
+use std::fs::DirBuilder;
+use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+#[cfg(any(test, feature = "desk-probe"))]
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,19 +56,13 @@ impl PinnedExecutable {
         let image = File::open(&source)?;
         let startup_inode = Inode::of(&image)?;
         let mut result = Self::capture(image, startup_inode);
-        if let crate::ProcessStartTime::Started(start) = crate::process_start_time(pid) {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let _ = result.pin_with_fallback(
-                &source,
-                home.as_deref(),
-                &std::env::temp_dir(),
-                pid,
-                start,
-            );
-        }
-        if result.pin.is_none() {
-            result.fallback_identity = crate::executed_image_identity(pid).ok();
-        }
+        // The module never launches its helper from a linked copy. macOS
+        // privacy permissions such as Screen Recording follow the executable's
+        // path for a tool outside an app bundle, so a copy at another path is a
+        // new app to the person and prompts again. The helper starts from the
+        // installed path instead, only while that path still names the startup
+        // inode and the child's code identity matches the running module's.
+        result.fallback_identity = crate::executed_image_identity(pid).ok();
         Ok(result)
     }
 
@@ -95,6 +94,8 @@ impl PinnedExecutable {
         }
     }
 
+    // Only the desk probe pins a copy now; see `at_startup`.
+    #[cfg(any(test, feature = "desk-probe"))]
     fn pin_with_fallback(
         &mut self,
         source: &Path,
@@ -124,6 +125,7 @@ impl PinnedExecutable {
         )
     }
 
+    #[cfg(any(test, feature = "desk-probe"))]
     fn pin_in(&mut self, source: &Path, root: &Path, pid: u32, start: u64) -> io::Result<()> {
         if let Some(parent) = root.parent() {
             DirBuilder::new()
@@ -204,6 +206,7 @@ impl Drop for PinnedExecutable {
     }
 }
 
+#[cfg(any(test, feature = "desk-probe"))]
 fn private_directory(path: &Path) -> io::Result<()> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -221,6 +224,7 @@ fn private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(any(test, feature = "desk-probe"))]
 extern "C" {
     fn geteuid() -> u32;
 }
@@ -233,6 +237,7 @@ fn remove_pin(directory: &Path) {
     }
 }
 
+#[cfg(any(test, feature = "desk-probe"))]
 fn sweep_stale(root: &Path, mut is_live: impl FnMut(u32, u64) -> bool) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
