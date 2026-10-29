@@ -8069,7 +8069,8 @@ mod tests {
         assert!(outline.find("article Paper Kite") < outline.find("complementary Trending"));
 
         // A budget that cannot hold both keeps the posts and cuts the
-        // sidebar, and the last line says so.
+        // sidebar, and the last line accounts for the missing subtree with a
+        // zoom reference to the page containing the omitted subtree.
         let cut = render_fixture(&observation, &url, None, 1_200);
         assert!(cut.text.len() <= 1_200, "{}", cut.text);
         assert!(
@@ -8081,12 +8082,13 @@ mod tests {
         assert!(!cut
             .printed_refs
             .contains(&ref_of(&observation, "searchbox", None)));
+        let page = ref_of(&observation, "RootWebArea", None);
         assert!(
-            cut.text
-                .ends_with("complementary e100 (all); zoom one of them or raise max_bytes]\n"),
+            cut.text.ends_with(&format!("not shown; zoom {page}\n")),
             "{}",
             cut.text
         );
+        assert!(cut.printed_refs.contains(&page));
 
         // The whole page zoomed is in document order, navigation first, yet a
         // cut still spends the budget on the posts and drops the chrome.
