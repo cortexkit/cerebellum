@@ -94,106 +94,7 @@ if [ "$self_test" -eq 0 ]; then
 fi
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 
-plan_for_files() {
-  FAST_GATE_METADATA="$metadata" FAST_GATE_FILES="$1" python3 - <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-
-metadata = json.loads(os.environ["FAST_GATE_METADATA"])
-files = [line for line in os.environ["FAST_GATE_FILES"].splitlines() if line]
-if not files:
-    print("refusing to plan an empty diff", file=sys.stderr)
-    sys.exit(2)
-
-root = Path.cwd().resolve()
-packages = metadata["packages"]
-workspace_wide = any(
-    path in {"Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml"}
-    or path.startswith(".cargo/")
-    for path in files
-)
-selected_packages = set()
-selected_suites = set()
-
-# Some sources live at the repo root but are compiled into a crate with
-# include_str!, so a path-containment match never selects that crate. Map them
-# explicitly, or a change to the data slips past the test that parses it.
-root_file_packages = {"engram-catalog.json": "cerebellum-core"}
-for path in files:
-    owner = root_file_packages.get(path)
-    if owner:
-        selected_packages.add(owner)
-
-for package in packages:
-    manifest = Path(package["manifest_path"]).resolve()
-    package_root = manifest.parent
-    if workspace_wide:
-        selected_packages.add(package["name"])
-        continue
-    for relative in files:
-        candidate = (root / relative).resolve()
-        try:
-            candidate.relative_to(package_root)
-        except ValueError:
-            continue
-        selected_packages.add(package["name"])
-        if not candidate.is_relative_to(package_root / "tests"):
-            continue
-        test_targets = [target for target in package["targets"] if "test" in target["kind"]]
-        mapped = set()
-        for target in test_targets:
-            source = Path(target["src_path"]).resolve()
-            if candidate == source:
-                mapped.add(target["name"])
-            elif source.name == "main.rs" and candidate.is_relative_to(source.parent):
-                mapped.add(target["name"])
-        if not mapped:
-            # An unrecognized helper, fixture, or module path may be shared by
-            # several test targets, so run every integration suite in its crate.
-            mapped.update(target["name"] for target in test_targets)
-        selected_suites.update((package["name"], suite) for suite in mapped)
-
-# Each crate's consolidated `it` target holds the source scans over that crate's
-# shipped code. cerebellum's covers the single launch-secret reader, zero
-# runtime prints, declared launch-path outcome words, the one lease clock,
-# private file writes and more; cerebellum-core's keeps the crate free of plane
-# identifiers. Each scan reads files under src/, so a change there can break one
-# while no test file changed, and a hand-picked subset of modules misses
-# whichever scan reads the changed file. So whenever a package is selected, run
-# its whole `it` target. cerebellum's takes about 15 s once built, and the gate
-# builds it either way.
-for name in selected_packages:
-    package = next(package for package in packages if package["name"] == name)
-    if any(
-        target["name"] == "it" and "test" in target["kind"]
-        for target in package["targets"]
-    ):
-        selected_suites.add((name, "it"))
-
-for name in sorted(selected_packages):
-    print(f"P|{name}")
-    package = next(package for package in packages if package["name"] == name)
-    if any("lib" in target["kind"] for target in package["targets"]):
-        print(f"L|{name}")
-for package, suite in sorted(selected_suites):
-    print(f"T|{package}|{suite}")
-for package in packages:
-    for target in package["targets"]:
-        if "test" in target["kind"]:
-            print(f"S|{package['name']}|{target['name']}")
-for required in (
-    "tool-catalog-and-schema-bytes",
-    "flat-tools-fingerprints",
-    "format-floor-and-journal-formats",
-    "launch-secret-single-reader",
-    "zero-prints",
-    "module-wiring",
-):
-    print(f"A|{required}")
-PY
-}
+source "$repo_root/scripts/lib/fast-gate-plan.sh"
 
 # A harness-less desk test (one that opens AppKit windows on the main thread)
 # prints "test NAME ... SKIPPED: reason", or "SKIPPED (what it did check):
@@ -223,14 +124,14 @@ if [ "$self_test" -eq 1 ]; then
   fi
   echo "SELF-TEST PASSED: a desk-test skip yields its reason and a pass yields none"
 
-  suite_plan="$(plan_for_files 'crates/cerebellum/tests/it/tool_catalog.rs')"
+  suite_plan="$(plan_for_files 'crates/cerebellum/tests/it/tool_catalog.rs' "$metadata")"
   if ! printf '%s\n' "$suite_plan" | grep -Fxq 'T|cerebellum|it'; then
     echo "SELF-TEST FAILED: a planted tests/it source path did not select suite it" >&2
     exit 1
   fi
   echo "SELF-TEST PASSED: a planted tests/it source path selects suite it"
 
-  flat_plan="$(plan_for_files 'crates/cerebellum/src/flat_tools.rs')"
+  flat_plan="$(plan_for_files 'crates/cerebellum/src/flat_tools.rs' "$metadata")"
   if ! printf '%s\n' "$flat_plan" | grep -Fxq 'P|cerebellum' || \
      ! printf '%s\n' "$flat_plan" | grep -Fxq 'A|tool-catalog-and-schema-bytes' || \
      ! printf '%s\n' "$flat_plan" | grep -Fxq 'A|flat-tools-fingerprints'; then
@@ -239,7 +140,7 @@ if [ "$self_test" -eq 1 ]; then
   fi
   echo "SELF-TEST PASSED: a planted flat_tools.rs change keeps catalog and fingerprint checks"
 
-  catalog_plan="$(plan_for_files 'engram-catalog.json')"
+  catalog_plan="$(plan_for_files 'engram-catalog.json' "$metadata")"
   if ! printf '%s\n' "$catalog_plan" | grep -Fxq 'P|cerebellum-core' || \
      ! printf '%s\n' "$catalog_plan" | grep -Fxq 'L|cerebellum-core'; then
     echo "SELF-TEST FAILED: engram-catalog.json did not select cerebellum-core --lib" >&2
@@ -249,7 +150,7 @@ if [ "$self_test" -eq 1 ]; then
 
   # A shipped-source change with no test file in the diff must still run every
   # source scan in cerebellum's `it` target, which reads src/ directly.
-  scan_plan="$(plan_for_files 'crates/cerebellum/src/browser_session.rs')"
+  scan_plan="$(plan_for_files 'crates/cerebellum/src/browser_session.rs' "$metadata")"
   if ! printf '%s\n' "$scan_plan" | grep -Fxq 'T|cerebellum|it'; then
     echo "SELF-TEST FAILED: a cerebellum src change did not select the whole it target" >&2
     exit 1
@@ -258,7 +159,7 @@ if [ "$self_test" -eq 1 ]; then
 
   # The same holds for every crate with an `it` target: cerebellum-core's keeps
   # the crate free of plane identifiers, and once missed a test renamed in src/.
-  core_scan_plan="$(plan_for_files 'crates/cerebellum-core/src/engram_catalog.rs')"
+  core_scan_plan="$(plan_for_files 'crates/cerebellum-core/src/engram_catalog.rs' "$metadata")"
   if ! printf '%s\n' "$core_scan_plan" | grep -Fxq 'T|cerebellum-core|it'; then
     echo "SELF-TEST FAILED: a cerebellum-core src change did not select its it target" >&2
     exit 1
@@ -268,14 +169,14 @@ if [ "$self_test" -eq 1 ]; then
   # The control: a change outside cerebellum must not schedule cerebellum's `it`
   # target, which shows the rule above follows package selection and is not a
   # blanket run.
-  core_plan="$(plan_for_files 'crates/cerebellum-core/src/private_fs.rs')"
+  core_plan="$(plan_for_files 'crates/cerebellum-core/src/private_fs.rs' "$metadata")"
   if printf '%s\n' "$core_plan" | grep -Fxq 'T|cerebellum|it'; then
     echo "SELF-TEST FAILED: a cerebellum-core-only change scheduled cerebellum's it target" >&2
     exit 1
   fi
   echo "SELF-TEST PASSED: a change outside cerebellum leaves its it target to the mandatory modules"
 
-  if plan_for_files '' >/dev/null 2>&1; then
+  if plan_for_files '' "$metadata" >/dev/null 2>&1; then
     echo "SELF-TEST FAILED: an empty diff was accepted" >&2
     exit 1
   fi
@@ -298,7 +199,7 @@ if [ -z "$changed_files" ]; then
   exit 2
 fi
 
-plan="$(plan_for_files "$changed_files")"
+plan="$(plan_for_files "$changed_files" "$metadata")"
 packages=()
 lib_packages=()
 suites=()
