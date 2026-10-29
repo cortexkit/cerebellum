@@ -7697,6 +7697,11 @@ mod tests {
             fill::FillRefusal::VaultUnavailable,
             fill::FillRefusal::Aborted {
                 reason_code: "document_changed",
+                insertion_attempted: true,
+            },
+            fill::FillRefusal::Aborted {
+                reason_code: "owner_frame_changed",
+                insertion_attempted: false,
             },
             fill::FillRefusal::FilledPasswordOnPage,
             fill::FillRefusal::WindowExpired,

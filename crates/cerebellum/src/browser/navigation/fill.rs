@@ -12,7 +12,7 @@ use crate::browser::fill::{
 
 // No focus events or focus-directed CDP insertion: the page cannot redirect
 // this value to a different element between validation and the setter.
-const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin, value, isUsername, password) {
+const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin, value, isUsername, password, checkOnly) {
     const win = doc.defaultView;
     if (!this.isConnected || this.ownerDocument !== doc || !win || win.document !== doc ||
         win.origin !== origin || doc.location.protocol !== 'https:' ||
@@ -44,6 +44,7 @@ const INSERT_FILLED: &str = r#"function(doc, expectedType, autocomplete, origin,
             }
         }
     }
+    if (checkOnly) return true;
     const set = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'value').set;
     set.call(this, value);
     this.dispatchEvent(new win.Event('input', {bubbles:true}));
@@ -56,6 +57,44 @@ const CLEAR_FILLED: &str = "function() { if (typeof this.value === 'string') { t
 const STILL_FILLED: &str = "function() { return this.isConnected && typeof this.value === 'string' && this.value.length > 0; }";
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
+    /// All live field/frame checks, without sending values or changing fields.
+    /// A reason is a refusal; None means the page is ready to ask the vault.
+    pub fn check_fill_login(
+        &mut self,
+        context_key: &str,
+        dispatch: &FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<Option<&'static str>, NavigationDriveError> {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_millis(deadline_ms))
+            .ok_or(NavigationDriveError::CdpFailure)?;
+        self.ensure_attached(context_key, deadline, &mut clock)?;
+        let mut runtime = HashSet::new();
+        let mut filled = Vec::new();
+        for target in &dispatch.targets {
+            let check = self
+                .verify_fill_target(context_key, dispatch, target, deadline, &mut clock)
+                .and_then(|()| {
+                    self.check_or_insert_fill_target(
+                        context_key,
+                        dispatch,
+                        target,
+                        &mut runtime,
+                        &mut filled,
+                        true,
+                        deadline,
+                        &mut clock,
+                    )
+                });
+            if let Err(reason_code) = check {
+                return Ok(Some(reason_code));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn fill_login(
         &mut self,
         context_key: &str,
@@ -85,15 +124,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             let step = self
                 .verify_fill_target(context_key, dispatch, target, deadline, &mut clock)
                 .and_then(|()| {
-                    filled.push(FilledField {
-                        identity: target.identity.clone(),
-                        frame: target.frame.clone(),
-                    });
-                    self.insert_fill_value(
+                    self.check_or_insert_fill_target(
                         context_key,
                         dispatch,
                         target,
                         &mut runtime,
+                        &mut filled,
+                        false,
                         deadline,
                         &mut clock,
                     )
@@ -261,12 +298,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(())
     }
 
-    fn insert_fill_value(
+    #[allow(clippy::too_many_arguments)]
+    fn check_or_insert_fill_target(
         &mut self,
         context_key: &str,
         dispatch: &FillDispatch,
         target: &FillTarget,
         runtime: &mut HashSet<String>,
+        filled: &mut Vec<FilledField>,
+        check_only: bool,
         deadline: Instant,
         clock: &mut SystemNavigationClock,
     ) -> Result<(), &'static str> {
@@ -277,8 +317,23 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .resolve_fill_node(&target.identity, runtime, deadline, clock)
             .map_err(|_| "fill_context_not_ready")?
             .ok_or("node_changed")?;
-        // Resolve the actual owner document rather than relying on the
-        // classification's recorded frame. A node adopted into a same-session frame keeps its id.
+        // resolve_fill_node creates this wrapper in the exact captured frame's
+        // isolated world. Compare its owner with that world's document, not
+        // DOM.Node.frameId, which Chrome omits when describing a Document.
+        // A same-session, same-origin adoption must still fail this check.
+        if self
+            .call_on_fill_node(
+                &target.identity,
+                &object_id,
+                "function() { return this.ownerDocument === document; }",
+                deadline,
+                clock,
+            )
+            .map_err(|_| "owner_document_unavailable")?
+            != Some(Value::Bool(true))
+        {
+            return Err("owner_frame_changed");
+        }
         let owner = self.fill_command(&attachment.session_id, "Runtime.callFunctionOn",
             serde_json::json!({"objectId":object_id,"functionDeclaration":"function() { return this.ownerDocument; }","returnByValue":false}), deadline, clock)
             .ok_or("owner_document_unavailable")?;
@@ -297,9 +352,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             )
             .ok_or("owner_document_unavailable")?;
         let node = described.get("node").ok_or("owner_document_unavailable")?;
-        if node.get("frameId").and_then(Value::as_str) != Some(target.identity.frame_id.as_str()) {
-            return Err("owner_frame_changed");
-        }
         let expected_origin = target
             .frame
             .as_ref()
@@ -336,13 +388,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             serde_json::json!({"value": null})
         };
+        if !check_only {
+            dispatch.mark_insertion_attempted();
+            filled.push(FilledField {
+                identity: target.identity.clone(),
+                frame: target.frame.clone(),
+            });
+        }
         let result = self.fill_command(&attachment.session_id, "Runtime.callFunctionOn", serde_json::json!({
             "objectId":object_id, "functionDeclaration":INSERT_FILLED, "returnByValue":true,
             "arguments":[{"objectId":owner_id},
                 {"value":target.classification.effective_input_type.as_deref().unwrap_or("text")},
                 {"value":target.classification.target_autocomplete_tokens},
-                {"value":expected_origin}, {"value":target.value.as_str()},
-                {"value":target.field == LoginField::Username}, password_argument]
+                {"value":expected_origin}, {"value":if check_only { None } else { Some(target.value.as_str()) }},
+                {"value":target.field == LoginField::Username}, password_argument, {"value":check_only}]
         }), deadline, clock).ok_or("fill_insert_not_ready")?;
         if result.contains_key("exceptionDetails")
             || result

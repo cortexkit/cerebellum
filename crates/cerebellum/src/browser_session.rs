@@ -839,6 +839,17 @@ pub trait OwnedBrowserProcess: Send {
         Err(NavigationDriveError::Unavailable)
     }
 
+    /// Check the live login fields without inserting or obtaining credentials.
+    /// None means ready; Some(reason) is a field/frame refusal.
+    fn check_fill_login(
+        &mut self,
+        _context_key: &str,
+        _dispatch: &crate::browser::fill::FillDispatch,
+        _deadline_ms: u64,
+    ) -> Result<Option<&'static str>, NavigationDriveError> {
+        Err(NavigationDriveError::CdpFailure)
+    }
+
     /// Re-check each login field's kind and frame and then insert its value,
     /// all through the process-owned CDP connection. A field already filled
     /// when a later check fails is cleared before this returns.
@@ -2186,6 +2197,18 @@ impl OperationGuard {
         self.drive(
             |error| error,
             |process| process.type_classified(context_key, target, text, clear_first, deadline_ms),
+        )
+    }
+
+    pub(crate) fn check_fill_login(
+        &mut self,
+        context_key: &str,
+        dispatch: &crate::browser::fill::FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<Option<&'static str>, NavigationDriveError> {
+        self.drive(
+            |error| error,
+            |process| process.check_fill_login(context_key, dispatch, deadline_ms),
         )
     }
 

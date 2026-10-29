@@ -2369,6 +2369,18 @@ impl OwnedBrowserProcess for ProductionProcess {
             .type_classified(context_key, target, text, clear_first, deadline_ms)
     }
 
+    fn check_fill_login(
+        &mut self,
+        context_key: &str,
+        dispatch: &crate::browser::fill::FillDispatch,
+        deadline_ms: u64,
+    ) -> Result<Option<&'static str>, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .check_fill_login(context_key, dispatch, deadline_ms)
+    }
+
     fn fill_login(
         &mut self,
         context_key: &str,
