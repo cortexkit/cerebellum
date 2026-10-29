@@ -52,8 +52,14 @@ impl PinnedExecutable {
         let startup_inode = Inode::of(&image)?;
         let mut result = Self::capture(image, startup_inode);
         if let crate::ProcessStartTime::Started(start) = crate::process_start_time(pid) {
-            let root = std::env::temp_dir().join("ck-cerebellum-helper-pins");
-            let _ = result.pin_in(&source, &root, pid, start);
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let _ = result.pin_with_fallback(
+                &source,
+                home.as_deref(),
+                &std::env::temp_dir(),
+                pid,
+                start,
+            );
         }
         if result.pin.is_none() {
             result.fallback_identity = crate::executed_image_identity(pid).ok();
@@ -73,12 +79,8 @@ impl PinnedExecutable {
         let crate::ProcessStartTime::Started(start) = crate::process_start_time(pid) else {
             return Err(io::Error::other("probe start time is unreadable"));
         };
-        result.pin_in(
-            source,
-            &std::env::temp_dir().join("ck-cerebellum-helper-pins"),
-            pid,
-            start,
-        )?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        result.pin_with_fallback(source, home.as_deref(), &std::env::temp_dir(), pid, start)?;
         Ok(result)
     }
 
@@ -93,7 +95,42 @@ impl PinnedExecutable {
         }
     }
 
+    fn pin_with_fallback(
+        &mut self,
+        source: &Path,
+        home: Option<&Path>,
+        temporary: &Path,
+        pid: u32,
+        start: u64,
+    ) -> io::Result<()> {
+        // Unlike the per-user temp folder, Caches is not periodically purged
+        // while a long-running module may still need its startup image.
+        if let Some(home) = home.filter(|home| home.is_absolute()) {
+            let root = home.join("Library/Caches/ck-cerebellum/helper-pins");
+            if self.pin_in(source, &root, pid, start).is_ok() {
+                return Ok(());
+            }
+            // A failed link can leave a per-start directory behind. Remove it
+            // before the temp attempt takes ownership of a different directory.
+            if let Some(directory) = self.directory.take() {
+                remove_pin(&directory);
+            }
+        }
+        self.pin_in(
+            source,
+            &temporary.join("ck-cerebellum-helper-pins"),
+            pid,
+            start,
+        )
+    }
+
     fn pin_in(&mut self, source: &Path, root: &Path, pid: u32, start: u64) -> io::Result<()> {
+        if let Some(parent) = root.parent() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
         private_directory(root)?;
         sweep_stale(root, |pid, start| {
             #[cfg(target_os = "macos")]
@@ -255,8 +292,14 @@ mod tests {
 
         fn pin(&self) -> PinnedExecutable {
             let mut pin = self.capture();
-            pin.pin_in(&self.module, &self.directory.join("pins"), 42, 100)
-                .unwrap();
+            pin.pin_with_fallback(
+                &self.module,
+                Some(&self.directory.join("home")),
+                &self.directory.join("temporary"),
+                42,
+                100,
+            )
+            .unwrap();
             pin
         }
 
@@ -314,6 +357,41 @@ mod tests {
     }
 
     #[test]
+    fn pin_uses_private_cache_root_instead_of_temporary_root() {
+        let fixture = Fixture::new();
+        let pin = fixture.pin();
+        let root = fixture
+            .directory
+            .join("home/Library/Caches/ck-cerebellum/helper-pins");
+        let launch = root.join("42-100/module");
+        assert_eq!(pin.launch_path().unwrap(), launch);
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        assert!(!fixture.directory.join("temporary").exists());
+        drop(pin);
+        assert!(!launch.exists());
+        assert!(!root.join("42-100").exists());
+    }
+
+    #[test]
+    fn unavailable_cache_directory_falls_back_to_private_temporary_pin() {
+        let fixture = Fixture::new();
+        let home = fixture.directory.join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("Library"), b"not a directory").unwrap();
+        let pin = fixture.pin();
+        let root = fixture
+            .directory
+            .join("temporary/ck-cerebellum-helper-pins");
+        let launch = root.join("42-100/module");
+        assert_eq!(pin.launch_path().unwrap(), launch);
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        fixture.replace_module();
+        assert_eq!(pin.launch_path().unwrap(), launch);
+        drop(pin);
+        assert!(!root.join("42-100").exists());
+    }
+
+    #[test]
     fn failed_pinning_falls_back_only_while_startup_inode_matches() {
         let fixture = Fixture::new();
         let mut pin = fixture.capture();
@@ -331,11 +409,27 @@ mod tests {
         let mut pin = fixture.capture();
         fixture.replace_module();
         assert!(pin
-            .pin_in(&fixture.module, &fixture.directory.join("pins"), 42, 100)
+            .pin_with_fallback(
+                &fixture.module,
+                Some(&fixture.directory.join("home")),
+                &fixture.directory.join("temporary"),
+                42,
+                100,
+            )
             .is_err());
         assert!(pin.pin.is_none());
         assert!(pin.path_for(&fixture.module).is_err());
+        assert!(!fixture
+            .directory
+            .join("home/Library/Caches/ck-cerebellum/helper-pins/42-100")
+            .exists());
         let directory = pin.directory.clone().unwrap();
+        assert_eq!(
+            directory,
+            fixture
+                .directory
+                .join("temporary/ck-cerebellum-helper-pins/42-100")
+        );
         drop(pin);
         assert!(!directory.exists());
     }
